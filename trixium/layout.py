@@ -194,3 +194,8 @@ def crc32(data):
 # 192 MB/channel for weights: Bonsai-8B (~2.9 GB with embeddings/LM head) fits from N=16 up
 # (~180 MB/channel).
 HBM_WEIGHT_BASE = 0x0400_0000 # 64 MB into each channel.
+
+# The BONS header+table ("meta") is uploaded by the host to ENGINE channel 0 at this offset
+# (the host's PCIe window covers CSRs only, not HBM channel 0 / main_ram); the firmware's
+# `loadhdr` command copies it from there to BONSAI_HDR_ADDR via FETCH + memcpy.
+HBM_META_OFFSET = HBM_WEIGHT_BASE - 0x0010_0000 # 1 MB before the payloads.

@@ -18,6 +18,7 @@ from migen import *
 from litex.gen import *
 
 from litex.soc.interconnect import wishbone
+from litex.soc.interconnect.csr import *
 
 # BonsaiScratchpad ---------------------------------------------------------------------------------
 
@@ -41,6 +42,13 @@ class BonsaiScratchpad(LiteXModule):
         # Engine gather write port (int32 granularity).
         self.gather = mem.get_port(write_capable=True, we_granularity=32)
         self.specials += self.gather
+
+    def add_csr_port(self):
+        """CSR-based peek/poke (host access over the PCIe BAR0/JTAG CSR window: BAR0 does not
+        cover the SoC bus, so upload verification and host-driven result readback go through
+        these registers). Write `adr` to trigger a read; `data_r` is valid on the next CSR
+        read. Write `data_w` to write 32 bits at `adr`."""
+        return _ScratchpadCSR(self)
 
     def add_wishbone_port(self):
         """32-bit Wishbone slave onto the 256-bit memory (CPU/host/JTAG access).
@@ -84,3 +92,33 @@ class BonsaiScratchpad(LiteXModule):
             NextState("IDLE"),
         )
         return bus
+
+# _ScratchpadCSR -----------------------------------------------------------------------------------
+
+class _ScratchpadCSR(LiteXModule):
+    def __init__(self, scratchpad):
+        self.adr    = CSRStorage(24, description="Byte address (4-aligned). Writing triggers a read.")
+        self.data_r = CSRStatus(32,  description="Read data for the last written adr.")
+        self.data_w = CSRStorage(32, description="Writing stores 32 bits at adr.")
+
+        # # #
+
+        port = scratchpad.mem.get_port(write_capable=True, we_granularity=8)
+        scratchpad.specials += port
+
+        sel   = Signal(3)
+        sel_r = Signal(3)
+        we    = Signal()
+        self.comb += [
+            port.adr.eq(self.adr.storage[5:]),
+            sel.eq(self.adr.storage[2:5]),
+            port.dat_w.eq(Replicate(self.data_w.storage, 8)),
+            If(we,
+                Case(sel, {i: port.we.eq(0xF << (4*i)) for i in range(8)}),
+            ),
+        ]
+        self.sync += [
+            we.eq(self.data_w.re),
+            sel_r.eq(sel),
+            Case(sel_r, {i: self.data_r.status.eq(port.dat_r[32*i:32*(i+1)]) for i in range(8)}),
+        ]

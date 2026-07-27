@@ -118,6 +118,7 @@ class BonsaiSoC(SoCCore):
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis)
             self.engine_csr = BonsaiEngineCSR(self.engine)
             self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)
+            self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
 
             # Scratchpad on the SoC bus (uncached: shared with the engine).
             self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
