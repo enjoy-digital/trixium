@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Build outputs
+build/
+firmware/build/
+prog/bitstreams/*
+!prog/bitstreams/.gitkeep
+
+# Models / weight images (regenerable, large)
+models/
+
+# Vivado cruft
+.Xil/
+vivado*.jou
+vivado*.log
+*.backup.jou
+*.backup.log
+
+# Software build artifacts
+*.o
+*.ko
+*.so
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Simulation artifacts
+*.vcd
+*.fst
+*.fst.hier
+csr.csv
+analyzer.csv
