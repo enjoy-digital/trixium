@@ -22,39 +22,83 @@ from migen import *
 
 from litex.gen import *
 
-from litex_boards.platforms import sqrl_fk33
-from litex_boards.targets.sqrl_fk33 import BaseSoC
-
+from litex.soc.cores.clock import *
+from litex.soc.cores.led import LedChaser
+from litex.soc.cores.ram.xilinx_usp_hbm2 import USPHBM2, add_usphbm2_pseudochannels
+from litex.soc.integration.soc import *
 from litex.soc.integration.builder import *
 
+from litepcie.phy.usppciephy import USPHBMPCIEPHY
 from litepcie.software import generate_litepcie_software
 
-# Constants ----------------------------------------------------------------------------------------
+from trixium.gateware.platform_fk33 import Platform
 
-# CPU/BIOS HBM window: channel 0 only (main_ram); channels 1..31 are reserved for the engine/BIST
-# and accessed through their native AXI ports (the AXI-Lite SoC bridges don't burst).
-CPU_HBM_CHANNELS = (0,)
+# CRG ----------------------------------------------------------------------------------------------
+
+class _CRG(LiteXModule):
+    def __init__(self, platform, sys_clk_freq):
+        self.rst        = Signal()
+        self.cd_sys     = ClockDomain()
+        self.cd_hbm_ref = ClockDomain()
+        self.cd_apb     = ClockDomain()
+
+        # # #
+
+        self.pll = pll = USPMMCM(speedgrade=-2)
+        self.comb += pll.reset.eq(self.rst)
+        pll.register_clkin(platform.request("clk200"), 200e6)
+        pll.create_clkout(self.cd_sys,     sys_clk_freq)
+        pll.create_clkout(self.cd_hbm_ref, 100e6)
+        pll.create_clkout(self.cd_apb,     100e6)
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
 # BonsaiSoC ----------------------------------------------------------------------------------------
 
-class BonsaiSoC(BaseSoC):
-    def __init__(self, variant="a", sys_clk_freq=250e6, pcie_lanes=4, **kwargs):
+class BonsaiSoC(SoCCore):
+    def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, **kwargs):
         assert variant in ["a", "b", "c"]
+        assert 225e6 <= sys_clk_freq <= 450e6 # HBM AXI clock range.
         self.bonsai_variant = variant
+        platform = Platform()
 
-        BaseSoC.__init__(self,
-            sys_clk_freq = sys_clk_freq,
-            with_pcie    = True,
-            pcie_lanes   = pcie_lanes,
-            with_hbm     = True,
-            hbm_channels = CPU_HBM_CHANNELS,
-            **kwargs)
+        # CRG --------------------------------------------------------------------------------------
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        if kwargs.get("uart_name", "serial") == "serial":
+            kwargs["uart_name"] = "crossover" # No physical UART: console over JTAGBone/PCIe.
+        kwargs["with_jtagbone"]  = True
+        kwargs["jtagbone_chain"] = 2 # Chain 1 already used by HBM2 debug probes.
+        SoCCore.__init__(self, platform, sys_clk_freq,
+            ident = f"TriXium {variant.upper()} on FK33", **kwargs)
         self.add_constant("BONSAI_VARIANT", ord(variant))
 
-        # The upgraded HBM IP (rev 16, Vivado 2024.1) embeds HBM monitor debug cores; the
-        # auto-inserted debug hub needs its clock connected explicitly or opt_design errors
-        # with "The debug port 'dbg_hub/clk' has 1 unconnected channels".
-        self.platform.add_platform_command("connect_debug_port dbg_hub/clk [get_nets apb_clk]")
+        # HBM --------------------------------------------------------------------------------------
+        # 32 pseudo-channels; CPU/BIOS window on channel 0 only (main_ram). Channels 1..31 are
+        # reserved for the engine/BIST through their native AXI ports (the AXI-Lite SoC bridges
+        # don't burst).
+        self.hbm = hbm = ClockDomainsRenamer({"axi": "sys"})(USPHBM2(platform))
+        add_usphbm2_pseudochannels(soc=self, hbm=hbm, channels=(0,), main_channel=0)
+
+        # The apb<->sys crossings (HBM AXI resets driven from the apb domain, apb_complete
+        # status into CSRs) are quasi-static: declare them false paths.
+        platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_apb.clk)
+
+        # The HBM IP (rev 16) embeds HBM monitor debug cores; the auto-inserted debug hub needs
+        # its clock connected explicitly or opt_design errors with "The debug port 'dbg_hub/clk'
+        # has 1 unconnected channels".
+        platform.add_platform_command("connect_debug_port dbg_hub/clk [get_nets apb_clk]")
+
+        # PCIe -------------------------------------------------------------------------------------
+        self.pcie_phy = USPHBMPCIEPHY(platform, platform.request(f"pcie_x{pcie_lanes}"),
+            data_width = {4: 128, 8: 256, 16: 512}[pcie_lanes],
+            bar0_size  = 0x20000)
+        self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
+
+        # Leds -------------------------------------------------------------------------------------
+        self.leds = LedChaser(
+            pads         = platform.request_all("user_led"),
+            sys_clk_freq = sys_clk_freq)
 
         # Variant a: HBM bandwidth BIST on channels 1..31 (added once gateware/bist.py lands).
         # Variant b: + MatVec engine (host-driven).
@@ -66,10 +110,10 @@ class BonsaiSoC(BaseSoC):
 
 def main():
     from litex.build.parser import LiteXArgumentParser
-    parser = LiteXArgumentParser(platform=sqrl_fk33.Platform, description="TriXium SoC on FK33.")
+    parser = LiteXArgumentParser(platform=Platform, description="TriXium SoC on FK33.")
     parser.add_target_argument("--variant",      default="a",               help="Bonsai variant (a: infra, b: matvec, c: full).")
-    parser.add_target_argument("--sys-clk-freq", default=250e6, type=float, help="System clock frequency.")
-    parser.add_target_argument("--pcie-lanes",   default=4, type=int,       choices=[4, 8, 16], help="PCIe lane count.")
+    parser.add_target_argument("--sys-clk-freq", default=225e6, type=float, help="System clock frequency (= HBM AXI clock, 225-450 MHz).")
+    parser.add_target_argument("--pcie-lanes",   default=4, type=int,       choices=[2, 4, 8, 16], help="PCIe lane count.")
     parser.add_target_argument("--driver",       action="store_true",       help="Generate LitePCIe driver headers.")
     args = parser.parse_args()
 
