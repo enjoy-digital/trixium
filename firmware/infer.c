@@ -167,47 +167,80 @@ static void embed_row_f(const struct bons_entry *e, int row, float *dst)
 }
 
 // RoPE with YaRN (transliterated from the golden model / llama.cpp).
+// Soft-float transcendentals dominate the CPU cost, so everything position-independent is
+// precomputed once (rope_init), and cos/sin are computed once per position (rope_pos) and
+// shared by all heads and by the Q and K applications.
+static float *rope_freq_i;  // Per pair: interpolated angular frequency.
+static float *rope_freq_e;  // Per pair: extrapolated (ramp-blended in).
+static float  rope_mscale;
+static float *rope_c, *rope_s; // Per-pair cos/sin for the current position.
+static int    rope_pos_cached;
+
 static float yarn_corr_dim(int n_dims, int n_ctx_orig, float n_rot, float base)
 {
     return n_dims*logf(n_ctx_orig/(n_rot*2.0f*(float)M_PI))/(2.0f*logf(base));
 }
 
-static void rope_apply(float *vec, int n_heads_v, int pos)
+static void rope_init(void)
 {
-    // Uses model constants: head_dim, rope theta from header, yarn 4x (Bonsai family).
+    // Bonsai GGUFs use yarn factor 4; tiny sim models use plain rope (vocab heuristic until
+    // the BONS header carries yarn fields).
     float theta_base = (float)H->rope_theta;
     float freq_scale = 1.0f;
     float ext_factor = 0.0f;
-    float mscale     = 1.0f;
-    // Bonsai GGUFs use yarn factor 4; the original ctx differs per model. Encode via
-    // max_ctx? Keep simple: yarn only when header vocab is the real one (>100k = real
-    // model). Tiny models use plain rope.
     if (H->vocab > 100000) {
         freq_scale = 0.25f;
         ext_factor = 1.0f;
     }
-    int   D    = head_dim;
-    float low  = 0, high = D - 1;
+    int   D   = head_dim;
+    float low = 0, high = D - 1;
+    rope_mscale = 1.0f;
     if (ext_factor != 0.0f) {
-        int orig = (H->vocab > 100000) ? ((n_embd >= 4096) ? 16384 : 8192) : 0;
+        int orig = (n_embd >= 4096) ? 16384 : 8192;
         low  = floorf(yarn_corr_dim(D, orig, 32.0f, theta_base));
         high = ceilf(yarn_corr_dim(D, orig, 1.0f, theta_base));
         if (low  < 0)     low  = 0;
         if (high > D - 1) high = D - 1;
-        mscale *= 1.0f + 0.1f*logf(1.0f/freq_scale);
+        rope_mscale *= 1.0f + 0.1f*logf(1.0f/freq_scale);
     }
+    rope_freq_i = halloc((D/2)*sizeof(float));
+    rope_freq_e = halloc((D/2)*sizeof(float));
+    rope_c      = halloc((D/2)*sizeof(float));
+    rope_s      = halloc((D/2)*sizeof(float));
+    for (int p2 = 0; p2 < D/2; p2++) {
+        float fe   = powf(theta_base, -2.0f*p2/D); // Extrapolated frequency.
+        float ramp = 0.0f;
+        if (ext_factor != 0.0f) {
+            float y = (p2 - low)/((high - low) > 0.001f ? (high - low) : 0.001f);
+            ramp    = (1.0f - fminf(1.0f, fmaxf(0.0f, y)))*ext_factor;
+        }
+        // theta(pos) = pos * (freq_scale*fe*(1-ramp) + fe*ramp).
+        rope_freq_i[p2] = freq_scale*fe*(1.0f - ramp) + fe*ramp;
+        rope_freq_e[p2] = fe;
+    }
+    rope_pos_cached = -1;
+}
+
+static void rope_pos(int pos)
+{
+    if (pos == rope_pos_cached)
+        return;
+    for (int p2 = 0; p2 < head_dim/2; p2++) {
+        float theta = pos*rope_freq_i[p2];
+        rope_c[p2] = cosf(theta)*rope_mscale;
+        rope_s[p2] = sinf(theta)*rope_mscale;
+    }
+    rope_pos_cached = pos;
+}
+
+static void rope_apply(float *vec, int n_heads_v, int pos)
+{
+    int D = head_dim;
+    rope_pos(pos);
     for (int hh = 0; hh < n_heads_v; hh++) {
         float *vh = vec + hh*D;
         for (int p2 = 0; p2 < D/2; p2++) {
-            float theta_extrap = pos*powf(theta_base, -2.0f*p2/D);
-            float theta = freq_scale*theta_extrap;
-            if (ext_factor != 0.0f) {
-                float y    = (p2 - low)/((high - low) > 0.001f ? (high - low) : 0.001f);
-                float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
-                theta = theta*(1.0f - ramp*ext_factor) + theta_extrap*ramp*ext_factor;
-            }
-            float c = cosf(theta)*mscale;
-            float s = sinf(theta)*mscale;
+            float c = rope_c[p2], s = rope_s[p2];
             float x0 = vh[p2], x1 = vh[p2 + D/2];
             vh[p2]       = x0*c - x1*s;
             vh[p2 + D/2] = x0*s + x1*c;
@@ -422,6 +455,7 @@ int infer_init(void)
     v_scale = halloc((uint64_t)n_layer*max_ctx*sizeof(float));
     scores  = halloc(max_ctx*sizeof(float));
     n_pos   = 0;
+    rope_init();
     return 0;
 }
 
