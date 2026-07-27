@@ -37,14 +37,15 @@ def test_sim_selftest_checksums():
     assert os.path.exists(os.path.join(SIM_DIR, "obj_dir/Vsim")), "build the sim first"
     assert os.path.exists(IMAGE)
 
-    # Run the sim until the self-test completes.
+    # Run the sim until the boot generation demo completes (the token gate needs the GEN
+    # line, which lands ~50 sim-seconds / ~5 min wall after SELFTEST).
     p = subprocess.Popen(["./obj_dir/Vsim"], cwd=SIM_DIR,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     lines = []
     try:
         for line in p.stdout:
             lines.append(line)
-            if "SELFTEST DONE" in line or len(lines) > 3000:
+            if "GEN DONE" in line or "BONSAI-READY" in line or len(lines) > 20000:
                 break
     finally:
         p.kill()

@@ -89,8 +89,13 @@ class BonsaiHBMBIST(LiteXModule):
             axi.ar.ready.eq(Array([hbm_axis[i].ar.ready for i in range(n)])[chan]),
             axi.aw.ready.eq(Array([hbm_axis[i].aw.ready for i in range(n)])[chan]),
             axi.w.ready.eq(Array([hbm_axis[i].w.ready   for i in range(n)])[chan]),
-            axi.b.valid.eq(Array([hbm_axis[i].b.valid   for i in range(n)])[chan]),
         ]
+        # B responses: registered (b.ready is held high on both sides, so each response is a
+        # single-cycle pulse at the source and a plain register preserves counts - same
+        # treatment as the R return mux).
+        b_valid_m = Signal()
+        self.comb += b_valid_m.eq(Array([hbm_axis[i].b.valid for i in range(n)])[chan])
+        self.sync += axi.b.valid.eq(b_valid_m) # b.ready is driven high by the writer.
 
         # The R return path (256-bit 32:1 mux into the reader FIFO) needs a pipeline register
         # stage to close timing at 225 MHz: mux -> reg -> reader.
