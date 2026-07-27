@@ -132,3 +132,49 @@ def test_matvec_q8():
                bias=B, rshift=R, xsrc=xsrc, dst=dst)
     got = _run_engine(dut, cmd, M, dst)
     assert np.array_equal(got, expected)
+
+import os
+import pytest
+
+@pytest.mark.slow
+def test_matvec_real_1p7b_slice():
+    # Real Ternary-Bonsai-1.7B layer-0 attn_q data (real fp16 scale distribution, real code
+    # statistics) through the Migen engine, bit-exact vs the golden model. Uses a 64-rows-per-
+    # channel slice of the N=2 layer-0 image so the HBM model init stays small.
+    from trixium.model.bons import BONSReader
+    img_path = "models/bons/bonsai-1p7b-l1-n2.img"
+    if not os.path.exists(img_path):
+        pytest.skip("1.7B layer-0 image not converted")
+    img  = BONSReader(img_path)
+    name = "blk.0.attn_q.weight"
+    e    = img.by_name[name]
+    scales, codes = img.tensor(name)
+
+    rows_per_chan = 64
+    cols          = e["cols"] # 2048.
+    rb            = layout.row_beats(cols, layout.KIND_TERNARY)
+    rpc_full      = e["rows"]//2
+
+    # Shard slices: channel c rows [c*rpc_full, c*rpc_full + rows_per_chan).
+    payloads, sel_rows = [], []
+    for c in range(2):
+        raw = bytes(img.tensor_channel_bytes(name, c))[:rows_per_chan*rb*32]
+        payloads.append(raw)
+        sel_rows.append(slice(c*rpc_full, c*rpc_full + rows_per_chan))
+
+    rng = np.random.default_rng(77)
+    x8  = rng.integers(-127, 128, cols, dtype=np.int8)
+
+    scl = np.concatenate([scales[s] for s in sel_rows], axis=0)
+    cds = np.concatenate([codes[s]  for s in sel_rows], axis=0)
+    expected = bx.matvec_ternary(scl, cds, x8, e["bias"], e["rshift"])
+
+    dst = 0x8000
+    dut = _EngineDUT(2, payloads, words_from_bytes(x8.tobytes()), latency=16, stall_rate=4)
+    cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+               wlen=rows_per_chan*rb,
+               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+               bias=e["bias"], rshift=e["rshift"], xsrc=0, dst=dst)
+    got = _run_engine(dut, cmd, 2*rows_per_chan, dst)
+    assert np.array_equal(got, expected)
