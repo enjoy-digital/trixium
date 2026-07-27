@@ -128,8 +128,13 @@ class BonsaiSoC(SoCCore):
                 self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"}),
             ]
 
-        if variant == "c":
-            raise NotImplementedError("variant c: vector unit/KV/top-k WIP")
+            # Firmware contract: BONS header+table live in HBM channel 0 (the CPU window) at
+            # HBM_WEIGHT_BASE; engine-channel payloads at the same offset in channels 1..N.
+            # Variant c == b gateware: the token loop is firmware + these constants.
+            from trixium.layout import HBM_WEIGHT_BASE
+            self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HBM_WEIGHT_BASE)
+            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
+            self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
 
         # Per-channel HBM bandwidth BIST (channels not owned by the engine).
         from trixium.gateware.bist import BonsaiHBMBIST
