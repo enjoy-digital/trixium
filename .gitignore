@@ -13,6 +13,10 @@ prog/bitstreams/*
 # Models / weight images (regenerable, large)
 models/
 
+# Vivado-generated HBM IP outputs (only the .xci is tracked)
+ip/hbm/*
+!ip/hbm/hbm_0.xci
+
 # Vivado cruft
 .Xil/
 vivado*.jou

@@ -8,6 +8,9 @@ PYTHON  ?= .venv/bin/python
 PIP     ?= .venv/bin/pip
 PYTEST  ?= .venv/bin/pytest
 
+# Vivado 2024.1 is required: the 2025.2 install lacks VU33P device support.
+VIVADO_SETTINGS ?= /opt/Xilinx/2024.1/Vivado/2024.1/settings64.sh
+
 # Environment ------------------------------------------------------------------------------------
 
 .PHONY: venv
@@ -50,23 +53,23 @@ sim:
 
 .PHONY: gateware-a gateware-b gateware-c
 gateware-a: df-check
-	$(PYTHON) trixium.py --variant=a --build
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=a --build"
 
 gateware-b: df-check
-	$(PYTHON) trixium.py --variant=b --build
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=b --build"
 
 gateware-c: df-check
-	$(PYTHON) trixium.py --variant=c --build
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=c --build"
 
 .PHONY: load-a load-b load-c
 load-a:
-	$(PYTHON) trixium.py --variant=a --load
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=a --load"
 
 load-b:
-	$(PYTHON) trixium.py --variant=b --load
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=b --load"
 
 load-c:
-	$(PYTHON) trixium.py --variant=c --load
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=c --load"
 
 # Software ---------------------------------------------------------------------------------------
 

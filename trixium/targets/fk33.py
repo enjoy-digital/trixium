@@ -51,6 +51,11 @@ class BonsaiSoC(BaseSoC):
             **kwargs)
         self.add_constant("BONSAI_VARIANT", ord(variant))
 
+        # The upgraded HBM IP (rev 16, Vivado 2024.1) embeds HBM monitor debug cores; the
+        # auto-inserted debug hub needs its clock connected explicitly or opt_design errors
+        # with "The debug port 'dbg_hub/clk' has 1 unconnected channels".
+        self.platform.add_platform_command("connect_debug_port dbg_hub/clk [get_nets apb_clk]")
+
         # Variant a: HBM bandwidth BIST on channels 1..31 (added once gateware/bist.py lands).
         # Variant b: + MatVec engine (host-driven).
         # Variant c: + Vector unit/KV/Top-K + firmware token loop.
