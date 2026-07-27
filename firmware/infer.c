@@ -395,6 +395,13 @@ int infer_init(void)
     H = model_header();
     if (H->magic != BONS_MAGIC)
         return -1;
+#ifdef BONSAI_N_CHANNELS
+    if (H->n_channels != BONSAI_N_CHANNELS) {
+        printf("infer: image channels (%lu) != engine channels (%u)\n",
+               (unsigned long)H->n_channels, BONSAI_N_CHANNELS);
+        return -3;
+    }
+#endif
     n_ch     = H->n_channels;
     n_layer  = H->n_layer;
     n_embd   = H->n_embd;
