@@ -1,0 +1,141 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+"""BonsaiAXIReader: native AXI4 burst reader (the weight streamer front-end).
+
+Takes {addr, len} commands (beat-aligned byte address, length in 256-bit beats), splits them
+into INCR bursts (64 beats by default, never crossing a 4 KB boundary), keeps several bursts
+outstanding with credit-based reservation of the output FIFO (so R data is never
+back-pressured by us at the AXI port when credits were granted), and streams beats out with
+`last` on the final beat of each command. Single ARID (in-order R data).
+
+Perf counters (free-running Signals, aggregated at the engine level): total beats delivered,
+AR stall cycles (command issued but not accepted), R stall cycles (R valid, FIFO not ready -
+should stay 0 thanks to crediting).
+"""
+
+from migen import *
+
+from litex.gen import *
+
+from litex.soc.interconnect import stream
+from litex.soc.interconnect.axi import BURST_INCR
+
+from trixium.layout import BEAT_BYTES
+
+# BonsaiAXIReader ----------------------------------------------------------------------------------
+
+class BonsaiAXIReader(LiteXModule):
+    def __init__(self, axi, burst_beats=64, fifo_depth=512):
+        assert axi.data_width == 256
+        self.sink   = sink   = stream.Endpoint([("addr", axi.address_width), ("len", 24)])
+        self.source = source = stream.Endpoint([("data", 256)])
+
+        self.total_beats = Signal(32)
+        self.ar_stalls   = Signal(32)
+        self.r_stalls    = Signal(32)
+
+        # # #
+
+        beat_shift = log2_int(BEAT_BYTES)
+
+        # Burst splitter ----------------------------------------------------------------------
+        cur_addr   = Signal(axi.address_width)
+        beats_left = Signal(24)
+        active     = Signal()
+
+        self.comb += sink.ready.eq(~active)
+        self.sync += [
+            If(sink.valid & sink.ready,
+                cur_addr.eq(sink.addr),
+                beats_left.eq(sink.len),
+                active.eq(sink.len != 0),
+            )
+        ]
+
+        # Burst length: min(burst_beats, beats_left, beats to next 4 KB boundary).
+        boundary_beats = Signal(8) # 1..128 beats to the 4 KB boundary; 0 encodes 128.
+        b_tmp          = Signal(25)
+        burst_len      = Signal(8) # 1..burst_beats, 0 encodes 128 in b_tmp path (never here).
+        self.comb += [
+            boundary_beats.eq((4096 - (cur_addr & 4095)) >> beat_shift),
+            If(beats_left < burst_beats,
+                b_tmp.eq(beats_left),
+            ).Else(
+                b_tmp.eq(burst_beats),
+            ),
+            # boundary_beats == 0 means the full 128-beat page is ahead (addr 4 KB-aligned).
+            If((boundary_beats != 0) & (boundary_beats < b_tmp),
+                burst_len.eq(boundary_beats),
+            ).Else(
+                burst_len.eq(b_tmp),
+            ),
+        ]
+
+        # Credit-based FIFO reservation.
+        reserved  = Signal(max=2*fifo_depth)
+        can_issue = Signal()
+        self.comb += can_issue.eq(active & (reserved <= (fifo_depth - burst_len)))
+
+        # Per-burst info (last burst of command?).
+        info = stream.SyncFIFO([("cmd_last", 1)], 16)
+        self.submodules += info
+
+        self.comb += [
+            axi.ar.valid.eq(can_issue & info.sink.ready),
+            axi.ar.addr.eq(cur_addr),
+            axi.ar.len.eq(burst_len - 1),
+            axi.ar.size.eq(beat_shift), # 32 bytes/beat.
+            axi.ar.burst.eq(BURST_INCR),
+            axi.ar.id.eq(0),
+            info.sink.valid.eq(axi.ar.valid & axi.ar.ready),
+            info.sink.cmd_last.eq(beats_left == burst_len),
+        ]
+        self.sync += [
+            If(axi.ar.valid & axi.ar.ready,
+                cur_addr.eq(cur_addr + (burst_len << beat_shift)),
+                beats_left.eq(beats_left - burst_len),
+                If(beats_left == burst_len,
+                    active.eq(0),
+                )
+            )
+        ]
+
+        # Data FIFO ---------------------------------------------------------------------------
+        fifo = stream.SyncFIFO([("data", 256)], fifo_depth, buffered=True)
+        self.submodules += fifo
+
+        self.comb += [
+            fifo.sink.valid.eq(axi.r.valid),
+            axi.r.ready.eq(fifo.sink.ready),
+            fifo.sink.data.eq(axi.r.data),
+            # Command-last: burst-last AND this burst is the command's final burst.
+            fifo.sink.last.eq(axi.r.last & info.source.cmd_last),
+            info.source.ready.eq(axi.r.valid & axi.r.ready & axi.r.last),
+            fifo.source.connect(source),
+        ]
+
+        # Credits: +burst_len on AR fire, -1 per beat delivered to the consumer.
+        ar_fire  = Signal()
+        out_fire = Signal()
+        self.comb += [
+            ar_fire.eq(axi.ar.valid & axi.ar.ready),
+            out_fire.eq(source.valid & source.ready),
+        ]
+        self.sync += [
+            reserved.eq(reserved + Mux(ar_fire, burst_len, 0) - Mux(out_fire, 1, 0)),
+        ]
+
+        # Perf counters -----------------------------------------------------------------------
+        self.sync += [
+            If(out_fire,                     self.total_beats.eq(self.total_beats + 1)),
+            If(axi.ar.valid & ~axi.ar.ready, self.ar_stalls.eq(self.ar_stalls + 1)),
+            If(axi.r.valid & ~axi.r.ready,   self.r_stalls.eq(self.r_stalls + 1)),
+        ]
+
+        # Idle indication (all issued data consumed, no command in flight).
+        self.idle = Signal()
+        self.comb += self.idle.eq(~active & (reserved == 0) & ~source.valid)
