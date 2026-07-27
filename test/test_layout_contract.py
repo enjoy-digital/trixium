@@ -24,12 +24,14 @@ def test_beat_math():
     assert layout.scale_beats(2048, layout.KIND_Q8) == 4        # 64 scales -> 128B -> 4 beats.
 
 def test_model_dims_divide():
-    # Every sharded tensor's rows must divide the max channel count, every ternary K the group.
+    # Every sharded tensor's rows must divide the max channel count (vocab via padding),
+    # every ternary K the 128 group.
     for cfg in (BONSAI_1P7B, BONSAI_8B):
-        for rows in (cfg.q_dim, cfg.kv_dim, cfg.n_embd, cfg.ffn_dim, cfg.vocab):
+        for rows in (cfg.q_dim, cfg.kv_dim, cfg.n_embd, cfg.ffn_dim, cfg.vocab_padded(32)):
             assert rows % 32 == 0, (cfg.name, rows)
         for cols in (cfg.n_embd, cfg.q_dim, cfg.ffn_dim):
             assert cols % layout.GROUP_TERNARY == 0, (cfg.name, cols)
+    assert BONSAI_1P7B.vocab_padded(32) == 151680 # 151669 padded.
     cfg = BONSAI_TINY
     for rows in (cfg.q_dim, cfg.kv_dim, cfg.n_embd, cfg.ffn_dim, cfg.vocab):
         assert rows % 2 == 0
@@ -79,7 +81,7 @@ def test_tiny_image_roundtrip(tmp_path):
     p1 = reader.channel_payload(1)
     assert len(p0) == len(p1) == reader.header["payload_beats"]*layout.BEAT_BYTES
     # Sharded tensors differ between channels; replicated ones don't.
-    assert not np.array_equal(reader.tensor_channel_bytes("output.weight", 0),
-                              reader.tensor_channel_bytes("output.weight", 1))
+    assert not np.array_equal(reader.tensor_channel_bytes("token_embd.weight", 0),
+                              reader.tensor_channel_bytes("token_embd.weight", 1))
     assert np.array_equal(reader.tensor_channel_bytes("blk.0.attn_norm.weight", 0),
                           reader.tensor_channel_bytes("blk.0.attn_norm.weight", 1))

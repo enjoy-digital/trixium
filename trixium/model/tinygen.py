@@ -43,9 +43,11 @@ def _norm(rng, name, role, layer, cols):
     return TensorSpec(name, role, layer, KIND_F32, 1, cols, values=values, flags=FLAG_REPLICATED)
 
 def make_tiny_tensors(cfg, seed=1234):
+    # Mirrors the real Ternary-Bonsai GGUF inventory: ternary everything (embeddings included,
+    # tied - no separate output.weight) + F32 norm vectors.
     rng = np.random.default_rng(seed)
     t   = []
-    t.append(_q8(rng, "token_embd.weight", ROLE_TOK_EMB, 0, cfg.vocab, cfg.n_embd))
+    t.append(_ternary(rng, "token_embd.weight", ROLE_TOK_EMB, 0, cfg.vocab, cfg.n_embd))
     for l in range(cfg.n_layer):
         p = f"blk.{l}."
         t.append(_norm   (rng, p+"attn_norm.weight",   ROLE_ATTN_NORM,   l, cfg.n_embd))
@@ -59,8 +61,8 @@ def make_tiny_tensors(cfg, seed=1234):
         t.append(_ternary(rng, p+"ffn_gate.weight",    ROLE_FFN_GATE,    l, cfg.ffn_dim, cfg.n_embd))
         t.append(_ternary(rng, p+"ffn_up.weight",      ROLE_FFN_UP,      l, cfg.ffn_dim, cfg.n_embd))
         t.append(_ternary(rng, p+"ffn_down.weight",    ROLE_FFN_DOWN,    l, cfg.n_embd,  cfg.ffn_dim))
-    t.append(_norm   (rng, "output_norm.weight", ROLE_OUT_NORM, 0, cfg.n_embd))
-    t.append(_ternary(rng, "output.weight",      ROLE_LM_HEAD,  0, cfg.vocab, cfg.n_embd))
+    t.append(_norm(rng, "output_norm.weight", ROLE_OUT_NORM, 0, cfg.n_embd))
+    # Tied embeddings: the LM head matvec streams token_embd.weight.
     return t
 
 def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY):
