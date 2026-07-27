@@ -100,11 +100,40 @@ class BonsaiSoC(SoCCore):
             pads         = platform.request_all("user_led"),
             sys_clk_freq = sys_clk_freq)
 
-        # Variant a: HBM bandwidth BIST on channels 1..31 (added once gateware/bist.py lands).
-        # Variant b: + MatVec engine (host-driven).
-        # Variant c: + Vector unit/KV/Top-K + firmware token loop.
+        # Bonsai -----------------------------------------------------------------------------------
+        # Channel budget: ch0 = CPU main_ram (AXI-Lite window); engine/loader own ch1..N;
+        # BIST muxes over the remaining channels.
+        engine_channels = {"a": 0, "b": 4, "c": 8}[variant]
+        engine_axis     = [hbm.axi[1 + i] for i in range(engine_channels)]
+        bist_channels   = list(range(1 + engine_channels, 32))
+
         if variant in ["b", "c"]:
-            raise NotImplementedError(f"variant {variant} not implemented yet (engine gateware WIP)")
+            from trixium.gateware.scratchpad import BonsaiScratchpad
+            from trixium.gateware.matvec import BonsaiMatVecEngine
+            from trixium.gateware.csr_front import BonsaiEngineCSR
+            from trixium.gateware.loader import BonsaiHBMLoader
+            from litex.soc.integration.soc import SoCRegion
+
+            self.scratchpad = BonsaiScratchpad(size=256*1024)
+            self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis)
+            self.engine_csr = BonsaiEngineCSR(self.engine)
+            self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)
+
+            # Scratchpad on the SoC bus (uncached: shared with the engine).
+            self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
+                SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
+
+            # Weight upload: PCIe DMA0 host->device stream feeds the loader.
+            self.comb += [
+                self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"}),
+            ]
+
+        if variant == "c":
+            raise NotImplementedError("variant c: vector unit/KV/top-k WIP")
+
+        # Per-channel HBM bandwidth BIST (channels not owned by the engine).
+        from trixium.gateware.bist import BonsaiHBMBIST
+        self.bist = BonsaiHBMBIST(hbm.axi, channels=bist_channels)
 
 # Build --------------------------------------------------------------------------------------------
 

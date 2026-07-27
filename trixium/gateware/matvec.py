@@ -34,7 +34,7 @@ class BonsaiMatVecEngine(LiteXModule):
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
-            ("kind",   2),   # 0: ternary, 1: q8.
+            ("kind",   2),   # 0: ternary, 1: q8, 2: fetch (HBM -> scratchpad, one channel).
             ("rows",   16),  # Rows per channel.
             ("cols",   14),  # K.
             ("wbase",  32),  # Per-channel weight byte address (beat-aligned).
@@ -45,6 +45,7 @@ class BonsaiMatVecEngine(LiteXModule):
             ("rshift", 6),   # R.
             ("xsrc",   24),  # x8 source byte address in scratchpad (32B aligned).
             ("dst",    24),  # Result destination byte address in scratchpad (4B aligned).
+            ("chan",   5),   # Fetch: source channel index.
         ])
         self.busy  = Signal()
         self.done  = Signal() # Pulse.
@@ -53,24 +54,42 @@ class BonsaiMatVecEngine(LiteXModule):
         # # #
 
         # Channels ----------------------------------------------------------------------------
+        fetch_mode = Signal() # kind == 2 for the latched command.
+        fetch_chan = Signal(5)
+
         self.readers = []
         self.pipes   = []
+        fetch_valids = []
+        fetch_datas  = []
         for i, axi in enumerate(hbm_axis):
             reader = BonsaiAXIReader(axi)
             pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups)
             setattr(self.submodules, f"reader{i}", reader)
             setattr(self.submodules, f"pipe{i}",   pipe)
-            self.comb += reader.source.connect(pipe.sink, omit={"last"})
+            is_fetch = Signal()
+            self.comb += [
+                is_fetch.eq(fetch_mode & (fetch_chan == i)),
+                # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
+                pipe.sink.valid.eq(reader.source.valid & ~is_fetch),
+                pipe.sink.data.eq(reader.source.data),
+                reader.source.ready.eq(1), # Pipe always accepts; fetch path always accepts.
+            ]
+            fetch_valids.append(reader.source.valid & is_fetch)
+            fetch_datas.append(reader.source.data)
             self.readers.append(reader)
             self.pipes.append(pipe)
 
         # Latched command ---------------------------------------------------------------------
         cmd_r = {}
         for name in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-                     "bias", "rshift", "xsrc", "dst"):
+                     "bias", "rshift", "xsrc", "dst", "chan"):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
+        self.comb += [
+            fetch_mode.eq(cmd_r["kind"] == 2),
+            fetch_chan.eq(cmd_r["chan"]),
+        ]
 
         # Broadcast op params to pipes.
         for pipe in self.pipes:
@@ -114,13 +133,29 @@ class BonsaiMatVecEngine(LiteXModule):
         ]
         for i, pipe in enumerate(self.pipes):
             self.comb += pipe.source.ready.eq(rr.grant == i)
-        # Write granted result: scratchpad int32 slot = dst/4 + grant*rows + row.
+
+        # Fetch datapath: selected channel's beats -> scratchpad (256-bit writes).
+        fetch_valid = Signal()
+        fetch_data  = Signal(256)
+        fetch_cnt   = Signal(24)
+        self.comb += [
+            fetch_valid.eq(reduce_or(fetch_valids)),
+            fetch_data.eq(Array(fetch_datas)[fetch_chan]),
+        ]
+
+        # Scratchpad write port: fetch beats or gathered int32 results.
         slot = Signal(24)
         self.comb += [
             slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["rows"] + grant_row),
-            scratchpad.gather.adr.eq(slot[3:]),
-            scratchpad.gather.dat_w.eq(Replicate(grant_data, 8)),
-            scratchpad.gather.we.eq(Mux(grant_valid, 1 << slot[:3], 0)),
+            If(fetch_mode,
+                scratchpad.gather.adr.eq((cmd_r["dst"] >> 5) + fetch_cnt),
+                scratchpad.gather.dat_w.eq(fetch_data),
+                scratchpad.gather.we.eq(Mux(fetch_valid, 0xFF, 0)),
+            ).Else(
+                scratchpad.gather.adr.eq(slot[3:]),
+                scratchpad.gather.dat_w.eq(Replicate(grant_data, 8)),
+                scratchpad.gather.we.eq(Mux(grant_valid, 1 << slot[:3], 0)),
+            )
         ]
 
         # Control FSM -------------------------------------------------------------------------
@@ -139,7 +174,11 @@ class BonsaiMatVecEngine(LiteXModule):
         )
         fsm.act("START",
             start_pulse.eq(1),
-            NextState("FILL"),
+            If(fetch_mode,
+                NextState("ISSUE"), # No x-fill for fetches.
+            ).Else(
+                NextState("FILL"),
+            )
         )
         fsm.act("FILL",
             self.busy.eq(1),
@@ -154,7 +193,8 @@ class BonsaiMatVecEngine(LiteXModule):
         )
         fsm.act("ISSUE",
             self.busy.eq(1),
-            *[r.sink.valid.eq(1) for r in self.readers],
+            *[r.sink.valid.eq(~fetch_mode | (fetch_chan == i))
+              for i, r in enumerate(self.readers)],
             *[r.sink.addr.eq(cmd_r["wbase"]) for r in self.readers],
             *[r.sink.len.eq(cmd_r["wlen"]) for r in self.readers],
             # All readers are idle here: they accept together.
@@ -164,7 +204,9 @@ class BonsaiMatVecEngine(LiteXModule):
         )
         fsm.act("RUN",
             self.busy.eq(1),
-            If(result_cnt == (cmd_r["rows"]*self.n_channels),
+            If(Mux(fetch_mode,
+                   fetch_cnt == cmd_r["wlen"],
+                   result_cnt == (cmd_r["rows"]*self.n_channels)),
                 self.done.eq(1),
                 NextState("IDLE"),
             )
@@ -176,8 +218,13 @@ class BonsaiMatVecEngine(LiteXModule):
             fill_beat_d.eq(fill_beat),
             If(start_pulse,
                 result_cnt.eq(0),
+                fetch_cnt.eq(0),
             ).Elif(scratchpad.gather.we != 0,
-                result_cnt.eq(result_cnt + 1),
+                If(fetch_mode,
+                    fetch_cnt.eq(fetch_cnt + 1),
+                ).Else(
+                    result_cnt.eq(result_cnt + 1),
+                )
             ),
         ]
 

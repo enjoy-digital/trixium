@@ -17,6 +17,8 @@ from migen import *
 
 from litex.gen import *
 
+from litex.soc.interconnect import wishbone
+
 # BonsaiScratchpad ---------------------------------------------------------------------------------
 
 class BonsaiScratchpad(LiteXModule):
@@ -37,6 +39,32 @@ class BonsaiScratchpad(LiteXModule):
         self.gather = mem.get_port(write_capable=True, we_granularity=32)
         self.specials += self.gather
 
-    def get_bus_port(self):
-        """Extra RW port for SoC bus bridging (wishbone.SRAM(self.mem))."""
-        return self.mem
+    def add_wishbone_port(self):
+        """32-bit Wishbone slave onto the 256-bit memory (CPU/host/JTAG access)."""
+        bus  = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+        port = self.mem.get_port(write_capable=True, we_granularity=8)
+        self.specials += port
+
+        sel = Signal(3) # 32-bit slice within the 256-bit word.
+        self.comb += [
+            port.adr.eq(bus.adr[3:]),
+            sel.eq(bus.adr[:3]),
+            port.dat_w.eq(Replicate(bus.dat_w, 8)),
+            bus.dat_r.eq(port.dat_r >> (sel*32)),
+        ]
+        self.bus_fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            If(bus.cyc & bus.stb,
+                If(bus.we,
+                    port.we.eq(bus.sel << (sel*4)),
+                    bus.ack.eq(1),
+                ).Else(
+                    NextState("READ"), # One cycle of read latency.
+                )
+            )
+        )
+        fsm.act("READ",
+            bus.ack.eq(1),
+            NextState("IDLE"),
+        )
+        return bus
