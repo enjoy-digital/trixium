@@ -120,9 +120,15 @@ static void sptest(void)
     int errors = 0;
     for (uint32_t i = 0; i < 64; i++)
         sp[i] = i*0x9E3779B1u;
-    for (uint32_t i = 0; i < 64; i++)
-        if (sp[i] != i*0x9E3779B1u)
+    for (uint32_t i = 0; i < 64; i++) {
+        uint32_t got = sp[i], exp = i*0x9E3779B1u;
+        if (got != exp) {
+            if (errors < 4)
+                printf("  sp[%lu]: got %08lx expect %08lx\n",
+                       (unsigned long)i, (unsigned long)got, (unsigned long)exp);
             errors++;
+        }
+    }
     printf("SPTEST %s (%d errors)\n", errors ? "FAIL" : "OK", errors);
 }
 

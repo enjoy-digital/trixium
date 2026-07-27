@@ -54,6 +54,9 @@ class BonsaiHBMBIST(LiteXModule):
 
         chan = self.chan.storage
 
+        # R return-path register stage (declared early: the demux below gates hbm.r.ready on it).
+        r_advance = Signal()
+
         # Outward demux: request channels driven per BIST channel, valid/ready gated by select.
         for i in channels:
             hbm = hbm_axis[i]
@@ -66,7 +69,7 @@ class BonsaiHBMBIST(LiteXModule):
                 hbm.ar.size.eq(axi.ar.size),
                 hbm.ar.burst.eq(axi.ar.burst),
                 hbm.ar.id.eq(axi.ar.id),
-                hbm.r.ready.eq(axi.r.ready & sel),
+                hbm.r.ready.eq(r_advance & sel), # Acceptance into the R register stage.
                 hbm.aw.valid.eq(axi.aw.valid & sel),
                 hbm.aw.addr.eq(axi.aw.addr),
                 hbm.aw.len.eq(axi.aw.len),
@@ -84,12 +87,34 @@ class BonsaiHBMBIST(LiteXModule):
         n = len(hbm_axis)
         self.comb += [
             axi.ar.ready.eq(Array([hbm_axis[i].ar.ready for i in range(n)])[chan]),
-            axi.r.valid.eq(Array([hbm_axis[i].r.valid   for i in range(n)])[chan]),
-            axi.r.data.eq(Array([hbm_axis[i].r.data     for i in range(n)])[chan]),
-            axi.r.last.eq(Array([hbm_axis[i].r.last     for i in range(n)])[chan]),
             axi.aw.ready.eq(Array([hbm_axis[i].aw.ready for i in range(n)])[chan]),
             axi.w.ready.eq(Array([hbm_axis[i].w.ready   for i in range(n)])[chan]),
             axi.b.valid.eq(Array([hbm_axis[i].b.valid   for i in range(n)])[chan]),
+        ]
+
+        # The R return path (256-bit 32:1 mux into the reader FIFO) needs a pipeline register
+        # stage to close timing at 225 MHz: mux -> reg -> reader.
+        r_valid_m = Signal()
+        r_data_m  = Signal(256)
+        r_last_m  = Signal()
+        r_v       = Signal()
+        r_d       = Signal(256)
+        r_l       = Signal()
+        self.comb += [
+            r_valid_m.eq(Array([hbm_axis[i].r.valid for i in range(n)])[chan]),
+            r_data_m.eq(Array([hbm_axis[i].r.data   for i in range(n)])[chan]),
+            r_last_m.eq(Array([hbm_axis[i].r.last   for i in range(n)])[chan]),
+            r_advance.eq(~r_v | axi.r.ready),
+            axi.r.valid.eq(r_v),
+            axi.r.data.eq(r_d),
+            axi.r.last.eq(r_l),
+        ]
+        self.sync += [
+            If(r_advance,
+                r_v.eq(r_valid_m),
+                r_d.eq(r_data_m),
+                r_l.eq(r_last_m),
+            )
         ]
 
         # Pattern pipeline: pat register always holds hash(idx); the multiply feeds a register

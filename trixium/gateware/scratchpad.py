@@ -43,23 +43,32 @@ class BonsaiScratchpad(LiteXModule):
         self.specials += self.gather
 
     def add_wishbone_port(self):
-        """32-bit Wishbone slave onto the 256-bit memory (CPU/host/JTAG access)."""
-        bus  = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+        """32-bit Wishbone slave onto the 256-bit memory (CPU/host/JTAG access).
+
+        Declared with byte addressing (what the SoC bus hands slaves in current LiteX -
+        verified empirically in simulation: adr LSBs advance by 4 per 32-bit word)."""
+        bus  = wishbone.Interface(data_width=32, address_width=32, addressing="byte")
         port = self.mem.get_port(write_capable=True, we_granularity=8)
         self.specials += port
 
         sel = Signal(3) # 32-bit slice within the 256-bit word.
+        we  = Signal()
         self.comb += [
-            port.adr.eq(bus.adr[3:]),
-            sel.eq(bus.adr[:3]),
+            port.adr.eq(bus.adr[5:]),  # 32-byte beat index.
+            sel.eq(bus.adr[2:5]),      # 32-bit word within the beat.
             port.dat_w.eq(Replicate(bus.dat_w, 8)),
-            bus.dat_r.eq(port.dat_r >> (sel*32)),
+            # Constant-slice muxes: variable shift amounts computed with '*' are self-determined
+            # (truncated) in the emitted Verilog - never use them.
+            Case(sel, {i: bus.dat_r.eq(port.dat_r[32*i:32*(i+1)]) for i in range(8)}),
+            If(we,
+                Case(sel, {i: port.we.eq(bus.sel << (4*i)) for i in range(8)}),
+            ),
         ]
         self.bus_fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(bus.cyc & bus.stb,
                 If(bus.we,
-                    port.we.eq(bus.sel << (sel*4)),
+                    we.eq(1),
                     NextState("ACK"), # Registered ack (comb ack races pipelined masters).
                 ).Else(
                     NextState("READ"), # One cycle of read latency.

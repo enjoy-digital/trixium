@@ -258,31 +258,42 @@ class BonsaiChannelPipe(LiteXModule):
         row_last2 = _delay(self, row_last1, n_tree + 1)
         scale2    = _delay(self, scale_f16, n_tree)
 
-        # fp16 decompose (comb) at the tree output.
-        f_sign = Signal()
-        f_exp  = Signal(5)
-        f_frac = Signal(10)
-        m11u   = Signal(11)
-        m11    = Signal((13, True))
-        e16    = Signal((7, True))
+        # fp16 decompose (comb) at the tree output. All arithmetic goes through dedicated
+        # signed intermediates: Migen's Verilog emission computes sub-expressions at
+        # self-determined widths (e.g. `f_exp - 25` at 5 bits inside a concat) and mixes
+        # signed/unsigned operands into unsigned expressions - both silently corrupt values.
+        f_sign  = Signal()
+        f_exp   = Signal(5)
+        f_frac  = Signal(10)
+        m11u    = Signal(11)
+        m11s    = Signal((12, True))
+        m11     = Signal((13, True))
+        f_exp_s = Signal((7, True))
+        e16n    = Signal((7, True))
+        e16     = Signal((7, True))
         self.comb += [
             f_sign.eq(scale2[15]),
             f_exp.eq(scale2[10:15]),
             f_frac.eq(scale2[:10]),
             m11u.eq(Mux(f_exp != 0, Cat(f_frac, 1), Cat(f_frac, 0))),
-            m11.eq(Mux(f_sign, -m11u, m11u)),
-            e16.eq(Mux(f_exp != 0, f_exp - 25, -24)),
+            m11s.eq(m11u),                # Zero-extend into a signed signal.
+            m11.eq(Mux(f_sign, -m11s, m11s)),
+            f_exp_s.eq(f_exp),            # Zero-extend into a signed signal.
+            e16n.eq(f_exp_s - 25),        # Full-width signed subtract (dedicated assign).
+            e16.eq(Mux(f_exp != 0, e16n, -24)),
         ]
 
         # T+1: product (DSP). ---------------------------------------------------------------------
         prod   = Signal((34, True))
+        bias_s = Signal((8, True)) # Signed copy of B: signed-only arithmetic for sh_r.
         sh_r   = Signal((8, True)) # 12 - (e16 + B) in [0, 44].
         v3     = Signal()
         row3   = Signal(16)
         rlast3 = Signal()
+        self.comb += bias_s.eq(self.bias)
         self.sync += [
             prod.eq(gs*m11),
-            sh_r.eq(12 - e16 - self.bias),
+            sh_r.eq(12 - e16 - bias_s),
             v3.eq(v2),
             row3.eq(row2),
             rlast3.eq(row_last2),
