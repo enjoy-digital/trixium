@@ -111,6 +111,7 @@ static void help(void)
     puts("TriXium firmware");
     puts("help            - this message");
     puts("info            - model info (BONS header)");
+    puts("hdrload         - copy BONS header+table staged by bonsai_load to CPU memory");
     puts("sptest          - scratchpad bus read/write test");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
@@ -119,6 +120,37 @@ static void help(void)
 static void emit_token(int tok)
 {
     printf(" %d", tok);
+}
+
+// Copy the BONS header+table from the HBM staging area (engine channel 0, uploaded there by
+// bonsai_load) into the CPU-visible header location, then re-init inference.
+#define HDR_STAGING (BONSAI_CHAN_WEIGHT_BASE - 0x100000)
+static void hdrload(void)
+{
+    // First fetch just the header to learn the table size.
+    engine_fetch(0, HDR_STAGING, 128, 0xC000);
+    volatile struct bons_header *sh =
+        (volatile struct bons_header *)(SCRATCHPAD_BASE + 0xC000);
+    if (sh->magic != BONS_MAGIC) {
+        printf("hdrload: no BONS header at staging (magic %08lx)\n",
+               (unsigned long)sh->magic);
+        return;
+    }
+    uint32_t bytes = sh->payload_offset;
+    uint8_t *dst   = (uint8_t *)BONSAI_HDR_ADDR;
+    uint32_t off   = 0;
+    while (off < bytes) {
+        uint32_t chunk = bytes - off > 0x10000 ? 0x10000 : bytes - off; // 64 KB chunks.
+        engine_fetch(0, HDR_STAGING + off, chunk/32, 0xC000);
+        volatile uint32_t *src = (volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000);
+        for (uint32_t i = 0; i < chunk/4; i++)
+            ((uint32_t *)(dst + off))[i] = src[i];
+        off += chunk;
+    }
+    printf("hdrload: %lu KB copied\n", (unsigned long)(bytes/1024));
+    model_info();
+    if (infer_init() == 0)
+        puts("hdrload: inference ready");
 }
 
 static int parse_int(const char *s)
@@ -223,6 +255,8 @@ static void console_service(void)
         selftest();
     else if (strcmp(token, "gen") == 0)
         gen_cmd(str);
+    else if (strcmp(token, "hdrload") == 0)
+        hdrload();
     else if (strlen(token))
         puts("unknown command");
     printf("bonsai> ");
