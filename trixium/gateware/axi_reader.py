@@ -57,11 +57,13 @@ class BonsaiAXIReader(LiteXModule):
         ]
 
         # Burst length: min(burst_beats, beats_left, beats to next 4 KB boundary).
-        boundary_beats = Signal(8) # 1..128 beats to the 4 KB boundary; 0 encodes 128.
+        boundary_full  = Signal(13) # Full-width intermediate: Migen emits narrow-context
+        boundary_beats = Signal(8)  # arithmetic inside shifts otherwise. 0 encodes 128.
         b_tmp          = Signal(25)
         burst_len      = Signal(8) # 1..burst_beats, 0 encodes 128 in b_tmp path (never here).
         self.comb += [
-            boundary_beats.eq((4096 - (cur_addr & 4095)) >> beat_shift),
+            boundary_full.eq(4096 - (cur_addr & 4095)),
+            boundary_beats.eq(boundary_full >> beat_shift),
             If(beats_left < burst_beats,
                 b_tmp.eq(beats_left),
             ).Else(

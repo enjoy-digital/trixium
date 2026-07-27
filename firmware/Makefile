@@ -11,7 +11,7 @@ BUILD_DIR ?= ../build/sim
 include $(BUILD_DIR)/software/include/generated/variables.mak
 include $(SOC_DIRECTORY)/software/common.mak
 
-OBJECTS = crt0.o main.o engine.o model.o
+OBJECTS = crt0.o main.o engine.o model.o infer.o
 
 COMMA = ,
 REGULAR_LIBS = $(filter-out $(ALWAYS_LINK_LIBS),$(LIBS))
@@ -31,6 +31,7 @@ bonsai.elf: $(OBJECTS)
 		-Wl,--start-group \
 		$(REGULAR_LIBS:lib%=-l%) \
 		$(ALWAYS_LINK_LIBFLAGS) \
+		$$($(TARGET_PREFIX)gcc -march=rv32im -mabi=ilp32 -print-file-name=libm.a) \
 		-Wl,--end-group \
 		-Wl,--gc-sections \
 		-Wl,-Map,$@.map

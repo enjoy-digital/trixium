@@ -20,6 +20,7 @@
 #include "bons.h"
 #include "engine.h"
 #include "model.h"
+#include "infer.h"
 
 /*-----------------------------------------------------------------------*/
 /* Console                                                               */
@@ -108,10 +109,45 @@ static void fill_x_pattern(uint32_t xsrc, uint32_t n)
 static void help(void)
 {
     puts("TriXium firmware");
-    puts("help       - this message");
-    puts("info       - model info (BONS header)");
-    puts("sptest     - scratchpad bus read/write test");
-    puts("selftest   - engine self-tests (matvec + fetch checksums)");
+    puts("help            - this message");
+    puts("info            - model info (BONS header)");
+    puts("sptest          - scratchpad bus read/write test");
+    puts("selftest        - engine self-tests (matvec + fetch checksums)");
+    puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
+}
+
+static void emit_token(int tok)
+{
+    printf(" %d", tok);
+}
+
+static int parse_int(const char *s)
+{
+    int v = 0;
+    while (*s >= '0' && *s <= '9')
+        v = v*10 + (*s++ - '0');
+    return v;
+}
+
+static void gen_cmd(char *args)
+{
+    static int prompt[64];
+    char *tok = get_token(&args);
+    int n = parse_int(tok);
+    int np = 0;
+    while (np < 64) {
+        tok = get_token(&args);
+        if (*tok == 0)
+            break;
+        prompt[np++] = parse_int(tok);
+    }
+    if (n <= 0 || np == 0) {
+        puts("usage: gen n id id ...");
+        return;
+    }
+    printf("GEN:");
+    infer_generate(prompt, np, n, emit_token);
+    puts("\nGEN DONE");
 }
 
 static void sptest(void)
@@ -151,6 +187,10 @@ static void selftest(void)
     model_matvec(e, xsrc, dst);
     uint32_t n = e->rows*4; // rows int32 results (all channels).
     uint32_t csum = fnv1a((volatile uint8_t *)(SCRATCHPAD_BASE + dst), n);
+    volatile uint32_t *res = (volatile uint32_t *)(SCRATCHPAD_BASE + dst);
+    printf("MATVEC R0=%08lx R1=%08lx R64=%08lx R128=%08lx R255=%08lx\n",
+           (unsigned long)res[0], (unsigned long)res[1], (unsigned long)res[64],
+           (unsigned long)res[128], (unsigned long)res[e->rows - 1]);
     printf("MATVEC CSUM=%08lx\n", (unsigned long)csum);
 
     // 2. Fetch the first 8 beats of channel 0's payload into the scratchpad.
@@ -181,6 +221,8 @@ static void console_service(void)
         sptest();
     else if (strcmp(token, "selftest") == 0)
         selftest();
+    else if (strcmp(token, "gen") == 0)
+        gen_cmd(str);
     else if (strlen(token))
         puts("unknown command");
     printf("bonsai> ");
@@ -198,6 +240,13 @@ int main(void)
     model_info();
     sptest();
     selftest();
+    if (infer_init() == 0) {
+        // Boot generation demo (deterministic; checked by the sim harness).
+        static const int prompt[3] = {1, 2, 3};
+        printf("GEN:");
+        infer_generate(prompt, 3, 4, emit_token);
+        puts("\nGEN DONE");
+    }
     puts("BONSAI-READY");
     printf("bonsai> ");
 

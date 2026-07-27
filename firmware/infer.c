@@ -21,6 +21,11 @@
 #include "model.h"
 #include "infer.h"
 
+// newlib-libm compatibility: the toolchain libm.a references __errno, absent from the
+// picolibc environment LiteX links against.
+static int __errno_storage;
+int *__errno(void) { return &__errno_storage; }
+
 // Scratchpad layout (byte offsets).
 #define SP_X    0x00000 // Quantized activations (engine matvec input).
 #define SP_Y    0x08000 // Engine results (int32).

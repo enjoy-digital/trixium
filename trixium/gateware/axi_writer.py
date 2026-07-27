@@ -46,11 +46,13 @@ class BonsaiAXIWriter(LiteXModule):
             )
         ]
 
+        boundary_full  = Signal(13) # Full-width intermediate (see axi_reader.py).
         boundary_beats = Signal(8)
         b_tmp          = Signal(25)
         burst_len      = Signal(8)
         self.comb += [
-            boundary_beats.eq((4096 - (cur_addr & 4095)) >> beat_shift),
+            boundary_full.eq(4096 - (cur_addr & 4095)),
+            boundary_beats.eq(boundary_full >> beat_shift),
             If(beats_left < burst_beats,
                 b_tmp.eq(beats_left),
             ).Else(
