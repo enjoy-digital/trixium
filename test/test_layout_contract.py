@@ -51,13 +51,15 @@ def test_header_roundtrip():
 
 def test_entry_roundtrip():
     e = layout.pack_entry(layout.ROLE_FFN_GATE, layout.KIND_TERNARY, 0, 5, 512, 256,
-                          123, 456, 0xCAFEBABE, "blk.5.ffn_gate.weight")
+                          123, 456, 0xCAFEBABE, bias=26, rshift=7,
+                          name="blk.5.ffn_gate.weight")
     assert len(e) == layout.BONS_ENTRY_SIZE
     d = layout.unpack_entry(e)
     assert d["role"] == layout.ROLE_FFN_GATE
     assert d["layer"] == 5
     assert d["rows"] == 512 and d["cols"] == 256
     assert d["chan_base_beats"] == 123 and d["chan_len_beats"] == 456
+    assert d["bias"] == 26 and d["rshift"] == 7
     assert d["name"] == "blk.5.ffn_gate.weight"
 
 def test_tiny_image_roundtrip(tmp_path):
