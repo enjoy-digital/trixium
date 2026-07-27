@@ -53,43 +53,67 @@ class BonsaiHBMBIST(LiteXModule):
         self.writer = BonsaiAXIWriter(axi)
 
         chan = self.chan.storage
+        n    = len(hbm_axis)
 
-        # R return-path register stage (declared early: the demux below gates hbm.r.ready on it).
-        r_advance = Signal()
+        # Every path between the BIST core and the 32-channel mux/demux gets a register stage
+        # (225 MHz across all HBM port columns): AR/AW/W outward through pipe stages, R/B
+        # inward through registered muxes. Full throughput is kept (ready = ~v | downstream).
+        def _pipe(fields, src_valid, src_ready, dst_ready_muxed):
+            """Register slice: core channel -> registered copy driving the demux."""
+            v    = Signal()
+            regs = [Signal.like(f) for f in fields]
+            self.comb += src_ready.eq(~v | dst_ready_muxed)
+            self.sync += [
+                If(src_valid & src_ready,
+                    v.eq(1),
+                    *[r.eq(f) for r, f in zip(regs, fields)],
+                ).Elif(dst_ready_muxed,
+                    v.eq(0),
+                )
+            ]
+            return v, regs
 
-        # Outward demux: request channels driven per BIST channel, valid/ready gated by select.
+        ar_ready_m = Signal()
+        aw_ready_m = Signal()
+        w_ready_m  = Signal()
+        r_advance  = Signal()
+        self.comb += [
+            ar_ready_m.eq(Array([hbm_axis[i].ar.ready for i in range(n)])[chan]),
+            aw_ready_m.eq(Array([hbm_axis[i].aw.ready for i in range(n)])[chan]),
+            w_ready_m.eq(Array([hbm_axis[i].w.ready   for i in range(n)])[chan]),
+        ]
+        ar_v, (ar_addr, ar_len) = _pipe([axi.ar.addr, axi.ar.len],
+                                        axi.ar.valid, axi.ar.ready, ar_ready_m)
+        aw_v, (aw_addr, aw_len) = _pipe([axi.aw.addr, axi.aw.len],
+                                        axi.aw.valid, axi.aw.ready, aw_ready_m)
+        w_v, (w_data, w_last)   = _pipe([axi.w.data, axi.w.last],
+                                        axi.w.valid, axi.w.ready, w_ready_m)
+
+        # Outward demux: registered request copies driven per BIST channel, valid gated by sel.
         for i in channels:
             hbm = hbm_axis[i]
             sel = Signal()
             self.comb += [
                 sel.eq(chan == i),
-                hbm.ar.valid.eq(axi.ar.valid & sel),
-                hbm.ar.addr.eq(axi.ar.addr),
-                hbm.ar.len.eq(axi.ar.len),
+                hbm.ar.valid.eq(ar_v & sel),
+                hbm.ar.addr.eq(ar_addr),
+                hbm.ar.len.eq(ar_len),
                 hbm.ar.size.eq(axi.ar.size),
                 hbm.ar.burst.eq(axi.ar.burst),
-                hbm.ar.id.eq(axi.ar.id),
+                hbm.ar.id.eq(0),
                 hbm.r.ready.eq(r_advance & sel), # Acceptance into the R register stage.
-                hbm.aw.valid.eq(axi.aw.valid & sel),
-                hbm.aw.addr.eq(axi.aw.addr),
-                hbm.aw.len.eq(axi.aw.len),
+                hbm.aw.valid.eq(aw_v & sel),
+                hbm.aw.addr.eq(aw_addr),
+                hbm.aw.len.eq(aw_len),
                 hbm.aw.size.eq(axi.aw.size),
                 hbm.aw.burst.eq(axi.aw.burst),
-                hbm.aw.id.eq(axi.aw.id),
-                hbm.w.valid.eq(axi.w.valid & sel),
-                hbm.w.data.eq(axi.w.data),
-                hbm.w.strb.eq(axi.w.strb),
-                hbm.w.last.eq(axi.w.last),
+                hbm.aw.id.eq(0),
+                hbm.w.valid.eq(w_v & sel),
+                hbm.w.data.eq(w_data),
+                hbm.w.strb.eq(2**32 - 1),
+                hbm.w.last.eq(w_last),
                 hbm.b.ready.eq(axi.b.ready & sel),
             ]
-
-        # Inward mux: balanced Array muxes over all 32 ports (selection restricted by software).
-        n = len(hbm_axis)
-        self.comb += [
-            axi.ar.ready.eq(Array([hbm_axis[i].ar.ready for i in range(n)])[chan]),
-            axi.aw.ready.eq(Array([hbm_axis[i].aw.ready for i in range(n)])[chan]),
-            axi.w.ready.eq(Array([hbm_axis[i].w.ready   for i in range(n)])[chan]),
-        ]
         # B responses: registered (b.ready is held high on both sides, so each response is a
         # single-cycle pulse at the source and a plain register preserves counts - same
         # treatment as the R return mux).
