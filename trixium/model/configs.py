@@ -72,8 +72,9 @@ BONSAI_1P7B = ModelConfig(
     yarn_orig_ctx  = 8192,
 )
 
-# Ternary-Bonsai-8B (Qwen3-8B geometry; tie_embeddings/yarn re-verified at conversion time
-# from the GGUF metadata).
+# Ternary-Bonsai-8B (verified against the GGUF metadata: qwen3, 36 blocks, 4096 embd,
+# 32Q/8KV heads x 128, ffn 12288, vocab 151669, yarn x4 over 16384, untied - separate ternary
+# output.weight).
 BONSAI_8B = ModelConfig(
     name          = "bonsai-8b",
     n_layer       = 36,
@@ -84,7 +85,7 @@ BONSAI_8B = ModelConfig(
     ffn_dim       = 12288,
     vocab         = 151669,
     yarn_factor   = 4.0,
-    yarn_orig_ctx = 8192,
+    yarn_orig_ctx = 16384,
 )
 
 CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B)}
