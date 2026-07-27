@@ -25,6 +25,9 @@ class BonsaiScratchpad(LiteXModule):
     def __init__(self, size=256*1024, init=None):
         self.size = size
         depth     = size//32
+        # The raw Memory must not be auto-exported over the CSR bus (AutoCSR scans Memory
+        # attributes of LiteXModules and would add an unwanted CSR-bus port + page register).
+        self.autocsr_exclude = {"mem"}
 
         # # #
 
@@ -57,13 +60,17 @@ class BonsaiScratchpad(LiteXModule):
             If(bus.cyc & bus.stb,
                 If(bus.we,
                     port.we.eq(bus.sel << (sel*4)),
-                    bus.ack.eq(1),
+                    NextState("ACK"), # Registered ack (comb ack races pipelined masters).
                 ).Else(
                     NextState("READ"), # One cycle of read latency.
                 )
             )
         )
         fsm.act("READ",
+            bus.ack.eq(1),
+            NextState("IDLE"),
+        )
+        fsm.act("ACK",
             bus.ack.eq(1),
             NextState("IDLE"),
         )

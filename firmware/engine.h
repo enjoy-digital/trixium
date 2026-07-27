@@ -1,0 +1,36 @@
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+// SPDX-License-Identifier: BSD-2-Clause
+
+#ifndef ENGINE_H
+#define ENGINE_H
+
+#include <stdint.h>
+
+#define ENGINE_KIND_TERNARY 0
+#define ENGINE_KIND_Q8      1
+#define ENGINE_KIND_FETCH   2
+
+// Scratchpad CPU window (uncached region defined in trixium.py / bonsai_sim.py).
+#define SCRATCHPAD_BASE 0xa0000000UL
+
+struct engine_op {
+    uint8_t  kind;
+    uint16_t rows;      // Rows per channel.
+    uint16_t cols;
+    uint32_t wbase;     // Per-channel weight byte address.
+    uint32_t wlen;      // Beats per channel.
+    uint8_t  sbeats;
+    uint8_t  cbeats;
+    uint8_t  bias;
+    uint8_t  rshift;
+    uint32_t xsrc;      // Scratchpad byte address of x8.
+    uint32_t dst;       // Scratchpad byte address for results.
+    uint8_t  chan;      // Fetch source channel.
+};
+
+void engine_run(const struct engine_op *op);
+void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst);
+
+#endif

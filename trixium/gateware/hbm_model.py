@@ -47,6 +47,7 @@ class BonsaiHBMChannelModel(LiteXModule):
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
         self.axi = axi
         depth    = size//BEAT_BYTES
+        self.autocsr_exclude = {"mem"} # Keep the model memory off the CSR bus (AutoCSR scan).
 
         # # #
 
