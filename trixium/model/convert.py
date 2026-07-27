@@ -1,0 +1,193 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+"""bonsai_convert: GGUF (PrismML Q2_0 g128) -> BONS hardware weight image.
+
+Subcommands:
+  inspect  <gguf>                    - dump metadata + tensor table.
+  convert  --gguf F --channels N --out IMG [--manifest J] [--tokenizer T] [--layers K] [--check]
+  verify   --image IMG               - re-CRC all tensor payloads.
+
+Vocab-sharded tensors (embeddings/LM head) are row-padded to divide the channel count with
+zero-weight rows (code 1 -> w = 0, scale 0); the top-k unit masks rows >= vocab."""
+
+import argparse
+import hashlib
+import sys
+
+import numpy as np
+
+from trixium import layout
+from trixium.layout import (
+    KIND_TERNARY, KIND_F32, FLAG_REPLICATED,
+    ROLE_TOK_EMB, ROLE_OUT_NORM, ROLE_LM_HEAD,
+    ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
+    ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
+    ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
+)
+from trixium.model import qformats
+from trixium.model.gguf_reader import GGUFReader, inspect as gguf_inspect
+from trixium.model.golden import config_from_gguf
+from trixium.model.bons import TensorSpec, write_image, BONSReader, decode_rows
+
+# GGUF name -> (role, replicated) ------------------------------------------------------------------
+
+_GLOBAL_ROLES = {
+    "token_embd.weight"  : (ROLE_TOK_EMB,  False),
+    "output_norm.weight" : (ROLE_OUT_NORM, True),
+    "output.weight"      : (ROLE_LM_HEAD,  False),
+}
+_BLK_ROLES = {
+    "attn_norm"   : (ROLE_ATTN_NORM,   True),
+    "attn_q"      : (ROLE_ATTN_Q,      False),
+    "attn_k"      : (ROLE_ATTN_K,      False),
+    "attn_v"      : (ROLE_ATTN_V,      False),
+    "attn_q_norm" : (ROLE_ATTN_Q_NORM, True),
+    "attn_k_norm" : (ROLE_ATTN_K_NORM, True),
+    "attn_output" : (ROLE_ATTN_OUT,    False),
+    "ffn_norm"    : (ROLE_FFN_NORM,    True),
+    "ffn_gate"    : (ROLE_FFN_GATE,    False),
+    "ffn_up"      : (ROLE_FFN_UP,      False),
+    "ffn_down"    : (ROLE_FFN_DOWN,    False),
+}
+
+def _name_role(name):
+    if name in _GLOBAL_ROLES:
+        return 0, *_GLOBAL_ROLES[name]
+    if name.startswith("blk."):
+        _, l, base = name.split(".", 2)
+        base = base.removesuffix(".weight")
+        role, repl = _BLK_ROLES[base]
+        return int(l), role, repl
+    raise KeyError(name)
+
+# Conversion ---------------------------------------------------------------------------------------
+
+def _spec_from_gguf(reader, name, n_channels, vocab_pad):
+    t     = reader.tensors[name]
+    layer, role, repl = _name_role(name)
+    flags = FLAG_REPLICATED if repl else 0
+
+    if t.type_name == "UNK42" or t.type_id == qformats.GGML_Q2_0:
+        rows, cols = t.shape
+        scales, codes = qformats.q2_0_unpack(reader.tensor_bytes(name))
+        scales = scales.reshape(rows, cols//layout.GROUP_TERNARY)
+        codes  = codes.reshape(rows, cols)
+        if not repl and rows % n_channels != 0:
+            assert role in (ROLE_TOK_EMB, ROLE_LM_HEAD), name
+            pad = vocab_pad - rows
+            scales = np.concatenate([scales, np.zeros((pad, scales.shape[1]), np.float16)])
+            codes  = np.concatenate([codes,  np.ones((pad, cols), np.uint8)]) # code 1 -> w=0.
+            rows   = vocab_pad
+        return TensorSpec(name, role, layer, KIND_TERNARY, rows, cols,
+                          scales=scales, values=codes, flags=flags)
+
+    if t.type_name == "F32":
+        cols   = t.shape[-1]
+        values = qformats.f32_dequant(reader.tensor_bytes(name)).reshape(1, cols)
+        return TensorSpec(name, role, layer, KIND_F32, 1, cols, values=values,
+                          flags=FLAG_REPLICATED)
+
+    raise NotImplementedError(f"{name}: unsupported tensor type {t.type_name}")
+
+def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
+            max_layers=None, check=False):
+    reader = GGUFReader(gguf_path)
+    cfg    = config_from_gguf(reader)
+    if max_layers is not None:
+        cfg.n_layer = min(cfg.n_layer, max_layers)
+        cfg.name    = f"{cfg.name}-l{cfg.n_layer}"
+    vocab_pad = cfg.vocab_padded(n_channels)
+
+    # Canonical tensor order: embeddings, per-layer blocks, final norm, head.
+    names = ["token_embd.weight"]
+    for l in range(cfg.n_layer):
+        for base in ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
+                     "attn_output", "ffn_norm", "ffn_gate", "ffn_up", "ffn_down"):
+            names.append(f"blk.{l}.{base}.weight")
+    names.append("output_norm.weight")
+    if "output.weight" in reader.tensors:
+        names.append("output.weight")
+
+    specs = []
+    for name in names:
+        print(f"  {name}...", flush=True)
+        specs.append(_spec_from_gguf(reader, name, n_channels, vocab_pad))
+
+    sha = b""
+    if tokenizer_path:
+        sha = hashlib.sha256(open(tokenizer_path, "rb").read()).digest()
+
+    manifest = write_image(cfg, specs, n_channels, out_path,
+                           tokenizer_sha256=sha, manifest_path=manifest_path)
+    print(f"image: {out_path} payload {manifest['payload_bytes_per_channel']/1e6:.1f} MB/channel"
+          f" x {n_channels} channels")
+
+    if check:
+        img = BONSReader(out_path)
+        for name in ("blk.0.attn_q.weight", "blk.0.ffn_gate.weight"):
+            s_img, v_img = img.tensor(name)
+            s_ref, v_ref = None, None
+            for spec in specs:
+                if spec.name == name:
+                    s_ref, v_ref = spec.scales, spec.values
+            assert np.array_equal(v_img, v_ref), name
+            assert np.array_equal(s_img, s_ref.astype(np.float16)), name
+            print(f"  check {name}: OK")
+    return manifest
+
+def verify(image_path):
+    img = BONSReader(image_path)
+    h   = img.header
+    print(f"BONS v{h['version']}: {h['n_tensors']} tensors, {h['n_channels']} channels, "
+          f"{h['payload_beats']*32/1e6:.1f} MB/channel")
+    import zlib
+    bad = 0
+    for e in img.entries:
+        crc = 0
+        for c in range(h["n_channels"]):
+            data = img.tensor_channel_bytes(e["name"], c)
+            crc  = zlib.crc32(bytes(data), crc) & 0xFFFFFFFF
+        ok = crc == e["crc32"]
+        bad += not ok
+        if not ok:
+            print(f"  CRC MISMATCH {e['name']}: {crc:#x} != {e['crc32']:#x}")
+    print("verify: OK" if bad == 0 else f"verify: {bad} bad tensors")
+    return bad == 0
+
+# CLI ----------------------------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="GGUF -> BONS converter.")
+    sub    = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("inspect")
+    p.add_argument("gguf")
+
+    p = sub.add_parser("convert")
+    p.add_argument("--gguf",      required=True)
+    p.add_argument("--channels",  required=True, type=int)
+    p.add_argument("--out",       required=True)
+    p.add_argument("--manifest",  default=None)
+    p.add_argument("--tokenizer", default=None)
+    p.add_argument("--layers",    default=None, type=int, help="Truncate to first K layers.")
+    p.add_argument("--check",     action="store_true")
+
+    p = sub.add_parser("verify")
+    p.add_argument("--image", required=True)
+
+    args = parser.parse_args()
+    if args.cmd == "inspect":
+        gguf_inspect(args.gguf)
+    elif args.cmd == "convert":
+        manifest = args.manifest or args.out.rsplit(".", 1)[0] + ".json"
+        convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
+                args.layers, args.check)
+    elif args.cmd == "verify":
+        sys.exit(0 if verify(args.image) else 1)
+
+if __name__ == "__main__":
+    main()

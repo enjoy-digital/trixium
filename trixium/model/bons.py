@@ -48,6 +48,15 @@ class TensorSpec:
             group = layout.KIND_GROUP[kind]
             assert cols % group == 0
             assert scales.shape == (rows, cols//group), (name, scales.shape)
+            # Per-tensor accumulator scale bias / result shift (bitexact contract).
+            from trixium.model import bitexact as bx
+            _, e16      = bx.fp16_decompose(np.asarray(scales, dtype=np.float16))
+            gs_max      = bx.GS_MAX if kind == KIND_TERNARY else bx.GS_MAX_Q8
+            self.bias   = bx.choose_scale_bias(e16)
+            self.rshift = bx.choose_result_shift(scales, self.bias, gs_max=gs_max)
+        else:
+            self.bias   = 0
+            self.rshift = 0
         assert values.shape == (rows, cols), (name, values.shape)
 
 # Row packet encoding ------------------------------------------------------------------------------
@@ -134,12 +143,13 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
         len_beats = len(chan_payloads[0])//BEAT_BYTES - base_beats
         entries.append(layout.pack_entry(
             spec.role, spec.kind, spec.flags, spec.layer, spec.rows, spec.cols,
-            base_beats, len_beats, crc, spec.name))
+            base_beats, len_beats, crc, spec.bias, spec.rshift, spec.name))
         manifest_tensors.append({
             "name": spec.name, "role": ROLE_NAMES[spec.role], "layer": spec.layer,
             "kind": KIND_NAMES[spec.kind], "flags": spec.flags,
             "rows": spec.rows, "cols": spec.cols,
             "chan_base_beats": base_beats, "chan_len_beats": len_beats, "crc32": crc,
+            "bias": spec.bias, "rshift": spec.rshift,
         })
         # All channels must stay in lockstep.
         assert all(len(p) == len(chan_payloads[0]) for p in chan_payloads), spec.name

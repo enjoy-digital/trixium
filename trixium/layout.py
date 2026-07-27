@@ -162,21 +162,24 @@ def unpack_header(data):
 # Tensor table entry (64 B):
 #  0: u8 role    1: u8 kind    2: u8 flags    3: u8 pad    4: u16 layer   6: u16 group
 #  8: u32 rows  12: u32 cols  16: u64 chan_base_beats     24: u64 chan_len_beats
-# 32: u32 crc32 (payload, channel-major)     36: 4B pad   40: 24B ascii name (debug).
-_ENTRY_FMT = "<BBBBHHIIQQI4x24s"
+# 32: u32 crc32 (payload, channel-major)     36: u8 bias (B)  37: u8 rshift (R)
+# 38: 2B pad   40: 24B ascii name (debug).
+_ENTRY_FMT = "<BBBBHHIIQQIBB2x24s"
 
-def pack_entry(role, kind, flags, layer, rows, cols, chan_base_beats, chan_len_beats, crc32, name=""):
+def pack_entry(role, kind, flags, layer, rows, cols, chan_base_beats, chan_len_beats, crc32,
+               bias=0, rshift=0, name=""):
     group = KIND_GROUP.get(kind, 0)
     return struct.pack(_ENTRY_FMT, role, kind, flags, 0, layer, group, rows, cols,
-                       chan_base_beats, chan_len_beats, crc32, name.encode()[:24])
+                       chan_base_beats, chan_len_beats, crc32, bias, rshift, name.encode()[:24])
 
 def unpack_entry(data, offset=0):
-    role, kind, flags, _, layer, group, rows, cols, base, length, crc, name = \
+    role, kind, flags, _, layer, group, rows, cols, base, length, crc, bias, rshift, name = \
         struct.unpack_from(_ENTRY_FMT, data, offset)
     return {
         "role": role, "kind": kind, "flags": flags, "layer": layer, "group": group,
         "rows": rows, "cols": cols, "chan_base_beats": base, "chan_len_beats": length,
-        "crc32": crc, "name": name.rstrip(b"\x00").decode(errors="replace"),
+        "crc32": crc, "bias": bias, "rshift": rshift,
+        "name": name.rstrip(b"\x00").decode(errors="replace"),
     }
 
 def crc32(data):
