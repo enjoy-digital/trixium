@@ -17,6 +17,9 @@ models/
 ip/hbm/*
 !ip/hbm/hbm_0.xci
 
+# Build/convert logs at the repo root
+/*.log
+
 # Vivado cruft
 .Xil/
 vivado*.jou
