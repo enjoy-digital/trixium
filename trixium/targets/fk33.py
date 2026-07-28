@@ -134,6 +134,13 @@ class BonsaiSoC(SoCCore):
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit)
             self.engine_csr = BonsaiEngineCSR(self.engine)
             self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)
+            # Engine kind-3 STORE (KV append) rides the loader's writers.
+            self.comb += [
+                self.engine.store_cmd.connect(self.loader.store_cmd),
+                self.engine.store_data.connect(self.loader.store_data),
+                self.engine.store_busy.eq(self.loader.store_busy),
+            ]
+            self.add_constant("BONSAI_HAS_KVSTORE")
             self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
 
             # Scratchpad on the SoC bus (uncached: shared with the engine).

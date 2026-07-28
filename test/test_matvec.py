@@ -282,3 +282,66 @@ def test_engine_csr_single_run_per_submit():
         assert (yield dut.front.status.fields.pending) == 0
 
     run_simulation(dut, [driver()])
+
+def test_engine_store_roundtrip():
+    # kind-3 STORE (scratchpad -> HBM via the loader's writers), then FETCH back: the KV
+    # append datapath. Also checks the done handshake orders after the B drain.
+    from trixium.gateware.loader import BonsaiHBMLoader
+
+    n_channels = 2
+    rng   = np.random.default_rng(17)
+    src   = rng.integers(0, 256, 512, dtype=np.uint8)  # 16 beats.
+    beats = len(src)//32
+
+    class _StoreDUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(
+                size=64*1024, init=words_from_bytes(src.tobytes()))
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32)
+            self.submodules.loader = BonsaiHBMLoader(axis)
+            self.comb += [
+                self.engine.store_cmd.connect(self.loader.store_cmd),
+                self.engine.store_data.connect(self.loader.store_data),
+                self.engine.store_busy.eq(self.loader.store_busy),
+            ]
+            for i, axi in enumerate(axis):
+                model = BonsaiHBMChannelModel(axi, size=64*1024, latency=8)
+                setattr(self.submodules, f"model{i}", model)
+
+    dut = _StoreDUT()
+
+    def submit(c):
+        for k in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
+                  "bias", "rshift", "xsrc", "dst", "chan"):
+            yield getattr(dut.engine.cmd, k).eq(c.get(k, 0))
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+
+    def wait_done():
+        for _ in range(50000):
+            if (yield dut.engine.done):
+                return
+            yield
+        raise AssertionError("timeout")
+
+    def driver():
+        # Store 16 beats from SP 0x0 to channel 1 @ 0x2000.
+        yield from submit(dict(kind=3, chan=1, wbase=0x2000, wlen=beats, xsrc=0))
+        yield from wait_done()
+        yield
+        # Fetch them back to SP 0x4000.
+        yield from submit(dict(kind=2, chan=1, wbase=0x2000, wlen=beats, dst=0x4000))
+        yield from wait_done()
+        yield
+        got = bytearray()
+        for w in range(len(src)//32):
+            v = (yield dut.scratchpad.mem[(0x4000 + 32*w)//32])
+            got += int(v).to_bytes(32, "little")
+        assert bytes(got) == src.tobytes(), "store/fetch roundtrip mismatch"
+
+    run_simulation(dut, [driver()])

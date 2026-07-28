@@ -48,6 +48,7 @@ from trixium.gateware.matvec import BonsaiMatVecEngine
 from trixium.gateware.csr_front import BonsaiEngineCSR
 from trixium.gateware.vector import BonsaiVectorUnit
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.gateware.loader import BonsaiHBMLoader
 from trixium.model.bons import BONSReader
 
 # Constants ----------------------------------------------------------------------------------------
@@ -96,7 +97,8 @@ class BonsaiSimSoC(SoCCore):
             size = 256*1024
             if img is not None:
                 payload = bytes(img.channel_payload(c))
-                while size < len(payload):
+                # Reserve headroom above the weights for the KV region (kind-3 stores).
+                while size < len(payload) + 128*1024:
                     size *= 2
                 init = words_from_bytes(payload)
             model = BonsaiHBMChannelModel(axi, size=size, init=init,
@@ -106,6 +108,15 @@ class BonsaiSimSoC(SoCCore):
         self.vecunit    = BonsaiVectorUnit()
         self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit)
         self.engine_csr = BonsaiEngineCSR(self.engine)
+        # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
+        # kind-3 STORE ops (KV append).
+        self.loader = BonsaiHBMLoader(axis)
+        self.comb += [
+            self.engine.store_cmd.connect(self.loader.store_cmd),
+            self.engine.store_data.connect(self.loader.store_data),
+            self.engine.store_busy.eq(self.loader.store_busy),
+        ]
+        self.add_constant("BONSAI_HAS_KVSTORE")
         self.add_constant("BONSAI_HAS_VECUNIT")
         self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set (rmsnorm scalar ops + rsqrt fix).
 

@@ -38,7 +38,7 @@ class BonsaiMatVecEngine(LiteXModule):
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
-            ("kind",   2),   # 0: ternary, 1: q8, 2: fetch (HBM -> scratchpad, one channel).
+            ("kind",   2),   # 0: ternary, 1: q8, 2: fetch (HBM -> SP), 3: store (SP -> HBM).
             ("rows",   16),  # Rows per channel.
             ("cols",   14),  # K.
             ("wbase",  32),  # Per-channel weight byte address (beat-aligned).
@@ -55,6 +55,14 @@ class BonsaiMatVecEngine(LiteXModule):
         self.done   = Signal() # Pulse.
         self.error  = Signal()
         self.absmax = Signal(32) # |int32| max over the last matvec's gathered results.
+
+        # STORE (kind 3): scratchpad beats -> one HBM channel, through the loader's
+        # per-channel AXI writers (wired by the integrator; a kind-3 op hangs if absent -
+        # firmware only issues it when BONSAI_HAS_KVSTORE is set). cmd reuse: chan = dest
+        # channel, wbase = HBM byte address, wlen = beats, xsrc = scratchpad byte source.
+        self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 32), ("len", 24)])
+        self.store_data = stream.Endpoint([("data", 256)])
+        self.store_busy = Signal() # From the loader: executing our store (incl. B drain).
 
         # # #
 
@@ -91,8 +99,10 @@ class BonsaiMatVecEngine(LiteXModule):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
+        store_mode = Signal()
         self.comb += [
             fetch_mode.eq(cmd_r["kind"] == 2),
+            store_mode.eq(cmd_r["kind"] == 3),
             fetch_chan.eq(cmd_r["chan"]),
         ]
 
@@ -116,8 +126,16 @@ class BonsaiMatVecEngine(LiteXModule):
         # Registered fill pipeline: address at T, data+write at T+1.
         fill_active_d = Signal()
         fill_beat_d   = Signal(10)
+        st_cnt        = Signal(13) # STORE beat counter (address holds until accepted).
+        st_rdv        = Signal()   # fill.dat_r valid for the STORE stream.
         eng_fill_adr = Signal(len(scratchpad.fill.adr))
-        self.comb += eng_fill_adr.eq((cmd_r["xsrc"] >> 5) + fill_beat)
+        self.comb += eng_fill_adr.eq((cmd_r["xsrc"] >> 5) + Mux(store_mode, st_cnt, fill_beat))
+        self.comb += [
+            self.store_data.valid.eq(st_rdv),
+            self.store_data.data.eq(scratchpad.fill.dat_r),
+        ]
+        st_advance = Signal()
+        self.comb += st_advance.eq(self.store_data.valid & self.store_data.ready)
         for pipe in self.pipes:
             self.comb += [
                 pipe.xw_group.eq(fill_beat_d[2:]),
@@ -226,8 +244,33 @@ class BonsaiMatVecEngine(LiteXModule):
             start_pulse.eq(1),
             If(fetch_mode,
                 NextState("ISSUE"), # No x-fill for fetches.
+            ).Elif(store_mode,
+                NextState("ST_CMD"),
             ).Else(
                 NextState("FILL"),
+            )
+        )
+        fsm.act("ST_CMD",
+            self.busy.eq(1),
+            self.store_cmd.valid.eq(1),
+            self.store_cmd.chan.eq(cmd_r["chan"]),
+            self.store_cmd.addr.eq(cmd_r["wbase"]),
+            self.store_cmd.len.eq(cmd_r["wlen"]),
+            If(self.store_cmd.ready,
+                NextState("ST_RUN"),
+            )
+        )
+        fsm.act("ST_RUN",
+            self.busy.eq(1),
+            If(st_advance & (st_cnt == cmd_r["wlen"] - 1),
+                NextState("ST_DRAIN"),
+            )
+        )
+        fsm.act("ST_DRAIN", # Wait for the loader's B-channel drain: data is then readable.
+            self.busy.eq(1),
+            If(~self.store_busy,
+                self.done.eq(1),
+                NextState("IDLE"),
             )
         )
         fsm.act("FILL",
@@ -266,6 +309,14 @@ class BonsaiMatVecEngine(LiteXModule):
         self.sync += [
             fill_active_d.eq(fsm.ongoing("FILL")),
             fill_beat_d.eq(fill_beat),
+            # STORE stream: the read address holds until the beat is accepted; dat_r is
+            # valid one stable-address cycle later (one dead cycle after each advance).
+            st_rdv.eq(fsm.ongoing("ST_RUN") & ~st_advance),
+            If(start_pulse,
+                st_cnt.eq(0),
+            ).Elif(st_advance,
+                st_cnt.eq(st_cnt + 1),
+            ),
             If(start_pulse,
                 result_cnt.eq(0),
                 fetch_cnt.eq(0),

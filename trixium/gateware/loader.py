@@ -36,6 +36,13 @@ class BonsaiHBMLoader(LiteXModule):
             CSRField("beats", size=24, offset=8, description="Beats written so far."),
         ])
 
+        # Engine STORE source (scratchpad -> HBM, KV append): granted only from IDLE, so
+        # host uploads and engine stores serialize on the shared per-channel writers.
+        # Firmware never overlaps them (weight upload happens before generation).
+        self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 32), ("len", 24)])
+        self.store_data = stream.Endpoint([("data", 256)])
+        self.store_busy = Signal()
+
         # # #
 
         n = len(hbm_axis)
@@ -53,13 +60,52 @@ class BonsaiHBMLoader(LiteXModule):
         beats = Signal(24)
         chan  = self.chan.storage
 
+        st_chan = Signal(5)
+        st_addr = Signal(32)
+        st_len  = Signal(24)
+        st_cnt  = Signal(24)
+
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(self.start.re & self.start.storage,
                 NextValue(beats, 0),
                 NextState("CMD"),
+            ).Elif(self.store_cmd.valid,
+                self.store_cmd.ready.eq(1),
+                NextValue(st_chan, self.store_cmd.chan),
+                NextValue(st_addr, self.store_cmd.addr),
+                NextValue(st_len,  self.store_cmd.len),
+                NextValue(st_cnt,  0),
+                NextState("EST_CMD"),
             )
         )
+        fsm.act("EST_CMD",
+            *[w.sink_cmd.valid.eq(st_chan == i) for i, w in enumerate(self.writers)],
+            *[w.sink_cmd.addr.eq(st_addr) for w in self.writers],
+            *[w.sink_cmd.len.eq(st_len) for w in self.writers],
+            If(Array([w.sink_cmd.ready for w in self.writers])[st_chan],
+                NextState("EST_DATA"),
+            )
+        )
+        fsm.act("EST_DATA",
+            *[w.sink_data.valid.eq((st_chan == i) & self.store_data.valid)
+              for i, w in enumerate(self.writers)],
+            *[w.sink_data.data.eq(self.store_data.data) for w in self.writers],
+            self.store_data.ready.eq(Array([w.sink_data.ready for w in self.writers])[st_chan]),
+            If(self.store_data.valid & self.store_data.ready,
+                NextValue(st_cnt, st_cnt + 1),
+                If(st_cnt == st_len - 1,
+                    NextState("EST_DRAIN"),
+                )
+            )
+        )
+        fsm.act("EST_DRAIN", # B responses: data readable once idle.
+            If(Array([w.idle for w in self.writers])[st_chan],
+                NextState("IDLE"),
+            )
+        )
+        self.comb += self.store_busy.eq(fsm.ongoing("EST_CMD") | fsm.ongoing("EST_DATA")
+                                        | fsm.ongoing("EST_DRAIN"))
         fsm.act("CMD",
             *[w.sink_cmd.valid.eq(chan == i) for i, w in enumerate(self.writers)],
             *[w.sink_cmd.addr.eq(self.base.storage) for w in self.writers],
