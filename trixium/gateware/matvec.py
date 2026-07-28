@@ -38,7 +38,8 @@ class BonsaiMatVecEngine(LiteXModule):
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
-            ("kind",   2),   # 0: ternary, 1: q8, 2: fetch (HBM -> SP), 3: store (SP -> HBM).
+            ("kind",   3),   # 0: ternary, 1: q8, 2: fetch (HBM -> SP), 3: store (SP -> HBM),
+                             # 4: axpy (weighted-V: per-lane accumulate, cols results/chan).
             ("rows",   16),  # Rows per channel.
             ("cols",   14),  # K.
             ("wbase",  32),  # Per-channel weight byte address (beat-aligned).
@@ -80,7 +81,7 @@ class BonsaiMatVecEngine(LiteXModule):
         fetch_datas  = []
         for i, axi in enumerate(hbm_axis):
             reader = BonsaiAXIReader(axi)
-            pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups)
+            pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
             setattr(self.submodules, f"reader{i}", reader)
             setattr(self.submodules, f"pipe{i}",   pipe)
             is_fetch = Signal()
@@ -104,16 +105,19 @@ class BonsaiMatVecEngine(LiteXModule):
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
         store_mode = Signal()
+        axpy_mode  = Signal()
         self.comb += [
             fetch_mode.eq(cmd_r["kind"] == 2),
             store_mode.eq(cmd_r["kind"] == 3),
+            axpy_mode.eq(cmd_r["kind"] == 4),
             fetch_chan.eq(cmd_r["chan"]),
         ]
 
         # Broadcast op params to pipes (channels < rem run one extra row).
         for i, pipe in enumerate(self.pipes):
             self.comb += [
-                pipe.kind.eq(cmd_r["kind"]),
+                pipe.kind.eq(Mux(axpy_mode, 2,
+                             Mux(fetch_mode | store_mode, 0, cmd_r["kind"][0:2]))),
                 pipe.rows.eq(cmd_r["rows"] + (i < cmd_r["rem"])),
                 pipe.scale_beats.eq(cmd_r["sbeats"]),
                 pipe.code_beats.eq(cmd_r["cbeats"]),
@@ -125,7 +129,9 @@ class BonsaiMatVecEngine(LiteXModule):
         # x-fill ------------------------------------------------------------------------------
         fill_beat  = Signal(10) # Beat index within x fill (cols/32 <= 384).
         fill_total = Signal(10)
-        self.comb += fill_total.eq(cmd_r["cols"] >> 5)
+        self.comb += fill_total.eq(Mux(axpy_mode,
+            (cmd_r["rows"]*self.n_channels + cmd_r["rem"] + 31) >> 5,
+            cmd_r["cols"] >> 5))
 
         # Registered fill pipeline: address at T, data+write at T+1.
         fill_active_d = Signal()
@@ -192,7 +198,9 @@ class BonsaiMatVecEngine(LiteXModule):
         eng_gw_we  = Signal(8)
         eng_gw_dat = Signal(256)
         self.comb += [
-            If(cmd_r["ilv"],
+            If(axpy_mode,
+                slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["cols"] + grant_row),
+            ).Elif(cmd_r["ilv"],
                 slot.eq((cmd_r["dst"] >> 2) + grant_row*self.n_channels + rr.grant),
             ).Else(
                 slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["rows"] + grant_row),
@@ -309,7 +317,9 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             If(Mux(fetch_mode,
                    fetch_cnt == cmd_r["wlen"],
-                   result_cnt == (cmd_r["rows"]*self.n_channels + cmd_r["rem"])),
+                   result_cnt == Mux(axpy_mode,
+                       cmd_r["cols"]*self.n_channels,
+                       cmd_r["rows"]*self.n_channels + cmd_r["rem"])),
                 self.done.eq(1),
                 NextState("IDLE"),
             )

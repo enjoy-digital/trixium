@@ -12,6 +12,7 @@
 #define ENGINE_KIND_Q8      1
 #define ENGINE_KIND_FETCH   2
 #define ENGINE_KIND_STORE   3
+#define ENGINE_KIND_AXPY    4
 
 // Scratchpad CPU window (uncached region defined in trixium.py / bonsai_sim.py).
 #define SCRATCHPAD_BASE 0xa0000000UL

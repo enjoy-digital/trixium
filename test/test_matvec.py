@@ -384,3 +384,44 @@ def test_matvec_q8_striped_interleave():
                    bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
         got = _run_engine(dut, cmd, T, 0x4000)
         assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
+
+def test_engine_axpy():
+    # Weighted-V: kind-4 op accumulates p8-weighted V rows per lane; each channel emits
+    # cols partial sums (chan-major), bit-exact vs bx.axpy_rows on its position stripe.
+    n_channels, cols, seed = 2, 64, 41
+    for T in (1, 3, 8):
+        rng = np.random.default_rng(seed + T)
+        ev  = rng.integers(-9, -4, T)
+        scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+        v8  = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        p8  = rng.integers(0, 128, T, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B    = 12 - int(e16.max())
+        Rpre = bx.axpy_rpre(int(p8.astype(np.int64).sum()))
+
+        rows, rem = T//n_channels, T % n_channels
+        payloads, expected = [], []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]
+            if pos:
+                spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                    len(pos), cols, scales=scales[pos], values=v8[pos])
+                payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+                expected.append(bx.axpy_rows(scales[pos], v8[pos], p8[pos], B, Rpre))
+            else:
+                payloads.append(b"")
+                expected.append(np.zeros(cols, dtype=np.int32))
+        maxlen = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+        expected = np.concatenate(expected)
+
+        x_init = p8.tobytes().ljust(64, b"\0")  # Probs vector, position-major.
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
+        rb  = layout.row_beats(cols, layout.KIND_Q8)
+        cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                   bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem)
+        got = _run_engine(dut, cmd, n_channels*cols, 0x4000)
+        assert np.array_equal(got, expected), f"T={T}"

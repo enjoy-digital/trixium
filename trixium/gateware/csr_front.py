@@ -24,7 +24,7 @@ from litex.soc.interconnect.csr import *
 
 class BonsaiEngineCSR(LiteXModule):
     def __init__(self, engine):
-        self.kind    = CSRStorage(2,  description="Op kind: 0 ternary, 1 q8, 2 fetch.")
+        self.kind    = CSRStorage(3,  description="Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
         self.rows    = CSRStorage(16, description="Rows per channel.")
         self.cols    = CSRStorage(14, description="Columns (K).")
         self.wbase   = CSRStorage(32, description="Per-channel weight byte address.")

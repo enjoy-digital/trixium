@@ -70,9 +70,10 @@ def _adder_tree(module, lanes, reg_every=2):
 
 KIND_OP_TERNARY = 0
 KIND_OP_Q8      = 1
+KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre).
 
 class BonsaiChannelPipe(LiteXModule):
-    def __init__(self, xbuf_groups=96, out_fifo_depth=8):
+    def __init__(self, xbuf_groups=96, out_fifo_depth=8, chan_id=0, n_channels=1):
         # Op parameters (quasi-static while busy).
         self.kind        = Signal(2)
         self.rows        = Signal(16)
@@ -97,6 +98,8 @@ class BonsaiChannelPipe(LiteXModule):
         self.overflow = Signal() # Sticky: result FIFO overflow (rate mismatch, debug).
 
         # # #
+
+        out_fifo_rdy_ax = Signal() # Driven at the FIFO hookup below (drain flow control).
 
         # x-buffer: 1024-bit words, one per ternary group (4 q8 groups). --------------------------
         xbuf = Memory(1024, xbuf_groups)
@@ -169,19 +172,26 @@ class BonsaiChannelPipe(LiteXModule):
 
         # T0: code-beat acceptance: launch x-buffer + scale reads, register codes. ----------------
         t0_fire = Signal()
+        pidx    = Signal(16) # AXPY: probs byte index = row*n_channels + chan_id.
         self.comb += [
             t0_fire.eq(accept & is_code),
-            xbuf_r.adr.eq(Mux(self.kind == KIND_OP_Q8, g_cnt[2:], g_cnt)),
+            pidx.eq(row_cnt*n_channels + chan_id),
+            xbuf_r.adr.eq(Mux(self.kind == KIND_OP_AXPY, pidx[7:],
+                          Mux(self.kind == KIND_OP_Q8, g_cnt[2:], g_cnt))),
             scale_r.adr.eq(Cat(g_cnt[4:7], row_cnt[0])), # Scale g at halfword g%16 of word g//16.
         ]
         codes_r   = Signal(256)
         g_lo_r    = Signal(4) # Scale index within the 16-scale word.
         q8_sub_r  = Signal(2) # 256-bit slice of the 1024-bit x word (q8 mode).
+        pidx_r    = Signal(7) # AXPY: byte within the 1024-bit x word.
+        g_ax_r    = Signal(3) # AXPY: accumulator group of this beat.
         self.sync += [
             If(t0_fire,
                 codes_r.eq(self.sink.data),
                 g_lo_r.eq(g_cnt[:4]),
                 q8_sub_r.eq(g_cnt[:2]),
+                pidx_r.eq(pidx[:7]),
+                g_ax_r.eq(g_cnt[:3]),
             )
         ]
         v1        = _delay(self, t0_fire, 1)             # T1 valid.
@@ -219,6 +229,13 @@ class BonsaiChannelPipe(LiteXModule):
         # Q8 lanes: w8 * x8 over the selected 256-bit x slice.
         xslice = Signal(256)
         self.comb += Case(q8_sub_r, {i: xslice.eq(xword[256*i:256*(i+1)]) for i in range(4)})
+        # AXPY coefficient byte: two-stage constant-slice mux out of the 1024-bit x word.
+        p8_grp = Signal(64)
+        p8_ax  = Signal((8, True))
+        self.comb += Case(pidx_r[3:], {i: p8_grp.eq(xword[64*i:64*(i+1)]) for i in range(16)})
+        self.comb += Case(pidx_r[:3], {i: p8_ax.eq(p8_grp[8*i:8*(i+1)]) for i in range(8)})
+        is_axpy = Signal()
+        self.comb += is_axpy.eq(self.kind == KIND_OP_AXPY)
         q8_lanes = []
         for j in range(32):
             w_j = Signal((8, True))
@@ -226,7 +243,7 @@ class BonsaiChannelPipe(LiteXModule):
             p   = Signal((16, True))
             self.comb += [
                 w_j.eq(codes_r[8*j:8*j+8]),
-                x_j.eq(xslice[8*j:8*j+8]),
+                x_j.eq(Mux(is_axpy, p8_ax, xslice[8*j:8*j+8])),
                 p.eq(w_j*x_j),
             ]
             r = Signal((16, True))
@@ -239,6 +256,88 @@ class BonsaiChannelPipe(LiteXModule):
         self.sync += If(v1, scale_word_r.eq(scale_r.dat_r), g_lo_r2.eq(g_lo_r))
         scale_f16 = Signal(16)
         self.comb += Case(g_lo_r2, {i: scale_f16.eq(scale_word_r[16*i:16*(i+1)]) for i in range(16)})
+
+        # AXPY datapath (kind 2): per-lane shift + int32 accumulators + drain. --------------------
+        # Row weight is one shift (pow-2 row scales, m11 == 1024): sh = (f_exp - 15) + B - Rpre
+        # with B on self.bias and Rpre on self.rshift. Lane products (v8 * p8, registered at
+        # T2) shift at T2->T3, accumulate per (group, lane) at T3; after the final row a
+        # drain FSM streams code_beats*32 accumulators into the out FIFO (row = g*32 + j).
+        ax_sh    = Signal((9, True))
+        ax_exp   = Signal(5)
+        ax_bias  = Signal((8, True))
+        ax_rpre  = Signal((8, True))
+        self.comb += [
+            ax_exp.eq(scale_f16[10:15]),
+            ax_bias.eq(self.bias),
+            ax_rpre.eq(self.rshift),
+            ax_sh.eq(ax_exp - 15 + ax_bias - ax_rpre),
+        ]
+        ax_shl = Signal(4)
+        ax_shr = Signal(5)
+        self.comb += [
+            ax_shl.eq(Mux(ax_sh >= 0, Mux(ax_sh > 15, 15, ax_sh[:4]), 0)),
+            ax_shr.eq(Mux(ax_sh < 0, Mux(ax_sh < -31, 31, (-ax_sh)[:5]), 0)),
+        ]
+        v2a    = _delay(self, v1, 1)              # Lane products valid (T2).
+        v3a    = _delay(self, v1, 2)              # Shifted values valid (T3).
+        g_ax2  = _delay(self, g_ax_r, 2)          # Beat group at T3.
+        ax_shifted = []
+        for j in range(32):
+            sh_full = Signal((32, True))
+            r       = Signal((32, True))
+            self.comb += sh_full.eq(Mux(ax_sh >= 0, q8_lanes[j] << ax_shl,
+                                                    q8_lanes[j] >> ax_shr))
+            self.sync += If(v2a, r.eq(sh_full))
+            ax_shifted.append(r)
+
+        AX_GROUPS = 4 # head_dim <= 128 for AXPY ops (kvpack contract).
+        acc_ax = [[Signal((32, True), name=f"axacc{g}_{j}") for j in range(32)]
+                  for g in range(AX_GROUPS)]
+        acc_flat = Array([acc_ax[g][j] for g in range(AX_GROUPS) for j in range(32)])
+
+        # Final-beat tag: last code beat of the last row, aligned to the accumulate stage.
+        fin_t0  = Signal()
+        self.comb += fin_t0.eq(t0_fire & row_last & (row_cnt == self.rows - 1))
+        fin_acc = _delay(self, fin_t0, 3)         # Accumulate of the final beat done (T4).
+
+        d_cnt   = Signal(8)
+        d_total = Signal(8)
+        self.comb += d_total.eq(Cat(C(0, 5), self.code_beats[:3])) # code_beats * 32.
+        self.ax_fsm = ax_fsm = FSM(reset_state="AX_IDLE")
+        drain_val = Signal()
+        ax_fsm.act("AX_IDLE",
+            If(self.start & (self.kind == KIND_OP_AXPY),
+                NextValue(d_cnt, 0),
+                If(self.rows == 0,
+                    NextState("AX_DRAIN"), # No rows on this channel: emit zero partials.
+                ).Else(
+                    NextState("AX_ACC"),
+                )
+            )
+        )
+        ax_fsm.act("AX_ACC",
+            If(fin_acc,
+                NextState("AX_DRAIN"),
+            )
+        )
+        ax_fsm.act("AX_DRAIN",
+            drain_val.eq(1),
+            If(out_fifo_rdy_ax,
+                NextValue(d_cnt, d_cnt + 1),
+                If(d_cnt == d_total - 1,
+                    NextState("AX_IDLE"),
+                )
+            )
+        )
+
+        self.sync += [
+            If(self.start,
+                *[acc_ax[g][j].eq(0) for g in range(AX_GROUPS) for j in range(32)],
+            ).Elif(v3a & (self.kind == KIND_OP_AXPY),
+                Case(g_ax2[:2], {g: [acc_ax[g][j].eq(acc_ax[g][j] + ax_shifted[j])
+                                     for j in range(32)] for g in range(AX_GROUPS)}),
+            ),
+        ]
 
         # T2..: adder trees (both built; result muxed by kind). -----------------------------------
         tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
@@ -338,8 +437,15 @@ class BonsaiChannelPipe(LiteXModule):
             ),
         ]
         self.comb += [
-            out_fifo.sink.valid.eq(v4 & rlast4),
-            out_fifo.sink.row.eq(row4),
-            out_fifo.sink.data.eq(result[:32]),
+            If(self.kind == KIND_OP_AXPY,
+                out_fifo.sink.valid.eq(drain_val),
+                out_fifo.sink.row.eq(d_cnt),
+                out_fifo.sink.data.eq(acc_flat[d_cnt][:32]),
+            ).Else(
+                out_fifo.sink.valid.eq(v4 & rlast4),
+                out_fifo.sink.row.eq(row4),
+                out_fifo.sink.data.eq(result[:32]),
+            ),
+            out_fifo_rdy_ax.eq(out_fifo.sink.ready),
             out_fifo.source.connect(self.source),
         ]
