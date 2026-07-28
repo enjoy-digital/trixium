@@ -26,24 +26,10 @@ uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
         vecunit_arg0_write, vecunit_arg1_write, vecunit_arg2_write, vecunit_arg3_write,
         vecunit_arg4_write, vecunit_arg5_write, vecunit_arg6_write, vecunit_arg7_write,
     };
-    // Delta CSR writes: nothing else touches these registers, and each uncached CSR
-    // write costs ~100 CPU cycles - per-head op sequences change only 1-2 args.
-    static uint32_t cached[8];
-    static uint32_t cached_pc = 0xFFFFFFFF;
-    static uint8_t  valid;
     uint32_t done = vecunit_done_count_read();
-    for (int i = 0; i < n_args; i++) {
-        uint32_t v = (uint32_t)args[i];
-        if (!(valid & (1u << i)) || cached[i] != v) {
-            wr[i](v);
-            cached[i] = v;
-            valid |= (uint8_t)(1u << i);
-        }
-    }
-    if (cached_pc != pc) {
-        vecunit_pc_write(pc);
-        cached_pc = pc;
-    }
+    for (int i = 0; i < n_args; i++)
+        wr[i]((uint32_t)args[i]);
+    vecunit_pc_write(pc);
     vecunit_submit_write(1);
     while (vecunit_done_count_read() == done);
     return vecunit_res6_read();
