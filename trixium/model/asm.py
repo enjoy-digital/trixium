@@ -617,6 +617,24 @@ def prog_rope():
         ("DONE",),
     ]
 
+def prog_scale8():
+    """int16 src -> int8 dst via one Q15 multiplier: dst = clamp8(rne(src*M >> 15)).
+    M (A4, < 2^15) folds a per-head non-power-of-2 factor (e.g. 1/sum-of-p8 and the
+    common-output-scale alignment) computed by the firmware; |src| <= 2^14 keeps the
+    product int32-safe. A0 = src, A2 = dst, A3 = beats (n/16)."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
+        ("BCAST", "v3", "s4"),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("VMUL",  "v0", "v0", "v3"),
+        ("VRNE",  "v0", "v0", 15),
+        ("VCLAMP8", "v0", "v0"),
+        ("STB",   "v0", "s2"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 PROGRAMS = {
     "resid_add":  prog_resid_add,
     "quant8":     prog_quant8,
@@ -626,6 +644,7 @@ PROGRAMS = {
     "softmax8":   prog_softmax8,
     "reduce_acc": prog_reduce_acc,
     "rope":       prog_rope,
+    "scale8":     prog_scale8,
 }
 
 def emit_c(out):

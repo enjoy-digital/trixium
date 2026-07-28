@@ -180,3 +180,10 @@ def test_rtl_rope():
     sp[512:512+hd] = rng.integers(-32767, 32768, hd//2).astype("<i2").tobytes()
     sp[768:768+hd] = rng.integers(-32767, 32768, hd//2).astype("<i2").tobytes()
     _compare("rope", bytes(sp), [0, 256, 512, 768, hd//2//16, 1024, 1280])
+
+def test_rtl_scale8():
+    rng = np.random.default_rng(64)
+    n   = 64
+    sp  = bytearray(SP_SIZE)
+    sp[0:2*n] = rng.integers(-16000, 16000, n).astype("<i2").tobytes()
+    _compare("scale8", bytes(sp), [0, 1024, 2048, n//16, 19571])

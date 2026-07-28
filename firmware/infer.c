@@ -581,12 +581,76 @@ static void kv_store_row_res(int l, int kvh, int kind, int t, uint32_t sp, int e
 }
 #endif
 
+// Integer embedding: fetch the ternary row, dequantize with exact fp16 decomposition
+// ((q-1)*m11 aligned to the smallest group exponent), then normalize to int16 BFP.
+// Pure integer (~6 ops/element vs ~50 soft-float ones); exponent returned.
+static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
+{
+    uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
+    uint32_t rpc = e->rows/n_ch;
+    engine_fetch(row/rpc,
+                 BONSAI_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)(row % rpc)*rb)*32,
+                 rb, SP_FET);
+    volatile uint8_t *pb = (volatile uint8_t *)(SCRATCHPAD_BASE + SP_FET);
+    uint32_t sb = bons_scale_beats(e->cols, e->group);
+    const volatile uint16_t *scales = (const volatile uint16_t *)pb;
+    const volatile uint8_t  *codes  = pb + sb*32;
+    int G = e->cols/128;
+    int32_t m11[32];
+    int     e16[32], e16min = 1000;
+    for (int g = 0; g < G; g++) {
+        uint16_t b2 = scales[g];
+        int exp2f_ = (b2 >> 10) & 0x1F;
+        int frac   = b2 & 0x3FF;
+        int m      = (exp2f_ > 0) ? (1024 + frac) : frac;
+        if (b2 & 0x8000) m = -m;
+        m11[g] = m;
+        e16[g] = (exp2f_ > 0) ? (exp2f_ - 25) : -24;
+        if (e16[g] < e16min) e16min = e16[g];
+    }
+    // Two passes (no buffer: SRAM is tight): amax of |(q-1)*m11 << sh| per group is just
+    // |m11[g]| << sh over any nonzero code - scan codes once for group nonzero-ness.
+    int32_t amax = 0;
+    for (int g = 0; g < G; g++) {
+        int sh = e16[g] - e16min;
+        if (sh > 20) sh = 20;
+        int32_t gm = ((m11[g] < 0) ? -m11[g] : m11[g]) << sh;
+        if (gm <= amax) continue;
+        for (int j = 0; j < 32; j++) { // Any nonzero 2-bit code pair in the group?
+            uint8_t b3 = codes[g*32 + j];
+            if (b3 != 0x55) { amax = gm; break; } // 0x55 = four "code 1" (zero weight).
+        }
+    }
+    int bl = 0;
+    while ((amax >> bl) != 0) bl++;      // Bit length.
+    int k2 = bl - 15;                    // Mantissas into [2^14, 2^15); may be negative.
+    volatile int16_t *pd = sp16(sp_dst);
+    for (int g = 0; g < G; g++) {
+        int sh = e16[g] - e16min;
+        if (sh > 20) sh = 20;
+        int net = sh - k2;               // Combined shift, sign either way.
+        for (int j = 0; j < 128; j++) {
+            int q2 = (codes[g*32 + j/4] >> ((j & 3)*2)) & 3;
+            int32_t v2 = (int32_t)(q2 - 1)*m11[g];
+            pd[g*128 + j] = (int16_t)((net >= 0) ? (v2 << net) : (v2 >> -net));
+        }
+    }
+    return e16min + k2;
+}
+
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
 static int forward(int token, int want_logits)
 {
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
     perf_enter(OP_EMBED);
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+    if (attn_all_hw()) {
+        ex_state = embed_row_bfp(emb, token, SP_XR);
+        perf_exit(OP_EMBED);
+        goto embed_done;
+    }
+#endif
     embed_row_f(emb, token, x);
     // Residual stream lives in the scratchpad as int16 BFP from here on.
     {
@@ -604,6 +668,9 @@ static int forward(int token, int want_logits)
         ex_state = e;
     }
     perf_exit(OP_EMBED);
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+embed_done: ;
+#endif
 
     int   kv_dim = n_kv_head*head_dim;
     int   q_dim  = n_head*head_dim;
@@ -726,6 +793,10 @@ static int forward(int token, int want_logits)
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
 attn_scores: ;
+        // Resident attention output: per-head int16 in SP_H + per-head value scales,
+        // aligned to a common ea8 and scale8-ed into SP_X after the head loop.
+        float aw_c[32];
+        float aw_hmax = 0;
 #endif
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
@@ -800,14 +871,24 @@ attn_scores: ;
                 wv.xsrc   = SP_X;
                 wv.dst    = SP_SC;
                 engine_run(&wv);
+                uint64_t am = 0;
                 for (int c = 1; c < n_ch; c++) {
                     int32_t rargs[4] = {(int32_t)SP_SC, (int32_t)(SP_SC + c*head_dim*4),
                                         (int32_t)SP_SC, head_dim/8};
-                    vec_run(PROG_REDUCE_ACC, rargs, 4);
+                    am = vec_run(PROG_REDUCE_ACC, rargs, 4);
                 }
-                float fs = ldexpf(1.0f/(float)(uint32_t)P8, Rpre - Bv);
-                for (int d = 0; d < head_dim; d++)
-                    ah[d] = (float)sc32[d]*fs;
+                if (n_ch == 1)
+                    am = engine_csr_absmax_read(); // AXPY partials tracked too.
+                int k2 = 0;
+                while ((am >> k2) > 16383u) k2++;
+                int32_t nargs[5] = {(int32_t)SP_SC, 0,
+                                    (int32_t)(SP_H + hh*head_dim*2), head_dim/16, k2};
+                vec_run(PROG_NORM_I32, nargs, 5);
+                float c2 = ldexpf(1.0f/(float)(uint32_t)P8, Rpre - Bv + k2);
+                aw_c[hh] = c2;
+                float hm2 = (float)(uint32_t)(am >> k2)*c2;
+                if (hm2 > aw_hmax) aw_hmax = hm2;
+                (void)ah;
                 perf_exit(OP_WV);
                 continue;
             }
@@ -927,7 +1008,24 @@ attn_scores: ;
         // Output projection + residual (resident).
         {
             const struct bons_entry *eo = model_entry(ROLE_ATTN_OUT, l);
-            int ea8 = quantize_f_pow2(attn, q_dim, SP_X);
+            int ea8;
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+            if (attn_hw) {
+                perf_enter(OP_QUANT8);
+                ea8 = 0;
+                if (aw_hmax > 0) { frexpf(aw_hmax, &ea8); ea8 -= 7; }
+                for (int hh = 0; hh < n_head; hh++) {
+                    int32_t Mh = (int32_t)lroundf(ldexpf(aw_c[hh], 15 - ea8));
+                    if (Mh > 32767) Mh = 32767;
+                    if (Mh < 0)     Mh = 0;
+                    int32_t sa2[5] = {(int32_t)(SP_H + hh*head_dim*2), 0,
+                                      (int32_t)(SP_X + hh*head_dim), head_dim/16, Mh};
+                    vec_run(PROG_SCALE8, sa2, 5);
+                }
+                perf_exit(OP_QUANT8);
+            } else
+#endif
+            ea8 = quantize_f_pow2(attn, q_dim, SP_X);
             model_matvec(eo, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);
             int kk = op_norm_i32_sp(SP_Y, SP_D, n_embd);

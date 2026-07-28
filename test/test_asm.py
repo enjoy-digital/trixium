@@ -256,3 +256,15 @@ def test_rope_accuracy():
     r1 = x[:hd//2]*np.sin(ang) + x[hd//2:]*np.cos(ang)
     assert np.abs(o0 - r0).max() < 3.0   # Q15 table + rounding.
     assert np.abs(o1 - r1).max() < 3.0
+
+def test_scale8():
+    rng = np.random.default_rng(12)
+    n   = 64
+    m   = rng.integers(-16000, 16000, n).astype(np.int64)
+    M   = 19571
+    sp  = bytearray(4096)
+    sp[0:2*n] = m.astype("<i2").tobytes()
+    _run("scale8", sp, [0, 0, 1024, n//16, M])
+    got = np.frombuffer(bytes(sp[1024:1024+n]), dtype=np.int8).astype(np.int64)
+    exp = np.clip(bx.rne_shift(m*M, 15), -127, 127)
+    assert np.array_equal(got, exp)

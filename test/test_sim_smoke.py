@@ -252,6 +252,52 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         vec_prog("rope", sp, [0, n, 4096, 4096 + n, (n//2)//16, 0, n])
         return np.frombuffer(bytes(sp[0:2*n]), dtype="<i2").astype(np.int64)
 
+    def kv_hbm_fused_int(l, kvh, q8):
+        # Returns (red int64, P8, Rpre, Bv): the integer pieces before normalization.
+        eq = E_NORM + 8
+        rowsk = hbm_kv[(l, kvh, 0)]
+        ekm = max(e for e, _ in rowsk)
+        Bk = 22 - ekm
+        boundk = (hd//32)*32*127*127*1024 << 12
+        Rk = 0
+        while (boundk >> Rk) >= (1 << 31):
+            Rk += 1
+        sck = np.array([[2.0**e]*(hd//32) for e, _ in rowsk], dtype=np.float16)
+        cdk = np.stack([c for _, c in rowsk])
+        res = bx.matvec_q8(sck, cdk, q8, Bk, Rk).astype(np.int64)
+        cnt = len(res)
+        padn = (16 - cnt % 16) % 16
+        buf = np.concatenate([res, np.full(padn, -2**31, dtype=np.int64)])
+        spb = bytearray(8192)
+        spb[0:4*len(buf)] = buf.astype("<i4").tobytes()
+        lg = int(np.log2(hd))
+        Ceff  = 523 if (lg & 1) else 739
+        sigma = eq - Bk + Rk - (lg >> 1)
+        s1v = 11
+        words = vasm.assemble(vasm.PROGRAMS["softmax8"]())
+        S, _ = vasm.VecInterp(spb).run(words, [0, Ceff, 4096, len(buf)//16,
+                                               -s1v, sigma + 6 + s1v])
+        p8 = np.frombuffer(bytes(spb[4096:4096+len(buf)]), dtype=np.int8).astype(np.int64)
+        P8 = int(S[6]) if S[6] else 1
+        rowsv = hbm_kv[(l, kvh, 1)]
+        ekv = max(e for e, _ in rowsv)
+        Bv = 22 - ekv
+        bound = P8*127*1024
+        bound <<= 12
+        bound *= 127
+        Rpre = 0
+        while (bound >> Rpre) >= (1 << 31):
+            Rpre += 1
+        nch = h["n_channels"]
+        red = np.zeros(hd, dtype=np.int64)
+        for c in range(nch):
+            posl = list(range(c, cnt, nch))
+            if posl:
+                scv = np.array([[2.0**rowsv[t][0]]*(hd//32) for t in posl], dtype=np.float16)
+                cdv = np.stack([rowsv[t][1] for t in posl])
+                red += bx.axpy_rows(scv, cdv, p8[posl], Bv, Rpre).astype(np.int64)
+        return red, P8, Rpre, Bv
+
     def kv_hbm_fused(l, kvh, qh, q8=None, eq=None):
         # Firmware's fused path: engine scores -> softmax8 (interpreter) -> AXPY -> reduce.
         if q8 is None:
@@ -329,10 +375,34 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         r  = f32(1.0)/np.sqrt(f32(f32(ss/f32(len(x))) + f32(eps)))
         return (x*r*w).astype(f32)
 
+    def embed_bfp_int(tok):
+        # Firmware's integer embed: (q-1)*m11 aligned to the smallest group e16, then
+        # normalized to 15-bit mantissas; all integer.
+        m11, e16 = bx.fp16_decompose(emb_s[tok])
+        e16min = int(e16.min())
+        sh  = np.minimum(e16 - e16min, 20).astype(np.int64)
+        q   = emb_c[tok].astype(np.int64).reshape(-1, 128) - 1
+        amax = 0
+        for g in range(q.shape[0]):
+            if np.any(q[g] != 0):
+                gm = int(abs(int(m11[g]))) << int(sh[g])
+                amax = max(amax, gm)
+        bl = amax.bit_length()
+        k2 = bl - 15
+        out = np.zeros(q.size, dtype=np.int64)
+        for g in range(q.shape[0]):
+            net = int(sh[g]) - k2
+            v2 = q[g]*int(m11[g])
+            out[g*128:(g+1)*128] = (v2 << net) if net >= 0 else (v2 >> -net)
+        return out.astype(np.int16).astype(np.int64), e16min + k2
+
     def forward(tok, pos, want):
-        xf = ((emb_c[tok].astype(np.int32) - 1)
-              .reshape(-1, 128)*emb_s[tok].astype(f32)[:, None]).reshape(-1).astype(f32)
-        xm, ex = to_bfp16(xf)
+        if modes.get("kv_hbm", "cpu") == "hw":
+            xm, ex = embed_bfp_int(tok)
+        else:
+            xf = ((emb_c[tok].astype(np.int32) - 1)
+                  .reshape(-1, 128)*emb_s[tok].astype(f32)[:, None]).reshape(-1).astype(f32)
+            xm, ex = to_bfp16(xf)
         for l in range(n_layer):
             p = f"blk.{l}."
             # Attention block.
@@ -370,12 +440,28 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                         (E_NORM + 8, quant8_sp(mh).astype(np.int8)))
                     hbm_kv.setdefault((l, i2, 1), []).append(
                         (evr + 8, quant8_sp(vm[i2*hd:(i2+1)*hd]).astype(np.int8)))
-                attn = np.zeros(n_head*hd, dtype=f32)
                 n_rep2 = n_head//n_kv
+                rms, cs = [], []
+                hmax = f32(0.0)
                 for i2 in range(n_head):
-                    attn[i2*hd:(i2+1)*hd] = kv_hbm_fused(l, i2//n_rep2, None,
-                                                         q8=qh8[i2], eq=E_NORM + 8)
-                a8, ea8 = quantize_f_pow2(attn)
+                    red, P8, Rpre, Bv = kv_hbm_fused_int(l, i2//n_rep2, qh8[i2])
+                    am = int(np.abs(red).max())
+                    k2 = 0
+                    while (am >> k2) > 16383:
+                        k2 += 1
+                    rm = np.clip(red >> k2, -32767, 32767)
+                    c2 = f32(np.ldexp(f32(1.0)/f32(P8), Rpre - Bv + k2))
+                    hm2 = f32(f32(am >> k2)*c2)
+                    if hm2 > hmax:
+                        hmax = hm2
+                    rms.append(rm)
+                    cs.append(c2)
+                ea8 = (int(np.frexp(hmax)[1]) - 7) if hmax > 0 else 0
+                a8 = np.zeros(n_head*hd, dtype=np.int8)
+                for i2 in range(n_head):
+                    Mh = int(np.clip(lroundf(np.ldexp(cs[i2], 15 - ea8)), 0, 32767))
+                    a8[i2*hd:(i2+1)*hd] = np.clip(
+                        bx.rne_shift(rms[i2]*Mh, 15), -127, 127).astype(np.int8)
                 res, er = matvec_i8(p + "attn_output.weight", a8, ea8)
                 dm, kk  = norm_i32_sp(res)
                 xm, ex  = resid_sp(xm, ex, dm, er + kk)
