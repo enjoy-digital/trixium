@@ -49,7 +49,11 @@ class BonsaiMatVecEngine(LiteXModule):
             ("rshift", 6),   # R.
             ("xsrc",   24),  # x8 source byte address in scratchpad (32B aligned).
             ("dst",    24),  # Result destination byte address in scratchpad (4B aligned).
-            ("chan",   5),   # Fetch: source channel index.
+            ("chan",   5),   # Fetch: source channel index. Store: destination channel.
+            ("rem",    5),   # Channels < rem stream one extra row (position-striped KV:
+                             # rows = T//n_channels, rem = T % n_channels).
+            ("ilv",    1),   # Interleaved gather: result slot = row*n_channels + chan
+                             # (position-major scores) instead of chan*rows + row.
         ])
         self.busy   = Signal()
         self.done   = Signal() # Pulse.
@@ -95,7 +99,7 @@ class BonsaiMatVecEngine(LiteXModule):
         # Latched command ---------------------------------------------------------------------
         cmd_r = {}
         for name in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-                     "bias", "rshift", "xsrc", "dst", "chan"):
+                     "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv"):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
@@ -106,11 +110,11 @@ class BonsaiMatVecEngine(LiteXModule):
             fetch_chan.eq(cmd_r["chan"]),
         ]
 
-        # Broadcast op params to pipes.
-        for pipe in self.pipes:
+        # Broadcast op params to pipes (channels < rem run one extra row).
+        for i, pipe in enumerate(self.pipes):
             self.comb += [
                 pipe.kind.eq(cmd_r["kind"]),
-                pipe.rows.eq(cmd_r["rows"]),
+                pipe.rows.eq(cmd_r["rows"] + (i < cmd_r["rem"])),
                 pipe.scale_beats.eq(cmd_r["sbeats"]),
                 pipe.code_beats.eq(cmd_r["cbeats"]),
                 pipe.bias.eq(cmd_r["bias"]),
@@ -188,7 +192,11 @@ class BonsaiMatVecEngine(LiteXModule):
         eng_gw_we  = Signal(8)
         eng_gw_dat = Signal(256)
         self.comb += [
-            slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["rows"] + grant_row),
+            If(cmd_r["ilv"],
+                slot.eq((cmd_r["dst"] >> 2) + grant_row*self.n_channels + rr.grant),
+            ).Else(
+                slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["rows"] + grant_row),
+            ),
             If(fetch_mode,
                 eng_gw_adr.eq((cmd_r["dst"] >> 5) + fetch_cnt),
                 eng_gw_dat.eq(fetch_data),
@@ -289,7 +297,9 @@ class BonsaiMatVecEngine(LiteXModule):
             *[r.sink.valid.eq(~fetch_mode | (fetch_chan == i))
               for i, r in enumerate(self.readers)],
             *[r.sink.addr.eq(cmd_r["wbase"]) for r in self.readers],
-            *[r.sink.len.eq(cmd_r["wlen"]) for r in self.readers],
+            *[r.sink.len.eq(cmd_r["wlen"]
+                + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
+              for i, r in enumerate(self.readers)],
             # All readers are idle here: they accept together.
             If(self.readers[0].sink.ready,
                 NextState("RUN"),
@@ -299,7 +309,7 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             If(Mux(fetch_mode,
                    fetch_cnt == cmd_r["wlen"],
-                   result_cnt == (cmd_r["rows"]*self.n_channels)),
+                   result_cnt == (cmd_r["rows"]*self.n_channels + cmd_r["rem"])),
                 self.done.eq(1),
                 NextState("IDLE"),
             )

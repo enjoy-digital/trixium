@@ -35,7 +35,9 @@ class BonsaiEngineCSR(LiteXModule):
         self.rshift  = CSRStorage(6,  description="Result shift R.")
         self.xsrc    = CSRStorage(24, description="x8 source scratchpad byte address.")
         self.dst     = CSRStorage(24, description="Result destination scratchpad byte address.")
-        self.chan    = CSRStorage(5,  description="Fetch source channel.")
+        self.chan    = CSRStorage(5,  description="Fetch source / store destination channel.")
+        self.rem     = CSRStorage(5,  description="Channels < rem stream one extra row.")
+        self.ilv     = CSRStorage(1,  description="Interleaved (position-major) gather.")
         self.submit  = CSRStorage(1,  description="Write 1 to submit the op.")
         self.status  = CSRStatus(fields=[
             CSRField("busy",     size=1),
@@ -84,6 +86,8 @@ class BonsaiEngineCSR(LiteXModule):
             engine.cmd.xsrc.eq(self.xsrc.storage),
             engine.cmd.dst.eq(self.dst.storage),
             engine.cmd.chan.eq(self.chan.storage),
+            engine.cmd.rem.eq(self.rem.storage),
+            engine.cmd.ilv.eq(self.ilv.storage),
             self.status.fields.busy.eq(engine.busy),
             self.status.fields.error.eq(engine.error),
             self.status.fields.pending.eq(pending),

@@ -345,3 +345,42 @@ def test_engine_store_roundtrip():
         assert bytes(got) == src.tobytes(), "store/fetch roundtrip mismatch"
 
     run_simulation(dut, [driver()])
+
+def test_matvec_q8_striped_interleave():
+    # Scores-op shape: position-striped rows (uneven per channel via rem) + interleaved
+    # (position-major) gather, Q8 kind - each row carries its own scale, per-position KV.
+    n_channels, cols, seed = 2, 128, 23
+    for T in (1, 2, 5, 8):  # positions (total rows); T=1 -> rows=0 on one channel.
+        rng    = np.random.default_rng(seed + T)
+        scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
+        q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B = bx.choose_scale_bias(e16)
+        R = bx.choose_result_shift(scales, B, gs_max=bx.GS_MAX_Q8)
+        expected = bx.matvec_q8(scales, q8w, x8, B, R)  # Position order.
+
+        rows, rem = T//n_channels, T % n_channels
+        payloads = []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]  # local row r <-> t = r*N + c
+            spec_c = TensorSpec("kv", layout.ROLE_ATTN_K if hasattr(layout, "ROLE_ATTN_K")
+                                else layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                max(len(pos), 1), cols,
+                                scales=scales[pos] if pos else scales[:1],
+                                values=q8w[pos] if pos else q8w[:1])
+            payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes() if pos else b"")
+
+        # Pad payloads to equal length for the DUT init (readers stop at their own len).
+        maxlen = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0)
+        rb  = layout.row_beats(cols, layout.KIND_Q8)
+        cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                   bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
+        got = _run_engine(dut, cmd, T, 0x4000)
+        assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
