@@ -38,6 +38,9 @@ uint32_t hw_caps(void)
 #ifdef BONSAI_HAS_TOPK
     caps |= (1 << OP_LMHEAD);
 #endif
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+    caps |= (1 << OP_SOFTMAX); // Fused resident attention (softmax8 + AXPY + reduce).
+#endif
     return caps;
 }
 

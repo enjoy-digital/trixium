@@ -605,6 +605,79 @@ static int forward(int token, int want_logits)
             int kvh = hh/n_rep;
             const float *qh = q + hh*head_dim;
             float smax = -1e30f;
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+            if (op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
+                // Fused resident path: scores (engine) -> softmax8 (vec, p8 + exact sum)
+                // -> weighted-V (engine AXPY) -> cross-channel reduce (vec). Scores never
+                // touch the CPU; the 1/sum fold is one float divide per head.
+                float *ah = attn + hh*head_dim;
+                perf_enter(OP_SCORES);
+                int eq = quantize_f_pow2(qh, head_dim, SP_X);
+                int Bk, Rk;
+                kv_scores_br(l, kvh, 0, &Bk, &Rk);
+                struct engine_op op = {0};
+                op.kind   = ENGINE_KIND_Q8;
+                op.rows   = (pos + 1)/n_ch;
+                op.rem    = (pos + 1) % n_ch;
+                op.ilv    = 1;
+                op.cols   = head_dim;
+                op.wbase  = kv_region_addr(l, kvh, 0);
+                op.wlen   = (uint32_t)op.rows*kv_rb;
+                op.sbeats = 1;
+                op.cbeats = head_dim/32;
+                op.bias   = Bk;
+                op.rshift = Rk;
+                op.xsrc   = SP_X;
+                op.dst    = SP_SC;
+                engine_run(&op);
+                perf_exit(OP_SCORES);
+                perf_enter(OP_SOFTMAX);
+                int cnt = pos + 1;
+                int padn = (16 - (cnt & 15)) & 15;
+                volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
+                for (int i2 = 0; i2 < padn; i2++)
+                    sc32[cnt + i2] = (int32_t)0x80000000;
+                // Attention scale 1/sqrt(head_dim): whole powers of two fold into
+                // sigma, an odd half folds into the log2e constant (739 -> 523).
+                int lg = 0;
+                while ((1 << lg) < head_dim) lg++;
+                int Ceff  = (lg & 1) ? 523 : 739;
+                int sigma = eq - Bk + Rk - (lg >> 1);
+                int s1v = 11;
+                int32_t sargs[6] = {(int32_t)SP_SC, Ceff, (int32_t)SP_X, (cnt + padn)/16,
+                                    -s1v, sigma + 6 + s1v};
+                uint64_t P8 = vec_run(PROG_SOFTMAX8, sargs, 6);
+                perf_exit(OP_SOFTMAX);
+                perf_enter(OP_WV);
+                int Bv, Rd;
+                kv_scores_br(l, kvh, 1, &Bv, &Rd);
+                int Rpre = axpy_rpre_c(P8 ? P8 : 1);
+                struct engine_op wv = {0};
+                wv.kind   = ENGINE_KIND_AXPY;
+                wv.rows   = (pos + 1)/n_ch;
+                wv.rem    = (pos + 1) % n_ch;
+                wv.cols   = head_dim;
+                wv.wbase  = kv_region_addr(l, kvh, 1);
+                wv.wlen   = (uint32_t)wv.rows*kv_rb;
+                wv.sbeats = 1;
+                wv.cbeats = head_dim/32;
+                wv.bias   = Bv;
+                wv.rshift = Rpre;
+                wv.xsrc   = SP_X;
+                wv.dst    = SP_SC;
+                engine_run(&wv);
+                for (int c = 1; c < n_ch; c++) {
+                    int32_t rargs[4] = {(int32_t)SP_SC, (int32_t)(SP_SC + c*head_dim*4),
+                                        (int32_t)SP_SC, head_dim/8};
+                    vec_run(PROG_REDUCE_ACC, rargs, 4);
+                }
+                float fs = ldexpf(1.0f/(float)(uint32_t)P8, Rpre - Bv);
+                for (int d = 0; d < head_dim; d++)
+                    ah[d] = (float)sc32[d]*fs;
+                perf_exit(OP_WV);
+                continue;
+            }
+#endif
             perf_enter(OP_SCORES);
 #ifdef BONSAI_HAS_KVSTORE
             if (op_on_hw(OP_SCORES)) {

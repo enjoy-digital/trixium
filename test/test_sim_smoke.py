@@ -230,6 +230,58 @@ def hybrid_generate(img, prompt, n_new, modes=None):
             acc = (acc + parts[c]).astype(f32)
         return acc*f32(np.exp2(ep + Rpre - B))
 
+    def kv_hbm_fused(l, kvh, qh):
+        # Firmware's fused path: engine scores -> softmax8 (interpreter) -> AXPY -> reduce.
+        eq = 0
+        amax = np.abs(qh).max()
+        if amax > 0:
+            eq = int(np.frexp(f32(amax))[1]) - 7
+        q8 = np.clip(lroundf(qh*f32(np.exp2(-eq))), -127, 127).astype(np.int8)
+        rowsk = hbm_kv[(l, kvh, 0)]
+        ekm   = max(e for e, _ in rowsk)
+        Bk    = 22 - ekm
+        boundk = (hd//32)*32*127*127*1024 << 12
+        Rk = 0
+        while (boundk >> Rk) >= (1 << 31):
+            Rk += 1
+        sck = np.array([[2.0**e]*(hd//32) for e, _ in rowsk], dtype=np.float16)
+        cdk = np.stack([c for _, c in rowsk])
+        res = bx.matvec_q8(sck, cdk, q8, Bk, Rk).astype(np.int64)
+        cnt  = len(res)
+        padn = (16 - cnt % 16) % 16
+        buf  = np.concatenate([res, np.full(padn, -2**31, dtype=np.int64)])
+        spb  = bytearray(8192)
+        spb[0:4*len(buf)] = buf.astype("<i4").tobytes()
+        lg = int(np.log2(hd))
+        Ceff  = 523 if (lg & 1) else 739
+        sigma = eq - Bk + Rk - (lg >> 1)
+        s1v   = 11
+        words = vasm.assemble(vasm.PROGRAMS["softmax8"]())
+        S, _  = vasm.VecInterp(spb).run(words, [0, Ceff, 4096, len(buf)//16,
+                                                -s1v, sigma + 6 + s1v])
+        p8 = np.frombuffer(bytes(spb[4096:4096+len(buf)]), dtype=np.int8).astype(np.int64)
+        P8 = int(S[6]) if S[6] else 1
+        rowsv = hbm_kv[(l, kvh, 1)]
+        ekv   = max(e for e, _ in rowsv)
+        Bv    = 22 - ekv
+        bound = P8*127*1024
+        bound <<= 12
+        bound *= 127
+        Rpre = 0
+        while (bound >> Rpre) >= (1 << 31):
+            Rpre += 1
+        nch = h["n_channels"]
+        red = np.zeros(hd, dtype=np.int64)
+        for c in range(nch):
+            posl = list(range(c, cnt, nch))
+            if posl:
+                scv = np.array([[2.0**rowsv[t][0]]*(hd//32) for t in posl], dtype=np.float16)
+                cdv = np.stack([rowsv[t][1] for t in posl])
+                red += bx.axpy_rows(scv, cdv, p8[posl], Bv, Rpre).astype(np.int64)
+        assert np.abs(red).max() < 2**31
+        fs = f32(np.ldexp(f32(1.0)/f32(P8), Rpre - Bv))
+        return red.astype(f32)*fs
+
     def kv_hbm_scores(l, kvh, qh):
         eq = 0
         amax = np.abs(qh).max()
@@ -296,11 +348,11 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                 kvh = i//n_rep
                 qh  = q[i*hd:(i+1)*hd]
                 if modes.get("kv_hbm", "cpu") == "hw":
-                    sc = kv_hbm_scores(l, kvh, qh)
-                else:
-                    sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst)
-                                    for kt, kst in zip(kc[l], ks[l])], dtype=f32)
-                    sc  = sc*f32(1.0/np.sqrt(hd))
+                    attn[i*hd:(i+1)*hd] = kv_hbm_fused(l, kvh, qh)
+                    continue
+                sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst)
+                                for kt, kst in zip(kc[l], ks[l])], dtype=f32)
+                sc  = sc*f32(1.0/np.sqrt(hd))
                 e   = np.exp(sc - sc.max(), dtype=f32)
                 pr  = e*f32(f32(1.0)/fsum32(e))
                 if modes.get("kv_hbm", "cpu") == "hw":
