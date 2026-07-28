@@ -118,8 +118,8 @@ def test_scalar_ops_m4():
         ("DONE",),
     ]
     words = asm.assemble(prog)
-    for a0, a1, sh in [(100, 23, 3), (1 << 40, 5, -12), (7, 0, 30), (-50, 20, 2),
-                       (0x3FFFFFFFFFF, 0, -20), (12345, 6789, 0)]:
+    for a0, a1, sh in [(100, 23, 3), (1 << 30, 5, -12), (7, 0, 30), (-50, 20, 2),
+                       (0x3FFFFFFF, 0, -20), (12345, 6789, 0)]:
         S, _ = asm.VecInterp(bytearray(64)).run(words, [a0, a1, sh])
         v = a0 + a1
         exp_shift = (v << sh) if sh >= 0 else (v >> -sh)
@@ -135,16 +135,20 @@ def test_scalar_ops_m4():
             assert (1 << 30) <= nv < (1 << 32), (exp_shift, e)
 
 def test_snorme_full_range():
-    prog = [("ARG", "s0", 0), ("SNORME", "s1", "s0"), ("SSHLV", "s0", "s1"),
+    # Args are int32 (sign-extended); values above 2^31 are built in-program via SSHLV.
+    prog = [("ARG", "s0", 0), ("ARG", "s1", 1), ("SSHLV", "s0", "s1"),
+            ("SNORME", "s1", "s0"), ("SSHLV", "s0", "s1"),
             ("SMOV", "s6", "s0"), ("SMOV", "s7", "s1"), ("DONE",)]
     words = asm.assemble(prog)
     for p in range(0, 47):
-        for v in {1 << p, (1 << p) + (1 << max(0, p - 3)), (1 << (p + 1)) - 1}:
-            if v >= (1 << 47):
+        for base in {1 << min(p, 30), (1 << min(p, 30)) + (1 << max(0, min(p, 30) - 3)),
+                     (1 << (min(p, 30) + 1)) - 1}:
+            up = p - min(p, 30)
+            S, _ = asm.VecInterp(bytearray(64)).run(words, [base, up])
+            if (base << up) >= (1 << 47):
                 continue
-            S, _ = asm.VecInterp(bytearray(64)).run(words, [v])
             assert S[7] % 2 == 0
-            assert (1 << 30) <= S[6] < (1 << 32), (v, S[6], S[7])
+            assert (1 << 30) <= S[6] < (1 << 32), (base, up, S[6], S[7])
 
 E_NORM_T = -11
 E_W_T    = -13

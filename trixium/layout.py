@@ -45,8 +45,12 @@ KIND_TERNARY = 0 # 2-bit codes {0,1,2}, group=128, w = (q-1)*scale.
 KIND_Q8      = 1 # int8 quants, group=32, w = q*scale.
 KIND_F16     = 2 # Raw fp16 rows (no scales).
 KIND_F32     = 3 # Raw fp32 rows (no scales; norms etc, consumed by CPU/vector unit).
+KIND_NORM16  = 4 # int16 rows at fixed exponent NORM16_EXP (norm weights for the vector unit).
 
-KIND_NAMES = {KIND_TERNARY: "ternary", KIND_Q8: "q8", KIND_F16: "f16", KIND_F32: "f32"}
+NORM16_EXP = -13 # w = q * 2^-13: |w| < 4 with ~1.2e-4 resolution - covers rmsnorm gammas.
+
+KIND_NAMES = {KIND_TERNARY: "ternary", KIND_Q8: "q8", KIND_F16: "f16", KIND_F32: "f32",
+              KIND_NORM16: "norm16"}
 
 KIND_GROUP = {KIND_TERNARY: GROUP_TERNARY, KIND_Q8: GROUP_Q8}
 
@@ -79,8 +83,8 @@ def row_groups(cols, kind):
     return cols//group
 
 def scale_beats(cols, kind):
-    """Beats of fp16 group scales prepended to each row (0 for f16/f32 rows)."""
-    if kind in (KIND_F16, KIND_F32):
+    """Beats of fp16 group scales prepended to each row (0 for f16/f32/norm16 rows)."""
+    if kind in (KIND_F16, KIND_F32, KIND_NORM16):
         return 0
     return ceil_div(row_groups(cols, kind), SCALES_PER_BEAT)
 
@@ -94,6 +98,8 @@ def code_beats(cols, kind):
         return ceil_div(2*cols, BEAT_BYTES)
     if kind == KIND_F32:
         return ceil_div(4*cols, BEAT_BYTES)
+    if kind == KIND_NORM16:
+        return ceil_div(2*cols, BEAT_BYTES)
     raise ValueError(kind)
 
 def row_beats(cols, kind):

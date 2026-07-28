@@ -21,7 +21,7 @@ import numpy as np
 from trixium import layout
 from trixium.layout import (
     BEAT_BYTES, GROUP_TERNARY, GROUP_Q8, SCALES_PER_BEAT,
-    KIND_TERNARY, KIND_Q8, KIND_F16, KIND_F32, KIND_NAMES, ROLE_NAMES,
+    KIND_TERNARY, KIND_Q8, KIND_F16, KIND_F32, KIND_NORM16, KIND_NAMES, ROLE_NAMES,
     FLAG_REPLICATED, ceil_div, scale_beats, code_beats, row_beats, shard_rows,
 )
 
@@ -87,6 +87,9 @@ def encode_rows(spec, row0, nrows):
     elif spec.kind == KIND_F32:
         vbytes = np.ascontiguousarray(v.astype(np.float32)).view(np.uint8).reshape(nrows, -1)
         out[:, sb*BEAT_BYTES:sb*BEAT_BYTES + vbytes.shape[1]] = vbytes
+    elif spec.kind == KIND_NORM16:
+        vbytes = np.ascontiguousarray(v.astype("<i2")).view(np.uint8).reshape(nrows, -1)
+        out[:, sb*BEAT_BYTES:sb*BEAT_BYTES + vbytes.shape[1]] = vbytes
     else:
         raise ValueError(spec.kind)
     return out.reshape(-1)
@@ -116,6 +119,8 @@ def decode_rows(spec_entry, payload):
         values = body[:, :2*cols].copy().view(np.float16)
     elif kind == KIND_F32:
         values = body[:, :4*cols].copy().view(np.float32)
+    elif kind == KIND_NORM16:
+        values = body[:, :2*cols].copy().view(np.int16)
     else:
         raise ValueError(kind)
     return scales, values
@@ -127,6 +132,18 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
     chan_payloads = [bytearray() for _ in range(n_channels)]
     entries       = []
     manifest_tensors = []
+
+    # Every F32 tensor (norm weights) gets an int16 companion at NORM16_EXP so the vector
+    # unit's rmsnorm can fetch it straight into the scratchpad (same role/layer; ".w16"
+    # name - the entry name field is 24 bytes; consumers select by kind).
+    tensors = list(tensors)
+    for spec in [t for t in tensors if t.kind == KIND_F32]:
+        q = np.clip(np.round(spec.values.astype(np.float64)*2.0**(-layout.NORM16_EXP)),
+                    -32767, 32767).astype(np.int16)
+        n16_name = spec.name.replace(".weight", "") + ".w16"
+        tensors.append(TensorSpec(n16_name, spec.role, spec.layer,
+                                  layout.KIND_NORM16, spec.rows, spec.cols,
+                                  values=q, flags=spec.flags))
 
     for spec in tensors:
         base_beats = len(chan_payloads[0])//BEAT_BYTES
