@@ -144,19 +144,18 @@ def axpy_rows(scales_f16, v8w, p8, B, Rpre):
     """AXPY mode (weighted-V): accumulate coeff_t * v_t into per-lane int32 accumulators.
     scales (M, K//32) fp16 (per-row 2^ev, all groups equal), v8w (M, K) int8 V rows,
     p8 (M,) int8 probability coefficients (position t -> row t of this channel's stripe).
-    Per row: coeff = p8_t * m11_t shifted by (e16_t + B), each product pre-shifted by Rpre
-    (floor) before accumulation so the int32 lanes never wrap:
-      acc[d] += (coeff * v8[t, d]) >> Rpre.
-    Firmware picks B = 12 - max(e16) (as Q8) and Rpre >= ceil(log2(sum_t p8 * 127)) + 22 - 31.
-    Returns int32 (K,)."""
+    Per-lane (RTL-faithful) form - pow-2 row scales only (m11 == 1024, the kvpack
+    contract), so the whole row weight is one shift:
+      acc[d] += (p8_t * v8[t, d]) << (10 + e16_t + B - Rpre)   (arith >> if negative)
+    Firmware picks B = 12 - max(e16) (as Q8) and Rpre from axpy_rpre(). Returns int32 (K,)."""
     M, K = v8w.shape
     m11, e16 = fp16_decompose(scales_f16)
+    assert np.all(np.abs(m11) == 1024), "axpy requires pow-2 row scales"
     acc = np.zeros(K, dtype=np.int64)
     for t in range(M):
-        sh = int(e16[t, 0]) + B  # All groups share the row scale.
-        c  = int(p8[t])*int(m11[t, 0])
-        c  = (c << sh) if sh >= 0 else (c >> -sh)
-        acc += (int(c)*v8w[t].astype(np.int64)) >> Rpre
+        sh = 10 + int(e16[t, 0]) + B - Rpre  # Row-constant lane shift.
+        prod = int(p8[t])*v8w[t].astype(np.int64)
+        acc += (prod << sh) if sh >= 0 else (prod >> -sh)
         assert np.all(np.abs(acc) < 2**31), "axpy accumulator overflow"
     return acc.astype(np.int32)
 
