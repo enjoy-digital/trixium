@@ -32,10 +32,8 @@ uint32_t hw_caps(void)
     caps |= (1 << OP_RMSNORM); // QKNORM/ROPE/SOFTMAX land with the attention flip (M5).
 #endif
 #ifdef BONSAI_HAS_KVSTORE
-    caps |= (1 << OP_KVQUANT) | (1 << OP_SCORES);
-#endif
-#ifdef BONSAI_HAS_AXPY
-    caps |= (1 << OP_WV);
+    // KVQUANT/SCORES/WV all ride the KV regions + engine (AXPY is in the base engine).
+    caps |= (1 << OP_KVQUANT) | (1 << OP_SCORES) | (1 << OP_WV);
 #endif
 #ifdef BONSAI_HAS_TOPK
     caps |= (1 << OP_LMHEAD);

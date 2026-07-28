@@ -262,15 +262,19 @@ class BonsaiChannelPipe(LiteXModule):
         # with B on self.bias and Rpre on self.rshift. Lane products (v8 * p8, registered at
         # T2) shift at T2->T3, accumulate per (group, lane) at T3; after the final row a
         # drain FSM streams code_beats*32 accumulators into the out FIFO (row = g*32 + j).
+        # Signed-only arithmetic through dedicated intermediates (unsigned operands mixed
+        # into signed expressions emit corrupt Verilog - see the fp16 decompose below).
         ax_sh    = Signal((9, True))
         ax_exp   = Signal(5)
+        ax_exp_s = Signal((7, True))
         ax_bias  = Signal((8, True))
         ax_rpre  = Signal((8, True))
         self.comb += [
             ax_exp.eq(scale_f16[10:15]),
+            ax_exp_s.eq(ax_exp),          # Zero-extend into a signed signal.
             ax_bias.eq(self.bias),
             ax_rpre.eq(self.rshift),
-            ax_sh.eq(ax_exp - 15 + ax_bias - ax_rpre),
+            ax_sh.eq(ax_exp_s - 15 + ax_bias - ax_rpre),
         ]
         ax_shl = Signal(4)
         ax_shr = Signal(5)

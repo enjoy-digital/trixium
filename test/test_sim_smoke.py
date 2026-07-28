@@ -202,6 +202,34 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         codes = np.clip(lroundf(vec*f32(np.exp2(-ek))), -127, 127).astype(np.int8)
         hbm_kv.setdefault((l, kvh, kind), []).append((ek, codes))
 
+    def kv_hbm_wv(l, kvh, pr):
+        pmax = pr.max()
+        ep = (int(np.frexp(f32(pmax))[1]) - 7) if pmax > 0 else 0
+        p8 = np.clip(lroundf(pr*f32(np.exp2(-ep))), 0, 127).astype(np.int64)
+        rowsd = hbm_kv[(l, kvh, 1)]
+        ekmax = max(e for e, _ in rowsd)
+        B     = 22 - ekmax
+        bound = ((1 << -ep) + len(pr))*127*1024
+        bound <<= 12
+        bound *= 127
+        Rpre = 0
+        while (bound >> Rpre) >= (1 << 31):
+            Rpre += 1
+        nch = h["n_channels"]
+        parts = []
+        for c in range(nch):
+            pos = list(range(c, len(pr), nch))
+            if pos:
+                sc8 = np.array([[2.0**rowsd[t][0]]*(hd//32) for t in pos], dtype=np.float16)
+                cd8 = np.stack([rowsd[t][1] for t in pos])
+                parts.append(bx.axpy_rows(sc8, cd8, p8[pos], B, Rpre).astype(f32))
+            else:
+                parts.append(np.zeros(hd, dtype=f32))
+        acc = np.zeros(hd, dtype=f32)
+        for c in range(nch):
+            acc = (acc + parts[c]).astype(f32)
+        return acc*f32(np.exp2(ep + Rpre - B))
+
     def kv_hbm_scores(l, kvh, qh):
         eq = 0
         amax = np.abs(qh).max()
@@ -275,10 +303,13 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                     sc  = sc*f32(1.0/np.sqrt(hd))
                 e   = np.exp(sc - sc.max(), dtype=f32)
                 pr  = e*f32(f32(1.0)/fsum32(e))
-                ah  = np.zeros(hd, dtype=f32)
-                for t in range(len(vc[l])):
-                    ah += pr[t]*vs[l][t]*vc[l][t][kvh*hd:(kvh+1)*hd].astype(f32)
-                attn[i*hd:(i+1)*hd] = ah
+                if modes.get("kv_hbm", "cpu") == "hw":
+                    attn[i*hd:(i+1)*hd] = kv_hbm_wv(l, kvh, pr)
+                else:
+                    ah  = np.zeros(hd, dtype=f32)
+                    for t in range(len(vc[l])):
+                        ah += pr[t]*vs[l][t]*vc[l][t][kvh*hd:(kvh+1)*hd].astype(f32)
+                    attn[i*hd:(i+1)*hd] = ah
             a8, ea8 = quantize_f_pow2(attn)
             res, er = matvec_i8(p + "attn_output.weight", a8, ea8)
             dm, kk  = norm_i32_sp(res)

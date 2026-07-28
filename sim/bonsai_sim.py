@@ -117,6 +117,7 @@ class BonsaiSimSoC(SoCCore):
             self.engine.store_busy.eq(self.loader.store_busy),
         ]
         self.add_constant("BONSAI_HAS_KVSTORE")
+        self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
         self.add_constant("BONSAI_HAS_VECUNIT")
         self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set (rmsnorm scalar ops + rsqrt fix).
 

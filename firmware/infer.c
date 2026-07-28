@@ -194,6 +194,17 @@ static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
     if (ek > kv_ekmax[idx]) kv_ekmax[idx] = ek;
 }
 
+// Smallest AXPY pre-shift keeping the int32 lane accumulators safe (bitexact.axpy_rpre).
+static int axpy_rpre_c(uint64_t p8sum)
+{
+    uint64_t bound = p8sum*127ull*1024ull;
+    bound <<= 12;
+    bound *= 127ull;
+    int r = 0;
+    while ((bound >> r) >= (1ull << 31)) r++;
+    return r;
+}
+
 // B/R for a scores op over a region: pow-2 scales make e16 + B == 12 exactly
 // (fp16_decompose: 2^ek = 1024 * 2^(ek-10); B = 12 - (ekmax - 10) = 22 - ekmax), so the
 // worst-row acc bound is closed-form: groups * (32*127*127) * 1024 << 12.
@@ -645,6 +656,58 @@ static int forward(int token, int want_logits)
             float inv = 1.0f/sum;
             perf_enter(OP_WV);
             float *ah = attn + hh*head_dim;
+#ifdef BONSAI_HAS_KVSTORE
+            if (op_on_hw(OP_WV)) {
+                // Probs -> int8 @ 2^ep (position-major in SP_X), one AXPY op over the V
+                // region; each channel lands head_dim int32 partials chan-major in SP_SC.
+                float pmax = 0;
+                for (int t = 0; t <= pos; t++) {
+                    float p = scores[t]*inv;
+                    if (p > pmax) pmax = p;
+                }
+                int ep = 0;
+                if (pmax > 0) { frexpf(pmax, &ep); ep -= 7; }
+                float pis = ldexpf(1.0f, -ep);
+                volatile uint32_t *px = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_X);
+                for (int t = 0; t <= pos; t += 4) {
+                    uint32_t w = 0;
+                    for (int b = 0; b < 4 && t + b <= pos; b++) {
+                        int p8 = (int)lroundf(scores[t+b]*inv*pis);
+                        if (p8 > 127) p8 = 127;
+                        if (p8 < 0)   p8 = 0;
+                        w |= ((uint32_t)p8) << (8*b);
+                    }
+                    px[t/4] = w;
+                }
+                int B, Rd;
+                kv_scores_br(l, kvh, 1, &B, &Rd);
+                int Rpre = axpy_rpre_c((uint64_t)(1u << -ep) + (uint32_t)(pos + 1));
+                struct engine_op op = {0};
+                op.kind   = ENGINE_KIND_AXPY;
+                op.rows   = (pos + 1)/n_ch;
+                op.rem    = (pos + 1) % n_ch;
+                op.cols   = head_dim;
+                op.wbase  = kv_region_addr(l, kvh, 1);
+                op.wlen   = (uint32_t)op.rows*kv_rb;
+                op.sbeats = 1;
+                op.cbeats = head_dim/32;
+                op.bias   = B;
+                op.rshift = Rpre;
+                op.xsrc   = SP_X;
+                op.dst    = SP_SC;
+                engine_run(&op);
+                volatile int32_t *pt = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
+                float fs = ldexpf(1.0f, ep + Rpre - B);
+                for (int d = 0; d < head_dim; d++) {
+                    float acc = 0;
+                    for (int c = 0; c < n_ch; c++)
+                        acc += (float)pt[c*head_dim + d];
+                    ah[d] = acc*fs;
+                }
+                perf_exit(OP_WV);
+                continue;
+            }
+#endif
             for (int d = 0; d < head_dim; d++) ah[d] = 0;
             for (int t = 0; t <= pos; t++) {
                 const int8_t *vt = v_cache + ((uint64_t)l*max_ctx + t)*kv_dim + kvh*head_dim;
@@ -737,6 +800,34 @@ static int forward(int token, int want_logits)
     uint32_t chunk_rpc = 0x20000/(4*n_ch); // 128 KB of int32 results per chunk.
     if (chunk_rpc > rpc) chunk_rpc = rpc;
 
+#ifdef BONSAI_HAS_TOPK
+    if (op_on_hw(OP_LMHEAD)) {
+        // One suppressed-write op over every row; the argmax tap returns value+index
+        // (global row order, ties to smallest - same as the CPU scan). Padding rows
+        // (vocab not divisible by n_ch) can win with garbage logits: fall through to
+        // the chunked CPU scan in that rare case.
+        uint32_t rb = bons_row_beats(head->cols, head->kind, head->group);
+        struct engine_op op = {0};
+        op.kind   = ENGINE_KIND_TERNARY;
+        op.rows   = rpc;
+        op.cols   = head->cols;
+        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + head->chan_base_beats*32;
+        op.wlen   = rpc*rb;
+        op.sbeats = bons_scale_beats(head->cols, head->group);
+        op.cbeats = bons_code_beats(head->cols, head->kind);
+        op.bias   = head->bias;
+        op.rshift = head->rshift;
+        op.xsrc   = SP_X;
+        op.dst    = SP_Y;
+        op.supw   = 1;
+        engine_run(&op);
+        uint32_t idx = engine_csr_argmax_idx_read();
+        if (idx < H->vocab) {
+            perf_exit(OP_LMHEAD);
+            return (int)idx;
+        }
+    }
+#endif
     int32_t best = -0x7FFFFFFF;
     int     best_tok = 0;
     volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);

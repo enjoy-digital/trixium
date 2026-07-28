@@ -141,6 +141,7 @@ class BonsaiSoC(SoCCore):
                 self.engine.store_busy.eq(self.loader.store_busy),
             ]
             self.add_constant("BONSAI_HAS_KVSTORE")
+            self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
             self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
 
             # Scratchpad on the SoC bus (uncached: shared with the engine).
