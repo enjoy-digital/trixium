@@ -161,7 +161,7 @@ def test_rtl_softmax8():
     sp  = bytearray(SP_SIZE)
     sp[0:4*pad] = buf.astype("<i4").tobytes()
     sigma, s1 = -18, 11
-    _compare("softmax8", bytes(sp), [0, 4096, 8192, pad//16, -s1, -(-(sigma + 6) - s1)])
+    _compare("softmax8", bytes(sp), [0, 739, 8192, pad//16, -s1, -(-(sigma + 6) - s1)])
 
 def test_rtl_reduce_acc():
     rng = np.random.default_rng(62)
@@ -170,3 +170,13 @@ def test_rtl_reduce_acc():
     sp[0:4*n]         = rng.integers(-2**28, 2**28, n).astype("<i4").tobytes()
     sp[1024:1024+4*n] = rng.integers(-2**28, 2**28, n).astype("<i4").tobytes()
     _compare("reduce_acc", bytes(sp), [0, 1024, 0, n//8])
+
+def test_rtl_rope():
+    rng = np.random.default_rng(63)
+    hd  = 64
+    sp  = bytearray(SP_SIZE)
+    sp[0:hd]       = rng.integers(-30000, 30000, hd//2).astype("<i2").tobytes()
+    sp[256:256+hd] = rng.integers(-30000, 30000, hd//2).astype("<i2").tobytes()
+    sp[512:512+hd] = rng.integers(-32767, 32768, hd//2).astype("<i2").tobytes()
+    sp[768:768+hd] = rng.integers(-32767, 32768, hd//2).astype("<i2").tobytes()
+    _compare("rope", bytes(sp), [0, 256, 512, 768, hd//2//16, 1024, 1280])

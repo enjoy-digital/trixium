@@ -515,8 +515,11 @@ def prog_softmax8():
       A4 = -s1 (score pre-shift, s1 >= 1: keeps the subtract and *739 in int32;
                 firmware picks s1 = max(1, 22 - floor(log2(2^31)) + ...) = enough that
                 |s>>s1| <= 2^21)
-      A5 = -s2 with s1 + s2 = -(sigma + 6): f = ((s>>s1 - smax>>s1)*739) >> s2 is Q15 of
-                (s - smax)*2^sigma*log2(e)  (C = 739 = round(log2(e)*2^9)).
+      A1 = C: 739 = round(log2(e)*2^9) for even log2(head_dim); 523 = round(739/sqrt(2))
+                when the 1/sqrt(head_dim) attention scale carries a half-power of two.
+      A5 = -s2 with s1 + s2 = -(sigma + 6): f = ((s>>s1 - smax>>s1)*C) >> s2 is Q15 of
+                (s - smax)*2^sigma*log2(e), sigma including the whole-power part of the
+                attention scale.
 
     Padding entries clamp to f = -15*2^15 -> p8 = 0."""
     return [
@@ -536,7 +539,7 @@ def prog_softmax8():
         ("BCAST", "v7", "s7"),          # smax.
         ("BCAST", "v6", "s4"),
         ("VSHLV", "v7", "v7", "v6"),    # smax >> s1.
-        ("MOVSI", "s1", 739),
+        ("ARG",   "s1", 1),
         ("BCAST", "v5", "s1"),
         ("MOVSI", "s1", -480),
         ("BCAST", "v4", "s1"),
@@ -582,6 +585,37 @@ def prog_reduce_acc():
         ("DONE",),
     ]
 
+def prog_rope():
+    """In-place rotate of one head's halves against Q15 cos/sin tables:
+      out0 = clamp16(rne(x0*c - x1*s, 15)),  out1 = clamp16(rne(x0*s + x1*c, 15)).
+    Tables are int16 Q15 (c15 = round(cos*32767)), written per position by the firmware
+    (llama-style half-split pairing: pair p = (x[p], x[p + hd/2])).
+      A0 = x0 (first half), A1 = x1 (second half), A2 = c table, A3 = s table,
+      A4 = beats (hd/2/16), A5 = x0 write ptr, A6 = x1 write ptr."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s5", 5), ("ARG", "s6", 6),
+        ("LOOPS", "s4"),
+        ("LDV",   "v0", "s0"),          # x0.
+        ("LDV",   "v1", "s1"),          # x1.
+        ("LDV",   "v2", "s2"),          # c.
+        ("LDV",   "v3", "s3"),          # s.
+        ("VMUL",  "v4", "v0", "v2"),    # x0*c.
+        ("VMUL",  "v5", "v1", "v3"),    # x1*s.
+        ("VSUB",  "v4", "v4", "v5"),
+        ("VRNE",  "v4", "v4", 15),
+        ("VCLAMP16", "v4", "v4"),
+        ("VMUL",  "v5", "v0", "v3"),    # x0*s.
+        ("VMUL",  "v6", "v1", "v2"),    # x1*c.
+        ("VADD",  "v5", "v5", "v6"),
+        ("VRNE",  "v5", "v5", 15),
+        ("VCLAMP16", "v5", "v5"),
+        ("STV",   "v4", "s5"),
+        ("STV",   "v5", "s6"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 PROGRAMS = {
     "resid_add":  prog_resid_add,
     "quant8":     prog_quant8,
@@ -590,6 +624,7 @@ PROGRAMS = {
     "rmsnorm":    prog_rmsnorm,
     "softmax8":   prog_softmax8,
     "reduce_acc": prog_reduce_acc,
+    "rope":       prog_rope,
 }
 
 def emit_c(out):

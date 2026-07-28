@@ -209,7 +209,7 @@ def test_softmax8_accuracy():
         sp[0:4*pad] = buf.astype("<i4").tobytes()
         s1 = 11                      # |s>>s1| <= 2^18: subtract and *739 int32-safe.
         s2 = -(sigma + 6) - s1
-        S, _ = _run("softmax8", sp, [0, 0, 4096, pad//16, -s1, -s2])
+        S, _ = _run("softmax8", sp, [0, 739, 4096, pad//16, -s1, -s2])
         got  = np.frombuffer(bytes(sp[4096:4096+pad]), dtype=np.int8).astype(np.float64)
         ref  = np.exp((s32 - s32.max()).astype(np.float64)*(2.0**sigma))
         # got/128 approximates ref (relative to the max entry).
@@ -235,3 +235,24 @@ def test_reduce_acc():
     got = np.frombuffer(bytes(sp[0:4*n]), dtype="<i4").astype(np.int64)
     assert np.array_equal(got, a + b)
     assert S[6] == int(np.abs(a + b).max())
+
+def test_rope_accuracy():
+    rng = np.random.default_rng(11)
+    hd  = 64
+    # Normed inputs (rmsnorm output <= ~2^14): rotations stay inside int16.
+    x   = rng.integers(-20000, 20000, hd).astype(np.int64)
+    ang = rng.uniform(0, 2*np.pi, hd//2)
+    c15 = np.round(np.cos(ang)*32767).astype(np.int64)
+    s15 = np.round(np.sin(ang)*32767).astype(np.int64)
+    sp  = bytearray(4096)
+    sp[0:hd]              = x[:hd//2].astype("<i2").tobytes()
+    sp[256:256+hd]        = x[hd//2:].astype("<i2").tobytes()
+    sp[512:512+hd]        = c15.astype("<i2").tobytes()
+    sp[768:768+hd]        = s15.astype("<i2").tobytes()
+    _run("rope", sp, [0, 256, 512, 768, hd//2//16, 1024, 1280])
+    o0 = np.frombuffer(bytes(sp[1024:1024+hd]), dtype="<i2").astype(np.float64)
+    o1 = np.frombuffer(bytes(sp[1280:1280+hd]), dtype="<i2").astype(np.float64)
+    r0 = x[:hd//2]*np.cos(ang) - x[hd//2:]*np.sin(ang)
+    r1 = x[:hd//2]*np.sin(ang) + x[hd//2:]*np.cos(ang)
+    assert np.abs(o0 - r0).max() < 3.0   # Q15 table + rounding.
+    assert np.abs(o1 - r1).max() < 3.0
