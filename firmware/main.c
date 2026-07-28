@@ -23,6 +23,7 @@
 #include "infer.h"
 #include "ops.h"
 #include "perf.h"
+#include "vec.h"
 
 /*-----------------------------------------------------------------------*/
 /* Console                                                               */
@@ -339,6 +340,9 @@ int main(void)
 #endif
     uart_init();
     perf_init();
+#ifdef CSR_VECUNIT_BASE
+    vec_init();
+#endif
 
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
     model_info();
@@ -352,6 +356,15 @@ int main(void)
         infer_generate(prompt, 3, 4, emit_token);
         puts("\nGEN DONE");
         perf_print();
+        if (hw_caps()) {
+            hwops_set_all(1);
+            printf("GEN-HW:");
+            perf_reset();
+            infer_generate(prompt, 3, 4, emit_token);
+            puts("\nGEN-HW DONE");
+            perf_print();
+            hwops_set_all(0);
+        }
     }
     puts("BONSAI-READY");
     printf("bonsai> ");

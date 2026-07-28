@@ -22,6 +22,7 @@
 #include "infer.h"
 #include "ops.h"
 #include "perf.h"
+#include "vec.h"
 
 // newlib-libm compatibility: the toolchain libm.a references __errno, absent from the
 // picolibc environment LiteX links against.
@@ -32,6 +33,9 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_X    0x00000 // Quantized activations (engine matvec input).
 #define SP_Y    0x08000 // Engine results (int32).
 #define SP_FET  0x30000 // Fetch staging (embedding rows).
+#define SP_VA   0x10000 // Vector-op staging: operand a (int16).
+#define SP_VB   0x18000 // Vector-op staging: operand b (int16).
+#define SP_VO   0x20000 // Vector-op staging: result (int16).
 
 // Heap: after the BONS header/table area.
 #define HEAP_BASE (BONSAI_HDR_ADDR + 0x100000)
@@ -254,6 +258,48 @@ static void rope_apply(float *vec, int n_heads_v, int pos)
     }
 }
 
+#ifdef CSR_VECUNIT_BASE
+#include "progs.h"
+// Validation-mode HW silu: gate/up float -> int16 BFP -> silu_mul program -> float.
+// Conversions cost ~= the cheap ops they wrap, but silu's soft-float expf is ~10x more -
+// still a large win; the resident-BFP loop flip (M3) removes the conversions entirely.
+static void hw_silu_mul(float *gate_v, const float *up_v, int n)
+{
+    float ga = 0, ua = 0;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(gate_v[i]); if (a > ga) ga = a;
+        a = fabsf(up_v[i]);         if (a > ua) ua = a;
+    }
+    if (ga == 0 || ua == 0) {
+        for (int i = 0; i < n; i++) gate_v[i] = 0;
+        return;
+    }
+    int eg, eu;
+    frexpf(ga, &eg); eg -= 15; // mantissa absmax in [2^13, 2^15).
+    frexpf(ua, &eu); eu -= 15;
+    float gs = ldexpf(1.0f, -eg), us = ldexpf(1.0f, -eu);
+    volatile uint32_t *va = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_VA);
+    volatile uint32_t *vb = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_VB);
+    for (int i = 0; i < n; i += 2) {
+        uint32_t w0 = (uint16_t)(int16_t)lroundf(gate_v[i]*gs)
+                    | ((uint32_t)(uint16_t)(int16_t)lroundf(gate_v[i+1]*gs) << 16);
+        uint32_t w1 = (uint16_t)(int16_t)lroundf(up_v[i]*us)
+                    | ((uint32_t)(uint16_t)(int16_t)lroundf(up_v[i+1]*us) << 16);
+        va[i/2] = w0;
+        vb[i/2] = w1;
+    }
+    int32_t args[7] = {SP_VA, SP_VB, SP_VO, n/16, -(eg + 6), 0, -15};
+    vec_run(PROG_SILU_MUL, args, 7);
+    volatile uint32_t *vo = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_VO);
+    float os = ldexpf(1.0f, eg + eu + 15);
+    for (int i = 0; i < n; i += 2) {
+        uint32_t w = vo[i/2];
+        gate_v[i]   = (float)(int16_t)(w & 0xFFFF)*os;
+        gate_v[i+1] = (float)(int16_t)(w >> 16)*os;
+    }
+}
+#endif
+
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
 static int forward(int token, int want_logits)
@@ -357,9 +403,16 @@ static int forward(int token, int want_logits)
         matvec_rows_f(model_entry(ROLE_FFN_GATE, l), 0, ffn_dim/n_ch, sx, gate);
         matvec_rows_f(model_entry(ROLE_FFN_UP,   l), 0, ffn_dim/n_ch, sx, up);
         perf_enter(OP_SILU_MUL);
-        for (int i = 0; i < ffn_dim; i++) {
-            float g = gate[i];
-            gate[i] = g/(1.0f + expf(-g))*up[i];
+#ifdef CSR_VECUNIT_BASE
+        if (op_on_hw(OP_SILU_MUL)) {
+            hw_silu_mul(gate, up, ffn_dim);
+        } else
+#endif
+        {
+            for (int i = 0; i < ffn_dim; i++) {
+                float g = gate[i];
+                gate[i] = g/(1.0f + expf(-g))*up[i];
+            }
         }
         perf_exit(OP_SILU_MUL);
         matvec_f(model_entry(ROLE_FFN_DOWN, l), gate, h);

@@ -56,7 +56,7 @@ class _CRG(LiteXModule):
 
 class BonsaiSoC(SoCCore):
     def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
-                 with_nvme=False, **kwargs):
+                 with_nvme=False, with_vecunit=False, **kwargs):
         # Phase-2 exploration flags (see docs/phase2.md).
         if with_nvme:
             raise NotImplementedError(
@@ -125,7 +125,12 @@ class BonsaiSoC(SoCCore):
             from litex.soc.integration.soc import SoCRegion
 
             self.scratchpad = BonsaiScratchpad(size=256*1024)
-            self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis)
+            vecunit = None
+            if with_vecunit:
+                from trixium.gateware.vector import BonsaiVectorUnit
+                vecunit = self.vecunit = BonsaiVectorUnit()
+                self.add_constant("BONSAI_HAS_VECUNIT")
+            self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit)
             self.engine_csr = BonsaiEngineCSR(self.engine)
             self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)
             self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
@@ -162,6 +167,7 @@ def main():
     parser.add_target_argument("--driver",       action="store_true",       help="Generate LitePCIe driver headers.")
     parser.add_target_argument("--engine-channels", default=None, type=int, help="Engine HBM channel count override (default: 4 for b, 8 for c; 8B needs >= 16, max 31).")
     parser.add_target_argument("--with-nvme",    action="store_true",       help="Phase-2: standalone NVMe weight loading (LiteNVMe root, no host PCIe) - not implemented yet.")
+    parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit (CPU-op offload; default off until sim-gated).")
     args = parser.parse_args()
 
     # Builds must run from the repo root: the HBM XCI is resolved as ip/hbm/hbm_0.xci from CWD.
@@ -172,6 +178,7 @@ def main():
         variant         = args.variant,
         engine_channels = args.engine_channels,
         with_nvme       = args.with_nvme,
+        with_vecunit    = args.with_vecunit,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,
         **parser.soc_argdict)

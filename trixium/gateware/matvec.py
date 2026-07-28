@@ -30,7 +30,11 @@ from trixium.gateware.ternary_mac import BonsaiChannelPipe
 # BonsaiMatVecEngine -------------------------------------------------------------------------------
 
 class BonsaiMatVecEngine(LiteXModule):
-    def __init__(self, scratchpad, hbm_axis, xbuf_groups=96):
+    def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None):
+        # When a BonsaiVectorUnit is passed, the scratchpad fill/gather ports are muxed
+        # between the engine and the vector unit (granted to the vector unit while it is
+        # busy - firmware serializes engine ops and vector ops, so contention is
+        # structurally impossible; never a 5th RAM port).
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
@@ -111,7 +115,8 @@ class BonsaiMatVecEngine(LiteXModule):
         # Registered fill pipeline: address at T, data+write at T+1.
         fill_active_d = Signal()
         fill_beat_d   = Signal(10)
-        self.comb += scratchpad.fill.adr.eq((cmd_r["xsrc"] >> 5) + fill_beat)
+        eng_fill_adr = Signal(len(scratchpad.fill.adr))
+        self.comb += eng_fill_adr.eq((cmd_r["xsrc"] >> 5) + fill_beat)
         for pipe in self.pipes:
             self.comb += [
                 pipe.xw_group.eq(fill_beat_d[2:]),
@@ -145,18 +150,47 @@ class BonsaiMatVecEngine(LiteXModule):
 
         # Scratchpad write port: fetch beats or gathered int32 results.
         slot = Signal(24)
+        eng_gw_adr = Signal(len(scratchpad.gather.adr))
+        eng_gw_we  = Signal(8)
+        eng_gw_dat = Signal(256)
         self.comb += [
             slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["rows"] + grant_row),
             If(fetch_mode,
-                scratchpad.gather.adr.eq((cmd_r["dst"] >> 5) + fetch_cnt),
-                scratchpad.gather.dat_w.eq(fetch_data),
-                scratchpad.gather.we.eq(Mux(fetch_valid, 0xFF, 0)),
+                eng_gw_adr.eq((cmd_r["dst"] >> 5) + fetch_cnt),
+                eng_gw_dat.eq(fetch_data),
+                eng_gw_we.eq(Mux(fetch_valid, 0xFF, 0)),
             ).Else(
-                scratchpad.gather.adr.eq(slot[3:]),
-                scratchpad.gather.dat_w.eq(Replicate(grant_data, 8)),
-                scratchpad.gather.we.eq(Mux(grant_valid, 1 << slot[:3], 0)),
+                eng_gw_adr.eq(slot[3:]),
+                eng_gw_dat.eq(Replicate(grant_data, 8)),
+                eng_gw_we.eq(Mux(grant_valid, 1 << slot[:3], 0)),
             )
         ]
+
+        # Scratchpad port wiring (direct, or muxed with the vector unit).
+        if vecunit is None:
+            self.comb += [
+                scratchpad.fill.adr.eq(eng_fill_adr),
+                scratchpad.gather.adr.eq(eng_gw_adr),
+                scratchpad.gather.dat_w.eq(eng_gw_dat),
+                scratchpad.gather.we.eq(eng_gw_we),
+            ]
+        else:
+            grant_vec = Signal()
+            self.comb += [
+                grant_vec.eq(vecunit.busy),
+                If(grant_vec,
+                    scratchpad.fill.adr.eq(vecunit.sp_rd_adr),
+                    scratchpad.gather.adr.eq(vecunit.sp_wr_adr),
+                    scratchpad.gather.dat_w.eq(vecunit.sp_wr_dat),
+                    scratchpad.gather.we.eq(vecunit.sp_wr_we),
+                ).Else(
+                    scratchpad.fill.adr.eq(eng_fill_adr),
+                    scratchpad.gather.adr.eq(eng_gw_adr),
+                    scratchpad.gather.dat_w.eq(eng_gw_dat),
+                    scratchpad.gather.we.eq(eng_gw_we),
+                ),
+                vecunit.sp_rd_dat.eq(scratchpad.fill.dat_r),
+            ]
 
         # Control FSM -------------------------------------------------------------------------
         self.fsm = fsm = FSM(reset_state="IDLE")
@@ -219,7 +253,7 @@ class BonsaiMatVecEngine(LiteXModule):
             If(start_pulse,
                 result_cnt.eq(0),
                 fetch_cnt.eq(0),
-            ).Elif(scratchpad.gather.we != 0,
+            ).Elif(eng_gw_we != 0,
                 If(fetch_mode,
                     fetch_cnt.eq(fetch_cnt + 1),
                 ).Else(

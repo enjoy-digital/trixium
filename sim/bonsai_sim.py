@@ -46,6 +46,7 @@ from litex.soc.interconnect.axi import AXIInterface
 from trixium.gateware.scratchpad import BonsaiScratchpad
 from trixium.gateware.matvec import BonsaiMatVecEngine
 from trixium.gateware.csr_front import BonsaiEngineCSR
+from trixium.gateware.vector import BonsaiVectorUnit
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 from trixium.model.bons import BONSReader
 
@@ -102,8 +103,10 @@ class BonsaiSimSoC(SoCCore):
                 latency=hbm_latency, stall_rate=hbm_stall_rate)
             self.add_module(f"hbm_model{c}", model)
             axis.append(axi)
-        self.engine     = BonsaiMatVecEngine(self.scratchpad, axis)
+        self.vecunit    = BonsaiVectorUnit()
+        self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit)
         self.engine_csr = BonsaiEngineCSR(self.engine)
+        self.add_constant("BONSAI_HAS_VECUNIT")
 
         self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
             SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
