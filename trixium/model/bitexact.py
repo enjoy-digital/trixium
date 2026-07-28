@@ -140,6 +140,36 @@ def matvec_q8(scales_f16, q8w, x8, B, R):
     assert np.all(np.abs(res) < 2**(RESULT_BITS - 1))
     return res.astype(np.int32)
 
+def axpy_rows(scales_f16, v8w, p8, B, Rpre):
+    """AXPY mode (weighted-V): accumulate coeff_t * v_t into per-lane int32 accumulators.
+    scales (M, K//32) fp16 (per-row 2^ev, all groups equal), v8w (M, K) int8 V rows,
+    p8 (M,) int8 probability coefficients (position t -> row t of this channel's stripe).
+    Per row: coeff = p8_t * m11_t shifted by (e16_t + B), each product pre-shifted by Rpre
+    (floor) before accumulation so the int32 lanes never wrap:
+      acc[d] += (coeff * v8[t, d]) >> Rpre.
+    Firmware picks B = 12 - max(e16) (as Q8) and Rpre >= ceil(log2(sum_t p8 * 127)) + 22 - 31.
+    Returns int32 (K,)."""
+    M, K = v8w.shape
+    m11, e16 = fp16_decompose(scales_f16)
+    acc = np.zeros(K, dtype=np.int64)
+    for t in range(M):
+        sh = int(e16[t, 0]) + B  # All groups share the row scale.
+        c  = int(p8[t])*int(m11[t, 0])
+        c  = (c << sh) if sh >= 0 else (c >> -sh)
+        acc += (int(c)*v8w[t].astype(np.int64)) >> Rpre
+        assert np.all(np.abs(acc) < 2**31), "axpy accumulator overflow"
+    return acc.astype(np.int32)
+
+def axpy_rpre(p8_sum_bound, B_top=22):
+    """Smallest Rpre keeping worst-case |acc| < 2^31: coeff <= 127*1024*2^12 per unit p8,
+    times |v8| <= 127, times sum|p8| <= p8_sum_bound."""
+    bound = int(p8_sum_bound)*127*1024 << 12
+    bound *= 127
+    r = 0
+    while (bound >> r) >= (1 << 31):
+        r += 1
+    return r
+
 # BFP vector helpers (vector-unit spec) ------------------------------------------------------------
 
 def normalize_i32_to_bfp(v32, e_in):
