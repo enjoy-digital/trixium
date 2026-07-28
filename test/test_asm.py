@@ -103,3 +103,93 @@ def test_silu_mul_zero_and_extremes():
     uv = u16.astype(np.float64)*2.0**eu
     expect = gv/(1.0 + np.exp(-gv))*uv
     assert np.all(np.abs(got_val - expect) < 4*2.0**(eg+eu+15) + 3e-3*np.abs(expect))
+
+def test_scalar_ops_m4():
+    # SADD / SSHLV / SNORME semantics (48-bit).
+    prog = [
+        ("ARG",   "s0", 0),
+        ("ARG",   "s1", 1),
+        ("SADD",  "s0", "s1"),      # s0 = a0 + a1
+        ("SMOV",  "s5", "s0"),
+        ("ARG",   "s2", 2),
+        ("SSHLV", "s0", "s2"),      # s6 = (a0+a1) shifted by a2
+        ("SMOV",  "s6", "s0"),
+        ("SNORME", "s7", "s0"),     # s7 = even normalize shift of s0
+        ("DONE",),
+    ]
+    words = asm.assemble(prog)
+    for a0, a1, sh in [(100, 23, 3), (1 << 40, 5, -12), (7, 0, 30), (-50, 20, 2),
+                       (0x3FFFFFFFFFF, 0, -20), (12345, 6789, 0)]:
+        S, _ = asm.VecInterp(bytearray(64)).run(words, [a0, a1, sh])
+        v = a0 + a1
+        exp_shift = (v << sh) if sh >= 0 else (v >> -sh)
+        exp_shift = ((exp_shift + (1 << 47)) & ((1 << 48) - 1)) - (1 << 47)
+        assert S[5] == v
+        assert S[6] == exp_shift
+        if exp_shift <= 0:
+            assert S[7] == 0
+        else:
+            e = S[7]
+            assert e % 2 == 0
+            nv = (exp_shift << e) if e >= 0 else (exp_shift >> -e)
+            assert (1 << 30) <= nv < (1 << 32), (exp_shift, e)
+
+def test_snorme_full_range():
+    prog = [("ARG", "s0", 0), ("SNORME", "s1", "s0"), ("SSHLV", "s0", "s1"),
+            ("SMOV", "s6", "s0"), ("SMOV", "s7", "s1"), ("DONE",)]
+    words = asm.assemble(prog)
+    for p in range(0, 47):
+        for v in {1 << p, (1 << p) + (1 << max(0, p - 3)), (1 << (p + 1)) - 1}:
+            if v >= (1 << 47):
+                continue
+            S, _ = asm.VecInterp(bytearray(64)).run(words, [v])
+            assert S[7] % 2 == 0
+            assert (1 << 30) <= S[6] < (1 << 32), (v, S[6], S[7])
+
+E_NORM_T = -11
+E_W_T    = -13
+
+def _rmsnorm_hw(m, es, w16, n):
+    beats = n//16
+    sp = bytearray(64*1024)
+    sp[0:2*n]         = m.astype("<i2").tobytes()
+    sp[8192:8192+2*n] = w16.astype("<i2").tobytes()
+    eps  = 1e-6
+    eps_int = max(1, int(round(eps*2.0**(-2*es))))
+    ln   = int(np.log2(n))
+    args = [0, 8192, 16384, beats, -ln, eps_int, E_W_T - E_NORM_T - 15]
+    _run("rmsnorm", sp, args)
+    return np.frombuffer(bytes(sp[16384:16384+2*n]), dtype="<i2").astype(np.int64)
+
+def _rmsnorm_float_ref(m, es, w16, n):
+    x  = m.astype(np.float64)*2.0**es
+    wf = w16.astype(np.float64)*2.0**E_W_T
+    r  = 1.0/np.sqrt(np.mean(x*x) + 1e-6)
+    return x*r*wf*2.0**(-E_NORM_T)
+
+def test_rmsnorm_accuracy():
+    rng = np.random.default_rng(42)
+    for es, n, wl in [(-11, 256, 0.9), (-15, 2048, 1.4), (-18, 256, 0.4), (-12, 1024, 1.0)]:
+        m   = np.clip(rng.normal(0, 9000, n), -32767, 32767).astype(np.int64)
+        wf  = np.abs(rng.normal(wl, 0.25, n)) + 0.05
+        w16 = np.clip(np.round(wf*2.0**(-E_W_T)), -32767, 32767).astype(np.int64)
+        got = _rmsnorm_hw(m, es, w16, n)
+        ref = _rmsnorm_float_ref(m, es, w16, n)
+        err = np.abs(got - ref)
+        # LUT rsqrt (256-entry interp) ~1e-4 relative + rounding.
+        tol = 1.0 + 3e-4*np.abs(ref)
+        assert np.all(err < tol), (es, n, err.max(), np.abs(ref).max())
+
+def test_rmsnorm_edges():
+    n = 256
+    # All-zero input: eps floor keeps SNORME's input positive; output all zero.
+    w16 = np.full(n, 8192, dtype=np.int64)
+    got = _rmsnorm_hw(np.zeros(n, dtype=np.int64), -11, w16, n)
+    assert np.all(got == 0)
+    # Saturated input: scale-invariance keeps output identical for m and m/2 @ es+1.
+    rng = np.random.default_rng(7)
+    m   = np.clip(rng.normal(0, 16000, n), -32766, 32766).astype(np.int64)
+    m   = m - (m % 2) # make halving exact
+    a   = _rmsnorm_hw(m, -13, w16, n)
+    b   = _rmsnorm_hw(m >> 1, -12, w16, n)
+    assert np.max(np.abs(a - b)) <= 1

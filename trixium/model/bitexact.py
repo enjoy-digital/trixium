@@ -185,11 +185,14 @@ def bfp_value(m, e):
 # LUT generators (shared ROM contents for golden, vector-unit BRAM init and firmware) --------------
 
 def rsqrt_lut(entries=256):
-    """1/sqrt(x) for x in [1, 4): entry i covers x = 1 + 3*i/entries... Spec: input is a
-    normalized fixed-point u in [2^30, 2^32) (30 fractional bits => x in [1, 4)); index =
-    top 8 bits below the leading bit range; value = round(2^15 / sqrt(x_mid))."""
-    x = 1.0 + 3.0*(np.arange(entries) + 0.5)/entries
-    return np.round((2**15)/np.sqrt(x)).astype(np.int32)
+    """1/sqrt(x) for x in [1, 4), input u in [2^30, 2^32) (30 fractional bits). MSB-split
+    layout so the index needs no multiplier: entries 0..127 cover [1, 2) at step 1/128
+    (idx = (u - 2^30) >> 23), entries 128..255 cover [2, 4) at step 1/64
+    (idx = 128 + ((u - 2^31) >> 24)); value = round(2^15 / sqrt(x_mid))."""
+    assert entries == 256
+    lo = 1.0 + np.arange(128)/128.0     # Edge values (the interpolator assumes edges).
+    hi = 2.0 + np.arange(128)/64.0
+    return np.round((2**15)/np.sqrt(np.concatenate([lo, hi]))).astype(np.int32)
 
 def exp2_lut(entries=256):
     """2^f for f in [0, 1): entry i = round(2^15 * 2^(i/entries))."""

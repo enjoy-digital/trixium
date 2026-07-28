@@ -281,9 +281,13 @@ class BonsaiVectorUnit(LiteXModule):
             m15 = Signal(15)
             self.comb += m15.eq(va_flat[32*i:32*i+15] - (1 << 14))
             self.comb += rom_rec[i].adr.eq(m15[6:14])
-            xr = Signal(32)
-            self.comb += xr.eq(va_flat[32*i:32*(i+1)] - (1 << 30))
-            self.comb += rom_rsq[i].adr.eq(xr[22:30])
+            # MSB-split rsqrt index (see bx.rsqrt_lut): [1,2) -> 0..127 step 1/128,
+            # [2,4) -> 128..255 step 1/64. Subtracting the leading power of two just
+            # clears that bit, so the address is a plain bit-select muxed on x[31].
+            xu = Signal(32)
+            self.comb += xu.eq(va_flat[32*i:32*(i+1)])
+            self.comb += rom_rsq[i].adr.eq(Mux(xu[31],
+                Cat(xu[24:31], C(1, 1)), Cat(xu[23:30], C(0, 1))))
 
             def interp(port, frac, fbits, out_lane):
                 e_a = Signal((18, True))
@@ -304,7 +308,7 @@ class BonsaiVectorUnit(LiteXModule):
             self.comb += fr6.eq(m15[0:6])
             interp(rom_rec[i], fr6, 6, lane(res["LUTRECIP"], i))
             fq7 = Signal(7)
-            self.comb += fq7.eq(xr[15:22])
+            self.comb += fq7.eq(Mux(xu[31], xu[17:24], xu[16:23]))
             interp(rom_rsq[i], fq7, 7, lane(res["LUTRSQRT"], i))
 
         # Vector writeback mux.
@@ -328,10 +332,38 @@ class BonsaiVectorUnit(LiteXModule):
             st8.eq(Cat(*[va_flat[32*i:32*i+8] for i in range(LANES)])),
         ]
 
-        # Args.
+        # Scalar SSHLV: 48-bit variable shift of S[sd] by S[sa] (clamped +-47), wraps to 48.
+        ssh_amt = Signal((7, True))
+        self.comb += ssh_amt.eq(Mux(sa_val > 47, 47, Mux(sa_val < -47, -47, sa_val[0:7])))
+        ssh_amt_pos = Signal(6)
+        ssh_amt_neg = Signal(6)
+        self.comb += [
+            ssh_amt_pos.eq(Mux(ssh_amt >= 0, ssh_amt[0:6], 0)),
+            ssh_amt_neg.eq(Mux(ssh_amt < 0, (-ssh_amt)[0:6], 0)),
+        ]
+        ssh_full  = Signal((48 + 64, True)) # Full-width left result, then truncate.
+        ssh_right = Signal((48, True))
+        sshlv_res = Signal((48, True))
+        self.comb += [
+            ssh_full.eq(sd_val << ssh_amt_pos),
+            ssh_right.eq(sd_val >> ssh_amt_neg),
+            sshlv_res.eq(Mux(ssh_amt >= 0, ssh_full[0:48], ssh_right)),
+        ]
+
+        # Scalar SNORME: even shift landing S[sa] in [2^30, 2^32); 0 for S[sa] <= 0.
+        snorme_res = Signal((48, True))
+        sn_cases = If(sa_val <= 0, snorme_res.eq(0))
+        for p in range(46, -1, -1):
+            sn_cases = sn_cases.Elif(sa_val[p],
+                snorme_res.eq((30 - p) if (p % 2 == 0) else (31 - p)))
+        self.comb += sn_cases
+
+        # Args (32-bit CSRs, sign-extended into the 48-bit scalar file by ARG).
         args_arr = Array([self.arg0.storage, self.arg1.storage, self.arg2.storage,
                           self.arg3.storage, self.arg4.storage, self.arg5.storage,
                           self.arg6.storage, self.arg7.storage])
+        arg_sel = Signal(32)
+        self.comb += arg_sel.eq(args_arr[f_imm[0:3]])
 
         # Control FSM -------------------------------------------------------------------------
         running = Signal()
@@ -409,9 +441,12 @@ class BonsaiVectorUnit(LiteXModule):
                 ),
                 # Scalar ops.
                 If(f_op == OP["MOVSI"], S[f_sd].eq(f_imm)),
-                If(f_op == OP["ARG"],   S[f_sd].eq(args_arr[f_imm[0:3]])),
+                If(f_op == OP["ARG"],   S[f_sd].eq(Cat(arg_sel, Replicate(arg_sel[31], 16)))),
                 If(f_op == OP["SADDI"], S[f_sd].eq(sd_val + f_imm)),
                 If(f_op == OP["SMOV"],  S[f_sd].eq(sa_val)),
+                If(f_op == OP["SADD"],  S[f_sd].eq(sd_val + sa_val)),
+                If(f_op == OP["SSHLV"], S[f_sd].eq(sshlv_res)),
+                If(f_op == OP["SNORME"], S[f_sd].eq(snorme_res)),
                 If(f_op == OP["LOOPS"],
                     If(f_imm == 0,
                         loop_cnt.eq(sa_val[0:32]),

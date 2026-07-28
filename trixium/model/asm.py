@@ -70,6 +70,12 @@ OPCODES = [
     "LUTE2",    # vd = exp2f(va & 0x7FFF)   : 2^f, f in [0,1) Q15 -> Q15 result [2^15, 2^16).
     "LUTRECIP", # vd = recip(va)            : va Q15 mantissa in [2^14, 2^15) meaning [0.5,1) -> Q15 of 1/m in (2^15, 2^16].
     "LUTRSQRT", # vd = rsqrt(va)            : va Q30-normalized in [2^30, 2^32) meaning [1,4) -> Q15 of 1/sqrt.
+    # Scalar (48-bit) ops added for rmsnorm (M4).
+    "SADD",     # sd += S[sa].
+    "SSHLV",    # sd shifted by S[sa] (left if >= 0, arith right if < 0; clamped +-47; wraps to 48 bits).
+    "SNORME",   # sd = EVEN shift e such that (S[sa] << e) lands in [2^30, 2^32); 0 for S[sa] <= 0.
+                # (Even so the shift splits cleanly into the rsqrt exponent half; the caller
+                #  guarantees S[sa] > 0 - firmware clamps the eps term to >= 1.)
 ]
 OP = {name: i for i, name in enumerate(OPCODES)}
 
@@ -107,7 +113,7 @@ def assemble(program):
         elif op in ("MOVSI", "ARG", "SADDI"):
             sd  = take_s()
             imm = take_i()
-        elif op == "SMOV":
+        elif op in ("SMOV", "SADD", "SSHLV", "SNORME"):
             sd = take_s(); sa = take_s()
         elif op == "LOOPS":
             if isinstance(args[0], str):
@@ -169,10 +175,14 @@ def recip_q15(m):
     return a + (((b - a)*frac) >> 6)
 
 def rsqrt_q15(x32):
-    """1/sqrt(v) for v = x32/2^30 in [1,4) -> Q15."""
+    """1/sqrt(v) for v = x32/2^30 in [1,4) -> Q15. MSB-split index (see bx.rsqrt_lut)."""
     x = int(x32) & MASK32
-    idx = (x - (1 << 30)) >> 22         # 8-bit index over [2^30, 2^32).
-    frac = ((x - (1 << 30)) >> 15) & 0x7F
+    if x < (1 << 31):                   # [1, 2): 128 entries, step 1/128.
+        idx  = (x - (1 << 30)) >> 23
+        frac = (x >> 16) & 0x7F
+    else:                               # [2, 4): 128 entries, step 1/64.
+        idx  = 128 + ((x - (1 << 31)) >> 24)
+        frac = (x >> 17) & 0x7F
     a = int(_RSQRT[idx])
     b = int(_RSQRT[idx + 1]) if idx < 255 else int(round((2**15)/2.0))
     return a + (((b - a)*frac) >> 7)
@@ -211,11 +221,23 @@ class VecInterp:
             elif op == "MOVSI":
                 S[sd] = imm
             elif op == "ARG":
-                S[sd] = _s48(A[imm & 7])
+                S[sd] = _s32(A[imm & 7]) # Args are 32-bit CSRs: sign-extend into the scalar.
             elif op == "SADDI":
                 S[sd] = _s48(S[sd] + imm)
             elif op == "SMOV":
                 S[sd] = S[sa]
+            elif op == "SADD":
+                S[sd] = _s48(S[sd] + S[sa])
+            elif op == "SSHLV":
+                amt = max(-47, min(47, S[sa]))
+                S[sd] = _s48(S[sd] << amt) if amt >= 0 else _s48(S[sd] >> -amt)
+            elif op == "SNORME":
+                v = S[sa]
+                if v <= 0:
+                    S[sd] = 0
+                else:
+                    p = v.bit_length() - 1
+                    S[sd] = (30 - p) if (p % 2 == 0) else (31 - p)
             elif op == "LOOPS":
                 loop_cnt   = (S[sa] & MASK32) if imm == 0 else imm
                 loop_start = npc
@@ -419,11 +441,65 @@ def prog_silu_mul():
         ("DONE",),
     ]
 
+def prog_rmsnorm():
+    """dst_i16 @ E_NORM = clamp16(round_half_up(m * w * rsqrt(mean(m^2) + eps))).
+
+    Two passes over the source: REDSSQ then apply. Source m is int16 @ es, weights w are
+    int16 @ e_w (the image's NORM16 rows, fixed exponent). All the es-dependence folds into
+    two firmware-computed args; the normalize shift e from SNORME carries the data-dependent
+    part (out = m*w*r_q15 * 2^(A6 + e/2) with the >>15 of VMULH15 folded into A6).
+
+      A0 = src, A1 = w, A2 = dst, A3 = beats (n/16)
+      A4 = -log2(n)                                (n is always a power of two here)
+      A5 = eps_int = max(1, round(eps * 2^(-2*es)))  (>= 1 keeps SNORME's input positive)
+      A6 = e_w - E_NORM - 15
+
+    Final shift K = A6 + e/2 is always negative for sane inputs (right shift with
+    round-half-up bias; half-up not RNE - the interpreter is the spec for ties)."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s5", 5), ("ARG", "s6", 6),
+        ("MOVSI", "s7", 0),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("REDSSQ", "s7", "v0"),
+        ("LOOPE",),
+        ("SSHLV", "s7", "s4"),      # ss / n (A4 negative).
+        ("SADD",  "s7", "s5"),      # + eps_int.
+        ("SNORME", "s4", "s7"),     # e (even).
+        ("SSHLV", "s7", "s4"),      # normalize into [2^30, 2^32).
+        ("BCAST", "v7", "s7"),
+        ("LUTRSQRT", "v7", "v7"),   # r_q15 in every lane.
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s4", "s5"),      # e/2 (e even: arith halving is exact).
+        ("SADD",  "s4", "s6"),      # K = A6 + e/2.
+        ("BCAST", "v6", "s4"),      # K lanes.
+        ("VSUB",  "v5", "v5", "v5"),
+        ("VSUB",  "v5", "v5", "v6"),  # -K.
+        ("MOVSI", "s5", 1),
+        ("BCAST", "v4", "s5"),        # ones.
+        ("VSUB",  "v3", "v5", "v4"),  # -K - 1.
+        ("VSHLV", "v4", "v4", "v3"),  # bias = 1 << (-K-1) (0 if K >= 0).
+        ("ARG",   "s0", 0),           # rewind src.
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),        # m.
+        ("LDV",   "v1", "s1"),        # w.
+        ("VMUL",  "v2", "v0", "v1"),  # m*w (<= 2^30: no wrap).
+        ("VMULH15", "v2", "v2", "v7"),# * r_q15 >> 15 (<= 2^30 post-shift: no wrap).
+        ("VADD",  "v2", "v2", "v4"),  # + bias.
+        ("VSHLV", "v2", "v2", "v6"),  # >> -K.
+        ("VCLAMP16", "v2", "v2"),
+        ("STV",   "v2", "s2"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 PROGRAMS = {
     "resid_add": prog_resid_add,
     "quant8":    prog_quant8,
     "norm_i32":  prog_norm_i32,
     "silu_mul":  prog_silu_mul,
+    "rmsnorm":   prog_rmsnorm,
 }
 
 def emit_c(out):

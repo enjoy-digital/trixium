@@ -112,3 +112,41 @@ def test_rtl_silu_mul():
     sp[0:2*n]         = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
     sp[2048:2048+2*n] = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
     _compare("silu_mul", sp, [0, 2048, 4096, n//16, 6, 0, -15]) # eg = -12 -> A4 = 6.
+
+def test_rtl_rmsnorm():
+    rng = np.random.default_rng(31)
+    n   = 128
+    es  = -12
+    m   = np.clip(rng.normal(0, 9000, n), -32767, 32767).astype("<i2")
+    w16 = np.clip(np.round((np.abs(rng.normal(1.0, 0.3, n)) + 0.05)*(2.0**13)),
+                  -32767, 32767).astype("<i2")
+    sp  = bytearray(SP_SIZE)
+    sp[0:2*n]         = m.tobytes()
+    sp[4096:4096+2*n] = w16.tobytes()
+    eps_int = max(1, int(round(1e-6*2.0**(-2*es))))
+    args = [0, 4096, 8192, n//16, -int(np.log2(n)), eps_int, (-13) - (-11) - 15]
+    _compare("rmsnorm", bytes(sp), args)
+
+def test_rtl_scalar_ops_m4():
+    # SADD/SSHLV/SNORME + sign-extending ARG, RTL vs interpreter (scalar results via res5-7).
+    prog = [
+        ("ARG",   "s0", 0),
+        ("ARG",   "s1", 1),
+        ("SADD",  "s0", "s1"),
+        ("SMOV",  "s5", "s0"),
+        ("ARG",   "s2", 2),
+        ("SSHLV", "s0", "s2"),
+        ("SMOV",  "s6", "s0"),
+        ("SNORME", "s7", "s0"),
+        ("DONE",),
+    ]
+    words = asm.PROGRAMS["_m4_scalar"] = lambda: prog
+    try:
+        for a in ([100, 23, 3], [1 << 20, 5, 12], [7, 0, 30], [-50, 20, 2],
+                  [123456, -456, -3], [-17, 0, 0]):
+            ref_S, _ = asm.VecInterp(bytearray(64)).run(asm.assemble(prog), list(a))
+            got = _run_rtl("_m4_scalar", bytes(SP_SIZE), a)
+            m48 = (1 << 48) - 1
+            assert got["s6"] == ref_S[6] & m48, (a, got["s6"], ref_S[6])
+    finally:
+        del asm.PROGRAMS["_m4_scalar"]
