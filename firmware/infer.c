@@ -331,7 +331,19 @@ static void op_quant8_sp(uint32_t src, uint32_t dst, int n)
 // Returns k (caller: out exponent = in exponent + k).
 static int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
 {
+#ifdef CSR_ENGINE_CSR_ABSMAX_ADDR
     uint32_t amax = engine_csr_absmax_read();
+#else
+    // Pre-absmax gateware (the archived variant-b bitstream): scan on the CPU.
+    uint32_t amax = 0;
+    {
+        volatile int32_t *pa = sp32(src);
+        for (int i = 0; i < n; i++) {
+            uint32_t a = (uint32_t)((pa[i] < 0) ? -pa[i] : pa[i]);
+            if (a > amax) amax = a;
+        }
+    }
+#endif
     int k = 0;
     while ((amax >> k) > 16383u) k++;
 #ifdef CSR_VECUNIT_BASE
