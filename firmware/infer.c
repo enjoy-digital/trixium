@@ -20,6 +20,8 @@
 #include "engine.h"
 #include "model.h"
 #include "infer.h"
+#include "ops.h"
+#include "perf.h"
 
 // newlib-libm compatibility: the toolchain libm.a references __errno, absent from the
 // picolibc environment LiteX links against.
@@ -90,6 +92,7 @@ static void rmsnorm_f(float *dst, const float *src, const float *w, int n, float
 // Quantize float vector to int8 in the scratchpad; returns the scale (absmax/127).
 static float quantize_to_sp(const float *src, int n, uint32_t sp_off)
 {
+    perf_enter(OP_QUANT8);
     float amax = 0;
     for (int i = 0; i < n; i++) {
         float a = fabsf(src[i]);
@@ -108,6 +111,7 @@ static float quantize_to_sp(const float *src, int n, uint32_t sp_off)
         }
         sp[i/4] = w;
     }
+    perf_exit(OP_QUANT8);
     return s;
 }
 
@@ -131,10 +135,12 @@ static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t ro
     op.dst    = SP_Y;
     engine_run(&op);
 
+    perf_enter(OP_NORM_I32);
     float sc = ldexpf(xscale, (int)e->rshift - (int)e->bias);
     volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
     for (uint32_t i = 0; i < rows*n_ch; i++)
         dst[i] = (float)y[i]*sc;
+    perf_exit(OP_NORM_I32);
 }
 
 // Full matvec (all rows), output in original row order (block shard: chan-major == row order).
@@ -253,7 +259,9 @@ static void rope_apply(float *vec, int n_heads_v, int pos)
 static int forward(int token, int want_logits)
 {
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
+    perf_enter(OP_EMBED);
     embed_row_f(emb, token, x);
+    perf_exit(OP_EMBED);
 
     int   kv_dim = n_kv_head*head_dim;
     int   q_dim  = n_head*head_dim;
@@ -262,20 +270,27 @@ static int forward(int token, int want_logits)
 
     for (int l = 0; l < n_layer; l++) {
         // Attention block.
+        perf_enter(OP_RMSNORM);
         rmsnorm_f(h, x, attn_norm[l], n_embd, H->rms_eps);
+        perf_exit(OP_RMSNORM);
         float sx = quantize_to_sp(h, n_embd, SP_X);
         matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q);
         matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k);
         matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v);
 
+        perf_enter(OP_QKNORM);
         for (int hh = 0; hh < n_head; hh++)
             rmsnorm_f(q + hh*head_dim, q + hh*head_dim, q_norm[l], head_dim, H->rms_eps);
         for (int hh = 0; hh < n_kv_head; hh++)
             rmsnorm_f(k + hh*head_dim, k + hh*head_dim, k_norm[l], head_dim, H->rms_eps);
+        perf_exit(OP_QKNORM);
+        perf_enter(OP_ROPE);
         rope_apply(q, n_head,    pos);
         rope_apply(k, n_kv_head, pos);
+        perf_exit(OP_ROPE);
 
         // Append K/V (int8 + per-row scale) to the CPU-side caches.
+        perf_enter(OP_KVQUANT);
         {
             int8_t *kd = k_cache + ((uint64_t)l*max_ctx + pos)*kv_dim;
             int8_t *vd = v_cache + ((uint64_t)l*max_ctx + pos)*kv_dim;
@@ -291,6 +306,7 @@ static int forward(int token, int want_logits)
             for (int i = 0; i < kv_dim; i++) vd[i] = (int8_t)lroundf(v[i]*is);
             v_scale[l*max_ctx + pos] = vs;
         }
+        perf_exit(OP_KVQUANT);
 
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
@@ -298,6 +314,7 @@ static int forward(int token, int want_logits)
             int kvh = hh/n_rep;
             const float *qh = q + hh*head_dim;
             float smax = -1e30f;
+            perf_enter(OP_SCORES);
             for (int t = 0; t <= pos; t++) {
                 const int8_t *kt = k_cache + ((uint64_t)l*max_ctx + t)*kv_dim + kvh*head_dim;
                 float dot = 0;
@@ -306,12 +323,16 @@ static int forward(int token, int want_logits)
                 scores[t] = sc;
                 if (sc > smax) smax = sc;
             }
+            perf_exit(OP_SCORES);
+            perf_enter(OP_SOFTMAX);
             float sum = 0;
             for (int t = 0; t <= pos; t++) {
                 scores[t] = expf(scores[t] - smax);
                 sum += scores[t];
             }
+            perf_exit(OP_SOFTMAX);
             float inv = 1.0f/sum;
+            perf_enter(OP_WV);
             float *ah = attn + hh*head_dim;
             for (int d = 0; d < head_dim; d++) ah[d] = 0;
             for (int t = 0; t <= pos; t++) {
@@ -319,23 +340,32 @@ static int forward(int token, int want_logits)
                 float p = scores[t]*inv*v_scale[l*max_ctx + t];
                 for (int d = 0; d < head_dim; d++) ah[d] += p*vt[d];
             }
+            perf_exit(OP_WV);
         }
 
         // Output projection + residual.
         matvec_f(model_entry(ROLE_ATTN_OUT, l), attn, h);
+        perf_enter(OP_RESID_ADD);
         for (int i = 0; i < n_embd; i++) x[i] += h[i];
+        perf_exit(OP_RESID_ADD);
 
         // FFN.
+        perf_enter(OP_RMSNORM);
         rmsnorm_f(h, x, ffn_norm[l], n_embd, H->rms_eps);
+        perf_exit(OP_RMSNORM);
         sx = quantize_to_sp(h, n_embd, SP_X);
         matvec_rows_f(model_entry(ROLE_FFN_GATE, l), 0, ffn_dim/n_ch, sx, gate);
         matvec_rows_f(model_entry(ROLE_FFN_UP,   l), 0, ffn_dim/n_ch, sx, up);
+        perf_enter(OP_SILU_MUL);
         for (int i = 0; i < ffn_dim; i++) {
             float g = gate[i];
             gate[i] = g/(1.0f + expf(-g))*up[i];
         }
+        perf_exit(OP_SILU_MUL);
         matvec_f(model_entry(ROLE_FFN_DOWN, l), gate, h);
+        perf_enter(OP_RESID_ADD);
         for (int i = 0; i < n_embd; i++) x[i] += h[i];
+        perf_exit(OP_RESID_ADD);
     }
     n_pos++;
 
@@ -343,7 +373,10 @@ static int forward(int token, int want_logits)
         return -1;
 
     // Final norm + LM head (tied or separate), chunked over rows to fit the scratchpad.
+    perf_enter(OP_RMSNORM);
     rmsnorm_f(h, x, out_norm, n_embd, H->rms_eps);
+    perf_exit(OP_RMSNORM);
+    perf_enter(OP_LMHEAD);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head)
         head = model_entry(ROLE_TOK_EMB, 0);
@@ -385,6 +418,7 @@ static int forward(int token, int want_logits)
         }
     }
     (void)sc;
+    perf_exit(OP_LMHEAD);
     return best_tok;
 }
 

@@ -8,9 +8,11 @@
 #include <generated/csr.h>
 
 #include "engine.h"
+#include "perf.h"
 
 void engine_run(const struct engine_op *op)
 {
+    perf_enter(OP_ENGINE_WAIT);
     uint32_t done = engine_csr_done_count_read();
 
     engine_csr_kind_write(op->kind);
@@ -28,6 +30,7 @@ void engine_run(const struct engine_op *op)
     engine_csr_submit_write(1);
 
     while (engine_csr_done_count_read() == done);
+    perf_exit(OP_ENGINE_WAIT);
 }
 
 void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst)

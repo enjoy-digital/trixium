@@ -21,6 +21,8 @@
 #include "engine.h"
 #include "model.h"
 #include "infer.h"
+#include "ops.h"
+#include "perf.h"
 
 /*-----------------------------------------------------------------------*/
 /* Console                                                               */
@@ -106,6 +108,9 @@ static void fill_x_pattern(uint32_t xsrc, uint32_t n)
 /* Commands                                                              */
 /*-----------------------------------------------------------------------*/
 
+static void emit_token(int tok);
+static int  parse_int(const char *s);
+
 static void help(void)
 {
     puts("TriXium firmware");
@@ -115,6 +120,60 @@ static void help(void)
     puts("sptest          - scratchpad bus read/write test");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
+    puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
+    puts("stats [reset]   - per-op cycle profile");
+    puts("bench [n]       - profiled generation benchmark (default 4 tokens)");
+}
+
+static void hwops_cmd(char *args)
+{
+    char *op  = get_token(&args);
+    char *mode = get_token(&args);
+    if (*op == 0) {
+        hwops_print();
+        return;
+    }
+    int hw = (strcmp(mode, "hw") == 0);
+    if (!hw && strcmp(mode, "cpu") != 0) {
+        puts("usage: hwops [<op>|all cpu|hw]");
+        return;
+    }
+    if (strcmp(op, "all") == 0) {
+        hwops_set_all(hw);
+    } else {
+        int found = -1;
+        for (int i = 0; i < OP_COUNT; i++)
+            if (strcmp(op, op_name(i)) == 0)
+                found = i;
+        if (found < 0) {
+            puts("unknown op");
+            return;
+        }
+        hwops_set(found, hw);
+    }
+    hwops_print();
+}
+
+static void bench_cmd(char *args)
+{
+    char *tok = get_token(&args);
+    int n = (*tok) ? parse_int(tok) : 4;
+    static const int prompt[3] = {1, 2, 3};
+    perf_reset();
+    uint32_t t0 = perf_now();
+    printf("GEN:");
+    int count = infer_generate(prompt, 3, n, emit_token);
+    uint32_t dt = perf_now() - t0;
+    puts("");
+    perf_print();
+    printf("BENCH: %d tokens, %lu cycles total", count, (unsigned long)dt);
+    if (count > 0)
+        printf(", %lu cycles/token (%lu.%03lu tok/s @%luMHz)",
+               (unsigned long)(dt/count),
+               (unsigned long)(((uint64_t)CONFIG_CLOCK_FREQUENCY*count)/dt),
+               (unsigned long)((((uint64_t)CONFIG_CLOCK_FREQUENCY*count*1000)/dt) % 1000),
+               (unsigned long)(CONFIG_CLOCK_FREQUENCY/1000000));
+    puts("");
 }
 
 static void emit_token(int tok)
@@ -255,6 +314,16 @@ static void console_service(void)
         selftest();
     else if (strcmp(token, "gen") == 0)
         gen_cmd(str);
+    else if (strcmp(token, "hwops") == 0)
+        hwops_cmd(str);
+    else if (strcmp(token, "stats") == 0) {
+        if (strncmp(str, "reset", 5) == 0)
+            perf_reset();
+        else
+            perf_print();
+    }
+    else if (strcmp(token, "bench") == 0)
+        bench_cmd(str);
     else if (strcmp(token, "hdrload") == 0)
         hdrload();
     else if (strlen(token))
@@ -269,6 +338,7 @@ int main(void)
     irq_setie(1);
 #endif
     uart_init();
+    perf_init();
 
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
     model_info();
@@ -278,8 +348,10 @@ int main(void)
         // Boot generation demo (deterministic; checked by the sim harness).
         static const int prompt[3] = {1, 2, 3};
         printf("GEN:");
+        perf_reset();
         infer_generate(prompt, 3, 4, emit_token);
         puts("\nGEN DONE");
+        perf_print();
     }
     puts("BONSAI-READY");
     printf("bonsai> ");
