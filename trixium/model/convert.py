@@ -71,9 +71,14 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
     layer, role, repl = _name_role(name)
     flags = FLAG_REPLICATED if repl else 0
 
-    if t.type_name == "UNK42" or t.type_id == qformats.GGML_Q2_0:
+    if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_Q1_0):
         rows, cols = t.shape
-        scales, codes = qformats.q2_0_unpack(reader.tensor_bytes(name))
+        if t.type_id == qformats.GGML_Q2_0:
+            scales, codes = qformats.q2_0_unpack(reader.tensor_bytes(name))
+        else:
+            # 1-bit builds ("Bonsai" as opposed to "Ternary-Bonsai"): run on the ternary
+            # engine via code expansion (see qformats.q1_0_to_ternary_codes).
+            scales, codes = qformats.q1_0_to_ternary_codes(reader.tensor_bytes(name))
         scales = scales.reshape(rows, cols//layout.GROUP_TERNARY)
         codes  = codes.reshape(rows, cols)
         if not repl and rows % n_channels != 0:

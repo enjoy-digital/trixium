@@ -53,6 +53,46 @@ def q2_0_dequant(raw):
     scales, codes = q2_0_unpack(raw)
     return ((codes.astype(np.int32) - 1)*scales.astype(np.float32)[:, None]).reshape(-1)
 
+# Q1_0 (1-bit, PrismML fork) -----------------------------------------------------------------------
+# Block of 128 weights = 2B fp16 scale d + 16B of bits (element j: bit j%8 of byte j//8).
+# Dequant: w = bit ? +d : -d  (1.125 bits/weight).
+
+QK_Q1_0    = 128
+BLOCK_Q1_0 = 2 + QK_Q1_0//8 # 18 bytes.
+
+def q1_0_unpack(raw):
+    """Raw Q1_0 bytes -> (scales float16 (nb,), bits uint8 (nb, 128) with values 0/1)."""
+    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    assert raw.size % BLOCK_Q1_0 == 0, f"Q1_0 payload not a multiple of {BLOCK_Q1_0} bytes"
+    blocks = raw.reshape(-1, BLOCK_Q1_0)
+    scales = blocks[:, 0:2].copy().view(np.float16).reshape(-1)
+    qs     = blocks[:, 2:]
+    bits   = np.unpackbits(qs, axis=1, bitorder="little")
+    return scales, bits
+
+def q1_0_pack(scales, bits):
+    scales = np.asarray(scales, dtype=np.float16)
+    bits   = np.asarray(bits, dtype=np.uint8)
+    assert bits.ndim == 2 and bits.shape[1] == QK_Q1_0
+    nb  = bits.shape[0]
+    qs  = np.packbits(bits, axis=1, bitorder="little")
+    out = np.empty((nb, BLOCK_Q1_0), dtype=np.uint8)
+    out[:, 0:2] = scales.view(np.uint8).reshape(nb, 2)
+    out[:, 2:]  = qs
+    return out.reshape(-1)
+
+def q1_0_dequant(raw):
+    scales, bits = q1_0_unpack(raw)
+    w = bits.astype(np.float32)*2.0 - 1.0
+    return (w*scales.astype(np.float32)[:, None]).reshape(-1)
+
+def q1_0_to_ternary_codes(raw):
+    """Bridge for the existing ternary engine: 1-bit weights as ternary codes (0 -> -1 -> code
+    0, 1 -> +1 -> code 2). Stored at 2.125 bpw instead of 1.125 - functional today; a native
+    Q1 unpacker mode (phase 2) halves the streamed bytes."""
+    scales, bits = q1_0_unpack(raw)
+    return scales, (bits.astype(np.uint8)*2)
+
 # Q8_0 ---------------------------------------------------------------------------------------------
 
 QK_Q8_0    = 32
@@ -108,5 +148,6 @@ DEQUANT = {
     0:         f32_dequant,
     1:         f16_dequant,
     8:         q8_0_dequant,
+    GGML_Q1_0: q1_0_dequant,
     GGML_Q2_0: q2_0_dequant,
 }

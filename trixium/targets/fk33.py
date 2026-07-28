@@ -55,7 +55,14 @@ class _CRG(LiteXModule):
 # BonsaiSoC ----------------------------------------------------------------------------------------
 
 class BonsaiSoC(SoCCore):
-    def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, **kwargs):
+    def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
+                 with_nvme=False, **kwargs):
+        # Phase-2 exploration flags (see docs/phase2.md).
+        if with_nvme:
+            raise NotImplementedError(
+                "--with-nvme (LiteNVMe standalone weight loading) is a phase-2 option: the "
+                "PCIe lanes switch from endpoint (host) to root (NVMe) role - mutually "
+                "exclusive with --with-pcie host access. See docs/phase2.md.")
         assert variant in ["a", "b", "c"]
         assert 225e6 <= sys_clk_freq <= 450e6 # HBM AXI clock range.
         self.bonsai_variant = variant
@@ -102,10 +109,13 @@ class BonsaiSoC(SoCCore):
 
         # Bonsai -----------------------------------------------------------------------------------
         # Channel budget: ch0 = CPU main_ram (AXI-Lite window); engine/loader own ch1..N;
-        # BIST muxes over the remaining channels.
-        engine_channels = {"a": 0, "b": 4, "c": 8}[variant]
-        engine_axis     = [hbm.axi[1 + i] for i in range(engine_channels)]
-        bist_channels   = list(range(1 + engine_channels, 32))
+        # BIST muxes over the remaining channels. N scales the engine (phase-1 default 4;
+        # 8B needs N >= 16, phase-2 throughput target N = 31).
+        if engine_channels is None:
+            engine_channels = {"a": 0, "b": 4, "c": 8}[variant]
+        assert 0 <= engine_channels <= 31
+        engine_axis   = [hbm.axi[1 + i] for i in range(engine_channels)]
+        bist_channels = list(range(1 + engine_channels, 32))
 
         if variant in ["b", "c"]:
             from trixium.gateware.scratchpad import BonsaiScratchpad
@@ -150,6 +160,8 @@ def main():
     parser.add_target_argument("--sys-clk-freq", default=225e6, type=float, help="System clock frequency (= HBM AXI clock, 225-450 MHz).")
     parser.add_target_argument("--pcie-lanes",   default=4, type=int,       choices=[2, 4, 8, 16], help="PCIe lane count.")
     parser.add_target_argument("--driver",       action="store_true",       help="Generate LitePCIe driver headers.")
+    parser.add_target_argument("--engine-channels", default=None, type=int, help="Engine HBM channel count override (default: 4 for b, 8 for c; 8B needs >= 16, max 31).")
+    parser.add_target_argument("--with-nvme",    action="store_true",       help="Phase-2: standalone NVMe weight loading (LiteNVMe root, no host PCIe) - not implemented yet.")
     args = parser.parse_args()
 
     # Builds must run from the repo root: the HBM XCI is resolved as ip/hbm/hbm_0.xci from CWD.
@@ -157,7 +169,9 @@ def main():
         "ip/hbm/hbm_0.xci not found; run from the repository root."
 
     soc = BonsaiSoC(
-        variant      = args.variant,
+        variant         = args.variant,
+        engine_channels = args.engine_channels,
+        with_nvme       = args.with_nvme,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,
         **parser.soc_argdict)
@@ -165,7 +179,8 @@ def main():
     # Per-variant build directory (default Builder output_dir collides across variants).
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
-        builder_argd["output_dir"] = os.path.join("build", f"trixium_{args.variant}")
+        suffix = f"_n{args.engine_channels}" if args.engine_channels is not None else ""
+        builder_argd["output_dir"] = os.path.join("build", f"trixium_{args.variant}{suffix}")
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = "csr.csv"
 

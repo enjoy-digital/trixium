@@ -71,3 +71,28 @@ def test_q8_0_quant_dequant_close():
     w   = rng.normal(0, 1, 4*QK_Q8_0).astype(np.float32)
     wq  = q8_0_dequant(q8_0_quant(w))
     assert np.abs(w - wq).max() < 0.02 # |err| <= d/2 with d ~= amax/127.
+
+def test_q1_0_roundtrip_and_semantics():
+    from trixium.model.qformats import (
+        QK_Q1_0, BLOCK_Q1_0, q1_0_pack, q1_0_unpack, q1_0_dequant, q1_0_to_ternary_codes)
+    rng    = np.random.default_rng(9)
+    nb     = 6
+    scales = rng.uniform(0.001, 0.1, nb).astype(np.float16)
+    bits   = rng.integers(0, 2, (nb, QK_Q1_0), dtype=np.uint8)
+    raw    = q1_0_pack(scales, bits)
+    assert raw.size == nb*BLOCK_Q1_0
+    s2, b2 = q1_0_unpack(raw)
+    assert np.array_equal(s2, scales)
+    assert np.array_equal(b2, bits)
+    # C reference semantics: bit j at (qs[j//8] >> (j%8)) & 1; w = bit ? d : -d.
+    w = q1_0_dequant(raw).reshape(nb, QK_Q1_0)
+    for i in (0, nb - 1):
+        for j in (0, 1, 7, 8, 127):
+            byte = raw[i*BLOCK_Q1_0 + 2 + j//8]
+            bit  = (int(byte) >> (j % 8)) & 1
+            expect = float(scales[i]) if bit else -float(scales[i])
+            assert w[i, j] == np.float32(expect)
+    # Ternary-code bridge: 0 -> code 0 (-1), 1 -> code 2 (+1).
+    s3, codes = q1_0_to_ternary_codes(raw)
+    assert np.array_equal(s3, scales)
+    assert np.array_equal(codes, bits*2)
