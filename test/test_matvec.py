@@ -223,3 +223,62 @@ def test_engine_absmax_tracker():
 
     run_simulation(dut, [driver(), check()])
     assert absmax["v"] == int(np.abs(expected).max())
+
+def test_engine_csr_single_run_per_submit():
+    # Regression: submitting while the engine is idle used to latch `pending` even though
+    # the command was accepted on the submit cycle itself, replaying every op once the
+    # engine returned to idle (identical results, but the replay's command accept reset
+    # the absmax tracker mid-read and doubled the stream time).
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+
+    n_channels, rows_per_chan, cols, seed = 2, 8, 256, 11
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = []
+    for c in range(n_channels):
+        row0, nrows = layout.shard_rows(M, n_channels, c)
+        payloads.append(encode_rows(spec, row0, nrows).tobytes())
+
+    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()))
+    dut.submodules.front = BonsaiEngineCSR(dut.engine)
+
+    cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+               wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
+               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+               bias=B, rshift=R, xsrc=0, dst=0x4000)
+
+    def driver():
+        for k, v in cmd.items():
+            yield getattr(dut.front, k).storage.eq(v)
+        yield
+        yield dut.front.submit.storage.eq(1)
+        yield dut.front.submit.re.eq(1)
+        yield
+        yield dut.front.submit.re.eq(0)
+        yield
+        dones = 0
+        absmax_at_done = None
+        for cyc in range(20000):
+            if (yield dut.engine.done):
+                dones += 1
+                if absmax_at_done is None:
+                    absmax_at_done = (yield dut.engine.absmax)
+            yield
+        assert dones == 1, f"engine ran {dones} times for one submit"
+        assert absmax_at_done == int(np.abs(expected).max())
+        assert (yield dut.front.status.fields.pending) == 0
+
+    run_simulation(dut, [driver()])

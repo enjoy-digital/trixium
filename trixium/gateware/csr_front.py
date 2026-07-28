@@ -54,11 +54,16 @@ class BonsaiEngineCSR(LiteXModule):
         # # #
 
         pending = Signal()
+        # Accept beats submit: when the engine is idle it accepts the command on the submit
+        # cycle itself, and latching pending anyway would replay the op once the engine
+        # returns to idle (results are rewritten identically, but the replay's command
+        # accept resets the absmax tracker under the firmware's feet - and doubles the
+        # HBM stream time of every op).
         self.sync += [
-            If(self.submit.re & self.submit.storage,
-                pending.eq(1),
-            ).Elif(engine.cmd.valid & engine.cmd.ready,
+            If(engine.cmd.valid & engine.cmd.ready,
                 pending.eq(0),
+            ).Elif(self.submit.re & self.submit.storage,
+                pending.eq(1),
             ),
             If(engine.done,
                 self.done_count.status.eq(self.done_count.status + 1),

@@ -101,6 +101,12 @@ def hybrid_generate(img, prompt, n_new, modes=None):
     def lroundf(x):
         return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
 
+    def fsum32(v):
+        acc = f32(0.0)
+        for e in np.asarray(v, dtype=f32):
+            acc = f32(acc + e)
+        return acc
+
     def entry(name):
         return img.by_name[name]
 
@@ -120,8 +126,8 @@ def hybrid_generate(img, prompt, n_new, modes=None):
 
     def rmsnorm_sp(m, e, w):
         v  = m.astype(f32)*f32(np.exp2(e))
-        ss = f32((v.astype(f32)**2).sum())
-        r  = f32(1.0)/np.sqrt(ss/f32(len(v)) + f32(h["rms_eps"]))
+        ss = fsum32(v*v)
+        r  = f32(1.0)/np.sqrt(f32(f32(ss/f32(len(v))) + f32(h["rms_eps"])))
         o  = v*r*w*f32(np.exp2(-E_NORM))
         return np.clip(lroundf(o), -32767, 32767)
 
@@ -178,8 +184,8 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         kc.append([]); vc.append([]); ks.append([]); vs.append([])
 
     def rmsnorm_f(x, w):
-        ss = f32((x.astype(f32)**2).sum())
-        r  = f32(1.0)/np.sqrt(ss/f32(len(x)) + f32(eps))
+        ss = fsum32(x*x)
+        r  = f32(1.0)/np.sqrt(f32(f32(ss/f32(len(x))) + f32(eps)))
         return (x*r*w).astype(f32)
 
     def forward(tok, pos, want):
@@ -210,20 +216,20 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                         x0, x1 = vh[p2], vh[p2 + hd//2]
                         vh[p2]         = x0*c - x1*sn
                         vh[p2 + hd//2] = x0*sn + x1*c
-            ka = np.abs(k).max(); kscale = f32(ka/127.0) if ka > 0 else f32(1.0)
-            va = np.abs(v).max(); vscale = f32(va/127.0) if va > 0 else f32(1.0)
-            kc[l].append(np.round(k/kscale).astype(np.int8)); ks[l].append(kscale)
-            vc[l].append(np.round(v/vscale).astype(np.int8)); vs[l].append(vscale)
+            ka = np.abs(k).max(); kscale = f32(ka/f32(127.0)) if ka > 0 else f32(1.0)
+            va = np.abs(v).max(); vscale = f32(va/f32(127.0)) if va > 0 else f32(1.0)
+            kc[l].append(lroundf(k*f32(f32(1.0)/kscale)).astype(np.int8)); ks[l].append(kscale)
+            vc[l].append(lroundf(v*f32(f32(1.0)/vscale)).astype(np.int8)); vs[l].append(vscale)
             n_rep = n_head//n_kv
             attn  = np.zeros(n_head*hd, dtype=f32)
             for i in range(n_head):
                 kvh = i//n_rep
                 qh  = q[i*hd:(i+1)*hd]
-                sc  = np.array([f32((qh*kt[kvh*hd:(kvh+1)*hd]).sum())*kst
+                sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst)
                                 for kt, kst in zip(kc[l], ks[l])], dtype=f32)
                 sc  = sc*f32(1.0/np.sqrt(hd))
                 e   = np.exp(sc - sc.max(), dtype=f32)
-                pr  = e/e.sum()
+                pr  = e*f32(f32(1.0)/fsum32(e))
                 ah  = np.zeros(hd, dtype=f32)
                 for t in range(len(vc[l])):
                     ah += pr[t]*vs[l][t]*vc[l][t][kvh*hd:(kvh+1)*hd].astype(f32)
