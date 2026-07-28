@@ -55,11 +55,18 @@ class BonsaiMatVecEngine(LiteXModule):
                              # rows = T//n_channels, rem = T % n_channels).
             ("ilv",    1),   # Interleaved gather: result slot = row*n_channels + chan
                              # (position-major scores) instead of chan*rows + row.
+            ("supw",   1),   # Suppress scratchpad result writes (argmax-tap-only ops:
+                             # the LM head needs no 600 KB result spill).
         ])
         self.busy   = Signal()
         self.done   = Signal() # Pulse.
         self.error  = Signal()
         self.absmax = Signal(32) # |int32| max over the last matvec's gathered results.
+        # Argmax tap over the gathered results (matvec kinds only): value + global row
+        # index (grant*rows + row), ties to the smallest index (matches np.argmax across
+        # the round-robin arrival order). Reset on command accept.
+        self.argmax_val = Signal((32, True), reset=-(1 << 31))
+        self.argmax_idx = Signal(24, reset=0xFFFFFF)
 
         # STORE (kind 3): scratchpad beats -> one HBM channel, through the loader's
         # per-channel AXI writers (wired by the integrator; a kind-3 op hangs if absent -
@@ -100,7 +107,7 @@ class BonsaiMatVecEngine(LiteXModule):
         # Latched command ---------------------------------------------------------------------
         cmd_r = {}
         for name in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-                     "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv"):
+                     "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw"):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
@@ -182,6 +189,23 @@ class BonsaiMatVecEngine(LiteXModule):
                 self.absmax.eq(grant_abs),
             )
         ]
+        is_matvec = Signal() # Kinds 0/1 only (not fetch/store/axpy partials).
+        gidx      = Signal(24)
+        self.comb += [
+            is_matvec.eq((cmd_r["kind"] == 0) | (cmd_r["kind"] == 1)),
+            gidx.eq(rr.grant*cmd_r["rows"] + grant_row),
+        ]
+        self.sync += [
+            If(self.cmd.valid & self.cmd.ready,
+                self.argmax_val.eq(-(1 << 31)),
+                self.argmax_idx.eq(0xFFFFFF),
+            ).Elif(is_matvec & grant_valid &
+                   ((grant_s > self.argmax_val)
+                    | ((grant_s == self.argmax_val) & (gidx < self.argmax_idx))),
+                self.argmax_val.eq(grant_s),
+                self.argmax_idx.eq(gidx),
+            )
+        ]
 
         # Fetch datapath: selected channel's beats -> scratchpad (256-bit writes).
         fetch_valid = Signal()
@@ -216,13 +240,16 @@ class BonsaiMatVecEngine(LiteXModule):
             )
         ]
 
-        # Scratchpad port wiring (direct, or muxed with the vector unit).
+        # Scratchpad port wiring (direct, or muxed with the vector unit). supw masks only
+        # the memory-facing enables - result counting still runs on eng_gw_we.
+        sp_gw_we = Signal(8)
+        self.comb += sp_gw_we.eq(Mux(cmd_r["supw"] & ~fetch_mode, 0, eng_gw_we))
         if vecunit is None:
             self.comb += [
                 scratchpad.fill.adr.eq(eng_fill_adr),
                 scratchpad.gather.adr.eq(eng_gw_adr),
                 scratchpad.gather.dat_w.eq(eng_gw_dat),
-                scratchpad.gather.we.eq(eng_gw_we),
+                scratchpad.gather.we.eq(sp_gw_we),
             ]
         else:
             grant_vec = Signal()
@@ -237,7 +264,7 @@ class BonsaiMatVecEngine(LiteXModule):
                     scratchpad.fill.adr.eq(eng_fill_adr),
                     scratchpad.gather.adr.eq(eng_gw_adr),
                     scratchpad.gather.dat_w.eq(eng_gw_dat),
-                    scratchpad.gather.we.eq(eng_gw_we),
+                    scratchpad.gather.we.eq(sp_gw_we),
                 ),
                 vecunit.sp_rd_dat.eq(scratchpad.fill.dat_r),
             ]

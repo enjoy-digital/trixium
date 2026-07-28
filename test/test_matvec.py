@@ -425,3 +425,69 @@ def test_engine_axpy():
                    bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem)
         got = _run_engine(dut, cmd, n_channels*cols, 0x4000)
         assert np.array_equal(got, expected), f"T={T}"
+
+def test_engine_argmax_tap_and_suppress():
+    # Argmax tap: value + global index (ties to smallest index) over a suppressed-write
+    # ternary op - the scratchpad result region must stay untouched.
+    n_channels, rows_per_chan, cols, seed = 2, 16, 256, 51
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+    # Force a tie for the max between two rows (row 5 copies row 20's content).
+    codes[5]  = codes[20]
+    scales[5] = scales[20]
+
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+    exp_idx  = int(np.argmax(expected))
+    exp_val  = int(expected[exp_idx])
+
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = []
+    for c in range(n_channels):
+        row0, nrows = layout.shard_rows(M, n_channels, c)
+        payloads.append(encode_rows(spec, row0, nrows).tobytes())
+
+    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()))
+    cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+               wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
+               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+               bias=B, rshift=R, xsrc=0, dst=0x4000, supw=1)
+    out = {}
+
+    def driver():
+        for k, v in cmd.items():
+            yield getattr(dut.engine.cmd, k).eq(v)
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+        for _ in range(50000):
+            if (yield dut.engine.done):
+                break
+            yield
+        else:
+            raise AssertionError("timeout")
+        yield
+        yield
+        out["val"] = (yield dut.engine.argmax_val)
+        out["idx"] = (yield dut.engine.argmax_idx)
+        # Result region untouched (suppressed): scratchpad still zero there.
+        untouched = 0
+        for w in range(8):
+            untouched |= (yield dut.scratchpad.mem[(0x4000 + 32*w)//32])
+        out["untouched"] = untouched
+
+    run_simulation(dut, [driver()])
+    val = out["val"] - (1 << 32) if out["val"] & (1 << 31) else out["val"]
+    assert val == exp_val, (val, exp_val)
+    assert out["idx"] == exp_idx, (out["idx"], exp_idx)
+    assert out["untouched"] == 0

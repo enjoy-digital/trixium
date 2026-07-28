@@ -38,6 +38,7 @@ class BonsaiEngineCSR(LiteXModule):
         self.chan    = CSRStorage(5,  description="Fetch source / store destination channel.")
         self.rem     = CSRStorage(5,  description="Channels < rem stream one extra row.")
         self.ilv     = CSRStorage(1,  description="Interleaved (position-major) gather.")
+        self.supw    = CSRStorage(1,  description="Suppress scratchpad result writes (argmax-only ops).")
         self.submit  = CSRStorage(1,  description="Write 1 to submit the op.")
         self.status  = CSRStatus(fields=[
             CSRField("busy",     size=1),
@@ -46,6 +47,8 @@ class BonsaiEngineCSR(LiteXModule):
         ])
         self.done_count = CSRStatus(32, description="Completed op counter.")
         self.absmax     = CSRStatus(32, description="|int32| max over the last matvec's results.")
+        self.argmax_val = CSRStatus(32, description="Max signed result of the last matvec.")
+        self.argmax_idx = CSRStatus(24, description="Global row index of argmax (ties: smallest).")
 
         # Perf counters, muxed by perf_chan.
         self.perf_chan  = CSRStorage(5)
@@ -88,10 +91,13 @@ class BonsaiEngineCSR(LiteXModule):
             engine.cmd.chan.eq(self.chan.storage),
             engine.cmd.rem.eq(self.rem.storage),
             engine.cmd.ilv.eq(self.ilv.storage),
+            engine.cmd.supw.eq(self.supw.storage),
             self.status.fields.busy.eq(engine.busy),
             self.status.fields.error.eq(engine.error),
             self.status.fields.pending.eq(pending),
             self.absmax.status.eq(engine.absmax),
+            self.argmax_val.status.eq(engine.argmax_val),
+            self.argmax_idx.status.eq(engine.argmax_idx),
         ]
 
         beats = Array([r.total_beats for r in engine.readers])

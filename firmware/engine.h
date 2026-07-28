@@ -22,6 +22,7 @@ struct engine_op {
     uint16_t rows;      // Rows per channel.
     uint8_t  rem;       // Channels < rem stream one extra row (striped KV).
     uint8_t  ilv;       // Interleaved (position-major) gather.
+    uint8_t  supw;      // Suppress scratchpad result writes (argmax tap only).
     uint16_t cols;
     uint32_t wbase;     // Per-channel weight byte address.
     uint32_t wlen;      // Beats per channel.

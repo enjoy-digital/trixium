@@ -29,6 +29,7 @@ void engine_run(const struct engine_op *op)
     engine_csr_chan_write(op->chan);
     engine_csr_rem_write(op->rem);
     engine_csr_ilv_write(op->ilv);
+    engine_csr_supw_write(op->supw);
     engine_csr_submit_write(1);
 
     while (engine_csr_done_count_read() == done);
