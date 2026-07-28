@@ -242,8 +242,8 @@ def test_rope_accuracy():
     # Normed inputs (rmsnorm output <= ~2^14): rotations stay inside int16.
     x   = rng.integers(-20000, 20000, hd).astype(np.int64)
     ang = rng.uniform(0, 2*np.pi, hd//2)
-    c15 = np.round(np.cos(ang)*32767).astype(np.int64)
-    s15 = np.round(np.sin(ang)*32767).astype(np.int64)
+    c15 = np.round(np.cos(ang)*(1 << 14)).astype(np.int64)
+    s15 = np.round(np.sin(ang)*(1 << 14)).astype(np.int64)
     sp  = bytearray(4096)
     sp[0:hd]              = x[:hd//2].astype("<i2").tobytes()
     sp[256:256+hd]        = x[hd//2:].astype("<i2").tobytes()

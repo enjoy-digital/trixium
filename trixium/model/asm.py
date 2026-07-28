@@ -586,10 +586,11 @@ def prog_reduce_acc():
     ]
 
 def prog_rope():
-    """In-place rotate of one head's halves against Q15 cos/sin tables:
-      out0 = clamp16(rne(x0*c - x1*s, 15)),  out1 = clamp16(rne(x0*s + x1*c, 15)).
-    Tables are int16 Q15 (c15 = round(cos*32767)), written per position by the firmware
-    (llama-style half-split pairing: pair p = (x[p], x[p + hd/2])).
+    """In-place rotate of one head's halves against Q14 cos/sin tables:
+      out0 = clamp16(rne(x0*c - x1*s, 14)),  out1 = clamp16(rne(x0*s + x1*c, 14)).
+    Tables are int16 Q14 (c14 = round(cos*mscale*2^14) - Q14 absorbs YaRN's mscale > 1),
+    fetched from the image's rope_tab row for the position (half-split pairing:
+    pair p = (x[p], x[p + hd/2])).
       A0 = x0 (first half), A1 = x1 (second half), A2 = c table, A3 = s table,
       A4 = beats (hd/2/16), A5 = x0 write ptr, A6 = x1 write ptr."""
     return [
@@ -603,12 +604,12 @@ def prog_rope():
         ("VMUL",  "v4", "v0", "v2"),    # x0*c.
         ("VMUL",  "v5", "v1", "v3"),    # x1*s.
         ("VSUB",  "v4", "v4", "v5"),
-        ("VRNE",  "v4", "v4", 15),
+        ("VRNE",  "v4", "v4", 14),
         ("VCLAMP16", "v4", "v4"),
         ("VMUL",  "v5", "v0", "v3"),    # x0*s.
         ("VMUL",  "v6", "v1", "v2"),    # x1*c.
         ("VADD",  "v5", "v5", "v6"),
-        ("VRNE",  "v5", "v5", 15),
+        ("VRNE",  "v5", "v5", 14),
         ("VCLAMP16", "v5", "v5"),
         ("STV",   "v4", "s5"),
         ("STV",   "v5", "s6"),

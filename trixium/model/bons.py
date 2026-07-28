@@ -133,6 +133,19 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
     entries       = []
     manifest_tensors = []
 
+    # Rope tables baked into the image: one NORM16 row per position, [c14 | s14] Q14
+    # halves (Q14 absorbs YaRN's mscale > 1), computed with golden.rope_tables (float64
+    # numpy) - the image is the single source of truth, so the firmware and every mirror
+    # use bit-identical tables with no libm coupling.
+    from trixium.model.golden import rope_tables
+    if getattr(cfg, "max_ctx", 0) and getattr(cfg, "head_dim", 0):
+        cos, sin = rope_tables(cfg, np.arange(cfg.max_ctx), dtype=np.float64)
+        tab = np.concatenate([cos, sin], axis=1)
+        t14 = np.clip(np.round(tab*(1 << 14)), -32767, 32767).astype(np.int16)
+        tensors = list(tensors) + [TensorSpec("rope_tab", layout.ROLE_ROPE_TAB, 0,
+                                              layout.KIND_NORM16, cfg.max_ctx, cfg.head_dim,
+                                              values=t14, flags=FLAG_REPLICATED)]
+
     # Every F32 tensor (norm weights) gets an int16 companion at NORM16_EXP so the vector
     # unit's rmsnorm can fetch it straight into the scratchpad (same role/layer; ".w16"
     # name - the entry name field is 24 bytes; consumers select by kind).

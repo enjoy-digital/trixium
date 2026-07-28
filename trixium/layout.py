@@ -62,7 +62,8 @@ FLAG_REPLICATED = 0x01 # Tensor payload identical in every channel (not row-shar
 (ROLE_TOK_EMB, ROLE_OUT_NORM, ROLE_LM_HEAD,
  ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
  ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
- ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN) = range(14)
+ ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
+ ROLE_ROPE_TAB) = range(15)
 
 ROLE_NAMES = {
     ROLE_TOK_EMB     : "tok_emb",     ROLE_OUT_NORM  : "out_norm",  ROLE_LM_HEAD  : "lm_head",
@@ -70,6 +71,7 @@ ROLE_NAMES = {
     ROLE_ATTN_V      : "attn_v",      ROLE_ATTN_OUT  : "attn_out",  ROLE_ATTN_Q_NORM: "attn_q_norm",
     ROLE_ATTN_K_NORM : "attn_k_norm", ROLE_FFN_NORM  : "ffn_norm",  ROLE_FFN_GATE : "ffn_gate",
     ROLE_FFN_UP      : "ffn_up",      ROLE_FFN_DOWN  : "ffn_down",
+    ROLE_ROPE_TAB    : "rope_tab",
 }
 
 # Row packet math ----------------------------------------------------------------------------------
