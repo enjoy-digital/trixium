@@ -42,6 +42,11 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_FET  0x30000 // Fetch staging (embedding rows, norm16 rows).
 #define SP_KVP  0x34000 // KV row-packet staging (built by CPU, engine-stored to HBM).
 #define SP_SC   0x36000 // Engine score results (int32, position-major).
+#define SP_Q    0x38000 // Resident q int16 (q_dim <= 4096: 8 KB).
+#define SP_K    0x3A000 // Resident k int16 (kv_dim <= 1024: 2 KB).
+#define SP_V    0x3B000 // Resident v int16.
+#define SP_TAB  0x3B800 // Rope table row for the current position ([c14 | s14]).
+#define SP_FET2 0x3C000 // Second norm16 staging slot (k_norm while q_norm sits in SP_FET).
 
 // Fixed exponent for CPU-produced normed vectors (values bounded ~16 by construction).
 #define E_NORM  (-11)
@@ -517,6 +522,65 @@ static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n)
     return eo;
 }
 
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+// Resident attention front (all attention hwops on): q/k/v live in the scratchpad as
+// int16 from the matvec on; qk-norm/rope/kv-pack run on the vector unit; the CPU float
+// K/V cache is not maintained (attention op bits are latched per generation - flipping
+// them mid-generation is a debug-only move).
+static int attn_all_hw(void)
+{
+    return op_on_hw(OP_QKNORM) && op_on_hw(OP_ROPE) && op_on_hw(OP_KVQUANT)
+        && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV);
+}
+
+// vec rmsnorm of one head slice in place (w16 rows already staged at w_sp).
+static void vec_rmsnorm_head(uint32_t sp, int es, uint32_t w_sp, int n)
+{
+    int eps_int = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*es));
+    if (eps_int < 1) eps_int = 1;
+    int ln = 0;
+    while ((1 << ln) < n) ln++;
+    int32_t args[7] = {(int32_t)sp, (int32_t)w_sp, (int32_t)sp, n/16,
+                       -ln, eps_int, E_W16 - E_NORM - 15};
+    vec_run(PROG_RMSNORM, args, 7);
+}
+
+static void vec_rope_head(uint32_t sp, int hd)
+{
+    int32_t args[7] = {(int32_t)sp, (int32_t)(sp + hd), (int32_t)SP_TAB,
+                       (int32_t)(SP_TAB + hd), (hd/2)/16,
+                       (int32_t)sp, (int32_t)(sp + hd)};
+    vec_run(PROG_ROPE, args, 7);
+}
+
+// vec quant8 head slice -> int8 at dst (exponent = es + 8).
+static void vec_quant8_head(uint32_t sp, uint32_t dst, int n)
+{
+    int32_t args[4] = {(int32_t)sp, 0, (int32_t)dst, n/16};
+    vec_run(PROG_QUANT8, args, 4);
+}
+
+// Pack a resident head as a KV row packet and store it (scale = 2^(es+8) exactly).
+static void kv_store_row_res(int l, int kvh, int kind, int t, uint32_t sp, int es)
+{
+    volatile uint16_t *ps = (volatile uint16_t *)(SCRATCHPAD_BASE + SP_KVP);
+    int groups = head_dim/32;
+    int e8 = es + 8;
+    for (int g = 0; g < 16; g++)
+        ps[g] = (g < groups) ? (uint16_t)((e8 + 15) << 10) : 0;
+    vec_quant8_head(sp, SP_KVP + 32, head_dim);
+    struct engine_op op = {0};
+    op.kind  = ENGINE_KIND_STORE;
+    op.chan  = t % n_ch;
+    op.wbase = kv_region_addr(l, kvh, kind) + (uint32_t)(t/n_ch)*kv_rb*32;
+    op.wlen  = kv_rb;
+    op.xsrc  = SP_KVP;
+    engine_run(&op);
+    int idx = kv_ek_idx(l, kvh, kind);
+    if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
+}
+#endif
+
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
 static int forward(int token, int want_logits)
@@ -546,6 +610,17 @@ static int forward(int token, int want_logits)
     float scale  = 1.0f/sqrtf((float)head_dim);
     int   pos    = n_pos;
 
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+    int attn_hw = attn_all_hw();
+    if (attn_hw) {
+        // Rope table row for this position ([c14 | s14], Q14, from the image).
+        const struct bons_entry *rt = model_entry_kind(ROLE_ROPE_TAB, 0, KIND_NORM16);
+        uint32_t rb = (2u*head_dim + 31)/32;
+        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + (rt->chan_base_beats + (uint64_t)pos*rb)*32,
+                     rb, SP_TAB);
+    }
+#endif
+
     for (int l = 0; l < n_layer; l++) {
         // Attention block.
         perf_enter(OP_RMSNORM);
@@ -555,10 +630,60 @@ static int forward(int token, int want_logits)
         perf_enter(OP_QUANT8);
         op_quant8_sp(SP_H, SP_X, n_embd);
         perf_exit(OP_QUANT8);
+        int eq_res = 0, ev_res = 0;
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+        if (attn_hw) {
+            // q/k/v: engine matvec -> vec norm_i32 -> int16 resident; qk-norm + rope on
+            // the vector unit; K/V packed and stored to HBM. No CPU floats anywhere.
+            const struct bons_entry *eqt = model_entry(ROLE_ATTN_Q, l);
+            const struct bons_entry *ekt = model_entry(ROLE_ATTN_K, l);
+            const struct bons_entry *evt = model_entry(ROLE_ATTN_V, l);
+            perf_enter(OP_NORM_I32);
+            model_matvec(eqt, SP_X, SP_Y);
+            int kq = op_norm_i32_sp(SP_Y, SP_Q, q_dim);
+            int eq_r = (E_NORM + 8) - (int)eqt->bias + (int)eqt->rshift + kq;
+            model_matvec(ekt, SP_X, SP_Y);
+            int kk2 = op_norm_i32_sp(SP_Y, SP_K, kv_dim);
+            int ek_r = (E_NORM + 8) - (int)ekt->bias + (int)ekt->rshift + kk2;
+            model_matvec(evt, SP_X, SP_Y);
+            int kv2 = op_norm_i32_sp(SP_Y, SP_V, kv_dim);
+            ev_res = (E_NORM + 8) - (int)evt->bias + (int)evt->rshift + kv2;
+            perf_exit(OP_NORM_I32);
+            perf_enter(OP_QKNORM);
+            const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
+            const struct bons_entry *kn16 = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
+            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + qn16->chan_base_beats*32,
+                         qn16->chan_len_beats, SP_FET);
+            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
+                         kn16->chan_len_beats, SP_FET2);
+            for (int hh = 0; hh < n_head; hh++)
+                vec_rmsnorm_head(SP_Q + hh*head_dim*2, eq_r, SP_FET, head_dim);
+            for (int hh = 0; hh < n_kv_head; hh++)
+                vec_rmsnorm_head(SP_K + hh*head_dim*2, ek_r, SP_FET2, head_dim);
+            perf_exit(OP_QKNORM);
+            perf_enter(OP_ROPE);
+            for (int hh = 0; hh < n_head; hh++)
+                vec_rope_head(SP_Q + hh*head_dim*2, head_dim);
+            for (int hh = 0; hh < n_kv_head; hh++)
+                vec_rope_head(SP_K + hh*head_dim*2, head_dim);
+            perf_exit(OP_ROPE);
+            perf_enter(OP_KVQUANT);
+            for (int hh = 0; hh < n_kv_head; hh++) {
+                kv_store_row_res(l, hh, 0, pos, SP_K + hh*head_dim*2, E_NORM);
+                kv_store_row_res(l, hh, 1, pos, SP_V + hh*head_dim*2, ev_res);
+            }
+            perf_exit(OP_KVQUANT);
+            eq_res = E_NORM;
+            (void)eq_res;
+            goto attn_scores;
+        }
+#endif
+        {
         float sx = ldexpf(1.0f, E_NORM + 8);
         matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q);
         matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k);
         matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v);
+        }
 
         perf_enter(OP_QKNORM);
         for (int hh = 0; hh < n_head; hh++)
@@ -599,6 +724,9 @@ static int forward(int token, int want_logits)
 #endif
         perf_exit(OP_KVQUANT);
 
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+attn_scores: ;
+#endif
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
         for (int hh = 0; hh < n_head; hh++) {
@@ -612,7 +740,13 @@ static int forward(int token, int want_logits)
                 // touch the CPU; the 1/sum fold is one float divide per head.
                 float *ah = attn + hh*head_dim;
                 perf_enter(OP_SCORES);
-                int eq = quantize_f_pow2(qh, head_dim, SP_X);
+                int eq;
+                if (attn_hw) {
+                    vec_quant8_head(SP_Q + hh*head_dim*2, SP_X, head_dim);
+                    eq = E_NORM + 8;
+                } else {
+                    eq = quantize_f_pow2(qh, head_dim, SP_X);
+                }
                 int Bk, Rk;
                 kv_scores_br(l, kvh, 0, &Bk, &Rk);
                 struct engine_op op = {0};

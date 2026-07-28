@@ -230,13 +230,36 @@ def hybrid_generate(img, prompt, n_new, modes=None):
             acc = (acc + parts[c]).astype(f32)
         return acc*f32(np.exp2(ep + Rpre - B))
 
-    def kv_hbm_fused(l, kvh, qh):
+    def vec_prog(name, sp, args):
+        words = vasm.assemble(vasm.PROGRAMS[name]())
+        return vasm.VecInterp(sp).run(words, args)
+
+    def res_rmsnorm_head(m, es, w16):
+        n  = len(m)
+        sp = bytearray(3*4096)
+        sp[0:2*n]         = np.asarray(m).astype("<i2").tobytes()
+        sp[4096:4096+2*n] = np.asarray(w16).astype("<i2").tobytes()
+        eps_int = max(1, int(round(float(h["rms_eps"])*2.0**(-2*es))))
+        vec_prog("rmsnorm", sp, [0, 4096, 8192, n//16, -int(np.log2(n)), eps_int,
+                                 (-13) - E_NORM - 15])
+        return np.frombuffer(bytes(sp[8192:8192+2*n]), dtype="<i2").astype(np.int64)
+
+    def res_rope_head(m, tab_row):
+        n  = len(m)
+        sp = bytearray(3*4096)
+        sp[0:2*n]         = np.asarray(m).astype("<i2").tobytes()
+        sp[4096:4096+2*n] = np.asarray(tab_row).astype("<i2").tobytes()
+        vec_prog("rope", sp, [0, n, 4096, 4096 + n, (n//2)//16, 0, n])
+        return np.frombuffer(bytes(sp[0:2*n]), dtype="<i2").astype(np.int64)
+
+    def kv_hbm_fused(l, kvh, qh, q8=None, eq=None):
         # Firmware's fused path: engine scores -> softmax8 (interpreter) -> AXPY -> reduce.
-        eq = 0
-        amax = np.abs(qh).max()
-        if amax > 0:
-            eq = int(np.frexp(f32(amax))[1]) - 7
-        q8 = np.clip(lroundf(qh*f32(np.exp2(-eq))), -127, 127).astype(np.int8)
+        if q8 is None:
+            eq = 0
+            amax = np.abs(qh).max()
+            if amax > 0:
+                eq = int(np.frexp(f32(amax))[1]) - 7
+            q8 = np.clip(lroundf(qh*f32(np.exp2(-eq))), -127, 127).astype(np.int8)
         rowsk = hbm_kv[(l, kvh, 0)]
         ekm   = max(e for e, _ in rowsk)
         Bk    = 22 - ekm
@@ -319,6 +342,56 @@ def hybrid_generate(img, prompt, n_new, modes=None):
             def qkv(name):
                 res, er = matvec_i8(p + name, x8, e8)
                 return (res.astype(np.float64)*np.exp2(er)).astype(f32)
+            if modes.get("kv_hbm", "cpu") == "hw":
+                # Resident front: matvec -> norm_i32 -> int16; qk-norm/rope on the
+                # interpreter (image w16 rows + rope_tab row); K/V packed from residents;
+                # per-head q8 at fixed E_NORM+8; fused scores/softmax/WV as before.
+                def qkv_res(name):
+                    res2, _ = matvec_i8(p + name, x8, e8)
+                    m2, kx = norm_i32_sp(res2)
+                    e2 = entry(p + name)
+                    return m2, e8 - e2["bias"] + e2["rshift"] + kx
+                qm, eqr = qkv_res("attn_q.weight")
+                km, ekr = qkv_res("attn_k.weight")
+                vm, evr = qkv_res("attn_v.weight")
+                _, qn16 = img.tensor(p + "attn_q_norm.w16")
+                _, kn16 = img.tensor(p + "attn_k_norm.w16")
+                _, rtab = img.tensor("rope_tab")
+                trow = rtab[pos]
+                qh8 = []
+                for i2 in range(n_head):
+                    mh = res_rmsnorm_head(qm[i2*hd:(i2+1)*hd], eqr, qn16.reshape(-1))
+                    mh = res_rope_head(mh, trow)
+                    qh8.append(quant8_sp(mh))
+                for i2 in range(n_kv):
+                    mh = res_rmsnorm_head(km[i2*hd:(i2+1)*hd], ekr, kn16.reshape(-1))
+                    mh = res_rope_head(mh, trow)
+                    hbm_kv.setdefault((l, i2, 0), []).append(
+                        (E_NORM + 8, quant8_sp(mh).astype(np.int8)))
+                    hbm_kv.setdefault((l, i2, 1), []).append(
+                        (evr + 8, quant8_sp(vm[i2*hd:(i2+1)*hd]).astype(np.int8)))
+                attn = np.zeros(n_head*hd, dtype=f32)
+                n_rep2 = n_head//n_kv
+                for i2 in range(n_head):
+                    attn[i2*hd:(i2+1)*hd] = kv_hbm_fused(l, i2//n_rep2, None,
+                                                         q8=qh8[i2], eq=E_NORM + 8)
+                a8, ea8 = quantize_f_pow2(attn)
+                res, er = matvec_i8(p + "attn_output.weight", a8, ea8)
+                dm, kk  = norm_i32_sp(res)
+                xm, ex  = resid_sp(xm, ex, dm, er + kk)
+                hm = rmsnorm_sp(xm, ex, p + "ffn_norm.weight")
+                x8 = quant8_sp(hm)
+                gres, ger = matvec_i8(p + "ffn_gate.weight", x8, E_NORM + 8)
+                gm, kg = norm_i32_sp(gres)
+                ures, uer = matvec_i8(p + "ffn_up.weight", x8, E_NORM + 8)
+                um, ku = norm_i32_sp(ures)
+                sm = silu_sp(gm, ger + kg, um, uer + ku)
+                s8 = quant8_sp(sm)
+                dres, der = matvec_i8(p + "ffn_down.weight", s8,
+                                      (ger + kg) + (uer + ku) + 15 + 8)
+                dm, kd = norm_i32_sp(dres)
+                xm, ex = resid_sp(xm, ex, dm, der + kd)
+                continue
             q = qkv("attn_q.weight")
             k = qkv("attn_k.weight")
             v = qkv("attn_v.weight")
