@@ -176,7 +176,7 @@ def main():
     parser.add_target_argument("--driver",       action="store_true",       help="Generate LitePCIe driver headers.")
     parser.add_target_argument("--engine-channels", default=None, type=int, help="Engine HBM channel count override (default: 4 for b, 8 for c; 8B needs >= 16, max 31).")
     parser.add_target_argument("--with-nvme",    action="store_true",       help="Phase-2: standalone NVMe weight loading (LiteNVMe root, no host PCIe) - not implemented yet.")
-    parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit (CPU-op offload; default off until sim-gated).")
+    parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
 
     # Builds must run from the repo root: the HBM XCI is resolved as ip/hbm/hbm_0.xci from CWD.

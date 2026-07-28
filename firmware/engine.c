@@ -15,21 +15,29 @@ void engine_run(const struct engine_op *op)
     perf_enter(OP_ENGINE_WAIT);
     uint32_t done = engine_csr_done_count_read();
 
-    engine_csr_kind_write(op->kind);
-    engine_csr_rows_write(op->rows);
-    engine_csr_cols_write(op->cols);
-    engine_csr_wbase_write(op->wbase);
-    engine_csr_wlen_write(op->wlen);
-    engine_csr_sbeats_write(op->sbeats);
-    engine_csr_cbeats_write(op->cbeats);
-    engine_csr_bias_write(op->bias);
-    engine_csr_rshift_write(op->rshift);
-    engine_csr_xsrc_write(op->xsrc);
-    engine_csr_dst_write(op->dst);
-    engine_csr_chan_write(op->chan);
-    engine_csr_rem_write(op->rem);
-    engine_csr_ilv_write(op->ilv);
-    engine_csr_supw_write(op->supw);
+    // Delta CSR writes (nothing else touches the engine op registers).
+    static struct engine_op c;
+    static int c_valid;
+#define EW(field, wrfn) do { \
+        if (!c_valid || c.field != op->field) { wrfn(op->field); c.field = op->field; } \
+    } while (0)
+    EW(kind,   engine_csr_kind_write);
+    EW(rows,   engine_csr_rows_write);
+    EW(cols,   engine_csr_cols_write);
+    EW(wbase,  engine_csr_wbase_write);
+    EW(wlen,   engine_csr_wlen_write);
+    EW(sbeats, engine_csr_sbeats_write);
+    EW(cbeats, engine_csr_cbeats_write);
+    EW(bias,   engine_csr_bias_write);
+    EW(rshift, engine_csr_rshift_write);
+    EW(xsrc,   engine_csr_xsrc_write);
+    EW(dst,    engine_csr_dst_write);
+    EW(chan,   engine_csr_chan_write);
+    EW(rem,    engine_csr_rem_write);
+    EW(ilv,    engine_csr_ilv_write);
+    EW(supw,   engine_csr_supw_write);
+#undef EW
+    c_valid = 1;
     engine_csr_submit_write(1);
 
     while (engine_csr_done_count_read() == done);
