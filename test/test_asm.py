@@ -197,3 +197,41 @@ def test_rmsnorm_edges():
     a   = _rmsnorm_hw(m, -13, w16, n)
     b   = _rmsnorm_hw(m >> 1, -12, w16, n)
     assert np.max(np.abs(a - b)) <= 1
+
+def test_softmax8_accuracy():
+    rng = np.random.default_rng(9)
+    for T, sigma in [(5, -18), (30, -20), (64, -16), (1, -18)]:
+        s32 = rng.integers(-2**29, 2**29, T).astype(np.int64)
+        pad = ((T + 15)//16)*16
+        buf = np.full(pad, -2**31, dtype=np.int64)
+        buf[:T] = s32
+        sp = bytearray(8192)
+        sp[0:4*pad] = buf.astype("<i4").tobytes()
+        s1 = 11                      # |s>>s1| <= 2^18: subtract and *739 int32-safe.
+        s2 = -(sigma + 6) - s1
+        S, _ = _run("softmax8", sp, [0, 0, 4096, pad//16, -s1, -s2])
+        got  = np.frombuffer(bytes(sp[4096:4096+pad]), dtype=np.int8).astype(np.float64)
+        ref  = np.exp((s32 - s32.max()).astype(np.float64)*(2.0**sigma))
+        # got/128 approximates ref (relative to the max entry).
+        err = np.abs(got[:T]/128.0 - ref)
+        assert np.all(err < 0.02), (T, err.max())
+        assert got[T:].sum() == 0                       # Padding contributes nothing.
+        assert S[6] == int(got[:pad].sum())             # Exact emitted sum.
+        assert S[7] == int(s32.max())
+        # Normalized probs vs softmax: relative error after the 1/S6 fold.
+        pn  = got[:T]/S[6]
+        rn  = ref/ref.sum()
+        assert np.abs(pn - rn).max() < 0.02
+
+def test_reduce_acc():
+    rng = np.random.default_rng(10)
+    n   = 64
+    a   = rng.integers(-2**28, 2**28, n).astype(np.int64)
+    b   = rng.integers(-2**28, 2**28, n).astype(np.int64)
+    sp  = bytearray(4096)
+    sp[0:4*n]         = a.astype("<i4").tobytes()
+    sp[1024:1024+4*n] = b.astype("<i4").tobytes()
+    S, _ = _run("reduce_acc", sp, [0, 1024, 0, n//8])
+    got = np.frombuffer(bytes(sp[0:4*n]), dtype="<i4").astype(np.int64)
+    assert np.array_equal(got, a + b)
+    assert S[6] == int(np.abs(a + b).max())

@@ -201,6 +201,20 @@ class BonsaiVectorUnit(LiteXModule):
                 level = nxt
             return level[0]
         red_max_v = tree_max(abs_l)
+        def tree_smax(sigs):
+            level = list(sigs)
+            while len(level) > 1:
+                nxt = []
+                for j in range(0, len(level), 2):
+                    if j + 1 < len(level):
+                        m = Signal((32, True))
+                        self.comb += m.eq(Mux(level[j] > level[j+1], level[j], level[j+1]))
+                        nxt.append(m)
+                    else:
+                        nxt.append(level[j])
+                level = nxt
+            return level[0]
+        red_smax_v = tree_smax(a_l)
 
         # Lanewise results --------------------------------------------------------------------
         res = {name: Signal(32*LANES, name=f"res_{name.lower()}") for name in
@@ -415,6 +429,11 @@ class BonsaiVectorUnit(LiteXModule):
                     self.sp_wr_dat.eq(Cat(st8, C(0, 128))),
                 ),
             ),
+            If(f_op == OP["STW"],
+                self.sp_wr_adr.eq(sa_val[5:18]),
+                self.sp_wr_we.eq(0xFF),
+                self.sp_wr_dat.eq(va_flat[0:256]), # Lanes 0..7 as 8 x int32.
+            ),
             # PC update.
             If(f_op == OP["DONE"],
                 NextState("FINISH"),
@@ -456,7 +475,8 @@ class BonsaiVectorUnit(LiteXModule):
                     loop_start.eq(pc + 1),
                 ),
                 # Memory post-increment.
-                If((f_op == OP["LDV"]) | (f_op == OP["LDW"]) | (f_op == OP["STV"]),
+                If((f_op == OP["LDV"]) | (f_op == OP["LDW"]) | (f_op == OP["STV"])
+                   | (f_op == OP["STW"]),
                     S[f_sa].eq(sa_val + 32),
                 ),
                 If(f_op == OP["STB"],
@@ -468,6 +488,11 @@ class BonsaiVectorUnit(LiteXModule):
                 If(f_op == OP["REDMAX"],
                     If(red_max_v > sd_val[0:32],
                         S[f_sd].eq(red_max_v),
+                    )
+                ),
+                If(f_op == OP["REDSMAX"],
+                    If(red_smax_v > sd_val,
+                        S[f_sd].eq(red_smax_v),
                     )
                 ),
                 If(~is_known, bad_op.eq(1)),

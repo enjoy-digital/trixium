@@ -76,6 +76,9 @@ OPCODES = [
     "SNORME",   # sd = EVEN shift e such that (S[sa] << e) lands in [2^30, 2^32); 0 for S[sa] <= 0.
                 # (Even so the shift splits cleanly into the rsqrt exponent half; the caller
                 #  guarantees S[sa] > 0 - firmware clamps the eps term to >= 1.)
+    # M8 additions (softmax/reduce programs).
+    "REDSMAX",  # sd = max(sd, max(lanes)) SIGNED (REDMAX is an abs-max).
+    "STW",      # store lanes 0..7 as 8 x int32 (32 bytes; S[sa] += 32).
 ]
 OP = {name: i for i, name in enumerate(OPCODES)}
 
@@ -124,7 +127,7 @@ def assemble(program):
             pass
         elif op in ("LDV", "LDW"):
             vd = take_v(); sa = take_s()
-        elif op in ("STV", "STB"):
+        elif op in ("STV", "STB", "STW"):
             va = take_v(); sa = take_s()
         elif op == "BCAST":
             vd = take_v(); sa = take_s()
@@ -134,7 +137,7 @@ def assemble(program):
             vd = take_v(); va = take_v(); imm = take_i()
         elif op in ("VCLAMP8", "VCLAMP16", "VABS", "VCLZN", "LUTE2", "LUTRECIP", "LUTRSQRT"):
             vd = take_v(); va = take_v()
-        elif op in ("REDSUM", "REDSSQ", "REDMAX"):
+        elif op in ("REDSUM", "REDSSQ", "REDMAX", "REDSMAX"):
             sd = take_s(); va = take_v()
         else:
             raise ValueError(op)
@@ -306,6 +309,13 @@ class VecInterp:
                 S[sd] = _s48(S[sd] + int(np.sum([_s32(x)*_s32(x) for x in V[va]])))
             elif op == "REDMAX":
                 S[sd] = max(S[sd], int(np.max(np.abs([_s32(x) for x in V[va]]))))
+            elif op == "REDSMAX":
+                S[sd] = max(S[sd], int(np.max([_s32(x) for x in V[va]])))
+            elif op == "STW":
+                a = S[sa] & 0xFFFFFF
+                self.sp[a:a+32] = np.asarray([_s32(x) for x in V[va][:8]],
+                                             dtype="<i4").tobytes()
+                S[sa] = _s48(S[sa] + 32)
             elif op == "LUTE2":
                 V[vd] = np.asarray([exp2f_q15(x) for x in V[va]], dtype=np.int64)
             elif op == "LUTRECIP":
@@ -494,12 +504,92 @@ def prog_rmsnorm():
         ("DONE",),
     ]
 
+def prog_softmax8():
+    """int32 scores (position-major, padded to a 16-multiple with INT32_MIN) -> int8 probs
+    relative to the max entry: p8_i = clamp8(rne(2^((s_i - smax)*log2e*2^sigma) * 2^15 >> 8)).
+    The 1/sum normalization is NOT applied here - S6 returns the exact sum of the emitted
+    p8 integers (the firmware folds 1/S6 into the attention scale and uses S6 as the AXPY
+    Rpre bound); S7 returns smax.
+
+      A0 = scores, A2 = p8 dst, A3 = blocks (padded/16)
+      A4 = -s1 (score pre-shift, s1 >= 1: keeps the subtract and *739 in int32;
+                firmware picks s1 = max(1, 22 - floor(log2(2^31)) + ...) = enough that
+                |s>>s1| <= 2^21)
+      A5 = -s2 with s1 + s2 = -(sigma + 6): f = ((s>>s1 - smax>>s1)*739) >> s2 is Q15 of
+                (s - smax)*2^sigma*log2(e)  (C = 739 = round(log2(e)*2^9)).
+
+    Padding entries clamp to f = -15*2^15 -> p8 = 0."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s3", 3),
+        ("MOVSI", "s5", 47),
+        ("MOVSI", "s7", -1),
+        ("SSHLV", "s7", "s5"),          # smax accumulator = -2^47.
+        ("LOOPS", "s3"),
+        ("LDW",   "v0", "s0"),
+        ("LDW",   "v1", "s0"),
+        ("VPACK", "v0", "v0", "v1"),
+        ("REDSMAX", "s7", "v0"),
+        ("LOOPE",),
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s5", 5),
+        ("MOVSI", "s6", 0),
+        ("BCAST", "v7", "s7"),          # smax.
+        ("BCAST", "v6", "s4"),
+        ("VSHLV", "v7", "v7", "v6"),    # smax >> s1.
+        ("MOVSI", "s1", 739),
+        ("BCAST", "v5", "s1"),
+        ("MOVSI", "s1", -480),
+        ("BCAST", "v4", "s1"),
+        ("VSHLI", "v4", "v4", 10),      # -15*2^15.
+        ("LOOPS", "s3"),
+        ("LDW",   "v0", "s0"),
+        ("LDW",   "v1", "s0"),
+        ("VPACK", "v0", "v0", "v1"),
+        ("BCAST", "v1", "s4"),
+        ("VSHLV", "v0", "v0", "v1"),    # s >> s1.
+        ("VSUB",  "v0", "v0", "v7"),    # d' <= 0.
+        ("VMUL",  "v0", "v0", "v5"),    # d'*739.
+        ("BCAST", "v1", "s5"),
+        ("VSHLV", "v0", "v0", "v1"),    # f (Q15).
+        ("VMAX",  "v0", "v0", "v4"),    # clamp at -15*2^15.
+        ("VSHRI", "v1", "v0", 15),      # i = floor(f) in [-15, 0].
+        ("VSHLI", "v2", "v1", 15),
+        ("VSUB",  "v2", "v0", "v2"),    # r in [0, 2^15).
+        ("LUTE2", "v2", "v2"),
+        ("VSHLV", "v2", "v2", "v1"),    # 2^f, Q15.
+        ("VRNE",  "v2", "v2", 8),
+        ("VCLAMP8", "v2", "v2"),        # p8 in [0, 127] (max entry 128 -> 127).
+        ("REDSUM", "s6", "v2"),         # Exact sum of emitted p8.
+        ("STB",   "v2", "s2"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
+def prog_reduce_acc():
+    """acc_i32 += src_i32 (8 int32 per iteration); S6 = |max| of the post-add values
+    (the last call of an N-way reduce returns the true absmax for the norm shift).
+    A0 = acc read ptr, A1 = src, A2 = acc write ptr (same address as A0), A3 = beats."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("MOVSI", "s6", 0),
+        ("LOOPS", "s3"),
+        ("LDW",   "v0", "s0"),
+        ("LDW",   "v1", "s1"),
+        ("VADD",  "v0", "v0", "v1"),
+        ("REDMAX", "s6", "v0"),
+        ("STW",   "v0", "s2"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 PROGRAMS = {
-    "resid_add": prog_resid_add,
-    "quant8":    prog_quant8,
-    "norm_i32":  prog_norm_i32,
-    "silu_mul":  prog_silu_mul,
-    "rmsnorm":   prog_rmsnorm,
+    "resid_add":  prog_resid_add,
+    "quant8":     prog_quant8,
+    "norm_i32":   prog_norm_i32,
+    "silu_mul":   prog_silu_mul,
+    "rmsnorm":    prog_rmsnorm,
+    "softmax8":   prog_softmax8,
+    "reduce_acc": prog_reduce_acc,
 }
 
 def emit_c(out):

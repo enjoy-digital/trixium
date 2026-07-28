@@ -150,3 +150,23 @@ def test_rtl_scalar_ops_m4():
             assert got["s6"] == ref_S[6] & m48, (a, got["s6"], ref_S[6])
     finally:
         del asm.PROGRAMS["_m4_scalar"]
+
+def test_rtl_softmax8():
+    rng = np.random.default_rng(61)
+    T   = 30
+    pad = 32
+    s32 = rng.integers(-2**29, 2**29, T).astype(np.int64)
+    buf = np.full(pad, -2**31, dtype=np.int64)
+    buf[:T] = s32
+    sp  = bytearray(SP_SIZE)
+    sp[0:4*pad] = buf.astype("<i4").tobytes()
+    sigma, s1 = -18, 11
+    _compare("softmax8", bytes(sp), [0, 4096, 8192, pad//16, -s1, -(-(sigma + 6) - s1)])
+
+def test_rtl_reduce_acc():
+    rng = np.random.default_rng(62)
+    n   = 64
+    sp  = bytearray(SP_SIZE)
+    sp[0:4*n]         = rng.integers(-2**28, 2**28, n).astype("<i4").tobytes()
+    sp[1024:1024+4*n] = rng.integers(-2**28, 2**28, n).astype("<i4").tobytes()
+    _compare("reduce_acc", bytes(sp), [0, 1024, 0, n//8])
