@@ -51,9 +51,10 @@ class BonsaiMatVecEngine(LiteXModule):
             ("dst",    24),  # Result destination byte address in scratchpad (4B aligned).
             ("chan",   5),   # Fetch: source channel index.
         ])
-        self.busy  = Signal()
-        self.done  = Signal() # Pulse.
-        self.error = Signal()
+        self.busy   = Signal()
+        self.done   = Signal() # Pulse.
+        self.error  = Signal()
+        self.absmax = Signal(32) # |int32| max over the last matvec's gathered results.
 
         # # #
 
@@ -138,6 +139,21 @@ class BonsaiMatVecEngine(LiteXModule):
         ]
         for i, pipe in enumerate(self.pipes):
             self.comb += pipe.source.ready.eq(rr.grant == i)
+
+        # Result absmax tracker (norm_i32's shift argument; reset on command accept).
+        grant_abs = Signal(32)
+        grant_s   = Signal((32, True))
+        self.comb += [
+            grant_s.eq(grant_data),
+            grant_abs.eq(Mux(grant_s < 0, -grant_s, grant_s)),
+        ]
+        self.sync += [
+            If(self.cmd.valid & self.cmd.ready,
+                self.absmax.eq(0),
+            ).Elif(~fetch_mode & grant_valid & (grant_abs > self.absmax),
+                self.absmax.eq(grant_abs),
+            )
+        ]
 
         # Fetch datapath: selected channel's beats -> scratchpad (256-bit writes).
         fetch_valid = Signal()

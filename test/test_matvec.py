@@ -178,3 +178,48 @@ def test_matvec_real_1p7b_slice():
                bias=e["bias"], rshift=e["rshift"], xsrc=0, dst=dst)
     got = _run_engine(dut, cmd, 2*rows_per_chan, dst)
     assert np.array_equal(got, expected)
+
+def test_engine_absmax_tracker():
+    # The absmax CSR input signal must equal max(|results|) after a matvec.
+    rng    = np.random.default_rng(31)
+    M, K   = 16, 256
+    G      = K//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, K), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, K, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, K,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, 2, c)).tobytes() for c in range(2)]
+    dut = _EngineDUT(2, payloads, words_from_bytes(x8.tobytes()))
+    cmd = dict(kind=0, rows=M//2, cols=K, wbase=0,
+               wlen=(M//2)*layout.row_beats(K, layout.KIND_TERNARY),
+               sbeats=layout.scale_beats(K, layout.KIND_TERNARY),
+               cbeats=layout.code_beats(K, layout.KIND_TERNARY),
+               bias=B, rshift=R, xsrc=0, dst=0x4000)
+    absmax = {}
+
+    def check():
+        yield
+        for _ in range(20000):
+            if (yield dut.engine.done):
+                break
+            yield
+        yield
+        absmax["v"] = (yield dut.engine.absmax)
+
+    def driver():
+        for k, v in cmd.items():
+            yield getattr(dut.engine.cmd, k).eq(v)
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+
+    run_simulation(dut, [driver(), check()])
+    assert absmax["v"] == int(np.abs(expected).max())

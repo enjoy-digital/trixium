@@ -29,13 +29,20 @@
 static int __errno_storage;
 int *__errno(void) { return &__errno_storage; }
 
-// Scratchpad layout (byte offsets).
-#define SP_X    0x00000 // Quantized activations (engine matvec input).
-#define SP_Y    0x08000 // Engine results (int32).
+// Scratchpad layout (byte offsets) - resident-BFP regions (int16 mantissas + firmware-
+// tracked exponents; sized for the 8B: E=4096, F=12288).
+#define SP_X    0x00000 // int8 matvec input (<= 12 KB).
+#define SP_Y    0x04000 // Engine int32 results (<= 48 KB).
+#define SP_YU   0x10000 // Engine int32 results, second stream (up proj).
+#define SP_H    0x1C000 // Normed activations int16.
+#define SP_XR   0x1E000 // Resident x (residual stream) int16.
+#define SP_G    0x20000 // Gate int16 (silu in/out).
+#define SP_U    0x26000 // Up int16.
+#define SP_D    0x2C000 // Projection-result int16 (residual addend).
 #define SP_FET  0x30000 // Fetch staging (embedding rows).
-#define SP_VA   0x10000 // Vector-op staging: operand a (int16).
-#define SP_VB   0x18000 // Vector-op staging: operand b (int16).
-#define SP_VO   0x20000 // Vector-op staging: result (int16).
+
+// Fixed exponent for CPU-produced normed vectors (values bounded ~16 by construction).
+#define E_NORM  (-11)
 
 // Heap: after the BONS header/table area.
 #define HEAP_BASE (BONSAI_HDR_ADDR + 0x100000)
@@ -62,6 +69,7 @@ static float  *k_scale, *v_scale;    // [layer][pos].
 static int    n_pos;
 
 static float *x, *h, *q, *k, *v, *attn, *gate, *up, *scores;
+static int ex_state; // Exponent of the resident x (SP_XR).
 
 // Helpers ------------------------------------------------------------------------------------
 
@@ -93,8 +101,9 @@ static void rmsnorm_f(float *dst, const float *src, const float *w, int n, float
     for (int i = 0; i < n; i++) dst[i] = src[i]*r*w[i];
 }
 
-// Quantize float vector to int8 in the scratchpad; returns the scale (absmax/127).
-static float quantize_to_sp(const float *src, int n, uint32_t sp_off)
+// Quantize a float vector to int8 with a power-of-two scale 2^e8 (so downstream exponent
+// algebra stays integer). Returns e8.
+static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
 {
     perf_enter(OP_QUANT8);
     float amax = 0;
@@ -102,8 +111,12 @@ static float quantize_to_sp(const float *src, int n, uint32_t sp_off)
         float a = fabsf(src[i]);
         if (a > amax) amax = a;
     }
-    float s  = (amax > 0) ? amax/127.0f : 1.0f;
-    float is = 1.0f/s;
+    int e8 = 0;
+    if (amax > 0) {
+        frexpf(amax, &e8);
+        e8 -= 7; // mantissas in [2^6, 2^7).
+    }
+    float is = ldexpf(1.0f, -e8);
     volatile uint32_t *sp = (volatile uint32_t *)(SCRATCHPAD_BASE + sp_off);
     for (int i = 0; i < n; i += 4) {
         uint32_t w = 0;
@@ -116,7 +129,7 @@ static float quantize_to_sp(const float *src, int n, uint32_t sp_off)
         sp[i/4] = w;
     }
     perf_exit(OP_QUANT8);
-    return s;
+    return e8;
 }
 
 // Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
@@ -260,45 +273,132 @@ static void rope_apply(float *vec, int n_heads_v, int pos)
 
 #ifdef CSR_VECUNIT_BASE
 #include "progs.h"
-// Validation-mode HW silu: gate/up float -> int16 BFP -> silu_mul program -> float.
-// Conversions cost ~= the cheap ops they wrap, but silu's soft-float expf is ~10x more -
-// still a large win; the resident-BFP loop flip (M3) removes the conversions entirely.
-static void hw_silu_mul(float *gate_v, const float *up_v, int n)
+#endif
+
+// Resident-BFP op layer: every op has a CPU implementation (float math over the int16
+// scratchpad regions - the always-available fallback) and, when the vector unit exists,
+// a HW implementation running the corresponding microcode program. Exponent algebra stays
+// in this file; ops receive shift amounts only.
+
+static inline volatile int16_t *sp16(uint32_t off) { return (volatile int16_t *)(SCRATCHPAD_BASE + off); }
+static inline volatile int32_t *sp32(uint32_t off) { return (volatile int32_t *)(SCRATCHPAD_BASE + off); }
+static inline volatile int8_t  *sp8(uint32_t off)  { return (volatile int8_t  *)(SCRATCHPAD_BASE + off); }
+
+// rmsnorm: SP int16(src,esrc) -> SP int16(dst) at fixed E_NORM (CPU float math; HW in M4).
+static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w, int n, uint32_t dst)
 {
-    float ga = 0, ua = 0;
+    volatile int16_t *ps = sp16(src);
+    volatile int16_t *pd = sp16(dst);
+    float es = ldexpf(1.0f, esrc);
+    float ss = 0;
     for (int i = 0; i < n; i++) {
-        float a = fabsf(gate_v[i]); if (a > ga) ga = a;
-        a = fabsf(up_v[i]);         if (a > ua) ua = a;
+        float v = (float)ps[i]*es;
+        ss += v*v;
     }
-    if (ga == 0 || ua == 0) {
-        for (int i = 0; i < n; i++) gate_v[i] = 0;
-        return;
-    }
-    int eg, eu;
-    frexpf(ga, &eg); eg -= 15; // mantissa absmax in [2^13, 2^15).
-    frexpf(ua, &eu); eu -= 15;
-    float gs = ldexpf(1.0f, -eg), us = ldexpf(1.0f, -eu);
-    volatile uint32_t *va = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_VA);
-    volatile uint32_t *vb = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_VB);
-    for (int i = 0; i < n; i += 2) {
-        uint32_t w0 = (uint16_t)(int16_t)lroundf(gate_v[i]*gs)
-                    | ((uint32_t)(uint16_t)(int16_t)lroundf(gate_v[i+1]*gs) << 16);
-        uint32_t w1 = (uint16_t)(int16_t)lroundf(up_v[i]*us)
-                    | ((uint32_t)(uint16_t)(int16_t)lroundf(up_v[i+1]*us) << 16);
-        va[i/2] = w0;
-        vb[i/2] = w1;
-    }
-    int32_t args[7] = {SP_VA, SP_VB, SP_VO, n/16, -(eg + 6), 0, -15};
-    vec_run(PROG_SILU_MUL, args, 7);
-    volatile uint32_t *vo = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_VO);
-    float os = ldexpf(1.0f, eg + eu + 15);
-    for (int i = 0; i < n; i += 2) {
-        uint32_t w = vo[i/2];
-        gate_v[i]   = (float)(int16_t)(w & 0xFFFF)*os;
-        gate_v[i+1] = (float)(int16_t)(w >> 16)*os;
+    float r  = 1.0f/sqrtf(ss/n + H->rms_eps);
+    float os = ldexpf(1.0f, -E_NORM);
+    for (int i = 0; i < n; i++) {
+        float v = (float)ps[i]*es*r*w[i]*os;
+        int32_t q = (int32_t)lroundf(v);
+        if (q >  32767) q =  32767;
+        if (q < -32767) q = -32767;
+        pd[i] = (int16_t)q;
     }
 }
+
+// quant8: SP int16 -> SP int8 (RNE >> 8); returns nothing (out exponent = e + 8).
+static void op_quant8_sp(uint32_t src, uint32_t dst, int n)
+{
+#ifdef CSR_VECUNIT_BASE
+    if (op_on_hw(OP_QUANT8)) {
+        int32_t args[4] = {(int32_t)src, 0, (int32_t)dst, n/16};
+        vec_run(PROG_QUANT8, args, 4);
+        return;
+    }
 #endif
+    volatile int16_t *ps = sp16(src);
+    volatile int8_t  *pd = sp8(dst);
+    for (int i = 0; i < n; i++) {
+        int32_t v = ps[i];
+        int32_t q = (v >> 8) + (((v >> 7) & 1) & (((v & 0x7F) != 0) | ((v >> 8) & 1)));
+        if (q >  127) q =  127;
+        if (q < -127) q = -127;
+        pd[i] = (int8_t)q;
+    }
+}
+
+// norm_i32: SP int32 -> SP int16 (floor >> k chosen from the engine absmax CSR).
+// Returns k (caller: out exponent = in exponent + k).
+static int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
+{
+    uint32_t amax = engine_csr_absmax_read();
+    int k = 0;
+    while ((amax >> k) > 16383u) k++;
+#ifdef CSR_VECUNIT_BASE
+    if (op_on_hw(OP_NORM_I32)) {
+        int32_t args[5] = {(int32_t)src, 0, (int32_t)dst, n/16, k};
+        vec_run(PROG_NORM_I32, args, 5);
+        return k;
+    }
+#endif
+    volatile int32_t *ps = sp32(src);
+    volatile int16_t *pd = sp16(dst);
+    for (int i = 0; i < n; i++) {
+        int32_t v = ps[i] >> k;
+        if (v >  32767) v =  32767;
+        if (v < -32767) v = -32767;
+        pd[i] = (int16_t)v;
+    }
+    return k;
+}
+
+// silu_mul: SP int16(gate,eg) x SP int16(up,eu) -> SP int16(gate) at eg+eu+15.
+static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n)
+{
+#ifdef CSR_VECUNIT_BASE
+    if (op_on_hw(OP_SILU_MUL)) {
+        int32_t args[7] = {(int32_t)gsrc, (int32_t)usrc, (int32_t)gsrc, n/16,
+                           -(eg + 6), 0, -15};
+        vec_run(PROG_SILU_MUL, args, 7);
+        return;
+    }
+#endif
+    volatile int16_t *pg = sp16(gsrc);
+    volatile int16_t *pu = sp16(usrc);
+    float gs = ldexpf(1.0f, eg), us = ldexpf(1.0f, eu);
+    float os = ldexpf(1.0f, -(eg + eu + 15));
+    for (int i = 0; i < n; i++) {
+        float g = (float)pg[i]*gs;
+        float v = g/(1.0f + expf(-g))*(float)pu[i]*us*os;
+        int32_t q = (int32_t)lroundf(v);
+        if (q >  32767) q =  32767;
+        if (q < -32767) q = -32767;
+        pg[i] = (int16_t)q;
+    }
+}
+
+// resid_add: SP int16(a,ea) + SP int16(b,eb) -> SP int16(a) at eo = max(ea,eb)+1.
+// Returns eo.
+static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n)
+{
+    int eo = ((ea > eb) ? ea : eb) + 1;
+#ifdef CSR_VECUNIT_BASE
+    if (op_on_hw(OP_RESID_ADD)) {
+        int32_t args[6] = {(int32_t)a, (int32_t)b, (int32_t)a, n/16, ea - eo, eb - eo};
+        vec_run(PROG_RESID_ADD, args, 6);
+        return eo;
+    }
+#endif
+    volatile int16_t *pa = sp16(a);
+    volatile int16_t *pb = sp16(b);
+    for (int i = 0; i < n; i++) {
+        int32_t v = (pa[i] >> (eo - ea)) + (pb[i] >> (eo - eb));
+        if (v >  32767) v =  32767;
+        if (v < -32767) v = -32767;
+        pa[i] = (int16_t)v;
+    }
+    return eo;
+}
 
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
@@ -307,6 +407,21 @@ static int forward(int token, int want_logits)
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
     perf_enter(OP_EMBED);
     embed_row_f(emb, token, x);
+    // Residual stream lives in the scratchpad as int16 BFP from here on.
+    {
+        float amax = 0;
+        for (int i = 0; i < n_embd; i++) {
+            float a = fabsf(x[i]);
+            if (a > amax) amax = a;
+        }
+        int e = 0;
+        if (amax > 0) { frexpf(amax, &e); e -= 15; }
+        float is = ldexpf(1.0f, -e);
+        volatile int16_t *pd = sp16(SP_XR);
+        for (int i = 0; i < n_embd; i++)
+            pd[i] = (int16_t)lroundf(x[i]*is);
+        ex_state = e;
+    }
     perf_exit(OP_EMBED);
 
     int   kv_dim = n_kv_head*head_dim;
@@ -317,9 +432,12 @@ static int forward(int token, int want_logits)
     for (int l = 0; l < n_layer; l++) {
         // Attention block.
         perf_enter(OP_RMSNORM);
-        rmsnorm_f(h, x, attn_norm[l], n_embd, H->rms_eps);
+        op_rmsnorm_sp(SP_XR, ex_state, attn_norm[l], n_embd, SP_H);
         perf_exit(OP_RMSNORM);
-        float sx = quantize_to_sp(h, n_embd, SP_X);
+        perf_enter(OP_QUANT8);
+        op_quant8_sp(SP_H, SP_X, n_embd);
+        perf_exit(OP_QUANT8);
+        float sx = ldexpf(1.0f, E_NORM + 8);
         matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q);
         matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k);
         matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v);
@@ -389,36 +507,65 @@ static int forward(int token, int want_logits)
             perf_exit(OP_WV);
         }
 
-        // Output projection + residual.
-        matvec_f(model_entry(ROLE_ATTN_OUT, l), attn, h);
-        perf_enter(OP_RESID_ADD);
-        for (int i = 0; i < n_embd; i++) x[i] += h[i];
-        perf_exit(OP_RESID_ADD);
-
-        // FFN.
-        perf_enter(OP_RMSNORM);
-        rmsnorm_f(h, x, ffn_norm[l], n_embd, H->rms_eps);
-        perf_exit(OP_RMSNORM);
-        sx = quantize_to_sp(h, n_embd, SP_X);
-        matvec_rows_f(model_entry(ROLE_FFN_GATE, l), 0, ffn_dim/n_ch, sx, gate);
-        matvec_rows_f(model_entry(ROLE_FFN_UP,   l), 0, ffn_dim/n_ch, sx, up);
-        perf_enter(OP_SILU_MUL);
-#ifdef CSR_VECUNIT_BASE
-        if (op_on_hw(OP_SILU_MUL)) {
-            hw_silu_mul(gate, up, ffn_dim);
-        } else
-#endif
+        // Output projection + residual (resident).
         {
-            for (int i = 0; i < ffn_dim; i++) {
-                float g = gate[i];
-                gate[i] = g/(1.0f + expf(-g))*up[i];
-            }
+            const struct bons_entry *eo = model_entry(ROLE_ATTN_OUT, l);
+            int ea8 = quantize_f_pow2(attn, q_dim, SP_X);
+            model_matvec(eo, SP_X, SP_Y);
+            perf_enter(OP_NORM_I32);
+            int kk = op_norm_i32_sp(SP_Y, SP_D, n_embd);
+            perf_exit(OP_NORM_I32);
+            int ed = ea8 - (int)eo->bias + (int)eo->rshift + kk;
+            perf_enter(OP_RESID_ADD);
+            ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd);
+            perf_exit(OP_RESID_ADD);
         }
-        perf_exit(OP_SILU_MUL);
-        matvec_f(model_entry(ROLE_FFN_DOWN, l), gate, h);
-        perf_enter(OP_RESID_ADD);
-        for (int i = 0; i < n_embd; i++) x[i] += h[i];
-        perf_exit(OP_RESID_ADD);
+
+        // FFN (fully resident: no float round-trips).
+        {
+            const struct bons_entry *eg_t = model_entry(ROLE_FFN_GATE, l);
+            const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
+            const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
+            perf_enter(OP_RMSNORM);
+            op_rmsnorm_sp(SP_XR, ex_state, ffn_norm[l], n_embd, SP_H);
+            perf_exit(OP_RMSNORM);
+            perf_enter(OP_QUANT8);
+            op_quant8_sp(SP_H, SP_X, n_embd);
+            perf_exit(OP_QUANT8);
+            int ex8 = E_NORM + 8;
+
+            model_matvec(eg_t, SP_X, SP_Y);
+            perf_enter(OP_NORM_I32);
+            int kg = op_norm_i32_sp(SP_Y, SP_G, ffn_dim);
+            perf_exit(OP_NORM_I32);
+            int eg = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
+
+            model_matvec(eu_t, SP_X, SP_YU);
+            perf_enter(OP_NORM_I32);
+            int ku = op_norm_i32_sp(SP_YU, SP_U, ffn_dim);
+            perf_exit(OP_NORM_I32);
+            int eu = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
+
+            perf_enter(OP_SILU_MUL);
+            op_silu_mul_sp(SP_G, eg, SP_U, eu, ffn_dim);
+            perf_exit(OP_SILU_MUL);
+            int es = eg + eu + 15;
+
+            perf_enter(OP_QUANT8);
+            op_quant8_sp(SP_G, SP_X, ffn_dim);
+            perf_exit(OP_QUANT8);
+            int es8 = es + 8;
+
+            model_matvec(ed_t, SP_X, SP_Y);
+            perf_enter(OP_NORM_I32);
+            int kd = op_norm_i32_sp(SP_Y, SP_D, n_embd);
+            perf_exit(OP_NORM_I32);
+            int ed = es8 - (int)ed_t->bias + (int)ed_t->rshift + kd;
+
+            perf_enter(OP_RESID_ADD);
+            ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd);
+            perf_exit(OP_RESID_ADD);
+        }
     }
     n_pos++;
 
@@ -427,14 +574,16 @@ static int forward(int token, int want_logits)
 
     // Final norm + LM head (tied or separate), chunked over rows to fit the scratchpad.
     perf_enter(OP_RMSNORM);
-    rmsnorm_f(h, x, out_norm, n_embd, H->rms_eps);
+    op_rmsnorm_sp(SP_XR, ex_state, out_norm, n_embd, SP_H);
     perf_exit(OP_RMSNORM);
+    perf_enter(OP_QUANT8);
+    op_quant8_sp(SP_H, SP_X, n_embd);
+    perf_exit(OP_QUANT8);
     perf_enter(OP_LMHEAD);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head)
         head = model_entry(ROLE_TOK_EMB, 0);
-    float sx  = quantize_to_sp(h, n_embd, SP_X);
-    float sc  = ldexpf(sx, (int)head->rshift - (int)head->bias);
+    float sc  = 0; // Argmax runs on raw int32 (same scale across chunks).
     uint32_t rpc       = head->rows/n_ch;
     uint32_t chunk_rpc = 0x20000/(4*n_ch); // 128 KB of int32 results per chunk.
     if (chunk_rpc > rpc) chunk_rpc = rpc;

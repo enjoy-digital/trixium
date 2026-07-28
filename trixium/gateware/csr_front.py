@@ -43,6 +43,7 @@ class BonsaiEngineCSR(LiteXModule):
             CSRField("pending",  size=1, description="Submitted op not yet accepted."),
         ])
         self.done_count = CSRStatus(32, description="Completed op counter.")
+        self.absmax     = CSRStatus(32, description="|int32| max over the last matvec's results.")
 
         # Perf counters, muxed by perf_chan.
         self.perf_chan  = CSRStorage(5)
@@ -81,6 +82,7 @@ class BonsaiEngineCSR(LiteXModule):
             self.status.fields.busy.eq(engine.busy),
             self.status.fields.error.eq(engine.error),
             self.status.fields.pending.eq(pending),
+            self.absmax.status.eq(engine.absmax),
         ]
 
         beats = Array([r.total_beats for r in engine.readers])
