@@ -82,7 +82,7 @@ def test_sim_selftest_checksums():
     mhw = re.search(r"GEN-HW:((?: \d+)+)", out)
     assert mhw, f"no GEN-HW line in:\n{out[-1500:]}"
     hw_tokens = [int(t) for t in mhw.group(1).split()]
-    ref_hw    = hybrid_generate(img, [1, 2, 3], len(hw_tokens), modes={"silu_mul": "hw", "rmsnorm": "hw"})
+    ref_hw    = hybrid_generate(img, [1, 2, 3], len(hw_tokens), modes={"silu_mul": "hw", "rmsnorm": "hw", "kv_hbm": "hw"})
     assert hw_tokens == ref_hw, f"HW-ops tokens {hw_tokens} != hw ref {ref_hw}"
 
 def hybrid_generate(img, prompt, n_new, modes=None):
@@ -194,6 +194,32 @@ def hybrid_generate(img, prompt, n_new, modes=None):
     kc, vc, ks, vs = [], [], [], []
     for _ in range(n_layer):
         kc.append([]); vc.append([]); ks.append([]); vs.append([])
+    hbm_kv = {}  # (l, kvh, kind) -> list of (ek, int8 codes) in position order.
+
+    def kv_hbm_append(l, kvh, kind, vec):
+        amax = np.abs(vec).max()
+        ek = (int(np.frexp(f32(amax))[1]) - 7) if amax > 0 else 0
+        codes = np.clip(lroundf(vec*f32(np.exp2(-ek))), -127, 127).astype(np.int8)
+        hbm_kv.setdefault((l, kvh, kind), []).append((ek, codes))
+
+    def kv_hbm_scores(l, kvh, qh):
+        eq = 0
+        amax = np.abs(qh).max()
+        if amax > 0:
+            eq = int(np.frexp(f32(amax))[1]) - 7
+        q8 = np.clip(lroundf(qh*f32(np.exp2(-eq))), -127, 127).astype(np.int8)
+        rowsd  = hbm_kv[(l, kvh, 0)]
+        ekmax  = max(e for e, _ in rowsd)
+        B      = 22 - ekmax
+        bound  = (hd//32)*32*127*127*1024 << 12
+        R      = 0
+        while (bound >> R) >= (1 << 31):
+            R += 1
+        scales = np.array([[2.0**e]*(hd//32) for e, _ in rowsd], dtype=np.float16)
+        codes  = np.stack([c for _, c in rowsd])
+        res    = bx.matvec_q8(scales, codes, q8, B, R)
+        fs     = f32(np.ldexp(f32(1.0/np.sqrt(hd)), eq - B + R))
+        return res.astype(f32)*fs
 
     def rmsnorm_f(x, w):
         ss = fsum32(x*x)
@@ -232,14 +258,21 @@ def hybrid_generate(img, prompt, n_new, modes=None):
             va = np.abs(v).max(); vscale = f32(va/f32(127.0)) if va > 0 else f32(1.0)
             kc[l].append(lroundf(k*f32(f32(1.0)/kscale)).astype(np.int8)); ks[l].append(kscale)
             vc[l].append(lroundf(v*f32(f32(1.0)/vscale)).astype(np.int8)); vs[l].append(vscale)
+            if modes.get("kv_hbm", "cpu") == "hw":
+                for i2 in range(n_kv):
+                    kv_hbm_append(l, i2, 0, k[i2*hd:(i2+1)*hd])
+                    kv_hbm_append(l, i2, 1, v[i2*hd:(i2+1)*hd])
             n_rep = n_head//n_kv
             attn  = np.zeros(n_head*hd, dtype=f32)
             for i in range(n_head):
                 kvh = i//n_rep
                 qh  = q[i*hd:(i+1)*hd]
-                sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst)
-                                for kt, kst in zip(kc[l], ks[l])], dtype=f32)
-                sc  = sc*f32(1.0/np.sqrt(hd))
+                if modes.get("kv_hbm", "cpu") == "hw":
+                    sc = kv_hbm_scores(l, kvh, qh)
+                else:
+                    sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst)
+                                    for kt, kst in zip(kc[l], ks[l])], dtype=f32)
+                    sc  = sc*f32(1.0/np.sqrt(hd))
                 e   = np.exp(sc - sc.max(), dtype=f32)
                 pr  = e*f32(f32(1.0)/fsum32(e))
                 ah  = np.zeros(hd, dtype=f32)

@@ -39,7 +39,9 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_G    0x20000 // Gate int16 (silu in/out).
 #define SP_U    0x26000 // Up int16.
 #define SP_D    0x2C000 // Projection-result int16 (residual addend).
-#define SP_FET  0x30000 // Fetch staging (embedding rows).
+#define SP_FET  0x30000 // Fetch staging (embedding rows, norm16 rows).
+#define SP_KVP  0x34000 // KV row-packet staging (built by CPU, engine-stored to HBM).
+#define SP_SC   0x36000 // Engine score results (int32, position-major).
 
 // Fixed exponent for CPU-produced normed vectors (values bounded ~16 by construction).
 #define E_NORM  (-11)
@@ -131,6 +133,80 @@ static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
     perf_exit(OP_QUANT8);
     return e8;
 }
+
+// KV-to-HBM (M5): per (layer, kv-head, K|V) region of Q8 row packets, position-striped
+// (position t -> channel t % n_ch, local row t / n_ch). All groups of a row share one
+// power-of-two scale 2^ek, stored as an exactly-representable fp16 ((ek+15)<<10), so the
+// engine's Q8 scale path applies it bit-exactly and the exponent algebra stays integer.
+#ifdef BONSAI_HAS_KVSTORE
+static uint32_t kv_base;    // Per-channel byte address of the KV region (4 KB aligned).
+static uint32_t kv_rb;      // Beats per KV row packet (cols = head_dim, Q8).
+static uint32_t kv_region;  // Beats per (layer, kv-head, K|V) region.
+static int8_t  *kv_ekmax;   // Running max ek per region (B selection); -128 = empty.
+
+static uint32_t kv_region_addr(int l, int kvh, int kind)
+{
+    return kv_base + ((uint32_t)((l*n_kv_head + kvh)*2 + kind)*kv_region)*32;
+}
+
+static int kv_ek_idx(int l, int kvh, int kind)
+{
+    return (l*n_kv_head + kvh)*2 + kind;
+}
+
+// Quantize one head slice to a Q8 row packet in SP_KVP and store it to HBM.
+static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
+{
+    float amax = 0;
+    for (int i = 0; i < head_dim; i++) {
+        float a = fabsf(vec[i]);
+        if (a > amax) amax = a;
+    }
+    int ek = 0;
+    if (amax > 0) {
+        frexpf(amax, &ek);
+        ek -= 7; // Mantissas in [2^6, 2^7).
+    }
+    volatile uint16_t *ps = (volatile uint16_t *)(SCRATCHPAD_BASE + SP_KVP);
+    int groups = head_dim/32;
+    for (int g = 0; g < 16; g++) // Scale beat: fp16(2^ek) per group, zero padding.
+        ps[g] = (g < groups) ? (uint16_t)((ek + 15) << 10) : 0;
+    float is = ldexpf(1.0f, -ek);
+    volatile uint32_t *pc = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_KVP + 32);
+    for (int i = 0; i < head_dim; i += 4) {
+        uint32_t w = 0;
+        for (int b = 0; b < 4; b++) {
+            int q8 = (int)lroundf(vec[i+b]*is);
+            if (q8 >  127) q8 =  127;
+            if (q8 < -127) q8 = -127;
+            w |= ((uint32_t)(uint8_t)(int8_t)q8) << (8*b);
+        }
+        pc[i/4] = w;
+    }
+    struct engine_op op = {0};
+    op.kind  = ENGINE_KIND_STORE;
+    op.chan  = t % n_ch;
+    op.wbase = kv_region_addr(l, kvh, kind) + (uint32_t)(t/n_ch)*kv_rb*32;
+    op.wlen  = kv_rb;
+    op.xsrc  = SP_KVP;
+    engine_run(&op);
+    int idx = kv_ek_idx(l, kvh, kind);
+    if (ek > kv_ekmax[idx]) kv_ekmax[idx] = ek;
+}
+
+// B/R for a scores op over a region: pow-2 scales make e16 + B == 12 exactly
+// (fp16_decompose: 2^ek = 1024 * 2^(ek-10); B = 12 - (ekmax - 10) = 22 - ekmax), so the
+// worst-row acc bound is closed-form: groups * (32*127*127) * 1024 << 12.
+static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
+{
+    int ekmax = kv_ekmax[kv_ek_idx(l, kvh, kind)];
+    *B = 22 - ekmax;
+    uint64_t bound = (uint64_t)(head_dim/32)*32u*127u*127u*1024u << 12;
+    int r = 0;
+    while ((bound >> r) >= (1ull << 31)) r++;
+    *R = r;
+}
+#endif
 
 // Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
 // scaled by xscale) into dst[gathered global order: chan*rows + row].
@@ -501,6 +577,15 @@ static int forward(int token, int want_logits)
             for (int i = 0; i < kv_dim; i++) vd[i] = (int8_t)lroundf(v[i]*is);
             v_scale[l*max_ctx + pos] = vs;
         }
+#ifdef BONSAI_HAS_KVSTORE
+        // Dual-KV: also append Q8 row packets to HBM for the engine scores path.
+        if (op_on_hw(OP_KVQUANT)) {
+            for (int h = 0; h < n_kv_head; h++) {
+                kv_store_row(l, h, 0, pos, k + h*head_dim);
+                kv_store_row(l, h, 1, pos, v + h*head_dim);
+            }
+        }
+#endif
         perf_exit(OP_KVQUANT);
 
         // Attention (CPU, GQA).
@@ -510,6 +595,37 @@ static int forward(int token, int want_logits)
             const float *qh = q + hh*head_dim;
             float smax = -1e30f;
             perf_enter(OP_SCORES);
+#ifdef BONSAI_HAS_KVSTORE
+            if (op_on_hw(OP_SCORES)) {
+                // q head -> int8 @ 2^eq in SP_X, one striped+interleaved Q8 op over the
+                // K region: int32 scores land position-major in SP_SC.
+                int eq = quantize_f_pow2(qh, head_dim, SP_X);
+                int B, R;
+                kv_scores_br(l, kvh, 0, &B, &R);
+                struct engine_op op = {0};
+                op.kind   = ENGINE_KIND_Q8;
+                op.rows   = (pos + 1)/n_ch;
+                op.rem    = (pos + 1) % n_ch;
+                op.ilv    = 1;
+                op.cols   = head_dim;
+                op.wbase  = kv_region_addr(l, kvh, 0);
+                op.wlen   = (uint32_t)op.rows*kv_rb;
+                op.sbeats = 1;
+                op.cbeats = head_dim/32;
+                op.bias   = B;
+                op.rshift = R;
+                op.xsrc   = SP_X;
+                op.dst    = SP_SC;
+                engine_run(&op);
+                volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
+                float fs = ldexpf(scale, eq - B + R);
+                for (int t = 0; t <= pos; t++) {
+                    float sc = (float)sc32[t]*fs;
+                    scores[t] = sc;
+                    if (sc > smax) smax = sc;
+                }
+            } else
+#endif
             for (int t = 0; t <= pos; t++) {
                 const int8_t *kt = k_cache + ((uint64_t)l*max_ctx + t)*kv_dim + kvh*head_dim;
                 float dot = 0;
@@ -725,6 +841,14 @@ int infer_init(void)
 
     // KV caches: size to the header ctx (tiny in sim; on hardware capped by the converter).
     max_ctx = H->max_ctx;
+#ifdef BONSAI_HAS_KVSTORE
+    // KV region: above the per-channel weight payload, 4 KB aligned.
+    kv_base   = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
+    kv_rb     = 1 + head_dim/32; // One scale beat + code beats (cols = head_dim, Q8).
+    kv_region = (uint32_t)((max_ctx + n_ch - 1)/n_ch)*kv_rb;
+    kv_ekmax  = halloc(n_layer*n_kv_head*2);
+    for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
+#endif
     k_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
     v_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
     k_scale = halloc((uint64_t)n_layer*max_ctx*sizeof(float));

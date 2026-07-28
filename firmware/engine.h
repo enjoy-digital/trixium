@@ -11,6 +11,7 @@
 #define ENGINE_KIND_TERNARY 0
 #define ENGINE_KIND_Q8      1
 #define ENGINE_KIND_FETCH   2
+#define ENGINE_KIND_STORE   3
 
 // Scratchpad CPU window (uncached region defined in trixium.py / bonsai_sim.py).
 #define SCRATCHPAD_BASE 0xa0000000UL
@@ -18,6 +19,8 @@
 struct engine_op {
     uint8_t  kind;
     uint16_t rows;      // Rows per channel.
+    uint8_t  rem;       // Channels < rem stream one extra row (striped KV).
+    uint8_t  ilv;       // Interleaved (position-major) gather.
     uint16_t cols;
     uint32_t wbase;     // Per-channel weight byte address.
     uint32_t wlen;      // Beats per channel.
