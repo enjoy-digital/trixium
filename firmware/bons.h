@@ -17,6 +17,7 @@
 #define KIND_Q8      1
 #define KIND_F16     2
 #define KIND_F32     3
+#define KIND_NORM16  4 // int16 rows at 2^-13 (layout.NORM16_EXP) for the vector unit.
 
 #define FLAG_REPLICATED 0x01
 

@@ -284,9 +284,27 @@ static inline volatile int16_t *sp16(uint32_t off) { return (volatile int16_t *)
 static inline volatile int32_t *sp32(uint32_t off) { return (volatile int32_t *)(SCRATCHPAD_BASE + off); }
 static inline volatile int8_t  *sp8(uint32_t off)  { return (volatile int8_t  *)(SCRATCHPAD_BASE + off); }
 
-// rmsnorm: SP int16(src,esrc) -> SP int16(dst) at fixed E_NORM (CPU float math; HW in M4).
-static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w, int n, uint32_t dst)
+// rmsnorm: SP int16(src,esrc) -> SP int16(dst) at fixed E_NORM. HW path: fetch the
+// image's int16 norm rows (kind norm16, exponent E_W16) into SP_FET and run the vector
+// unit's two-pass program; CPU path: soft-float with the F32 weights from RAM.
+#define E_W16 (-13) // layout.NORM16_EXP.
+static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
+                          const struct bons_entry *w16, int n, uint32_t dst)
 {
+#if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
+    if (op_on_hw(OP_RMSNORM) && w16) {
+        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
+                     w16->chan_len_beats, SP_FET);
+        int eps_int = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*esrc));
+        if (eps_int < 1) eps_int = 1;
+        int ln = 0;
+        while ((1 << ln) < n) ln++;
+        int32_t args[7] = {(int32_t)src, (int32_t)SP_FET, (int32_t)dst, n/16,
+                           -ln, eps_int, E_W16 - E_NORM - 15};
+        vec_run(PROG_RMSNORM, args, 7);
+        return;
+    }
+#endif
     volatile int16_t *ps = sp16(src);
     volatile int16_t *pd = sp16(dst);
     float es = ldexpf(1.0f, esrc);
@@ -444,7 +462,8 @@ static int forward(int token, int want_logits)
     for (int l = 0; l < n_layer; l++) {
         // Attention block.
         perf_enter(OP_RMSNORM);
-        op_rmsnorm_sp(SP_XR, ex_state, attn_norm[l], n_embd, SP_H);
+        op_rmsnorm_sp(SP_XR, ex_state, attn_norm[l],
+                      model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16), n_embd, SP_H);
         perf_exit(OP_RMSNORM);
         perf_enter(OP_QUANT8);
         op_quant8_sp(SP_H, SP_X, n_embd);
@@ -539,7 +558,8 @@ static int forward(int token, int want_logits)
             const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
             const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
             perf_enter(OP_RMSNORM);
-            op_rmsnorm_sp(SP_XR, ex_state, ffn_norm[l], n_embd, SP_H);
+            op_rmsnorm_sp(SP_XR, ex_state, ffn_norm[l],
+                          model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16), n_embd, SP_H);
             perf_exit(OP_RMSNORM);
             perf_enter(OP_QUANT8);
             op_quant8_sp(SP_H, SP_X, n_embd);
@@ -586,7 +606,8 @@ static int forward(int token, int want_logits)
 
     // Final norm + LM head (tied or separate), chunked over rows to fit the scratchpad.
     perf_enter(OP_RMSNORM);
-    op_rmsnorm_sp(SP_XR, ex_state, out_norm, n_embd, SP_H);
+    op_rmsnorm_sp(SP_XR, ex_state, out_norm,
+                  model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16), n_embd, SP_H);
     perf_exit(OP_RMSNORM);
     perf_enter(OP_QUANT8);
     op_quant8_sp(SP_H, SP_X, n_embd);

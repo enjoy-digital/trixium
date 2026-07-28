@@ -15,6 +15,7 @@
 
 const struct bons_header *model_header(void);
 const struct bons_entry  *model_entry(int role, int layer);
+const struct bons_entry  *model_entry_kind(int role, int layer, int kind);
 void model_info(void);
 
 // Run a ternary/q8 matvec for one tensor: x8 at scratchpad `xsrc`, int32 results at `dst`.

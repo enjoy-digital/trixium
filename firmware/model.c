@@ -33,6 +33,16 @@ const struct bons_entry *model_entry(int role, int layer)
     return 0;
 }
 
+const struct bons_entry *model_entry_kind(int role, int layer, int kind)
+{
+    const struct bons_header *h = model_header();
+    const struct bons_entry  *t = model_table();
+    for (uint32_t i = 0; i < h->n_tensors; i++)
+        if (t[i].role == role && t[i].layer == layer && t[i].kind == kind)
+            return &t[i];
+    return 0;
+}
+
 void model_info(void)
 {
     const struct bons_header *h = model_header();

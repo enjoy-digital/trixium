@@ -130,6 +130,7 @@ class BonsaiSoC(SoCCore):
                 from trixium.gateware.vector import BonsaiVectorUnit
                 vecunit = self.vecunit = BonsaiVectorUnit()
                 self.add_constant("BONSAI_HAS_VECUNIT")
+                self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set.
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit)
             self.engine_csr = BonsaiEngineCSR(self.engine)
             self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)

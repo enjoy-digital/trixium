@@ -82,7 +82,7 @@ def test_sim_selftest_checksums():
     mhw = re.search(r"GEN-HW:((?: \d+)+)", out)
     assert mhw, f"no GEN-HW line in:\n{out[-1500:]}"
     hw_tokens = [int(t) for t in mhw.group(1).split()]
-    ref_hw    = hybrid_generate(img, [1, 2, 3], len(hw_tokens), modes={"silu_mul": "hw"})
+    ref_hw    = hybrid_generate(img, [1, 2, 3], len(hw_tokens), modes={"silu_mul": "hw", "rmsnorm": "hw"})
     assert hw_tokens == ref_hw, f"HW-ops tokens {hw_tokens} != hw ref {ref_hw}"
 
 def hybrid_generate(img, prompt, n_new, modes=None):
@@ -124,7 +124,19 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         e = int(np.frexp(f32(amax))[1]) - 15
         return np.clip(lroundf(x*f32(np.exp2(-e))), -32767, 32767), e
 
-    def rmsnorm_sp(m, e, w):
+    def rmsnorm_sp(m, e, name):
+        n = len(m)
+        if modes.get("rmsnorm", "cpu") == "hw":
+            _, w16 = img.tensor(name.replace(".weight", "") + ".w16")
+            sp = bytearray(3*8192)
+            sp[0:2*n]         = np.asarray(m).astype("<i2").tobytes()
+            sp[8192:8192+2*n] = w16.reshape(-1).astype("<i2").tobytes()
+            eps_int = max(1, int(round(float(h["rms_eps"])*2.0**(-2*e))))
+            words = vasm.assemble(vasm.PROGRAMS["rmsnorm"]())
+            vasm.VecInterp(sp).run(words, [0, 8192, 16384, n//16,
+                                           -int(np.log2(n)), eps_int, (-13) - E_NORM - 15])
+            return np.frombuffer(bytes(sp[16384:16384+2*n]), dtype="<i2").astype(np.int64)
+        w  = norm_w(name)
         v  = m.astype(f32)*f32(np.exp2(e))
         ss = fsum32(v*v)
         r  = f32(1.0)/np.sqrt(f32(f32(ss/f32(len(v))) + f32(h["rms_eps"])))
@@ -195,7 +207,7 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         for l in range(n_layer):
             p = f"blk.{l}."
             # Attention block.
-            hm = rmsnorm_sp(xm, ex, norm_w(p + "attn_norm.weight"))
+            hm = rmsnorm_sp(xm, ex, p + "attn_norm.weight")
             x8 = quant8_sp(hm)
             e8 = E_NORM + 8
             def qkv(name):
@@ -239,7 +251,7 @@ def hybrid_generate(img, prompt, n_new, modes=None):
             dm, kk  = norm_i32_sp(res)
             xm, ex  = resid_sp(xm, ex, dm, er + kk)
             # FFN block (fully resident).
-            hm = rmsnorm_sp(xm, ex, norm_w(p + "ffn_norm.weight"))
+            hm = rmsnorm_sp(xm, ex, p + "ffn_norm.weight")
             x8 = quant8_sp(hm)
             gres, ger = matvec_i8(p + "ffn_gate.weight", x8, E_NORM + 8)
             gm, kg = norm_i32_sp(gres)
@@ -253,7 +265,7 @@ def hybrid_generate(img, prompt, n_new, modes=None):
             xm, ex = resid_sp(xm, ex, dm, der + kd)
         if not want:
             return -1
-        hm = rmsnorm_sp(xm, ex, norm_w("output_norm.weight"))
+        hm = rmsnorm_sp(xm, ex, "output_norm.weight")
         x8 = quant8_sp(hm)
         head = "output.weight" if "output.weight" in img.by_name else "token_embd.weight"
         e = entry(head)

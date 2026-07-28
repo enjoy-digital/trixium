@@ -29,7 +29,7 @@ uint32_t hw_caps(void)
     caps |= (1 << OP_SILU_MUL) | (1 << OP_QUANT8) | (1 << OP_NORM_I32) | (1 << OP_RESID_ADD);
 #endif
 #ifdef BONSAI_HAS_VECUNIT2
-    caps |= (1 << OP_RMSNORM) | (1 << OP_QKNORM) | (1 << OP_ROPE) | (1 << OP_SOFTMAX);
+    caps |= (1 << OP_RMSNORM); // QKNORM/ROPE/SOFTMAX land with the attention flip (M5).
 #endif
 #ifdef BONSAI_HAS_KVSTORE
     caps |= (1 << OP_KVQUANT) | (1 << OP_SCORES);

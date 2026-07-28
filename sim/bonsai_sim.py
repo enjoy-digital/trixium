@@ -107,6 +107,7 @@ class BonsaiSimSoC(SoCCore):
         self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit)
         self.engine_csr = BonsaiEngineCSR(self.engine)
         self.add_constant("BONSAI_HAS_VECUNIT")
+        self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set (rmsnorm scalar ops + rsqrt fix).
 
         self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
             SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
