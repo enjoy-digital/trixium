@@ -642,6 +642,6 @@ def test_sequencer_mixed_list():
                                    dtype="<i2")[:M]
         assert np.array_equal(out["x8"], x8_exp.astype(np.int8)), "quant8 via sequencer"
         assert np.array_equal(out["res"], res_exp), "matvec via sequencer"
-        assert np.array_equal(out["nrm"], nrm_exp.astype(np.int16)), "norm_i32 auto-k"
+        assert np.array_equal(out["nrm"], nrm_exp.astype(np.int16)), ("norm_i32 auto-k", out["nrm"][:8], nrm_exp[:8], k_exp, amax)
 
     run_simulation(dut, [driver()])

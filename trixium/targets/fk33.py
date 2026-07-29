@@ -131,8 +131,22 @@ class BonsaiSoC(SoCCore):
                 vecunit = self.vecunit = BonsaiVectorUnit()
                 self.add_constant("BONSAI_HAS_VECUNIT")
                 self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set.
-            self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit)
-            self.engine_csr = BonsaiEngineCSR(self.engine)
+            seq = None
+            if with_vecunit:
+                from trixium.gateware.sequencer import BonsaiSequencer
+                seq = self.seq = BonsaiSequencer()
+                self.comb += [
+                    vecunit.seq_en.eq(seq.busy),
+                    vecunit.seq_start.eq(seq.vec_start),
+                    vecunit.seq_pc.eq(seq.vec_pc),
+                    seq.vec_done.eq(vecunit.done),
+                    seq.vec_res6.eq(vecunit.res6.status),
+                ]
+                self.comb += [vecunit.seq_args[i].eq(seq.vec_args[i]) for i in range(8)]
+                self.add_constant("BONSAI_HAS_SEQ")
+            self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
+                                                 seq=seq)
+            self.engine_csr = BonsaiEngineCSR(self.engine, seq=seq)
             self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [

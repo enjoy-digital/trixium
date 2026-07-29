@@ -11,7 +11,7 @@ BUILD_DIR ?= ../build/sim
 include $(BUILD_DIR)/software/include/generated/variables.mak
 include $(SOC_DIRECTORY)/software/common.mak
 
-OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o
+OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o
 
 COMMA = ,
 REGULAR_LIBS = $(filter-out $(ALWAYS_LINK_LIBS),$(LIBS))

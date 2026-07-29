@@ -77,7 +77,12 @@ def _compare(prog_name, sp_bytes, args):
     ref_sp = bytearray(sp_bytes)
     S, _   = asm.VecInterp(ref_sp).run(asm.assemble(asm.PROGRAMS[prog_name]()), list(args))
     got    = _run_rtl(prog_name, sp_bytes, args)
-    assert got["sp"] == bytes(ref_sp), f"{prog_name}: scratchpad mismatch"
+    if got["sp"] != bytes(ref_sp):
+        gb, rb = got["sp"], bytes(ref_sp)
+        diffs = [i for i in range(len(gb)) if gb[i] != rb[i]][:8]
+        raise AssertionError(f"{prog_name}: sp mismatch at {diffs}: "
+                             f"got {[hex(gb[i]) for i in diffs]} "
+                             f"ref {[hex(rb[i]) for i in diffs]}")
     return S, got
 
 def test_rtl_resid_add():

@@ -49,6 +49,7 @@ from trixium.gateware.csr_front import BonsaiEngineCSR
 from trixium.gateware.vector import BonsaiVectorUnit
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 from trixium.gateware.loader import BonsaiHBMLoader
+from trixium.gateware.sequencer import BonsaiSequencer
 from trixium.model.bons import BONSReader
 
 # Constants ----------------------------------------------------------------------------------------
@@ -106,8 +107,19 @@ class BonsaiSimSoC(SoCCore):
             self.add_module(f"hbm_model{c}", model)
             axis.append(axi)
         self.vecunit    = BonsaiVectorUnit()
-        self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit)
-        self.engine_csr = BonsaiEngineCSR(self.engine)
+        self.seq = BonsaiSequencer()
+        self.comb += [
+            self.vecunit.seq_en.eq(self.seq.busy),
+            self.vecunit.seq_start.eq(self.seq.vec_start),
+            self.vecunit.seq_pc.eq(self.seq.vec_pc),
+            self.seq.vec_done.eq(self.vecunit.done),
+            self.seq.vec_res6.eq(self.vecunit.res6.status),
+        ]
+        self.comb += [self.vecunit.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+        self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit,
+                                              seq=self.seq)
+        self.engine_csr = BonsaiEngineCSR(self.engine, seq=self.seq)
+        self.add_constant("BONSAI_HAS_SEQ")
         # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
         # kind-3 STORE ops (KV append).
         self.loader = BonsaiHBMLoader(axis)

@@ -24,6 +24,7 @@
 #include "ops.h"
 #include "perf.h"
 #include "vec.h"
+#include "progs.h"
 
 /*-----------------------------------------------------------------------*/
 /* Console                                                               */
@@ -347,6 +348,57 @@ int main(void)
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
     model_info();
     sptest();
+#ifdef CSR_VECUNIT_BASE
+    { // Vec unit smoke test: quant8 of a known ramp via the CSR dispatch path. Catches
+      // emission-level datapath breaks that Migen-sim unit tests cannot see (the VCLAMP8
+      // unsigned-literal emission bug shipped through six token-gated milestones).
+        volatile int16_t *pi = (volatile int16_t *)(SCRATCHPAD_BASE + 0x100);
+        volatile int8_t  *po = (volatile int8_t  *)(SCRATCHPAD_BASE + 0x200);
+        for (int i = 0; i < 16; i++) pi[i] = (int16_t)(i*1000 - 8000);
+        for (int i = 0; i < 16; i++) po[i] = 0x5A;
+        int32_t va[4] = {0x100, 0, 0x200, 1};
+        vec_run(PROG_QUANT8, va, 4);
+        int ok = 1;
+        for (int i = 0; i < 16; i++) {
+            int32_t v = i*1000 - 8000;
+            int32_t q = (v >> 8) + (((v >> 7) & 1) & (((v & 0x7F) != 0) | ((v >> 8) & 1)));
+            if (po[i] != (int8_t)q) ok = 0;
+        }
+        printf("VECTEST %s\n", ok ? "OK" : "FAIL");
+        // Per-program CRC sweep: run every program on a seeded pattern; the sim harness
+        // compares each printed CRC against the interpreter (named failure per program).
+        {
+            volatile uint32_t *sp32b = (volatile uint32_t *)(SCRATCHPAD_BASE + 0x8000);
+            uint32_t seed = 0x12345678u;
+            for (int i = 0; i < 1024; i++) { // 4 KB of LCG pattern at 0x8000.
+                seed = seed*1664525u + 1013904223u;
+                sp32b[i] = seed;
+            }
+            struct { const char *name; uint16_t pc; int32_t a[8]; int na; } progs[] = {
+                {"quant8",   PROG_QUANT8,   {0x8000, 0, 0xA000, 8}, 4},
+                {"norm_i32", PROG_NORM_I32, {0x8000, 0, 0xA200, 4, 13}, 5},
+                {"resid",    PROG_RESID_ADD,{0x8000, 0x8400, 0xA400, 8, 1, 2}, 6},
+                {"silu",     PROG_SILU_MUL, {0x8000, 0x8400, 0xA600, 8, 6, 0, -15}, 7},
+                {"rmsnorm",  PROG_RMSNORM,  {0x8000, 0x8400, 0xA800, 8, -7, 17, -17}, 7},
+                {"rope",     PROG_ROPE,     {0x8000, 0x8080, 0x8400, 0x8480, 4,
+                                             0xAA00, 0xAA80}, 7},
+                {"softmax8", PROG_SOFTMAX8, {0x8000, 739, 0xAC00, 4, -11, 17}, 6},
+                {"reduce",   PROG_REDUCE_ACC,{0xA200, 0x8400, 0xAE00, 4}, 4},
+                {"scale8",   PROG_SCALE8,   {0x8000, 0, 0xB000, 8, 19571}, 5},
+            };
+            for (unsigned pi2 = 0; pi2 < sizeof(progs)/sizeof(progs[0]); pi2++) {
+                uint64_t r6 = vec_run(progs[pi2].pc, progs[pi2].a, progs[pi2].na);
+                uint32_t crc = 0;
+                volatile uint32_t *dst = (volatile uint32_t *)(SCRATCHPAD_BASE
+                                          + (uint32_t)progs[pi2].a[2]);
+                for (int i = 0; i < 128; i++)
+                    crc = (crc ^ dst[i])*16777619u;
+                printf("VECCRC %s %08lx %08lx\n", progs[pi2].name,
+                       (unsigned long)crc, (unsigned long)(uint32_t)r6);
+            }
+        }
+    }
+#endif
     selftest();
     if (infer_init() == 0) {
         // Boot generation demo (deterministic; checked by the sim harness).

@@ -229,6 +229,16 @@ class BonsaiVectorUnit(LiteXModule):
                 "VSHLV", "VRNE", "VCLAMP8", "VCLAMP16", "VABS", "VCLZN", "VPACK",
                 "LDV", "LDW", "BCAST", "LUTE2", "LUTRECIP", "LUTRSQRT")}
 
+        c31n  = Signal((32, True), reset=-31)
+        c8p   = Signal((32, True), reset=127)
+        c8n   = Signal((32, True), reset=-127)
+        c8p_v = Signal((32, True), reset=127)
+        c8n_v = Signal((32, True), reset=-127)
+        c16p   = Signal((32, True), reset=32767)
+        c16n   = Signal((32, True), reset=-32767)
+        c16p_v = Signal((32, True), reset=32767)
+        c16n_v = Signal((32, True), reset=-32767)
+
         am5 = Signal(5)
         am5m1 = Signal(5) # am5 - 1 clamped at 0 (both Mux branches evaluate in simulation).
         self.comb += [
@@ -248,8 +258,11 @@ class BonsaiVectorUnit(LiteXModule):
                 lane(res["VMAX"], i).eq(Mux(a > b, a, b)),
                 lane(res["VSHRI"], i).eq(a >> am5),
                 lane(res["VSHLI"], i).eq(a << am5),
-                lane(res["VCLAMP8"],  i).eq(Mux(a > 127, 127, Mux(a < -127, -127, a))),
-                lane(res["VCLAMP16"], i).eq(Mux(a > 32767, 32767, Mux(a < -32767, -32767, a))),
+                # Clamp bounds as dedicated signed signals: literal negative constants
+                # in comparisons can emit as unsigned-typed Verilog literals, flipping
+                # the comparison unsigned (Verilator-visible only; Migen sim is fine).
+                lane(res["VCLAMP8"],  i).eq(Mux(a > c8p, c8p_v, Mux(a < c8n, c8n_v, a))),
+                lane(res["VCLAMP16"], i).eq(Mux(a > c16p, c16p_v, Mux(a < c16n, c16n_v, a))),
                 lane(res["VABS"], i).eq(abs_l[i]),
                 lane(res["BCAST"], i).eq(sa_val[0:32]),
             ]
@@ -270,7 +283,10 @@ class BonsaiVectorUnit(LiteXModule):
             # VSHLV (per-lane signed variable shift, clamp +-31).
             amtc = Signal((6, True))
             self.comb += [
-                amtc.eq(Mux(b > 31, 31, Mux(b < -31, -31, b))),
+                # -31 as a signed Signal: a negative literal here emits as an unsigned
+                # Verilog literal (-6'd31 = 33), turning the comparison unsigned - small
+                # positive amounts then clamp to -31 and left shifts become >>31.
+                amtc.eq(Mux(b > 31, 31, Mux(b < c31n, c31n, b))),
                 lane(res["VSHLV"], i).eq(Mux(amtc >= 0, a << amtc[0:5], a >> (-amtc)[0:5])),
             ]
             # VCLZN: shift normalizing |a| into [2^14, 2^15); 0 for a == 0.
@@ -355,7 +371,8 @@ class BonsaiVectorUnit(LiteXModule):
 
         # Scalar SSHLV: 48-bit variable shift of S[sd] by S[sa] (clamped +-47), wraps to 48.
         ssh_amt = Signal((7, True))
-        self.comb += ssh_amt.eq(Mux(sa_val > 47, 47, Mux(sa_val < -47, -47, sa_val[0:7])))
+        c47n = Signal((48, True), reset=-47)
+        self.comb += ssh_amt.eq(Mux(sa_val > 47, 47, Mux(sa_val < c47n, c47n, sa_val[0:7])))
         ssh_amt_pos = Signal(6)
         ssh_amt_neg = Signal(6)
         self.comb += [

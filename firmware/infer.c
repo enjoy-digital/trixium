@@ -23,6 +23,7 @@
 #include "ops.h"
 #include "perf.h"
 #include "vec.h"
+#include "seq.h"
 
 // newlib-libm compatibility: the toolchain libm.a references __errno, absent from the
 // picolibc environment LiteX links against.
@@ -636,6 +637,40 @@ static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
     return e16min + k2;
 }
 
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
+// Sequencer descriptor list for the per-head qk-norm + rope loops. Addresses are
+// head-relative inside SP_Q/SP_K, so the list is layer-independent; per layer only the
+// rmsnorm eps_int args (A5 = descriptor word 7) change. Built once at init.
+static int seq_qkr_count;
+static void seq_build_qkr(void)
+{
+    int ln = 0;
+    while ((1 << ln) < head_dim) ln++;
+    uint32_t di = 0;
+    for (int hh = 0; hh < n_head + n_kv_head; hh++) {
+        int      is_q = hh < n_head;
+        uint32_t sp   = is_q ? (SP_Q + hh*head_dim*2)
+                             : (SP_K + (hh - n_head)*head_dim*2);
+        uint32_t wsp  = is_q ? SP_FET : SP_FET2;
+        int32_t rargs[7] = {(int32_t)sp, (int32_t)wsp, (int32_t)sp, head_dim/16,
+                            -ln, 1, E_W16 - E_NORM - 15};
+        seq_desc_vec(di++, PROG_RMSNORM, rargs, 7, 0);
+        int32_t pargs[7] = {(int32_t)sp, (int32_t)(sp + head_dim), (int32_t)SP_TAB,
+                            (int32_t)(SP_TAB + head_dim), (head_dim/2)/16,
+                            (int32_t)sp, (int32_t)(sp + head_dim)};
+        seq_desc_vec(di++, PROG_ROPE, pargs, 7, 0);
+    }
+    seq_desc_stop(di++);
+    seq_qkr_count = di;
+}
+
+static int seq_eps_int(int es)
+{
+    int e = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*es));
+    return (e < 1) ? 1 : e;
+}
+#endif
+
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
 static int forward(int token, int want_logits)
@@ -721,6 +756,17 @@ embed_done: ;
                          qn16->chan_len_beats, SP_FET);
             engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
                          kn16->chan_len_beats, SP_FET2);
+#ifdef CSR_SEQ_BASE
+            {
+                // One sequencer run replaces the 2*(n_head+n_kv) per-head dispatches;
+                // only the eps args change per layer (descriptor word 7 = A5).
+                int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
+                for (int hh = 0; hh < n_head + n_kv_head; hh++)
+                    seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
+                seq_run(0, seq_qkr_count);
+            }
+            perf_exit(OP_QKNORM);
+#else
             for (int hh = 0; hh < n_head; hh++)
                 vec_rmsnorm_head(SP_Q + hh*head_dim*2, eq_r, SP_FET, head_dim);
             for (int hh = 0; hh < n_kv_head; hh++)
@@ -732,6 +778,7 @@ embed_done: ;
             for (int hh = 0; hh < n_kv_head; hh++)
                 vec_rope_head(SP_K + hh*head_dim*2, head_dim);
             perf_exit(OP_ROPE);
+#endif
             perf_enter(OP_KVQUANT);
             for (int hh = 0; hh < n_kv_head; hh++) {
                 kv_store_row_res(l, hh, 0, pos, SP_K + hh*head_dim*2, E_NORM);
@@ -1242,6 +1289,9 @@ int infer_init(void)
     kv_region = (uint32_t)((max_ctx + n_ch - 1)/n_ch)*kv_rb;
     kv_ekmax  = halloc(n_layer*n_kv_head*2);
     for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
+#ifdef CSR_SEQ_BASE
+    seq_build_qkr();
+#endif
 #endif
     k_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
     v_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);

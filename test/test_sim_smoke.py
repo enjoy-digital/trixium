@@ -53,6 +53,42 @@ def test_sim_selftest_checksums():
         p.kill()
     out = "".join(lines)
     assert "SPTEST OK" in out, out[-2000:]
+    assert "VECTEST OK" in out, "vec unit smoke failed (emission-level datapath break)"
+
+    # Per-program CRC sweep vs the interpreter (named failure per program).
+    import re as _re
+    from trixium.model import asm as _vasm
+    sp = bytearray(256*1024)
+    seed = 0x12345678
+    for i in range(1024):
+        seed = (seed*1664525 + 1013904223) & 0xFFFFFFFF
+        sp[0x8000 + 4*i:0x8000 + 4*i + 4] = seed.to_bytes(4, "little")
+    _progs = [
+        ("quant8",   "quant8",     [0x8000, 0, 0xA000, 8]),
+        ("norm_i32", "norm_i32",   [0x8000, 0, 0xA200, 4, 13]),
+        ("resid",    "resid_add",  [0x8000, 0x8400, 0xA400, 8, 1, 2]),
+        ("silu",     "silu_mul",   [0x8000, 0x8400, 0xA600, 8, 6, 0, -15]),
+        ("rmsnorm",  "rmsnorm",    [0x8000, 0x8400, 0xA800, 8, -7, 17, -17]),
+        ("rope",     "rope",       [0x8000, 0x8080, 0x8400, 0x8480, 4, 0xAA00, 0xAA80]),
+        ("softmax8", "softmax8",   [0x8000, 739, 0xAC00, 4, -11, 17]),
+        ("reduce",   "reduce_acc", [0xA200, 0x8400, 0xAE00, 4]),
+        ("scale8",   "scale8",     [0x8000, 0, 0xB000, 8, 19571]),
+    ]
+    exp_crc = {}
+    for name, prog, pargs in _progs:
+        S, _ = _vasm.VecInterp(sp).run(_vasm.assemble(_vasm.PROGRAMS[prog]()), list(pargs))
+        crc = 0
+        for i in range(128):
+            w = int.from_bytes(sp[pargs[2] + 4*i:pargs[2] + 4*i + 4], "little")
+            crc = ((crc ^ w)*16777619) & 0xFFFFFFFF
+        exp_crc[name] = (crc, S[6] & 0xFFFFFFFF)
+    for m2 in _re.finditer(r"VECCRC (\w+) ([0-9a-f]{8}) ([0-9a-f]{8})", out):
+        name, crc, r6 = m2.group(1), int(m2.group(2), 16), int(m2.group(3), 16)
+        assert name in exp_crc, name
+        assert crc == exp_crc[name][0], (
+            f"vec program '{name}' diverged from the interpreter "
+            f"(crc {crc:08x} != {exp_crc[name][0]:08x}) - emission-level break")
+    assert len(_re.findall(r"VECCRC", out)) == len(_progs), "missing VECCRC lines"
 
     img  = BONSReader(IMAGE)
     e    = img.by_name["blk.0.attn_q.weight"]
