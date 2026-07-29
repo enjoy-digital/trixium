@@ -58,6 +58,7 @@ class BonsaiVectorUnit(LiteXModule):
         self.seq_start = Signal()
         self.seq_pc    = Signal(16)
         self.seq_args  = [Signal(32, name=f"vseq_arg{i}") for i in range(8)]
+        self.seq_seed7 = Signal(48) # S7 initial value under seq_en (prev prog's res6).
 
         # CSRs.
         self.prog      = CSRStorage(32, description="Instruction upload (auto-incrementing address).")
@@ -530,7 +531,8 @@ class BonsaiVectorUnit(LiteXModule):
             ),
             If(start,
                 bad_op.eq(0),
-                *[S[i].eq(0) for i in range(8)],
+                *[S[i].eq(0) for i in range(7)],
+                S[7].eq(Mux(self.seq_en, self.seq_seed7, 0)),
             ),
             If(fsm.ongoing("FINISH"),
                 self.done_count.status.eq(self.done_count.status + 1),

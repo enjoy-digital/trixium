@@ -17,8 +17,10 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
        [31:16] vec arg sources, 2 bits each (arg i at [16+2i +: 2]):
                0 = immediate (w2+i), 1 = k(engine absmax) = max(0, bitlen(absmax) - 14),
                2 = rpre(prev vec res6) = bitlen(res6) + 5 (bitexact.axpy_rpre),
-               3 = prev vec res6 low 32 bits.
-  engine: w1 = kind | ilv<<8 | supw<<9;  w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;
+               3 = k(prev vec res6) = max(0, bitlen(res6) - 14) (norm shift from a
+                   reduce_acc absmax result).
+  engine: w1 = kind | ilv<<8 | supw<<9 | rshift_rpre<<10 (rshift taken from
+          rpre(prev vec res6) instead of w7);  w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;
           w5 = wlen;  w6 = sbeats | cbeats<<8;  w7 = bias | rshift<<16;  w8 = xsrc;
           w9 = dst;  w10 = chan.
   vec:    w1 = pc;  w2..w9 = args 0..7.
@@ -118,9 +120,11 @@ class BonsaiSequencer(LiteXModule):
 
         k_absmax = Signal(32)
         rpre_v   = Signal(32)
+        k_res6   = Signal(32)
         self.comb += [
             k_absmax.eq(Mux(absmax_bl > 14, absmax_bl - 14, 0)),
             rpre_v.eq(res6_bl + 5),
+            k_res6.eq(Mux(res6_bl > 14, res6_bl - 14, 0)),
         ]
 
         for i in range(8):
@@ -133,7 +137,7 @@ class BonsaiSequencer(LiteXModule):
                     0: self.vec_args[i].eq(imm),
                     1: self.vec_args[i].eq(k_absmax),
                     2: self.vec_args[i].eq(rpre_v),
-                    3: self.vec_args[i].eq(self.vec_res6[0:32]),
+                    3: self.vec_args[i].eq(k_res6),
                 }),
             ]
 
@@ -150,7 +154,7 @@ class BonsaiSequencer(LiteXModule):
             self.eng_sbeats.eq(w(0, 6)[0:4]),
             self.eng_cbeats.eq(w(0, 6)[8:16]),
             self.eng_bias.eq(w(0, 7)[0:7]),
-            self.eng_rshift.eq(w(0, 7)[16:22]),
+            self.eng_rshift.eq(Mux(w(0, 1)[10], rpre_v[0:6], w(0, 7)[16:22])),
             self.eng_xsrc.eq(w(1, 8)[0:24]),
             self.eng_dst.eq(w(1, 9)[0:24]),
             self.eng_chan.eq(w(1, 10)[0:5]),

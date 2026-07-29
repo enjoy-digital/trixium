@@ -196,9 +196,11 @@ class VecInterp:
     def __init__(self, scratchpad):
         self.sp = scratchpad # bytearray.
 
-    def run(self, words, args, max_steps=1_000_000):
+    def run(self, words, args, max_steps=1_000_000, s7_seed=0):
+        # s7_seed models the sequencer's res6-chaining (S7 starts as the previous
+        # program's res6 under direct drive; 0 for CSR dispatch).
         V = [np.zeros(LANES, dtype=np.int64) for _ in range(8)]
-        S = [0]*8
+        S = [0]*7 + [_s48(s7_seed)]
         A = list(args) + [0]*(8 - len(args))
         pc = 0
         loop_start = loop_cnt = 0
@@ -635,6 +637,19 @@ def prog_scale8():
         ("DONE",),
     ]
 
+def prog_spill():
+    """Store S7's low 32 bits (sequencer-seeded with the previous program's res6) to A0.
+    Lets a descriptor list persist per-head hardware results (softmax sums, reduce
+    absmaxes) for one CPU readout after the whole list completes. Writes 8 copies
+    (one 32-byte beat)."""
+    return [
+        ("ARG",   "s0", 0),
+        ("BCAST", "v0", "s7"),
+        ("STW",   "v0", "s0"),
+        ("SMOV",  "s6", "s7"),  # Preserve the chained value in res6 for the next program.
+        ("DONE",),
+    ]
+
 PROGRAMS = {
     "resid_add":  prog_resid_add,
     "quant8":     prog_quant8,
@@ -645,6 +660,7 @@ PROGRAMS = {
     "reduce_acc": prog_reduce_acc,
     "rope":       prog_rope,
     "scale8":     prog_scale8,
+    "spill":      prog_spill,
 }
 
 def emit_c(out):
