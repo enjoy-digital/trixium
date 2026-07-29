@@ -199,15 +199,13 @@ static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
     if (ek > kv_ekmax[idx]) kv_ekmax[idx] = ek;
 }
 
-// Smallest AXPY pre-shift keeping the int32 lane accumulators safe (bitexact.axpy_rpre).
+// AXPY pre-shift keeping the int32 lane accumulators safe (bitexact.axpy_rpre):
+// pure bit-length form so the descriptor sequencer can compute it in hardware.
 static int axpy_rpre_c(uint64_t p8sum)
 {
-    uint64_t bound = p8sum*127ull*1024ull;
-    bound <<= 12;
-    bound *= 127ull;
-    int r = 0;
-    while ((bound >> r) >= (1ull << 31)) r++;
-    return r;
+    int bl = 0;
+    while ((p8sum >> bl) != 0) bl++;
+    return bl + 5;
 }
 
 // B/R for a scores op over a region: pow-2 scales make e16 + B == 12 exactly

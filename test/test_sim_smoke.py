@@ -20,7 +20,9 @@ from trixium.model import bitexact as bx
 from trixium.model.bons import BONSReader
 
 SIM_DIR = "build/sim/gateware"
-IMAGE   = "models/tiny/bonsai-tiny-n2.img"
+# Override to gate against a different channel count (rebuild the sim with the same
+# image first: BONSAI_SIM_IMAGE=... python3 sim/bonsai_sim.py).
+IMAGE   = os.environ.get("BONSAI_SIM_IMAGE", "models/tiny/bonsai-tiny-n2.img")
 
 def fnv1a(data):
     h = 2166136261
@@ -209,12 +211,7 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         rowsd = hbm_kv[(l, kvh, 1)]
         ekmax = max(e for e, _ in rowsd)
         B     = 22 - ekmax
-        bound = ((1 << -ep) + len(pr))*127*1024
-        bound <<= 12
-        bound *= 127
-        Rpre = 0
-        while (bound >> Rpre) >= (1 << 31):
-            Rpre += 1
+        Rpre = (((1 << -ep) + len(pr))).bit_length() + 5
         nch = h["n_channels"]
         parts = []
         for c in range(nch):
@@ -282,12 +279,7 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         rowsv = hbm_kv[(l, kvh, 1)]
         ekv = max(e for e, _ in rowsv)
         Bv = 22 - ekv
-        bound = P8*127*1024
-        bound <<= 12
-        bound *= 127
-        Rpre = 0
-        while (bound >> Rpre) >= (1 << 31):
-            Rpre += 1
+        Rpre = P8.bit_length() + 5
         nch = h["n_channels"]
         red = np.zeros(hd, dtype=np.int64)
         for c in range(nch):
@@ -333,12 +325,7 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         rowsv = hbm_kv[(l, kvh, 1)]
         ekv   = max(e for e, _ in rowsv)
         Bv    = 22 - ekv
-        bound = P8*127*1024
-        bound <<= 12
-        bound *= 127
-        Rpre = 0
-        while (bound >> Rpre) >= (1 << 31):
-            Rpre += 1
+        Rpre = P8.bit_length() + 5
         nch = h["n_channels"]
         red = np.zeros(hd, dtype=np.int64)
         for c in range(nch):

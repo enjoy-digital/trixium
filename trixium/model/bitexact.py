@@ -160,14 +160,11 @@ def axpy_rows(scales_f16, v8w, p8, B, Rpre):
     return acc.astype(np.int32)
 
 def axpy_rpre(p8_sum_bound, B_top=22):
-    """Smallest Rpre keeping worst-case |acc| < 2^31: coeff <= 127*1024*2^12 per unit p8,
-    times |v8| <= 127, times sum|p8| <= p8_sum_bound."""
-    bound = int(p8_sum_bound)*127*1024 << 12
-    bound *= 127
-    r = 0
-    while (bound >> r) >= (1 << 31):
-        r += 1
-    return r
+    """Rpre keeping worst-case |acc| < 2^31: per unit of p8 the contribution is bounded by
+    127*1024*127*2^12 < 2^36, so r = max(0, bitlen(sum|p8|) + 36 - 31). Pure bit-length
+    form (a priority encoder in hardware - the sequencer computes it from the softmax's
+    returned sum), conservative by at most one bit vs the exact product loop."""
+    return max(0, int(p8_sum_bound).bit_length() + 5)
 
 # BFP vector helpers (vector-unit spec) ------------------------------------------------------------
 

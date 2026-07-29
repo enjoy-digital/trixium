@@ -51,6 +51,13 @@ class BonsaiVectorUnit(LiteXModule):
         self.sp_wr_dat = Signal(256)
 
         self.busy = Signal()
+        self.done = Signal() # Pulse at program completion (sequencer handshake).
+
+        # Direct-drive port (descriptor sequencer): overrides the CSR path while seq_en.
+        self.seq_en    = Signal()
+        self.seq_start = Signal()
+        self.seq_pc    = Signal(16)
+        self.seq_args  = [Signal(32, name=f"vseq_arg{i}") for i in range(8)]
 
         # CSRs.
         self.prog      = CSRStorage(32, description="Instruction upload (auto-incrementing address).")
@@ -372,10 +379,15 @@ class BonsaiVectorUnit(LiteXModule):
                 snorme_res.eq((30 - p) if (p % 2 == 0) else (31 - p)))
         self.comb += sn_cases
 
-        # Args (32-bit CSRs, sign-extended into the 48-bit scalar file by ARG).
-        args_arr = Array([self.arg0.storage, self.arg1.storage, self.arg2.storage,
-                          self.arg3.storage, self.arg4.storage, self.arg5.storage,
-                          self.arg6.storage, self.arg7.storage])
+        # Args (32-bit CSRs, sign-extended into the 48-bit scalar file by ARG). The
+        # sequencer's direct-drive values replace the CSR storage while seq_en is high.
+        csr_args = [self.arg0.storage, self.arg1.storage, self.arg2.storage,
+                    self.arg3.storage, self.arg4.storage, self.arg5.storage,
+                    self.arg6.storage, self.arg7.storage]
+        arg_eff = [Signal(32, name=f"arg_eff{i}") for i in range(8)]
+        for i in range(8):
+            self.comb += arg_eff[i].eq(Mux(self.seq_en, self.seq_args[i], csr_args[i]))
+        args_arr = Array(arg_eff)
         arg_sel = Signal(32)
         self.comb += arg_sel.eq(args_arr[f_imm[0:3]])
 
@@ -388,7 +400,8 @@ class BonsaiVectorUnit(LiteXModule):
             self.status.fields.bad_op.eq(bad_op),
         ]
         start = Signal()
-        self.comb += start.eq(self.submit.re & self.submit.storage)
+        self.comb += start.eq(Mux(self.seq_en, self.seq_start,
+                                  self.submit.re & self.submit.storage))
 
         self.fsm = fsm = FSM(reset_state="IDLE")
 
@@ -398,7 +411,7 @@ class BonsaiVectorUnit(LiteXModule):
 
         fsm.act("IDLE",
             If(start,
-                NextValue(pc, self.pc.storage),
+                NextValue(pc, Mux(self.seq_en, self.seq_pc, self.pc.storage)),
                 NextValue(running, 1),
                 NextState("FETCH"),
             )
@@ -447,6 +460,7 @@ class BonsaiVectorUnit(LiteXModule):
             ),
         )
         fsm.act("FINISH",
+            self.done.eq(1),
             NextValue(running, 0),
             NextState("IDLE"),
         )

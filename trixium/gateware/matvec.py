@@ -30,7 +30,7 @@ from trixium.gateware.ternary_mac import BonsaiChannelPipe
 # BonsaiMatVecEngine -------------------------------------------------------------------------------
 
 class BonsaiMatVecEngine(LiteXModule):
-    def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None):
+    def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None):
         # When a BonsaiVectorUnit is passed, the scratchpad fill/gather ports are muxed
         # between the engine and the vector unit (granted to the vector unit while it is
         # busy - firmware serializes engine ops and vector ops, so contention is
@@ -253,13 +253,20 @@ class BonsaiMatVecEngine(LiteXModule):
             ]
         else:
             grant_vec = Signal()
+            grant_seq = Signal()
             self.comb += [
                 grant_vec.eq(vecunit.busy),
+                grant_seq.eq(0 if seq is None else seq.sp_active),
                 If(grant_vec,
                     scratchpad.fill.adr.eq(vecunit.sp_rd_adr),
                     scratchpad.gather.adr.eq(vecunit.sp_wr_adr),
                     scratchpad.gather.dat_w.eq(vecunit.sp_wr_dat),
                     scratchpad.gather.we.eq(vecunit.sp_wr_we),
+                ).Elif(grant_seq,
+                    scratchpad.fill.adr.eq(0 if seq is None else seq.sp_adr),
+                    scratchpad.gather.adr.eq(eng_gw_adr),
+                    scratchpad.gather.dat_w.eq(eng_gw_dat),
+                    scratchpad.gather.we.eq(0), # Descriptor fetches never write.
                 ).Else(
                     scratchpad.fill.adr.eq(eng_fill_adr),
                     scratchpad.gather.adr.eq(eng_gw_adr),
@@ -268,6 +275,8 @@ class BonsaiMatVecEngine(LiteXModule):
                 ),
                 vecunit.sp_rd_dat.eq(scratchpad.fill.dat_r),
             ]
+            if seq is not None:
+                self.comb += seq.sp_dat.eq(scratchpad.fill.dat_r)
 
         # Control FSM -------------------------------------------------------------------------
         self.fsm = fsm = FSM(reset_state="IDLE")

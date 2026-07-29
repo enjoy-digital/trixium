@@ -1,0 +1,238 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+"""BonsaiSequencer: hardware execution of descriptor lists (engine + vector-unit ops).
+
+Op dispatch from the CPU costs ~1k cycles per op (CSR writes + completion polling) and the
+engine/vector units serialize behind it - at N >= 16 channels dispatch dominates the token
+time. The sequencer executes a scratchpad-resident descriptor list back-to-back: the CPU
+builds the (mostly static) list once, patches the few data-dependent words, writes
+base/count and one start, then polls a single completion.
+
+Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
+  w0:  [3:0] unit: 0 = stop, 1 = engine op, 2 = vector-unit program.
+       [31:16] vec arg sources, 2 bits each (arg i at [16+2i +: 2]):
+               0 = immediate (w2+i), 1 = k(engine absmax) = max(0, bitlen(absmax) - 14),
+               2 = rpre(prev vec res6) = bitlen(res6) + 5 (bitexact.axpy_rpre),
+               3 = prev vec res6 low 32 bits.
+  engine: w1 = kind | ilv<<8 | supw<<9;  w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;
+          w5 = wlen;  w6 = sbeats | cbeats<<8;  w7 = bias | rshift<<16;  w8 = xsrc;
+          w9 = dst;  w10 = chan.
+  vec:    w1 = pc;  w2..w9 = args 0..7.
+
+Numerics are UNCHANGED - sequencing is transparent; the golden mirrors need no update.
+
+Scratchpad access rides the engine fill port (never a fifth RAM port): descriptors are
+fetched only while both units are idle, so the integrator grants the port as
+vec.busy > seq.sp_active > engine."""
+
+from migen import *
+
+from litex.gen import *
+
+from litex.soc.interconnect.csr import *
+
+# BonsaiSequencer ----------------------------------------------------------------------------------
+
+class BonsaiSequencer(LiteXModule):
+    def __init__(self):
+        self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
+        self.count  = CSRStorage(16, description="Descriptor count (stop descriptor also ends).")
+        self.start  = CSRStorage(1,  description="Write 1 to run the list.")
+        self.status = CSRStatus(fields=[
+            CSRField("busy",   size=1),
+            CSRField("dcount", size=16, offset=8, description="Descriptors completed."),
+        ])
+
+        # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
+        self.eng_valid  = Signal()
+        self.eng_ready  = Signal()
+        self.eng_kind   = Signal(3)
+        self.eng_rows   = Signal(16)
+        self.eng_cols   = Signal(14)
+        self.eng_wbase  = Signal(32)
+        self.eng_wlen   = Signal(24)
+        self.eng_sbeats = Signal(4)
+        self.eng_cbeats = Signal(8)
+        self.eng_bias   = Signal(7)
+        self.eng_rshift = Signal(6)
+        self.eng_xsrc   = Signal(24)
+        self.eng_dst    = Signal(24)
+        self.eng_chan   = Signal(5)
+        self.eng_rem    = Signal(5)
+        self.eng_ilv    = Signal()
+        self.eng_supw   = Signal()
+        self.eng_done   = Signal()   # From the engine (pulse).
+        self.absmax     = Signal(32) # From the engine tracker.
+
+        # Vector-unit direct-drive side.
+        self.vec_start = Signal()    # Pulse.
+        self.vec_pc    = Signal(16)
+        self.vec_args  = [Signal(32, name=f"seq_vec_arg{i}") for i in range(8)]
+        self.vec_done  = Signal()    # From the vector unit (pulse).
+        self.vec_res6  = Signal(48)  # Vector unit S6 result (registered at DONE).
+
+        # Scratchpad read (through the engine's fill-port mux).
+        self.sp_adr    = Signal(13)
+        self.sp_dat    = Signal(256)
+        self.sp_active = Signal()
+
+        self.busy = Signal()
+
+        # # #
+
+        dptr   = Signal(13) # Beat index of the current descriptor.
+        left   = Signal(16)
+        dcount = Signal(16)
+        d0     = Signal(256)
+        d1     = Signal(256)
+
+        def w(beat, i): # Word i of a captured beat.
+            return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
+
+        unit    = Signal(4)
+        argsrc  = Signal(16)
+        self.comb += [
+            unit.eq(w(0, 0)[0:4]),
+            argsrc.eq(w(0, 0)[16:32]),
+        ]
+
+        # Special arg sources (pure bit-length functions, matching the firmware/bitexact).
+        def bitlen(sig):
+            n   = len(sig)
+            res = Signal(7)
+            cases = If(sig[n-1], res.eq(n))
+            for b in range(n - 2, -1, -1):
+                cases = cases.Elif(sig[b], res.eq(b + 1))
+            cases = cases.Else(res.eq(0))
+            self.comb += cases
+            return res
+
+        absmax_bl = bitlen(self.absmax)
+        res6_lo   = Signal(48)
+        self.comb += res6_lo.eq(self.vec_res6)
+        res6_bl   = bitlen(res6_lo)
+
+        k_absmax = Signal(32)
+        rpre_v   = Signal(32)
+        self.comb += [
+            k_absmax.eq(Mux(absmax_bl > 14, absmax_bl - 14, 0)),
+            rpre_v.eq(res6_bl + 5),
+        ]
+
+        for i in range(8):
+            src = Signal(2)
+            imm = Signal(32)
+            self.comb += [
+                src.eq(argsrc[2*i:2*i+2]),
+                imm.eq(w(0, 2 + i) if (2 + i) < 8 else w(1, 2 + i)),
+                Case(src, {
+                    0: self.vec_args[i].eq(imm),
+                    1: self.vec_args[i].eq(k_absmax),
+                    2: self.vec_args[i].eq(rpre_v),
+                    3: self.vec_args[i].eq(self.vec_res6[0:32]),
+                }),
+            ]
+
+        # Engine fields straight from the descriptor.
+        self.comb += [
+            self.eng_kind.eq(w(0, 1)[0:3]),
+            self.eng_ilv.eq(w(0, 1)[8]),
+            self.eng_supw.eq(w(0, 1)[9]),
+            self.eng_rows.eq(w(0, 2)[0:16]),
+            self.eng_rem.eq(w(0, 2)[16:21]),
+            self.eng_cols.eq(w(0, 3)[0:14]),
+            self.eng_wbase.eq(w(0, 4)),
+            self.eng_wlen.eq(w(0, 5)[0:24]),
+            self.eng_sbeats.eq(w(0, 6)[0:4]),
+            self.eng_cbeats.eq(w(0, 6)[8:16]),
+            self.eng_bias.eq(w(0, 7)[0:7]),
+            self.eng_rshift.eq(w(0, 7)[16:22]),
+            self.eng_xsrc.eq(w(1, 8)[0:24]),
+            self.eng_dst.eq(w(1, 9)[0:24]),
+            self.eng_chan.eq(w(1, 10)[0:5]),
+            self.vec_pc.eq(w(0, 1)[0:16]),
+        ]
+
+        self.comb += [
+            self.status.fields.busy.eq(self.busy),
+            self.status.fields.dcount.eq(dcount),
+        ]
+
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            If(self.start.re & self.start.storage,
+                NextValue(dptr, self.base.storage[5:]),
+                NextValue(left, self.count.storage),
+                NextValue(dcount, 0),
+                NextState("FETCH0"),
+            )
+        )
+        fsm.act("FETCH0",
+            self.busy.eq(1),
+            self.sp_active.eq(1),
+            self.sp_adr.eq(dptr),
+            If(left == 0,
+                NextState("IDLE"),
+            ).Else(
+                NextState("FETCH0_L"),
+            )
+        )
+        fsm.act("FETCH0_L", # dat valid this cycle (address held from FETCH0's registered mux path).
+            self.busy.eq(1),
+            self.sp_active.eq(1),
+            self.sp_adr.eq(dptr), # Hold.
+            NextValue(d0, self.sp_dat),
+            NextState("FETCH1"),
+        )
+        fsm.act("FETCH1",
+            self.busy.eq(1),
+            self.sp_active.eq(1),
+            self.sp_adr.eq(dptr + 1),
+            NextState("FETCH1_L"),
+        )
+        fsm.act("FETCH1_L",
+            self.busy.eq(1),
+            self.sp_active.eq(1),
+            self.sp_adr.eq(dptr + 1), # Hold.
+            NextValue(d1, self.sp_dat),
+            NextState("DISPATCH"),
+        )
+        fsm.act("DISPATCH",
+            self.busy.eq(1),
+            If(unit == 0,
+                NextState("IDLE"),
+            ).Elif(unit == 1,
+                self.eng_valid.eq(1),
+                If(self.eng_ready,
+                    NextState("WAIT_ENG"),
+                )
+            ).Elif(unit == 2,
+                self.vec_start.eq(1),
+                NextState("WAIT_VEC"),
+            ).Else(
+                NextState("IDLE"), # Unknown unit: stop (firmware bug guard).
+            )
+        )
+        fsm.act("WAIT_ENG",
+            self.busy.eq(1),
+            If(self.eng_done,
+                NextState("NEXT"),
+            )
+        )
+        fsm.act("WAIT_VEC",
+            self.busy.eq(1),
+            If(self.vec_done,
+                NextState("NEXT"),
+            )
+        )
+        fsm.act("NEXT",
+            self.busy.eq(1),
+            NextValue(dptr, dptr + 2),
+            NextValue(left, left - 1),
+            NextValue(dcount, dcount + 1),
+            NextState("FETCH0"),
+        )

@@ -491,3 +491,157 @@ def test_engine_argmax_tap_and_suppress():
     assert val == exp_val, (val, exp_val)
     assert out["idx"] == exp_idx, (out["idx"], exp_idx)
     assert out["untouched"] == 0
+
+def _desc_engine(**f):
+    w = [0]*16
+    w[0] = 1
+    w[1] = f.get("kind", 0) | (f.get("ilv", 0) << 8) | (f.get("supw", 0) << 9)
+    w[2] = f.get("rows", 0) | (f.get("rem", 0) << 16)
+    w[3] = f.get("cols", 0)
+    w[4] = f.get("wbase", 0)
+    w[5] = f.get("wlen", 0)
+    w[6] = f.get("sbeats", 0) | (f.get("cbeats", 0) << 8)
+    w[7] = f.get("bias", 0) | (f.get("rshift", 0) << 16)
+    w[8] = f.get("xsrc", 0)
+    w[9] = f.get("dst", 0)
+    w[10] = f.get("chan", 0)
+    return b"".join(x.to_bytes(4, "little") for x in w)
+
+def _desc_vec(pc, args, srcs=None):
+    w = [0]*16
+    sel = 0
+    for i, sv in enumerate(srcs or []):
+        sel |= (sv & 3) << (2*i)
+    w[0] = 2 | (sel << 16)
+    w[1] = pc
+    for i, a in enumerate(args):
+        w[2 + i] = a & 0xFFFFFFFF
+    return b"".join(x.to_bytes(4, "little") for x in w)
+
+def _desc_stop():
+    return (0).to_bytes(4, "little")*16
+
+def test_sequencer_mixed_list():
+    # Descriptor list: vec quant8 -> engine ternary matvec -> vec norm_i32 with the k
+    # auto-arg from the engine absmax tracker -> stop. Results must match the individually
+    # computed goldens; numerics are the same as CPU-dispatched ops by construction.
+    from trixium.gateware.vector import BonsaiVectorUnit
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.model import asm as vasm
+
+    n_channels, rows_per_chan, cols, seed = 2, 4, 128, 71
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x16    = rng.integers(-32000, 32000, cols).astype("<i2")
+
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    x8_exp  = np.clip(bx.rne_shift(x16.astype(np.int64), 8), -127, 127)
+    res_exp = bx.matvec_ternary(scales, codes, x8_exp.astype(np.int8), B, R)
+    amax    = int(np.abs(res_exp).max())
+    k_exp   = max(0, amax.bit_length() - 14)
+    nrm_exp = np.clip(res_exp.astype(np.int64) >> k_exp, -32767, 32767)
+
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+
+    words = []
+    offs  = {}
+    for name in ("quant8", "norm_i32"):
+        offs[name] = len(words)
+        words += vasm.assemble(vasm.PROGRAMS[name]())
+
+    # Scratchpad map: x16 @ 0x0, x8 @ 0x1000, matvec out @ 0x2000, norm out @ 0x3000,
+    # descriptors @ 0x6000.
+    rb = layout.row_beats(cols, layout.KIND_TERNARY)
+    descs = (_desc_vec(offs["quant8"], [0x0, 0, 0x1000, cols//16])
+             + _desc_engine(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+                            wlen=rows_per_chan*rb,
+                            sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                            cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                            bias=B, rshift=R, xsrc=0x1000, dst=0x2000)
+             + _desc_vec(offs["norm_i32"], [0x2000, 0, 0x3000, M//16 if M >= 16 else 1, 0],
+                         srcs=[0, 0, 0, 0, 1])  # A4 = k(absmax).
+             + _desc_stop())
+
+    sp = bytearray(64*1024)
+    sp[0:2*cols]              = x16.tobytes()
+    sp[0x6000:0x6000+len(descs)] = descs
+
+    class _SeqDUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+                                                          init=words_from_bytes(bytes(sp)))
+            self.submodules.vu  = BonsaiVectorUnit()
+            self.submodules.seq = BonsaiSequencer()
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                        xbuf_groups=32,
+                                                        vecunit=self.vu, seq=self.seq)
+            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.comb += [
+                self.vu.seq_en.eq(self.seq.busy),
+                self.vu.seq_start.eq(self.seq.vec_start),
+                self.vu.seq_pc.eq(self.seq.vec_pc),
+                self.seq.vec_done.eq(self.vu.done),
+                self.seq.vec_res6.eq(self.vu.res6.status),
+            ]
+            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+            for i, axi in enumerate(axis):
+                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                    init=words_from_bytes(payloads[i]), latency=8)
+                setattr(self.submodules, f"model{i}", model)
+
+    dut = _SeqDUT()
+
+    def driver():
+        # Upload the vec programs.
+        yield dut.vu.prog_adr.storage.eq(0)
+        yield dut.vu.prog_adr.re.eq(1)
+        yield
+        yield dut.vu.prog_adr.re.eq(0)
+        for wd in words:
+            yield dut.vu.prog.storage.eq(wd)
+            yield dut.vu.prog.re.eq(1)
+            yield
+        yield dut.vu.prog.re.eq(0)
+        yield
+        # Kick the sequencer.
+        yield dut.seq.base.storage.eq(0x6000)
+        yield dut.seq.count.storage.eq(4)
+        yield
+        yield dut.seq.start.storage.eq(1)
+        yield dut.seq.start.re.eq(1)
+        yield
+        yield dut.seq.start.re.eq(0)
+        yield
+        for _ in range(100000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("sequencer timeout")
+        yield
+        assert (yield dut.seq.status.fields.dcount) == 3
+        data = bytearray()
+        for wd in range(0x4000//32):
+            v = (yield dut.scratchpad.mem[wd])
+            data += int(v).to_bytes(32, "little")
+        out = {}
+        out["x8"]  = np.frombuffer(bytes(data[0x1000:0x1000+cols]), dtype=np.int8)
+        out["res"] = np.frombuffer(bytes(data[0x2000:0x2000+4*M]), dtype="<i4")
+        out["nrm"] = np.frombuffer(bytes(data[0x3000:0x3000+2*16*max(1, M//16 if M >= 16 else 1)]),
+                                   dtype="<i2")[:M]
+        assert np.array_equal(out["x8"], x8_exp.astype(np.int8)), "quant8 via sequencer"
+        assert np.array_equal(out["res"], res_exp), "matvec via sequencer"
+        assert np.array_equal(out["nrm"], nrm_exp.astype(np.int16)), "norm_i32 auto-k"
+
+    run_simulation(dut, [driver()])

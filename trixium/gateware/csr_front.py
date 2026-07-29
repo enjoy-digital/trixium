@@ -23,7 +23,7 @@ from litex.soc.interconnect.csr import *
 # BonsaiEngineCSR ----------------------------------------------------------------------------------
 
 class BonsaiEngineCSR(LiteXModule):
-    def __init__(self, engine):
+    def __init__(self, engine, seq=None):
         self.kind    = CSRStorage(3,  description="Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
         self.rows    = CSRStorage(16, description="Rows per channel.")
         self.cols    = CSRStorage(14, description="Columns (K).")
@@ -74,8 +74,35 @@ class BonsaiEngineCSR(LiteXModule):
                 self.done_count.status.eq(self.done_count.status + 1),
             ),
         ]
-        # `submit.re` fires on CSR write; latch as cmd.valid until accepted.
+        # `submit.re` fires on CSR write; latch as cmd.valid until accepted. While the
+        # sequencer runs it owns the command interface (firmware never mixes the two).
+        seq_own = Signal()
+        if seq is not None:
+            self.comb += [
+                seq_own.eq(seq.busy),
+                seq.eng_ready.eq(engine.cmd.ready & seq_own),
+                seq.eng_done.eq(engine.done),
+                seq.absmax.eq(engine.absmax),
+            ]
         self.comb += [
+            If(seq_own,
+                engine.cmd.valid.eq(0 if seq is None else seq.eng_valid),
+                engine.cmd.kind.eq(0 if seq is None else seq.eng_kind),
+                engine.cmd.rows.eq(0 if seq is None else seq.eng_rows),
+                engine.cmd.cols.eq(0 if seq is None else seq.eng_cols),
+                engine.cmd.wbase.eq(0 if seq is None else seq.eng_wbase),
+                engine.cmd.wlen.eq(0 if seq is None else seq.eng_wlen),
+                engine.cmd.sbeats.eq(0 if seq is None else seq.eng_sbeats),
+                engine.cmd.cbeats.eq(0 if seq is None else seq.eng_cbeats),
+                engine.cmd.bias.eq(0 if seq is None else seq.eng_bias),
+                engine.cmd.rshift.eq(0 if seq is None else seq.eng_rshift),
+                engine.cmd.xsrc.eq(0 if seq is None else seq.eng_xsrc),
+                engine.cmd.dst.eq(0 if seq is None else seq.eng_dst),
+                engine.cmd.chan.eq(0 if seq is None else seq.eng_chan),
+                engine.cmd.rem.eq(0 if seq is None else seq.eng_rem),
+                engine.cmd.ilv.eq(0 if seq is None else seq.eng_ilv),
+                engine.cmd.supw.eq(0 if seq is None else seq.eng_supw),
+            ).Else(
             engine.cmd.valid.eq(pending | (self.submit.re & self.submit.storage)),
             engine.cmd.kind.eq(self.kind.storage),
             engine.cmd.rows.eq(self.rows.storage),
@@ -92,6 +119,7 @@ class BonsaiEngineCSR(LiteXModule):
             engine.cmd.rem.eq(self.rem.storage),
             engine.cmd.ilv.eq(self.ilv.storage),
             engine.cmd.supw.eq(self.supw.storage),
+            ),
             self.status.fields.busy.eq(engine.busy),
             self.status.fields.error.eq(engine.error),
             self.status.fields.pending.eq(pending),
