@@ -46,6 +46,13 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_AW   SP_Y            // Attention: AXPY partials + reduce/norm scratch (free here).
 #define SP_AWP8 (SP_Y + 0x2000) // Per-head softmax p8-sum spill beats (32 B each).
 #define SP_AWAM (SP_Y + 0x2400) // Per-head reduce-absmax spill beats (32 B each).
+// Dual-Q (n_rep == 2) attention map: scores A at SP_Y, scores B at SP_Y + 8 KB (qstride
+// 0x800 words, bounds ctx at 2048); AXPY partials in SP_YU (A at 0, B at n_ch*hd words);
+// spill tables above them. All regions are dead outside the attention block.
+#define SP_SCB   (SP_Y + 0x2000)
+#define SP_AW2   SP_YU
+#define SP_A2P8  (SP_YU + 0x4000) // Per-head p8-sum spills (32 B each, indexed by head).
+#define SP_A2AM  (SP_YU + 0x4800) // Per-head absmax spills.
 #define SP_Q    0x38000 // Resident q int16 (q_dim <= 4096: 8 KB).
 #define SP_K    0x3A000 // Resident k int16 (kv_dim <= 1024: 2 KB).
 #define SP_V    0x3B000 // Resident v int16.
@@ -736,6 +743,101 @@ static void seq_build_attn(void)
                      (uint16_t)(SEQ_SRC_KRES6 << 8)); // A4 = k(res6).
     }
 }
+
+// Dual-Q (S3) attention lists, two phases per layer. Phase 1 per kv-head: quant8 both
+// sibling Q-heads -> one dual-Q scores op over the shared K stream -> softmax8 + spill
+// per head. The CPU then reads the p8-sum spills, computes each head's Rpre and patches
+// the AXPY descriptors. Phase 2 per kv-head: one dual-Q AXPY over the shared V stream ->
+// per head: reduce chain -> spill(absmax) -> norm_i32 (k from res6). Requires n_rep == 2
+// and n_ch >= 2; other configs use the v1 list or CPU dispatch.
+static int seq_at2_base, seq_at2_p1n, seq_at2_p2n, seq_at2_kvchunk;
+static int seq_at2_p1dn, seq_at2_p2dn;
+static void seq_build_attn2(void)
+{
+    seq_at2_kvchunk = 0;
+    if (n_ch < 2 || n_head != 2*n_kv_head)
+        return;
+    int p1dn = 7;            // q8A q8B scores smA spA smB spB.
+    int p2dn = 2*n_ch + 3;   // axpy redA* spA normA redB* spB normB.
+    int cap  = (192 - seq_qkr_count)/(p1dn + p2dn);
+    if (cap <= 0)
+        return;
+    int chunk = (cap < n_kv_head) ? cap : n_kv_head;
+    int lg = 0;
+    while ((1 << lg) < head_dim) lg++;
+    int Ceff = (lg & 1) ? 523 : 739;
+    seq_at2_base    = seq_qkr_count;
+    seq_at2_p1dn    = p1dn;
+    seq_at2_p2dn    = p2dn;
+    seq_at2_p1n     = chunk*p1dn;
+    seq_at2_p2n     = chunk*p2dn;
+    seq_at2_kvchunk = chunk;
+    uint32_t qs2 = (uint32_t)n_ch*head_dim; // AXPY head-B partial offset (words).
+    for (int j = 0; j < chunk; j++) {
+        int hA = 2*j, hB = 2*j + 1;
+        uint32_t d1 = (uint32_t)seq_at2_base + (uint32_t)j*p1dn;
+        int32_t qa[4] = {(int32_t)(SP_Q + (uint32_t)hA*head_dim*2), 0,
+                         (int32_t)SP_X, head_dim/16};
+        seq_desc_vec(d1 + 0, PROG_QUANT8, qa, 4, 0);
+        int32_t qb[4] = {(int32_t)(SP_Q + (uint32_t)hB*head_dim*2), 0,
+                         (int32_t)(SP_X + head_dim), head_dim/16};
+        seq_desc_vec(d1 + 1, PROG_QUANT8, qb, 4, 0);
+        struct engine_op sc = {0};
+        sc.kind    = ENGINE_KIND_Q8;
+        sc.ilv     = 1;
+        sc.cols    = head_dim;
+        sc.sbeats  = 1;
+        sc.cbeats  = head_dim/32;
+        sc.xsrc    = SP_X;
+        sc.dst     = SP_Y;
+        sc.qn      = 1;
+        sc.qstride = 0x800;
+        seq_desc_engine(d1 + 2, &sc);
+        int32_t sa[6] = {(int32_t)SP_Y, Ceff, (int32_t)SP_X, 0, -11, 0};
+        seq_desc_vec(d1 + 3, PROG_SOFTMAX8, sa, 6, 0);
+        int32_t pa = (int32_t)(SP_A2P8 + (uint32_t)hA*32);
+        seq_desc_vec(d1 + 4, PROG_SPILL, &pa, 1, 0);
+        int32_t sb[6] = {(int32_t)SP_SCB, Ceff, 0, 0, -11, 0}; // A2 (p8B dst) per token.
+        seq_desc_vec(d1 + 5, PROG_SOFTMAX8, sb, 6, 0);
+        int32_t pb = (int32_t)(SP_A2P8 + (uint32_t)hB*32);
+        seq_desc_vec(d1 + 6, PROG_SPILL, &pb, 1, 0);
+
+        uint32_t d2 = (uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n + (uint32_t)j*p2dn;
+        struct engine_op wv = {0};
+        wv.kind    = ENGINE_KIND_AXPY;
+        wv.cols    = head_dim;
+        wv.sbeats  = 1;
+        wv.cbeats  = head_dim/32;
+        wv.xsrc    = SP_X;
+        wv.dst     = SP_AW2;
+        wv.qn      = 1;
+        wv.qstride = (uint16_t)qs2;
+        seq_desc_engine(d2 + 0, &wv);
+        for (int c = 1; c < n_ch; c++) {
+            int32_t ra[4] = {(int32_t)SP_AW2, (int32_t)(SP_AW2 + (uint32_t)c*head_dim*4),
+                             (int32_t)SP_AW2, head_dim/8};
+            seq_desc_vec(d2 + c, PROG_REDUCE_ACC, ra, 4, 0);
+        }
+        int32_t ma = (int32_t)(SP_A2AM + (uint32_t)hA*32);
+        seq_desc_vec(d2 + n_ch, PROG_SPILL, &ma, 1, 0);
+        int32_t na[5] = {(int32_t)SP_AW2, 0, (int32_t)(SP_H + (uint32_t)hA*head_dim*2),
+                         head_dim/16, 0};
+        seq_desc_vec(d2 + n_ch + 1, PROG_NORM_I32, na, 5,
+                     (uint16_t)(SEQ_SRC_KRES6 << 8));
+        uint32_t b2 = SP_AW2 + 4*qs2;
+        for (int c = 1; c < n_ch; c++) {
+            int32_t rb2[4] = {(int32_t)b2, (int32_t)(b2 + (uint32_t)c*head_dim*4),
+                              (int32_t)b2, head_dim/8};
+            seq_desc_vec(d2 + n_ch + 1 + c, PROG_REDUCE_ACC, rb2, 4, 0);
+        }
+        int32_t mb = (int32_t)(SP_A2AM + (uint32_t)hB*32);
+        seq_desc_vec(d2 + 2*n_ch + 1, PROG_SPILL, &mb, 1, 0);
+        int32_t nb[5] = {(int32_t)b2, 0, (int32_t)(SP_H + (uint32_t)hB*head_dim*2),
+                         head_dim/16, 0};
+        seq_desc_vec(d2 + 2*n_ch + 2, PROG_NORM_I32, nb, 5,
+                     (uint16_t)(SEQ_SRC_KRES6 << 8));
+    }
+}
 #endif
 
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
@@ -913,6 +1015,103 @@ attn_scores: ;
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
+        if (attn_hw && seq_at2_kvchunk > 0
+            && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
+            // S3 dual-Q path: one K stream scores both sibling heads, one V stream feeds
+            // both AXPYs - halves the KV restream of GQA. Two list runs per layer with a
+            // CPU Rpre patch between them; numerics identical to the single-head chain.
+            perf_enter(OP_SCORES);
+            int cnt  = pos + 1;
+            int padn = (16 - (cnt & 15)) & 15;
+            volatile int32_t *scA = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
+            volatile int32_t *scB = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SCB);
+            for (int i2 = 0; i2 < padn; i2++) {
+                scA[cnt + i2] = (int32_t)0x80000000;
+                scB[cnt + i2] = (int32_t)0x80000000;
+            }
+            uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
+            uint32_t wlen  = rows*kv_rb;
+            uint32_t rowsw = rows | (rem << 16);
+            int lg = 0;
+            while ((1 << lg) < head_dim) lg++;
+            uint32_t blocks = (uint32_t)(cnt + padn)/16;
+            uint32_t p8pad  = ((uint32_t)cnt + 31) & ~31u; // 32B-padded p8 vector size.
+            for (int k0 = 0; k0 < n_kv_head; k0 += seq_at2_kvchunk) {
+                int nk = n_kv_head - k0;
+                if (nk > seq_at2_kvchunk) nk = seq_at2_kvchunk;
+                for (int j = 0; j < nk; j++) {
+                    int kvh = k0 + j, hA = 2*kvh, hB = hA + 1;
+                    uint32_t d1 = (uint32_t)seq_at2_base + (uint32_t)j*seq_at2_p1dn;
+                    int Bk, Rk;
+                    kv_scores_br(l, kvh, 0, &Bk, &Rk);
+                    int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
+                    seq_patch(d1 + 0, 2, SP_Q + (uint32_t)hA*head_dim*2);
+                    seq_patch(d1 + 1, 2, SP_Q + (uint32_t)hB*head_dim*2);
+                    seq_patch(d1 + 2, 2, rowsw);
+                    seq_patch(d1 + 2, 4, kv_region_addr(l, kvh, 0));
+                    seq_patch(d1 + 2, 5, wlen);
+                    seq_patch(d1 + 2, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
+                    // p8 pool: per-kv-head buffers in the FFN scratch (dead here) so
+                    // phase 2's AXPYs still see them after later heads' softmaxes ran.
+                    uint32_t pbase = SP_G + (uint32_t)kvh*2*p8pad;
+                    seq_patch(d1 + 3, 4, pbase);
+                    seq_patch(d1 + 3, 5, blocks);
+                    seq_patch(d1 + 3, 7, (uint32_t)(sigma + 6 + 11));
+                    seq_patch(d1 + 4, 2, SP_A2P8 + (uint32_t)hA*32);
+                    seq_patch(d1 + 5, 4, pbase + p8pad);
+                    seq_patch(d1 + 5, 5, blocks);
+                    seq_patch(d1 + 5, 7, (uint32_t)(sigma + 6 + 11));
+                    seq_patch(d1 + 6, 2, SP_A2P8 + (uint32_t)hB*32);
+                }
+                seq_run((uint32_t)seq_at2_base, (uint32_t)nk*seq_at2_p1dn);
+                for (int j = 0; j < nk; j++) {
+                    int kvh = k0 + j, hA = 2*kvh, hB = hA + 1;
+                    uint32_t d2 = (uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n
+                                  + (uint32_t)j*seq_at2_p2dn;
+                    uint32_t P8a = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
+                                                          + (uint32_t)hA*32);
+                    uint32_t P8b = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
+                                                          + (uint32_t)hB*32);
+                    int Bv, Rd;
+                    kv_scores_br(l, kvh, 1, &Bv, &Rd);
+                    uint32_t Ra = (uint32_t)axpy_rpre_c(P8a ? P8a : 1);
+                    uint32_t Rb = (uint32_t)axpy_rpre_c(P8b ? P8b : 1);
+                    seq_patch(d2 + 0, 2, rowsw);
+                    seq_patch(d2 + 0, 4, kv_region_addr(l, kvh, 1));
+                    seq_patch(d2 + 0, 5, wlen);
+                    seq_patch(d2 + 0, 7, (uint32_t)Bv | (Ra << 16) | (Rb << 22));
+                    seq_patch(d2 + 0, 8, SP_G + (uint32_t)kvh*2*p8pad);
+                    seq_patch(d2 + n_ch, 2, SP_A2AM + (uint32_t)hA*32);
+                    seq_patch(d2 + n_ch + 1, 4, SP_H + (uint32_t)hA*head_dim*2);
+                    seq_patch(d2 + 2*n_ch + 1, 2, SP_A2AM + (uint32_t)hB*32);
+                    seq_patch(d2 + 2*n_ch + 2, 4, SP_H + (uint32_t)hB*head_dim*2);
+                    (void)Rd;
+                }
+                seq_run((uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n,
+                        (uint32_t)nk*seq_at2_p2dn);
+            }
+            perf_exit(OP_SCORES);
+            perf_enter(OP_WV);
+            for (int hh = 0; hh < n_head; hh++) {
+                int kvh = hh/n_rep;
+                uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
+                                                     + (uint32_t)hh*32);
+                uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2AM
+                                                     + (uint32_t)hh*32);
+                int Bv, Rd;
+                kv_scores_br(l, kvh, 1, &Bv, &Rd);
+                int Rpre = axpy_rpre_c(P8 ? P8 : 1);
+                int k2 = 0;
+                while ((am >> k2) > 16383u) k2++;
+                float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), Rpre - Bv + k2);
+                aw_c[hh] = c2;
+                float hm2 = (float)(am >> k2)*c2;
+                if (hm2 > aw_hmax) aw_hmax = hm2;
+                (void)Rd;
+            }
+            perf_exit(OP_WV);
+            goto attn_heads_done;
+        }
         if (attn_hw && seq_attn_heads > 0
             && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
             // Whole-head-loop descriptor lists: ~6 dispatch/poll round-trips per head
@@ -1432,6 +1631,7 @@ int infer_init(void)
 #ifdef CSR_SEQ_BASE
     seq_build_qkr();
     seq_build_attn();
+    seq_build_attn2();
 #endif
 #endif
     k_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);

@@ -33,6 +33,11 @@ void engine_run(const struct engine_op *op)
     engine_csr_rem_write(op->rem);
     engine_csr_ilv_write(op->ilv);
     engine_csr_supw_write(op->supw);
+#ifdef CSR_ENGINE_CSR_QN_ADDR
+    engine_csr_qn_write(op->qn);
+    engine_csr_qstride_write(op->qstride);
+    engine_csr_rshift2_write(op->rshift2);
+#endif
     engine_csr_submit_write(1);
 
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of

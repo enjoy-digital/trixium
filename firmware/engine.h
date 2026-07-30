@@ -31,6 +31,9 @@ struct engine_op {
     uint8_t  bias;
     uint8_t  rshift;
     uint8_t  rshift_rpre; // Sequencer only: rshift = bitlen(prev vec res6) + 5 (AXPY Rpre).
+    uint8_t  qn;          // Dual-Q GQA mode: one K/V stream serves 2 sibling Q-heads.
+    uint16_t qstride;     // Head-B result offset in words.
+    uint8_t  rshift2;     // Head-B AXPY pre-shift.
     uint32_t xsrc;      // Scratchpad byte address of x8.
     uint32_t dst;       // Scratchpad byte address for results.
     uint8_t  chan;      // Fetch source channel.
