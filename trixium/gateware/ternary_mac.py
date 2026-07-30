@@ -557,17 +557,22 @@ class BonsaiChannelPipe(LiteXModule):
             If(self.start,
                 acc.eq(0),
                 acc2.eq(0),
-                pendb_v.eq(0),
             ).Elif(v4,
                 acc.eq(Mux(rlast4, 0, acc_new)),
                 acc2.eq(Mux(rlast4, 0, acc2_new)),
-                If(rlast4 & self.qn
+            ),
+            # Head-B staging: set on row-last (priority), clear only when the push is
+            # accepted. A clear gated behind the v4 branch re-pushes every dense-stream
+            # cycle (v4 high back-to-back) and overshoots result_cnt - the op never
+            # terminates. Migen tests missed it: reader-latency bubbles masked the race.
+            If(self.start,
+                pendb_v.eq(0),
+            ).Elif(v4 & rlast4 & self.qn
                    & ((self.kind == KIND_OP_Q8) | (self.kind == KIND_OP_TERNARY)),
-                    pendb_v.eq(1),
-                    pendb_row.eq(row4),
-                    pendb_dat.eq(result2[:32]),
-                )
-            ).Elif(pendb_v,
+                pendb_v.eq(1),
+                pendb_row.eq(row4),
+                pendb_dat.eq(result2[:32]),
+            ).Elif(pendb_v & out_fifo.sink.ready,
                 pendb_v.eq(0),
             ),
             If(self.start,

@@ -113,7 +113,8 @@ def test_matvec_ternary_dual_x():
     # vectors word-interleaved in the x-buffer via its second read port). Chan-major dsts,
     # head B at dst + 4*qstride; bit-exact vs two independent references.
     cols, seed = 256, 91
-    for n_channels, rows_per_chan in [(2, 4), (4, 3)]:
+    for (n_channels, rows_per_chan), lat in [((2, 4), 8), ((4, 3), 8),
+                                             ((2, 4), 2), ((4, 6), 2)]:
         rng    = np.random.default_rng(seed + n_channels)
         M      = n_channels*rows_per_chan
         G      = cols//layout.GROUP_TERNARY
@@ -135,7 +136,7 @@ def test_matvec_ternary_dual_x():
 
         qstride = 64
         dut = _EngineDUT(n_channels, payloads, words_from_bytes(xa.tobytes() + xb.tobytes()),
-                         8, 0)
+                         lat, 0)
         cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                    wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                    sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
@@ -439,7 +440,8 @@ def test_matvec_q8_dual_head():
     # contiguously (head B at xsrc + cols); results land position-major per head, head B
     # offset by qstride words. Bit-exact vs two independent matvec_q8 references.
     cols, seed = 128, 57
-    for n_channels, T in [(2, 5), (2, 8), (4, 3), (4, 9)]:
+    for (n_channels, T), lat in [((2, 5), 8), ((2, 8), 8), ((4, 3), 8), ((4, 9), 8),
+                                 ((2, 8), 2), ((4, 9), 2)]:
         rng    = np.random.default_rng(seed + 16*n_channels + T)
         scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
         q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
@@ -466,7 +468,7 @@ def test_matvec_q8_dual_head():
 
         qstride = 64 # Head-B result offset in words.
         x_init  = xa.tobytes() + xb.tobytes()
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), lat, 0)
         rb  = layout.row_beats(cols, layout.KIND_Q8)
         cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                    sbeats=layout.scale_beats(cols, layout.KIND_Q8),
