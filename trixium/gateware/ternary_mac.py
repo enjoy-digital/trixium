@@ -108,15 +108,24 @@ class BonsaiChannelPipe(LiteXModule):
         out_fifo_room   = Signal() # Driven at the FIFO hookup below (beat-intake flow control).
 
         # x-buffer: 1024-bit words, one per ternary group (4 q8 groups). --------------------------
-        xbuf = Memory(1024, xbuf_groups)
-        self.specials += xbuf
+        # Dual-Q ternary needs a second read port (head B's word). Vivado will NOT infer
+        # a 1W+2R RAM with byte-granular writes from the emitted Verilog ("Unsupported
+        # RAM template" - the memory dissolves into FFs + read muxes and the LUT budget
+        # explodes, 519k/440k at N=16). Standard idiom instead: two 1W+1R copies with
+        # mirrored writes, one per read port.
+        xbuf  = Memory(1024, xbuf_groups)
+        xbufb = Memory(1024, xbuf_groups)
+        self.specials += xbuf, xbufb
         xbuf_w  = xbuf.get_port(write_capable=True, we_granularity=256)
         xbuf_r  = xbuf.get_port()
-        # Second read port for dual-Q ternary (head B's word): the x-buffer is distributed
-        # RAM (1024b wide), where extra read ports are native - the no-new-port rule guards
-        # the BRAM scratchpad, not this.
-        xbuf_r2 = xbuf.get_port()
-        self.specials += xbuf_w, xbuf_r, xbuf_r2
+        xbufb_w = xbufb.get_port(write_capable=True, we_granularity=256)
+        xbuf_r2 = xbufb.get_port()
+        self.specials += xbuf_w, xbuf_r, xbufb_w, xbuf_r2
+        self.comb += [
+            xbufb_w.adr.eq(xbuf_w.adr),
+            xbufb_w.dat_w.eq(xbuf_w.dat_w),
+            xbufb_w.we.eq(xbuf_w.we),
+        ]
         self.comb += [
             xbuf_w.adr.eq(self.xw_group),
             xbuf_w.dat_w.eq(Replicate(self.xw_data, 4)),
