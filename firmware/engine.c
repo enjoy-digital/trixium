@@ -5,7 +5,10 @@
 //
 // Engine CSR driver: program one op, submit, poll completion.
 
+#include <stdio.h>
+
 #include <generated/csr.h>
+#include <generated/soc.h>
 
 #include "engine.h"
 #include "perf.h"
@@ -32,7 +35,24 @@ void engine_run(const struct engine_op *op)
     engine_csr_supw_write(op->supw);
     engine_csr_submit_write(1);
 
-    while (engine_csr_done_count_read() == done);
+    // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
+    // hanging the boot silently.
+    uint32_t spins = 0;
+    while (engine_csr_done_count_read() == done) {
+        if (++spins == 200000u) {
+            printf("ENGSTALL st=%02lx seq=%02lx", (unsigned long)engine_csr_status_read(),
+                   (unsigned long)seq_status_read());
+            for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
+                engine_csr_perf_chan_write(c);
+                printf(" ch%d beats=%08lx ar=%08lx r=%08lx", c,
+                       (unsigned long)engine_csr_perf_beats_read(),
+                       (unsigned long)engine_csr_perf_ar_read(),
+                       (unsigned long)engine_csr_perf_r_read());
+            }
+            printf("\n");
+            spins = 0;
+        }
+    }
     perf_exit(OP_ENGINE_WAIT);
 }
 

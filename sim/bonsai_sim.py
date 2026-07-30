@@ -171,7 +171,7 @@ def main():
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
-    builder.build(sim_config=sim_config, run=args.run,
+    builder.build(sim_config=sim_config, run=args.run, opt_level="O3",
         threads=args.threads, trace=args.trace, trace_fst=args.trace)
 
 if __name__ == "__main__":

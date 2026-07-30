@@ -276,7 +276,9 @@ static void selftest(void)
 
     // 1. Ternary matvec on blk.0.attn_q with the deterministic x pattern.
     uint32_t xsrc = 0, dst = 0x8000;
+    puts("ST:fill");
     fill_x_pattern(xsrc, e->cols);
+    puts("ST:mv");
     model_matvec(e, xsrc, dst);
     uint32_t n = e->rows*4; // rows int32 results (all channels).
     uint32_t csum = fnv1a((volatile uint8_t *)(SCRATCHPAD_BASE + dst), n);
@@ -405,14 +407,14 @@ int main(void)
         static const int prompt[3] = {1, 2, 3};
         printf("GEN:");
         perf_reset();
-        infer_generate(prompt, 3, 4, emit_token);
+        infer_generate(prompt, 3, 2, emit_token);
         puts("\nGEN DONE");
         perf_print();
         if (hw_caps()) {
             hwops_set_all(1);
             printf("GEN-HW:");
             perf_reset();
-            infer_generate(prompt, 3, 4, emit_token);
+            infer_generate(prompt, 3, 2, emit_token);
             puts("\nGEN-HW DONE");
             perf_print();
             hwops_set_all(0);
