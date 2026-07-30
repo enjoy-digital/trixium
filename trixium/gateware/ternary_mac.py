@@ -73,7 +73,7 @@ KIND_OP_Q8      = 1
 KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre).
 
 class BonsaiChannelPipe(LiteXModule):
-    def __init__(self, xbuf_groups=96, out_fifo_depth=8, chan_id=0, n_channels=1):
+    def __init__(self, xbuf_groups=96, out_fifo_depth=16, chan_id=0, n_channels=1):
         # Op parameters (quasi-static while busy).
         self.kind        = Signal(2)
         self.rows        = Signal(16)
@@ -100,6 +100,7 @@ class BonsaiChannelPipe(LiteXModule):
         # # #
 
         out_fifo_rdy_ax = Signal() # Driven at the FIFO hookup below (drain flow control).
+        out_fifo_room   = Signal() # Driven at the FIFO hookup below (beat-intake flow control).
 
         # x-buffer: 1024-bit words, one per ternary group (4 q8 groups). --------------------------
         xbuf = Memory(1024, xbuf_groups)
@@ -128,7 +129,11 @@ class BonsaiChannelPipe(LiteXModule):
 
         accept = Signal()
         self.comb += [
-            self.sink.ready.eq(1),
+            # Beat intake throttles on result-FIFO headroom: at N channels the aggregate
+            # result rate (N/row_beats per cycle) can exceed the 1/cycle gather drain
+            # (first bites at N=4 ternary, 3 beats/row) - without this the FIFO drops
+            # results and the op never completes.
+            self.sink.ready.eq(out_fifo_room),
             accept.eq(self.sink.valid & self.sink.ready),
         ]
 
@@ -437,7 +442,9 @@ class BonsaiChannelPipe(LiteXModule):
             ),
             If(self.start,
                 self.overflow.eq(0),
-            ).Elif(out_fifo.sink.valid & ~out_fifo.sink.ready,
+            ).Elif(out_fifo.sink.valid & ~out_fifo.sink.ready & (self.kind != KIND_OP_AXPY),
+                # Matvec pushes don't wait: valid & !ready here is a dropped result. The
+                # AXPY drain FSM holds valid until accepted - backpressure, not a drop.
                 self.overflow.eq(1),
             ),
         ]
@@ -452,5 +459,8 @@ class BonsaiChannelPipe(LiteXModule):
                 out_fifo.sink.data.eq(result[:32]),
             ),
             out_fifo_rdy_ax.eq(out_fifo.sink.ready),
+            # 4 slots of slack cover results already in flight (T+0..T+3 stages, rows are
+            # >= 2 beats so at most 3 row-lasts can be inside the pipeline when intake stops).
+            out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 4)),
             out_fifo.source.connect(self.source),
         ]

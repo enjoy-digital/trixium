@@ -101,6 +101,13 @@ def test_matvec_ternary_n2():
 def test_matvec_ternary_n4():
     _case_ternary(n_channels=4, rows_per_chan=4, cols=256, latency=8, stall_rate=3, seed=7)
 
+def test_matvec_ternary_n4_gather_pressure():
+    # 4 channels x 2-beat rows demand 2 results/cycle against the 1/cycle gather drain:
+    # pipes must throttle beat intake on result-FIFO headroom instead of dropping results
+    # (pre-backpressure this overflowed out_fifo and the op never completed - the n4 SoC
+    # boot hang of 2026-07-30).
+    _case_ternary(n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=9)
+
 def test_matvec_ternary_multi_scaleword():
     # cols=4096: 32 groups -> 2 scale beats/row, exercises scale-word switching + row parity.
     _case_ternary(n_channels=2, rows_per_chan=2, cols=4096, latency=16, stall_rate=5, seed=3)

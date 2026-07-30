@@ -97,7 +97,9 @@ class BonsaiMatVecEngine(LiteXModule):
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
                 pipe.sink.valid.eq(reader.source.valid & ~is_fetch),
                 pipe.sink.data.eq(reader.source.data),
-                reader.source.ready.eq(1), # Pipe always accepts; fetch path always accepts.
+                # Fetch path always accepts; compute beats honor the pipe's result-FIFO
+                # backpressure (drops results past N=2 otherwise - N/row_beats > 1 gather/cycle).
+                reader.source.ready.eq(is_fetch | pipe.sink.ready),
             ]
             fetch_valids.append(reader.source.valid & is_fetch)
             fetch_datas.append(reader.source.data)
@@ -131,7 +133,9 @@ class BonsaiMatVecEngine(LiteXModule):
                 pipe.bias.eq(cmd_r["bias"]),
                 pipe.rshift.eq(cmd_r["rshift"]),
             ]
-        self.comb += self.error.eq(reduce_or([p.error for p in self.pipes]))
+        # Overflow is included so any future rate mismatch fails loud (sticky error bit)
+        # instead of dropping results and hanging the op.
+        self.comb += self.error.eq(reduce_or([p.error | p.overflow for p in self.pipes]))
 
         # x-fill ------------------------------------------------------------------------------
         fill_beat  = Signal(10) # Beat index within x fill (cols/32 <= 384).
