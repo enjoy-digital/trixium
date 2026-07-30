@@ -114,6 +114,7 @@ class BonsaiSimSoC(SoCCore):
             self.vecunit.seq_pc.eq(self.seq.vec_pc),
             self.seq.vec_done.eq(self.vecunit.done),
             self.seq.vec_res6.eq(self.vecunit.res6.status),
+            self.vecunit.seq_seed7.eq(self.seq.vec_res6), # res6 chaining (S7 seed).
         ]
         self.comb += [self.vecunit.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
         self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit,

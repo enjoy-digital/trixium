@@ -141,6 +141,7 @@ class BonsaiSoC(SoCCore):
                     vecunit.seq_pc.eq(seq.vec_pc),
                     seq.vec_done.eq(vecunit.done),
                     seq.vec_res6.eq(vecunit.res6.status),
+                    vecunit.seq_seed7.eq(seq.vec_res6), # res6 chaining (S7 seed).
                 ]
                 self.comb += [vecunit.seq_args[i].eq(seq.vec_args[i]) for i in range(8)]
                 self.add_constant("BONSAI_HAS_SEQ")

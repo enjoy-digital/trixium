@@ -507,7 +507,8 @@ def test_engine_argmax_tap_and_suppress():
 def _desc_engine(**f):
     w = [0]*16
     w[0] = 1
-    w[1] = f.get("kind", 0) | (f.get("ilv", 0) << 8) | (f.get("supw", 0) << 9)
+    w[1] = (f.get("kind", 0) | (f.get("ilv", 0) << 8) | (f.get("supw", 0) << 9)
+            | (f.get("rshift_rpre", 0) << 10))
     w[2] = f.get("rows", 0) | (f.get("rem", 0) << 16)
     w[3] = f.get("cols", 0)
     w[4] = f.get("wbase", 0)
@@ -532,6 +533,152 @@ def _desc_vec(pc, args, srcs=None):
 
 def _desc_stop():
     return (0).to_bytes(4, "little")*16
+
+def test_sequencer_v2_chaining():
+    # Sequencer v2 primitives in one list, the way seq_build_attn will use them:
+    #   reduce_acc (res6 = absmax) -> spill (S7 seeded with prev res6, persisted to SP,
+    #   res6 preserved) -> norm_i32 with k from src=3 (k(res6)) -> reduce_acc over a
+    #   crafted buffer (res6 = sum p8, standing in for softmax8's S6) -> engine AXPY with
+    #   rshift_rpre=1 (rshift = bitlen(res6)+5 from the sequencer, w7 rshift left 0).
+    from trixium.gateware.vector import BonsaiVectorUnit
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.model import asm as vasm
+
+    n_channels, cols, T, seed = 2, 64, 5, 83
+    rng = np.random.default_rng(seed)
+
+    # reduce_acc data: 16 int32 acc + src, absmax sets the norm k.
+    acc = rng.integers(-(1 << 30), 1 << 30, 16).astype("<i4")
+    src = rng.integers(-(1 << 30), 1 << 30, 16).astype("<i4")
+    summed = acc.astype(np.int64) + src.astype(np.int64)
+    K1     = int(np.abs(summed).max())
+    k_exp  = max(0, K1.bit_length() - 14)
+    nrm_exp = np.clip(summed >> k_exp, -32767, 32767).astype(np.int16)
+
+    # AXPY data (test_engine_axpy shape): res6 for rpre comes from a reduce over [S, 0..].
+    ev  = rng.integers(-9, -4, T)
+    scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+    v8  = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+    p8  = rng.integers(1, 128, T, dtype=np.int8)
+    S   = int(p8.astype(np.int64).sum())
+    _, e16 = bx.fp16_decompose(scales)
+    B_ax = 12 - int(e16.max())
+    Rpre = bx.axpy_rpre(S)
+    assert Rpre == S.bit_length() + 5  # The sequencer computes bitlen(res6) + 5.
+
+    rows, rem = T//n_channels, T % n_channels
+    payloads, axpy_exp = [], []
+    for c in range(n_channels):
+        pos = [t for t in range(T) if t % n_channels == c]
+        if pos:
+            spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                len(pos), cols, scales=scales[pos], values=v8[pos])
+            payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+            axpy_exp.append(bx.axpy_rows(scales[pos], v8[pos], p8[pos], B_ax, Rpre))
+        else:
+            payloads.append(b"")
+            axpy_exp.append(np.zeros(cols, dtype=np.int32))
+    maxlen   = max(len(p) for p in payloads)
+    payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+    axpy_exp = np.concatenate(axpy_exp)
+
+    words = []
+    offs  = {}
+    for name in ("reduce_acc", "norm_i32", "spill"):
+        offs[name] = len(words)
+        words += vasm.assemble(vasm.PROGRAMS[name]())
+
+    # SP map: acc 0x0, src 0x100, B2 [S,0..] 0x180, zeros 0x1C0, p8 0x200,
+    # norm out 0x3000, spill out 0x3800, axpy out 0x4000, descriptors 0x6000.
+    b2 = np.zeros(8, dtype="<i4"); b2[0] = S
+    rb = layout.row_beats(cols, layout.KIND_Q8)
+    descs = (_desc_vec(offs["reduce_acc"], [0x0, 0x100, 0x0, 2])
+             + _desc_vec(offs["spill"], [0x3800])
+             + _desc_vec(offs["norm_i32"], [0x0, 0, 0x3000, 1, 0],
+                         srcs=[0, 0, 0, 0, 3])  # A4 = k(res6).
+             + _desc_vec(offs["reduce_acc"], [0x180, 0x1C0, 0x180, 1])
+             + _desc_engine(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                            sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                            cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                            bias=B_ax, rshift=0, rshift_rpre=1, rem=rem,
+                            xsrc=0x200, dst=0x4000)
+             + _desc_stop())
+
+    sp = bytearray(64*1024)
+    sp[0x0:0x0+64]      = acc.tobytes()
+    sp[0x100:0x100+64]  = src.tobytes()
+    sp[0x180:0x180+32]  = b2.tobytes()
+    sp[0x200:0x200+T]   = p8.tobytes()
+    sp[0x6000:0x6000+len(descs)] = descs
+
+    class _SeqDUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+                                                          init=words_from_bytes(bytes(sp)))
+            self.submodules.vu  = BonsaiVectorUnit()
+            self.submodules.seq = BonsaiSequencer()
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                        xbuf_groups=32,
+                                                        vecunit=self.vu, seq=self.seq)
+            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.comb += [
+                self.vu.seq_en.eq(self.seq.busy),
+                self.vu.seq_start.eq(self.seq.vec_start),
+                self.vu.seq_pc.eq(self.seq.vec_pc),
+                self.seq.vec_done.eq(self.vu.done),
+                self.seq.vec_res6.eq(self.vu.res6.status),
+                self.vu.seq_seed7.eq(self.seq.vec_res6), # res6 chaining (S7 seed).
+            ]
+            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+            for i, axi in enumerate(axis):
+                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                    init=words_from_bytes(payloads[i]), latency=8)
+                setattr(self.submodules, f"model{i}", model)
+
+    dut = _SeqDUT()
+
+    def driver():
+        yield dut.vu.prog_adr.storage.eq(0)
+        yield dut.vu.prog_adr.re.eq(1)
+        yield
+        yield dut.vu.prog_adr.re.eq(0)
+        for wd in words:
+            yield dut.vu.prog.storage.eq(wd)
+            yield dut.vu.prog.re.eq(1)
+            yield
+        yield dut.vu.prog.re.eq(0)
+        yield
+        yield dut.seq.base.storage.eq(0x6000)
+        yield dut.seq.count.storage.eq(6)
+        yield
+        yield dut.seq.start.storage.eq(1)
+        yield dut.seq.start.re.eq(1)
+        yield
+        yield dut.seq.start.re.eq(0)
+        yield
+        for _ in range(100000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("sequencer timeout")
+        yield
+        assert (yield dut.seq.status.fields.dcount) == 5
+        data = bytearray()
+        for wd in range(0x5000//32):
+            v = (yield dut.scratchpad.mem[wd])
+            data += int(v).to_bytes(32, "little")
+        spill = np.frombuffer(bytes(data[0x3800:0x3800+32]), dtype="<u4")
+        nrm   = np.frombuffer(bytes(data[0x3000:0x3000+32]), dtype="<i2")[:16]
+        axp   = np.frombuffer(bytes(data[0x4000:0x4000+4*n_channels*cols]), dtype="<i4")
+        assert np.all(spill == K1 & 0xFFFFFFFF), ("spill S7 seed", spill, K1)
+        assert np.array_equal(nrm, nrm_exp), ("norm_i32 k via src=3", nrm[:8], nrm_exp[:8], k_exp)
+        assert np.array_equal(axp, axpy_exp), ("axpy rshift_rpre", axp[:8], axpy_exp[:8], Rpre)
+
+    run_simulation(dut, [driver()])
 
 def test_sequencer_mixed_list():
     # Descriptor list: vec quant8 -> engine ternary matvec -> vec norm_i32 with the k
