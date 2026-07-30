@@ -108,6 +108,43 @@ def test_matvec_ternary_n4_gather_pressure():
     # boot hang of 2026-07-30).
     _case_ternary(n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=9)
 
+def test_matvec_ternary_dual_x():
+    # S6 enabler: one ternary weight stream verifies two speculated tokens (qn=1, two x
+    # vectors word-interleaved in the x-buffer via its second read port). Chan-major dsts,
+    # head B at dst + 4*qstride; bit-exact vs two independent references.
+    cols, seed = 256, 91
+    for n_channels, rows_per_chan in [(2, 4), (4, 3)]:
+        rng    = np.random.default_rng(seed + n_channels)
+        M      = n_channels*rows_per_chan
+        G      = cols//layout.GROUP_TERNARY
+        scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+        codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+        xa     = rng.integers(-127, 128, cols, dtype=np.int8)
+        xb     = rng.integers(-127, 128, cols, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B = bx.choose_scale_bias(e16)
+        R = bx.choose_result_shift(scales, B)
+        exp_a = bx.matvec_ternary(scales, codes, xa, B, R)
+        exp_b = bx.matvec_ternary(scales, codes, xb, B, R)
+
+        spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                          scales=scales, values=codes)
+        payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                    for c in range(n_channels)]
+
+        qstride = 64
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(xa.tobytes() + xb.tobytes()),
+                         8, 0)
+        cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+                   wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
+                   sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                   cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                   bias=B, rshift=R, xsrc=0, dst=0x4000, qn=1, qstride=qstride)
+        got = _run_engine(dut, cmd, qstride + M, 0x4000)
+        assert np.array_equal(got[:M], exp_a), f"N={n_channels} head A"
+        assert np.array_equal(got[qstride:qstride + M], exp_b), f"N={n_channels} head B"
+
 def test_matvec_ternary_multi_scaleword():
     # cols=4096: 32 groups -> 2 scale beats/row, exercises scale-word switching + row parity.
     _case_ternary(n_channels=2, rows_per_chan=2, cols=4096, latency=16, stall_rate=5, seed=3)

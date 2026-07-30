@@ -110,9 +110,13 @@ class BonsaiChannelPipe(LiteXModule):
         # x-buffer: 1024-bit words, one per ternary group (4 q8 groups). --------------------------
         xbuf = Memory(1024, xbuf_groups)
         self.specials += xbuf
-        xbuf_w = xbuf.get_port(write_capable=True, we_granularity=256)
-        xbuf_r = xbuf.get_port()
-        self.specials += xbuf_w, xbuf_r
+        xbuf_w  = xbuf.get_port(write_capable=True, we_granularity=256)
+        xbuf_r  = xbuf.get_port()
+        # Second read port for dual-Q ternary (head B's word): the x-buffer is distributed
+        # RAM (1024b wide), where extra read ports are native - the no-new-port rule guards
+        # the BRAM scratchpad, not this.
+        xbuf_r2 = xbuf.get_port()
+        self.specials += xbuf_w, xbuf_r, xbuf_r2
         self.comb += [
             xbuf_w.adr.eq(self.xw_group),
             xbuf_w.dat_w.eq(Replicate(self.xw_data, 4)),
@@ -195,7 +199,10 @@ class BonsaiChannelPipe(LiteXModule):
             xbuf_r.adr.eq(Mux(self.kind == KIND_OP_AXPY,
                               Mux(self.qn, pidx_d[7:], pidx[7:]),
                           Mux(self.kind == KIND_OP_Q8,
-                              Mux(self.qn, g_cnt[1:], g_cnt[2:]), g_cnt))),
+                              Mux(self.qn, g_cnt[1:], g_cnt[2:]),
+                              Mux(self.qn, Cat(C(0, 1), g_cnt[:7]), g_cnt)))),
+            # Dual ternary: head A at even words (2g), head B at odd (2g+1).
+            xbuf_r2.adr.eq(Cat(C(1, 1), g_cnt[:7])),
             scale_r.adr.eq(Cat(g_cnt[4:7], row_cnt[0])), # Scale g at halfword g%16 of word g//16.
         ]
         codes_r   = Signal(256)
@@ -218,9 +225,11 @@ class BonsaiChannelPipe(LiteXModule):
 
         # T1: lane select + scale fp16 mux; register lanes. ---------------------------------------
         # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error).
-        xword = xbuf_r.dat_r # 1024-bit, valid at T1.
+        xword  = xbuf_r.dat_r  # 1024-bit, valid at T1.
+        xword2 = xbuf_r2.dat_r # Head B's word (dual ternary), valid at T1.
 
-        tern_lanes = []
+        tern_lanes  = []
+        tern_lanesb = []
         code3_seen = Signal()
         code3_any  = []
         for j in range(128):
@@ -241,6 +250,20 @@ class BonsaiChannelPipe(LiteXModule):
             r = Signal((9, True))
             self.sync += If(v1, r.eq(lane))
             tern_lanes.append(r)
+            xb_t  = Signal((8, True))
+            laneb = Signal((9, True))
+            self.comb += [
+                xb_t.eq(xword2[8*j:8*j+8]),
+                Case(c_j, {
+                    0 : laneb.eq(-xb_t),
+                    1 : laneb.eq(0),
+                    2 : laneb.eq(xb_t),
+                    3 : laneb.eq(0),
+                }),
+            ]
+            rbt = Signal((9, True))
+            self.sync += If(v1 & self.qn, rbt.eq(laneb))
+            tern_lanesb.append(rbt)
         self.comb += code3_seen.eq(v1 & (self.kind == KIND_OP_TERNARY) & reduce(or_, code3_any))
         self.sync += If(self.start, self.error.eq(0)).Elif(code3_seen, self.error.eq(1))
 
@@ -423,16 +446,18 @@ class BonsaiChannelPipe(LiteXModule):
         tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
         q8_sum,   q8_regs   = _adder_tree(self, q8_lanes)   # 5 levels -> 21b, n regs.
         q8_sumb,  q8_regsb  = _adder_tree(self, q8_lanesb)  # Head B (dual-Q).
+        tern_sumb, tern_regsb = _adder_tree(self, tern_lanesb)
         n_tree = max(tern_regs, q8_regs)
-        tern_sum = _delay(self, tern_sum, n_tree - tern_regs)
-        q8_sum   = _delay(self, q8_sum,   n_tree - q8_regs)
-        q8_sumb  = _delay(self, q8_sumb,  n_tree - q8_regsb)
+        tern_sum  = _delay(self, tern_sum,  n_tree - tern_regs)
+        q8_sum    = _delay(self, q8_sum,    n_tree - q8_regs)
+        q8_sumb   = _delay(self, q8_sumb,   n_tree - q8_regsb)
+        tern_sumb = _delay(self, tern_sumb, n_tree - tern_regsb)
 
         gs  = Signal((22, True))
         gsb = Signal((22, True))
         self.comb += [
             gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum)),
-            gsb.eq(q8_sumb),
+            gsb.eq(Mux(self.kind == KIND_OP_Q8, q8_sumb, tern_sumb)),
         ]
 
         # Align tags and scale with the tree output. Lanes are registered on v1 (valid T2),
@@ -536,7 +561,8 @@ class BonsaiChannelPipe(LiteXModule):
             ).Elif(v4,
                 acc.eq(Mux(rlast4, 0, acc_new)),
                 acc2.eq(Mux(rlast4, 0, acc2_new)),
-                If(rlast4 & self.qn & (self.kind == KIND_OP_Q8),
+                If(rlast4 & self.qn
+                   & ((self.kind == KIND_OP_Q8) | (self.kind == KIND_OP_TERNARY)),
                     pendb_v.eq(1),
                     pendb_row.eq(row4),
                     pendb_dat.eq(result2[:32]),

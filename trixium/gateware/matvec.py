@@ -177,7 +177,14 @@ class BonsaiMatVecEngine(LiteXModule):
         self.comb += [
             fill_headb.eq(cmd_r["qn"] & (fill_beat_d >= fill_half)),
             fill_g.eq(Mux(fill_headb, fill_beat_d - fill_half, fill_beat_d)),
-            fill_pos.eq(Mux(cmd_r["qn"], Cat(fill_headb, fill_g[:9]), fill_beat_d)),
+            # Ternary consumes whole 1024b words per beat: interleave at word granularity
+            # (head B at odd words, read via the xbuf's second port). Q8/AXPY interleave
+            # at 32B sub-word granularity (one word covers both heads' slices).
+            fill_pos.eq(Mux(cmd_r["qn"],
+                Mux(cmd_r["kind"] == 0,
+                    Cat(fill_g[0:2], fill_headb, fill_g[2:9]),
+                    Cat(fill_headb, fill_g[:9])),
+                fill_beat_d)),
         ]
         for pipe in self.pipes:
             self.comb += [
