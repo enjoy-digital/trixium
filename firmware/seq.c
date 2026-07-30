@@ -3,6 +3,8 @@
 // Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
 
+#include <stdio.h>
+
 #include <generated/csr.h>
 #include <generated/soc.h>
 
@@ -28,7 +30,8 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
 {
     volatile uint32_t *d = desc_w(idx);
     d[0]  = 1;
-    d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9);
+    d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9)
+                     | ((uint32_t)op->rshift_rpre << 10);
     d[2]  = op->rows | ((uint32_t)op->rem << 16);
     d[3]  = op->cols;
     d[4]  = op->wbase;
@@ -55,7 +58,16 @@ void seq_run(uint32_t idx0, uint32_t count)
     seq_base_write(SP_DESC + idx0*64);
     seq_count_write(count);
     seq_start_write(1);
-    while (seq_status_read() & 1);
+    // Spin-capped poll: a wedged list names the stuck descriptor instead of hanging.
+    uint32_t spins = 0;
+    while (seq_status_read() & 1) {
+        if (++spins == 200000u) {
+            printf("SEQSTALL dcount=%lu/%lu eng=%02lx\n",
+                   (unsigned long)(seq_status_read() >> 8), (unsigned long)count,
+                   (unsigned long)engine_csr_status_read());
+            spins = 0;
+        }
+    }
 }
 
 #endif

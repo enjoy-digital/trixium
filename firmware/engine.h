@@ -30,6 +30,7 @@ struct engine_op {
     uint8_t  cbeats;
     uint8_t  bias;
     uint8_t  rshift;
+    uint8_t  rshift_rpre; // Sequencer only: rshift = bitlen(prev vec res6) + 5 (AXPY Rpre).
     uint32_t xsrc;      // Scratchpad byte address of x8.
     uint32_t dst;       // Scratchpad byte address for results.
     uint8_t  chan;      // Fetch source channel.

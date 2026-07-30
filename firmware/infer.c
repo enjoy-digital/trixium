@@ -43,6 +43,9 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_FET  0x30000 // Fetch staging (embedding rows, norm16 rows).
 #define SP_KVP  0x34000 // KV row-packet staging (built by CPU, engine-stored to HBM).
 #define SP_SC   0x36000 // Engine score results (int32, position-major).
+#define SP_AW   SP_Y            // Attention: AXPY partials + reduce/norm scratch (free here).
+#define SP_AWP8 (SP_Y + 0x2000) // Per-head softmax p8-sum spill beats (32 B each).
+#define SP_AWAM (SP_Y + 0x2400) // Per-head reduce-absmax spill beats (32 B each).
 #define SP_Q    0x38000 // Resident q int16 (q_dim <= 4096: 8 KB).
 #define SP_K    0x3A000 // Resident k int16 (kv_dim <= 1024: 2 KB).
 #define SP_V    0x3B000 // Resident v int16.
@@ -669,6 +672,70 @@ static int seq_eps_int(int es)
     int e = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*es));
     return (e < 1) ? 1 : e;
 }
+
+// Sequencer descriptor list for the fused per-head attention chain:
+//   quant8 -> scores (engine) -> softmax8 -> spill(p8 sum) -> AXPY (rshift from rpre of
+//   the chained res6 = p8 sum) -> reduce x(n_ch-1) -> spill(absmax) -> norm_i32 (k via
+//   res6). One block per head slot, reused across chunks; head/token/layer-dependent
+//   words are patched before each run. Spills feed the one CPU float fold per head
+//   (c2/hmax) after the list - identical numerics to the CPU-dispatched fused path.
+static int seq_attn_base, seq_attn_dph, seq_attn_heads;
+static void seq_build_attn(void)
+{
+    seq_attn_heads = 0;
+    if (n_ch < 2)
+        return; // n1's absmax lives in the engine CSR; keep CPU-dispatched ops there.
+    int dph = 6 + n_ch;
+    int cap = (192 - seq_qkr_count)/dph;
+    if (cap <= 0)
+        return;
+    int chunk = (cap < n_head) ? cap : n_head;
+    int lg = 0;
+    while ((1 << lg) < head_dim) lg++;
+    int Ceff = (lg & 1) ? 523 : 739;
+    seq_attn_base  = seq_qkr_count;
+    seq_attn_dph   = dph;
+    seq_attn_heads = chunk;
+    for (int j = 0; j < chunk; j++) {
+        uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*dph;
+        int32_t qargs[4] = {(int32_t)(SP_Q + (uint32_t)j*head_dim*2), 0,
+                            (int32_t)SP_X, head_dim/16};
+        seq_desc_vec(di + 0, PROG_QUANT8, qargs, 4, 0);
+        struct engine_op sc = {0};
+        sc.kind   = ENGINE_KIND_Q8;
+        sc.ilv    = 1;
+        sc.cols   = head_dim;
+        sc.sbeats = 1;
+        sc.cbeats = head_dim/32;
+        sc.xsrc   = SP_X;
+        sc.dst    = SP_SC;
+        seq_desc_engine(di + 1, &sc);
+        int32_t sargs[6] = {(int32_t)SP_SC, Ceff, (int32_t)SP_X, 0, -11, 0};
+        seq_desc_vec(di + 2, PROG_SOFTMAX8, sargs, 6, 0);
+        int32_t p1 = (int32_t)(SP_AWP8 + (uint32_t)j*32);
+        seq_desc_vec(di + 3, PROG_SPILL, &p1, 1, 0);
+        struct engine_op wv = {0};
+        wv.kind        = ENGINE_KIND_AXPY;
+        wv.cols        = head_dim;
+        wv.sbeats      = 1;
+        wv.cbeats      = head_dim/32;
+        wv.xsrc        = SP_X;
+        wv.dst         = SP_AW;
+        wv.rshift_rpre = 1;
+        seq_desc_engine(di + 4, &wv);
+        for (int c = 1; c < n_ch; c++) {
+            int32_t rargs[4] = {(int32_t)SP_AW, (int32_t)(SP_AW + (uint32_t)c*head_dim*4),
+                                (int32_t)SP_AW, head_dim/8};
+            seq_desc_vec(di + 4 + c, PROG_REDUCE_ACC, rargs, 4, 0);
+        }
+        int32_t p2 = (int32_t)(SP_AWAM + (uint32_t)j*32);
+        seq_desc_vec(di + 4 + n_ch, PROG_SPILL, &p2, 1, 0);
+        int32_t nargs[5] = {(int32_t)SP_AW, 0, (int32_t)(SP_H + (uint32_t)j*head_dim*2),
+                            head_dim/16, 0};
+        seq_desc_vec(di + 5 + n_ch, PROG_NORM_I32, nargs, 5,
+                     (uint16_t)(SEQ_SRC_KRES6 << 8)); // A4 = k(res6).
+    }
+}
 #endif
 
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
@@ -845,6 +912,76 @@ attn_scores: ;
 #endif
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
+        if (attn_hw && seq_attn_heads > 0
+            && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
+            // Whole-head-loop descriptor lists: ~6 dispatch/poll round-trips per head
+            // collapse into one submit per chunk; the AXPY rshift and norm k are computed
+            // in-sequencer from the chained res6. Numerics identical to the fused path.
+            perf_enter(OP_SCORES);
+            int cnt  = pos + 1;
+            int padn = (16 - (cnt & 15)) & 15;
+            volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
+            for (int i2 = 0; i2 < padn; i2++)
+                sc32[cnt + i2] = (int32_t)0x80000000;
+            uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
+            uint32_t wlen  = rows*kv_rb;
+            uint32_t rowsw = rows | (rem << 16);
+            int lg = 0;
+            while ((1 << lg) < head_dim) lg++;
+            uint32_t blocks = (uint32_t)(cnt + padn)/16;
+            for (int h0 = 0; h0 < n_head; h0 += seq_attn_heads) {
+                int nh = n_head - h0;
+                if (nh > seq_attn_heads) nh = seq_attn_heads;
+                for (int j = 0; j < nh; j++) {
+                    int hh = h0 + j, kvh = hh/n_rep;
+                    uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*seq_attn_dph;
+                    int Bk, Rk, Bv, Rd;
+                    kv_scores_br(l, kvh, 0, &Bk, &Rk);
+                    kv_scores_br(l, kvh, 1, &Bv, &Rd);
+                    int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
+                    seq_patch(di + 0, 2, SP_Q + (uint32_t)hh*head_dim*2);
+                    seq_patch(di + 1, 2, rowsw);
+                    seq_patch(di + 1, 4, kv_region_addr(l, kvh, 0));
+                    seq_patch(di + 1, 5, wlen);
+                    seq_patch(di + 1, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
+                    seq_patch(di + 2, 5, blocks);          // softmax8 A3 (blocks).
+                    seq_patch(di + 2, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
+                    seq_patch(di + 3, 2, SP_AWP8 + (uint32_t)hh*32);
+                    seq_patch(di + 4, 2, rowsw);
+                    seq_patch(di + 4, 4, kv_region_addr(l, kvh, 1));
+                    seq_patch(di + 4, 5, wlen);
+                    seq_patch(di + 4, 7, (uint32_t)Bv);
+                    seq_patch(di + 4 + n_ch, 2, SP_AWAM + (uint32_t)hh*32);
+                    seq_patch(di + 5 + n_ch, 4, SP_H + (uint32_t)hh*head_dim*2);
+                    (void)Rd;
+                }
+                seq_run((uint32_t)seq_attn_base, (uint32_t)nh*seq_attn_dph);
+            }
+            perf_exit(OP_SCORES);
+            // One float fold per head from the spilled p8 sums / absmaxes.
+            perf_enter(OP_WV);
+            for (int hh = 0; hh < n_head; hh++) {
+                int kvh = hh/n_rep;
+                uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8
+                                                     + (uint32_t)hh*32);
+                uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWAM
+                                                     + (uint32_t)hh*32);
+                int Bv, Rd;
+                kv_scores_br(l, kvh, 1, &Bv, &Rd);
+                int Rpre = axpy_rpre_c(P8 ? P8 : 1);
+                int k2 = 0;
+                while ((am >> k2) > 16383u) k2++;
+                float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), Rpre - Bv + k2);
+                aw_c[hh] = c2;
+                float hm2 = (float)(am >> k2)*c2;
+                if (hm2 > aw_hmax) aw_hmax = hm2;
+                (void)Rd;
+            }
+            perf_exit(OP_WV);
+            goto attn_heads_done;
+        }
+#endif
         for (int hh = 0; hh < n_head; hh++) {
             int kvh = hh/n_rep;
             const float *qh = q + hh*head_dim;
@@ -1049,6 +1186,9 @@ attn_scores: ;
             }
             perf_exit(OP_WV);
         }
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
+attn_heads_done: ;
+#endif
 
         // Output projection + residual (resident).
         {
@@ -1291,6 +1431,7 @@ int infer_init(void)
     for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
 #ifdef CSR_SEQ_BASE
     seq_build_qkr();
+    seq_build_attn();
 #endif
 #endif
     k_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
