@@ -128,6 +128,10 @@ class BonsaiSimSoC(SoCCore):
             self.engine.store_cmd.connect(self.loader.store_cmd),
             self.engine.store_data.connect(self.loader.store_data),
             self.engine.store_busy.eq(self.loader.store_busy),
+            # Sideband (wishbone) scratchpad access is granted only while every unit
+            # that touches the two memory ports is idle.
+            self.scratchpad.units_idle.eq(~self.engine.busy & ~self.vecunit.busy
+                                          & ~self.seq.busy),
         ]
         self.add_constant("BONSAI_HAS_KVSTORE")
         self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.

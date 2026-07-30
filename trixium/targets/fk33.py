@@ -157,6 +157,13 @@ class BonsaiSoC(SoCCore):
             ]
             self.add_constant("BONSAI_HAS_KVSTORE")
             self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
+            # Sideband (wishbone/CSR) scratchpad access only while all units are idle.
+            units_idle = ~self.engine.busy
+            if vecunit is not None:
+                units_idle = units_idle & ~vecunit.busy
+            if seq is not None:
+                units_idle = units_idle & ~seq.busy
+            self.comb += self.scratchpad.units_idle.eq(units_idle)
             self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
 
             # Scratchpad on the SoC bus (uncached: shared with the engine).
