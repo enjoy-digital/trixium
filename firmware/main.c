@@ -121,6 +121,7 @@ static void help(void)
     puts("hdrload         - copy BONS header+table staged by bonsai_load to CPU memory");
     puts("sptest          - scratchpad bus read/write test");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
+    puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
@@ -328,6 +329,15 @@ static void console_service(void)
     }
     else if (strcmp(token, "bench") == 0)
         bench_cmd(str);
+    else if (strcmp(token, "spec") == 0) {
+        if (strncmp(str, "on", 2) == 0)
+            infer_spec(1);
+        else if (strncmp(str, "off", 3) == 0)
+            infer_spec(0);
+        int acc, rej;
+        infer_spec_stats(&acc, &rej);
+        printf("SPEC acc=%d rej=%d\n", acc, rej);
+    }
     else if (strcmp(token, "hdrload") == 0)
         hdrload();
     else if (strlen(token))
