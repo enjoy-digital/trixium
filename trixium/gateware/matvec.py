@@ -171,39 +171,62 @@ class BonsaiMatVecEngine(LiteXModule):
         grant_valid = Array([p.source.valid for p in self.pipes])[rr.grant]
         grant_row   = Array([p.source.row   for p in self.pipes])[rr.grant]
         grant_data  = Array([p.source.data  for p in self.pipes])[rr.grant]
+        grant_wide  = Array([p.source.wide  for p in self.pipes])[rr.grant]
+
+        # Interleaved (position-major) ops merge every pipe whose head falls in the same
+        # scratchpad beat as the granted head: slot = row*N + chan, so within one beat all
+        # lanes map to distinct pipes (N power-of-2) and up to 8 results retire per cycle.
+        # This is the gather-widen: at N channels the aggregate score rate N/row_beats
+        # exceeds 1/cycle from N=4 up, and merged retirement keeps the drain above it.
+        ilv_mode = Signal()
+        dstw     = Signal(24)
+        self.comb += [
+            ilv_mode.eq(cmd_r["ilv"] & ~axpy_mode & ~fetch_mode & ~store_mode),
+            dstw.eq(cmd_r["dst"] >> 2),
+        ]
+        slot_p     = [Signal(24, name=f"slot_p{i}") for i in range(n)]
+        merge_mask = Signal(n)
+        grant_slot = Signal(24)
+        for i, pipe in enumerate(self.pipes):
+            self.comb += slot_p[i].eq(dstw + pipe.source.row*n + i)
+        self.comb += grant_slot.eq(Array(slot_p)[rr.grant])
+        self.comb += merge_mask.eq(Cat(*[
+            self.pipes[i].source.valid & ~self.pipes[i].source.wide
+            & (slot_p[i][3:] == grant_slot[3:])
+            for i in range(n)]))
 
         self.comb += [
             rr.request.eq(Cat(*[p.source.valid for p in self.pipes])),
             rr.ce.eq(1),
         ]
         for i, pipe in enumerate(self.pipes):
-            self.comb += pipe.source.ready.eq(rr.grant == i)
+            self.comb += pipe.source.ready.eq(Mux(ilv_mode, merge_mask[i], rr.grant == i))
 
-        # Result absmax tracker (norm_i32's shift argument; reset on command accept).
-        grant_abs = Signal(32)
-        grant_s   = Signal((32, True))
-        self.comb += [
-            grant_s.eq(grant_data),
-            grant_abs.eq(Mux(grant_s < 0, -grant_s, grant_s)),
-        ]
-        self.sync += [
-            If(self.cmd.valid & self.cmd.ready,
-                self.absmax.eq(0),
-            ).Elif(~fetch_mode & grant_valid & (grant_abs > self.absmax),
-                self.absmax.eq(grant_abs),
-            )
-        ]
+        # Merged lane build: within one beat each word lane belongs to at most one pipe.
+        lane_we  = Signal(8)
+        lane_dat = Signal(256)
+        for l in range(8):
+            sels = [merge_mask[i] & (slot_p[i][0:3] == l) for i in range(n)]
+            self.comb += lane_we[l].eq(reduce_or(sels))
+            self.comb += lane_dat[32*l:32*l+32].eq(reduce_or(
+                [Replicate(sels[i], 32) & self.pipes[i].source.data[0:32]
+                 for i in range(n)]))
+
         is_matvec = Signal() # Kinds 0/1 only (not fetch/store/axpy partials).
         gidx      = Signal(24)
+        grant_s   = Signal((32, True))
         self.comb += [
+            grant_s.eq(grant_data[0:32]),
             is_matvec.eq((cmd_r["kind"] == 0) | (cmd_r["kind"] == 1)),
             gidx.eq(rr.grant*cmd_r["rows"] + grant_row),
         ]
+        # Argmax tap rides the single-grant path only: it is used exclusively by the
+        # chan-major LM-head op (never ilv, never AXPY), where grants stay 1/cycle.
         self.sync += [
             If(self.cmd.valid & self.cmd.ready,
                 self.argmax_val.eq(-(1 << 31)),
                 self.argmax_idx.eq(0xFFFFFF),
-            ).Elif(is_matvec & grant_valid &
+            ).Elif(is_matvec & ~ilv_mode & grant_valid & ~grant_wide &
                    ((grant_s > self.argmax_val)
                     | ((grant_s == self.argmax_val) & (gidx < self.argmax_idx))),
                 self.argmax_val.eq(grant_s),
@@ -220,27 +243,64 @@ class BonsaiMatVecEngine(LiteXModule):
             fetch_data.eq(Array(fetch_datas)[fetch_chan]),
         ]
 
-        # Scratchpad write port: fetch beats or gathered int32 results.
+        # Scratchpad write port: fetch beats, one merged ilv beat, one wide AXPY beat, or
+        # a single gathered int32.
         slot = Signal(24)
         eng_gw_adr = Signal(len(scratchpad.gather.adr))
         eng_gw_we  = Signal(8)
         eng_gw_dat = Signal(256)
         self.comb += [
             If(axpy_mode,
-                slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["cols"] + grant_row),
-            ).Elif(cmd_r["ilv"],
-                slot.eq((cmd_r["dst"] >> 2) + grant_row*self.n_channels + rr.grant),
+                # Wide drain rows are 8-lane group starts; dst must be 32B-aligned.
+                slot.eq(dstw + rr.grant*cmd_r["cols"] + grant_row),
             ).Else(
-                slot.eq((cmd_r["dst"] >> 2) + rr.grant*cmd_r["rows"] + grant_row),
+                slot.eq(dstw + rr.grant*cmd_r["rows"] + grant_row),
             ),
             If(fetch_mode,
                 eng_gw_adr.eq((cmd_r["dst"] >> 5) + fetch_cnt),
                 eng_gw_dat.eq(fetch_data),
                 eng_gw_we.eq(Mux(fetch_valid, 0xFF, 0)),
+            ).Elif(ilv_mode,
+                eng_gw_adr.eq(grant_slot[3:]),
+                eng_gw_dat.eq(lane_dat),
+                eng_gw_we.eq(Mux(grant_valid, lane_we, 0)),
+            ).Elif(axpy_mode,
+                eng_gw_adr.eq(slot[3:]),
+                eng_gw_dat.eq(grant_data),
+                eng_gw_we.eq(Mux(grant_valid, 0xFF, 0)),
             ).Else(
                 eng_gw_adr.eq(slot[3:]),
-                eng_gw_dat.eq(Replicate(grant_data, 8)),
+                eng_gw_dat.eq(Replicate(grant_data[0:32], 8)),
                 eng_gw_we.eq(Mux(grant_valid, 1 << slot[:3], 0)),
+            )
+        ]
+
+        # Result absmax tracker, write-stage (norm_i32's shift argument; reset on command
+        # accept). Runs over every written lane so merged/wide retirement is covered.
+        lane_abs = []
+        for l in range(8):
+            ls = Signal((32, True), name=f"labs_s{l}")
+            la = Signal(32, name=f"labs{l}")
+            self.comb += [
+                ls.eq(eng_gw_dat[32*l:32*l+32]),
+                la.eq(Mux(eng_gw_we[l], Mux(ls < 0, -ls, ls), 0)),
+            ]
+            lane_abs.append(la)
+        def _maxtree(sigs):
+            while len(sigs) > 1:
+                nxt = []
+                for a, b in zip(sigs[::2], sigs[1::2]):
+                    m = Signal(32)
+                    self.comb += m.eq(Mux(a > b, a, b))
+                    nxt.append(m)
+                sigs = nxt
+            return sigs[0]
+        wr_absmax = _maxtree(lane_abs)
+        self.sync += [
+            If(self.cmd.valid & self.cmd.ready,
+                self.absmax.eq(0),
+            ).Elif(~fetch_mode & (wr_absmax > self.absmax),
+                self.absmax.eq(wr_absmax),
             )
         ]
 
@@ -384,7 +444,8 @@ class BonsaiMatVecEngine(LiteXModule):
                 If(fetch_mode,
                     fetch_cnt.eq(fetch_cnt + 1),
                 ).Else(
-                    result_cnt.eq(result_cnt + 1),
+                    # Merged ilv beats and wide AXPY beats retire several results at once.
+                    result_cnt.eq(result_cnt + sum(eng_gw_we[l] for l in range(8))),
                 )
             ),
         ]

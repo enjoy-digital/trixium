@@ -85,7 +85,9 @@ class BonsaiChannelPipe(LiteXModule):
 
         # Weight beats in, results out.
         self.sink   = stream.Endpoint([("data", 256)])
-        self.source = stream.Endpoint([("row", 16), ("data", 32)])
+        # Matvec results present one int32 in data[:32] (wide=0); AXPY drain entries carry
+        # 8 accumulators = one full scratchpad beat (wide=1, row = first lane index).
+        self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1)])
 
         # x-buffer broadcast write port (from the engine's fill FSM).
         self.xw_group = Signal(max=max(xbuf_groups, 2))
@@ -312,7 +314,9 @@ class BonsaiChannelPipe(LiteXModule):
 
         d_cnt   = Signal(8)
         d_total = Signal(8)
-        self.comb += d_total.eq(Cat(C(0, 5), self.code_beats[:3])) # code_beats * 32.
+        # Wide drain: 8 accumulators (one scratchpad beat) per FIFO entry, so the gather
+        # stage retires 8 partials/cycle instead of 1. d_cnt counts 8-lane groups.
+        self.comb += d_total.eq(Cat(C(0, 2), self.code_beats[:3])) # code_beats * 4 = cols/8.
         self.ax_fsm = ax_fsm = FSM(reset_state="AX_IDLE")
         drain_val = Signal()
         ax_fsm.act("AX_IDLE",
@@ -432,7 +436,11 @@ class BonsaiChannelPipe(LiteXModule):
         ]
 
         out_fifo = stream.SyncFIFO([("row", 16), ("data", 32)], out_fifo_depth)
-        self.submodules += out_fifo
+        # AXPY wide-drain FIFO: 8 accumulators per entry (one full beat). Matvec and AXPY
+        # entries never interleave (drain runs only in AXPY mode, row-last pushes only in
+        # matvec kinds), so the source muxes by kind.
+        axw_fifo = stream.SyncFIFO([("row", 16), ("data", 256)], 4)
+        self.submodules += out_fifo, axw_fifo
 
         self.sync += [
             If(self.start,
@@ -450,17 +458,29 @@ class BonsaiChannelPipe(LiteXModule):
         ]
         self.comb += [
             If(self.kind == KIND_OP_AXPY,
-                out_fifo.sink.valid.eq(drain_val),
-                out_fifo.sink.row.eq(d_cnt),
-                out_fifo.sink.data.eq(acc_flat[d_cnt][:32]),
+                axw_fifo.sink.valid.eq(drain_val),
+                axw_fifo.sink.row.eq(Cat(C(0, 3), d_cnt)), # First lane index = d_cnt*8.
+                axw_fifo.sink.data.eq(Cat(*[acc_flat[(d_cnt << 3) + i][0:32]
+                                            for i in range(8)])),
             ).Else(
                 out_fifo.sink.valid.eq(v4 & rlast4),
                 out_fifo.sink.row.eq(row4),
                 out_fifo.sink.data.eq(result[:32]),
             ),
-            out_fifo_rdy_ax.eq(out_fifo.sink.ready),
+            out_fifo_rdy_ax.eq(axw_fifo.sink.ready),
             # 4 slots of slack cover results already in flight (T+0..T+3 stages, rows are
             # >= 2 beats so at most 3 row-lasts can be inside the pipeline when intake stops).
             out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 4)),
-            out_fifo.source.connect(self.source),
+            If(self.kind == KIND_OP_AXPY,
+                self.source.valid.eq(axw_fifo.source.valid),
+                self.source.row.eq(axw_fifo.source.row),
+                self.source.data.eq(axw_fifo.source.data),
+                self.source.wide.eq(1),
+                axw_fifo.source.ready.eq(self.source.ready),
+            ).Else(
+                self.source.valid.eq(out_fifo.source.valid),
+                self.source.row.eq(out_fifo.source.row),
+                self.source.data.eq(out_fifo.source.data),
+                out_fifo.source.ready.eq(self.source.ready),
+            ),
         ]
