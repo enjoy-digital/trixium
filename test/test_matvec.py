@@ -397,6 +397,50 @@ def test_matvec_q8_striped_interleave():
         got = _run_engine(dut, cmd, T, 0x4000)
         assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
 
+def test_matvec_q8_dual_head():
+    # Dual-Q GQA scores: one K stream serves two Q-heads (qn=1). x holds both vectors
+    # contiguously (head B at xsrc + cols); results land position-major per head, head B
+    # offset by qstride words. Bit-exact vs two independent matvec_q8 references.
+    cols, seed = 128, 57
+    for n_channels, T in [(2, 5), (2, 8), (4, 3), (4, 9)]:
+        rng    = np.random.default_rng(seed + 16*n_channels + T)
+        scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
+        q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        xa     = rng.integers(-127, 128, cols, dtype=np.int8)
+        xb     = rng.integers(-127, 128, cols, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B = bx.choose_scale_bias(e16)
+        R = bx.choose_result_shift(scales, B, gs_max=bx.GS_MAX_Q8)
+        exp_a = bx.matvec_q8(scales, q8w, xa, B, R)
+        exp_b = bx.matvec_q8(scales, q8w, xb, B, R)
+
+        rows, rem = T//n_channels, T % n_channels
+        payloads = []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]
+            spec_c = TensorSpec("kv", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                max(len(pos), 1), cols,
+                                scales=scales[pos] if pos else scales[:1],
+                                values=q8w[pos] if pos else q8w[:1])
+            payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes() if pos else b"")
+        maxlen = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+
+        qstride = 64 # Head-B result offset in words.
+        x_init  = xa.tobytes() + xb.tobytes()
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
+        rb  = layout.row_beats(cols, layout.KIND_Q8)
+        cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                   bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1,
+                   qn=1, qstride=qstride)
+        got = _run_engine(dut, cmd, qstride + T, 0x4000)
+        assert np.array_equal(got[:T], exp_a), f"N={n_channels} T={T} head A"
+        assert np.array_equal(got[qstride:qstride + T], exp_b), \
+            f"N={n_channels} T={T} head B"
+
 def test_engine_axpy():
     # Weighted-V: kind-4 op accumulates p8-weighted V rows per lane; each channel emits
     # cols partial sums (chan-major), bit-exact vs bx.axpy_rows on its position stripe.
@@ -437,6 +481,56 @@ def test_engine_axpy():
                    bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem)
         got = _run_engine(dut, cmd, n_channels*cols, 0x4000)
         assert np.array_equal(got, expected), f"T={T}"
+
+def test_engine_axpy_dual_head():
+    # Dual-Q GQA weighted-V: one V stream serves two heads' AXPYs (qn=1). p8 vectors
+    # contiguous at xsrc (head B at +pad32(T)); per-head Rpre via rshift/rshift2; head B
+    # partials land at dst + 4*qstride. Bit-exact vs two independent axpy_rows refs.
+    cols, seed = 64, 67
+    for n_channels, T in [(2, 3), (2, 8), (4, 5)]:
+        rng = np.random.default_rng(seed + 16*n_channels + T)
+        ev  = rng.integers(-9, -4, T)
+        scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+        v8  = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        p8a = rng.integers(1, 128, T, dtype=np.int8)
+        p8b = rng.integers(1, 128, T, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B     = 12 - int(e16.max())
+        Rpre_a = bx.axpy_rpre(int(p8a.astype(np.int64).sum()))
+        Rpre_b = bx.axpy_rpre(int(p8b.astype(np.int64).sum()) + 1000) # Force different Rpre.
+
+        rows, rem = T//n_channels, T % n_channels
+        payloads, exp_a, exp_b = [], [], []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]
+            if pos:
+                spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                    len(pos), cols, scales=scales[pos], values=v8[pos])
+                payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+                exp_a.append(bx.axpy_rows(scales[pos], v8[pos], p8a[pos], B, Rpre_a))
+                exp_b.append(bx.axpy_rows(scales[pos], v8[pos], p8b[pos], B, Rpre_b))
+            else:
+                payloads.append(b"")
+                exp_a.append(np.zeros(cols, dtype=np.int32))
+                exp_b.append(np.zeros(cols, dtype=np.int32))
+        maxlen   = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+        exp_a, exp_b = np.concatenate(exp_a), np.concatenate(exp_b)
+
+        qstride = 256 # Words; must cover n_channels*cols head-A partials.
+        x_init  = p8a.tobytes().ljust(32, b"\0") + p8b.tobytes().ljust(32, b"\0")
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
+        rb  = layout.row_beats(cols, layout.KIND_Q8)
+        cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                   bias=B, rshift=Rpre_a, rshift2=Rpre_b, qn=1, qstride=qstride,
+                   xsrc=0, dst=0x4000, rem=rem)
+        got = _run_engine(dut, cmd, qstride + n_channels*cols, 0x4000)
+        assert np.array_equal(got[:n_channels*cols], exp_a), f"N={n_channels} T={T} head A"
+        assert np.array_equal(got[qstride:qstride + n_channels*cols], exp_b), \
+            f"N={n_channels} T={T} head B"
 
 def test_engine_argmax_tap_and_suppress():
     # Argmax tap: value + global index (ties to smallest index) over a suppressed-write
@@ -508,13 +602,13 @@ def _desc_engine(**f):
     w = [0]*16
     w[0] = 1
     w[1] = (f.get("kind", 0) | (f.get("ilv", 0) << 8) | (f.get("supw", 0) << 9)
-            | (f.get("rshift_rpre", 0) << 10))
+            | (f.get("rshift_rpre", 0) << 10) | (f.get("qn", 0) << 11))
     w[2] = f.get("rows", 0) | (f.get("rem", 0) << 16)
     w[3] = f.get("cols", 0)
     w[4] = f.get("wbase", 0)
     w[5] = f.get("wlen", 0)
-    w[6] = f.get("sbeats", 0) | (f.get("cbeats", 0) << 8)
-    w[7] = f.get("bias", 0) | (f.get("rshift", 0) << 16)
+    w[6] = f.get("sbeats", 0) | (f.get("cbeats", 0) << 8) | (f.get("qstride", 0) << 16)
+    w[7] = f.get("bias", 0) | (f.get("rshift", 0) << 16) | (f.get("rshift2", 0) << 22)
     w[8] = f.get("xsrc", 0)
     w[9] = f.get("dst", 0)
     w[10] = f.get("chan", 0)

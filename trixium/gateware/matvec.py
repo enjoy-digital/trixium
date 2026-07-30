@@ -57,6 +57,10 @@ class BonsaiMatVecEngine(LiteXModule):
                              # (position-major scores) instead of chan*rows + row.
             ("supw",   1),   # Suppress scratchpad result writes (argmax-tap-only ops:
                              # the LM head needs no 600 KB result spill).
+            ("qn",     1),   # Dual-Q GQA mode: one K/V stream serves 2 sibling Q-heads
+                             # (Q8 scores and AXPY kinds only; x holds both vectors).
+            ("qstride", 16), # Head-B result offset in words (dst + 4*qstride).
+            ("rshift2", 6),  # Head-B AXPY pre-shift (Rpre differs per head).
         ])
         self.busy   = Signal()
         self.done   = Signal() # Pulse.
@@ -109,7 +113,8 @@ class BonsaiMatVecEngine(LiteXModule):
         # Latched command ---------------------------------------------------------------------
         cmd_r = {}
         for name in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-                     "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw"):
+                     "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
+                     "qn", "qstride", "rshift2"):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
@@ -132,6 +137,8 @@ class BonsaiMatVecEngine(LiteXModule):
                 pipe.code_beats.eq(cmd_r["cbeats"]),
                 pipe.bias.eq(cmd_r["bias"]),
                 pipe.rshift.eq(cmd_r["rshift"]),
+                pipe.qn.eq(cmd_r["qn"]),
+                pipe.rshift2.eq(cmd_r["rshift2"]),
             ]
         # Overflow is included so any future rate mismatch fails loud (sticky error bit)
         # instead of dropping results and hanging the op.
@@ -140,9 +147,13 @@ class BonsaiMatVecEngine(LiteXModule):
         # x-fill ------------------------------------------------------------------------------
         fill_beat  = Signal(10) # Beat index within x fill (cols/32 <= 384).
         fill_total = Signal(10)
-        self.comb += fill_total.eq(Mux(axpy_mode,
-            (cmd_r["rows"]*self.n_channels + cmd_r["rem"] + 31) >> 5,
-            cmd_r["cols"] >> 5))
+        fill_half  = Signal(10) # Beats per head (dual-Q reads 2x: A then B, contiguous).
+        self.comb += [
+            fill_half.eq(Mux(axpy_mode,
+                (cmd_r["rows"]*self.n_channels + cmd_r["rem"] + 31) >> 5,
+                cmd_r["cols"] >> 5)),
+            fill_total.eq(Mux(cmd_r["qn"], fill_half << 1, fill_half)),
+        ]
 
         # Registered fill pipeline: address at T, data+write at T+1.
         fill_active_d = Signal()
@@ -157,10 +168,21 @@ class BonsaiMatVecEngine(LiteXModule):
         ]
         st_advance = Signal()
         self.comb += st_advance.eq(self.store_data.valid & self.store_data.ready)
+        # Dual-Q fill: source beats stay contiguous (head A then head B at xsrc), the
+        # x-buffer position interleaves them at 32B granularity (pos = 2g + head) so one
+        # xbuf read serves both heads in the pipes.
+        fill_headb = Signal()
+        fill_g     = Signal(10)
+        fill_pos   = Signal(10)
+        self.comb += [
+            fill_headb.eq(cmd_r["qn"] & (fill_beat_d >= fill_half)),
+            fill_g.eq(Mux(fill_headb, fill_beat_d - fill_half, fill_beat_d)),
+            fill_pos.eq(Mux(cmd_r["qn"], Cat(fill_headb, fill_g[:9]), fill_beat_d)),
+        ]
         for pipe in self.pipes:
             self.comb += [
-                pipe.xw_group.eq(fill_beat_d[2:]),
-                pipe.xw_sub.eq(fill_beat_d[:2]),
+                pipe.xw_group.eq(fill_pos[2:]),
+                pipe.xw_sub.eq(fill_pos[:2]),
                 pipe.xw_data.eq(scratchpad.fill.dat_r),
                 pipe.xw_we.eq(fill_active_d),
             ]
@@ -188,7 +210,8 @@ class BonsaiMatVecEngine(LiteXModule):
         merge_mask = Signal(n)
         grant_slot = Signal(24)
         for i, pipe in enumerate(self.pipes):
-            self.comb += slot_p[i].eq(dstw + pipe.source.row*n + i)
+            self.comb += slot_p[i].eq(dstw + Mux(pipe.source.head, cmd_r["qstride"], 0)
+                                      + pipe.source.row*n + i)
         self.comb += grant_slot.eq(Array(slot_p)[rr.grant])
         self.comb += merge_mask.eq(Cat(*[
             self.pipes[i].source.valid & ~self.pipes[i].source.wide
@@ -249,12 +272,15 @@ class BonsaiMatVecEngine(LiteXModule):
         eng_gw_adr = Signal(len(scratchpad.gather.adr))
         eng_gw_we  = Signal(8)
         eng_gw_dat = Signal(256)
+        grant_head = Array([p.source.head for p in self.pipes])[rr.grant]
+        grant_qoff = Signal(16)
+        self.comb += grant_qoff.eq(Mux(grant_head, cmd_r["qstride"], 0))
         self.comb += [
             If(axpy_mode,
                 # Wide drain rows are 8-lane group starts; dst must be 32B-aligned.
-                slot.eq(dstw + rr.grant*cmd_r["cols"] + grant_row),
+                slot.eq(dstw + grant_qoff + rr.grant*cmd_r["cols"] + grant_row),
             ).Else(
-                slot.eq(dstw + rr.grant*cmd_r["rows"] + grant_row),
+                slot.eq(dstw + grant_qoff + rr.grant*cmd_r["rows"] + grant_row),
             ),
             If(fetch_mode,
                 eng_gw_adr.eq((cmd_r["dst"] >> 5) + fetch_cnt),
@@ -413,13 +439,20 @@ class BonsaiMatVecEngine(LiteXModule):
                 NextState("RUN"),
             )
         )
+        mv_total = Signal(24)
+        ax_total = Signal(24)
+        self.comb += [
+            mv_total.eq(cmd_r["rows"]*self.n_channels + cmd_r["rem"]),
+            ax_total.eq(cmd_r["cols"]*self.n_channels),
+        ]
         fsm.act("RUN",
             self.busy.eq(1),
             If(Mux(fetch_mode,
                    fetch_cnt == cmd_r["wlen"],
-                   result_cnt == Mux(axpy_mode,
-                       cmd_r["cols"]*self.n_channels,
-                       cmd_r["rows"]*self.n_channels + cmd_r["rem"])),
+                   # Dual-Q ops retire two heads' results per stream.
+                   result_cnt == Mux(cmd_r["qn"],
+                       Mux(axpy_mode, ax_total << 1, mv_total << 1),
+                       Mux(axpy_mode, ax_total, mv_total))),
                 self.done.eq(1),
                 NextState("IDLE"),
             )

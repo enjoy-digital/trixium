@@ -73,7 +73,7 @@ KIND_OP_Q8      = 1
 KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre).
 
 class BonsaiChannelPipe(LiteXModule):
-    def __init__(self, xbuf_groups=96, out_fifo_depth=16, chan_id=0, n_channels=1):
+    def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1):
         # Op parameters (quasi-static while busy).
         self.kind        = Signal(2)
         self.rows        = Signal(16)
@@ -81,13 +81,16 @@ class BonsaiChannelPipe(LiteXModule):
         self.code_beats  = Signal(8)   # Code beats (= groups) per row.
         self.bias        = Signal(7)   # B.
         self.rshift      = Signal(6)   # R.
+        self.qn          = Signal()    # Dual-Q GQA mode (Q8/AXPY): 2 heads per stream.
+        self.rshift2     = Signal(6)   # Head-B AXPY pre-shift.
         self.start       = Signal()    # Pulse: reset counters/accumulator/error.
 
         # Weight beats in, results out.
         self.sink   = stream.Endpoint([("data", 256)])
         # Matvec results present one int32 in data[:32] (wide=0); AXPY drain entries carry
         # 8 accumulators = one full scratchpad beat (wide=1, row = first lane index).
-        self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1)])
+        # head=1 marks dual-Q head-B results (gather adds the qstride offset).
+        self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1), ("head", 1)])
 
         # x-buffer broadcast write port (from the engine's fill FSM).
         self.xw_group = Signal(max=max(xbuf_groups, 2))
@@ -180,11 +183,19 @@ class BonsaiChannelPipe(LiteXModule):
         # T0: code-beat acceptance: launch x-buffer + scale reads, register codes. ----------------
         t0_fire = Signal()
         pidx    = Signal(16) # AXPY: probs byte index = row*n_channels + chan_id.
+        # Dual-Q x layout: the fill interleaves the two heads' vectors at 32-byte
+        # granularity (position 2g = head A group g, 2g+1 = head B group g), so one xbuf
+        # read serves both heads. AXPY bytes get the same treatment: byte t of head A
+        # lives at (t>>5)*64 + (t&31), head B at +32 - always inside the same 1024b word.
+        pidx_d = Signal(16) # AXPY dual: interleaved byte index of head A.
         self.comb += [
             t0_fire.eq(accept & is_code),
             pidx.eq(row_cnt*n_channels + chan_id),
-            xbuf_r.adr.eq(Mux(self.kind == KIND_OP_AXPY, pidx[7:],
-                          Mux(self.kind == KIND_OP_Q8, g_cnt[2:], g_cnt))),
+            pidx_d.eq(Cat(pidx[0:5], C(0, 1), pidx[5:15])),
+            xbuf_r.adr.eq(Mux(self.kind == KIND_OP_AXPY,
+                              Mux(self.qn, pidx_d[7:], pidx[7:]),
+                          Mux(self.kind == KIND_OP_Q8,
+                              Mux(self.qn, g_cnt[1:], g_cnt[2:]), g_cnt))),
             scale_r.adr.eq(Cat(g_cnt[4:7], row_cnt[0])), # Scale g at halfword g%16 of word g//16.
         ]
         codes_r   = Signal(256)
@@ -196,8 +207,8 @@ class BonsaiChannelPipe(LiteXModule):
             If(t0_fire,
                 codes_r.eq(self.sink.data),
                 g_lo_r.eq(g_cnt[:4]),
-                q8_sub_r.eq(g_cnt[:2]),
-                pidx_r.eq(pidx[:7]),
+                q8_sub_r.eq(Mux(self.qn, Cat(C(0, 1), g_cnt[0]), g_cnt[:2])),
+                pidx_r.eq(Mux(self.qn, pidx_d[:7], pidx[:7])),
                 g_ax_r.eq(g_cnt[:3]),
             )
         ]
@@ -233,17 +244,29 @@ class BonsaiChannelPipe(LiteXModule):
         self.comb += code3_seen.eq(v1 & (self.kind == KIND_OP_TERNARY) & reduce(or_, code3_any))
         self.sync += If(self.start, self.error.eq(0)).Elif(code3_seen, self.error.eq(1))
 
-        # Q8 lanes: w8 * x8 over the selected 256-bit x slice.
-        xslice = Signal(256)
+        # Q8 lanes: w8 * x8 over the selected 256-bit x slice. Head B (dual-Q) uses the
+        # adjacent slice / adjacent p8 byte (+32) of the same 1024-bit x word.
+        xslice  = Signal(256)
+        xsliceb = Signal(256)
+        q8_subb = Signal(2)
+        self.comb += q8_subb.eq(q8_sub_r | 1)
         self.comb += Case(q8_sub_r, {i: xslice.eq(xword[256*i:256*(i+1)]) for i in range(4)})
+        self.comb += Case(q8_subb,  {i: xsliceb.eq(xword[256*i:256*(i+1)]) for i in range(4)})
         # AXPY coefficient byte: two-stage constant-slice mux out of the 1024-bit x word.
-        p8_grp = Signal(64)
-        p8_ax  = Signal((8, True))
+        p8_grp  = Signal(64)
+        p8_ax   = Signal((8, True))
+        p8_grpb = Signal(64)
+        p8_axb  = Signal((8, True))
+        pidx_rb = Signal(7)
+        self.comb += pidx_rb.eq(pidx_r | 32) # Dual layout: head B byte at +32 (bit 5 clear on A).
         self.comb += Case(pidx_r[3:], {i: p8_grp.eq(xword[64*i:64*(i+1)]) for i in range(16)})
         self.comb += Case(pidx_r[:3], {i: p8_ax.eq(p8_grp[8*i:8*(i+1)]) for i in range(8)})
+        self.comb += Case(pidx_rb[3:], {i: p8_grpb.eq(xword[64*i:64*(i+1)]) for i in range(16)})
+        self.comb += Case(pidx_rb[:3], {i: p8_axb.eq(p8_grpb[8*i:8*(i+1)]) for i in range(8)})
         is_axpy = Signal()
         self.comb += is_axpy.eq(self.kind == KIND_OP_AXPY)
-        q8_lanes = []
+        q8_lanes  = []
+        q8_lanesb = []
         for j in range(32):
             w_j = Signal((8, True))
             x_j = Signal((8, True))
@@ -256,6 +279,15 @@ class BonsaiChannelPipe(LiteXModule):
             r = Signal((16, True))
             self.sync += If(v1, r.eq(p))
             q8_lanes.append(r)
+            xb_j = Signal((8, True))
+            pb   = Signal((16, True))
+            self.comb += [
+                xb_j.eq(Mux(is_axpy, p8_axb, xsliceb[8*j:8*j+8])),
+                pb.eq(w_j*xb_j),
+            ]
+            rb = Signal((16, True))
+            self.sync += If(v1 & self.qn, rb.eq(pb))
+            q8_lanesb.append(rb)
 
         # Scale fp16: mux halfword out of the scale word (registered at T1 for use at T2+).
         scale_word_r = Signal(256)
@@ -290,10 +322,22 @@ class BonsaiChannelPipe(LiteXModule):
             ax_shl.eq(Mux(ax_sh >= 0, Mux(ax_sh > 15, 15, ax_sh[:4]), 0)),
             ax_shr.eq(Mux(ax_sh < 0, Mux(ax_sh < ax_c31n, 31, (-ax_sh)[:5]), 0)),
         ]
+        # Head B (dual-Q): its own pre-shift (Rpre differs per head), same exponent path.
+        ax_sh2    = Signal((9, True))
+        ax_rpre2  = Signal((8, True))
+        ax_shl2   = Signal(4)
+        ax_shr2   = Signal(5)
+        self.comb += [
+            ax_rpre2.eq(self.rshift2),
+            ax_sh2.eq(ax_exp_s - 15 + ax_bias - ax_rpre2),
+            ax_shl2.eq(Mux(ax_sh2 >= 0, Mux(ax_sh2 > 15, 15, ax_sh2[:4]), 0)),
+            ax_shr2.eq(Mux(ax_sh2 < 0, Mux(ax_sh2 < ax_c31n, 31, (-ax_sh2)[:5]), 0)),
+        ]
         v2a    = _delay(self, v1, 1)              # Lane products valid (T2).
         v3a    = _delay(self, v1, 2)              # Shifted values valid (T3).
         g_ax2  = _delay(self, g_ax_r, 2)          # Beat group at T3.
-        ax_shifted = []
+        ax_shifted  = []
+        ax_shifted2 = []
         for j in range(32):
             sh_full = Signal((32, True))
             r       = Signal((32, True))
@@ -301,11 +345,20 @@ class BonsaiChannelPipe(LiteXModule):
                                                     q8_lanes[j] >> ax_shr))
             self.sync += If(v2a, r.eq(sh_full))
             ax_shifted.append(r)
+            sh_full2 = Signal((32, True))
+            r2       = Signal((32, True))
+            self.comb += sh_full2.eq(Mux(ax_sh2 >= 0, q8_lanesb[j] << ax_shl2,
+                                                      q8_lanesb[j] >> ax_shr2))
+            self.sync += If(v2a & self.qn, r2.eq(sh_full2))
+            ax_shifted2.append(r2)
 
         AX_GROUPS = 4 # head_dim <= 128 for AXPY ops (kvpack contract).
         acc_ax = [[Signal((32, True), name=f"axacc{g}_{j}") for j in range(32)]
                   for g in range(AX_GROUPS)]
         acc_flat = Array([acc_ax[g][j] for g in range(AX_GROUPS) for j in range(32)])
+        acc_ax2 = [[Signal((32, True), name=f"axacc2_{g}_{j}") for j in range(32)]
+                   for g in range(AX_GROUPS)]
+        acc2_flat = Array([acc_ax2[g][j] for g in range(AX_GROUPS) for j in range(32)])
 
         # Final-beat tag: last code beat of the last row, aligned to the accumulate stage.
         fin_t0  = Signal()
@@ -318,10 +371,12 @@ class BonsaiChannelPipe(LiteXModule):
         # stage retires 8 partials/cycle instead of 1. d_cnt counts 8-lane groups.
         self.comb += d_total.eq(Cat(C(0, 2), self.code_beats[:3])) # code_beats * 4 = cols/8.
         self.ax_fsm = ax_fsm = FSM(reset_state="AX_IDLE")
-        drain_val = Signal()
+        drain_val  = Signal()
+        drain_head = Signal() # Dual-Q: drain bank A fully, then bank B.
         ax_fsm.act("AX_IDLE",
             If(self.start & (self.kind == KIND_OP_AXPY),
                 NextValue(d_cnt, 0),
+                NextValue(drain_head, 0),
                 If(self.rows == 0,
                     NextState("AX_DRAIN"), # No rows on this channel: emit zero partials.
                 ).Else(
@@ -339,7 +394,13 @@ class BonsaiChannelPipe(LiteXModule):
             If(out_fifo_rdy_ax,
                 NextValue(d_cnt, d_cnt + 1),
                 If(d_cnt == d_total - 1,
-                    NextState("AX_IDLE"),
+                    If(self.qn & ~drain_head,
+                        NextValue(drain_head, 1),
+                        NextValue(d_cnt, 0),
+                    ).Else(
+                        NextValue(drain_head, 0),
+                        NextState("AX_IDLE"),
+                    )
                 )
             )
         )
@@ -347,21 +408,32 @@ class BonsaiChannelPipe(LiteXModule):
         self.sync += [
             If(self.start,
                 *[acc_ax[g][j].eq(0) for g in range(AX_GROUPS) for j in range(32)],
+                *[acc_ax2[g][j].eq(0) for g in range(AX_GROUPS) for j in range(32)],
             ).Elif(v3a & (self.kind == KIND_OP_AXPY),
                 Case(g_ax2[:2], {g: [acc_ax[g][j].eq(acc_ax[g][j] + ax_shifted[j])
                                      for j in range(32)] for g in range(AX_GROUPS)}),
+                If(self.qn,
+                    Case(g_ax2[:2], {g: [acc_ax2[g][j].eq(acc_ax2[g][j] + ax_shifted2[j])
+                                         for j in range(32)] for g in range(AX_GROUPS)}),
+                )
             ),
         ]
 
         # T2..: adder trees (both built; result muxed by kind). -----------------------------------
         tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
         q8_sum,   q8_regs   = _adder_tree(self, q8_lanes)   # 5 levels -> 21b, n regs.
+        q8_sumb,  q8_regsb  = _adder_tree(self, q8_lanesb)  # Head B (dual-Q).
         n_tree = max(tern_regs, q8_regs)
         tern_sum = _delay(self, tern_sum, n_tree - tern_regs)
         q8_sum   = _delay(self, q8_sum,   n_tree - q8_regs)
+        q8_sumb  = _delay(self, q8_sumb,  n_tree - q8_regsb)
 
-        gs = Signal((22, True))
-        self.comb += gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum))
+        gs  = Signal((22, True))
+        gsb = Signal((22, True))
+        self.comb += [
+            gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum)),
+            gsb.eq(q8_sumb),
+        ]
 
         # Align tags and scale with the tree output. Lanes are registered on v1 (valid T2),
         # the tree adds n_tree stages -> gs valid at T{2+n_tree}. v1 is high at T1, so tags
@@ -398,6 +470,7 @@ class BonsaiChannelPipe(LiteXModule):
 
         # T+1: product (DSP). ---------------------------------------------------------------------
         prod   = Signal((34, True))
+        prod2  = Signal((34, True)) # Head B (dual-Q Q8): shares the row scale.
         bias_s = Signal((8, True)) # Signed copy of B: signed-only arithmetic for sh_r.
         sh_r   = Signal((8, True)) # 12 - (e16 + B) in [0, 44].
         v3     = Signal()
@@ -406,6 +479,7 @@ class BonsaiChannelPipe(LiteXModule):
         self.comb += bias_s.eq(self.bias)
         self.sync += [
             prod.eq(gs*m11),
+            prod2.eq(gsb*m11),
             sh_r.eq(12 - e16 - bias_s),
             v3.eq(v2),
             row3.eq(row2),
@@ -413,7 +487,8 @@ class BonsaiChannelPipe(LiteXModule):
         ]
 
         # T+2: shift to accumulator scale (contribution = prod << (e16+B), via <<12 then >>). -----
-        contrib = Signal((46, True))
+        contrib  = Signal((46, True))
+        contrib2 = Signal((46, True))
         v4      = Signal()
         row4    = Signal(16)
         rlast4  = Signal()
@@ -421,32 +496,53 @@ class BonsaiChannelPipe(LiteXModule):
         self.comb += shamt.eq(Mux(sh_r > 45, 45, sh_r)) # >>45 of a 46-bit value = sign only.
         self.sync += [
             contrib.eq((prod << 12) >> shamt),
+            contrib2.eq((prod2 << 12) >> shamt),
             v4.eq(v3),
             row4.eq(row3),
             rlast4.eq(rlast3),
         ]
 
         # T+3: 48-bit accumulate; emit on row_last. -----------------------------------------------
-        acc     = Signal((48, True))
-        acc_new = Signal((48, True))
-        result  = Signal((48, True))
+        acc      = Signal((48, True))
+        acc_new  = Signal((48, True))
+        result   = Signal((48, True))
+        acc2     = Signal((48, True))
+        acc2_new = Signal((48, True))
+        result2  = Signal((48, True))
         self.comb += [
             acc_new.eq(acc + contrib),
             result.eq(acc_new >> self.rshift),
+            acc2_new.eq(acc2 + contrib2),
+            result2.eq(acc2_new >> self.rshift), # Scores share R across the head pair.
         ]
 
-        out_fifo = stream.SyncFIFO([("row", 16), ("data", 32)], out_fifo_depth)
+        out_fifo = stream.SyncFIFO([("row", 16), ("data", 32), ("head", 1)], out_fifo_depth)
         # AXPY wide-drain FIFO: 8 accumulators per entry (one full beat). Matvec and AXPY
         # entries never interleave (drain runs only in AXPY mode, row-last pushes only in
         # matvec kinds), so the source muxes by kind.
-        axw_fifo = stream.SyncFIFO([("row", 16), ("data", 256)], 4)
+        axw_fifo = stream.SyncFIFO([("row", 16), ("data", 256), ("head", 1)], 4)
         self.submodules += out_fifo, axw_fifo
 
+        # Dual-Q: head B's result is staged one cycle behind head A's push (rows are >= 2
+        # beats apart, so the slot is always free before the next row-last).
+        pendb_v   = Signal()
+        pendb_row = Signal(16)
+        pendb_dat = Signal(32)
         self.sync += [
             If(self.start,
                 acc.eq(0),
+                acc2.eq(0),
+                pendb_v.eq(0),
             ).Elif(v4,
                 acc.eq(Mux(rlast4, 0, acc_new)),
+                acc2.eq(Mux(rlast4, 0, acc2_new)),
+                If(rlast4 & self.qn & (self.kind == KIND_OP_Q8),
+                    pendb_v.eq(1),
+                    pendb_row.eq(row4),
+                    pendb_dat.eq(result2[:32]),
+                )
+            ).Elif(pendb_v,
+                pendb_v.eq(0),
             ),
             If(self.start,
                 self.overflow.eq(0),
@@ -460,27 +556,36 @@ class BonsaiChannelPipe(LiteXModule):
             If(self.kind == KIND_OP_AXPY,
                 axw_fifo.sink.valid.eq(drain_val),
                 axw_fifo.sink.row.eq(Cat(C(0, 3), d_cnt)), # First lane index = d_cnt*8.
-                axw_fifo.sink.data.eq(Cat(*[acc_flat[(d_cnt << 3) + i][0:32]
-                                            for i in range(8)])),
+                axw_fifo.sink.head.eq(drain_head),
+                axw_fifo.sink.data.eq(Mux(drain_head,
+                    Cat(*[acc2_flat[(d_cnt << 3) + i][0:32] for i in range(8)]),
+                    Cat(*[acc_flat[(d_cnt << 3) + i][0:32] for i in range(8)]))),
+            ).Elif(pendb_v,
+                out_fifo.sink.valid.eq(1),
+                out_fifo.sink.row.eq(pendb_row),
+                out_fifo.sink.data.eq(pendb_dat),
+                out_fifo.sink.head.eq(1),
             ).Else(
                 out_fifo.sink.valid.eq(v4 & rlast4),
                 out_fifo.sink.row.eq(row4),
                 out_fifo.sink.data.eq(result[:32]),
             ),
             out_fifo_rdy_ax.eq(axw_fifo.sink.ready),
-            # 4 slots of slack cover results already in flight (T+0..T+3 stages, rows are
-            # >= 2 beats so at most 3 row-lasts can be inside the pipeline when intake stops).
-            out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 4)),
+            # 8 slots of slack cover in-flight results (<= 3 row-lasts in the T+0..T+3
+            # stages, x2 for the dual-Q staged head-B pushes).
+            out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 8)),
             If(self.kind == KIND_OP_AXPY,
                 self.source.valid.eq(axw_fifo.source.valid),
                 self.source.row.eq(axw_fifo.source.row),
                 self.source.data.eq(axw_fifo.source.data),
+                self.source.head.eq(axw_fifo.source.head),
                 self.source.wide.eq(1),
                 axw_fifo.source.ready.eq(self.source.ready),
             ).Else(
                 self.source.valid.eq(out_fifo.source.valid),
                 self.source.row.eq(out_fifo.source.row),
                 self.source.data.eq(out_fifo.source.data),
+                self.source.head.eq(out_fifo.source.head),
                 out_fifo.source.ready.eq(self.source.ready),
             ),
         ]

@@ -20,9 +20,11 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
                3 = k(prev vec res6) = max(0, bitlen(res6) - 14) (norm shift from a
                    reduce_acc absmax result).
   engine: w1 = kind | ilv<<8 | supw<<9 | rshift_rpre<<10 (rshift taken from
-          rpre(prev vec res6) instead of w7);  w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;
-          w5 = wlen;  w6 = sbeats | cbeats<<8;  w7 = bias | rshift<<16;  w8 = xsrc;
-          w9 = dst;  w10 = chan.
+          rpre(prev vec res6) instead of w7) | qn<<11 (dual-Q GQA);
+          w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;  w5 = wlen;
+          w6 = sbeats | cbeats<<8 | qstride<<16 (head-B result offset, words);
+          w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
+          w8 = xsrc;  w9 = dst;  w10 = chan.
   vec:    w1 = pc;  w2..w9 = args 0..7.
 
 Numerics are UNCHANGED - sequencing is transparent; the golden mirrors need no update.
@@ -67,6 +69,9 @@ class BonsaiSequencer(LiteXModule):
         self.eng_rem    = Signal(5)
         self.eng_ilv    = Signal()
         self.eng_supw   = Signal()
+        self.eng_qn      = Signal()
+        self.eng_qstride = Signal(16)
+        self.eng_rshift2 = Signal(6)
         self.eng_done   = Signal()   # From the engine (pulse).
         self.absmax     = Signal(32) # From the engine tracker.
 
@@ -155,6 +160,9 @@ class BonsaiSequencer(LiteXModule):
             self.eng_cbeats.eq(w(0, 6)[8:16]),
             self.eng_bias.eq(w(0, 7)[0:7]),
             self.eng_rshift.eq(Mux(w(0, 1)[10], rpre_v[0:6], w(0, 7)[16:22])),
+            self.eng_qn.eq(w(0, 1)[11]),
+            self.eng_qstride.eq(w(0, 6)[16:32]),
+            self.eng_rshift2.eq(w(0, 7)[22:28]),
             self.eng_xsrc.eq(w(1, 8)[0:24]),
             self.eng_dst.eq(w(1, 9)[0:24]),
             self.eng_chan.eq(w(1, 10)[0:5]),
