@@ -9,14 +9,16 @@
 Bit-exact contract: the asm.py INTERPRETER is the golden model - this RTL must produce
 identical scratchpad contents and scalar results for the same binary and arguments.
 
-Implementation: uniform 3-cycle instructions (FETCH -> EX1 -> EX2) - trivial to verify,
+Implementation: uniform 4-cycle instructions (FETCH -> FETCHR -> EX1 -> EX2) - trivial to
 and still >100x faster than the soft-float CPU paths it replaces (~40k cycles for a
 6144-element silu_mul). 16 lanes x int32 (8 vregs as flat 512-bit signals), 8 x 48-bit
 scalars, one hardware loop, Q15 LUT ops with x16-replicated dual-entry ROMs.
 
 Cycle contract per instruction:
-  FETCH: imem_r.adr = pc (data valid during EX1).
-  EX1  : decode from imem_r.dat_r; scratchpad read launch (sp_rd_adr from S[sa]); LUT ROM
+  FETCH : imem_r.adr = pc (data valid during FETCHR).
+  FETCHR: instruction captured into a register (BRAM-output decode was the hardware
+          critical path).
+  EX1   : decode from the registered instruction; scratchpad read launch; LUT ROM
          addresses launch (from V[va]); multiplier capture; instr registered.
   EX2  : all effects: vreg writeback, scalar updates, address post-increment, store port
          drive, pc update (loop/done).
@@ -125,11 +127,15 @@ class BonsaiVectorUnit(LiteXModule):
         V = Array([Signal(32*LANES, name=f"vr{i}") for i in range(8)])
         S = Array([Signal((48, True), name=f"sr{i}") for i in range(8)])
 
-        # Decode: fields from imem output during EX1, from the registered copy during EX2.
+        # Decode: EX1 reads the FETCHR-registered instruction (decoding straight off the
+        # imem BRAM output was the worst timing path on hardware: BRAM clock-to-out +
+        # decode + wide register-file CE fanout, ~10ns route-dominated). EX2 uses the
+        # EX1-registered copy as before.
+        insn_f  = Signal(32)
         instr_r = Signal(32)
         in_ex1  = Signal()
         cur     = Signal(32)
-        self.comb += cur.eq(Mux(in_ex1, imem_r.dat_r, instr_r))
+        self.comb += cur.eq(Mux(in_ex1, insn_f, instr_r))
 
         f_op  = Signal(6)
         f_vd  = Signal(3)
@@ -435,13 +441,19 @@ class BonsaiVectorUnit(LiteXModule):
             )
         )
         fsm.act("FETCH",
+            NextState("FETCHR"), # imem data valid next cycle; captured into insn_f.
+        )
+        fsm.act("FETCHR",
             NextState("EX1"),
         )
         fsm.act("EX1",
             in_ex1.eq(1),
             NextState("EX2"),
         )
-        self.sync += If(in_ex1, instr_r.eq(imem_r.dat_r))
+        self.sync += [
+            If(fsm.ongoing("FETCHR"), insn_f.eq(imem_r.dat_r)),
+            If(in_ex1, instr_r.eq(insn_f)),
+        ]
 
         fsm.act("EX2",
             # Store port drive.
