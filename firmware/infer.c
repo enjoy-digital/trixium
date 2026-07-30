@@ -840,6 +840,385 @@ static void seq_build_attn2(void)
 }
 #endif
 
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
+// One layer of dual-Q sequencer attention (S3): shared by forward() and
+// forward_pair(). Fills aw_c[] and raises *aw_hmax.
+static void attn_seq2_layer(int l, int pos, float *aw_c, float *aw_hmax)
+{
+    int n_rep = n_head/n_kv_head;
+    // S3 dual-Q path: one K stream scores both sibling heads, one V stream feeds
+    // both AXPYs - halves the KV restream of GQA. Two list runs per layer with a
+    // CPU Rpre patch between them; numerics identical to the single-head chain.
+    perf_enter(OP_SCORES);
+    int cnt  = pos + 1;
+    int padn = (16 - (cnt & 15)) & 15;
+    volatile int32_t *scA = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
+    volatile int32_t *scB = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SCB);
+    for (int i2 = 0; i2 < padn; i2++) {
+        scA[cnt + i2] = (int32_t)0x80000000;
+        scB[cnt + i2] = (int32_t)0x80000000;
+    }
+    uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
+    uint32_t wlen  = rows*kv_rb;
+    uint32_t rowsw = rows | (rem << 16);
+    int lg = 0;
+    while ((1 << lg) < head_dim) lg++;
+    uint32_t blocks = (uint32_t)(cnt + padn)/16;
+    uint32_t p8pad  = ((uint32_t)cnt + 31) & ~31u; // 32B-padded p8 vector size.
+    for (int k0 = 0; k0 < n_kv_head; k0 += seq_at2_kvchunk) {
+        int nk = n_kv_head - k0;
+        if (nk > seq_at2_kvchunk) nk = seq_at2_kvchunk;
+        for (int j = 0; j < nk; j++) {
+            int kvh = k0 + j, hA = 2*kvh, hB = hA + 1;
+            uint32_t d1 = (uint32_t)seq_at2_base + (uint32_t)j*seq_at2_p1dn;
+            int Bk, Rk;
+            kv_scores_br(l, kvh, 0, &Bk, &Rk);
+            int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
+            seq_patch(d1 + 0, 2, SP_Q + (uint32_t)hA*head_dim*2);
+            seq_patch(d1 + 1, 2, SP_Q + (uint32_t)hB*head_dim*2);
+            seq_patch(d1 + 2, 2, rowsw);
+            seq_patch(d1 + 2, 4, kv_region_addr(l, kvh, 0));
+            seq_patch(d1 + 2, 5, wlen);
+            seq_patch(d1 + 2, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
+            // p8 pool: per-kv-head buffers in the FFN scratch (dead here) so
+            // phase 2's AXPYs still see them after later heads' softmaxes ran.
+            uint32_t pbase = SP_G + (uint32_t)kvh*2*p8pad;
+            seq_patch(d1 + 3, 4, pbase);
+            seq_patch(d1 + 3, 5, blocks);
+            seq_patch(d1 + 3, 7, (uint32_t)(sigma + 6 + 11));
+            seq_patch(d1 + 4, 2, SP_A2P8 + (uint32_t)hA*32);
+            seq_patch(d1 + 5, 4, pbase + p8pad);
+            seq_patch(d1 + 5, 5, blocks);
+            seq_patch(d1 + 5, 7, (uint32_t)(sigma + 6 + 11));
+            seq_patch(d1 + 6, 2, SP_A2P8 + (uint32_t)hB*32);
+        }
+        seq_run((uint32_t)seq_at2_base, (uint32_t)nk*seq_at2_p1dn);
+        for (int j = 0; j < nk; j++) {
+            int kvh = k0 + j, hA = 2*kvh, hB = hA + 1;
+            uint32_t d2 = (uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n
+                          + (uint32_t)j*seq_at2_p2dn;
+            uint32_t P8a = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
+                                                  + (uint32_t)hA*32);
+            uint32_t P8b = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
+                                                  + (uint32_t)hB*32);
+            int Bv, Rd;
+            kv_scores_br(l, kvh, 1, &Bv, &Rd);
+            uint32_t Ra = (uint32_t)axpy_rpre_c(P8a ? P8a : 1);
+            uint32_t Rb = (uint32_t)axpy_rpre_c(P8b ? P8b : 1);
+            seq_patch(d2 + 0, 2, rowsw);
+            seq_patch(d2 + 0, 4, kv_region_addr(l, kvh, 1));
+            seq_patch(d2 + 0, 5, wlen);
+            seq_patch(d2 + 0, 7, (uint32_t)Bv | (Ra << 16) | (Rb << 22));
+            seq_patch(d2 + 0, 8, SP_G + (uint32_t)kvh*2*p8pad);
+            seq_patch(d2 + n_ch, 2, SP_A2AM + (uint32_t)hA*32);
+            seq_patch(d2 + n_ch + 1, 4, SP_H + (uint32_t)hA*head_dim*2);
+            seq_patch(d2 + 2*n_ch + 1, 2, SP_A2AM + (uint32_t)hB*32);
+            seq_patch(d2 + 2*n_ch + 2, 4, SP_H + (uint32_t)hB*head_dim*2);
+            (void)Rd;
+        }
+        seq_run((uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n,
+                (uint32_t)nk*seq_at2_p2dn);
+    }
+    perf_exit(OP_SCORES);
+    perf_enter(OP_WV);
+    for (int hh = 0; hh < n_head; hh++) {
+        int kvh = hh/n_rep;
+        uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
+                                             + (uint32_t)hh*32);
+        uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2AM
+                                             + (uint32_t)hh*32);
+        int Bv, Rd;
+        kv_scores_br(l, kvh, 1, &Bv, &Rd);
+        int Rpre = axpy_rpre_c(P8 ? P8 : 1);
+        int k2 = 0;
+        while ((am >> k2) > 16383u) k2++;
+        float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), Rpre - Bv + k2);
+        aw_c[hh] = c2;
+        float hm2 = (float)(am >> k2)*c2;
+        if (hm2 > (*aw_hmax)) (*aw_hmax) = hm2;
+        (void)Rd;
+    }
+    perf_exit(OP_WV);
+}
+
+#endif
+
+// Speculative-decode state: successor draft table + acceptance counters (the
+// counters exist on every build; the machinery only under the full-HW guard).
+static int       spec_on, spec_acc, spec_rej;
+static uint16_t *spec_succ;
+static uint8_t  *spec_succ_v;
+
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
+    && defined(BONSAI_HAS_TOPK)
+// S6 speculative decode: forward TWO positions through ONE weight stream per matvec
+// (dual-x ternary, model_matvec2). Positions are independent along the residual; the only
+// coupling is attention, which runs per position in-order (store KV p0 -> attn p0 ->
+// store KV p1 -> attn p1) so each position's Bk/Rk view matches the non-speculative
+// mirror exactly. Greedy speculation is lossless: accepted streams are token-identical
+// to plain decode, so the existing gate references validate this path.
+//
+// Per-position regions: residual XR + p*0x1000; x8 pairs contiguous at SP_X (+p*width);
+// matvec results A/B at dst + p*4*rows; SP_Q/SP_K staging halves; V p1 staged in the
+// KV-pack region; FFN G/U halves; SP_D halves. kv_ekmax entries touched by p1's stores
+// are captured per layer for exact rollback on draft rejection.
+// Undo records: (index, value) pairs.
+static int     ek_undo_n;
+static int16_t ek_undo_idx[64*8*2];
+static int8_t  ek_undo_val[64*8*2];
+static void ek_capture(int l)
+{
+    for (int h = 0; h < n_kv_head; h++)
+        for (int k = 0; k < 2; k++) {
+            int idx = kv_ek_idx(l, h, k);
+            ek_undo_idx[ek_undo_n] = (int16_t)idx;
+            ek_undo_val[ek_undo_n] = kv_ekmax[idx];
+            ek_undo_n++;
+        }
+}
+static void ek_restore(void)
+{
+    for (int i = 0; i < ek_undo_n; i++)
+        kv_ekmax[ek_undo_idx[i]] = ek_undo_val[i];
+    ek_undo_n = 0;
+}
+
+// Forward positions n_pos (token t0) and n_pos+1 (token t1); returns argmaxes for both.
+// Returns 0 on success, -1 if the argmax tap hit a padding row (caller falls back).
+static int forward_pair(int t0, int t1, int *am0, int *am1)
+{
+    const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
+    const struct bons_entry *rt  = model_entry_kind(ROLE_ROPE_TAB, 0, KIND_NORM16);
+    int   kv_dim = n_kv_head*head_dim;
+    int   q_dim  = n_head*head_dim;
+    int   pos    = n_pos;
+    int   ex_st[2];
+    float aw_cp[2][32];
+    uint32_t xr[2]  = {SP_XR, SP_XR + 0x1000};
+    uint32_t vst[2] = {SP_V, SP_KVP + 0x1000};
+    ek_undo_n = 0;
+
+    perf_enter(OP_EMBED);
+    ex_st[0] = embed_row_bfp(emb, t0, xr[0]);
+    ex_st[1] = embed_row_bfp(emb, t1, xr[1]);
+    perf_exit(OP_EMBED);
+
+    for (int l = 0; l < n_layer; l++) {
+        const struct bons_entry *eqt = model_entry(ROLE_ATTN_Q, l);
+        const struct bons_entry *ekt = model_entry(ROLE_ATTN_K, l);
+        const struct bons_entry *evt = model_entry(ROLE_ATTN_V, l);
+        // Attention rmsnorm + quant8 per position -> x8 pair.
+        for (int p = 0; p < 2; p++) {
+            perf_enter(OP_RMSNORM);
+            op_rmsnorm_sp(xr[p], ex_st[p], attn_norm[l],
+                          model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16), n_embd, SP_H);
+            perf_exit(OP_RMSNORM);
+            perf_enter(OP_QUANT8);
+            op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
+            perf_exit(OP_QUANT8);
+        }
+        // q/k/v: one weight stream each, both positions.
+        perf_enter(OP_NORM_I32);
+        int eq_r[2], ek_r[2], ev_r[2];
+        model_matvec2(eqt, SP_X, SP_Y, (uint16_t)eqt->rows);
+        for (int p = 0; p < 2; p++) {
+            int kq = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eqt->rows,
+                                    SP_Q + (uint32_t)p*q_dim*2, q_dim);
+            eq_r[p] = (E_NORM + 8) - (int)eqt->bias + (int)eqt->rshift + kq;
+        }
+        model_matvec2(ekt, SP_X, SP_Y, (uint16_t)ekt->rows);
+        for (int p = 0; p < 2; p++) {
+            int kk = op_norm_i32_sp(SP_Y + (uint32_t)p*4*ekt->rows,
+                                    SP_K + (uint32_t)p*kv_dim*2, kv_dim);
+            ek_r[p] = (E_NORM + 8) - (int)ekt->bias + (int)ekt->rshift + kk;
+        }
+        model_matvec2(evt, SP_X, SP_Y, (uint16_t)evt->rows);
+        for (int p = 0; p < 2; p++) {
+            int kv2 = op_norm_i32_sp(SP_Y + (uint32_t)p*4*evt->rows, vst[p], kv_dim);
+            ev_r[p] = (E_NORM + 8) - (int)evt->bias + (int)evt->rshift + kv2;
+        }
+        perf_exit(OP_NORM_I32);
+        // qk-norm weight rows (shared by both positions).
+        const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
+        const struct bons_entry *kn16 = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
+        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + qn16->chan_base_beats*32,
+                     qn16->chan_len_beats, SP_FET);
+        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
+                     kn16->chan_len_beats, SP_FET2);
+        uint32_t rb = (2u*head_dim + 31)/32;
+        float aw_hmaxp[2] = {0, 0};
+        int   ea8p[2] = {0, 0};
+        for (int p = 0; p < 2; p++) {
+            // Stage this position's K into SP_K[0..) and V into SP_V (the qkr list and
+            // kv-pack operate on the fixed regions).
+            if (p == 1) {
+                volatile uint32_t *d = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_K);
+                volatile uint32_t *s2 = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_K
+                                                              + (uint32_t)kv_dim*2);
+                for (int i = 0; i < kv_dim/2; i++) d[i] = s2[i];
+                volatile uint32_t *dv = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_V);
+                volatile uint32_t *sv = (volatile uint32_t *)(SCRATCHPAD_BASE + vst[1]);
+                for (int i = 0; i < kv_dim/2; i++) dv[i] = sv[i];
+                volatile uint32_t *dq = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_Q);
+                volatile uint32_t *sq = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_Q
+                                                              + (uint32_t)q_dim*2);
+                for (int i = 0; i < q_dim/2; i++) dq[i] = sq[i];
+            }
+            perf_enter(OP_QKNORM);
+            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE
+                            + (rt->chan_base_beats + (uint64_t)(pos + p)*rb)*32,
+                         rb, SP_TAB);
+            int epq = seq_eps_int(eq_r[p]), epk = seq_eps_int(ek_r[p]);
+            for (int hh = 0; hh < n_head + n_kv_head; hh++)
+                seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
+            seq_run(0, seq_qkr_count);
+            perf_exit(OP_QKNORM);
+            perf_enter(OP_KVQUANT);
+            if (p == 1)
+                ek_capture(l);
+            for (int hh = 0; hh < n_kv_head; hh++) {
+                kv_store_row_res(l, hh, 0, pos + p, SP_K + hh*head_dim*2, E_NORM);
+                kv_store_row_res(l, hh, 1, pos + p, SP_V + hh*head_dim*2, ev_r[p]);
+            }
+            perf_exit(OP_KVQUANT);
+            attn_seq2_layer(l, pos + p, aw_cp[p], &aw_hmaxp[p]);
+            // Head outputs -> int8 at the position's x8 slot.
+            perf_enter(OP_QUANT8);
+            int ea8 = 0;
+            if (aw_hmaxp[p] > 0) { frexpf(aw_hmaxp[p], &ea8); ea8 -= 7; }
+            for (int hh = 0; hh < n_head; hh++) {
+                int32_t Mh = (int32_t)lroundf(ldexpf(aw_cp[p][hh], 15 - ea8));
+                if (Mh > 32767) Mh = 32767;
+                if (Mh < 0)     Mh = 0;
+                int32_t sa2[5] = {(int32_t)(SP_H + hh*head_dim*2), 0,
+                                  (int32_t)(SP_X + 0x800 + (uint32_t)p*q_dim
+                                            + hh*head_dim),
+                                  head_dim/16, Mh};
+                vec_run(PROG_SCALE8, sa2, 5);
+            }
+            perf_exit(OP_QUANT8);
+            ea8p[p] = ea8;
+        }
+        // Output projection: one stream, both positions.
+        {
+            const struct bons_entry *eo = model_entry(ROLE_ATTN_OUT, l);
+            // x pair sits above the attention scratch (position 1's head quant8 writes
+            // SP_X[0, head_dim) while position 0's staged vector must survive).
+            model_matvec2(eo, SP_X + 0x800, SP_Y, (uint16_t)eo->rows);
+            for (int p = 0; p < 2; p++) {
+                perf_enter(OP_NORM_I32);
+                int kk = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eo->rows,
+                                        SP_D + (uint32_t)p*n_embd*2, n_embd);
+                perf_exit(OP_NORM_I32);
+                int ed = ea8p[p] - (int)eo->bias + (int)eo->rshift + kk;
+                perf_enter(OP_RESID_ADD);
+                ex_st[p] = op_resid_add_sp(xr[p], ex_st[p],
+                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd);
+                perf_exit(OP_RESID_ADD);
+            }
+        }
+        // FFN: norm/quant per position, gate/up/down shared streams.
+        {
+            const struct bons_entry *eg_t = model_entry(ROLE_FFN_GATE, l);
+            const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
+            const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
+            for (int p = 0; p < 2; p++) {
+                perf_enter(OP_RMSNORM);
+                op_rmsnorm_sp(xr[p], ex_st[p], ffn_norm[l],
+                              model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16), n_embd, SP_H);
+                perf_exit(OP_RMSNORM);
+                perf_enter(OP_QUANT8);
+                op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
+                perf_exit(OP_QUANT8);
+            }
+            int ex8 = E_NORM + 8;
+            int eg[2], eu[2];
+            model_matvec2(eg_t, SP_X, SP_Y, (uint16_t)eg_t->rows);
+            perf_enter(OP_NORM_I32);
+            for (int p = 0; p < 2; p++) {
+                int kg = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eg_t->rows,
+                                        SP_G + (uint32_t)p*ffn_dim*2, ffn_dim);
+                eg[p] = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
+            }
+            perf_exit(OP_NORM_I32);
+            model_matvec2(eu_t, SP_X, SP_YU, (uint16_t)eu_t->rows);
+            perf_enter(OP_NORM_I32);
+            for (int p = 0; p < 2; p++) {
+                int ku = op_norm_i32_sp(SP_YU + (uint32_t)p*4*eu_t->rows,
+                                        SP_U + (uint32_t)p*ffn_dim*2, ffn_dim);
+                eu[p] = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
+            }
+            perf_exit(OP_NORM_I32);
+            int es8[2];
+            for (int p = 0; p < 2; p++) {
+                perf_enter(OP_SILU_MUL);
+                op_silu_mul_sp(SP_G + (uint32_t)p*ffn_dim*2, eg[p],
+                               SP_U + (uint32_t)p*ffn_dim*2, eu[p], ffn_dim);
+                perf_exit(OP_SILU_MUL);
+                perf_enter(OP_QUANT8);
+                op_quant8_sp(SP_G + (uint32_t)p*ffn_dim*2,
+                             SP_X + (uint32_t)p*ffn_dim, ffn_dim);
+                perf_exit(OP_QUANT8);
+                es8[p] = eg[p] + eu[p] + 15 + 8;
+            }
+            model_matvec2(ed_t, SP_X, SP_Y, (uint16_t)ed_t->rows);
+            for (int p = 0; p < 2; p++) {
+                perf_enter(OP_NORM_I32);
+                int kd = op_norm_i32_sp(SP_Y + (uint32_t)p*4*ed_t->rows,
+                                        SP_D + (uint32_t)p*n_embd*2, n_embd);
+                perf_exit(OP_NORM_I32);
+                int ed = es8[p] - (int)ed_t->bias + (int)ed_t->rshift + kd;
+                perf_enter(OP_RESID_ADD);
+                ex_st[p] = op_resid_add_sp(xr[p], ex_st[p],
+                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd);
+                perf_exit(OP_RESID_ADD);
+            }
+        }
+    }
+    n_pos += 2;
+
+    // Final norm + LM head per position (argmax tap; vocab-padding edge bails out).
+    const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
+    if (!head)
+        head = model_entry(ROLE_TOK_EMB, 0);
+    uint32_t rpc  = head->rows/n_ch;
+    uint32_t hrb  = bons_row_beats(head->cols, head->kind, head->group);
+    int am[2];
+    for (int p = 0; p < 2; p++) {
+        perf_enter(OP_RMSNORM);
+        op_rmsnorm_sp(xr[p], ex_st[p], out_norm,
+                      model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16), n_embd, SP_H);
+        perf_exit(OP_RMSNORM);
+        perf_enter(OP_QUANT8);
+        op_quant8_sp(SP_H, SP_X, n_embd);
+        perf_exit(OP_QUANT8);
+        perf_enter(OP_LMHEAD);
+        struct engine_op op = {0};
+        op.kind   = ENGINE_KIND_TERNARY;
+        op.rows   = rpc;
+        op.cols   = head->cols;
+        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + head->chan_base_beats*32;
+        op.wlen   = rpc*hrb;
+        op.sbeats = bons_scale_beats(head->cols, head->group);
+        op.cbeats = bons_code_beats(head->cols, head->kind);
+        op.bias   = head->bias;
+        op.rshift = head->rshift;
+        op.xsrc   = SP_X;
+        op.dst    = SP_Y;
+        op.supw   = 1;
+        engine_run(&op);
+        uint32_t idx = engine_csr_argmax_idx_read();
+        perf_exit(OP_LMHEAD);
+        if (idx >= H->vocab)
+            return -1;
+        am[p] = (int)idx;
+    }
+    *am0 = am[0];
+    *am1 = am[1];
+    return 0;
+}
+#endif
+
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
 static int forward(int token, int want_logits)
@@ -1017,99 +1396,7 @@ attn_scores: ;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
         if (attn_hw && seq_at2_kvchunk > 0
             && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
-            // S3 dual-Q path: one K stream scores both sibling heads, one V stream feeds
-            // both AXPYs - halves the KV restream of GQA. Two list runs per layer with a
-            // CPU Rpre patch between them; numerics identical to the single-head chain.
-            perf_enter(OP_SCORES);
-            int cnt  = pos + 1;
-            int padn = (16 - (cnt & 15)) & 15;
-            volatile int32_t *scA = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
-            volatile int32_t *scB = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SCB);
-            for (int i2 = 0; i2 < padn; i2++) {
-                scA[cnt + i2] = (int32_t)0x80000000;
-                scB[cnt + i2] = (int32_t)0x80000000;
-            }
-            uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
-            uint32_t wlen  = rows*kv_rb;
-            uint32_t rowsw = rows | (rem << 16);
-            int lg = 0;
-            while ((1 << lg) < head_dim) lg++;
-            uint32_t blocks = (uint32_t)(cnt + padn)/16;
-            uint32_t p8pad  = ((uint32_t)cnt + 31) & ~31u; // 32B-padded p8 vector size.
-            for (int k0 = 0; k0 < n_kv_head; k0 += seq_at2_kvchunk) {
-                int nk = n_kv_head - k0;
-                if (nk > seq_at2_kvchunk) nk = seq_at2_kvchunk;
-                for (int j = 0; j < nk; j++) {
-                    int kvh = k0 + j, hA = 2*kvh, hB = hA + 1;
-                    uint32_t d1 = (uint32_t)seq_at2_base + (uint32_t)j*seq_at2_p1dn;
-                    int Bk, Rk;
-                    kv_scores_br(l, kvh, 0, &Bk, &Rk);
-                    int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
-                    seq_patch(d1 + 0, 2, SP_Q + (uint32_t)hA*head_dim*2);
-                    seq_patch(d1 + 1, 2, SP_Q + (uint32_t)hB*head_dim*2);
-                    seq_patch(d1 + 2, 2, rowsw);
-                    seq_patch(d1 + 2, 4, kv_region_addr(l, kvh, 0));
-                    seq_patch(d1 + 2, 5, wlen);
-                    seq_patch(d1 + 2, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
-                    // p8 pool: per-kv-head buffers in the FFN scratch (dead here) so
-                    // phase 2's AXPYs still see them after later heads' softmaxes ran.
-                    uint32_t pbase = SP_G + (uint32_t)kvh*2*p8pad;
-                    seq_patch(d1 + 3, 4, pbase);
-                    seq_patch(d1 + 3, 5, blocks);
-                    seq_patch(d1 + 3, 7, (uint32_t)(sigma + 6 + 11));
-                    seq_patch(d1 + 4, 2, SP_A2P8 + (uint32_t)hA*32);
-                    seq_patch(d1 + 5, 4, pbase + p8pad);
-                    seq_patch(d1 + 5, 5, blocks);
-                    seq_patch(d1 + 5, 7, (uint32_t)(sigma + 6 + 11));
-                    seq_patch(d1 + 6, 2, SP_A2P8 + (uint32_t)hB*32);
-                }
-                seq_run((uint32_t)seq_at2_base, (uint32_t)nk*seq_at2_p1dn);
-                for (int j = 0; j < nk; j++) {
-                    int kvh = k0 + j, hA = 2*kvh, hB = hA + 1;
-                    uint32_t d2 = (uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n
-                                  + (uint32_t)j*seq_at2_p2dn;
-                    uint32_t P8a = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
-                                                          + (uint32_t)hA*32);
-                    uint32_t P8b = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
-                                                          + (uint32_t)hB*32);
-                    int Bv, Rd;
-                    kv_scores_br(l, kvh, 1, &Bv, &Rd);
-                    uint32_t Ra = (uint32_t)axpy_rpre_c(P8a ? P8a : 1);
-                    uint32_t Rb = (uint32_t)axpy_rpre_c(P8b ? P8b : 1);
-                    seq_patch(d2 + 0, 2, rowsw);
-                    seq_patch(d2 + 0, 4, kv_region_addr(l, kvh, 1));
-                    seq_patch(d2 + 0, 5, wlen);
-                    seq_patch(d2 + 0, 7, (uint32_t)Bv | (Ra << 16) | (Rb << 22));
-                    seq_patch(d2 + 0, 8, SP_G + (uint32_t)kvh*2*p8pad);
-                    seq_patch(d2 + n_ch, 2, SP_A2AM + (uint32_t)hA*32);
-                    seq_patch(d2 + n_ch + 1, 4, SP_H + (uint32_t)hA*head_dim*2);
-                    seq_patch(d2 + 2*n_ch + 1, 2, SP_A2AM + (uint32_t)hB*32);
-                    seq_patch(d2 + 2*n_ch + 2, 4, SP_H + (uint32_t)hB*head_dim*2);
-                    (void)Rd;
-                }
-                seq_run((uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n,
-                        (uint32_t)nk*seq_at2_p2dn);
-            }
-            perf_exit(OP_SCORES);
-            perf_enter(OP_WV);
-            for (int hh = 0; hh < n_head; hh++) {
-                int kvh = hh/n_rep;
-                uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2P8
-                                                     + (uint32_t)hh*32);
-                uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_A2AM
-                                                     + (uint32_t)hh*32);
-                int Bv, Rd;
-                kv_scores_br(l, kvh, 1, &Bv, &Rd);
-                int Rpre = axpy_rpre_c(P8 ? P8 : 1);
-                int k2 = 0;
-                while ((am >> k2) > 16383u) k2++;
-                float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), Rpre - Bv + k2);
-                aw_c[hh] = c2;
-                float hm2 = (float)(am >> k2)*c2;
-                if (hm2 > aw_hmax) aw_hmax = hm2;
-                (void)Rd;
-            }
-            perf_exit(OP_WV);
+            attn_seq2_layer(l, pos, aw_c, &aw_hmax);
             goto attn_heads_done;
         }
         if (attn_hw && seq_attn_heads > 0
@@ -1639,9 +1926,32 @@ int infer_init(void)
     k_scale = halloc((uint64_t)n_layer*max_ctx*sizeof(float));
     v_scale = halloc((uint64_t)n_layer*max_ctx*sizeof(float));
     scores  = halloc(max_ctx*sizeof(float));
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
+    && defined(BONSAI_HAS_TOPK)
+    spec_succ   = halloc((uint64_t)H->vocab*2);
+    spec_succ_v = halloc(H->vocab);
+#endif
     n_pos   = 0;
     rope_init();
     return 0;
+}
+
+void infer_spec(int on)
+{
+    spec_on  = on;
+    spec_acc = spec_rej = 0;
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
+    && defined(BONSAI_HAS_TOPK)
+    if (on && spec_succ_v)
+        for (uint32_t i = 0; i < H->vocab; i++)
+            spec_succ_v[i] = 0;
+#endif
+}
+
+void infer_spec_stats(int *acc, int *rej)
+{
+    *acc = spec_acc;
+    *rej = spec_rej;
 }
 
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
@@ -1656,6 +1966,49 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
             break;
         emit(tok);
         count++;
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
+    && defined(BONSAI_HAS_TOPK)
+        // Speculative decode: draft the successor seen last time this token appeared;
+        // one dual-x pair-forward verifies the draft and computes the next token. On
+        // accept, two tokens per weight-stream pass. Greedy -> lossless (token stream
+        // identical to plain decode). Rejection restores the kv_ekmax entries the
+        // speculated position touched; its KV rows are overwritten by the re-forward.
+        if (spec_on && attn_all_hw() && seq_at2_kvchunk > 0 && spec_succ != 0
+            && n_pos + 2 <= max_ctx && i + 1 < max_new) {
+            int draft = spec_succ_v[tok] ? (int)spec_succ[tok] : -1;
+            if (draft >= 0) {
+                int am0 = -1, am1 = -1;
+                int save_pos = n_pos;
+                if (forward_pair(tok, draft, &am0, &am1) == 0) {
+                    if (am0 == draft) {
+                        spec_acc++;
+                        spec_succ[tok] = (uint16_t)draft; spec_succ_v[tok] = 1;
+                        emit(draft);
+                        count++; i++;
+                        spec_succ[draft] = (uint16_t)am1; spec_succ_v[draft] = 1;
+                        tok = am1;
+                        continue;
+                    }
+                    // Reject: keep position n_pos-2 (t0 accepted), drop the draft's.
+                    spec_rej++;
+                    ek_restore();
+                    n_pos = save_pos + 1;
+                    spec_succ[tok] = (uint16_t)am0; spec_succ_v[tok] = 1;
+                    tok = am0;
+                    continue;
+                }
+                n_pos = save_pos; // Padding-row bail: redo plainly.
+                ek_restore();
+            }
+        }
+        if (spec_on && spec_succ != 0) {
+            // Track successors even on the plain path so drafts warm up.
+            int nt = forward(tok, 1);
+            spec_succ[tok] = (uint16_t)nt; spec_succ_v[tok] = 1;
+            tok = nt;
+            continue;
+        }
+#endif
         tok = forward(tok, 1);
     }
     return count;

@@ -20,5 +20,7 @@ void model_info(void);
 
 // Run a ternary/q8 matvec for one tensor: x8 at scratchpad `xsrc`, int32 results at `dst`.
 void model_matvec(const struct bons_entry *e, uint32_t xsrc, uint32_t dst);
+void model_matvec2(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
+                   uint16_t qstride);
 
 #endif

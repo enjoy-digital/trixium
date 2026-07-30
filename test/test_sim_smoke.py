@@ -123,6 +123,17 @@ def test_sim_selftest_checksums():
     ref_hw    = hybrid_generate(img, [1, 2, 3], len(hw_tokens), modes={"silu_mul": "hw", "rmsnorm": "hw", "kv_hbm": "hw"})
     assert hw_tokens == ref_hw, f"HW-ops tokens {hw_tokens} != hw ref {ref_hw}"
 
+    # Speculative-decode leg (when built): greedy speculation is lossless, so tokens
+    # must equal the plain HW-ops reference at its length. SPEC counters just have to
+    # show the machinery ran (acc+rej >= 0; a hit is model-dependent).
+    msp = re.search(r"GEN-SP:((?: \d+)+)", out)
+    if msp:
+        sp_tokens = [int(t) for t in msp.group(1).split()]
+        ref_sp    = hybrid_generate(img, [1, 2, 3], len(sp_tokens),
+                                    modes={"silu_mul": "hw", "rmsnorm": "hw", "kv_hbm": "hw"})
+        assert sp_tokens == ref_sp, f"spec tokens {sp_tokens} != ref {ref_sp}"
+        assert re.search(r"SPEC acc=\d+ rej=\d+", out)
+
 def hybrid_generate(img, prompt, n_new, modes=None):
     """Python mirror of the firmware loop (resident-BFP): engine-bitexact matvecs,
     int16 scratchpad-resident activations with integer exponent algebra, float32 CPU op

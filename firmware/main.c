@@ -417,6 +417,20 @@ int main(void)
             infer_generate(prompt, 3, 2, emit_token);
             puts("\nGEN-HW DONE");
             perf_print();
+            // Speculative-decode leg: greedy spec is lossless, so the tokens must match
+            // the same references; the acc/rej counters show the machinery engaged.
+            infer_spec(1);
+            printf("GEN-SP:");
+            perf_reset();
+            infer_generate(prompt, 3, 6, emit_token);
+            puts("\nGEN-SP DONE");
+            {
+                int acc, rej;
+                infer_spec_stats(&acc, &rej);
+                printf("SPEC acc=%d rej=%d\n", acc, rej);
+            }
+            perf_print();
+            infer_spec(0);
             hwops_set_all(0);
         }
     }

@@ -75,3 +75,26 @@ void model_matvec(const struct bons_entry *e, uint32_t xsrc, uint32_t dst)
     op.dst    = dst;
     engine_run(&op);
 }
+
+// Dual-x matvec (S6 speculative decode): one weight stream, two x vectors (x2 at
+// xsrc + cols int8), second result block at dst + 4*qstride. rows must fit qstride.
+void model_matvec2(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
+                   uint16_t qstride)
+{
+    const struct bons_header *h = model_header();
+    struct engine_op op = {0};
+    op.kind    = (e->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
+    op.rows    = e->rows/h->n_channels;
+    op.cols    = e->cols;
+    op.wbase   = BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
+    op.wlen    = e->chan_len_beats;
+    op.sbeats  = bons_scale_beats(e->cols, e->group);
+    op.cbeats  = bons_code_beats(e->cols, e->kind);
+    op.bias    = e->bias;
+    op.rshift  = e->rshift;
+    op.xsrc    = xsrc;
+    op.dst     = dst;
+    op.qn      = 1;
+    op.qstride = qstride;
+    engine_run(&op);
+}
