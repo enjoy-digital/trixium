@@ -98,6 +98,9 @@ def test_matvec_ternary_n1():
 def test_matvec_ternary_n2():
     _case_ternary(n_channels=2, rows_per_chan=8, cols=256, latency=8, stall_rate=0, seed=2)
 
+def test_matvec_ternary_n4():
+    _case_ternary(n_channels=4, rows_per_chan=4, cols=256, latency=8, stall_rate=3, seed=7)
+
 def test_matvec_ternary_multi_scaleword():
     # cols=4096: 32 groups -> 2 scale beats/row, exercises scale-word switching + row parity.
     _case_ternary(n_channels=2, rows_per_chan=2, cols=4096, latency=16, stall_rate=5, seed=3)
@@ -349,8 +352,10 @@ def test_engine_store_roundtrip():
 def test_matvec_q8_striped_interleave():
     # Scores-op shape: position-striped rows (uneven per channel via rem) + interleaved
     # (position-major) gather, Q8 kind - each row carries its own scale, per-position KV.
-    n_channels, cols, seed = 2, 128, 23
-    for T in (1, 2, 5, 8):  # positions (total rows); T=1 -> rows=0 on one channel.
+    cols, seed = 128, 23
+    for n_channels, T in [(2, 1), (2, 2), (2, 5), (2, 8),
+                          (4, 1), (4, 3), (4, 6), (4, 9)]:
+        # positions (total rows); T < N -> rows=0 on some channels.
         rng    = np.random.default_rng(seed + T)
         scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
         q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
@@ -388,8 +393,8 @@ def test_matvec_q8_striped_interleave():
 def test_engine_axpy():
     # Weighted-V: kind-4 op accumulates p8-weighted V rows per lane; each channel emits
     # cols partial sums (chan-major), bit-exact vs bx.axpy_rows on its position stripe.
-    n_channels, cols, seed = 2, 64, 41
-    for T in (1, 3, 8):
+    cols, seed = 64, 41
+    for n_channels, T in [(2, 1), (2, 3), (2, 8), (4, 1), (4, 5), (4, 9)]:
         rng = np.random.default_rng(seed + T)
         ev  = rng.integers(-9, -4, T)
         scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
