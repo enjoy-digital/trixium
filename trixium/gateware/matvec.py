@@ -255,15 +255,24 @@ class BonsaiMatVecEngine(LiteXModule):
         ]
         # Argmax tap rides the single-grant path only: it is used exclusively by the
         # chan-major LM-head op (never ilv, never AXPY), where grants stay 1/cycle.
+        # Argmax compare runs one stage after the grant (same lag argument as absmax).
+        am_v_r  = Signal()
+        am_s_r  = Signal((32, True))
+        am_i_r  = Signal(24)
+        self.sync += [
+            am_v_r.eq(is_matvec & ~ilv_mode & grant_valid & ~grant_wide),
+            am_s_r.eq(grant_s),
+            am_i_r.eq(gidx),
+        ]
         self.sync += [
             If(self.cmd.valid & self.cmd.ready,
                 self.argmax_val.eq(-(1 << 31)),
                 self.argmax_idx.eq(0xFFFFFF),
-            ).Elif(is_matvec & ~ilv_mode & grant_valid & ~grant_wide &
-                   ((grant_s > self.argmax_val)
-                    | ((grant_s == self.argmax_val) & (gidx < self.argmax_idx))),
-                self.argmax_val.eq(grant_s),
-                self.argmax_idx.eq(gidx),
+            ).Elif(am_v_r &
+                   ((am_s_r > self.argmax_val)
+                    | ((am_s_r == self.argmax_val) & (am_i_r < self.argmax_idx))),
+                self.argmax_val.eq(am_s_r),
+                self.argmax_idx.eq(am_i_r),
             )
         ]
 
@@ -335,15 +344,20 @@ class BonsaiMatVecEngine(LiteXModule):
 
         # Result absmax tracker, write-stage (norm_i32's shift argument; reset on command
         # accept). Runs over every written lane so merged/wide retirement is covered.
+        # Per-lane |value| is registered before the max tree: FF(write data) -> abs ->
+        # tree -> compare -> CE was v6's worst path. The tracker lags the write by two
+        # cycles; every reader (CSR, sequencer k(absmax) at DISPATCH) trails done by more.
         lane_abs = []
         for l in range(8):
             ls = Signal((32, True), name=f"labs_s{l}")
             la = Signal(32, name=f"labs{l}")
+            lr = Signal(32, name=f"labsr{l}")
             self.comb += [
                 ls.eq(eng_gw_dat[32*l:32*l+32]),
                 la.eq(Mux(eng_gw_we[l], Mux(ls < 0, -ls, ls), 0)),
             ]
-            lane_abs.append(la)
+            self.sync += lr.eq(la)
+            lane_abs.append(lr)
         def _maxtree(sigs):
             while len(sigs) > 1:
                 nxt = []
