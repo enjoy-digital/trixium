@@ -189,12 +189,24 @@ class BonsaiMatVecEngine(LiteXModule):
                     Cat(fill_headb, fill_g[:9])),
                 fill_beat_d)),
         ]
+        # Second fill stage: the 256-bit scratchpad read data was broadcast COMB from
+        # the BRAM output to every pipe's x-buffer write port (the v11 worst path).
+        # Data registers once here; position/enable delay a cycle to stay aligned. The
+        # last writes land during ISSUE - x-buffer reads only start once beats arrive.
+        fill_active_d2 = Signal()
+        fill_pos_d2    = Signal(10)
+        fill_dat_q     = Signal(256)
+        self.sync += [
+            fill_active_d2.eq(fill_active_d),
+            fill_pos_d2.eq(fill_pos),
+            fill_dat_q.eq(scratchpad.fill.dat_r),
+        ]
         for pipe in self.pipes:
             self.comb += [
-                pipe.xw_group.eq(fill_pos[2:]),
-                pipe.xw_sub.eq(fill_pos[:2]),
-                pipe.xw_data.eq(scratchpad.fill.dat_r),
-                pipe.xw_we.eq(fill_active_d),
+                pipe.xw_group.eq(fill_pos_d2[2:]),
+                pipe.xw_sub.eq(fill_pos_d2[:2]),
+                pipe.xw_data.eq(fill_dat_q),
+                pipe.xw_we.eq(fill_active_d2),
             ]
 
         # Gather ------------------------------------------------------------------------------
