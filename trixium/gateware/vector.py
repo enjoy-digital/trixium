@@ -171,6 +171,12 @@ class BonsaiVectorUnit(LiteXModule):
         sa_val_c  = Signal((48, True))
         sd_val_c  = Signal((48, True))
         va_flat = Signal(32*LANES)
+        # Physical duplicate feeding only the reduction cone: the 512-bit operand
+        # register's fanout (multipliers + reductions + store + ROMs) was 71%-route
+        # critical; a dedicated copy lets the placer keep each cone tight. dont_touch
+        # stops synthesis re-merging the equivalent registers.
+        va_flat_red = Signal(32*LANES)
+        va_flat_red.attr.add(("dont_touch", "true"))
         vb_flat = Signal(32*LANES)
         sa_val  = Signal((48, True))
         sd_val  = Signal((48, True))
@@ -203,15 +209,21 @@ class BonsaiVectorUnit(LiteXModule):
             self.sync += If(in_ex1, m.eq(a_l[i]*b_in))
             mul_full.append(m)
 
-        # Reductions (comb over EX2's operand view - V regs are stable between EX1 and EX2).
+        # Reductions (comb over EX2's operand view - V regs are stable between EX1 and
+        # EX2). Lanes come from the dedicated va_flat_red copy (placement isolation).
+        ared_l = []
+        for i in range(LANES):
+            a = Signal((32, True))
+            self.comb += a.eq(va_flat_red[32*i:32*(i+1)])
+            ared_l.append(a)
         red_sum = Signal((48, True))
-        self.comb += red_sum.eq(sum(a_l))
+        self.comb += red_sum.eq(sum(ared_l))
         sq_sum = Signal((64, True))
         self.comb += sq_sum.eq(sum(mul_full))
         abs_l = []
         for i in range(LANES):
             s = Signal(32)
-            self.comb += s.eq(Mux(a_l[i] < 0, -a_l[i], a_l[i]))
+            self.comb += s.eq(Mux(ared_l[i] < 0, -ared_l[i], ared_l[i]))
             abs_l.append(s)
         def tree_max(sigs):
             level = list(sigs)
@@ -227,6 +239,15 @@ class BonsaiVectorUnit(LiteXModule):
                 level = nxt
             return level[0]
         red_max_v = tree_max(abs_l)
+        # Registered reduction results + compare flags: operands are stable from EX0, so
+        # the 4-level trees and the 48b compares run during EX1 and register - EX2's
+        # conditional S-writes see flags only (the tree->compare->CE cone was the v5
+        # worst path family).
+        red_sum_r  = Signal((48, True))
+        red_max_r  = Signal(32)
+        red_smax_r = Signal((32, True))
+        red_max_gt  = Signal()
+        red_smax_gt = Signal()
         def tree_smax(sigs):
             level = list(sigs)
             while len(level) > 1:
@@ -241,6 +262,13 @@ class BonsaiVectorUnit(LiteXModule):
                 level = nxt
             return level[0]
         red_smax_v = tree_smax(a_l)
+        self.sync += If(in_ex1,
+            red_sum_r.eq(red_sum),
+            red_max_r.eq(red_max_v),
+            red_smax_r.eq(red_smax_v),
+            red_max_gt.eq(red_max_v > sd_val[0:32]),
+            red_smax_gt.eq(red_smax_v > sd_val),
+        )
 
         # Lanewise results --------------------------------------------------------------------
         res = {name: Signal(32*LANES, name=f"res_{name.lower()}") for name in
@@ -470,6 +498,7 @@ class BonsaiVectorUnit(LiteXModule):
             If(fsm.ongoing("FETCHR"), insn_f.eq(imem_r.dat_r)),
             If(fsm.ongoing("EX0"),
                 va_flat.eq(va_flat_c),
+                va_flat_red.eq(va_flat_c),
                 vb_flat.eq(vb_flat_c),
                 sa_val.eq(sa_val_c),
                 sd_val.eq(sd_val_c),
@@ -549,16 +578,16 @@ class BonsaiVectorUnit(LiteXModule):
                     S[f_sa].eq(sa_val + 16),
                 ),
                 # Reductions.
-                If(f_op == OP["REDSUM"], S[f_sd].eq(sd_val + red_sum)),
+                If(f_op == OP["REDSUM"], S[f_sd].eq(sd_val + red_sum_r)),
                 If(f_op == OP["REDSSQ"], S[f_sd].eq(sd_val + sq_sum[0:48])),
                 If(f_op == OP["REDMAX"],
-                    If(red_max_v > sd_val[0:32],
-                        S[f_sd].eq(red_max_v),
+                    If(red_max_gt,
+                        S[f_sd].eq(red_max_r),
                     )
                 ),
                 If(f_op == OP["REDSMAX"],
-                    If(red_smax_v > sd_val,
-                        S[f_sd].eq(red_smax_v),
+                    If(red_smax_gt,
+                        S[f_sd].eq(red_smax_r),
                     )
                 ),
                 If(~is_known, bad_op.eq(1)),
