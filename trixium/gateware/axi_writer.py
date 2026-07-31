@@ -89,23 +89,53 @@ class BonsaiAXIWriter(LiteXModule):
             )
         ]
 
-        # W data path: pop winfo, stream len beats with wlast.
+        # W data path: pop winfo, stream len beats with wlast - through an output skid
+        # so the HBM macro's W-READY pin never gates fabric FIFO pops combinationally
+        # (macro-boundary register slice, same reasoning as the reader's R slice).
         w_left   = Signal(8)
         w_active = Signal()
+        wi_valid = Signal()
+        wi_last  = Signal()
+        wi_ready = Signal()
+        wo_valid = Signal()
+        wo_data  = Signal(len(axi.w.data))
+        wo_last  = Signal()
+        ws_valid = Signal()
+        ws_data  = Signal(len(axi.w.data))
+        ws_last  = Signal()
         self.comb += [
             winfo.source.ready.eq(~w_active),
-            axi.w.valid.eq(w_active & data.valid),
-            axi.w.data.eq(data.data),
+            wi_valid.eq(w_active & data.valid),
+            wi_last.eq(w_left == 1),
+            wi_ready.eq(~ws_valid),
+            data.ready.eq(w_active & wi_ready),
+            axi.w.valid.eq(wo_valid),
+            axi.w.data.eq(wo_data),
             axi.w.strb.eq(2**len(axi.w.strb) - 1),
-            axi.w.last.eq(w_left == 1),
-            data.ready.eq(w_active & axi.w.ready),
+            axi.w.last.eq(wo_last),
         ]
         self.sync += [
+            If(axi.w.ready | ~wo_valid,
+                If(ws_valid,
+                    wo_valid.eq(1),
+                    wo_data.eq(ws_data),
+                    wo_last.eq(ws_last),
+                    ws_valid.eq(0),
+                ).Else(
+                    wo_valid.eq(wi_valid & wi_ready),
+                    wo_data.eq(data.data),
+                    wo_last.eq(wi_last),
+                )
+            ).Elif(wi_valid & wi_ready,
+                ws_valid.eq(1),
+                ws_data.eq(data.data),
+                ws_last.eq(wi_last),
+            ),
             If(winfo.source.valid & winfo.source.ready,
                 w_left.eq(winfo.source.len),
                 w_active.eq(1),
             ),
-            If(axi.w.valid & axi.w.ready,
+            If(wi_valid & wi_ready,
                 w_left.eq(w_left - 1),
                 If(w_left == 1,
                     w_active.eq(0),
@@ -113,11 +143,15 @@ class BonsaiAXIWriter(LiteXModule):
             ),
         ]
 
-        # B responses.
+        # B responses (valid sampled through a register: no comb path off the macro pin).
         outstanding = Signal(8)
+        b_valid_r   = Signal()
         self.comb += axi.b.ready.eq(1)
-        self.sync += outstanding.eq(outstanding
-            + Mux(axi.aw.valid & axi.aw.ready, 1, 0)
-            - Mux(axi.b.valid & axi.b.ready, 1, 0))
+        self.sync += [
+            b_valid_r.eq(axi.b.valid),
+            outstanding.eq(outstanding
+                + Mux(axi.aw.valid & axi.aw.ready, 1, 0)
+                - Mux(b_valid_r, 1, 0)),
+        ]
 
         self.comb += self.idle.eq(~active & ~w_active & (outstanding == 0) & ~winfo.source.valid)

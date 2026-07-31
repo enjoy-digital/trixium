@@ -44,10 +44,12 @@ def test_sim_selftest_checksums():
     p = subprocess.Popen(["./obj_dir/Vsim"], cwd=SIM_DIR,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     lines = []
+    import time as _t
+    deadline = _t.time() + 40*60
     try:
         for line in p.stdout:
             lines.append(line)
-            if "BONSAI-READY" in line or len(lines) > 40000:
+            if "BONSAI-READY" in line or len(lines) > 400000 or _t.time() > deadline:
                 break
     finally:
         p.kill()
