@@ -135,6 +135,7 @@ class BonsaiVectorUnit(LiteXModule):
         instr_r = Signal(32)
         in_ex0  = Signal()
         in_ex1  = Signal()
+        in_ex1b = Signal()
         cur     = Signal(32)
         # EX0 and EX1 decode the freshly fetched instruction; EX2 the registered copy
         # (instr_r only updates at EX1 - without in_ex0 the operand-fetch stage would
@@ -262,7 +263,9 @@ class BonsaiVectorUnit(LiteXModule):
                 level = nxt
             return level[0]
         red_smax_v = tree_smax(a_l)
-        self.sync += If(in_ex1,
+        # Captured at EX1B (not EX1): sources are the EX0 operand registers, so the
+        # abs/tree/compare cone gets two full cycles and rides the vecunit MCP.
+        self.sync += If(in_ex1b,
             red_sum_r.eq(red_sum),
             red_max_r.eq(red_max_v),
             red_smax_r.eq(red_smax_v),
@@ -492,6 +495,10 @@ class BonsaiVectorUnit(LiteXModule):
         )
         fsm.act("EX1",
             in_ex1.eq(1),
+            NextState("EX1B"),
+        )
+        fsm.act("EX1B", # Reduction capture window (see red_* regs).
+            in_ex1b.eq(1),
             NextState("EX2"),
         )
         self.sync += [
