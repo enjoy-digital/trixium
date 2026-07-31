@@ -106,17 +106,53 @@ class BonsaiAXIReader(LiteXModule):
             )
         ]
 
+        # R-channel register slice (skid buffer): the HBM hard macro's AXI interface pins
+        # sit at fixed die locations; a comb path from them into the fabric FIFO was the
+        # residual timing family at 225MHz. The slice holds beats outside the FIFO, so
+        # the AR credit accounting (bounded by fifo_depth) stays conservative.
+        r_valid  = Signal()
+        r_data   = Signal(256)
+        r_last   = Signal()
+        r_ready  = Signal()
+        rs_valid = Signal()
+        rs_data  = Signal(256)
+        rs_last  = Signal()
+        r_infire = Signal()
+        self.comb += [
+            axi.r.ready.eq(~rs_valid),
+            r_infire.eq(axi.r.valid & ~rs_valid),
+        ]
+        self.sync += [
+            If(r_ready | ~r_valid,
+                If(rs_valid,
+                    r_valid.eq(1),
+                    r_data.eq(rs_data),
+                    r_last.eq(rs_last),
+                    rs_valid.eq(0),
+                ).Else(
+                    r_valid.eq(r_infire),
+                    r_data.eq(axi.r.data),
+                    r_last.eq(axi.r.last),
+                )
+            ).Elif(r_infire,
+                rs_valid.eq(1),
+                rs_data.eq(axi.r.data),
+                rs_last.eq(axi.r.last),
+            )
+        ]
+
         # Data FIFO ---------------------------------------------------------------------------
         fifo = stream.SyncFIFO([("data", 256)], fifo_depth, buffered=True)
         self.submodules += fifo
 
         self.comb += [
-            fifo.sink.valid.eq(axi.r.valid),
-            axi.r.ready.eq(fifo.sink.ready),
-            fifo.sink.data.eq(axi.r.data),
-            # Command-last: burst-last AND this burst is the command's final burst.
-            fifo.sink.last.eq(axi.r.last & info.source.cmd_last),
-            info.source.ready.eq(axi.r.valid & axi.r.ready & axi.r.last),
+            fifo.sink.valid.eq(r_valid),
+            r_ready.eq(fifo.sink.ready),
+            fifo.sink.data.eq(r_data),
+            # Command-last: burst-last AND this burst is the command's final burst. The
+            # info pop tracks the sliced stream, so command tags stay beat-aligned.
+            fifo.sink.last.eq(r_last & info.source.cmd_last),
+            info.source.ready.eq(r_valid & r_ready & r_last),
             fifo.source.connect(source),
         ]
 
