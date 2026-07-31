@@ -63,6 +63,9 @@ class BonsaiMatVecEngine(LiteXModule):
             ("rshift2", 6),  # Head-B AXPY pre-shift (Rpre differs per head).
         ])
         self.busy   = Signal()
+        self.sp_busy = Signal() # busy + 1 cycle: the registered write stage's last beat
+                                # lands the cycle after busy drops; sideband arbitration
+                                # (scratchpad.units_idle) must wait for it.
         self.done   = Signal() # Pulse.
         self.error  = Signal()
         self.absmax = Signal(32) # |int32| max over the last matvec's gathered results.
@@ -274,11 +277,33 @@ class BonsaiMatVecEngine(LiteXModule):
         ]
 
         # Scratchpad write port: fetch beats, one merged ilv beat, one wide AXPY beat, or
-        # a single gathered int32.
+        # a single gathered int32. The write stage is REGISTERED: FIFO-out -> merge muxes
+        # -> RAM write / absmax tree in one cycle was the worst hardware path (38 logic
+        # levels); the RAM write, result counting and the trackers run one cycle later
+        # off these registers (ops are separated by dispatch - the lag is invisible).
         slot = Signal(24)
+        # Fetch write addressing counts at the comb stage (beats arrive every cycle;
+        # the registered fetch_cnt lags one cycle and is only the terminator).
+        fetch_wcnt   = Signal(24)
+        eng_gw_adr_c = Signal(len(scratchpad.gather.adr))
+        eng_gw_we_c  = Signal(8)
+        eng_gw_dat_c = Signal(256)
         eng_gw_adr = Signal(len(scratchpad.gather.adr))
         eng_gw_we  = Signal(8)
         eng_gw_dat = Signal(256)
+        self.sync += [
+            eng_gw_adr.eq(eng_gw_adr_c),
+            eng_gw_we.eq(eng_gw_we_c),
+            eng_gw_dat.eq(eng_gw_dat_c),
+        ]
+        busy_d = Signal()
+        self.sync += busy_d.eq(self.busy)
+        self.comb += self.sp_busy.eq(self.busy | busy_d)
+        self.sync += If(self.cmd.valid & self.cmd.ready,
+            fetch_wcnt.eq(0),
+        ).Elif((eng_gw_we_c != 0) & fetch_mode,
+            fetch_wcnt.eq(fetch_wcnt + 1),
+        )
         grant_head = Array([p.source.head for p in self.pipes])[rr.grant]
         grant_qoff = Signal(16)
         self.comb += grant_qoff.eq(Mux(grant_head, cmd_r["qstride"], 0))
@@ -290,21 +315,21 @@ class BonsaiMatVecEngine(LiteXModule):
                 slot.eq(dstw + grant_qoff + rr.grant*cmd_r["rows"] + grant_row),
             ),
             If(fetch_mode,
-                eng_gw_adr.eq((cmd_r["dst"] >> 5) + fetch_cnt),
-                eng_gw_dat.eq(fetch_data),
-                eng_gw_we.eq(Mux(fetch_valid, 0xFF, 0)),
+                eng_gw_adr_c.eq((cmd_r["dst"] >> 5) + fetch_wcnt),
+                eng_gw_dat_c.eq(fetch_data),
+                eng_gw_we_c.eq(Mux(fetch_valid, 0xFF, 0)),
             ).Elif(ilv_mode,
-                eng_gw_adr.eq(grant_slot[3:]),
-                eng_gw_dat.eq(lane_dat),
-                eng_gw_we.eq(Mux(grant_valid, lane_we, 0)),
+                eng_gw_adr_c.eq(grant_slot[3:]),
+                eng_gw_dat_c.eq(lane_dat),
+                eng_gw_we_c.eq(Mux(grant_valid, lane_we, 0)),
             ).Elif(axpy_mode,
-                eng_gw_adr.eq(slot[3:]),
-                eng_gw_dat.eq(grant_data),
-                eng_gw_we.eq(Mux(grant_valid, 0xFF, 0)),
+                eng_gw_adr_c.eq(slot[3:]),
+                eng_gw_dat_c.eq(grant_data),
+                eng_gw_we_c.eq(Mux(grant_valid, 0xFF, 0)),
             ).Else(
-                eng_gw_adr.eq(slot[3:]),
-                eng_gw_dat.eq(Replicate(grant_data[0:32], 8)),
-                eng_gw_we.eq(Mux(grant_valid, 1 << slot[:3], 0)),
+                eng_gw_adr_c.eq(slot[3:]),
+                eng_gw_dat_c.eq(Replicate(grant_data[0:32], 8)),
+                eng_gw_we_c.eq(Mux(grant_valid, 1 << slot[:3], 0)),
             )
         ]
 

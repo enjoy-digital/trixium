@@ -130,7 +130,7 @@ class BonsaiSimSoC(SoCCore):
             self.engine.store_busy.eq(self.loader.store_busy),
             # Sideband (wishbone) scratchpad access is granted only while every unit
             # that touches the two memory ports is idle.
-            self.scratchpad.units_idle.eq(~self.engine.busy & ~self.vecunit.busy
+            self.scratchpad.units_idle.eq(~self.engine.sp_busy & ~self.vecunit.busy
                                           & ~self.seq.busy),
         ]
         self.add_constant("BONSAI_HAS_KVSTORE")

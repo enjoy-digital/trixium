@@ -158,7 +158,7 @@ class BonsaiSoC(SoCCore):
             self.add_constant("BONSAI_HAS_KVSTORE")
             self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
             # Sideband (wishbone/CSR) scratchpad access only while all units are idle.
-            units_idle = ~self.engine.busy
+            units_idle = ~self.engine.sp_busy
             if vecunit is not None:
                 units_idle = units_idle & ~vecunit.busy
             if seq is not None:
