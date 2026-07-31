@@ -193,20 +193,25 @@ class BonsaiMatVecEngine(LiteXModule):
         # the BRAM output to every pipe's x-buffer write port (the v11 worst path).
         # Data registers once here; position/enable delay a cycle to stay aligned. The
         # last writes land during ISSUE - x-buffer reads only start once beats arrive.
-        fill_active_d2 = Signal()
-        fill_pos_d2    = Signal(10)
-        fill_dat_q     = Signal(256)
-        self.sync += [
-            fill_active_d2.eq(fill_active_d),
-            fill_pos_d2.eq(fill_pos),
-            fill_dat_q.eq(scratchpad.fill.dat_r),
-        ]
-        for pipe in self.pipes:
+        # Per-pipe copies (dont_touch): a single stage-2 register driving every pipe's
+        # x-buffer write port was the v13 route-spread path; each pipe now owns a local
+        # copy the placer can pull next to its x-buffer.
+        for i, pipe in enumerate(self.pipes):
+            fa2 = Signal(name=f"fill_act2_{i}")
+            fp2 = Signal(10, name=f"fill_pos2_{i}")
+            fd2 = Signal(256, name=f"fill_dat2_{i}")
+            for sig in (fa2, fp2, fd2):
+                sig.attr.add(("dont_touch", "true"))
+            self.sync += [
+                fa2.eq(fill_active_d),
+                fp2.eq(fill_pos),
+                fd2.eq(scratchpad.fill.dat_r),
+            ]
             self.comb += [
-                pipe.xw_group.eq(fill_pos_d2[2:]),
-                pipe.xw_sub.eq(fill_pos_d2[:2]),
-                pipe.xw_data.eq(fill_dat_q),
-                pipe.xw_we.eq(fill_active_d2),
+                pipe.xw_group.eq(fp2[2:]),
+                pipe.xw_sub.eq(fp2[:2]),
+                pipe.xw_data.eq(fd2),
+                pipe.xw_we.eq(fa2),
             ]
 
         # Gather ------------------------------------------------------------------------------
