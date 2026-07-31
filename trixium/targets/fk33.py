@@ -151,6 +151,22 @@ class BonsaiSoC(SoCCore):
                 platform.add_platform_command(
                     "set_property RAM_STYLE distributed "
                     "[get_cells -hierarchical -filter {{NAME =~ *imem_reg*}}]")
+                # The vecunit EX cone is architecturally multicycle: operands register at
+                # EX0, multiplier products at EX1, and every S/V-register effect is CE-
+                # gated on EX2 - sources are stable for >= 2 full cycles before capture.
+                # Declared as MCP so the tools stop fighting single-cycle closure on it.
+                # Scoped from the operand/product registers only: paths with true 1-cycle
+                # windows into S/V (e.g. scratchpad dat_r -> LDW writeback) stay default.
+                platform.add_platform_command(
+                    "set_multicycle_path -setup 2 "
+                    "-from [get_cells -hierarchical -regexp "
+                    "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg).*}}] "
+                    "-to [get_cells -hierarchical -regexp {{.*(sr|vr)[0-9]_reg.*}}]")
+                platform.add_platform_command(
+                    "set_multicycle_path -hold 1 "
+                    "-from [get_cells -hierarchical -regexp "
+                    "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg).*}}] "
+                    "-to [get_cells -hierarchical -regexp {{.*(sr|vr)[0-9]_reg.*}}]")
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
                                                  seq=seq)
             self.engine_csr = BonsaiEngineCSR(self.engine, seq=seq)
