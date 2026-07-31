@@ -160,12 +160,12 @@ class BonsaiSoC(SoCCore):
                 platform.add_platform_command(
                     "set_multicycle_path -setup 2 "
                     "-from [get_cells -hierarchical -regexp "
-                    "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg).*}}] "
+                    "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg|rom_[0-9]+_dat0.*).*}}] "
                     "-to [get_cells -hierarchical -regexp {{.*((sr|vr)[0-9]_reg|red_(sum|max|smax).*_reg).*}}]")
                 platform.add_platform_command(
                     "set_multicycle_path -hold 1 "
                     "-from [get_cells -hierarchical -regexp "
-                    "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg).*}}] "
+                    "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg|rom_[0-9]+_dat0.*).*}}] "
                     "-to [get_cells -hierarchical -regexp {{.*((sr|vr)[0-9]_reg|red_(sum|max|smax).*_reg).*}}]")
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
                                                  seq=seq)
