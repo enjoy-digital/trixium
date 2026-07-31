@@ -9,7 +9,7 @@
 Bit-exact contract: the asm.py INTERPRETER is the golden model - this RTL must produce
 identical scratchpad contents and scalar results for the same binary and arguments.
 
-Implementation: uniform 4-cycle instructions (FETCH -> FETCHR -> EX1 -> EX2) - trivial to
+Implementation: uniform 5-cycle instructions (FETCH -> FETCHR -> EX0 -> EX1 -> EX2) -
 and still >100x faster than the soft-float CPU paths it replaces (~40k cycles for a
 6144-element silu_mul). 16 lanes x int32 (8 vregs as flat 512-bit signals), 8 x 48-bit
 scalars, one hardware loop, Q15 LUT ops with x16-replicated dual-entry ROMs.
@@ -133,9 +133,13 @@ class BonsaiVectorUnit(LiteXModule):
         # EX1-registered copy as before.
         insn_f  = Signal(32)
         instr_r = Signal(32)
+        in_ex0  = Signal()
         in_ex1  = Signal()
         cur     = Signal(32)
-        self.comb += cur.eq(Mux(in_ex1, insn_f, instr_r))
+        # EX0 and EX1 decode the freshly fetched instruction; EX2 the registered copy
+        # (instr_r only updates at EX1 - without in_ex0 the operand-fetch stage would
+        # capture the PREVIOUS instruction's registers).
+        self.comb += cur.eq(Mux(in_ex0 | in_ex1, insn_f, instr_r))
 
         f_op  = Signal(6)
         f_vd  = Signal(3)
@@ -158,15 +162,23 @@ class BonsaiVectorUnit(LiteXModule):
         loop_start = Signal(16)
         loop_cnt   = Signal(32)
 
+        # Operand fetch registers (EX0): the register-file Array muxes + their fanout to
+        # the multiplier/ROM/scratchpad launches were the residual critical path once the
+        # instruction itself was registered. Instructions are strictly sequential (one in
+        # flight), so registering the operand view has no hazards.
+        va_flat_c = Signal(32*LANES)
+        vb_flat_c = Signal(32*LANES)
+        sa_val_c  = Signal((48, True))
+        sd_val_c  = Signal((48, True))
         va_flat = Signal(32*LANES)
         vb_flat = Signal(32*LANES)
         sa_val  = Signal((48, True))
         sd_val  = Signal((48, True))
         self.comb += [
-            va_flat.eq(V[f_va]),
-            vb_flat.eq(V[f_vb]),
-            sa_val.eq(S[f_sa]),
-            sd_val.eq(S[f_sd]),
+            va_flat_c.eq(V[f_va]),
+            vb_flat_c.eq(V[f_vb]),
+            sa_val_c.eq(S[f_sa]),
+            sd_val_c.eq(S[f_sd]),
         ]
 
         def lane(sig, i):
@@ -444,6 +456,10 @@ class BonsaiVectorUnit(LiteXModule):
             NextState("FETCHR"), # imem data valid next cycle; captured into insn_f.
         )
         fsm.act("FETCHR",
+            NextState("EX0"),
+        )
+        fsm.act("EX0", # Operand fetch: register the regfile view for EX1/EX2.
+            in_ex0.eq(1),
             NextState("EX1"),
         )
         fsm.act("EX1",
@@ -452,6 +468,12 @@ class BonsaiVectorUnit(LiteXModule):
         )
         self.sync += [
             If(fsm.ongoing("FETCHR"), insn_f.eq(imem_r.dat_r)),
+            If(fsm.ongoing("EX0"),
+                va_flat.eq(va_flat_c),
+                vb_flat.eq(vb_flat_c),
+                sa_val.eq(sa_val_c),
+                sd_val.eq(sd_val_c),
+            ),
             If(in_ex1, instr_r.eq(insn_f)),
         ]
 
