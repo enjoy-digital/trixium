@@ -205,9 +205,13 @@ class BonsaiSoC(SoCCore):
             self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
             self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
 
-        # Per-channel HBM bandwidth BIST (channels not owned by the engine).
-        from trixium.gateware.bist import BonsaiHBMBIST
-        self.bist = BonsaiHBMBIST(hbm.axi, channels=bist_channels)
+        # Per-channel HBM bandwidth BIST (channels not owned by the engine). Skipped on
+        # phase-2 inference builds (--with-vecunit): its 20+ channels of unsliced macro-
+        # boundary FIFO paths were the residual 225MHz timing family, and the archived
+        # phase-1 bitstreams remain the bandwidth-test vehicle.
+        if not with_vecunit:
+            from trixium.gateware.bist import BonsaiHBMBIST
+            self.bist = BonsaiHBMBIST(hbm.axi, channels=bist_channels)
 
 # Build --------------------------------------------------------------------------------------------
 
