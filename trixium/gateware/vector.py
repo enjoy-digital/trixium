@@ -402,8 +402,23 @@ class BonsaiVectorUnit(LiteXModule):
         vec_wb_ops = ["VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHRI", "VSHLI",
                       "VSHLV", "VRNE", "VCLAMP8", "VCLAMP16", "VABS", "VCLZN", "VPACK",
                       "LDV", "LDW", "BCAST", "LUTE2", "LUTRECIP", "LUTRSQRT"]
+        # Writeback value. The 21-way 512-bit opcode mux was the EX2 critical path
+        # (FSM state -> mux -> V register D). Everything except the two load ops is
+        # computed from registers that are stable by EX1B, so that part is selected and
+        # REGISTERED there; EX2 only picks between it and the scratchpad read data
+        # (which genuinely arrives at EX2). instr_r already holds the current
+        # instruction during EX1B, so f_op is the right selector at both edges.
+        wb_alu_ops = [n for n in vec_wb_ops if n not in ("LDV", "LDW")]
+        wb_alu   = Signal(32*LANES)
+        wb_alu_r = Signal(32*LANES)
+        self.comb += Case(f_op, {OP[n]: wb_alu.eq(res[n]) for n in wb_alu_ops})
+        self.sync += If(in_ex1b, wb_alu_r.eq(wb_alu))
+        is_load = Signal()
+        self.comb += is_load.eq((f_op == OP["LDV"]) | (f_op == OP["LDW"]))
         wb_val = Signal(32*LANES)
-        self.comb += Case(f_op, {OP[n]: wb_val.eq(res[n]) for n in vec_wb_ops})
+        self.comb += wb_val.eq(Mux(is_load,
+                                   Mux(f_op == OP["LDV"], res["LDV"], res["LDW"]),
+                                   wb_alu_r))
         is_vec_wb = Signal()
         self.comb += is_vec_wb.eq(reduce(or_, [f_op == OP[n] for n in vec_wb_ops]))
 
