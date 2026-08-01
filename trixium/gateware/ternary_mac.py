@@ -239,6 +239,20 @@ class BonsaiChannelPipe(LiteXModule):
             )
         ]
         v1        = _delay(self, t0_fire, 1)             # T1 valid.
+        # v1 is a HIGH-FANOUT ENABLE: it gates the clock enable of ~160 lane registers
+        # (128 ternary + 32 Q8) plus the scale capture. A single driver forces the placer
+        # to reach every lane from one flop; per-group dont_touch replicas let each copy
+        # sit with its consumers. (Hardware worst path at WNS -0.487: v1 -> lane reg CE.)
+        _v1_copies = []
+        def v1_rep(tag):
+            c = Signal(name=f"v1_rep_{tag}")
+            c.attr.add(("dont_touch", "true"))
+            self.sync += c.eq(t0_fire)
+            _v1_copies.append(c)
+            return c
+        v1_tern  = [v1_rep(f"t{k}") for k in range(8)] # One per 16 ternary lanes.
+        v1_q8    = [v1_rep(f"q{k}") for k in range(2)] # One per 16 Q8 lanes.
+        v1_scale = v1_rep("scale")
         row1      = _delay(self, row_cnt, 1)
         row_last1 = _delay(self, row_last, 1)
 
@@ -267,7 +281,7 @@ class BonsaiChannelPipe(LiteXModule):
             ]
             code3_any.append(c_j == 3)
             r = Signal((9, True))
-            self.sync += If(v1, r.eq(lane))
+            self.sync += If(v1_tern[j // 16], r.eq(lane))
             tern_lanes.append(r)
             if not dual:
                 continue
@@ -326,7 +340,7 @@ class BonsaiChannelPipe(LiteXModule):
                 p.eq(w_j*x_j),
             ]
             r = Signal((16, True))
-            self.sync += If(v1, r.eq(p))
+            self.sync += If(v1_q8[j // 16], r.eq(p))
             q8_lanes.append(r)
             if not dual:
                 continue
@@ -343,7 +357,7 @@ class BonsaiChannelPipe(LiteXModule):
         # Scale fp16: mux halfword out of the scale word (registered at T1 for use at T2+).
         scale_word_r = Signal(256)
         g_lo_r2      = Signal(4)
-        self.sync += If(v1, scale_word_r.eq(scale_r.dat_r), g_lo_r2.eq(g_lo_r))
+        self.sync += If(v1_scale, scale_word_r.eq(scale_r.dat_r), g_lo_r2.eq(g_lo_r))
         scale_f16 = Signal(16)
         self.comb += Case(g_lo_r2, {i: scale_f16.eq(scale_word_r[16*i:16*(i+1)]) for i in range(16)})
 
