@@ -755,6 +755,9 @@ static int seq_at2_p1dn, seq_at2_p2dn;
 static void seq_build_attn2(void)
 {
     seq_at2_kvchunk = 0;
+#ifndef BONSAI_HAS_DUALQ
+    return; // Engine built without the head-B datapath: use the v1 single-head lists.
+#else
     if (n_ch < 2 || n_head != 2*n_kv_head)
         return;
     int p1dn = 7;            // q8A q8B scores smA spA smB spB.
@@ -837,6 +840,7 @@ static void seq_build_attn2(void)
         seq_desc_vec(d2 + 2*n_ch + 2, PROG_NORM_I32, nb, 5,
                      (uint16_t)(SEQ_SRC_KRES6 << 8));
     }
+#endif
 }
 #endif
 
@@ -950,7 +954,7 @@ static uint16_t *spec_succ;
 static uint8_t  *spec_succ_v;
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK)
+    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
 // S6 speculative decode: forward TWO positions through ONE weight stream per matvec
 // (dual-x ternary, model_matvec2). Positions are independent along the residual; the only
 // coupling is attention, which runs per position in-order (store KV p0 -> attn p0 ->
@@ -1927,7 +1931,7 @@ int infer_init(void)
     v_scale = halloc((uint64_t)n_layer*max_ctx*sizeof(float));
     scores  = halloc(max_ctx*sizeof(float));
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK)
+    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
     spec_succ   = halloc((uint64_t)H->vocab*2);
     spec_succ_v = halloc(H->vocab);
 #endif
@@ -1941,7 +1945,7 @@ void infer_spec(int on)
     spec_on  = on;
     spec_acc = spec_rej = 0;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK)
+    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
     if (on && spec_succ_v)
         for (uint32_t i = 0; i < H->vocab; i++)
             spec_succ_v[i] = 0;
@@ -1967,7 +1971,7 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
         emit(tok);
         count++;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK)
+    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
         // Speculative decode: draft the successor seen last time this token appeared;
         // one dual-x pair-forward verifies the draft and computes the next token. On
         // accept, two tokens per weight-stream pass. Greedy -> lossless (token stream

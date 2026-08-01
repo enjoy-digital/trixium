@@ -30,7 +30,8 @@ from trixium.gateware.ternary_mac import BonsaiChannelPipe
 # BonsaiMatVecEngine -------------------------------------------------------------------------------
 
 class BonsaiMatVecEngine(LiteXModule):
-    def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None):
+    def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
+                 dual=True):
         # When a BonsaiVectorUnit is passed, the scratchpad fill/gather ports are muxed
         # between the engine and the vector unit (granted to the vector unit while it is
         # busy - firmware serializes engine ops and vector ops, so contention is
@@ -95,7 +96,8 @@ class BonsaiMatVecEngine(LiteXModule):
         fetch_datas  = []
         for i, axi in enumerate(hbm_axis):
             reader = BonsaiAXIReader(axi)
-            pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
+            pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n,
+                                       dual=dual)
             setattr(self.submodules, f"reader{i}", reader)
             setattr(self.submodules, f"pipe{i}",   pipe)
             is_fetch = Signal()
@@ -327,7 +329,10 @@ class BonsaiMatVecEngine(LiteXModule):
         self.comb += self.sp_busy.eq(self.busy | busy_d)
         self.sync += If(self.cmd.valid & self.cmd.ready,
             fetch_wcnt.eq(0),
-        ).Elif((eng_gw_we_c != 0) & fetch_mode,
+        ).Elif(fetch_mode & fetch_valid,
+            # Equivalent to (eng_gw_we_c != 0) in fetch mode, but off the reader valids
+            # directly: the OR-reduce of the muxed write enables dragged the pipes' FIFO
+            # state into this CE (v15's worst path).
             fetch_wcnt.eq(fetch_wcnt + 1),
         )
         grant_head = Array([p.source.head for p in self.pipes])[rr.grant]

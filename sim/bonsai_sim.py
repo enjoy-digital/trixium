@@ -135,6 +135,7 @@ class BonsaiSimSoC(SoCCore):
         ]
         self.add_constant("BONSAI_HAS_KVSTORE")
         self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
+        self.add_constant("BONSAI_HAS_DUALQ") # Sim always builds the head-B datapath.
         self.add_constant("BONSAI_HAS_VECUNIT")
         self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set (rmsnorm scalar ops + rsqrt fix).
 

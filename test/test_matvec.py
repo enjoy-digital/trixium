@@ -21,11 +21,13 @@ from trixium.gateware.matvec import BonsaiMatVecEngine
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 class _EngineDUT(Module):
-    def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0):
+    def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
+                 dual=True):
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
         self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
-        self.submodules.engine     = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32)
+        self.submodules.engine     = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+                                                        dual=dual)
         for i, axi in enumerate(axis):
             model = BonsaiHBMChannelModel(axi, size=64*1024,
                 init=words_from_bytes(chan_payloads[i]), latency=latency, stall_rate=stall_rate)
@@ -60,7 +62,8 @@ def _run_engine(dut, cmd, n_results, dst):
     run_simulation(dut, [driver()])
     return np.array(results, dtype=np.int64)
 
-def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed):
+def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed,
+                  dual=True):
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
     G      = cols//layout.GROUP_TERNARY
@@ -83,7 +86,7 @@ def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed):
     xsrc, dst = 0, 0x4000
     sp_init   = words_from_bytes(x8.tobytes())
 
-    dut = _EngineDUT(n_channels, payloads, sp_init, latency, stall_rate)
+    dut = _EngineDUT(n_channels, payloads, sp_init, latency, stall_rate, dual=dual)
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
@@ -145,6 +148,69 @@ def test_matvec_ternary_dual_x():
         got = _run_engine(dut, cmd, qstride + M, 0x4000)
         assert np.array_equal(got[:M], exp_a), f"N={n_channels} head A"
         assert np.array_equal(got[qstride:qstride + M], exp_b), f"N={n_channels} head B"
+
+def test_matvec_slim_no_dual():
+    # Hardware builds without the head-B datapath (--with-dual off): the engine is half
+    # the area and every non-qn op must be bit-identical. Ternary + Q8 + striped/ilv
+    # scores + AXPY, all with dual=False.
+    _case_ternary(n_channels=4, rows_per_chan=8, cols=256, latency=8, stall_rate=2,
+                  seed=31, dual=False)
+
+    cols, T, n_channels, seed = 128, 6, 2, 33
+    rng    = np.random.default_rng(seed)
+    scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
+    q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+    x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B, gs_max=bx.GS_MAX_Q8)
+    expected = bx.matvec_q8(scales, q8w, x8, B, R)
+    rows, rem = T//n_channels, T % n_channels
+    payloads = []
+    for c in range(n_channels):
+        pos = [t for t in range(T) if t % n_channels == c]
+        spec_c = TensorSpec("kv", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8, len(pos), cols,
+                            scales=scales[pos], values=q8w[pos])
+        payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+    maxlen = max(len(p) for p in payloads)
+    payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0, dual=False)
+    rb  = layout.row_beats(cols, layout.KIND_Q8)
+    cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+               sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+               cbeats=layout.code_beats(cols, layout.KIND_Q8),
+               bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
+    got = _run_engine(dut, cmd, T, 0x4000)
+    assert np.array_equal(got, expected), "slim ilv scores"
+
+    # AXPY (single head) on the slim engine.
+    cols = 64
+    ev  = rng.integers(-9, -4, T)
+    scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+    v8  = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+    p8  = rng.integers(1, 128, T, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B    = 12 - int(e16.max())
+    Rpre = bx.axpy_rpre(int(p8.astype(np.int64).sum()))
+    payloads, expected = [], []
+    for c in range(n_channels):
+        pos = [t for t in range(T) if t % n_channels == c]
+        spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8, len(pos), cols,
+                            scales=scales[pos], values=v8[pos])
+        payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+        expected.append(bx.axpy_rows(scales[pos], v8[pos], p8[pos], B, Rpre))
+    maxlen = max(len(p) for p in payloads)
+    payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+    expected = np.concatenate(expected)
+    dut = _EngineDUT(n_channels, payloads, words_from_bytes(p8.tobytes().ljust(32, b"\0")),
+                     8, 0, dual=False)
+    rb  = layout.row_beats(cols, layout.KIND_Q8)
+    cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+               sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+               cbeats=layout.code_beats(cols, layout.KIND_Q8),
+               bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem)
+    got = _run_engine(dut, cmd, n_channels*cols, 0x4000)
+    assert np.array_equal(got, expected), "slim axpy"
 
 def test_matvec_ternary_multi_scaleword():
     # cols=4096: 32 groups -> 2 scale beats/row, exercises scale-word switching + row parity.

@@ -56,7 +56,7 @@ class _CRG(LiteXModule):
 
 class BonsaiSoC(SoCCore):
     def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
-                 with_nvme=False, with_vecunit=False, **kwargs):
+                 with_nvme=False, with_vecunit=False, with_dual=False, **kwargs):
         # Phase-2 exploration flags (see docs/phase2.md).
         if with_nvme:
             raise NotImplementedError(
@@ -168,7 +168,10 @@ class BonsaiSoC(SoCCore):
                     "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg|rom_[0-9]+_dat0.*).*}}] "
                     "-to [get_cells -hierarchical -regexp {{.*((sr|vr)[0-9]_reg|red_(sum|max|smax).*_reg).*}}]")
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
-                                                 seq=seq)
+                                                 seq=seq, dual=with_dual)
+            if with_dual:
+                # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
+                self.add_constant("BONSAI_HAS_DUALQ")
             self.engine_csr = BonsaiEngineCSR(self.engine, seq=seq)
             self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)
             # Engine kind-3 STORE (KV append) rides the loader's writers.
@@ -224,6 +227,7 @@ def main():
     parser.add_target_argument("--driver",       action="store_true",       help="Generate LitePCIe driver headers.")
     parser.add_target_argument("--engine-channels", default=None, type=int, help="Engine HBM channel count override (default: 4 for b, 8 for c; 8B needs >= 16, max 31).")
     parser.add_target_argument("--with-nvme",    action="store_true",       help="Phase-2: standalone NVMe weight loading (LiteNVMe root, no host PCIe) - not implemented yet.")
+    parser.add_target_argument("--with-dual",    action="store_true",       help="Phase-2: dual-Q GQA + speculative pair-verify datapath (~2x engine area; needs headroom).")
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
 
@@ -236,6 +240,7 @@ def main():
         engine_channels = args.engine_channels,
         with_nvme       = args.with_nvme,
         with_vecunit    = args.with_vecunit,
+        with_dual       = args.with_dual,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,
         **parser.soc_argdict)
