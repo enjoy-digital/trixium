@@ -56,7 +56,8 @@ class _CRG(LiteXModule):
 
 class BonsaiSoC(SoCCore):
     def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
-                 with_nvme=False, with_vecunit=False, with_dual=False, **kwargs):
+                 with_nvme=False, with_vecunit=False, with_dual=False, hbm_tck=900,
+                 **kwargs):
         # Phase-2 exploration flags (see docs/phase2.md).
         if with_nvme:
             raise NotImplementedError(
@@ -64,7 +65,12 @@ class BonsaiSoC(SoCCore):
                 "PCIe lanes switch from endpoint (host) to root (NVMe) role - mutually "
                 "exclusive with --with-pcie host access. See docs/phase2.md.")
         assert variant in ["a", "b", "c"]
-        assert 225e6 <= sys_clk_freq <= 450e6 # HBM AXI clock range.
+        # The HBM AXI clock must sit in [tck/4, tck/2] (PG276). tck is the stack clock set
+        # by the IP's PLL divider: 900 MHz (1800 Mbps, ip/hbm/hbm_0.xci) -> 225..450 MHz;
+        # 800 MHz (1600 Mbps, ip/hbm/hbm_800.xci) -> 200..400 MHz at 11% less bandwidth,
+        # which buys timing headroom when the fabric cannot make 225.
+        assert hbm_tck in (800, 900)
+        assert (hbm_tck/4)*1e6 <= sys_clk_freq <= (hbm_tck/2)*1e6 # HBM AXI clock range.
         self.bonsai_variant = variant
         platform = Platform()
 
@@ -84,7 +90,9 @@ class BonsaiSoC(SoCCore):
         # 32 pseudo-channels; CPU/BIOS window on channel 0 only (main_ram). Channels 1..31 are
         # reserved for the engine/BIST through their native AXI ports (the AXI-Lite SoC bridges
         # don't burst).
-        self.hbm = hbm = ClockDomainsRenamer({"axi": "sys"})(USPHBM2(platform))
+        hbm_ip = "hbm_0" if hbm_tck == 900 else f"hbm_{hbm_tck}"
+        self.hbm = hbm = ClockDomainsRenamer({"axi": "sys"})(
+            USPHBM2(platform, hbm_ip_name=hbm_ip))
         add_usphbm2_pseudochannels(soc=self, hbm=hbm, channels=(0,), main_channel=0)
 
         # The apb<->sys crossings (HBM AXI resets driven from the apb domain, apb_complete
@@ -227,6 +235,7 @@ def main():
     parser.add_target_argument("--driver",       action="store_true",       help="Generate LitePCIe driver headers.")
     parser.add_target_argument("--engine-channels", default=None, type=int, help="Engine HBM channel count override (default: 4 for b, 8 for c; 8B needs >= 16, max 31).")
     parser.add_target_argument("--with-nvme",    action="store_true",       help="Phase-2: standalone NVMe weight loading (LiteNVMe root, no host PCIe) - not implemented yet.")
+    parser.add_target_argument("--hbm-tck",      default=900, type=int, choices=[800, 900], help="HBM stack clock MHz: 900 (AXI 225-450) or 800 (AXI 200-400, -11%% bandwidth).")
     parser.add_target_argument("--with-dual",    action="store_true",       help="Phase-2: dual-Q GQA + speculative pair-verify datapath (~2x engine area; needs headroom).")
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
@@ -241,6 +250,7 @@ def main():
         with_nvme       = args.with_nvme,
         with_vecunit    = args.with_vecunit,
         with_dual       = args.with_dual,
+        hbm_tck         = args.hbm_tck,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,
         **parser.soc_argdict)

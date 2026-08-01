@@ -123,21 +123,6 @@ class BonsaiChannelPipe(LiteXModule):
         xbuf_w = xbuf.get_port(write_capable=True, we_granularity=256)
         xbuf_r = xbuf.get_port()
         self.specials += xbuf_w, xbuf_r
-        xbuf_n_r = None
-        if not dual:
-            # 256-bit mirror: Q8/AXPY only ever consume one 32-byte slice, so fold the
-            # 4:1 output mux into the address (RAM -> mux -> multiply was the hardware
-            # worst path at WNS -0.461). Same total bits as the wide buffer.
-            xbuf_n   = Memory(256, xbuf_groups*4)
-            self.specials += xbuf_n
-            xbuf_n_w = xbuf_n.get_port(write_capable=True)
-            xbuf_n_r = xbuf_n.get_port()
-            self.specials += xbuf_n_w, xbuf_n_r
-            self.comb += [
-                xbuf_n_w.adr.eq(Cat(self.xw_sub, self.xw_group)),
-                xbuf_n_w.dat_w.eq(self.xw_data),
-                xbuf_n_w.we.eq(self.xw_we),
-            ]
         xbuf_r2 = None
         if dual:
             xbufb = Memory(1024, xbuf_groups)
@@ -239,8 +224,7 @@ class BonsaiChannelPipe(LiteXModule):
         ]
         if dual: # Dual ternary: head A at even words (2g), head B at odd (2g+1).
             self.comb += xbuf_r2.adr.eq(Cat(C(1, 1), g_cnt[:7]))
-        else:
-            self.comb += xbuf_n_r.adr.eq(Mux(self.kind == KIND_OP_AXPY, pidx[5:], g_cnt))
+
         codes_r   = Signal(256)
         g_lo_r    = Signal(4) # Scale index within the 16-scale word.
         q8_sub_r  = Signal(2) # 256-bit slice of the 1024-bit x word (q8 mode).
@@ -322,11 +306,7 @@ class BonsaiChannelPipe(LiteXModule):
         # Q8 lanes: w8 * x8 over the selected 256-bit x slice. Head B (dual-Q) uses the
         # adjacent slice / adjacent p8 byte (+32) of the same 1024-bit x word.
         xslice  = Signal(256)
-        if dual:
-            self.comb += Case(q8_sub_r, {i: xslice.eq(xword[256*i:256*(i+1)])
-                                         for i in range(4)})
-        else:
-            self.comb += xslice.eq(xbuf_n_r.dat_r) # Selection already in the address.
+        self.comb += Case(q8_sub_r, {i: xslice.eq(xword[256*i:256*(i+1)]) for i in range(4)})
         if dual:
             xsliceb = Signal(256)
             q8_subb = Signal(2)
@@ -336,14 +316,8 @@ class BonsaiChannelPipe(LiteXModule):
         # AXPY coefficient byte: two-stage constant-slice mux out of the 1024-bit x word.
         p8_grp  = Signal(64)
         p8_ax   = Signal((8, True))
-        if dual:
-            self.comb += Case(pidx_r[3:], {i: p8_grp.eq(xword[64*i:64*(i+1)])
-                                           for i in range(16)})
-            self.comb += Case(pidx_r[:3], {i: p8_ax.eq(p8_grp[8*i:8*(i+1)])
-                                           for i in range(8)})
-        else:
-            self.comb += Case(pidx_r[:5], {i: p8_ax.eq(xbuf_n_r.dat_r[8*i:8*(i+1)])
-                                           for i in range(32)})
+        self.comb += Case(pidx_r[3:], {i: p8_grp.eq(xword[64*i:64*(i+1)]) for i in range(16)})
+        self.comb += Case(pidx_r[:3], {i: p8_ax.eq(p8_grp[8*i:8*(i+1)]) for i in range(8)})
         if dual: # Head B byte at +32 (bit 5 clear on A).
             p8_grpb = Signal(64)
             p8_axb  = Signal((8, True))
