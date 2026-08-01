@@ -61,7 +61,8 @@ HDR_OFFSET    = 0x0040_0000 # BONS header+table at main_ram + 4 MB.
 # BonsaiSimSoC -------------------------------------------------------------------------------------
 
 class BonsaiSimSoC(SoCCore):
-    def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0):
+    def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
+                 dual=True):
         platform = Platform()
         self.comb += platform.trace.eq(1)
 
@@ -118,7 +119,7 @@ class BonsaiSimSoC(SoCCore):
         ]
         self.comb += [self.vecunit.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
         self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit,
-                                              seq=self.seq)
+                                              seq=self.seq, dual=dual)
         self.engine_csr = BonsaiEngineCSR(self.engine, seq=self.seq)
         self.add_constant("BONSAI_HAS_SEQ")
         # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
@@ -135,7 +136,8 @@ class BonsaiSimSoC(SoCCore):
         ]
         self.add_constant("BONSAI_HAS_KVSTORE")
         self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
-        self.add_constant("BONSAI_HAS_DUALQ") # Sim always builds the head-B datapath.
+        if dual: # Matches the hardware --with-dual option.
+            self.add_constant("BONSAI_HAS_DUALQ")
         self.add_constant("BONSAI_HAS_VECUNIT")
         self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set (rmsnorm scalar ops + rsqrt fix).
 
@@ -161,20 +163,22 @@ def main():
     parser.add_argument("--hbm-latency",    default=16, type=int)
     parser.add_argument("--hbm-stall-rate", default=0, type=int)
     parser.add_argument("--threads",        default=4, type=int)
+    parser.add_argument("--no-dual",        action="store_true",
+        help="Build the slim engine (no S3/S6 head-B datapath), matching a hardware build without --with-dual.")
     args = parser.parse_args()
 
     sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
 
     if args.build_software:
-        soc     = BonsaiSimSoC(image=args.image, firmware=None,
+        soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=not args.no_dual,
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
         builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
         return
 
-    soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware,
+    soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=not args.no_dual,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
     builder.build(sim_config=sim_config, run=args.run, opt_level="O3",
