@@ -408,17 +408,22 @@ class BonsaiVectorUnit(LiteXModule):
         # REGISTERED there; EX2 only picks between it and the scratchpad read data
         # (which genuinely arrives at EX2). instr_r already holds the current
         # instruction during EX1B, so f_op is the right selector at both edges.
-        wb_alu_ops = [n for n in vec_wb_ops if n not in ("LDV", "LDW")]
+        # LUT ops stay OUT of the early capture: their ROM data only becomes valid at the
+        # EX1B edge, so registering at EX1B would give the ROM -> interpolate -> mux cone
+        # a single cycle, where routing it to EX2 gives it two under the EX-cone MCP
+        # (measured: hoisting them regressed WNS -0.641 -> -1.035).
+        wb_late    = ("LDV", "LDW", "LUTE2", "LUTRECIP", "LUTRSQRT")
+        wb_alu_ops = [n for n in vec_wb_ops if n not in wb_late]
         wb_alu   = Signal(32*LANES)
         wb_alu_r = Signal(32*LANES)
         self.comb += Case(f_op, {OP[n]: wb_alu.eq(res[n]) for n in wb_alu_ops})
         self.sync += If(in_ex1b, wb_alu_r.eq(wb_alu))
-        is_load = Signal()
-        self.comb += is_load.eq((f_op == OP["LDV"]) | (f_op == OP["LDW"]))
+        is_late = Signal()
+        self.comb += is_late.eq(reduce(or_, [f_op == OP[n] for n in wb_late]))
+        wb_late_val = Signal(32*LANES)
+        self.comb += Case(f_op, {OP[n]: wb_late_val.eq(res[n]) for n in wb_late})
         wb_val = Signal(32*LANES)
-        self.comb += wb_val.eq(Mux(is_load,
-                                   Mux(f_op == OP["LDV"], res["LDV"], res["LDW"]),
-                                   wb_alu_r))
+        self.comb += wb_val.eq(Mux(is_late, wb_late_val, wb_alu_r))
         is_vec_wb = Signal()
         self.comb += is_vec_wb.eq(reduce(or_, [f_op == OP[n] for n in vec_wb_ops]))
 
