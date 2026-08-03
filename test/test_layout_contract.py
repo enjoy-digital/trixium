@@ -66,8 +66,18 @@ def test_tiny_image_roundtrip(tmp_path):
     img, man, manifest = generate(str(tmp_path), n_channels=2, seed=99)
     reader  = bons.BONSReader(img)
     tensors = make_tiny_tensors(BONSAI_TINY, seed=99) # Same seed -> same arrays.
-    assert reader.header["n_tensors"] == len(tensors)
+
+    # write_image bakes in derived entries on top of the source list: the rope table (when the
+    # config has a context and head dim) and an int16 ".w16" companion for every F32 norm
+    # vector, so the image legitimately carries more tensors than make_tiny_tensors returns.
+    f32 = [t for t in tensors if t.kind == layout.KIND_F32]
+    n_derived = len(f32) + (1 if BONSAI_TINY.max_ctx and BONSAI_TINY.head_dim else 0)
+    assert reader.header["n_tensors"] == len(tensors) + n_derived
     assert reader.header["n_channels"] == 2
+    if BONSAI_TINY.max_ctx and BONSAI_TINY.head_dim:
+        assert "rope_tab" in reader.by_name
+    for spec in f32:
+        assert spec.name.replace(".weight", "") + ".w16" in reader.by_name
     for spec in tensors:
         scales, values = reader.tensor(spec.name)
         if spec.kind == layout.KIND_TERNARY:
