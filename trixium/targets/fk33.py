@@ -215,8 +215,8 @@ class BonsaiSoC(SoCCore):
             # HBM_WEIGHT_BASE; engine-channel payloads one HBM_CHAN_STRIDE apart (the AXI
             # switch makes the address, not the port, select the pseudo-channel).
             # Variant c == b gateware: the token loop is firmware + these constants.
-            from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE
-            self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HBM_WEIGHT_BASE)
+            from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
+            self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
             self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
             self.add_constant("BONSAI_CHAN_STRIDE",      HBM_CHAN_STRIDE)
             self.add_constant("BONSAI_N_CHANNELS",       engine_channels)

@@ -222,3 +222,9 @@ HBM_CHAN_STRIDE = 0x1000_0000 # 256 MB per channel, matching the pseudo-channel 
 # (the host's PCIe window covers CSRs only, not HBM channel 0 / main_ram); the firmware's
 # `loadhdr` command copies it from there to BONSAI_HDR_ADDR via FETCH + memcpy.
 HBM_META_OFFSET = HBM_WEIGHT_BASE - 0x0010_0000 # 1 MB before the payloads.
+
+# Where the firmware keeps its CPU-side copy of the BONS header+table, as an offset into
+# main_ram. This is a CPU address and has nothing to do with the HBM weight base - deriving it
+# from HBM_WEIGHT_BASE put it at 0xC000_0000 once the weight windows moved to 2 GB, i.e. far
+# outside main_ram (0x4000_0000, 256 MB). The firmware also places its heap 1 MB above this.
+HDR_CPU_OFFSET = 0x0040_0000 # main_ram + 4 MB.

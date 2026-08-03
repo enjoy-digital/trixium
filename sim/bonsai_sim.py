@@ -56,7 +56,8 @@ from trixium.model.bons import BONSReader
 
 MAIN_RAM_BASE = 0x4000_0000
 MAIN_RAM_SIZE = 0x0080_0000 # 8 MB.
-HDR_OFFSET    = 0x0040_0000 # BONS header+table at main_ram + 4 MB.
+from trixium.layout import HDR_CPU_OFFSET
+HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared with hardware).
 
 # BonsaiSimSoC -------------------------------------------------------------------------------------
 
