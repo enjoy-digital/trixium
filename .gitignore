@@ -44,3 +44,10 @@ modules.order
 *.fst.hier
 csr.csv
 analyzer.csv
+
+# Firmware build artifacts (regenerate with: make -C firmware BUILD_DIR=../build/<tree>).
+# The binary is tree-specific - CSR maps differ - so a checked-in copy is a footgun.
+firmware/*.d
+firmware/*.elf
+firmware/*.elf.map
+firmware/bonsai.bin
