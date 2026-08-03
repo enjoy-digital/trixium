@@ -672,12 +672,17 @@ int main(int argc, char **argv)
 
     if (fw && serialboot(fw) < 0) return 1;
 
-    /* Sync with the firmware prompt. */
+    /* Sync with the firmware prompt. The firmware runs its power-on self-tests (scratchpad,
+     * vector-unit programs, and with a model present the engine matvec/fetch checksums)
+     * before it prints a prompt, which takes well over ten seconds on a cold boot - waiting
+     * too briefly here reports "firmware not running" for a board that is merely busy, and
+     * eats the startup log on the way out. */
     send_line("");
-    if (!tty_expect("bonsai>", 10.0, NULL, 0, 0)) {
+    if (!tty_expect("bonsai>", 120.0, NULL, 0, 1)) { /* echo: show the self-tests as they run */
         fprintf(stderr,
-            "no 'bonsai>' prompt on %s.\n"
+            "no 'bonsai>' prompt on %s after 120 s.\n"
             "  - firmware not running? re-run with -k firmware/bonsai.bin\n"
+            "  - self-test wedged? watch the console directly and look for ENGSTALL\n"
             "  - wrong console? try -t /dev/ttyLXU0 (PCIe) or use litex_term crossover\n", tty);
         return 1;
     }
