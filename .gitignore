@@ -51,3 +51,8 @@ firmware/*.d
 firmware/*.elf
 firmware/*.elf.map
 firmware/bonsai.bin
+
+# Host tool binaries (build with: make -C trixium/software/user BUILD_DIR=<build tree>).
+trixium/software/user/bonsai_util
+trixium/software/user/bonsai_load
+trixium/software/user/bonsai_chat
