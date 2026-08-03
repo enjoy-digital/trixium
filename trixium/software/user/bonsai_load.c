@@ -45,6 +45,10 @@ struct bons_header {
  * (the loader writes the padding beats past the payload into free HBM space, harmless). */
 #define DMA_CHUNK 8192
 
+/* Scratch HBM address for the DMA priming transfer below: clear of every channel window
+ * (which start at BONSAI_CHAN_WEIGHT_BASE) and of the header staging area beneath them. */
+#define LOADER_SCRATCH 0x10000000u
+
 static void write_all(int fd, const uint8_t *buf, size_t len)
 {
     while (len) {
@@ -61,6 +65,39 @@ static void write_all(int fd, const uint8_t *buf, size_t len)
         buf += r;
         len -= r;
     }
+}
+
+/* Swallow the DMA ring's first lap; see the call site in main(). */
+static void loader_align(int fd)
+{
+    const uint64_t ring = (uint64_t)DMA_BUFFER_COUNT*DMA_BUFFER_SIZE;
+
+    litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,   0);
+    litepcie_writel(fd, CSR_LOADER_BASE_ADDR,   LOADER_SCRATCH);
+    litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR, (uint32_t)(ring/32));
+    litepcie_writel(fd, CSR_LOADER_START_ADDR,  1);
+
+    /* Feed it one ring of throwaway data. The driver discards this while the hardware is
+     * lapping ahead of us (its `underflows` path advances the buffer counter without copying),
+     * so what actually reaches the card is the ring's uninitialised contents - which is the
+     * point: this transfer exists to absorb them. By the time it completes, software and
+     * hardware are in step and every later write() is delivered in order. */
+    uint8_t *pad = calloc(1, DMA_CHUNK);
+    if (!pad) { perror("calloc"); exit(1); }
+    for (uint64_t left = ring; left; left -= DMA_CHUNK)
+        write_all(fd, pad, DMA_CHUNK);
+    free(pad);
+
+    int timeout = 5000;
+    while (!(litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 1)) {
+        usleep(1000);
+        if (--timeout == 0) {
+            fprintf(stderr, "loader_align: did not complete (status %08x)\n",
+                    litepcie_readl(fd, CSR_LOADER_STATUS_ADDR));
+            exit(1);
+        }
+    }
+    printf("  dma: absorbed the ring's first lap (%.1f MB)\n", ring/1e6);
 }
 
 static void loader_transfer(int fd, int chan, uint32_t base, const uint8_t *data, uint64_t beats)
@@ -134,6 +171,22 @@ int main(int argc, char **argv)
     uint64_t chan_bytes  = hdr.payload_beats*32;
     uint64_t buf_size    = PAD(chan_bytes > meta_bytes ? chan_bytes : meta_bytes);
     uint8_t *buf = malloc(buf_size);
+
+    /* Align the DMA stream with our writes before the first real transfer.
+     *
+     * litepcie_dma_reader_start() programs all DMA_BUFFER_COUNT descriptors and *then* enables
+     * the reader, so the hardware immediately streams a whole ring of buffers we have not
+     * written yet - 2 MB of leftovers from whatever ran before. The loader back-pressures
+     * rather than discarding while idle, so those leftovers became the head of the first armed
+     * transfer: on hardware the staged header and the first megabyte of channel 0 read back as
+     * zeros while everything after them was correct and correctly ordered.
+     *
+     * The loader back-pressures while idle, so the stream stalls between transfers and the
+     * misalignment is exactly one ring lap, taken by whichever transfer is armed first. Give
+     * that lap a throwaway transfer of its own - armed for exactly one ring, writing nothing -
+     * and the hardware wraps back to buffer 0 just as our first write() lands there. */
+    if (getenv("BONSAI_DMA_ALIGN")) /* only needed against an unpatched driver */
+        loader_align(fd);
 
     /* Header + table -> channel 0 staging area (firmware copies with `hdrload`). */
     fseek(f, 0, SEEK_SET);

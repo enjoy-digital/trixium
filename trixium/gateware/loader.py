@@ -67,6 +67,19 @@ class BonsaiHBMLoader(LiteXModule):
 
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
+            # Discard whatever the DMA is pushing while no transfer is armed.
+            #
+            # The host->device DMA is free-running: litepcie_dma_reader_start() programs all
+            # DMA_BUFFER_COUNT descriptors and enables the reader, after which the hardware
+            # streams the ring whether or not software has written anything into it. Holding
+            # sink.ready low here does not stop that - it just parks the ring's uninitialised
+            # contents at the head of the stream, where the next armed transfer eats it as if
+            # it were payload. On hardware that cost the staged BONS header and the first 2 MB
+            # of channel 0 (exactly DMA_BUFFER_COUNT*DMA_BUFFER_SIZE), every time.
+            #
+            # Discarding while idle also means a sacrificial transfer can be over-fed to soak
+            # up the stale lap without deadlocking the writer, which is what the host does.
+            self.sink.ready.eq(1),
             If(self.start.re & self.start.storage,
                 NextValue(beats, 0),
                 NextState("CMD"),
