@@ -56,3 +56,8 @@ firmware/bonsai.bin
 trixium/software/user/bonsai_util
 trixium/software/user/bonsai_load
 trixium/software/user/bonsai_chat
+trixium/software/user/*.d
+trixium/software/user/*.o
+trixium/software/user/liblitepcie/*.d
+trixium/software/user/liblitepcie/*.o
+trixium/software/user/liblitepcie/*.a
