@@ -16,6 +16,7 @@
 # - b: a + Ternary MatVec Engine (host-driven, N=4 HBM channels).
 # - c: Full inference  : Engine + Vector Unit + KV-Cache + Top-K + firmware token loop.
 
+import atexit
 import os
 
 from migen import *
@@ -240,10 +241,24 @@ def main():
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
 
-    # Builds must run from the repo root: the HBM XCI is resolved as ip/hbm/hbm_0.xci from CWD.
-    _hbm_ip = "hbm_0" if args.hbm_tck == 900 else f"hbm_{args.hbm_tck}"
-    assert os.path.exists(os.path.join("ip", "hbm", _hbm_ip + ".xci")), \
-        f"ip/hbm/{_hbm_ip}.xci not found; run from the repository root."
+    # Builds must run from the repo root: USPHBM2 resolves the XCI as <cwd>/ip/hbm/<name>.xci.
+    # The 800 MHz stack keeps its own directory (ip/hbm800) because Vivado's per-IP support
+    # files collide with the 900 MHz ones - 31 identically named files, among them the
+    # xpm_internal_config_file_*.mem that encode the PLL divider - so a merged ip/hbm would
+    # silently reconfigure whichever stack was generated second. A full gateware build of the
+    # 800 MHz variant therefore needs ip/hbm pointing at ip/hbm800 (see docs/bringup.md);
+    # header-only runs (--driver) just need the XCI to resolve.
+    _hbm_ip  = "hbm_0" if args.hbm_tck == 900 else f"hbm_{args.hbm_tck}"
+    _hbm_xci = os.path.join("ip", "hbm", _hbm_ip + ".xci")
+    _hbm_alt = os.path.join("ip", f"hbm{args.hbm_tck}", _hbm_ip + ".xci")
+    if not os.path.exists(_hbm_xci):
+        assert os.path.exists(_hbm_alt), \
+            f"neither {_hbm_xci} nor {_hbm_alt} found; run from the repository root."
+        assert not args.build, (
+            f"{_hbm_ip} lives in ip/hbm{args.hbm_tck}/ but USPHBM2 reads ip/hbm/; point ip/hbm at "
+            f"it first (e.g. 'mv ip/hbm ip/hbm900 && ln -s hbm{args.hbm_tck} ip/hbm').")
+        os.symlink(os.path.join("..", f"hbm{args.hbm_tck}", _hbm_ip + ".xci"), _hbm_xci)
+        atexit.register(lambda p=_hbm_xci: os.path.islink(p) and os.unlink(p))
 
     soc = BonsaiSoC(
         variant         = args.variant,
