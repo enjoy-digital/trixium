@@ -27,7 +27,10 @@ MEM_SIZE = 64*1024
 
 
 class _DUT(Module):
-    def __init__(self, n=2):
+    # data_width=128 matches the SoC (the DMA sink is 128-bit). Testing at 256 hid a real bug:
+    # the CSR poke path used to feed the 128->256 upconverter, which duplicated every word
+    # across both halves of the beat on hardware while a 256-wide DUT saw no converter at all.
+    def __init__(self, n=2, data_width=128):
         axis = []
         self.models = []
         for i in range(n):
@@ -36,13 +39,13 @@ class _DUT(Module):
             model = BonsaiHBMChannelModel(axi, size=MEM_SIZE, latency=4)
             self.submodules += model
             self.models.append(model)
-        self.loader = BonsaiHBMLoader(axis, data_width=256)
+        self.loader = BonsaiHBMLoader(axis, data_width=data_width)
         self.submodules += self.loader
 
 
 def _run(garbage_beats, payload, chan=0, addr=0x400, use_sync=True, markers=1):
     """Feed junk, then `markers` marker beats, then `payload`; return what landed in HBM."""
-    dut = _DUT()
+    dut = _DUT(data_width=256)
     rng = random.Random(1234)
 
     def driver():

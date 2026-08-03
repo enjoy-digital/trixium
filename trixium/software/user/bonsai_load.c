@@ -22,6 +22,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <dirent.h>
 
 #include "liblitepcie.h"
 
@@ -81,25 +83,68 @@ static void write_all(int fd, const uint8_t *buf, size_t len)
  * So the stream says where it starts: arm with resync and prefix one SYNC_MAGIC beat. The
  * loader discards everything until it sees the marker and takes the payload from the beat
  * after it. Whatever the DMA invented beforehand is discarded rather than written. */
-static const uint8_t SYNC_BEAT[32] = {
-    0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
-    0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
-};
+/* BAR0 mapped for direct MMIO.
+ *
+ * liblitepcie's litepcie_writel() is an ioctl - a syscall per 32-bit word - which for a 467 MB
+ * upload is over a hundred million syscalls and minutes of pure overhead. The CSR upload path
+ * pokes one word at a time, so it maps BAR0 and stores to it directly instead. sysfs maps the
+ * resource uncached, so each store is its own posted write, which is exactly the semantics a
+ * FIFO register needs.
+ */
+static volatile uint32_t *bar;
+
+static void bar_map(int devnum)
+{
+    char path[512], vend[16];
+    DIR *d = opendir("/sys/bus/pci/devices");
+    struct dirent *e;
+    int found = 0, n = 0;
+
+    if (!d) { perror("opendir"); exit(1); }
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/vendor", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue;
+        if (fgets(vend, sizeof(vend), f) && strtoul(vend, NULL, 0) == 0x10ee && n++ == devnum) {
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource0", e->d_name);
+            found = 1;
+        }
+        fclose(f);
+        if (found)
+            break;
+    }
+    closedir(d);
+    if (!found) { fprintf(stderr, "no Xilinx device %d found\n", devnum); exit(1); }
+
+    int fd = open(path, O_RDWR | O_SYNC);
+    if (fd < 0) { perror(path); exit(1); }
+    void *m = mmap(NULL, 0x20000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) { perror("mmap BAR0"); exit(1); }
+    close(fd);
+    bar = (volatile uint32_t *)m;
+}
+
+#define BAR_W(a, v) do { bar[((a) - CSR_BASE)/4] = (v); } while (0)
+#define BAR_R(a)    (bar[((a) - CSR_BASE)/4])
 
 static const uint8_t SYNC_BEAT[32] = {
     0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
     0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
 };
+
 
 static int use_csr = 1;   /* -d selects the DMA path */
 
 static void loader_wait(int fd, int chan, uint32_t base, uint64_t beats)
 {
     int timeout = 60000;
-    while (!(litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 1)) {
+    while (!(BAR_R(CSR_LOADER_STATUS_ADDR) & 1)) {
         usleep(1000);
         if (--timeout == 0) {
-            uint32_t st = litepcie_readl(fd, CSR_LOADER_STATUS_ADDR);
+            uint32_t st = BAR_R(CSR_LOADER_STATUS_ADDR);
             fprintf(stderr, "loader timeout chan %d addr %08x (status %08x, %u of %llu beats%s)\n",
                     chan, base, st, (st >> 8) & 0xFFFFFF, (unsigned long long)beats,
                     (st & 2) ? ", still hunting for the sync marker" : "");
@@ -120,12 +165,12 @@ static void loader_wait(int fd, int chan, uint32_t base, uint64_t beats)
 static void loader_transfer_csr(int fd, int chan, uint32_t base,
                                 const uint8_t *data, uint64_t beats)
 {
-    litepcie_writel(fd, CSR_LOADER_SRC_SEL_ADDR, 1);
-    litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,    chan);
-    litepcie_writel(fd, CSR_LOADER_BASE_ADDR,    base);
-    litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR,  beats);
-    litepcie_writel(fd, CSR_LOADER_RESYNC_ADDR,  0);
-    litepcie_writel(fd, CSR_LOADER_START_ADDR,   1);
+    BAR_W(CSR_LOADER_SRC_SEL_ADDR, 1);
+    BAR_W(CSR_LOADER_CHAN_ADDR,     chan);
+    BAR_W(CSR_LOADER_BASE_ADDR,     base);
+    BAR_W(CSR_LOADER_LENGTH_ADDR,   beats);
+    BAR_W(CSR_LOADER_RESYNC_ADDR,   0);
+    BAR_W(CSR_LOADER_START_ADDR,    1);
 
     const uint32_t *w = (const uint32_t *)data;
     uint64_t nwords = beats*8;
@@ -133,9 +178,9 @@ static void loader_transfer_csr(int fd, int chan, uint32_t base,
         /* The FIFO drains at HBM speed, so it only fills if the link is unusually fast;
          * check periodically rather than per word. */
         if ((i & 0xFF) == 0)
-            while (litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 4)
+            while (BAR_R(CSR_LOADER_STATUS_ADDR) & 4)
                 ;
-        litepcie_writel(fd, CSR_LOADER_POKE_ADDR, w[i]);
+        BAR_W(CSR_LOADER_POKE_ADDR, w[i]);
     }
     loader_wait(fd, chan, base, beats);
 }
@@ -189,6 +234,7 @@ int main(int argc, char **argv)
 
     char devname[64];
     snprintf(devname, sizeof(devname), "/dev/bonsai%d", devnum);
+    bar_map(devnum);
     int fd = open(devname, O_RDWR);
     if (fd < 0) { perror(devname); exit(1); }
 

@@ -72,11 +72,15 @@ class BonsaiHBMLoader(LiteXModule):
 
         # CSR poke -> stream: pack 32-bit writes into sink-width words, buffer them, and mux
         # that in place of the DMA when src_sel is set.
-        assert data_width % 32 == 0
-        poke_ratio = data_width//32
-        poke_sr    = Signal(data_width)
-        poke_cnt   = Signal(max=max(poke_ratio, 2))
-        self.poke_fifo = poke_fifo = stream.SyncFIFO([("data", data_width)], 512)
+        # Pack straight to 256-bit beats and mux at the *converter output*, not its input:
+        # feeding 128-bit words into the upconverter duplicated each one across both halves of
+        # the beat on hardware (the sim DUT used data_width=256, so it never saw the
+        # converter and the bug did not show). Nothing needs converting here anyway - the
+        # host knows it is writing beats.
+        poke_ratio = 256//32
+        poke_sr    = Signal(256)
+        poke_cnt   = Signal(max=poke_ratio)
+        self.poke_fifo = poke_fifo = stream.SyncFIFO([("data", 256)], 256)
         self.sync += [
             poke_fifo.sink.valid.eq(0),
             If(self.poke.re,
@@ -121,6 +125,14 @@ class BonsaiHBMLoader(LiteXModule):
         # discarded instead of written.
         sync_hunt = Signal()
         sync_seen = Signal()
+
+        # Upload source seen by the transfer FSM: DMA (via the width converter) or CSR pokes.
+        src = stream.Endpoint([("data", 256)])
+        self.comb += If(self.src_sel.storage,
+            poke_fifo.source.connect(src),
+        ).Else(
+            conv.source.connect(src),
+        )
 
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
@@ -197,21 +209,21 @@ class BonsaiHBMLoader(LiteXModule):
             # send a long prefix of them. The dropped region at the head of the stream can be
             # a megabyte, so a single marker would simply be lost and the loader would hunt
             # forever; a prefix longer than the drop always leaves one standing.
-            If(conv.source.valid & (conv.source.data == SYNC_MAGIC),
-                conv.source.ready.eq(1),
+            If(src.valid & (src.data == SYNC_MAGIC),
+                src.ready.eq(1),
                 NextValue(sync_seen, 1),
-            ).Elif(conv.source.valid & sync_seen,
+            ).Elif(src.valid & sync_seen,
                 NextState("DATA"),          # leave this beat for DATA
             ).Else(
-                conv.source.ready.eq(1),    # pre-marker filler
+                src.ready.eq(1),    # pre-marker filler
             )
         )
         fsm.act("DATA",
-            *[w.sink_data.valid.eq((chan == i) & conv.source.valid)
+            *[w.sink_data.valid.eq((chan == i) & src.valid)
               for i, w in enumerate(self.writers)],
-            *[w.sink_data.data.eq(conv.source.data) for w in self.writers],
-            conv.source.ready.eq(Array([w.sink_data.ready for w in self.writers])[chan]),
-            If(conv.source.valid & conv.source.ready,
+            *[w.sink_data.data.eq(src.data) for w in self.writers],
+            src.ready.eq(Array([w.sink_data.ready for w in self.writers])[chan]),
+            If(src.valid & src.ready,
                 NextValue(beats, beats + 1),
                 If(beats == self.length.storage - 1,
                     NextState("DRAIN"),
@@ -225,12 +237,7 @@ class BonsaiHBMLoader(LiteXModule):
         )
 
         self.comb += [
-            If(self.src_sel.storage,
-                poke_fifo.source.connect(conv.sink, omit={"last"}),
-            ).Else(
-                self.sink.connect(conv.sink, omit={"last"}),
-                self.sink.ready.eq(conv.sink.ready | fsm.ongoing("IDLE")),
-            ),
+            self.sink.connect(conv.sink, omit={"last"}),
             self.status.fields.poke_full.eq(~poke_fifo.sink.ready),
             self.status.fields.done.eq(fsm.ongoing("IDLE")),
             self.status.fields.sync.eq(fsm.ongoing("SYNC")),
