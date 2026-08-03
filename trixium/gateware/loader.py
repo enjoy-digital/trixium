@@ -21,6 +21,11 @@ from litex.soc.interconnect.csr import *
 
 from trixium.gateware.axi_writer import BonsaiAXIWriter
 
+# One 256-bit beat the host prefixes to a transfer so the loader can find the start of the
+# payload in a stream it does not otherwise control. Repeated 32-bit word so it is trivial to
+# emit from C and unlikely to occur in packed weights.
+SYNC_MAGIC = int("B0FFA5A5"*8, 16)
+
 # BonsaiHBMLoader ----------------------------------------------------------------------------------
 
 class BonsaiHBMLoader(LiteXModule):
@@ -31,8 +36,13 @@ class BonsaiHBMLoader(LiteXModule):
         self.base   = CSRStorage(32, description="Destination byte address (beat-aligned).")
         self.length = CSRStorage(24, description="Transfer length in 256-bit beats.")
         self.start  = CSRStorage(1,  description="Write 1 to arm the transfer.")
+        # NB: not `self.sync` - that name is Migen's synchronous-logic proxy on a Module.
+        self.resync = CSRStorage(1,  description=
+            "Arm with stream resynchronisation: discard beats until the LOADER_SYNC_MAGIC "
+            "beat is seen, then take the payload from the beat after it.")
         self.status = CSRStatus(fields=[
             CSRField("done",  size=1, description="Transfer complete (idle)."),
+            CSRField("sync",  size=1, offset=1, description="Hunting for the sync marker."),
             CSRField("beats", size=24, offset=8, description="Beats written so far."),
         ])
 
@@ -65,6 +75,23 @@ class BonsaiHBMLoader(LiteXModule):
         st_len  = Signal(24)
         st_cnt  = Signal(24)
 
+        # Stream resynchronisation.
+        #
+        # The host->device DMA is free-running and cannot be flow-controlled: the driver
+        # programs every descriptor and then enables the reader, so the card is fed the ring's
+        # contents whether or not software has written them, and litepcie_write() silently
+        # drops the caller's data whenever the hardware laps it. Either way the loader cannot
+        # tell payload from filler, and a transfer that starts on the wrong beat writes
+        # plausible-looking rubbish to HBM - which is exactly how the staged BONS header and
+        # the first megabyte of channel 0 were lost.
+        #
+        # So let the stream say where it starts. Armed with `sync`, the loader discards beats
+        # until it sees SYNC_MAGIC and takes the payload from the beat after it; the host
+        # prefixes one marker beat per transfer. Anything the DMA invents beforehand is
+        # discarded instead of written.
+        sync_hunt = Signal()
+        sync_seen = Signal()
+
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             # Discard whatever the DMA is pushing while no transfer is armed.
@@ -82,6 +109,8 @@ class BonsaiHBMLoader(LiteXModule):
             self.sink.ready.eq(1),
             If(self.start.re & self.start.storage,
                 NextValue(beats, 0),
+                NextValue(sync_hunt, self.resync.storage),
+                NextValue(sync_seen, 0),
                 NextState("CMD"),
             ).Elif(self.store_cmd.valid,
                 self.store_cmd.ready.eq(1),
@@ -124,7 +153,28 @@ class BonsaiHBMLoader(LiteXModule):
             *[w.sink_cmd.addr.eq(self.base.storage) for w in self.writers],
             *[w.sink_cmd.len.eq(self.length.storage) for w in self.writers],
             If(Array([w.sink_cmd.ready for w in self.writers])[chan],
-                NextState("DATA"),
+                If(sync_hunt,
+                    NextState("SYNC"),
+                ).Else(
+                    NextState("DATA"),
+                )
+            )
+        )
+        fsm.act("SYNC",
+            # Discard until a marker is seen, then discard the run of markers; the payload is
+            # the first non-marker beat after it, and that beat is left for DATA to consume.
+            #
+            # Skipping the whole run (rather than exactly one marker) is what lets the host
+            # send a long prefix of them. The dropped region at the head of the stream can be
+            # a megabyte, so a single marker would simply be lost and the loader would hunt
+            # forever; a prefix longer than the drop always leaves one standing.
+            If(conv.source.valid & (conv.source.data == SYNC_MAGIC),
+                conv.source.ready.eq(1),
+                NextValue(sync_seen, 1),
+            ).Elif(conv.source.valid & sync_seen,
+                NextState("DATA"),          # leave this beat for DATA
+            ).Else(
+                conv.source.ready.eq(1),    # pre-marker filler
             )
         )
         fsm.act("DATA",
@@ -148,5 +198,6 @@ class BonsaiHBMLoader(LiteXModule):
         self.comb += [
             self.sink.connect(conv.sink, omit={"last"}),
             self.status.fields.done.eq(fsm.ongoing("IDLE")),
+            self.status.fields.sync.eq(fsm.ongoing("SYNC")),
             self.status.fields.beats.eq(beats),
         ]

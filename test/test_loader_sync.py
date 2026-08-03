@@ -1,0 +1,109 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+"""Loader stream resynchronisation.
+
+The host->device DMA cannot be flow-controlled: the driver programs every descriptor and then
+enables the reader, so the card is fed the ring's contents whether or not software has written
+them. A transfer armed on the wrong beat writes plausible rubbish to HBM - that is how the
+staged BONS header and the first megabyte of channel 0 were lost on hardware. Armed with
+`sync`, the loader discards beats until it sees SYNC_MAGIC and takes the payload from the beat
+after it, so whatever the DMA invents beforehand is discarded rather than written.
+"""
+
+import random
+
+from migen import *
+
+from litex.soc.interconnect.axi import AXIInterface
+
+from trixium.gateware.hbm_model import BonsaiHBMChannelModel
+from trixium.gateware.loader import BonsaiHBMLoader, SYNC_MAGIC
+
+MEM_SIZE = 64*1024
+
+
+class _DUT(Module):
+    def __init__(self, n=2):
+        axis = []
+        self.models = []
+        for i in range(n):
+            axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+            axis.append(axi)
+            model = BonsaiHBMChannelModel(axi, size=MEM_SIZE, latency=4)
+            self.submodules += model
+            self.models.append(model)
+        self.loader = BonsaiHBMLoader(axis, data_width=256)
+        self.submodules += self.loader
+
+
+def _run(garbage_beats, payload, chan=0, addr=0x400, use_sync=True, markers=1):
+    """Feed junk, then `markers` marker beats, then `payload`; return what landed in HBM."""
+    dut = _DUT()
+    rng = random.Random(1234)
+
+    def driver():
+        yield dut.loader.chan.storage.eq(chan)
+        yield dut.loader.base.storage.eq(addr)
+        yield dut.loader.length.storage.eq(len(payload))
+        yield dut.loader.resync.storage.eq(1 if use_sync else 0)
+        yield
+        yield dut.loader.start.storage.eq(1)
+        yield dut.loader.start.re.eq(1)
+        yield
+        yield dut.loader.start.re.eq(0)
+        yield
+
+        stream_beats = [rng.getrandbits(256) for _ in range(garbage_beats)]
+        if use_sync:
+            stream_beats += [SYNC_MAGIC]*markers
+        stream_beats += payload
+
+        for w in stream_beats:
+            yield dut.loader.sink.data.eq(w)
+            yield dut.loader.sink.valid.eq(1)
+            yield
+            while not (yield dut.loader.sink.ready):
+                yield
+        yield dut.loader.sink.valid.eq(0)
+
+        for _ in range(4000):
+            if (yield dut.loader.status.fields.done):
+                break
+            yield
+        assert (yield dut.loader.status.fields.done), "loader did not finish"
+
+    got = []
+
+    def driver_then_read():
+        yield from driver()
+        for i in range(len(payload)):
+            got.append((yield dut.models[chan].mem[addr//32 + i]))
+
+    run_simulation(dut, [driver_then_read()])
+    return got
+
+
+def test_sync_skips_garbage_before_the_marker():
+    payload = [0x1000 + i for i in range(8)]
+    assert _run(garbage_beats=37, payload=payload) == payload
+
+
+def test_sync_skips_a_run_of_markers():
+    """A long marker prefix is how the host survives the dropped head of the stream."""
+    payload = [0x4000 + i for i in range(6)]
+    assert _run(garbage_beats=11, payload=payload, markers=64) == payload
+
+
+def test_sync_with_no_garbage():
+    payload = [0x2000 + i for i in range(4)]
+    assert _run(garbage_beats=0, payload=payload) == payload
+
+
+def test_without_sync_the_garbage_is_written():
+    """The failure mode sync exists to prevent, pinned so the flag cannot silently regress."""
+    payload = [0x3000 + i for i in range(4)]
+    assert _run(garbage_beats=5, payload=payload, use_sync=False) != payload

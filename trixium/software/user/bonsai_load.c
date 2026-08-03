@@ -67,55 +67,58 @@ static void write_all(int fd, const uint8_t *buf, size_t len)
     }
 }
 
-/* Swallow the DMA ring's first lap; see the call site in main(). */
-static void loader_align(int fd)
-{
-    const uint64_t ring = (uint64_t)DMA_BUFFER_COUNT*DMA_BUFFER_SIZE;
-
-    litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,   0);
-    litepcie_writel(fd, CSR_LOADER_BASE_ADDR,   LOADER_SCRATCH);
-    litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR, (uint32_t)(ring/32));
-    litepcie_writel(fd, CSR_LOADER_START_ADDR,  1);
-
-    /* Feed it one ring of throwaway data. The driver discards this while the hardware is
-     * lapping ahead of us (its `underflows` path advances the buffer counter without copying),
-     * so what actually reaches the card is the ring's uninitialised contents - which is the
-     * point: this transfer exists to absorb them. By the time it completes, software and
-     * hardware are in step and every later write() is delivered in order. */
-    uint8_t *pad = calloc(1, DMA_CHUNK);
-    if (!pad) { perror("calloc"); exit(1); }
-    for (uint64_t left = ring; left; left -= DMA_CHUNK)
-        write_all(fd, pad, DMA_CHUNK);
-    free(pad);
-
-    int timeout = 5000;
-    while (!(litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 1)) {
-        usleep(1000);
-        if (--timeout == 0) {
-            fprintf(stderr, "loader_align: did not complete (status %08x)\n",
-                    litepcie_readl(fd, CSR_LOADER_STATUS_ADDR));
-            exit(1);
-        }
-    }
-    printf("  dma: absorbed the ring's first lap (%.1f MB)\n", ring/1e6);
-}
+/* One transfer: marker beat, then payload.
+ *
+ * The host->device DMA cannot be flow-controlled. litepcie_dma_reader_start() programs every
+ * descriptor and *then* enables the reader, so the card is fed the ring's contents whether or
+ * not we have written them, and litepcie_write() silently drops our data whenever the hardware
+ * laps it (its underflow path advances the buffer counter without copying). Either way the
+ * loader cannot tell payload from filler on its own, and a transfer that starts on the wrong
+ * beat writes plausible rubbish - that is how the staged BONS header and the first megabyte of
+ * channel 0 were lost, while this tool cheerfully reported success because the byte count it
+ * prints is its own.
+ *
+ * So the stream says where it starts: arm with resync and prefix one SYNC_MAGIC beat. The
+ * loader discards everything until it sees the marker and takes the payload from the beat
+ * after it. Whatever the DMA invented beforehand is discarded rather than written. */
+static const uint8_t SYNC_BEAT[32] = {
+    0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
+    0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
+};
 
 static void loader_transfer(int fd, int chan, uint32_t base, const uint8_t *data, uint64_t beats)
 {
     litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,   chan);
     litepcie_writel(fd, CSR_LOADER_BASE_ADDR,   base);
     litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR, beats);
+    litepcie_writel(fd, CSR_LOADER_RESYNC_ADDR, 1);
     litepcie_writel(fd, CSR_LOADER_START_ADDR,  1);
+
+    /* The loader discards until it sees a marker, then discards the whole run of them, so a
+     * prefix longer than the dropped head of the stream always leaves one standing. Only the
+     * first transfer needs that: the drop happens once, while the hardware is lapping a ring
+     * software has not filled yet. */
+    static int primed = 0;
+    uint64_t prefix = primed ? 32 : 2*1024*1024;
+    primed = 1;
+
+    uint8_t *markers = malloc(prefix);
+    if (!markers) { perror("malloc"); exit(1); }
+    for (uint64_t o = 0; o < prefix; o += 32)
+        memcpy(markers + o, SYNC_BEAT, 32);
+    write_all(fd, markers, prefix);
+    free(markers);
 
     write_all(fd, data, beats*32);
 
-    int timeout = 10000; /* 10 s */
+    int timeout = 20000;
     while (!(litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 1)) {
         usleep(1000);
         if (--timeout == 0) {
             uint32_t st = litepcie_readl(fd, CSR_LOADER_STATUS_ADDR);
-            fprintf(stderr, "loader timeout (status %08x, %u beats written)\n",
-                    st, (st >> 8) & 0xFFFFFF);
+            fprintf(stderr, "loader timeout chan %d addr %08x (status %08x, %u of %llu beats%s)\n",
+                    chan, base, st, (st >> 8) & 0xFFFFFF, (unsigned long long)beats,
+                    (st & 2) ? ", still hunting for the sync marker" : "");
             exit(1);
         }
     }
@@ -185,9 +188,6 @@ int main(int argc, char **argv)
      * misalignment is exactly one ring lap, taken by whichever transfer is armed first. Give
      * that lap a throwaway transfer of its own - armed for exactly one ring, writing nothing -
      * and the hardware wraps back to buffer 0 just as our first write() lands there. */
-    if (getenv("BONSAI_DMA_ALIGN")) /* only needed against an unpatched driver */
-        loader_align(fd);
-
     /* Header + table -> channel 0 staging area (firmware copies with `hdrload`). */
     fseek(f, 0, SEEK_SET);
     if (fread(buf, 1, meta_bytes, f) != meta_bytes) { perror("fread"); exit(1); }
