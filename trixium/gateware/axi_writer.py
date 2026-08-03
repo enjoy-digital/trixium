@@ -11,10 +11,11 @@ issues W data only after the corresponding AW was accepted, counts B responses a
 `idle` for sequencing. Full-beat writes only (wstrb all-ones). Single AWID.
 
 **burst_beats must not exceed 16**: the HBM controller's ports are AXI3, so AWLEN is four bits
-(see the note in axi_reader.py). Overlong write bursts are worse than overlong reads - they do
-not stall, they corrupt: the IP ends the burst after 16 beats while we keep driving W data and
-place WLAST 48 beats late, so the surplus beats land wherever the controller attributes them.
-A weight upload "succeeds" (our own beat counter is happy) and the HBM contents are wrong."""
+(see the note in axi_reader.py). Overlong write bursts fail more quietly than overlong reads -
+they do not stall: the IP ends the burst after 16 beats while we keep driving W data and place
+WLAST 48 beats late, so the surplus beats are attributed by the controller rather than by us.
+A weight upload still reports success, because the count it reports is our own beat counter and
+not an acknowledgement from HBM."""
 
 from migen import *
 

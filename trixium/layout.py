@@ -201,6 +201,15 @@ def crc32(data):
 # CPU's main_ram at channel offset 0, so the CPU heap is capped to this base. 64 MB keeps
 # 192 MB/channel for weights: Bonsai-8B (~2.9 GB with embeddings/LM head) fits from N=16 up
 # (~180 MB/channel).
+# OPEN QUESTION (2026-08-03, unverified on hardware): "into each channel" assumes each AXI port
+# owns a private address space. The IP is configured with USER_SWITCH_ENABLE_00/01 = TRUE, i.e.
+# the AXI crossbar is on, which normally means the address selects the pseudo-channel and the
+# port is just an access point - in which case every channel's payload, written at this same
+# address on a different port, aliases onto one region. LiteX's usphbm2_channel_origin() reads
+# the same way: it hands channel c the global origin hbm_base + 256 MB*c and does not strip it.
+# The firmware's `selftest` settles this - aliased channels all checksum to whichever channel
+# was written last. If it does alias, give each channel a 256 MB stride placed clear of the
+# CPU's main_ram window (SoC 0x4000_0000 maps straight through to AXI 0x4000_0000 on port 0).
 HBM_WEIGHT_BASE = 0x0400_0000 # 64 MB into each channel.
 
 # The BONS header+table ("meta") is uploaded by the host to ENGINE channel 0 at this offset
