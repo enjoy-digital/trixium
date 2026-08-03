@@ -147,6 +147,10 @@ class BonsaiSimSoC(SoCCore):
         # Firmware-visible contract.
         self.add_constant("BONSAI_HDR_ADDR",         MAIN_RAM_BASE + HDR_OFFSET)
         self.add_constant("BONSAI_CHAN_WEIGHT_BASE", 0)
+        # Sim keeps stride 0: each channel has its own independent HBM model, so the models
+        # already give every channel a private address space. On hardware the AXI switch makes
+        # the address select the pseudo-channel, hence the non-zero stride there.
+        self.add_constant("BONSAI_CHAN_STRIDE",      0)
         self.add_constant("BONSAI_N_CHANNELS",       n_channels)
         if firmware is not None:
             self.add_constant("ROM_BOOT_ADDRESS", MAIN_RAM_BASE)

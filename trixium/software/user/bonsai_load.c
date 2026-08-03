@@ -151,7 +151,11 @@ int main(int argc, char **argv)
         }
         memset(buf + chan_bytes, 0, PAD(chan_bytes) - chan_bytes);
         printf("  channel %u payload (%.1f MB)\n", c, chan_bytes/1e6);
-        loader_transfer(fd, c, BONSAI_CHAN_WEIGHT_BASE, buf, PAD(chan_bytes)/32);
+        /* The HBM AXI switch makes the address select the pseudo-channel, so each channel
+         * needs its own window - writing them all at one base put every payload on top of
+         * the last (confirmed on hardware). The engine adds the same offset on its side. */
+        loader_transfer(fd, c, BONSAI_CHAN_WEIGHT_BASE + (uint32_t)c*BONSAI_CHAN_STRIDE,
+                        buf, PAD(chan_bytes)/32);
     }
 
     reader.enable = 0;

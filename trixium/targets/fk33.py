@@ -176,8 +176,10 @@ class BonsaiSoC(SoCCore):
                     "-from [get_cells -hierarchical -regexp "
                     "{{.*(m[0-9]+_reg|va_flat.*_reg|vb_flat.*_reg|sa_val.*_reg|sd_val.*_reg|rom_[0-9]+_dat0.*).*}}] "
                     "-to [get_cells -hierarchical -regexp {{.*((sr|vr)[0-9]_reg|red_(sum|max|smax).*_reg).*}}]")
+            from trixium.layout import HBM_CHAN_STRIDE
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
-                                                 seq=seq, dual=with_dual)
+                                                 seq=seq, dual=with_dual,
+                                                 chan_stride=HBM_CHAN_STRIDE)
             if with_dual:
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
                 self.add_constant("BONSAI_HAS_DUALQ")
@@ -210,11 +212,13 @@ class BonsaiSoC(SoCCore):
             ]
 
             # Firmware contract: BONS header+table live in HBM channel 0 (the CPU window) at
-            # HBM_WEIGHT_BASE; engine-channel payloads at the same offset in channels 1..N.
+            # HBM_WEIGHT_BASE; engine-channel payloads one HBM_CHAN_STRIDE apart (the AXI
+            # switch makes the address, not the port, select the pseudo-channel).
             # Variant c == b gateware: the token loop is firmware + these constants.
-            from trixium.layout import HBM_WEIGHT_BASE
+            from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE
             self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HBM_WEIGHT_BASE)
             self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
+            self.add_constant("BONSAI_CHAN_STRIDE",      HBM_CHAN_STRIDE)
             self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
 
         # Per-channel HBM bandwidth BIST (channels not owned by the engine). Skipped on

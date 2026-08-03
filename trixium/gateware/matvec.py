@@ -31,11 +31,22 @@ from trixium.gateware.ternary_mac import BonsaiChannelPipe
 
 class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
-                 dual=True):
+                 dual=True, chan_stride=0):
+        # chan_stride: byte distance between consecutive channels' weight regions. The HBM IP
+        # is configured with the AXI switch enabled (USER_SWITCH_ENABLE_00/01), so the address
+        # - not the port it arrives on - selects the pseudo-channel: with stride 0 every
+        # channel reads the same bytes. Confirmed on hardware, where `peek <c> 4000000`
+        # returned byte-identical data for all eight channels despite each having been
+        # uploaded a different payload. Sim keeps 0 because its per-channel HBM models are
+        # independent memories (each channel already has its own address space there).
         # When a BonsaiVectorUnit is passed, the scratchpad fill/gather ports are muxed
         # between the engine and the vector unit (granted to the vector unit while it is
         # busy - firmware serializes engine ops and vector ops, so contention is
         # structurally impossible; never a 5th RAM port).
+        assert chan_stride == 0 or (chan_stride & (chan_stride - 1)) == 0, \
+            "chan_stride must be 0 or a power of two (the STORE path shifts by it)"
+        chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
+
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
@@ -464,7 +475,10 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             self.store_cmd.valid.eq(1),
             self.store_cmd.chan.eq(cmd_r["chan"]),
-            self.store_cmd.addr.eq(cmd_r["wbase"]),
+            # STORE targets the one channel in cmd.chan, so it needs the same per-channel
+            # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
+            self.store_cmd.addr.eq(cmd_r["wbase"] +
+                (cmd_r["chan"] << chan_shift if chan_stride else 0)),
             self.store_cmd.len.eq(cmd_r["wlen"]),
             If(self.store_cmd.ready,
                 NextState("ST_RUN"),
@@ -498,7 +512,8 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             *[r.sink.valid.eq(~fetch_mode | (fetch_chan == i))
               for i, r in enumerate(self.readers)],
-            *[r.sink.addr.eq(cmd_r["wbase"]) for r in self.readers],
+            *[r.sink.addr.eq(cmd_r["wbase"] + i*chan_stride)
+              for i, r in enumerate(self.readers)],
             *[r.sink.len.eq(cmd_r["wlen"]
                 + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
               for i, r in enumerate(self.readers)],

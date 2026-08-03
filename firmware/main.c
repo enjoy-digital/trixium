@@ -121,6 +121,7 @@ static void help(void)
     puts("info            - model info (BONS header)");
     puts("hdrload         - copy BONS header+table staged by bonsai_load to CPU memory");
     puts("sptest          - scratchpad bus read/write test");
+    puts("peek c addr     - dump one HBM beat via the engine (hex addr)");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
     puts("tokclr/tok/genb - chunked prompt buffer + generate (host chat tool)");
@@ -221,6 +222,30 @@ static void hdrload(void)
     model_info();
     if (infer_init() == 0)
         puts("hdrload: inference ready");
+}
+
+// Fetch one beat from (channel, HBM byte address) through the engine and dump it. Ground
+// truth for "did the host's upload land where the engine looks for it?" - the two sides
+// agree on paper (both byte addresses, both indexing hbm.axi[1+c]) but only this says so.
+//   peek <chan> <hex-addr>
+static void peek_cmd(char *str)
+{
+    char *c_s = get_token(&str);
+    char *a_s = get_token(&str);
+    if (*c_s == 0 || *a_s == 0) {
+        puts("usage: peek <chan> <hex-addr>");
+        return;
+    }
+    int      chan = (int)strtoul(c_s, NULL, 0);
+    uint32_t addr = (uint32_t)strtoul(a_s, NULL, 16);
+    volatile uint32_t *sp = (volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000);
+    for (int i = 0; i < 8; i++)
+        sp[i] = 0xdeadbeef;                 // so "unchanged" is distinguishable from "read 0"
+    engine_fetch(chan, addr, 1, 0xC000);
+    printf("peek ch%d %08lx:", chan, (unsigned long)addr);
+    for (int i = 0; i < 8; i++)
+        printf(" %08lx", (unsigned long)sp[i]);
+    printf("\n");
 }
 
 static int parse_int(const char *s)
@@ -359,6 +384,8 @@ static void console_service(void)
         model_info();
     else if (strcmp(token, "sptest") == 0)
         sptest();
+    else if (strcmp(token, "peek") == 0)
+        peek_cmd(str);
     else if (strcmp(token, "selftest") == 0)
         selftest();
     else if (strcmp(token, "gen") == 0)
