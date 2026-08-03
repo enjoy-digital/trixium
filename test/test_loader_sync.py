@@ -107,3 +107,59 @@ def test_without_sync_the_garbage_is_written():
     """The failure mode sync exists to prevent, pinned so the flag cannot silently regress."""
     payload = [0x3000 + i for i in range(4)]
     assert _run(garbage_beats=5, payload=payload, use_sync=False) != payload
+
+
+# CSR upload path ------------------------------------------------------------------------------
+#
+# The host poking words through BAR0 instead of streaming over DMA. Slower - a posted PCIe
+# write per 32 bits - but nothing can be dropped, reordered or invented on the way, so it needs
+# neither the resync marker nor any pacing.
+
+def test_csr_poke_upload():
+    dut = _DUT()
+    payload = [0x11110000 + i for i in range(16)]   # 16 x 256-bit beats, as 32-bit words
+    words = []
+    for beat in payload:
+        for w in range(8):
+            words.append((beat + w) & 0xFFFFFFFF)
+    addr, chan = 0x800, 1
+    got = []
+
+    def driver():
+        yield dut.loader.src_sel.storage.eq(1)
+        yield dut.loader.chan.storage.eq(chan)
+        yield dut.loader.base.storage.eq(addr)
+        yield dut.loader.length.storage.eq(len(payload))
+        yield dut.loader.resync.storage.eq(0)
+        yield
+        yield dut.loader.start.storage.eq(1)
+        yield dut.loader.start.re.eq(1)
+        yield
+        yield dut.loader.start.re.eq(0)
+        yield
+
+        for w in words:
+            while (yield dut.loader.status.fields.poke_full):
+                yield
+            yield dut.loader.poke.storage.eq(w)
+            yield dut.loader.poke.re.eq(1)
+            yield
+            yield dut.loader.poke.re.eq(0)
+            yield
+
+        for _ in range(8000):
+            if (yield dut.loader.status.fields.done):
+                break
+            yield
+        assert (yield dut.loader.status.fields.done), "CSR upload did not finish"
+        for i in range(len(payload)):
+            got.append((yield dut.models[chan].mem[addr//32 + i]))
+
+    run_simulation(dut, [driver()])
+    expect = []
+    for beat in payload:
+        v = 0
+        for w in range(8):
+            v |= ((beat + w) & 0xFFFFFFFF) << (32*w)
+        expect.append(v)
+    assert got == expect, "CSR-poked payload landed wrong"

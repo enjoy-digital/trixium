@@ -86,32 +86,16 @@ static const uint8_t SYNC_BEAT[32] = {
     0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
 };
 
-static void loader_transfer(int fd, int chan, uint32_t base, const uint8_t *data, uint64_t beats)
+static const uint8_t SYNC_BEAT[32] = {
+    0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
+    0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0, 0xa5, 0xa5, 0xff, 0xb0,
+};
+
+static int use_csr = 1;   /* -d selects the DMA path */
+
+static void loader_wait(int fd, int chan, uint32_t base, uint64_t beats)
 {
-    litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,   chan);
-    litepcie_writel(fd, CSR_LOADER_BASE_ADDR,   base);
-    litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR, beats);
-    litepcie_writel(fd, CSR_LOADER_RESYNC_ADDR, 1);
-    litepcie_writel(fd, CSR_LOADER_START_ADDR,  1);
-
-    /* The loader discards until it sees a marker, then discards the whole run of them, so a
-     * prefix longer than the dropped head of the stream always leaves one standing. Only the
-     * first transfer needs that: the drop happens once, while the hardware is lapping a ring
-     * software has not filled yet. */
-    static int primed = 0;
-    uint64_t prefix = primed ? 32 : 2*1024*1024;
-    primed = 1;
-
-    uint8_t *markers = malloc(prefix);
-    if (!markers) { perror("malloc"); exit(1); }
-    for (uint64_t o = 0; o < prefix; o += 32)
-        memcpy(markers + o, SYNC_BEAT, 32);
-    write_all(fd, markers, prefix);
-    free(markers);
-
-    write_all(fd, data, beats*32);
-
-    int timeout = 20000;
+    int timeout = 60000;
     while (!(litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 1)) {
         usleep(1000);
         if (--timeout == 0) {
@@ -124,16 +108,82 @@ static void loader_transfer(int fd, int chan, uint32_t base, const uint8_t *data
     }
 }
 
+/* Upload by poking words through BAR0.
+ *
+ * The DMA is faster but cannot be flow-controlled: litepcie_dma_reader_start() programs every
+ * descriptor and *then* enables the reader, so the card is fed the ring's contents whether or
+ * not we have written them, and litepcie_write() silently drops our data whenever the hardware
+ * laps it. That cost the staged BONS header and the first megabyte of channel 0 on every
+ * upload, with this tool reporting success throughout because the byte count it prints is its
+ * own. Poking each word ourselves cannot drop, reorder or invent anything - slower, but the
+ * bytes that arrive are the bytes we sent. */
+static void loader_transfer_csr(int fd, int chan, uint32_t base,
+                                const uint8_t *data, uint64_t beats)
+{
+    litepcie_writel(fd, CSR_LOADER_SRC_SEL_ADDR, 1);
+    litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,    chan);
+    litepcie_writel(fd, CSR_LOADER_BASE_ADDR,    base);
+    litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR,  beats);
+    litepcie_writel(fd, CSR_LOADER_RESYNC_ADDR,  0);
+    litepcie_writel(fd, CSR_LOADER_START_ADDR,   1);
+
+    const uint32_t *w = (const uint32_t *)data;
+    uint64_t nwords = beats*8;
+    for (uint64_t i = 0; i < nwords; i++) {
+        /* The FIFO drains at HBM speed, so it only fills if the link is unusually fast;
+         * check periodically rather than per word. */
+        if ((i & 0xFF) == 0)
+            while (litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 4)
+                ;
+        litepcie_writel(fd, CSR_LOADER_POKE_ADDR, w[i]);
+    }
+    loader_wait(fd, chan, base, beats);
+}
+
+static void loader_transfer_dma(int fd, int chan, uint32_t base,
+                                const uint8_t *data, uint64_t beats)
+{
+    litepcie_writel(fd, CSR_LOADER_SRC_SEL_ADDR, 0);
+    litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,    chan);
+    litepcie_writel(fd, CSR_LOADER_BASE_ADDR,    base);
+    litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR,  beats);
+    litepcie_writel(fd, CSR_LOADER_RESYNC_ADDR,  1);
+    litepcie_writel(fd, CSR_LOADER_START_ADDR,   1);
+
+    /* Marker prefix longer than the dropped head of the stream; only the first transfer needs
+     * it, since the drop happens once while the hardware laps a ring software has not filled. */
+    static int primed = 0;
+    uint64_t prefix = primed ? 32 : 8*1024*1024;
+    primed = 1;
+    uint8_t *markers = malloc(prefix);
+    if (!markers) { perror("malloc"); exit(1); }
+    for (uint64_t o = 0; o < prefix; o += 32)
+        memcpy(markers + o, SYNC_BEAT, 32);
+    write_all(fd, markers, prefix);
+    free(markers);
+
+    write_all(fd, data, beats*32);
+    loader_wait(fd, chan, base, beats);
+}
+
+static void loader_transfer(int fd, int chan, uint32_t base, const uint8_t *data, uint64_t beats)
+{
+    if (use_csr)
+        loader_transfer_csr(fd, chan, base, data, beats);
+    else
+        loader_transfer_dma(fd, chan, base, data, beats);
+}
+
 int main(int argc, char **argv)
 {
     int devnum = 0;
     int opt;
     while ((opt = getopt(argc, argv, "c:h")) != -1) {
         if (opt == 'c') devnum = atoi(optarg);
-        else { printf("usage: bonsai_load [-c devnum] image.img\n"); exit(0); }
+        else { printf("usage: bonsai_load [-c devnum] [-d] image.img\n  -d  upload over DMA instead of CSR\n"); exit(0); }
     }
     if (optind >= argc) {
-        fprintf(stderr, "usage: bonsai_load [-c devnum] image.img\n");
+        fprintf(stderr, "usage: bonsai_load [-c devnum] [-d] image.img\n");
         exit(1);
     }
 

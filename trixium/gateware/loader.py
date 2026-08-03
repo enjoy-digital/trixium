@@ -40,9 +40,19 @@ class BonsaiHBMLoader(LiteXModule):
         self.resync = CSRStorage(1,  description=
             "Arm with stream resynchronisation: discard beats until the LOADER_SYNC_MAGIC "
             "beat is seen, then take the payload from the beat after it.")
+        # CSR upload path: the host poking words through BAR0 instead of streaming over DMA.
+        #
+        # The DMA is the fast path but it cannot be flow-controlled - see the resync notes
+        # below - so this is the one that is simply always right: the host writes each word
+        # itself, so nothing can be dropped, reordered or invented. It is slower (a posted
+        # PCIe write per 32 bits) but it needs no marker, no pacing and no luck.
+        self.src_sel = CSRStorage(1, description="Upload source: 0 = PCIe DMA, 1 = CSR poke.")
+        self.poke    = CSRStorage(32, description="Write a 32-bit word into the upload stream.")
+
         self.status = CSRStatus(fields=[
             CSRField("done",  size=1, description="Transfer complete (idle)."),
             CSRField("sync",  size=1, offset=1, description="Hunting for the sync marker."),
+            CSRField("poke_full", size=1, offset=2, description="CSR poke FIFO cannot accept."),
             CSRField("beats", size=24, offset=8, description="Beats written so far."),
         ])
 
@@ -59,6 +69,26 @@ class BonsaiHBMLoader(LiteXModule):
 
         # Width conversion to 256-bit beats.
         self.conv = conv = stream.Converter(data_width, 256)
+
+        # CSR poke -> stream: pack 32-bit writes into sink-width words, buffer them, and mux
+        # that in place of the DMA when src_sel is set.
+        assert data_width % 32 == 0
+        poke_ratio = data_width//32
+        poke_sr    = Signal(data_width)
+        poke_cnt   = Signal(max=max(poke_ratio, 2))
+        self.poke_fifo = poke_fifo = stream.SyncFIFO([("data", data_width)], 512)
+        self.sync += [
+            poke_fifo.sink.valid.eq(0),
+            If(self.poke.re,
+                poke_sr.eq(Cat(poke_sr[32:], self.poke.storage)),
+                poke_cnt.eq(poke_cnt + 1),
+                If(poke_cnt == poke_ratio - 1,
+                    poke_cnt.eq(0),
+                    poke_fifo.sink.valid.eq(1),
+                    poke_fifo.sink.data.eq(Cat(poke_sr[32:], self.poke.storage)),
+                )
+            )
+        ]
 
         # One writer per channel; command + data demuxed by `chan`.
         self.writers = []
@@ -94,19 +124,18 @@ class BonsaiHBMLoader(LiteXModule):
 
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
-            # Discard whatever the DMA is pushing while no transfer is armed.
+            # Deliberately NOT ready here.
             #
-            # The host->device DMA is free-running: litepcie_dma_reader_start() programs all
-            # DMA_BUFFER_COUNT descriptors and enables the reader, after which the hardware
-            # streams the ring whether or not software has written anything into it. Holding
-            # sink.ready low here does not stop that - it just parks the ring's uninitialised
-            # contents at the head of the stream, where the next armed transfer eats it as if
-            # it were payload. On hardware that cost the staged BONS header and the first 2 MB
-            # of channel 0 (exactly DMA_BUFFER_COUNT*DMA_BUFFER_SIZE), every time.
+            # Back-pressure while idle is load-bearing: it is the only thing throttling the
+            # free-running host->device DMA. Letting the loader swallow the stream instead (to
+            # allow a sacrificial transfer to be over-fed) means the hardware laps the ring
+            # continuously, litepcie_write() sees itself permanently overtaken, and every write
+            # is dropped - the card then receives nothing but stale ring contents and no
+            # transfer ever completes. Stalling the stream between transfers is what lets
+            # software catch up, and after the first lap the drops stop.
             #
-            # Discarding while idle also means a sacrificial transfer can be over-fed to soak
-            # up the stale lap without deadlocking the writer, which is what the host does.
-            self.sink.ready.eq(1),
+            # The garbage this parks at the head of the stream is handled by the resync marker
+            # below, not by discarding it here.
             If(self.start.re & self.start.storage,
                 NextValue(beats, 0),
                 NextValue(sync_hunt, self.resync.storage),
@@ -196,7 +225,13 @@ class BonsaiHBMLoader(LiteXModule):
         )
 
         self.comb += [
-            self.sink.connect(conv.sink, omit={"last"}),
+            If(self.src_sel.storage,
+                poke_fifo.source.connect(conv.sink, omit={"last"}),
+            ).Else(
+                self.sink.connect(conv.sink, omit={"last"}),
+                self.sink.ready.eq(conv.sink.ready | fsm.ongoing("IDLE")),
+            ),
+            self.status.fields.poke_full.eq(~poke_fifo.sink.ready),
             self.status.fields.done.eq(fsm.ongoing("IDLE")),
             self.status.fields.sync.eq(fsm.ongoing("SYNC")),
             self.status.fields.beats.eq(beats),
