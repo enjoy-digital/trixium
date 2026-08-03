@@ -33,7 +33,7 @@
 static char *readstr(void)
 {
     char c[2];
-    static char s[64];
+    static char s[1024];
     static int ptr = 0;
 
     if (readchar_nonblock()) {
@@ -111,6 +111,7 @@ static void fill_x_pattern(uint32_t xsrc, uint32_t n)
 /*-----------------------------------------------------------------------*/
 
 static void emit_token(int tok);
+static int  gen_emit_to_pbuf;
 static int  parse_int(const char *s);
 
 static void help(void)
@@ -122,6 +123,7 @@ static void help(void)
     puts("sptest          - scratchpad bus read/write test");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
+    puts("tokclr/tok/genb - chunked prompt buffer + generate (host chat tool)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
@@ -179,9 +181,15 @@ static void bench_cmd(char *args)
     puts("");
 }
 
+static int gen_emit_to_pbuf;
+static int pbuf[512];   // Chunked prompt buffer (tok/genb).
+static int pbuf_n;
+
 static void emit_token(int tok)
 {
     printf(" %d", tok);
+    if (gen_emit_to_pbuf && pbuf_n < (int)(sizeof(pbuf)/sizeof(pbuf[0])))
+        pbuf[pbuf_n++] = tok;
 }
 
 // Copy the BONS header+table from the HBM staging area (engine channel 0, uploaded there by
@@ -221,6 +229,42 @@ static int parse_int(const char *s)
     while (*s >= '0' && *s <= '9')
         v = v*10 + (*s++ - '0');
     return v;
+}
+
+static void tokclr_cmd(void)
+{
+    pbuf_n = 0;
+    printf("TOKCLR %d\n", pbuf_n);
+}
+
+static void tok_cmd(char *args)
+{
+    char *tok;
+    while (1) {
+        tok = get_token(&args);
+        if (*tok == 0)
+            break;
+        if (pbuf_n < (int)(sizeof(pbuf)/sizeof(pbuf[0])))
+            pbuf[pbuf_n++] = parse_int(tok);
+    }
+    printf("TOK %d\n", pbuf_n); // Host uses this to confirm the running length.
+}
+
+// Generate from the accumulated prompt buffer; appends the emitted tokens to it so the
+// next turn continues the conversation without the host resending history.
+static void genb_cmd(char *args)
+{
+    char *tok = get_token(&args);
+    int n = parse_int(tok);
+    if (n <= 0 || pbuf_n == 0) {
+        puts("usage: tok <ids...> ; genb <n>");
+        return;
+    }
+    printf("GEN:");
+    gen_emit_to_pbuf = 1;
+    infer_generate(pbuf, pbuf_n, n, emit_token);
+    gen_emit_to_pbuf = 0;
+    puts("\nGEN DONE");
 }
 
 static void gen_cmd(char *args)
@@ -319,6 +363,12 @@ static void console_service(void)
         selftest();
     else if (strcmp(token, "gen") == 0)
         gen_cmd(str);
+    else if (strcmp(token, "tok") == 0)
+        tok_cmd(str);
+    else if (strcmp(token, "tokclr") == 0)
+        tokclr_cmd();
+    else if (strcmp(token, "genb") == 0)
+        genb_cmd(str);
     else if (strcmp(token, "hwops") == 0)
         hwops_cmd(str);
     else if (strcmp(token, "stats") == 0) {
