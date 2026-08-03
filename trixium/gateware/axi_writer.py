@@ -4,11 +4,17 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiAXIWriter: native AXI4 burst writer (KV-cache append + weight loader back-end).
+"""BonsaiAXIWriter: native AXI burst writer (KV-cache append + weight loader back-end).
 
 Takes {addr, len} commands and a beat data stream, splits into INCR bursts (4 KB safe),
 issues W data only after the corresponding AW was accepted, counts B responses and exposes
-`idle` for sequencing. Full-beat writes only (wstrb all-ones). Single AWID."""
+`idle` for sequencing. Full-beat writes only (wstrb all-ones). Single AWID.
+
+**burst_beats must not exceed 16**: the HBM controller's ports are AXI3, so AWLEN is four bits
+(see the note in axi_reader.py). Overlong write bursts are worse than overlong reads - they do
+not stall, they corrupt: the IP ends the burst after 16 beats while we keep driving W data and
+place WLAST 48 beats late, so the surplus beats land wherever the controller attributes them.
+A weight upload "succeeds" (our own beat counter is happy) and the HBM contents are wrong."""
 
 from migen import *
 
@@ -22,8 +28,9 @@ from trixium.layout import BEAT_BYTES
 # BonsaiAXIWriter ----------------------------------------------------------------------------------
 
 class BonsaiAXIWriter(LiteXModule):
-    def __init__(self, axi, burst_beats=64):
+    def __init__(self, axi, burst_beats=16):
         assert axi.data_width == 256
+        assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"
         self.sink_cmd  = cmd  = stream.Endpoint([("addr", axi.address_width), ("len", 24)])
         self.sink_data = data = stream.Endpoint([("data", 256)])
         self.idle      = Signal()

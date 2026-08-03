@@ -954,8 +954,11 @@ static int litepcie_alloc_chdev(struct litepcie_device *s)
 
 	index = litepcie_minor_idx;
 	for (i = 0; i < s->channels; i++) {
-		dev_info(&s->dev->dev, "Creating /dev/litepcie%d\n", index);
-		if (!device_create(litepcie_class, NULL, MKDEV(litepcie_major, index), NULL, "litepcie%d", index)) {
+		/* Node name must match what the user tools open (/dev/bonsai<N>), and the rest of
+		   the driver already brands itself LITEPCIE_NAME = "bonsai". */
+		dev_info(&s->dev->dev, "Creating /dev/" LITEPCIE_NAME "%d\n", index);
+		if (!device_create(litepcie_class, NULL, MKDEV(litepcie_major, index), NULL,
+				   LITEPCIE_NAME "%d", index)) {
 			ret = -EINVAL;
 			dev_err(&s->dev->dev, "Failed to create device\n");
 			goto fail_create;

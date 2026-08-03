@@ -63,6 +63,17 @@ class BonsaiHBMChannelModel(LiteXModule):
         stall = Signal()
         self.comb += stall.eq(lfsr[:4] < stall_rate)
 
+        # AXI3 burst-length truncation ---------------------------------------------------------
+        # The real IP's ports are AXI3: AXI_nn_AxLEN is 4 bits, so anything above 16 beats
+        # silently loses its upper bits on the way in. Model that exactly, or simulation
+        # happily serves 64-beat bursts that hardware never will (which is precisely how the
+        # first engine fetch on silicon came to stall). `axlen_overflow` latches the mistake
+        # so a test can name it instead of just timing out.
+        self.axlen_overflow = axlen_overflow = Signal()
+        self.sync += If((axi.ar.valid & (axi.ar.len[4:] != 0)) |
+                        (axi.aw.valid & (axi.aw.len[4:] != 0)),
+            axlen_overflow.eq(1))
+
         # Read path ---------------------------------------------------------------------------
         ar_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
         self.submodules += ar_fifo
@@ -70,7 +81,7 @@ class BonsaiHBMChannelModel(LiteXModule):
             ar_fifo.sink.valid.eq(axi.ar.valid),
             axi.ar.ready.eq(ar_fifo.sink.ready),
             ar_fifo.sink.addr.eq(axi.ar.addr),
-            ar_fifo.sink.len.eq(axi.ar.len),
+            ar_fifo.sink.len.eq(axi.ar.len[:4]),
             ar_fifo.sink.id.eq(axi.ar.id),
         ]
 
@@ -131,7 +142,7 @@ class BonsaiHBMChannelModel(LiteXModule):
             aw_fifo.sink.valid.eq(axi.aw.valid),
             axi.aw.ready.eq(aw_fifo.sink.ready),
             aw_fifo.sink.addr.eq(axi.aw.addr),
-            aw_fifo.sink.len.eq(axi.aw.len),
+            aw_fifo.sink.len.eq(axi.aw.len[:4]),
             aw_fifo.sink.id.eq(axi.aw.id),
         ]
 

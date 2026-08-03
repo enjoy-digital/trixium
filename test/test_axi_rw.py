@@ -8,6 +8,7 @@
 # exact data/last sequences under latency + R-stall jitter + consumer backpressure,
 # streamer utilization on the clean model, write-then-readback integrity.
 
+import pytest
 import random
 
 import numpy as np
@@ -163,5 +164,45 @@ def test_writer_readback():
         for i, w in enumerate(words):
             got = (yield dut.model.mem[addr//32 + i])
             assert got == w, f"beat {i}"
+
+    run_simulation(dut, [driver()])
+
+
+# AXI3 burst-length cap -----------------------------------------------------------------------
+#
+# The HBM controller's ports are AXI3: AXI_nn_AxLEN is 4 bits (see ip/hbm*/hbm_*_stub.v), so a
+# burst can never exceed 16 beats. LiteX's AXIInterface carries an 8-bit `len` and the upper
+# bits are dropped where it meets the IP, which is silent and ugly: reads stall forever waiting
+# for beats the IP will not send, and writes place WLAST late and corrupt memory. This is how
+# the first engine fetch on real hardware wedged (ENGSTALL, 32 of 128 beats delivered), so the
+# limit is pinned here rather than left to a comment.
+
+@pytest.mark.parametrize("cls", [BonsaiAXIReader, BonsaiAXIWriter])
+def test_burst_beats_capped_at_axi3_limit(cls):
+    axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+    with pytest.raises(AssertionError):
+        cls(axi, burst_beats=64)
+
+@pytest.mark.parametrize("cls", [BonsaiAXIReader, BonsaiAXIWriter])
+def test_burst_beats_16_is_accepted(cls):
+    axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+    cls(axi, burst_beats=16)
+
+def test_hbm_model_flags_axlen_overflow():
+    """The model truncates AxLEN like the IP does, and latches the protocol violation."""
+    axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+    dut = Module()
+    dut.submodules.model = model = BonsaiHBMChannelModel(axi, size=MEM_SIZE, latency=1)
+
+    def driver():
+        yield axi.ar.addr.eq(0)
+        yield axi.ar.len.eq(63)          # 64-beat burst: illegal on an AXI3 port.
+        yield axi.ar.valid.eq(1)
+        for _ in range(8):
+            yield
+        yield axi.ar.valid.eq(0)
+        for _ in range(4):
+            yield
+        assert (yield model.axlen_overflow), "model accepted an out-of-range AxLEN"
 
     run_simulation(dut, [driver()])

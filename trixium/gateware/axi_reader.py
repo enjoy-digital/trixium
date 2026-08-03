@@ -4,13 +4,21 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiAXIReader: native AXI4 burst reader (the weight streamer front-end).
+"""BonsaiAXIReader: native AXI burst reader (the weight streamer front-end).
 
 Takes {addr, len} commands (beat-aligned byte address, length in 256-bit beats), splits them
-into INCR bursts (64 beats by default, never crossing a 4 KB boundary), keeps several bursts
+into INCR bursts (16 beats by default, never crossing a 4 KB boundary), keeps several bursts
 outstanding with credit-based reservation of the output FIFO (so R data is never
 back-pressured by us at the AXI port when credits were granted), and streams beats out with
 `last` on the final beat of each command. Single ARID (in-order R data).
+
+**burst_beats must not exceed 16.** The Xilinx HBM controller's ports are AXI3
+(`AXI_nn_ARLEN[3:0]`, see ip/hbm*/hbm_*_stub.v), so AxLEN is four bits wide and the longest
+legal burst is 16 beats. LiteX's AXIInterface carries an 8-bit `len`, and the upper bits are
+simply dropped where it meets the IP - asking for 64 beats arrives as 16. Nothing complains:
+the reader then waits forever for beats 17..64 of each burst. On hardware that showed up as
+`ENGSTALL ... ch0 beats=00000020` (two bursts in flight x 16 beats delivered, then a
+permanent stall) on the very first engine fetch from HBM.
 
 Perf counters (free-running Signals, aggregated at the engine level): total beats delivered,
 AR stall cycles (command issued but not accepted), R stall cycles (R valid, FIFO not ready -
@@ -29,8 +37,9 @@ from trixium.layout import BEAT_BYTES
 # BonsaiAXIReader ----------------------------------------------------------------------------------
 
 class BonsaiAXIReader(LiteXModule):
-    def __init__(self, axi, burst_beats=64, fifo_depth=512):
+    def __init__(self, axi, burst_beats=16, fifo_depth=512):
         assert axi.data_width == 256
+        assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"
         self.sink   = sink   = stream.Endpoint([("addr", axi.address_width), ("len", 24)])
         self.source = source = stream.Endpoint([("data", 256)])
 
