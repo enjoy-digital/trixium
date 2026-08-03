@@ -241,8 +241,9 @@ def main():
     args = parser.parse_args()
 
     # Builds must run from the repo root: the HBM XCI is resolved as ip/hbm/hbm_0.xci from CWD.
-    assert os.path.exists(os.path.join("ip", "hbm", "hbm_0.xci")), \
-        "ip/hbm/hbm_0.xci not found; run from the repository root."
+    _hbm_ip = "hbm_0" if args.hbm_tck == 900 else f"hbm_{args.hbm_tck}"
+    assert os.path.exists(os.path.join("ip", "hbm", _hbm_ip + ".xci")), \
+        f"ip/hbm/{_hbm_ip}.xci not found; run from the repository root."
 
     soc = BonsaiSoC(
         variant         = args.variant,
