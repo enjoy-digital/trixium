@@ -136,7 +136,7 @@ def test_sim_selftest_checksums():
         assert sp_tokens == ref_sp, f"spec tokens {sp_tokens} != ref {ref_sp}"
         assert re.search(r"SPEC acc=\d+ rej=\d+", out)
 
-def hybrid_generate(img, prompt, n_new, modes=None):
+def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
     """Python mirror of the firmware loop (resident-BFP): engine-bitexact matvecs,
     int16 scratchpad-resident activations with integer exponent algebra, float32 CPU op
     math mirroring the soft-float firmware, per-op cpu/hw switches (hw ops run the actual
@@ -195,7 +195,13 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         return np.clip(lroundf(o), -32767, 32767)
 
     def quant8_sp(m):
-        return np.clip(bx.rne_shift(m, 8), -127, 127).astype(np.int8)
+        # Scale to the int8 range instead of shifting by a fixed 8. After rmsnorm the mantissas
+        # sit near 2**11, so >>8 handed the matvec int8 values of about +-9 - 3 of the 7 bits
+        # available - and cost ~30% rel-rms on every matvec output, compounding layer over layer
+        # into garbage tokens. bit_length()-7 is clip-free by construction (amax>>sh < 128).
+        amax = int(np.abs(m).max()) if len(m) else 0
+        sh   = max(0, amax.bit_length() - 7)
+        return np.clip(bx.rne_shift(m, sh), -127, 127).astype(np.int8), sh
 
     def norm_i32_sp(res):
         amax = int(np.abs(res).max()) if len(res) else 0
@@ -219,8 +225,20 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         return np.clip(lroundf(o), -32767, 32767)
 
     def resid_sp(am, ea, bm, eb):
-        eo = max(ea, eb) + 1
-        v  = (am.astype(np.int64) >> (eo - ea)) + (bm.astype(np.int64) >> (eo - eb))
+        # Pick the output exponent from the operands' real magnitudes, not from the worst case
+        # both-mantissas-full bound. `max(ea, eb) + 1` spends a mantissa bit on every call, and
+        # there are two calls per layer against a 15-bit mantissa: by layer 11 the residual was
+        # down to a single bit (every element 0 or +-2**ex) and its own quantization error then
+        # grew 4x per layer, which is what turned the output into garbage tokens.
+        emin  = min(ea, eb)
+        bound = ((int(np.abs(am).max()) << (ea - emin)) +
+                 (int(np.abs(bm).max()) << (eb - emin)))
+        eo    = emin + max(0, bound.bit_length() - 15)
+        sa, sb = eo - ea, eo - eb
+        a64 = am.astype(np.int64)
+        b64 = bm.astype(np.int64)
+        v   = ((a64 >> sa) if sa >= 0 else (a64 << -sa)) + \
+              ((b64 >> sb) if sb >= 0 else (b64 << -sb))
         return np.clip(v, -32767, 32767), eo
 
     def matvec_i8(name, x8, e8):
@@ -298,9 +316,8 @@ def hybrid_generate(img, prompt, n_new, modes=None):
         vec_prog("rope", sp, [0, n, 4096, 4096 + n, (n//2)//16, 0, n])
         return np.frombuffer(bytes(sp[0:2*n]), dtype="<i2").astype(np.int64)
 
-    def kv_hbm_fused_int(l, kvh, q8):
+    def kv_hbm_fused_int(l, kvh, q8, eq):
         # Returns (red int64, P8, Rpre, Bv): the integer pieces before normalization.
-        eq = E_NORM + 8
         rowsk = hbm_kv[(l, kvh, 0)]
         ekm = max(e for e, _ in rowsk)
         Bk = 22 - ekm
@@ -443,8 +460,8 @@ def hybrid_generate(img, prompt, n_new, modes=None):
             p = f"blk.{l}."
             # Attention block.
             hm = rmsnorm_sp(xm, ex, p + "attn_norm.weight")
-            x8 = quant8_sp(hm)
-            e8 = E_NORM + 8
+            x8, sh8 = quant8_sp(hm)
+            e8 = E_NORM + sh8
             def qkv(name):
                 res, er = matvec_i8(p + name, x8, e8)
                 return (res.astype(np.float64)*np.exp2(er)).astype(f32)
@@ -468,19 +485,23 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                 for i2 in range(n_head):
                     mh = res_rmsnorm_head(qm[i2*hd:(i2+1)*hd], eqr, qn16.reshape(-1))
                     mh = res_rope_head(mh, trow)
-                    qh8.append(quant8_sp(mh))
+                    q_i8, q_sh = quant8_sp(mh)
+                    qh8.append((q_i8, E_NORM + q_sh))
                 for i2 in range(n_kv):
                     mh = res_rmsnorm_head(km[i2*hd:(i2+1)*hd], ekr, kn16.reshape(-1))
                     mh = res_rope_head(mh, trow)
+                    # Per-row exponents: matvec_q8's headroom depends on the spread of the row
+                    # exponents, not their absolute value, so scaled rows keep the same bound.
+                    k_i8, k_sh = quant8_sp(mh)
                     hbm_kv.setdefault((l, i2, 0), []).append(
-                        (E_NORM + 8, quant8_sp(mh).astype(np.int8)))
-                    hbm_kv.setdefault((l, i2, 1), []).append(
-                        (evr + 8, quant8_sp(vm[i2*hd:(i2+1)*hd]).astype(np.int8)))
+                        (E_NORM + k_sh, k_i8.astype(np.int8)))
+                    v_i8, v_sh = quant8_sp(vm[i2*hd:(i2+1)*hd])
+                    hbm_kv.setdefault((l, i2, 1), []).append((evr + v_sh, v_i8.astype(np.int8)))
                 n_rep2 = n_head//n_kv
                 rms, cs = [], []
                 hmax = f32(0.0)
                 for i2 in range(n_head):
-                    red, P8, Rpre, Bv = kv_hbm_fused_int(l, i2//n_rep2, qh8[i2])
+                    red, P8, Rpre, Bv = kv_hbm_fused_int(l, i2//n_rep2, *qh8[i2])
                     am = int(np.abs(red).max())
                     k2 = 0
                     while (am >> k2) > 16383:
@@ -502,37 +523,60 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                 dm, kk  = norm_i32_sp(res)
                 xm, ex  = resid_sp(xm, ex, dm, er + kk)
                 hm = rmsnorm_sp(xm, ex, p + "ffn_norm.weight")
-                x8 = quant8_sp(hm)
-                gres, ger = matvec_i8(p + "ffn_gate.weight", x8, E_NORM + 8)
+                x8, sh8 = quant8_sp(hm)
+                gres, ger = matvec_i8(p + "ffn_gate.weight", x8, E_NORM + sh8)
                 gm, kg = norm_i32_sp(gres)
-                ures, uer = matvec_i8(p + "ffn_up.weight", x8, E_NORM + 8)
+                ures, uer = matvec_i8(p + "ffn_up.weight", x8, E_NORM + sh8)
                 um, ku = norm_i32_sp(ures)
                 sm = silu_sp(gm, ger + kg, um, uer + ku)
-                s8 = quant8_sp(sm)
+                s8, shs = quant8_sp(sm)
                 dres, der = matvec_i8(p + "ffn_down.weight", s8,
-                                      (ger + kg) + (uer + ku) + 15 + 8)
+                                      (ger + kg) + (uer + ku) + 15 + shs)
                 dm, kd = norm_i32_sp(dres)
                 xm, ex = resid_sp(xm, ex, dm, der + kd)
                 continue
+            if trace is not None:
+                trace(pos, (l, "h_attn"), hm.astype(np.float64)*2.0**E_NORM)
             q = qkv("attn_q.weight")
             k = qkv("attn_k.weight")
             v = qkv("attn_v.weight")
+            if trace is not None:
+                trace(pos, (l, "qkv_raw"), np.concatenate([q, k, v]).astype(np.float64))
             qn, kn = norm_w(p + "attn_q_norm.weight"), norm_w(p + "attn_k_norm.weight")
             q = np.concatenate([rmsnorm_f(q[i*hd:(i+1)*hd], qn) for i in range(n_head)])
             k = np.concatenate([rmsnorm_f(k[i*hd:(i+1)*hd], kn) for i in range(n_kv)])
+            # Rope from the table baked into the image, not recomputed here. Computing
+            # theta = pos*theta_base**(-2p/hd) inline is plain RoPE: it silently drops YaRN,
+            # which the 1.7B uses (factor 4, plus an mscale of ~1.1387) and the tiny sim model
+            # does not (factor 1), so the tiny gate passed while every real model was wrong.
+            # The firmware derives the same thing; the table is the shared source of truth.
+            _, rope_tab = img.tensor("rope_tab")
+            rt = np.asarray(rope_tab, dtype=np.int64).reshape(-1, hd)[pos]
+            rc = (rt[:hd//2].astype(f32))*f32(2.0**-14)
+            rs = (rt[hd//2:].astype(f32))*f32(2.0**-14)
             for arr, nh in ((q, n_head), (k, n_kv)):
                 for i in range(nh):
                     vh = arr[i*hd:(i+1)*hd]
-                    for p2 in range(hd//2):
-                        theta = f32(pos*np.power(f32(h["rope_theta"]), f32(-2.0*p2/hd)))
-                        c, sn = np.cos(theta, dtype=f32), np.sin(theta, dtype=f32)
-                        x0, x1 = vh[p2], vh[p2 + hd//2]
-                        vh[p2]         = x0*c - x1*sn
-                        vh[p2 + hd//2] = x0*sn + x1*c
-            ka = np.abs(k).max(); kscale = f32(ka/f32(127.0)) if ka > 0 else f32(1.0)
-            va = np.abs(v).max(); vscale = f32(va/f32(127.0)) if va > 0 else f32(1.0)
-            kc[l].append(lroundf(k*f32(f32(1.0)/kscale)).astype(np.int8)); ks[l].append(kscale)
-            vc[l].append(lroundf(v*f32(f32(1.0)/vscale)).astype(np.int8)); vs[l].append(vscale)
+                    x0 = vh[:hd//2].copy()
+                    x1 = vh[hd//2:].copy()
+                    vh[:hd//2] = x0*rc - x1*rs
+                    vh[hd//2:] = x0*rs + x1*rc
+            if trace is not None:
+                trace(pos, (l, "q_roped"), q.astype(np.float64))
+                trace(pos, (l, "k_roped"), k.astype(np.float64))
+            # Per-head scales, not one per token: the head spread of K is large (16x at layer 0
+            # of the 1.7B, where head 4 peaks at 311 and head 6 at 18.9), so a single tensor
+            # scale leaves the quiet heads under 3 bits and wrecks their scores.
+            kr = k.reshape(n_kv, hd)
+            vr = v.reshape(n_kv, hd)
+            ka = np.abs(kr).max(axis=1)
+            va = np.abs(vr).max(axis=1)
+            kscale = np.where(ka > 0, ka/f32(127.0), f32(1.0)).astype(f32)
+            vscale = np.where(va > 0, va/f32(127.0), f32(1.0)).astype(f32)
+            kc[l].append(lroundf(kr*(f32(1.0)/kscale)[:, None]).astype(np.int8).reshape(-1))
+            ks[l].append(kscale)
+            vc[l].append(lroundf(vr*(f32(1.0)/vscale)[:, None]).astype(np.int8).reshape(-1))
+            vs[l].append(vscale)
             if modes.get("kv_hbm", "cpu") == "hw":
                 for i2 in range(n_kv):
                     kv_hbm_append(l, i2, 0, k[i2*hd:(i2+1)*hd])
@@ -545,7 +589,7 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                 if modes.get("kv_hbm", "cpu") == "hw":
                     attn[i*hd:(i+1)*hd] = kv_hbm_fused(l, kvh, qh)
                     continue
-                sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst)
+                sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst[kvh])
                                 for kt, kst in zip(kc[l], ks[l])], dtype=f32)
                 sc  = sc*f32(1.0/np.sqrt(hd))
                 e   = np.exp(sc - sc.max(), dtype=f32)
@@ -555,29 +599,35 @@ def hybrid_generate(img, prompt, n_new, modes=None):
                 else:
                     ah  = np.zeros(hd, dtype=f32)
                     for t in range(len(vc[l])):
-                        ah += pr[t]*vs[l][t]*vc[l][t][kvh*hd:(kvh+1)*hd].astype(f32)
+                        ah += pr[t]*vs[l][t][kvh]*vc[l][t][kvh*hd:(kvh+1)*hd].astype(f32)
                     attn[i*hd:(i+1)*hd] = ah
+            if trace is not None:
+                trace(pos, (l, "attn_out"), attn.astype(np.float64))
             a8, ea8 = quantize_f_pow2(attn)
             res, er = matvec_i8(p + "attn_output.weight", a8, ea8)
             dm, kk  = norm_i32_sp(res)
             xm, ex  = resid_sp(xm, ex, dm, er + kk)
+            if trace is not None:
+                trace(pos, (l, "resid_attn"), xm.astype(np.float64)*2.0**ex)
             # FFN block (fully resident).
             hm = rmsnorm_sp(xm, ex, p + "ffn_norm.weight")
-            x8 = quant8_sp(hm)
-            gres, ger = matvec_i8(p + "ffn_gate.weight", x8, E_NORM + 8)
+            x8, sh8 = quant8_sp(hm)
+            gres, ger = matvec_i8(p + "ffn_gate.weight", x8, E_NORM + sh8)
             gm, kg = norm_i32_sp(gres)
-            ures, uer = matvec_i8(p + "ffn_up.weight", x8, E_NORM + 8)
+            ures, uer = matvec_i8(p + "ffn_up.weight", x8, E_NORM + sh8)
             um, ku = norm_i32_sp(ures)
             sm = silu_sp(gm, ger + kg, um, uer + ku)
             es = (ger + kg) + (uer + ku) + 15
-            s8 = quant8_sp(sm)
-            dres, der = matvec_i8(p + "ffn_down.weight", s8, es + 8)
+            s8, shs = quant8_sp(sm)
+            dres, der = matvec_i8(p + "ffn_down.weight", s8, es + shs)
             dm, kd = norm_i32_sp(dres)
             xm, ex = resid_sp(xm, ex, dm, der + kd)
+            if trace is not None:
+                trace(pos, (l, "ffn"), xm.astype(np.float64)*2.0**ex)
         if not want:
             return -1
         hm = rmsnorm_sp(xm, ex, "output_norm.weight")
-        x8 = quant8_sp(hm)
+        x8, _ = quant8_sp(hm)
         head = "output.weight" if "output.weight" in img.by_name else "token_embd.weight"
         e = entry(head)
         scales, codes = tensor(head)

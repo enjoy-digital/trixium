@@ -19,6 +19,7 @@ import zlib
 import numpy as np
 
 from trixium import layout
+from trixium.layout import BONS_NAME_BYTES
 from trixium.layout import (
     BEAT_BYTES, GROUP_TERNARY, GROUP_Q8, SCALES_PER_BEAT,
     KIND_TERNARY, KIND_Q8, KIND_F16, KIND_F32, KIND_NORM16, KIND_NAMES, ROLE_NAMES,
@@ -215,6 +216,21 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
 
 # Reader -------------------------------------------------------------------------------------------
 
+class _TruncTolerantNames(dict):
+    """Name -> entry, tolerant of the 24-byte name field.
+
+    Anything longer is stored truncated - "blk.10.attn_q_norm.weight" (25 chars) lands as
+    "...weigh" - so a lookup by the real name misses and the tensor looks absent from the
+    image. The firmware indexes by (role, layer) and never saw this; every by-name consumer
+    did, including the Python mirror of the firmware loop.
+    """
+    def __missing__(self, name):
+        e = dict.get(self, name[:BONS_NAME_BYTES])
+        if e is None:
+            raise KeyError(name)
+        return e
+
+
 class BONSReader:
     def __init__(self, path):
         self.data   = np.memmap(path, dtype=np.uint8, mode="r")
@@ -225,7 +241,14 @@ class BONSReader:
             self.entries.append(layout.unpack_entry(
                 bytes(self.data[table_off + i*layout.BONS_ENTRY_SIZE:
                                 table_off + (i+1)*layout.BONS_ENTRY_SIZE])))
-        self.by_name = {e["name"]: e for e in self.entries}
+        # The entry name field is 24 bytes, so anything longer is stored truncated -
+        # "blk.10.attn_q_norm.weight" (25 chars) lands as "...weigh". Index both forms so a
+        # lookup by the real name still resolves; the firmware indexes by (role, layer) and
+        # never saw this, but every by-name consumer did, and it looks exactly like the
+        # tensor being absent from the image.
+        self.by_name = _TruncTolerantNames()
+        for e in self.entries:
+            self.by_name.setdefault(e["name"], e)
 
     def channel_payload(self, channel):
         """Full payload bytes of one channel (what gets uploaded to that pseudo-channel)."""
@@ -234,14 +257,22 @@ class BONSReader:
         return self.data[start:start + h["payload_beats"]*BEAT_BYTES]
 
     def tensor_channel_bytes(self, name, channel):
-        e  = self.by_name[name]
+        e  = self._lookup(name)
         ch = self.channel_payload(channel)
         return ch[e["chan_base_beats"]*BEAT_BYTES:
                   (e["chan_base_beats"] + e["chan_len_beats"])*BEAT_BYTES]
 
+    def _lookup(self, name):
+        e = self.by_name.get(name)
+        if e is None:
+            e = self.by_name.get(name[:BONS_NAME_BYTES])
+        if e is None:
+            raise KeyError(name)
+        return e
+
     def tensor(self, name):
         """Reassemble a full tensor from its shards -> (scales, values) numpy arrays."""
-        e = self.by_name[name]
+        e = self._lookup(name)
         h = self.header
         if e["flags"] & FLAG_REPLICATED:
             return decode_rows(e, self.tensor_channel_bytes(name, 0))

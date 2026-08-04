@@ -132,6 +132,7 @@ BONS_MAGIC       = 0x534E4F42 # "BONS" little-endian.
 BONS_VERSION     = 1
 BONS_HEADER_SIZE = 4096
 BONS_ENTRY_SIZE  = 64
+BONS_NAME_BYTES  = 24  # Entry name field; longer names are stored truncated.
 
 # Header struct (little-endian):
 #  0: u32 magic          4: u32 version       8: u32 n_layer      12: u32 n_embd
@@ -178,7 +179,7 @@ def pack_entry(role, kind, flags, layer, rows, cols, chan_base_beats, chan_len_b
                bias=0, rshift=0, name=""):
     group = KIND_GROUP.get(kind, 0)
     return struct.pack(_ENTRY_FMT, role, kind, flags, 0, layer, group, rows, cols,
-                       chan_base_beats, chan_len_beats, crc32, bias, rshift, name.encode()[:24])
+                       chan_base_beats, chan_len_beats, crc32, bias, rshift, name.encode()[:BONS_NAME_BYTES])
 
 def unpack_entry(data, offset=0):
     role, kind, flags, _, layer, group, rows, cols, base, length, crc, bias, rshift, name = \
