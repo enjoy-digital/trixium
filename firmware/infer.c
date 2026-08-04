@@ -809,6 +809,17 @@ static void seq_build_attn(void)
 // the AXPY descriptors. Phase 2 per kv-head: one dual-Q AXPY over the shared V stream ->
 // per head: reduce chain -> spill(absmax) -> norm_i32 (k from res6). Requires n_rep == 2
 // and n_ch >= 2; other configs use the v1 list or CPU dispatch.
+// Sequencer attention: the descriptor lists collapse ~6 dispatch round-trips per head into
+// one submit, but on this gateware they wedge the engine mid-op once a KV channel carries an
+// extra row (SEQSTALL, engine stuck in RUN holding the scratchpad; only reconfiguring the
+// FPGA recovers). Off by default: the same ops then run CPU-dispatched per head, which keeps
+// the whole HW mask usable. `seq on` re-enables the lists for debugging.
+//
+// Not reproducible in the Migen unit tests - the engine ops, the sequencer, and the two
+// together all pass at 8 channels with ragged rows (rows>=1, rem>=1). It does reproduce in
+// the Verilator sim with a tiny model sharded 8 ways, which is where to chase it next.
+int seq_use;
+
 static int seq_at2_base, seq_at2_p1n, seq_at2_p2n, seq_at2_kvchunk;
 static int seq_at2_p1dn, seq_at2_p2dn;
 static void seq_build_attn2(void)
@@ -1474,12 +1485,12 @@ attn_scores: ;
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
-        if (attn_hw && seq_at2_kvchunk > 0
+        if (seq_use && attn_hw && seq_at2_kvchunk > 0
             && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
             attn_seq2_layer(l, pos, aw_c, &aw_hmax);
             goto attn_heads_done;
         }
-        if (attn_hw && seq_attn_heads > 0
+        if (seq_use && attn_hw && seq_attn_heads > 0
             && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
             // Whole-head-loop descriptor lists: ~6 dispatch/poll round-trips per head
             // collapse into one submit per chunk; the AXPY rshift and norm k are computed
@@ -2053,7 +2064,7 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
         // accept, two tokens per weight-stream pass. Greedy -> lossless (token stream
         // identical to plain decode). Rejection restores the kv_ekmax entries the
         // speculated position touched; its KV rows are overwritten by the re-forward.
-        if (spec_on && attn_all_hw() && seq_at2_kvchunk > 0 && spec_succ != 0
+        if (spec_on && seq_use && attn_all_hw() && seq_at2_kvchunk > 0 && spec_succ != 0
             && n_pos + 2 <= max_ctx && i + 1 < max_new) {
             int draft = spec_succ_v[tok] ? (int)spec_succ[tok] : -1;
             if (draft >= 0) {

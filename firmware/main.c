@@ -125,6 +125,7 @@ static void help(void)
     puts("mvtest idx      - matvec tensor <idx> with the test pattern, print checksum");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
+    puts("seq [on|off]    - sequencer attention lists (off: same ops, CPU-dispatched)");
     puts("tokclr/tok/genb - chunked prompt buffer + generate (host chat tool)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
@@ -447,6 +448,14 @@ static void console_service(void)
         infer_spec_stats(&acc, &rej);
         printf("SPEC acc=%d rej=%d\n", acc, rej);
     }
+    else if (strcmp(token, "seq") == 0) {
+        if (strncmp(str, "on", 2) == 0)
+            seq_use = 1;
+        else if (strncmp(str, "off", 3) == 0)
+            seq_use = 0;
+        printf("SEQ %s (lists wedge the engine on this gateware; off runs the same ops "
+               "CPU-dispatched per head)\n", seq_use ? "on" : "off");
+    }
     else if (strcmp(token, "hdrload") == 0)
         hdrload();
     else if (strlen(token))
@@ -502,24 +511,35 @@ int main(void)
                 seed = seed*1664525u + 1013904223u;
                 sp32b[i] = seed;
             }
-            struct { const char *name; uint16_t pc; int32_t a[8]; int na; } progs[] = {
-                {"quant8",   PROG_QUANT8,   {0x8000, 1, 0xA000, 8}, 4},  // A1 = 1.
-                {"quant8f",  PROG_QUANT8,   {0x8000, 0, 0xB200, 8}, 4},  // A1 = 0.
-                {"norm_i32", PROG_NORM_I32, {0x8000, 0, 0xA200, 4, 13}, 5},
-                {"resid",    PROG_RESID_ADD,{0x8000, 0x8400, 0xA400, 8, 1, 2}, 6},
-                {"silu",     PROG_SILU_MUL, {0x8000, 0x8400, 0xA600, 8, 6, 0, -15}, 7},
-                {"rmsnorm",  PROG_RMSNORM,  {0x8000, 0x8400, 0xA800, 8, -7, 17, -17}, 7},
+            // `dst` is explicit because it is not always A2: rope takes A2 as its *cos
+            // table* and writes via A5/A6, so checksumming A2 was reading an input, and
+            // clearing it corrupted the table - which also broke reduce, whose A1 source is
+            // that same region.
+            struct { const char *name; uint16_t pc; int32_t a[8]; int na; uint32_t dst; }
+            progs[] = {
+                {"quant8",   PROG_QUANT8,   {0x8000, 1, 0xA000, 8}, 4, 0xA000},  // A1 = 1.
+                {"quant8f",  PROG_QUANT8,   {0x8000, 0, 0xB200, 8}, 4, 0xB200},  // A1 = 0.
+                {"norm_i32", PROG_NORM_I32, {0x8000, 0, 0xA200, 4, 13}, 5, 0xA200},
+                {"resid",    PROG_RESID_ADD,{0x8000, 0x8400, 0xA400, 8, 1, 2}, 6, 0xA400},
+                {"silu",     PROG_SILU_MUL, {0x8000, 0x8400, 0xA600, 8, 6, 0, -15}, 7, 0xA600},
+                {"rmsnorm",  PROG_RMSNORM,  {0x8000, 0x8400, 0xA800, 8, -7, 17, -17}, 7, 0xA800},
                 {"rope",     PROG_ROPE,     {0x8000, 0x8080, 0x8400, 0x8480, 4,
-                                             0xAA00, 0xAA80}, 7},
-                {"softmax8", PROG_SOFTMAX8, {0x8000, 739, 0xAC00, 4, -11, 17}, 6},
-                {"reduce",   PROG_REDUCE_ACC,{0xA200, 0x8400, 0xAE00, 4}, 4},
-                {"scale8",   PROG_SCALE8,   {0x8000, 0, 0xB000, 8, 19571}, 5},
+                                             0xAA00, 0xAA80}, 7, 0xAA00},
+                {"softmax8", PROG_SOFTMAX8, {0x8000, 739, 0xAC00, 4, -11, 17}, 6, 0xAC00},
+                {"reduce",   PROG_REDUCE_ACC,{0xA200, 0x8400, 0xAE00, 4}, 4, 0xAE00},
+                {"scale8",   PROG_SCALE8,   {0x8000, 0, 0xB000, 8, 19571}, 5, 0xB000},
             };
             for (unsigned pi2 = 0; pi2 < sizeof(progs)/sizeof(progs[0]); pi2++) {
+                volatile uint32_t *dst = (volatile uint32_t *)(SCRATCHPAD_BASE
+                                          + progs[pi2].dst);
+                // Clear the CRC window first. Programs write less than 128 words, so
+                // otherwise the checksum folds in whatever was left in the scratchpad -
+                // deterministic in a fresh sim, but history-dependent on a card that has
+                // run before, which made the hardware CRCs incomparable to the interpreter.
+                for (int i = 0; i < 128; i++)
+                    dst[i] = 0;
                 uint64_t r6 = vec_run(progs[pi2].pc, progs[pi2].a, progs[pi2].na);
                 uint32_t crc = 0;
-                volatile uint32_t *dst = (volatile uint32_t *)(SCRATCHPAD_BASE
-                                          + (uint32_t)progs[pi2].a[2]);
                 for (int i = 0; i < 128; i++)
                     crc = (crc ^ dst[i])*16777619u;
                 printf("VECCRC %s %08lx %08lx\n", progs[pi2].name,
@@ -529,9 +549,13 @@ int main(void)
     }
 #endif
     selftest();
+    hwops_init();
     if (infer_init() == 0) {
         // Boot generation demo (deterministic; checked by the sim harness).
         static const int prompt[3] = {1, 2, 3};
+        // The GEN leg is the all-CPU reference the gate compares against hybrid_generate's
+        // CPU modes, so pin it here rather than inheriting whatever the default mask is.
+        hwops_set_all(0);
         printf("GEN:");
         perf_reset();
         infer_generate(prompt, 3, 2, emit_token);
@@ -554,7 +578,6 @@ int main(void)
             // leg, and `spec on` still reaches it deliberately on hardware.
             if (model_header()->n_layer > 8) {
                 puts("GEN-SP skipped (see SEQSTALL; use `spec on` to run it deliberately)");
-                hwops_set_all(0);
                 goto boot_demo_done;
             }
             infer_spec(1);
@@ -569,10 +592,10 @@ int main(void)
             }
             perf_print();
             infer_spec(0);
-            hwops_set_all(0);
         }
     }
 boot_demo_done:
+    hwops_init(); // Leave the shell on the fast path, not on the debug fallbacks.
     puts("BONSAI-READY");
     printf("bonsai> ");
 

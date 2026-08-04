@@ -65,24 +65,29 @@ def test_sim_selftest_checksums():
     for i in range(1024):
         seed = (seed*1664525 + 1013904223) & 0xFFFFFFFF
         sp[0x8000 + 4*i:0x8000 + 4*i + 4] = seed.to_bytes(4, "little")
+    # The destination is explicit: it is not always A2. rope takes A2 as its *cos table* and
+    # writes via A5/A6, so checksumming A2 read an input rather than the result.
     _progs = [
-        ("quant8",   "quant8",     [0x8000, 1, 0xA000, 8]),   # A1 = 1: measured shift.
-        ("quant8f",  "quant8",     [0x8000, 0, 0xB200, 8]),   # A1 = 0: fixed >>8.
-        ("norm_i32", "norm_i32",   [0x8000, 0, 0xA200, 4, 13]),
-        ("resid",    "resid_add",  [0x8000, 0x8400, 0xA400, 8, 1, 2]),
-        ("silu",     "silu_mul",   [0x8000, 0x8400, 0xA600, 8, 6, 0, -15]),
-        ("rmsnorm",  "rmsnorm",    [0x8000, 0x8400, 0xA800, 8, -7, 17, -17]),
-        ("rope",     "rope",       [0x8000, 0x8080, 0x8400, 0x8480, 4, 0xAA00, 0xAA80]),
-        ("softmax8", "softmax8",   [0x8000, 739, 0xAC00, 4, -11, 17]),
-        ("reduce",   "reduce_acc", [0xA200, 0x8400, 0xAE00, 4]),
-        ("scale8",   "scale8",     [0x8000, 0, 0xB000, 8, 19571]),
+        ("quant8",   "quant8",     [0x8000, 1, 0xA000, 8], 0xA000),   # A1 = 1: measured.
+        ("quant8f",  "quant8",     [0x8000, 0, 0xB200, 8], 0xB200),   # A1 = 0: fixed >>8.
+        ("norm_i32", "norm_i32",   [0x8000, 0, 0xA200, 4, 13], 0xA200),
+        ("resid",    "resid_add",  [0x8000, 0x8400, 0xA400, 8, 1, 2], 0xA400),
+        ("silu",     "silu_mul",   [0x8000, 0x8400, 0xA600, 8, 6, 0, -15], 0xA600),
+        ("rmsnorm",  "rmsnorm",    [0x8000, 0x8400, 0xA800, 8, -7, 17, -17], 0xA800),
+        ("rope",     "rope",       [0x8000, 0x8080, 0x8400, 0x8480, 4, 0xAA00, 0xAA80], 0xAA00),
+        ("softmax8", "softmax8",   [0x8000, 739, 0xAC00, 4, -11, 17], 0xAC00),
+        ("reduce",   "reduce_acc", [0xA200, 0x8400, 0xAE00, 4], 0xAE00),
+        ("scale8",   "scale8",     [0x8000, 0, 0xB000, 8, 19571], 0xB000),
     ]
     exp_crc = {}
-    for name, prog, pargs in _progs:
+    for name, prog, pargs, pdst in _progs:
+        # Same clear the firmware does: the CRC window is wider than what any program
+        # writes, so without it the checksum folds in scratchpad history.
+        sp[pdst:pdst + 512] = bytes(512)
         S, _ = _vasm.VecInterp(sp).run(_vasm.assemble(_vasm.PROGRAMS[prog]()), list(pargs))
         crc = 0
         for i in range(128):
-            w = int.from_bytes(sp[pargs[2] + 4*i:pargs[2] + 4*i + 4], "little")
+            w = int.from_bytes(sp[pdst + 4*i:pdst + 4*i + 4], "little")
             crc = ((crc ^ w)*16777619) & 0xFFFFFFFF
         exp_crc[name] = (crc, S[6] & 0xFFFFFFFF)
     for m2 in _re.finditer(r"VECCRC (\w+) ([0-9a-f]{8}) ([0-9a-f]{8})", out):

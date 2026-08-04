@@ -17,6 +17,9 @@
 
 extern uint32_t hwops_mask;
 
+uint32_t hwops_default(void); // Caps minus the sequencer attention path (see ops.c).
+void hwops_init(void);        // Apply the default mask (call once at boot).
+
 uint32_t    hw_caps(void);                  // Which ops this gateware can do in HW.
 static inline int op_on_hw(enum perf_op op)
 {

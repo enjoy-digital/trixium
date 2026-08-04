@@ -11,6 +11,8 @@
 #include <generated/soc.h>
 
 #include "engine.h"
+
+int engine_wedged; // Sticky: an op never completed, so engine results are not trustworthy.
 #include "perf.h"
 
 void engine_run(const struct engine_op *op)
@@ -42,20 +44,30 @@ void engine_run(const struct engine_op *op)
 
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
     // hanging the boot silently.
-    uint32_t spins = 0;
+    uint32_t spins = 0, reports = 0;
     while (engine_csr_done_count_read() == done) {
-        if (++spins == 200000u) {
-            printf("ENGSTALL st=%02lx seq=%02lx", (unsigned long)engine_csr_status_read(),
-                   (unsigned long)seq_status_read());
-            for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
-                engine_csr_perf_chan_write(c);
-                printf(" ch%d beats=%08lx ar=%08lx r=%08lx", c,
-                       (unsigned long)engine_csr_perf_beats_read(),
-                       (unsigned long)engine_csr_perf_ar_read(),
-                       (unsigned long)engine_csr_perf_r_read());
-            }
-            printf("\n");
-            spins = 0;
+        if (++spins < 200000u)
+            continue;
+        spins = 0;
+        printf("ENGSTALL st=%02lx seq=%02lx", (unsigned long)engine_csr_status_read(),
+               (unsigned long)seq_status_read());
+        for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
+            engine_csr_perf_chan_write(c);
+            printf(" ch%d beats=%08lx ar=%08lx r=%08lx", c,
+                   (unsigned long)engine_csr_perf_beats_read(),
+                   (unsigned long)engine_csr_perf_ar_read(),
+                   (unsigned long)engine_csr_perf_r_read());
+        }
+        printf("\n");
+        // Give up rather than spin forever. A stuck op holds the scratchpad grant, so the
+        // CPU's own scratchpad reads return garbage from here on and nothing downstream is
+        // trustworthy - but spinning turns that into a card that answers nothing at all,
+        // and only reconfiguring the FPGA recovers either way.
+        if (++reports == 8) {
+            engine_wedged = 1;
+            puts("ENGSTALL: giving up. Reconfigure the FPGA to recover (a CPU reset will "
+                 "not do it), and reupload the weights - HBM is wiped with it.");
+            break;
         }
     }
     perf_exit(OP_ENGINE_WAIT);

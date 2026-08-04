@@ -53,19 +53,36 @@ void seq_patch(uint32_t idx, int word, uint32_t value)
     desc_w(idx)[word] = value;
 }
 
+int seq_wedged; // Sticky: a list never finished, so the engine state is not trustworthy.
+
 void seq_run(uint32_t idx0, uint32_t count)
 {
+    if (seq_wedged) // Nothing will complete until the FPGA is reconfigured.
+        return;
     seq_base_write(SP_DESC + idx0*64);
     seq_count_write(count);
     seq_start_write(1);
     // Spin-capped poll: a wedged list names the stuck descriptor instead of hanging.
-    uint32_t spins = 0;
+    //
+    // And it does have to *give up*. Spinning forever here is what turned a stalled
+    // descriptor into a dead card: the sequencer holds `busy`, the engine keeps the
+    // scratchpad grant (status bit 9), so the CPU's scratchpad reads come back garbage -
+    // SPTEST reports 64 errors - and a CPU reset does not clear either. Only reconfiguring
+    // the FPGA does. Giving up at least keeps the console alive to say so.
+    uint32_t spins = 0, reports = 0;
     while (seq_status_read() & 1) {
-        if (++spins == 200000u) {
-            printf("SEQSTALL dcount=%lu/%lu eng=%02lx\n",
-                   (unsigned long)(seq_status_read() >> 8), (unsigned long)count,
-                   (unsigned long)engine_csr_status_read());
-            spins = 0;
+        if (++spins < 200000u)
+            continue;
+        spins = 0;
+        printf("SEQSTALL dcount=%lu/%lu eng=%02lx\n",
+               (unsigned long)(seq_status_read() >> 8), (unsigned long)count,
+               (unsigned long)engine_csr_status_read());
+        if (++reports == 8) {
+            seq_wedged = 1;
+            puts("SEQSTALL: giving up. The engine is stuck mid-op and holds the scratchpad;\n"
+                 "results from here are garbage. Reconfigure the FPGA to recover (a CPU\n"
+                 "reset will not do it) - and note this wipes HBM, so reupload the weights.");
+            return;
         }
     }
 }

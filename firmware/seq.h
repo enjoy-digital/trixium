@@ -24,6 +24,7 @@ void     seq_desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n, uin
 void     seq_desc_engine(uint32_t idx, const struct engine_op *op);
 void     seq_desc_stop(uint32_t idx);
 void     seq_patch(uint32_t idx, int word, uint32_t value); // Patch one descriptor word.
-void     seq_run(uint32_t idx0, uint32_t count);            // Run + wait.
+void     seq_run(uint32_t idx0, uint32_t count);            // Run + wait (gives up if wedged).
+extern int seq_wedged; // Set once a list stalled: every later seq_run() is a no-op.
 
 #endif

@@ -471,8 +471,11 @@ def test_matvec_q8_striped_interleave():
     # Scores-op shape: position-striped rows (uneven per channel via rem) + interleaved
     # (position-major) gather, Q8 kind - each row carries its own scale, per-position KV.
     cols, seed = 128, 23
+    # n_channels=8 is the shipping configuration and was missing here: the card wedges on
+    # this exact op once a channel carries an extra KV row (rows>=1 with rem>=1).
     for n_channels, T in [(2, 1), (2, 2), (2, 5), (2, 8),
-                          (4, 1), (4, 3), (4, 6), (4, 9)]:
+                          (4, 1), (4, 3), (4, 6), (4, 9),
+                          (8, 1), (8, 7), (8, 8), (8, 9), (8, 10), (8, 16), (8, 17)]:
         # positions (total rows); T < N -> rows=0 on some channels.
         rng    = np.random.default_rng(seed + T)
         scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
@@ -513,8 +516,12 @@ def test_matvec_q8_dual_head():
     # contiguously (head B at xsrc + cols); results land position-major per head, head B
     # offset by qstride words. Bit-exact vs two independent matvec_q8 references.
     cols, seed = 128, 57
+    # 8 channels is the shipping configuration; T=9,10,17 are the ragged cases (rows>=1
+    # with rem>=1) where the card's sequencer attention wedges.
     for (n_channels, T), lat in [((2, 5), 8), ((2, 8), 8), ((4, 3), 8), ((4, 9), 8),
-                                 ((2, 8), 2), ((4, 9), 2)]:
+                                 ((2, 8), 2), ((4, 9), 2),
+                                 ((8, 8), 8), ((8, 9), 8), ((8, 10), 8), ((8, 17), 8),
+                                 ((8, 9), 2), ((8, 17), 2)]:
         rng    = np.random.default_rng(seed + 16*n_channels + T)
         scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
         q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
@@ -557,7 +564,10 @@ def test_engine_axpy():
     # Weighted-V: kind-4 op accumulates p8-weighted V rows per lane; each channel emits
     # cols partial sums (chan-major), bit-exact vs bx.axpy_rows on its position stripe.
     cols, seed = 64, 41
-    for n_channels, T in [(2, 1), (2, 3), (2, 8), (4, 1), (4, 5), (4, 9)]:
+    # 8 channels is the shipping configuration and was untested here; T=9,10,17 are the
+    # ragged cases (rows>=1, rem>=1) the card wedges on.
+    for n_channels, T in [(2, 1), (2, 3), (2, 8), (4, 1), (4, 5), (4, 9),
+                          (8, 8), (8, 9), (8, 10), (8, 17)]:
         rng = np.random.default_rng(seed + T)
         ev  = rng.integers(-9, -4, T)
         scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
@@ -599,7 +609,7 @@ def test_engine_axpy_dual_head():
     # contiguous at xsrc (head B at +pad32(T)); per-head Rpre via rshift/rshift2; head B
     # partials land at dst + 4*qstride. Bit-exact vs two independent axpy_rows refs.
     cols, seed = 64, 67
-    for n_channels, T in [(2, 3), (2, 8), (4, 5)]:
+    for n_channels, T in [(2, 3), (2, 8), (4, 5), (8, 9), (8, 17)]:
         rng = np.random.default_rng(seed + 16*n_channels + T)
         ev  = rng.integers(-9, -4, T)
         scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
@@ -630,7 +640,9 @@ def test_engine_axpy_dual_head():
         payloads = [p.ljust(maxlen, b"\0") for p in payloads]
         exp_a, exp_b = np.concatenate(exp_a), np.concatenate(exp_b)
 
-        qstride = 256 # Words; must cover n_channels*cols head-A partials.
+        # Words; must cover the n_channels*cols head-A partials, so it has to scale with the
+        # channel count - a fixed 256 silently overlapped the two heads at 8 channels.
+        qstride = n_channels*cols
         x_init  = p8a.tobytes().ljust(32, b"\0") + p8b.tobytes().ljust(32, b"\0")
         dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
         rb  = layout.row_beats(cols, layout.KIND_Q8)
@@ -1010,3 +1022,128 @@ def test_sequencer_mixed_list():
         assert np.array_equal(out["nrm"], nrm_exp.astype(np.int16)), ("norm_i32 auto-k", out["nrm"][:8], nrm_exp[:8], k_exp, amax)
 
     run_simulation(dut, [driver()])
+
+def test_sequencer_q8_scores_ragged():
+    """Scores op through the *sequencer* at the shipping channel count.
+
+    The engine's own tests cover this op shape (test_matvec_q8_striped_interleave /
+    _dual_head, both extended to 8 channels), and the sequencer tests cover mixed lists at 2
+    channels - but nothing covered the scores op *driven by the sequencer* at 8. That is the
+    combination the card wedges on: once T is not a multiple of the channel count and every
+    channel already carries a row (rows>=1, rem>=1), the engine sits in RUN holding the
+    scratchpad grant and never retires (SEQSTALL dcount=n/84 eng=301).
+
+    T = 8 is the last working case on hardware, 9 and 10 are the failing ones.
+    """
+    from trixium.gateware.vector import BonsaiVectorUnit
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.model import asm as vasm
+
+    vec_words = vasm.assemble(vasm.PROGRAMS["quant8"]())
+    n_channels, cols, seed = 8, 128, 91
+    for T in (8, 9, 10, 17):
+        rng    = np.random.default_rng(seed + T)
+        scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
+        q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B = bx.choose_scale_bias(e16)
+        R = bx.choose_result_shift(scales, B, gs_max=bx.GS_MAX_Q8)
+        expected = bx.matvec_q8(scales, q8w, x8, B, R)
+
+        rows, rem = T//n_channels, T % n_channels
+        payloads = []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]
+            spec_c = TensorSpec("kv", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                max(len(pos), 1), cols,
+                                scales=scales[pos] if pos else scales[:1],
+                                values=q8w[pos] if pos else q8w[:1])
+            payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes() if pos else b"")
+        maxlen   = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+
+        rb  = layout.row_beats(cols, layout.KIND_Q8)
+        # Twice back to back, as the per-head list does: one head's scores op is followed by
+        # the next head's, so a handshake that only settles between *lists* would pass a
+        # single-op test and hang here.
+        # Each head in the real list is a vec op then the engine op, so include the vec op:
+        # a list of engine ops alone never exercises the scratchpad hand-off between the
+        # vector unit and the engine.
+        one = (_desc_vec(0, [0x2000, 0, 0x1000, cols//16])
+               + _desc_engine(kind=1, rows=rows, rem=rem, ilv=1, cols=cols, wbase=0,
+                              wlen=rows*rb,
+                              sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                              cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                              bias=B, rshift=R, xsrc=0x1000, dst=0x4000))
+        descs = one + one + _desc_stop()
+        sp = bytearray(64*1024)
+        # int16 source for quant8; it writes the int8 x vector the engine op then consumes.
+        sp[0x2000:0x2000 + 2*cols]     = (x8.astype("<i2")*256).tobytes()
+        sp[0x6000:0x6000 + len(descs)] = descs
+
+        class _SeqQ8DUT(Module):
+            def __init__(self):
+                axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                        for _ in range(n_channels)]
+                self.submodules.scratchpad = BonsaiScratchpad(
+                    size=64*1024, init=words_from_bytes(bytes(sp)))
+                self.submodules.vu  = BonsaiVectorUnit()
+                self.submodules.seq = BonsaiSequencer()
+                self.submodules.engine = BonsaiMatVecEngine(
+                    self.scratchpad, axis, xbuf_groups=32, vecunit=self.vu, seq=self.seq)
+                self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+                self.comb += [
+                    self.vu.seq_en.eq(self.seq.busy),
+                    self.vu.seq_start.eq(self.seq.vec_start),
+                    self.vu.seq_pc.eq(self.seq.vec_pc),
+                    self.seq.vec_done.eq(self.vu.done),
+                    self.seq.vec_res6.eq(self.vu.res6.status),
+                ]
+                self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+                for i, axi in enumerate(axis):
+                    model = BonsaiHBMChannelModel(axi, size=64*1024,
+                        init=words_from_bytes(payloads[i]), latency=8)
+                    setattr(self.submodules, f"model{i}", model)
+
+        dut = _SeqQ8DUT()
+
+        def driver():
+            yield dut.vu.prog_adr.storage.eq(0)
+            yield dut.vu.prog_adr.re.eq(1)
+            yield
+            yield dut.vu.prog_adr.re.eq(0)
+            for wd in vec_words:
+                yield dut.vu.prog.storage.eq(wd)
+                yield dut.vu.prog.re.eq(1)
+                yield
+            yield dut.vu.prog.re.eq(0)
+            yield
+            yield dut.seq.base.storage.eq(0x6000)
+            yield dut.seq.count.storage.eq(5)
+            yield
+            yield dut.seq.start.storage.eq(1)
+            yield dut.seq.start.re.eq(1)
+            yield
+            yield dut.seq.start.re.eq(0)
+            yield
+            for _ in range(200000):
+                if not (yield dut.seq.busy):
+                    break
+                yield
+            else:
+                st = yield dut.front.status.status
+                raise AssertionError(
+                    f"T={T} rows={rows} rem={rem}: sequencer never finished "
+                    f"(engine status {st:03x}) - this is the SEQSTALL wedge")
+            yield
+            data = bytearray()
+            for wd in range(0x5000//32):
+                v = (yield dut.scratchpad.mem[wd])
+                data += int(v).to_bytes(32, "little")
+            got = np.frombuffer(bytes(data[0x4000:0x4000 + 4*T]), dtype="<i4")
+            assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
+
+        run_simulation(dut, [driver()])
