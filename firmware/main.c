@@ -122,6 +122,7 @@ static void help(void)
     puts("hdrload         - copy BONS header+table staged by bonsai_load to CPU memory");
     puts("sptest          - scratchpad bus read/write test");
     puts("peek c addr     - dump one HBM beat via the engine (hex addr)");
+    puts("mvtest idx      - matvec tensor <idx> with the test pattern, print checksum");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
     puts("tokclr/tok/genb - chunked prompt buffer + generate (host chat tool)");
@@ -246,6 +247,35 @@ static void peek_cmd(char *str)
     for (int i = 0; i < 8; i++)
         printf(" %08lx", (unsigned long)sp[i]);
     printf("\n");
+}
+
+// Matvec one tensor (by role and layer) with the deterministic x pattern and report its
+// checksum. selftest only ever covered blk.0.attn_q; the 1.7B model has several other shapes
+// - cols 6144 for ffn_down, rows 1024 for attn_k/v, the tied LM head - and none of them had
+// been checked on silicon, while the sim token gate runs the tiny model's small dimensions.
+//   mvtest <role> <layer>      roles: 4 attn_q  5 attn_k  6 attn_v  7 attn_out
+//                                    11 ffn_gate 12 ffn_up 13 ffn_down  2 lm_head
+static void mvtest_cmd(char *str)
+{
+    char *r = get_token(&str);
+    char *l = get_token(&str);
+    if (*r == 0) { puts("usage: mvtest <role> <layer>"); return; }
+    if (model_header()->magic != BONS_MAGIC) { puts("mvtest: no model"); return; }
+    int role  = (int)strtoul(r, NULL, 0);
+    int layer = (*l) ? (int)strtoul(l, NULL, 0) : 0;
+    const struct bons_entry *e = model_entry(role, layer);
+    if (!e) { printf("mvtest: no tensor role %d layer %d\n", role, layer); return; }
+    if (e->kind != KIND_TERNARY && e->kind != KIND_Q8) {
+        printf("mvtest: role %d layer %d is kind %u, not a matvec\n", role, layer, e->kind);
+        return;
+    }
+    uint32_t xsrc = 0, dst = 0x8000;
+    fill_x_pattern(xsrc, e->cols);
+    model_matvec(e, xsrc, dst);
+    uint32_t csum = fnv1a((volatile uint8_t *)(SCRATCHPAD_BASE + dst), e->rows*4);
+    printf("MV role=%d layer=%d rows=%lu cols=%lu bias=%d rshift=%d CSUM=%08lx\n",
+           role, layer, (unsigned long)e->rows, (unsigned long)e->cols,
+           e->bias, e->rshift, (unsigned long)csum);
 }
 
 static int parse_int(const char *s)
@@ -386,6 +416,8 @@ static void console_service(void)
         sptest();
     else if (strcmp(token, "peek") == 0)
         peek_cmd(str);
+    else if (strcmp(token, "mvtest") == 0)
+        mvtest_cmd(str);
     else if (strcmp(token, "selftest") == 0)
         selftest();
     else if (strcmp(token, "gen") == 0)

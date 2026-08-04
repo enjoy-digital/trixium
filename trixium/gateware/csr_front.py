@@ -152,8 +152,7 @@ class BonsaiEngineCSR(LiteXModule):
             self.status.fields.run.eq(engine.fsm.ongoing("RUN")),
             self.status.fields.sp_grant.eq(engine.sp_busy),
             self.status.fields.st_busy.eq(engine.store_busy),
-            self.status.fields.vec_busy.eq(getattr(engine, "vecunit", None).busy
-                                           if getattr(engine, "vecunit", None) is not None else 0),
+            self.status.fields.vec_busy.eq(getattr(engine, "vec_busy_in", 0)),
             self.absmax.status.eq(engine.absmax),
             self.argmax_val.status.eq(engine.argmax_val),
             self.argmax_idx.status.eq(engine.argmax_idx),

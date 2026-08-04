@@ -47,7 +47,11 @@ class BonsaiMatVecEngine(LiteXModule):
             "chan_stride must be 0 or a power of two (the STORE path shifts by it)"
         chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
 
-        self.vecunit = vecunit   # kept so the CSR front can report vec_busy
+        # Keep the vector unit's busy signal, not the module: assigning a Module to an
+        # attribute registers it as a submodule, and it is already one of the SoC's. The
+        # double registration renames its CSRs (vecunit_* -> vecunit_vecunit_*, plus an
+        # engine_vecunit_* alias) and moves them, which silently breaks firmware/vec.c.
+        self.vec_busy_in = vecunit.busy if vecunit is not None else Signal()
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
