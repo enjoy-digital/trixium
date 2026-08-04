@@ -397,9 +397,15 @@ def test_engine_csr_single_run_per_submit():
 
     run_simulation(dut, [driver()])
 
-def test_engine_store_roundtrip():
+@pytest.mark.parametrize("chan_stride", [0, 0x1000])
+def test_engine_store_roundtrip(chan_stride):
     # kind-3 STORE (scratchpad -> HBM via the loader's writers), then FETCH back: the KV
     # append datapath. Also checks the done handshake orders after the B drain.
+    #
+    # chan_stride is parametrised because the built SoC uses a non-zero one (each channel owns
+    # its own HBM window - the AXI switch makes the address, not the port, select the
+    # pseudo-channel) while this test only ever ran at 0. On hardware the KV STORE wedges the
+    # engine mid-token, and an untested address path is the first suspect.
     from trixium.gateware.loader import BonsaiHBMLoader
 
     n_channels = 2
@@ -413,7 +419,8 @@ def test_engine_store_roundtrip():
                     for _ in range(n_channels)]
             self.submodules.scratchpad = BonsaiScratchpad(
                 size=64*1024, init=words_from_bytes(src.tobytes()))
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32)
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+                                                        chan_stride=chan_stride)
             self.submodules.loader = BonsaiHBMLoader(axis)
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
