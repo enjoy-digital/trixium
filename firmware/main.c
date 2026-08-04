@@ -546,6 +546,17 @@ int main(void)
             perf_print();
             // Speculative-decode leg: greedy spec is lossless, so the tokens must match
             // the same references; the acc/rej counters show the machinery engaged.
+            //
+            // Skipped on big models at boot: on the 1.7B the sequencer stalls here
+            // (SEQSTALL dcount=43/84 eng=301) and keeps the scratchpad port, which leaves
+            // the shell unusable for everything afterwards - and a CPU reset does not clear
+            // it, only reconfiguring the FPGA does. The sim's tiny model still exercises the
+            // leg, and `spec on` still reaches it deliberately on hardware.
+            if (model_header()->n_layer > 8) {
+                puts("GEN-SP skipped (see SEQSTALL; use `spec on` to run it deliberately)");
+                hwops_set_all(0);
+                goto boot_demo_done;
+            }
             infer_spec(1);
             printf("GEN-SP:");
             perf_reset();
@@ -561,6 +572,7 @@ int main(void)
             hwops_set_all(0);
         }
     }
+boot_demo_done:
     puts("BONSAI-READY");
     printf("bonsai> ");
 
