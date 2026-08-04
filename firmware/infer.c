@@ -83,11 +83,17 @@ static float **attn_norm, **ffn_norm, **q_norm, **k_norm; // Per layer.
 static float *out_norm;
 
 static int8_t *k_cache, *v_cache;    // [layer][pos][kv_dim] int8.
-static float  *k_scale, *v_scale;    // [layer][pos].
+static float  *k_scale, *v_scale;    // [layer][pos][kv_head].
 static int    n_pos;
 
 static float *x, *h, *q, *k, *v, *attn, *gate, *up, *scores;
 static int ex_state; // Exponent of the resident x (SP_XR).
+// Absmax of the resident x mantissas: resid_add sizes its shifts from it so the residual
+// keeps its full 15-bit mantissa (see op_resid_add_sp). Both embedding paths normalize the
+// mantissas into [2^14, 2^15), so 32767 is a tight starting bound and resid_add returns the
+// exact value from then on.
+#define X_AMAX_AFTER_EMBED 32767u
+static uint32_t x_amax;
 
 // Helpers ------------------------------------------------------------------------------------
 
@@ -390,7 +396,7 @@ static inline volatile int8_t  *sp8(uint32_t off)  { return (volatile int8_t  *)
 // unit's two-pass program; CPU path: soft-float with the F32 weights from RAM.
 #define E_W16 (-13) // layout.NORM16_EXP.
 static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
-                          const struct bons_entry *w16, int n, uint32_t dst)
+                              const struct bons_entry *w16, int n, uint32_t dst)
 {
 #if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
     if (op_on_hw(OP_RMSNORM) && w16) {
@@ -425,30 +431,54 @@ static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
     }
 }
 
-// quant8: SP int16 -> SP int8 (RNE >> 8); returns nothing (out exponent = e + 8).
-static void op_quant8_sp(uint32_t src, uint32_t dst, int n)
+// quant8: SP int16 -> SP int8 (RNE >> s). Returns s; caller: out exponent = e + s.
+//
+// s comes from the source magnitude, not a fixed 8. After rmsnorm the mantissas sit near
+// 2**11, so >>8 handed the matvec int8 inputs of about +-9 - 3 of the 7 bits available -
+// and cost ~0.30 rel-rms on every matvec output. bit_length(amax) - 7 is clip-free by
+// construction (amax >> s < 128) and recovers a full order of magnitude of accuracy.
+// The program measures its own absmax (no producer has a spare scalar to return one in), so
+// both paths here derive the same shift from the same absmax. s may be negative: a small
+// source is scaled *up* into the int8 range.
+static int quant8_shift(uint32_t amax)
+{
+    if (amax == 0) return 8; // VCLZN(0) == 0, i.e. pre-shift 0 - keep the paths identical.
+    int b = 0;
+    while ((amax >> b) != 0) b++; // bitlen.
+    return b - 7;
+}
+
+static int op_quant8_sp(uint32_t src, uint32_t dst, int n)
 {
 #ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_QUANT8)) {
-        int32_t args[4] = {(int32_t)src, 0, (int32_t)dst, n/16};
-        vec_run(PROG_QUANT8, args, 4);
-        return;
+        int32_t args[4] = {(int32_t)src, 1, (int32_t)dst, n/16}; // A1 = 1: measure.
+        return quant8_shift((uint32_t)vec_run(PROG_QUANT8, args, 4)); // S6 = source absmax.
     }
 #endif
     volatile int16_t *ps = sp16(src);
     volatile int8_t  *pd = sp8(dst);
+    uint32_t amax = 0;
     for (int i = 0; i < n; i++) {
-        int32_t v = ps[i];
+        int32_t a = ps[i];
+        uint32_t m = (uint32_t)(a < 0 ? -a : a);
+        if (m > amax) amax = m;
+    }
+    int s = quant8_shift(amax);
+    for (int i = 0; i < n; i++) {
+        int32_t v = (s <= 8) ? ((int32_t)ps[i] << (8 - s)) : ((int32_t)ps[i] >> (s - 8));
         int32_t q = (v >> 8) + (((v >> 7) & 1) & (((v & 0x7F) != 0) | ((v >> 8) & 1)));
         if (q >  127) q =  127;
         if (q < -127) q = -127;
         pd[i] = (int8_t)q;
     }
+    return s;
 }
 
 // norm_i32: SP int32 -> SP int16 (floor >> k chosen from the engine absmax CSR).
-// Returns k (caller: out exponent = in exponent + k).
-static int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
+// Returns k (caller: out exponent = in exponent + k); *omax (optional) = output absmax,
+// which resid_add needs to size its own shifts.
+static int op_norm_i32_sp_m(uint32_t src, uint32_t dst, int n, uint32_t *omax)
 {
 #ifdef CSR_ENGINE_CSR_ABSMAX_ADDR
     uint32_t amax = engine_csr_absmax_read();
@@ -465,6 +495,7 @@ static int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
 #endif
     int k = 0;
     while ((amax >> k) > 16383u) k++;
+    if (omax) *omax = amax >> k;
 #ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_NORM_I32)) {
         int32_t args[5] = {(int32_t)src, 0, (int32_t)dst, n/16, k};
@@ -481,6 +512,11 @@ static int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
         pd[i] = (int16_t)v;
     }
     return k;
+}
+
+static inline int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
+{
+    return op_norm_i32_sp_m(src, dst, n, 0);
 }
 
 // silu_mul: SP int16(gate,eg) x SP int16(up,eu) -> SP int16(gate) at eg+eu+15.
@@ -508,26 +544,46 @@ static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n)
     }
 }
 
-// resid_add: SP int16(a,ea) + SP int16(b,eb) -> SP int16(a) at eo = max(ea,eb)+1.
-// Returns eo.
-static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n)
+// resid_add: SP int16(a,ea) + SP int16(b,eb) -> SP int16(a) at eo. Returns eo and, via
+// *amax_io, the output absmax (in: the absmax of a).
+//
+// eo comes from the operands' *measured* magnitudes. The old eo = max(ea,eb)+1 is the bound
+// for two full 15-bit mantissas, so it spent a mantissa bit on every call - and the loop
+// calls this twice per layer. On the 1.7B the residual was down to a single bit by layer 11
+// (every element 0 or +-2**ex); its own quantization error then grew 4x per layer, reaching
+// 6e11 by layer 27 and turning the output into garbage. Sizing eo from the real absmax keeps
+// ~14 bits at every layer. Shifts are signed (VSHLV: left when negative here).
+static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
+                           uint32_t bmax, uint32_t *amax_io)
 {
-    int eo = ((ea > eb) ? ea : eb) + 1;
+    int emin = (ea < eb) ? ea : eb;
+    // Bound the sum at the common exponent, then keep only the headroom it actually needs.
+    uint64_t bound = ((uint64_t)*amax_io << (ea - emin)) + ((uint64_t)bmax << (eb - emin));
+    int k = 0;
+    while ((bound >> k) > 32767) k++;
+    int eo = emin + k;
+    int sa = eo - ea, sb = eo - eb;
 #ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_RESID_ADD)) {
-        int32_t args[6] = {(int32_t)a, (int32_t)b, (int32_t)a, n/16, ea - eo, eb - eo};
-        vec_run(PROG_RESID_ADD, args, 6);
+        int32_t args[6] = {(int32_t)a, (int32_t)b, (int32_t)a, n/16, -sa, -sb};
+        *amax_io = (uint32_t)vec_run(PROG_RESID_ADD, args, 6); // S6 = output absmax.
         return eo;
     }
 #endif
     volatile int16_t *pa = sp16(a);
     volatile int16_t *pb = sp16(b);
+    uint32_t omax = 0;
     for (int i = 0; i < n; i++) {
-        int32_t v = (pa[i] >> (eo - ea)) + (pb[i] >> (eo - eb));
+        int32_t va = (sa >= 0) ? ((int32_t)pa[i] >> sa) : ((int32_t)pa[i] << -sa);
+        int32_t vb = (sb >= 0) ? ((int32_t)pb[i] >> sb) : ((int32_t)pb[i] << -sb);
+        int32_t v  = va + vb;
         if (v >  32767) v =  32767;
         if (v < -32767) v = -32767;
         pa[i] = (int16_t)v;
+        uint32_t m = (uint32_t)(v < 0 ? -v : v);
+        if (m > omax) omax = m;
     }
+    *amax_io = omax;
     return eo;
 }
 
@@ -562,10 +618,13 @@ static void vec_rope_head(uint32_t sp, int hd)
     vec_run(PROG_ROPE, args, 7);
 }
 
-// vec quant8 head slice -> int8 at dst (exponent = es + 8).
+// vec quant8 head slice -> int8 at dst (exponent = es + 8). Fixed shift on purpose: the
+// sequencer patches the softmax scale (which folds in this exponent) into a program it then
+// runs head after head with no CPU in the loop, so the shift has to be known in advance.
+// The measuring quant8 is used where firmware does the exponent algebra itself.
 static void vec_quant8_head(uint32_t sp, uint32_t dst, int n)
 {
-    int32_t args[4] = {(int32_t)sp, 0, (int32_t)dst, n/16};
+    int32_t args[4] = {(int32_t)sp, 0, (int32_t)dst, n/16}; // A1 = 0: fixed >>8.
     vec_run(PROG_QUANT8, args, 4);
 }
 
@@ -1003,6 +1062,7 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
     ek_undo_n = 0;
 
     perf_enter(OP_EMBED);
+    uint32_t xa_st[2] = {X_AMAX_AFTER_EMBED, X_AMAX_AFTER_EMBED};
     ex_st[0] = embed_row_bfp(emb, t0, xr[0]);
     ex_st[1] = embed_row_bfp(emb, t1, xr[1]);
     perf_exit(OP_EMBED);
@@ -1012,13 +1072,14 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
         const struct bons_entry *ekt = model_entry(ROLE_ATTN_K, l);
         const struct bons_entry *evt = model_entry(ROLE_ATTN_V, l);
         // Attention rmsnorm + quant8 per position -> x8 pair.
+        int sx8[2];
         for (int p = 0; p < 2; p++) {
             perf_enter(OP_RMSNORM);
             op_rmsnorm_sp(xr[p], ex_st[p], attn_norm[l],
                           model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16), n_embd, SP_H);
             perf_exit(OP_RMSNORM);
             perf_enter(OP_QUANT8);
-            op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
+            sx8[p] = op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
             perf_exit(OP_QUANT8);
         }
         // q/k/v: one weight stream each, both positions.
@@ -1028,18 +1089,18 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
         for (int p = 0; p < 2; p++) {
             int kq = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eqt->rows,
                                     SP_Q + (uint32_t)p*q_dim*2, q_dim);
-            eq_r[p] = (E_NORM + 8) - (int)eqt->bias + (int)eqt->rshift + kq;
+            eq_r[p] = (E_NORM + sx8[p]) - (int)eqt->bias + (int)eqt->rshift + kq;
         }
         model_matvec2(ekt, SP_X, SP_Y, (uint16_t)ekt->rows);
         for (int p = 0; p < 2; p++) {
             int kk = op_norm_i32_sp(SP_Y + (uint32_t)p*4*ekt->rows,
                                     SP_K + (uint32_t)p*kv_dim*2, kv_dim);
-            ek_r[p] = (E_NORM + 8) - (int)ekt->bias + (int)ekt->rshift + kk;
+            ek_r[p] = (E_NORM + sx8[p]) - (int)ekt->bias + (int)ekt->rshift + kk;
         }
         model_matvec2(evt, SP_X, SP_Y, (uint16_t)evt->rows);
         for (int p = 0; p < 2; p++) {
             int kv2 = op_norm_i32_sp(SP_Y + (uint32_t)p*4*evt->rows, vst[p], kv_dim);
-            ev_r[p] = (E_NORM + 8) - (int)evt->bias + (int)evt->rshift + kv2;
+            ev_r[p] = (E_NORM + sx8[p]) - (int)evt->bias + (int)evt->rshift + kv2;
         }
         perf_exit(OP_NORM_I32);
         // qk-norm weight rows (shared by both positions).
@@ -1111,13 +1172,15 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
             model_matvec2(eo, SP_X + 0x800, SP_Y, (uint16_t)eo->rows);
             for (int p = 0; p < 2; p++) {
                 perf_enter(OP_NORM_I32);
-                int kk = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eo->rows,
-                                        SP_D + (uint32_t)p*n_embd*2, n_embd);
+                uint32_t dmax = 0;
+                int kk = op_norm_i32_sp_m(SP_Y + (uint32_t)p*4*eo->rows,
+                                          SP_D + (uint32_t)p*n_embd*2, n_embd, &dmax);
                 perf_exit(OP_NORM_I32);
                 int ed = ea8p[p] - (int)eo->bias + (int)eo->rshift + kk;
                 perf_enter(OP_RESID_ADD);
                 ex_st[p] = op_resid_add_sp(xr[p], ex_st[p],
-                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd);
+                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd,
+                                           dmax, &xa_st[p]);
                 perf_exit(OP_RESID_ADD);
             }
         }
@@ -1126,23 +1189,23 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
             const struct bons_entry *eg_t = model_entry(ROLE_FFN_GATE, l);
             const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
             const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
+            int fx8[2];
             for (int p = 0; p < 2; p++) {
                 perf_enter(OP_RMSNORM);
                 op_rmsnorm_sp(xr[p], ex_st[p], ffn_norm[l],
                               model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16), n_embd, SP_H);
                 perf_exit(OP_RMSNORM);
                 perf_enter(OP_QUANT8);
-                op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
+                fx8[p] = E_NORM + op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
                 perf_exit(OP_QUANT8);
             }
-            int ex8 = E_NORM + 8;
             int eg[2], eu[2];
             model_matvec2(eg_t, SP_X, SP_Y, (uint16_t)eg_t->rows);
             perf_enter(OP_NORM_I32);
             for (int p = 0; p < 2; p++) {
                 int kg = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eg_t->rows,
                                         SP_G + (uint32_t)p*ffn_dim*2, ffn_dim);
-                eg[p] = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
+                eg[p] = fx8[p] - (int)eg_t->bias + (int)eg_t->rshift + kg;
             }
             perf_exit(OP_NORM_I32);
             model_matvec2(eu_t, SP_X, SP_YU, (uint16_t)eu_t->rows);
@@ -1150,7 +1213,7 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
             for (int p = 0; p < 2; p++) {
                 int ku = op_norm_i32_sp(SP_YU + (uint32_t)p*4*eu_t->rows,
                                         SP_U + (uint32_t)p*ffn_dim*2, ffn_dim);
-                eu[p] = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
+                eu[p] = fx8[p] - (int)eu_t->bias + (int)eu_t->rshift + ku;
             }
             perf_exit(OP_NORM_I32);
             int es8[2];
@@ -1160,21 +1223,23 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
                                SP_U + (uint32_t)p*ffn_dim*2, eu[p], ffn_dim);
                 perf_exit(OP_SILU_MUL);
                 perf_enter(OP_QUANT8);
-                op_quant8_sp(SP_G + (uint32_t)p*ffn_dim*2,
-                             SP_X + (uint32_t)p*ffn_dim, ffn_dim);
+                int ss = op_quant8_sp(SP_G + (uint32_t)p*ffn_dim*2,
+                                      SP_X + (uint32_t)p*ffn_dim, ffn_dim);
                 perf_exit(OP_QUANT8);
-                es8[p] = eg[p] + eu[p] + 15 + 8;
+                es8[p] = eg[p] + eu[p] + 15 + ss;
             }
             model_matvec2(ed_t, SP_X, SP_Y, (uint16_t)ed_t->rows);
             for (int p = 0; p < 2; p++) {
                 perf_enter(OP_NORM_I32);
-                int kd = op_norm_i32_sp(SP_Y + (uint32_t)p*4*ed_t->rows,
-                                        SP_D + (uint32_t)p*n_embd*2, n_embd);
+                uint32_t dmax = 0;
+                int kd = op_norm_i32_sp_m(SP_Y + (uint32_t)p*4*ed_t->rows,
+                                          SP_D + (uint32_t)p*n_embd*2, n_embd, &dmax);
                 perf_exit(OP_NORM_I32);
                 int ed = es8[p] - (int)ed_t->bias + (int)ed_t->rshift + kd;
                 perf_enter(OP_RESID_ADD);
                 ex_st[p] = op_resid_add_sp(xr[p], ex_st[p],
-                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd);
+                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd,
+                                           dmax, &xa_st[p]);
                 perf_exit(OP_RESID_ADD);
             }
         }
@@ -1232,6 +1297,7 @@ static int forward(int token, int want_logits)
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     if (attn_all_hw()) {
         ex_state = embed_row_bfp(emb, token, SP_XR);
+        x_amax   = X_AMAX_AFTER_EMBED;
         perf_exit(OP_EMBED);
         goto embed_done;
     }
@@ -1251,6 +1317,7 @@ static int forward(int token, int want_logits)
         for (int i = 0; i < n_embd; i++)
             pd[i] = (int16_t)lroundf(x[i]*is);
         ex_state = e;
+        x_amax   = X_AMAX_AFTER_EMBED;
     }
     perf_exit(OP_EMBED);
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
@@ -1280,7 +1347,7 @@ embed_done: ;
                       model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16), n_embd, SP_H);
         perf_exit(OP_RMSNORM);
         perf_enter(OP_QUANT8);
-        op_quant8_sp(SP_H, SP_X, n_embd);
+        int sx8 = op_quant8_sp(SP_H, SP_X, n_embd);
         perf_exit(OP_QUANT8);
         int eq_res = 0, ev_res = 0;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
@@ -1293,13 +1360,13 @@ embed_done: ;
             perf_enter(OP_NORM_I32);
             model_matvec(eqt, SP_X, SP_Y);
             int kq = op_norm_i32_sp(SP_Y, SP_Q, q_dim);
-            int eq_r = (E_NORM + 8) - (int)eqt->bias + (int)eqt->rshift + kq;
+            int eq_r = (E_NORM + sx8) - (int)eqt->bias + (int)eqt->rshift + kq;
             model_matvec(ekt, SP_X, SP_Y);
             int kk2 = op_norm_i32_sp(SP_Y, SP_K, kv_dim);
-            int ek_r = (E_NORM + 8) - (int)ekt->bias + (int)ekt->rshift + kk2;
+            int ek_r = (E_NORM + sx8) - (int)ekt->bias + (int)ekt->rshift + kk2;
             model_matvec(evt, SP_X, SP_Y);
             int kv2 = op_norm_i32_sp(SP_Y, SP_V, kv_dim);
-            ev_res = (E_NORM + 8) - (int)evt->bias + (int)evt->rshift + kv2;
+            ev_res = (E_NORM + sx8) - (int)evt->bias + (int)evt->rshift + kv2;
             perf_exit(OP_NORM_I32);
             perf_enter(OP_QKNORM);
             const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
@@ -1343,7 +1410,7 @@ embed_done: ;
         }
 #endif
         {
-        float sx = ldexpf(1.0f, E_NORM + 8);
+        float sx = ldexpf(1.0f, E_NORM + sx8);
         matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q);
         matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k);
         matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v);
@@ -1365,17 +1432,26 @@ embed_done: ;
         {
             int8_t *kd = k_cache + ((uint64_t)l*max_ctx + pos)*kv_dim;
             int8_t *vd = v_cache + ((uint64_t)l*max_ctx + pos)*kv_dim;
-            float ka = 0, va = 0;
-            for (int i = 0; i < kv_dim; i++) {
-                float a = fabsf(k[i]); if (a > ka) ka = a;
-                a = fabsf(v[i]);       if (a > va) va = a;
+            // Per-head scales, not one per token: the head spread of K is large (16x at
+            // layer 0 of the 1.7B, head 4 peaking at 311 against head 6 at 18.9), so a single
+            // tensor scale leaves the quiet heads under 3 bits and wrecks their scores.
+            for (int h = 0; h < n_kv_head; h++) {
+                const float *kh = k + h*head_dim, *vh = v + h*head_dim;
+                float ka = 0, va = 0;
+                for (int i = 0; i < head_dim; i++) {
+                    float a = fabsf(kh[i]); if (a > ka) ka = a;
+                    a = fabsf(vh[i]);       if (a > va) va = a;
+                }
+                uint64_t si = ((uint64_t)l*max_ctx + pos)*n_kv_head + h;
+                float ks = (ka > 0) ? ka/127.0f : 1.0f, is = 1.0f/ks;
+                for (int i = 0; i < head_dim; i++)
+                    kd[h*head_dim + i] = (int8_t)lroundf(kh[i]*is);
+                k_scale[si] = ks;
+                float vs = (va > 0) ? va/127.0f : 1.0f; is = 1.0f/vs;
+                for (int i = 0; i < head_dim; i++)
+                    vd[h*head_dim + i] = (int8_t)lroundf(vh[i]*is);
+                v_scale[si] = vs;
             }
-            float ks = (ka > 0) ? ka/127.0f : 1.0f, is = 1.0f/ks;
-            for (int i = 0; i < kv_dim; i++) kd[i] = (int8_t)lroundf(k[i]*is);
-            k_scale[l*max_ctx + pos] = ks;
-            float vs = (va > 0) ? va/127.0f : 1.0f; is = 1.0f/vs;
-            for (int i = 0; i < kv_dim; i++) vd[i] = (int8_t)lroundf(v[i]*is);
-            v_scale[l*max_ctx + pos] = vs;
         }
 #ifdef BONSAI_HAS_KVSTORE
         // Dual-KV: also append Q8 row packets to HBM for the engine scores path.
@@ -1601,7 +1677,7 @@ attn_scores: ;
                 const int8_t *kt = k_cache + ((uint64_t)l*max_ctx + t)*kv_dim + kvh*head_dim;
                 float dot = 0;
                 for (int d = 0; d < head_dim; d++) dot += qh[d]*kt[d];
-                float sc = dot*k_scale[l*max_ctx + t]*scale;
+                float sc = dot*k_scale[((uint64_t)l*max_ctx + t)*n_kv_head + kvh]*scale;
                 scores[t] = sc;
                 if (sc > smax) smax = sc;
             }
@@ -1671,7 +1747,7 @@ attn_scores: ;
             for (int d = 0; d < head_dim; d++) ah[d] = 0;
             for (int t = 0; t <= pos; t++) {
                 const int8_t *vt = v_cache + ((uint64_t)l*max_ctx + t)*kv_dim + kvh*head_dim;
-                float p = scores[t]*inv*v_scale[l*max_ctx + t];
+                float p = scores[t]*inv*v_scale[((uint64_t)l*max_ctx + t)*n_kv_head + kvh];
                 for (int d = 0; d < head_dim; d++) ah[d] += p*vt[d];
             }
             perf_exit(OP_WV);
@@ -1703,11 +1779,12 @@ attn_heads_done: ;
             ea8 = quantize_f_pow2(attn, q_dim, SP_X);
             model_matvec(eo, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);
-            int kk = op_norm_i32_sp(SP_Y, SP_D, n_embd);
+            uint32_t dmax = 0;
+            int kk = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
             perf_exit(OP_NORM_I32);
             int ed = ea8 - (int)eo->bias + (int)eo->rshift + kk;
             perf_enter(OP_RESID_ADD);
-            ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd);
+            ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax);
             perf_exit(OP_RESID_ADD);
         }
 
@@ -1721,9 +1798,8 @@ attn_heads_done: ;
                           model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16), n_embd, SP_H);
             perf_exit(OP_RMSNORM);
             perf_enter(OP_QUANT8);
-            op_quant8_sp(SP_H, SP_X, n_embd);
+            int ex8 = E_NORM + op_quant8_sp(SP_H, SP_X, n_embd);
             perf_exit(OP_QUANT8);
-            int ex8 = E_NORM + 8;
 
             model_matvec(eg_t, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);
@@ -1743,18 +1819,18 @@ attn_heads_done: ;
             int es = eg + eu + 15;
 
             perf_enter(OP_QUANT8);
-            op_quant8_sp(SP_G, SP_X, ffn_dim);
+            int es8 = es + op_quant8_sp(SP_G, SP_X, ffn_dim);
             perf_exit(OP_QUANT8);
-            int es8 = es + 8;
 
             model_matvec(ed_t, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);
-            int kd = op_norm_i32_sp(SP_Y, SP_D, n_embd);
+            uint32_t dmax = 0;
+            int kd = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
             perf_exit(OP_NORM_I32);
             int ed = es8 - (int)ed_t->bias + (int)ed_t->rshift + kd;
 
             perf_enter(OP_RESID_ADD);
-            ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd);
+            ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax);
             perf_exit(OP_RESID_ADD);
         }
     }
@@ -1927,8 +2003,8 @@ int infer_init(void)
 #endif
     k_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
     v_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
-    k_scale = halloc((uint64_t)n_layer*max_ctx*sizeof(float));
-    v_scale = halloc((uint64_t)n_layer*max_ctx*sizeof(float));
+    k_scale = halloc((uint64_t)n_layer*max_ctx*n_kv_head*sizeof(float));
+    v_scale = halloc((uint64_t)n_layer*max_ctx*n_kv_head*sizeof(float));
     scores  = halloc(max_ctx*sizeof(float));
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)

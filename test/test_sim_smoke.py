@@ -66,7 +66,8 @@ def test_sim_selftest_checksums():
         seed = (seed*1664525 + 1013904223) & 0xFFFFFFFF
         sp[0x8000 + 4*i:0x8000 + 4*i + 4] = seed.to_bytes(4, "little")
     _progs = [
-        ("quant8",   "quant8",     [0x8000, 0, 0xA000, 8]),
+        ("quant8",   "quant8",     [0x8000, 1, 0xA000, 8]),   # A1 = 1: measured shift.
+        ("quant8f",  "quant8",     [0x8000, 0, 0xB200, 8]),   # A1 = 0: fixed >>8.
         ("norm_i32", "norm_i32",   [0x8000, 0, 0xA200, 4, 13]),
         ("resid",    "resid_add",  [0x8000, 0x8400, 0xA400, 8, 1, 2]),
         ("silu",     "silu_mul",   [0x8000, 0x8400, 0xA600, 8, 6, 0, -15]),
@@ -194,14 +195,27 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         o  = v*r*w*f32(np.exp2(-E_NORM))
         return np.clip(lroundf(o), -32767, 32767)
 
+    def quant8_fixed(m):
+        # Per-head attention quantization keeps the fixed >>8: the sequencer patches the
+        # softmax scale (which folds in this exponent) into a program it runs head after head
+        # with no CPU in the loop, so the shift has to be known before the data exists.
+        # Mirrors PROGRAMS["quant8f"] / vec_quant8_head().
+        return np.clip(bx.rne_shift(m, 8), -127, 127).astype(np.int8)
+
     def quant8_sp(m):
         # Scale to the int8 range instead of shifting by a fixed 8. After rmsnorm the mantissas
         # sit near 2**11, so >>8 handed the matvec int8 values of about +-9 - 3 of the 7 bits
         # available - and cost ~30% rel-rms on every matvec output, compounding layer over layer
-        # into garbage tokens. bit_length()-7 is clip-free by construction (amax>>sh < 128).
+        # into garbage tokens.
+        #
+        # Same semantics as PROGRAMS["quant8"]: pre-shift left by VCLZN(absmax) = 15 - bitlen,
+        # then a fixed RNE at bit 8. sh may be negative (a small vector scales up), and the
+        # absmax == 0 case takes VCLZN(0) == 0.
         amax = int(np.abs(m).max()) if len(m) else 0
-        sh   = max(0, amax.bit_length() - 7)
-        return np.clip(bx.rne_shift(m, sh), -127, 127).astype(np.int8), sh
+        sh   = 8 if amax == 0 else amax.bit_length() - 7
+        m64  = m.astype(np.int64)
+        v    = (m64 << (8 - sh)) if sh <= 8 else (m64 >> (sh - 8))
+        return np.clip(bx.rne_shift(v, 8), -127, 127).astype(np.int8), sh
 
     def norm_i32_sp(res):
         amax = int(np.abs(res).max()) if len(res) else 0
@@ -485,18 +499,13 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                 for i2 in range(n_head):
                     mh = res_rmsnorm_head(qm[i2*hd:(i2+1)*hd], eqr, qn16.reshape(-1))
                     mh = res_rope_head(mh, trow)
-                    q_i8, q_sh = quant8_sp(mh)
-                    qh8.append((q_i8, E_NORM + q_sh))
+                    qh8.append((quant8_fixed(mh), E_NORM + 8))
                 for i2 in range(n_kv):
                     mh = res_rmsnorm_head(km[i2*hd:(i2+1)*hd], ekr, kn16.reshape(-1))
                     mh = res_rope_head(mh, trow)
-                    # Per-row exponents: matvec_q8's headroom depends on the spread of the row
-                    # exponents, not their absolute value, so scaled rows keep the same bound.
-                    k_i8, k_sh = quant8_sp(mh)
-                    hbm_kv.setdefault((l, i2, 0), []).append(
-                        (E_NORM + k_sh, k_i8.astype(np.int8)))
-                    v_i8, v_sh = quant8_sp(vm[i2*hd:(i2+1)*hd])
-                    hbm_kv.setdefault((l, i2, 1), []).append((evr + v_sh, v_i8.astype(np.int8)))
+                    hbm_kv.setdefault((l, i2, 0), []).append((E_NORM + 8, quant8_fixed(mh)))
+                    hbm_kv.setdefault((l, i2, 1), []).append(
+                        (evr + 8, quant8_fixed(vm[i2*hd:(i2+1)*hd])))
                 n_rep2 = n_head//n_kv
                 rms, cs = [], []
                 hmax = f32(0.0)

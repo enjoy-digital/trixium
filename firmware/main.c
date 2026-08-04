@@ -477,12 +477,19 @@ int main(void)
         volatile int8_t  *po = (volatile int8_t  *)(SCRATCHPAD_BASE + 0x200);
         for (int i = 0; i < 16; i++) pi[i] = (int16_t)(i*1000 - 8000);
         for (int i = 0; i < 16; i++) po[i] = 0x5A;
-        int32_t va[4] = {0x100, 0, 0x200, 1};
-        vec_run(PROG_QUANT8, va, 4);
-        int ok = 1;
+        int32_t va[4] = {0x100, 1, 0x200, 1}; // A1 = 1: measured shift.
+        uint64_t amax = vec_run(PROG_QUANT8, va, 4); // S6 = source absmax (pass 1).
+        // quant8 picks its shift from that absmax (see prog_quant8), so the expectation has
+        // to track it - this also puts VCLZN and REDMAX under the smoke test.
+        int bl = 0;
+        while ((amax >> bl) != 0) bl++;
+        int sh = (amax == 0) ? 8 : bl - 7;
+        int ok = (amax == 8000);
         for (int i = 0; i < 16; i++) {
-            int32_t v = i*1000 - 8000;
+            int32_t v = (int32_t)(i*1000 - 8000) << (8 - sh);
             int32_t q = (v >> 8) + (((v >> 7) & 1) & (((v & 0x7F) != 0) | ((v >> 8) & 1)));
+            if (q >  127) q =  127;
+            if (q < -127) q = -127;
             if (po[i] != (int8_t)q) ok = 0;
         }
         printf("VECTEST %s\n", ok ? "OK" : "FAIL");
@@ -496,7 +503,8 @@ int main(void)
                 sp32b[i] = seed;
             }
             struct { const char *name; uint16_t pc; int32_t a[8]; int na; } progs[] = {
-                {"quant8",   PROG_QUANT8,   {0x8000, 0, 0xA000, 8}, 4},
+                {"quant8",   PROG_QUANT8,   {0x8000, 1, 0xA000, 8}, 4},  // A1 = 1.
+                {"quant8f",  PROG_QUANT8,   {0x8000, 0, 0xB200, 8}, 4},  // A1 = 0.
                 {"norm_i32", PROG_NORM_I32, {0x8000, 0, 0xA200, 4, 13}, 5},
                 {"resid",    PROG_RESID_ADD,{0x8000, 0x8400, 0xA400, 8, 1, 2}, 6},
                 {"silu",     PROG_SILU_MUL, {0x8000, 0x8400, 0xA600, 8, 6, 0, -15}, 7},

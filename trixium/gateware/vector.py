@@ -44,7 +44,12 @@ LANES = 16
 # BonsaiVectorUnit ---------------------------------------------------------------------------------
 
 class BonsaiVectorUnit(LiteXModule):
-    def __init__(self, imem_depth=256):
+    def __init__(self, imem_depth=None):
+        # Kept in step with model.asm.IMEM_DEPTH, which asserts the programs fit: an
+        # overflowing upload wraps and silently overwrites the program at offset 0.
+        if imem_depth is None:
+            from trixium.model.asm import IMEM_DEPTH
+            imem_depth = IMEM_DEPTH
         # Scratchpad ports (muxed onto the engine's fill/gather ports by the integrator).
         self.sp_rd_adr = Signal(13)  # 256-bit beat index.
         self.sp_rd_dat = Signal(256) # Valid 1 cycle after adr.

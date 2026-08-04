@@ -31,6 +31,12 @@ from trixium.model import bitexact as bx
 
 LANES = 16
 
+# BonsaiVectorUnit.imem_depth: the programs are uploaded into a 256-word instruction BRAM at
+# init. Overflowing it does NOT fail loudly - the write pointer wraps and quietly overwrites
+# the programs at offset 0 (one added program once corrupted resid_add's ARG setup, and only
+# that program's CRC moved). emit_c() asserts against this, so keep it in step with the RTL.
+IMEM_DEPTH = 256
+
 # Opcodes ------------------------------------------------------------------------------------------
 
 OPCODES = [
@@ -336,11 +342,18 @@ class VecInterp:
 #   A4..A7   = op-specific shifts/constants computed by the firmware exponent algebra.
 
 def prog_resid_add():
-    """dst_i16 = clamp16((a >> A4) + (b >> A5)) — conservative pre-shifts (firmware picks
-    A4/A5 = e_out - e_a / e_out - e_b with e_out = max(e_a, e_b) + 1)."""
+    """dst_i16 = clamp16((a << A4) + (b << A5)), shifts signed (VSHLV: left if >= 0).
+
+    Firmware picks A4/A5 = e_a - e_out / e_b - e_out from the operands' *measured* absmax,
+    so the residual keeps its full 15-bit mantissa. Taking e_out = max(e_a, e_b) + 1 instead
+    - the bound for two full mantissas - spends a bit on every call, and the loop calls this
+    twice per layer: the 1.7B's residual was down to one bit by layer 11.
+
+    Returns S6 = output absmax, which is what lets the *next* call size its own shifts."""
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("ARG",   "s4", 4), ("ARG", "s5", 5),
+        ("MOVSI", "s6", 0),
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),
         ("LDV",   "v1", "s1"),
@@ -348,17 +361,46 @@ def prog_resid_add():
         ("BCAST", "v2", "s5"), ("VSHLV", "v1", "v1", "v2"),
         ("VADD",  "v0", "v0", "v1"),
         ("VCLAMP16", "v0", "v0"),
+        ("REDMAX", "s6", "v0"),
         ("STV",   "v0", "s2"),
         ("LOOPE",),
         ("DONE",),
     ]
 
 def prog_quant8():
-    """int16 BFP -> int8 matvec input: dst_i8 = clamp8(rne(src >> 8)). A0 src, A2 dst, A3 beats."""
+    """int16 BFP -> int8 matvec input: dst_i8 = clamp8(rne(src >> s)), out exponent = e + s.
+
+    A1 selects where s comes from:
+      A1 = 1  measure it (s = bitlen(absmax) - 7, a first pass over the source). After
+              rmsnorm the mantissas sit near 2**11, so the fixed 8 below would leave the
+              matvec int8 inputs of about +-9 - 3 of the 7 bits available - and cost ~0.30
+              rel-rms on every matvec output. s may be negative: a small source scales up.
+      A1 = 0  fixed s = 8. The attention path needs the shift known *before* the data
+              exists, because the sequencer patches the softmax scale (which folds in the q
+              exponent) into a program it then runs head after head with no CPU in the loop.
+
+    VCLZN(absmax) is exactly the pre-shift wanted - it normalizes the absmax into
+    [2^14, 2^15), i.e. shifts left by 15 - bitlen - and keeping the fixed RNE at bit 8 then
+    rounds at the same place as rne_shift(src, bitlen - 7), with no variable-rounding
+    microcode. Multiplying it by A1 selects the mode without a branch (the ISA has none).
+
+      A0 src, A1 mode, A2 dst, A3 beats.  Returns S6 = source absmax (firmware derives the
+      same s from it: 8 if absmax == 0 else bitlen(absmax) - 7)."""
     return [
-        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3),
-        ("LOOPS", "s3"),
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("MOVSI", "s6", 0),
+        ("LOOPS", "s3"),               # Pass 1: absmax.
         ("LDV",   "v0", "s0"),
+        ("REDMAX", "s6", "v0"),
+        ("LOOPE",),
+        ("BCAST", "v1", "s6"),
+        ("VCLZN", "v1", "v1"),         # 15 - bitlen(absmax) in every lane.
+        ("BCAST", "v2", "s1"),
+        ("VMUL",  "v1", "v1", "v2"),   # x1 = measure, x0 = fixed >>8.
+        ("ARG",   "s0", 0),            # Rewind src.
+        ("LOOPS", "s3"),               # Pass 2: scale, round, store.
+        ("LDV",   "v0", "s0"),
+        ("VSHLV", "v0", "v0", "v1"),
         ("VRNE",  "v0", "v0", 8),
         ("VCLAMP8", "v0", "v0"),
         ("STB",   "v0", "s2"),
@@ -672,6 +714,9 @@ def emit_c(out):
     for name, fn in PROGRAMS.items():
         offsets[name] = len(all_words)
         all_words += assemble(fn())
+    assert len(all_words) <= IMEM_DEPTH, (
+        f"programs need {len(all_words)} words but the instruction BRAM holds {IMEM_DEPTH}: "
+        f"the upload would wrap and silently overwrite the first program")
     lines.append(f"static const uint32_t bonsai_progs[{len(all_words)}] = {{")
     for i in range(0, len(all_words), 8):
         lines.append("    " + ", ".join(f"0x{w:08x}" for w in all_words[i:i+8]) + ",")
