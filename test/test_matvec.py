@@ -1034,6 +1034,12 @@ def test_sequencer_q8_scores_ragged():
     scratchpad grant and never retires (SEQSTALL dcount=n/84 eng=301).
 
     T = 8 is the last working case on hardware, 9 and 10 are the failing ones.
+
+    These all pass, so the wedge needs the full design: reproduce it in the Verilator sim
+    with a tiny model sharded 8 ways (the n2 sim does not reach a failing shape):
+
+      .venv/bin/python -m trixium.model.tinygen --channels 8
+      .venv/bin/python sim/bonsai_sim.py --image models/tiny/bonsai-tiny-n8.img --run
     """
     from trixium.gateware.vector import BonsaiVectorUnit
     from trixium.gateware.csr_front import BonsaiEngineCSR
