@@ -23,6 +23,10 @@ from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 class _EngineDUT(Module):
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
                  dual=True):
+        # latency/stall_rate may be a per-channel list: real HBM channels do not respond in
+        # lockstep, and several engine bugs only appear once the readers desynchronize.
+        lat = latency if isinstance(latency, (list, tuple)) else [latency]*n_channels
+        stl = stall_rate if isinstance(stall_rate, (list, tuple)) else [stall_rate]*n_channels
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
         self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
@@ -30,7 +34,7 @@ class _EngineDUT(Module):
                                                         dual=dual)
         for i, axi in enumerate(axis):
             model = BonsaiHBMChannelModel(axi, size=64*1024,
-                init=words_from_bytes(chan_payloads[i]), latency=latency, stall_rate=stall_rate)
+                init=words_from_bytes(chan_payloads[i]), latency=lat[i], stall_rate=stl[i])
             setattr(self.submodules, f"model{i}", model)
 
 def _run_engine(dut, cmd, n_results, dst):
@@ -1151,5 +1155,112 @@ def test_sequencer_q8_scores_ragged():
                 data += int(v).to_bytes(32, "little")
             got = np.frombuffer(bytes(data[0x4000:0x4000 + 4*T]), dtype="<i4")
             assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
+
+        run_simulation(dut, [driver()])
+
+def test_engine_back_to_back_scores_axpy_ragged():
+    """The real per-head chain: scores -> AXPY -> scores, back to back, 8 channels, ragged.
+
+    Each of those ops passes on its own. This runs them consecutively the way one head's
+    attention does, because ISSUE only waits on readers[0].sink.ready before moving to RUN -
+    "all readers are idle here" - and with rem>=1 the readers are handed *different* lengths,
+    so they do not finish together. If a reader is still busy when the next op issues, its
+    command is dropped, its pipe never produces results, and the engine sits in RUN forever.
+    """
+    cols, seed = 64, 131
+    n_channels = 8
+    for T in (9, 17):
+        rng    = np.random.default_rng(seed + T)
+        ev     = rng.integers(-9, -4, T)
+        scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+        w8     = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+        p8     = rng.integers(0, 128, T, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        Bs   = bx.choose_scale_bias(e16)
+        Rs   = bx.choose_result_shift(scales, Bs, gs_max=bx.GS_MAX_Q8)
+        Ba   = 12 - int(e16.max())
+        Rpre = bx.axpy_rpre(int(p8.astype(np.int64).sum()))
+        exp_scores = bx.matvec_q8(scales, w8, x8, Bs, Rs)
+        exp_axpy   = []
+
+        rows, rem = T//n_channels, T % n_channels
+        payloads = []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]
+            if pos:
+                spec_c = TensorSpec("kv", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                    len(pos), cols, scales=scales[pos], values=w8[pos])
+                payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+                exp_axpy.append(bx.axpy_rows(scales[pos], w8[pos], p8[pos], Ba, Rpre))
+            else:
+                payloads.append(b"")
+                exp_axpy.append(np.zeros(cols, dtype=np.int32))
+        maxlen   = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+        exp_axpy = np.concatenate(exp_axpy)
+
+        rb = layout.row_beats(cols, layout.KIND_Q8)
+        sb = layout.scale_beats(cols, layout.KIND_Q8)
+        cb = layout.code_beats(cols, layout.KIND_Q8)
+        # x holds the score vector at 0 and the probs at 0x100, as the head chain does.
+        x_init = x8.tobytes().ljust(0x100, b"\0") + p8.tobytes()
+        # Per-channel latency/stalls so the readers finish at different times, which is what
+        # real HBM does. A reader only accepts a command while idle (sink.ready = ~active),
+        # so one still draining when the next op issues is the failure mode under test.
+        lat = [4, 20, 6, 28, 8, 32, 10, 36][:n_channels]
+        stl = [0, 2, 0, 3, 0, 4, 0, 5][:n_channels]
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), lat, stl)
+
+        sc_cmd = dict(kind=1, rows=rows, rem=rem, ilv=1, cols=cols, wbase=0, wlen=rows*rb,
+                      sbeats=sb, cbeats=cb, bias=Bs, rshift=Rs, xsrc=0, dst=0x4000)
+        ax_cmd = dict(kind=4, rows=rows, rem=rem, cols=cols, wbase=0, wlen=rows*rb,
+                      sbeats=sb, cbeats=cb, bias=Ba, rshift=Rpre, xsrc=0x100, dst=0x5000)
+        fetch_cmd = dict(kind=2, rows=0, rem=0, cols=cols, wbase=0, wlen=4,
+                         sbeats=sb, cbeats=cb, bias=0, rshift=0, xsrc=0, dst=0x7000,
+                         chan=n_channels - 1)  # last channel, so reader 0 sits out
+
+        def read_i32(dst, n):
+            out = []
+            for i in range(n):
+                word = (yield dut.scratchpad.mem[(dst + 4*i)//32])
+                v    = (word >> (32*(((dst + 4*i)//4) % 8))) & 0xFFFFFFFF
+                out.append(v - (1 << 32) if v & (1 << 31) else v)
+            return np.array(out, dtype=np.int64)
+
+        def driver():
+            # A fetch commands ONE channel and leaves the rest idle, so it is the most
+            # likely thing to leave a reader busy while the next op issues - and firmware
+            # fetches constantly (rope rows, norm weights, embeddings).
+            for tag, cmd, dst in (("fetch",   fetch_cmd, 0x7000),
+                                  ("scores",  sc_cmd,    0x4000),
+                                  ("fetch2",  fetch_cmd, 0x7000),
+                                  ("axpy",    ax_cmd,    0x5000),
+                                  ("scores2", sc_cmd,    0x6000)):
+                for k, v in dict(cmd, dst=dst).items():
+                    yield getattr(dut.engine.cmd, k).eq(v)
+                yield dut.engine.cmd.valid.eq(1)
+                yield
+                while not (yield dut.engine.cmd.ready):
+                    yield
+                yield dut.engine.cmd.valid.eq(0)
+                for _ in range(300000):
+                    if (yield dut.engine.done):
+                        break
+                    yield
+                else:
+                    raise AssertionError(
+                        f"T={T} rows={rows} rem={rem}: '{tag}' never completed - "
+                        f"the back-to-back wedge")
+                yield
+                yield
+                assert (yield dut.engine.error) == 0, tag
+            got_s = yield from read_i32(0x4000, T)
+            got_a = yield from read_i32(0x5000, n_channels*cols)
+            got_2 = yield from read_i32(0x6000, T)
+            assert np.array_equal(got_s, exp_scores), f"T={T} scores"
+            assert np.array_equal(got_a, exp_axpy),   f"T={T} axpy"
+            assert np.array_equal(got_2, exp_scores), f"T={T} scores again"
 
         run_simulation(dut, [driver()])

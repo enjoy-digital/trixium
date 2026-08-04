@@ -513,17 +513,42 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             NextState("ISSUE"),
         )
+        # Per-reader command acceptance. A reader only takes a command while idle
+        # (sink.ready = ~active in axi_reader), and readers do NOT go idle together: with
+        # rem != 0 they are handed different lengths, and a fetch commands a single channel
+        # while the others sit out. Advancing on readers[0] alone - "all readers are idle
+        # here" - dropped the command for any reader still draining, so its pipe produced no
+        # results, result_cnt never reached mv_total, and the engine sat in RUN forever
+        # holding the scratchpad grant (status 0x301). That is the position-9 wedge: it needs
+        # the readers desynchronized, which is why every equal-length test passed.
+        #
+        # Hold each reader's command until that reader accepts it, latch who has, and leave
+        # only when every commanded reader is done. The latch is what keeps a reader that
+        # accepted on the first cycle from taking the same command again.
+        issued  = Signal(n)
+        want    = Signal(n)
+        acc_now = Signal(n)
+        self.comb += [
+            want.eq(Cat(*[~fetch_mode | (fetch_chan == i) for i in range(n)])),
+            acc_now.eq(Cat(*[r.sink.valid & r.sink.ready for r in self.readers])),
+        ]
+        self.sync += [
+            If(fsm.ongoing("ISSUE"),
+                *[If(acc_now[i], issued[i].eq(1)) for i in range(n)],
+            ).Else(
+                issued.eq(0),
+            )
+        ]
         fsm.act("ISSUE",
             self.busy.eq(1),
-            *[r.sink.valid.eq(~fetch_mode | (fetch_chan == i))
+            *[r.sink.valid.eq(want[i] & ~issued[i])
               for i, r in enumerate(self.readers)],
             *[r.sink.addr.eq(cmd_r["wbase"] + i*chan_stride)
               for i, r in enumerate(self.readers)],
             *[r.sink.len.eq(cmd_r["wlen"]
                 + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
               for i, r in enumerate(self.readers)],
-            # All readers are idle here: they accept together.
-            If(self.readers[0].sink.ready,
+            If(reduce_and([~want[i] | issued[i] | acc_now[i] for i in range(n)]),
                 NextState("RUN"),
             )
         )
@@ -570,6 +595,11 @@ class BonsaiMatVecEngine(LiteXModule):
                 )
             ),
         ]
+
+def reduce_and(sigs):
+    from functools import reduce
+    from operator import and_
+    return reduce(and_, sigs)
 
 def reduce_or(sigs):
     from functools import reduce

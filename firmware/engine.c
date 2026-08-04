@@ -12,8 +12,9 @@
 
 #include "engine.h"
 
-int engine_wedged; // Sticky: an op never completed, so engine results are not trustworthy.
 #include "perf.h"
+
+int engine_wedged; // Sticky: an op never completed, so engine results are not trustworthy.
 
 void engine_run(const struct engine_op *op)
 {
@@ -49,8 +50,18 @@ void engine_run(const struct engine_op *op)
         if (++spins < 200000u)
             continue;
         spins = 0;
-        printf("ENGSTALL st=%02lx seq=%02lx", (unsigned long)engine_csr_status_read(),
-               (unsigned long)seq_status_read());
+        // The op's own parameters, because a stall is nearly always a parameter the
+        // firmware computed rather than the datapath: the same shapes pass the Migen tests
+        // when the parameters are supplied by construction.
+        printf("ENGSTALL st=%02lx seq=%02lx kind=%d rows=%lu rem=%lu cols=%lu wlen=%lu "
+               "wbase=%08lx sb=%lu cb=%lu bias=%ld rsh=%ld ilv=%d qn=%d xsrc=%lx dst=%lx",
+               (unsigned long)engine_csr_status_read(),
+               (unsigned long)seq_status_read(), op->kind,
+               (unsigned long)op->rows, (unsigned long)op->rem, (unsigned long)op->cols,
+               (unsigned long)op->wlen, (unsigned long)op->wbase,
+               (unsigned long)op->sbeats, (unsigned long)op->cbeats,
+               (long)op->bias, (long)op->rshift, op->ilv, op->qn,
+               (unsigned long)op->xsrc, (unsigned long)op->dst);
         for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
             engine_csr_perf_chan_write(c);
             printf(" ch%d beats=%08lx ar=%08lx r=%08lx", c,
