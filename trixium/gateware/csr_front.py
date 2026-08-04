@@ -47,6 +47,19 @@ class BonsaiEngineCSR(LiteXModule):
             CSRField("busy",     size=1),
             CSRField("error",    size=1, description="Sticky reserved-code error."),
             CSRField("pending",  size=1, description="Submitted op not yet accepted."),
+            # A wedged op is only diagnosable if it says where it is wedged. On hardware a KV
+            # store left the engine busy forever and all the CSRs could report was "busy": no
+            # way to tell ST_CMD (loader will not take the command) from ST_RUN (scratchpad is
+            # not delivering beats) from ST_DRAIN (writer's B responses never came), which are
+            # three different bugs. The FSM state costs four bits and settles it.
+            CSRField("st_cmd",   size=1, offset=4, description="STORE: loader has not taken the command."),
+            CSRField("st_run",   size=1, offset=5, description="STORE: streaming beats from the scratchpad."),
+            CSRField("st_drain", size=1, offset=6, description="STORE: waiting for the writer's B responses."),
+            CSRField("fill",     size=1, offset=7, description="Broadcasting x into the pipes."),
+            CSRField("run",      size=1, offset=8, description="Streaming weights."),
+            CSRField("sp_grant", size=1, offset=9, description="Engine holds the scratchpad."),
+            CSRField("st_busy",  size=1, offset=10, description="Loader is running our store."),
+            CSRField("vec_busy", size=1, offset=11, description="Vector unit busy."),
         ])
         self.done_count = CSRStatus(32, description="Completed op counter.")
         self.absmax     = CSRStatus(32, description="|int32| max over the last matvec's results.")
@@ -132,6 +145,15 @@ class BonsaiEngineCSR(LiteXModule):
             self.status.fields.busy.eq(engine.busy),
             self.status.fields.error.eq(engine.error),
             self.status.fields.pending.eq(pending),
+            self.status.fields.st_cmd.eq(engine.fsm.ongoing("ST_CMD")),
+            self.status.fields.st_run.eq(engine.fsm.ongoing("ST_RUN")),
+            self.status.fields.st_drain.eq(engine.fsm.ongoing("ST_DRAIN")),
+            self.status.fields.fill.eq(engine.fsm.ongoing("FILL")),
+            self.status.fields.run.eq(engine.fsm.ongoing("RUN")),
+            self.status.fields.sp_grant.eq(engine.sp_busy),
+            self.status.fields.st_busy.eq(engine.store_busy),
+            self.status.fields.vec_busy.eq(getattr(engine, "vecunit", None).busy
+                                           if getattr(engine, "vecunit", None) is not None else 0),
             self.absmax.status.eq(engine.absmax),
             self.argmax_val.status.eq(engine.argmax_val),
             self.argmax_idx.status.eq(engine.argmax_idx),

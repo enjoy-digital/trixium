@@ -47,6 +47,7 @@ class BonsaiMatVecEngine(LiteXModule):
             "chan_stride must be 0 or a power of two (the STORE path shifts by it)"
         chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
 
+        self.vecunit = vecunit   # kept so the CSR front can report vec_busy
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
