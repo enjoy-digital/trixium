@@ -131,6 +131,7 @@ static void help(void)
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
     puts("bench [n]       - profiled generation benchmark (default 4 tokens)");
+    puts("vbench          - stage-by-stage cycle microbenchmark");
 }
 
 static void hwops_cmd(char *args)
@@ -220,6 +221,7 @@ static void hdrload(void)
             ((uint32_t *)(dst + off))[i] = src[i];
         off += chunk;
     }
+    model_cache_reset(); // Header changed: rebuild the (role, layer) lookup cache.
     printf("hdrload: %lu KB copied\n", (unsigned long)(bytes/1024));
     model_info();
     if (infer_init() == 0)
@@ -458,6 +460,8 @@ static void console_service(void)
     }
     else if (strcmp(token, "hdrload") == 0)
         hdrload();
+    else if (strcmp(token, "vbench") == 0)
+        infer_vbench();
     else if (strlen(token))
         puts("unknown command");
     printf("bonsai> ");

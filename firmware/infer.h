@@ -16,6 +16,7 @@ int  infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(i
 // infer.c). The same ops run CPU-dispatched per head when off.
 extern int seq_use;
 
+void infer_vbench(void);  // Stage-by-stage cycle microbenchmark (run after hdrload).
 void infer_spec(int on);                    // Speculative decode on/off (lossless, greedy).
 void infer_spec_stats(int *acc, int *rej);  // Accepted / rejected draft counts.
 

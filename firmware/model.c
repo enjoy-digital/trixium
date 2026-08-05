@@ -23,10 +23,62 @@ static const struct bons_entry *model_table(void)
     return (const struct bons_entry *)(BONSAI_HDR_ADDR + model_header()->table_offset);
 }
 
+// (role, layer) -> table-index cache. The linear scan below walks up to n_tensors entries
+// of the DRAM-resident table; measured on the card a token-loop rmsnorm call was 157k cycles
+// against 27k for the identical call with the entry pointer in hand - the difference is this
+// scan falling out of the D-cache. The loop does a dozen lookups per layer, so the scans
+// were 29% of token time, hiding as "unaccounted" because no perf region covered them.
+// `any` holds the first (role, layer) match in table order (model_entry semantics verbatim);
+// `n16` the first NORM16 match (the only kind model_entry_kind is used with - anything else
+// falls back to the scan). Rebuilt lazily; hdrload resets it when the header changes.
+// NOT in .bss: the sram region is 8 KB *including the stack* (_fstack sits at its top), and
+// these 4 KB of tables left it no room - the sim build failed to link and the card build
+// linked with so little stack that boot corrupted itself and hung. They live instead in the
+// unused main_ram window between the BONS header/table (~32 KB at BONSAI_HDR_ADDR) and the
+// inference heap (BONSAI_HDR_ADDR + 0x100000, see infer.c HEAP_BASE).
+#define ECACHE_ROLES  16
+#define ECACHE_LAYERS 64
+#define ECACHE_BASE   (BONSAI_HDR_ADDR + 0x80000)
+#define ecache_any ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE))
+#define ecache_n16 ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE + \
+                        ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))
+static int ecache_ok;
+
+void model_cache_reset(void)
+{
+    ecache_ok = 0;
+}
+
+static void ecache_build(void)
+{
+    const struct bons_header *h = model_header();
+    const struct bons_entry  *t = model_table();
+    for (int r = 0; r < ECACHE_ROLES; r++)
+        for (int l = 0; l < ECACHE_LAYERS; l++)
+            ecache_any[r][l] = ecache_n16[r][l] = -1;
+    for (uint32_t i = 0; i < h->n_tensors && i < 32767; i++) {
+        int r = t[i].role, l = t[i].layer;
+        if (r < 0 || r >= ECACHE_ROLES || l < 0 || l >= ECACHE_LAYERS)
+            continue;
+        if (ecache_any[r][l] < 0)
+            ecache_any[r][l] = (int16_t)i;
+        if (t[i].kind == KIND_NORM16 && ecache_n16[r][l] < 0)
+            ecache_n16[r][l] = (int16_t)i;
+    }
+    ecache_ok = 1;
+}
+
 const struct bons_entry *model_entry(int role, int layer)
 {
     const struct bons_header *h = model_header();
     const struct bons_entry  *t = model_table();
+    if (h->magic == BONS_MAGIC &&
+        role >= 0 && role < ECACHE_ROLES && layer >= 0 && layer < ECACHE_LAYERS) {
+        if (!ecache_ok)
+            ecache_build();
+        int16_t i = ecache_any[role][layer];
+        return (i >= 0) ? &t[i] : 0;
+    }
     for (uint32_t i = 0; i < h->n_tensors; i++)
         if (t[i].role == role && t[i].layer == layer)
             return &t[i];
@@ -37,6 +89,13 @@ const struct bons_entry *model_entry_kind(int role, int layer, int kind)
 {
     const struct bons_header *h = model_header();
     const struct bons_entry  *t = model_table();
+    if (kind == KIND_NORM16 && h->magic == BONS_MAGIC &&
+        role >= 0 && role < ECACHE_ROLES && layer >= 0 && layer < ECACHE_LAYERS) {
+        if (!ecache_ok)
+            ecache_build();
+        int16_t i = ecache_n16[role][layer];
+        return (i >= 0) ? &t[i] : 0;
+    }
     for (uint32_t i = 0; i < h->n_tensors; i++)
         if (t[i].role == role && t[i].layer == layer && t[i].kind == kind)
             return &t[i];

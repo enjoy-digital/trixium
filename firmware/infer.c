@@ -2031,6 +2031,113 @@ int infer_init(void)
     return 0;
 }
 
+// Microbenchmark: time each stage of the stack in isolation, so "where do the cycles go"
+// is measured on the card instead of argued about. Run after hdrload.
+void infer_vbench(void)
+{
+    if (!n_layer) { puts("vbench: run hdrload first"); return; }
+    uint32_t t0, dt;
+    printf("VB clk=%d MHz  (cycles, avg over reps)\n",
+           (int)(CONFIG_CLOCK_FREQUENCY/1000000));
+
+#ifdef CSR_VECUNIT_BASE
+    { // Vec dispatch floor: smallest real program run (resid_add, 1 beat).
+        int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 1, 0, -1};
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++) vec_run(PROG_RESID_ADD, a, 6);
+        dt = perf_now() - t0;
+        printf("VB vec_1beat        %8lu\n", (unsigned long)(dt/16));
+    }
+    { // Vec throughput: resid_add over n_embd (128 beats, ~1.3k instructions).
+        int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 128, 0, -1};
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++) vec_run(PROG_RESID_ADD, a, 6);
+        dt = perf_now() - t0;
+        printf("VB vec_resid_128b   %8lu\n", (unsigned long)(dt/16));
+    }
+#endif
+    { // Engine fetch: 128 beats from channel 0 (per-op latency + short stream).
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++)
+            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE, 128, SP_FET);
+        dt = perf_now() - t0;
+        printf("VB fetch_128b       %8lu\n", (unsigned long)(dt/16));
+    }
+    { // Engine fetch: 1 beat (pure per-op overhead + HBM latency).
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++)
+            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE, 1, SP_FET);
+        dt = perf_now() - t0;
+        printf("VB fetch_1b         %8lu\n", (unsigned long)(dt/16));
+    }
+    { // rmsnorm, staged: the op is fetch + eps glue + one vec program.
+        const struct bons_entry *an = model_entry_kind(ROLE_ATTN_NORM, 0, KIND_NORM16);
+        t0 = perf_now();
+        for (int i = 0; i < 8; i++)
+            op_rmsnorm_sp(SP_XR, -15, attn_norm[0], an, n_embd, SP_H);
+        dt = perf_now() - t0;
+        printf("VB rmsnorm_full     %8lu\n", (unsigned long)(dt/8));
+#if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
+        if (an) {
+            t0 = perf_now();
+            for (int i = 0; i < 8; i++)
+                engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + an->chan_base_beats*32,
+                             an->chan_len_beats, SP_FET);
+            dt = perf_now() - t0;
+            printf("VB rmsnorm_fetch    %8lu  (%lu beats)\n",
+                   (unsigned long)(dt/8), (unsigned long)an->chan_len_beats);
+            int eps_int = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*(-15)));
+            if (eps_int < 1) eps_int = 1;
+            int ln = 0;
+            while ((1 << ln) < n_embd) ln++;
+            int32_t a[7] = {(int32_t)SP_XR, (int32_t)SP_FET, (int32_t)SP_H, n_embd/16,
+                            -ln, eps_int, E_W16 - E_NORM - 15};
+            t0 = perf_now();
+            for (int i = 0; i < 8; i++) vec_run(PROG_RMSNORM, a, 7);
+            dt = perf_now() - t0;
+            printf("VB rmsnorm_vecrun   %8lu\n", (unsigned long)(dt/8));
+        }
+#endif
+    }
+    { // Big weight stream: ffn_gate matvec (the shape the token loop lives in), with the
+      // per-channel stream counters around it: AR-stall cycles say whether the HBM side
+      // limits, near-zero everywhere says the engine's own drain does.
+        const struct bons_entry *eg = model_entry(ROLE_FFN_GATE, 0);
+        uint32_t b0[8], a0[8];
+        for (int c = 0; c < n_ch && c < 8; c++) {
+            engine_csr_perf_chan_write(c);
+            b0[c] = engine_csr_perf_beats_read();
+            a0[c] = engine_csr_perf_ar_read();
+        }
+        t0 = perf_now();
+        for (int i = 0; i < 4; i++) model_matvec(eg, SP_X, SP_Y);
+        dt = perf_now() - t0;
+        printf("VB matvec_gate      %8lu  (%lu beats/chan)\n",
+               (unsigned long)(dt/4), (unsigned long)eg->chan_len_beats);
+        for (int c = 0; c < n_ch && c < 8; c += 4) {
+            engine_csr_perf_chan_write(c);
+            printf("VB   ch%d beats %lu arstall %lu\n", c,
+                   (unsigned long)((engine_csr_perf_beats_read() - b0[c])/4),
+                   (unsigned long)((engine_csr_perf_ar_read()   - a0[c])/4));
+        }
+    }
+    { // Small weight stream: attn_q matvec.
+        const struct bons_entry *eq = model_entry(ROLE_ATTN_Q, 0);
+        t0 = perf_now();
+        for (int i = 0; i < 8; i++) model_matvec(eq, SP_X, SP_Y);
+        dt = perf_now() - t0;
+        printf("VB matvec_q         %8lu  (%lu beats/chan)\n",
+               (unsigned long)(dt/8), (unsigned long)eq->chan_len_beats);
+    }
+    { // perf_now itself (measurement overhead per probe pair).
+        t0 = perf_now();
+        for (int i = 0; i < 64; i++) (void)perf_now();
+        dt = perf_now() - t0;
+        printf("VB perf_now         %8lu\n", (unsigned long)(dt/64));
+    }
+    puts("VB done");
+}
+
 void infer_spec(int on)
 {
     spec_on  = on;
