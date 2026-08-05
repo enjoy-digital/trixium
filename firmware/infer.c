@@ -1579,6 +1579,11 @@ attn_scores: ;
                 }
                 int Bk, Rk;
                 kv_scores_br(l, kvh, 0, &Bk, &Rk);
+                // This op is where the card wedges once rows >= 2, i.e. from position 9
+                // at 8 channels. Not the ragged shape: padding so every channel carries the
+                // same count (rem = 0) still wedges, with all channels then delivering
+                // 10/10 beats. All the data arrives; the results stop retiring. See
+                // docs/bringup.md before spending time on it.
                 struct engine_op op = {0};
                 op.kind   = ENGINE_KIND_Q8;
                 op.rows   = (pos + 1)/n_ch;

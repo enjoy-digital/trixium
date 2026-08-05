@@ -22,7 +22,7 @@ from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 class _EngineDUT(Module):
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
-                 dual=True):
+                 dual=True, xbuf_groups=32):
         # latency/stall_rate may be a per-channel list: real HBM channels do not respond in
         # lockstep, and several engine bugs only appear once the readers desynchronize.
         lat = latency if isinstance(latency, (list, tuple)) else [latency]*n_channels
@@ -30,8 +30,8 @@ class _EngineDUT(Module):
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
         self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
-        self.submodules.engine     = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
-                                                        dual=dual)
+        self.submodules.engine     = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                        xbuf_groups=xbuf_groups, dual=dual)
         for i, axi in enumerate(axis):
             model = BonsaiHBMChannelModel(axi, size=64*1024,
                 init=words_from_bytes(chan_payloads[i]), latency=lat[i], stall_rate=stl[i])
@@ -1245,7 +1245,7 @@ def test_engine_back_to_back_scores_axpy_ragged():
                 while not (yield dut.engine.cmd.ready):
                     yield
                 yield dut.engine.cmd.valid.eq(0)
-                for _ in range(300000):
+                for _ in range(60000):
                     if (yield dut.engine.done):
                         break
                     yield
@@ -1264,3 +1264,49 @@ def test_engine_back_to_back_scores_axpy_ragged():
             assert np.array_equal(got_2, exp_scores), f"T={T} scores again"
 
         run_simulation(dut, [driver()])
+
+def test_matvec_q8_ilv_multirow_gaps():
+    """Q8 interleaved scores with more than one row per channel, and gaps in the read data.
+
+    On the card the scores op stalls the moment a pipe has to process two rows: rows=1 works
+    at every rem, rows=2 wedges even with rem=0 and every channel delivering exactly the
+    beats it was commanded (measured ch0..7 = 10/10). The uniform-latency, gapless model
+    passes rows=2, so the difference to look for is timing: real HBM returns a burst with
+    gaps between beats, which is what stall_rate models.
+    """
+    cols, seed = 128, 151
+    n_channels = 8
+    for T, stall in [(8, 0), (16, 0), (16, 4), (24, 4), (17, 4)]:
+        rows, rem = T//n_channels, T % n_channels
+        rng    = np.random.default_rng(seed + T + stall)
+        scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
+        q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B = bx.choose_scale_bias(e16)
+        R = bx.choose_result_shift(scales, B, gs_max=bx.GS_MAX_Q8)
+        expected = bx.matvec_q8(scales, q8w, x8, B, R)
+
+        payloads = []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]
+            spec_c = TensorSpec("kv", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                max(len(pos), 1), cols,
+                                scales=scales[pos] if pos else scales[:1],
+                                values=q8w[pos] if pos else q8w[:1])
+            payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes() if pos else b"")
+        maxlen   = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+
+        # xbuf_groups=96 is what the SoC builds (the default). The tests had been running
+        # 32, and the Verilator sim - which uses 96 - is the only place the wedge reproduced.
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, stall,
+                         xbuf_groups=96)
+        rb  = layout.row_beats(cols, layout.KIND_Q8)
+        cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                   bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
+        got = _run_engine(dut, cmd, T, 0x4000)
+        assert np.array_equal(got, expected), f"T={T} stall={stall}: {got} != {expected}"

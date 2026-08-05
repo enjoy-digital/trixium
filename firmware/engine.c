@@ -41,6 +41,27 @@ void engine_run(const struct engine_op *op)
     engine_csr_qstride_write(op->qstride);
     engine_csr_rshift2_write(op->rshift2);
 #endif
+    // Snapshot each reader's beat counter before the op: on a stall the deltas say exactly
+    // which channel came up short, which is the one fact the status bits cannot give.
+    // Expected delta per channel = wlen + (chan < rem ? sbeats + cbeats : 0).
+    uint32_t beats0[BONSAI_N_CHANNELS];
+    for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
+        engine_csr_perf_chan_write(c);
+        beats0[c] = engine_csr_perf_beats_read();
+    }
+
+    // Mark the result slots so a stall shows which ones were retired. The interleaved
+    // gather writes slot = row*n_channels + chan, so the pattern says exactly which
+    // (row, channel) never produced a result.
+    volatile uint32_t *rslot = (volatile uint32_t *)(SCRATCHPAD_BASE + op->dst);
+    uint32_t nslot = 0;
+    if (op->kind == 1 && op->ilv) {
+        nslot = op->rows*BONSAI_N_CHANNELS + op->rem;
+        if (nslot > 64) nslot = 64;
+        for (uint32_t i = 0; i < nslot; i++)
+            rslot[i] = 0xDEADBEEFu;
+    }
+
     engine_csr_submit_write(1);
 
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
@@ -64,10 +85,16 @@ void engine_run(const struct engine_op *op)
                (unsigned long)op->xsrc, (unsigned long)op->dst);
         for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
             engine_csr_perf_chan_write(c);
-            printf(" ch%d beats=%08lx ar=%08lx r=%08lx", c,
-                   (unsigned long)engine_csr_perf_beats_read(),
-                   (unsigned long)engine_csr_perf_ar_read(),
-                   (unsigned long)engine_csr_perf_r_read());
+            uint32_t got  = engine_csr_perf_beats_read() - beats0[c];
+            uint32_t want = op->wlen + ((uint32_t)c < op->rem
+                                        ? (uint32_t)op->sbeats + op->cbeats : 0);
+            printf(" ch%d=%lu/%lu%s", c, (unsigned long)got, (unsigned long)want,
+                   (got == want) ? "" : " <<");
+        }
+        if (nslot) { // '.' = retired, 'X' = still the marker (no result).
+            printf(" slots=");
+            for (uint32_t i = 0; i < nslot; i++)
+                printf("%c", (rslot[i] == 0xDEADBEEFu) ? 'X' : '.');
         }
         printf("\n");
         // Give up rather than spin forever. A stuck op holds the scratchpad grant, so the
