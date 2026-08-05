@@ -810,15 +810,14 @@ static void seq_build_attn(void)
 // per head: reduce chain -> spill(absmax) -> norm_i32 (k from res6). Requires n_rep == 2
 // and n_ch >= 2; other configs use the v1 list or CPU dispatch.
 // Sequencer attention: the descriptor lists collapse ~6 dispatch round-trips per head into
-// one submit, but on this gateware they wedge the engine mid-op once a KV channel carries an
-// extra row (SEQSTALL, engine stuck in RUN holding the scratchpad; only reconfiguring the
-// FPGA recovers). Off by default: the same ops then run CPU-dispatched per head, which keeps
-// the whole HW mask usable. `seq on` re-enables the lists for debugging.
+// one submit. On by default - measured 1.415 tok/s against 1.175 with the lists off, same
+// tokens either way.
 //
-// Not reproducible in the Migen unit tests - the engine ops, the sequencer, and the two
-// together all pass at 8 channels with ragged rows (rows>=1, rem>=1). It does reproduce in
-// the Verilator sim with a tiny model sharded 8 ways, which is where to chase it next.
-int seq_use;
+// They were held off while the interleaved gather could wedge the engine mid-op, which
+// looked like a sequencer bug and was not: the gather consumed a merged result on merge_mask
+// but counted it on grant_valid, so a result could vanish without incrementing result_cnt.
+// `seq off` still selects the CPU-dispatched path per head.
+int seq_use = 1;
 
 static int seq_at2_base, seq_at2_p1n, seq_at2_p2n, seq_at2_kvchunk;
 static int seq_at2_p1dn, seq_at2_p2dn;

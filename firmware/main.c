@@ -125,7 +125,7 @@ static void help(void)
     puts("mvtest idx      - matvec tensor <idx> with the test pattern, print checksum");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
-    puts("seq [on|off]    - sequencer attention lists (off: same ops, CPU-dispatched)");
+    puts("seq [on|off]    - sequencer attention lists (on by default; off: CPU-dispatched)");
     puts("tokclr/tok/genb - chunked prompt buffer + generate (host chat tool)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
@@ -453,8 +453,8 @@ static void console_service(void)
             seq_use = 1;
         else if (strncmp(str, "off", 3) == 0)
             seq_use = 0;
-        printf("SEQ %s (lists wedge the engine on this gateware; off runs the same ops "
-               "CPU-dispatched per head)\n", seq_use ? "on" : "off");
+        printf("SEQ %s (off runs the same ops CPU-dispatched per head, ~20%% slower)\n",
+               seq_use ? "on" : "off");
     }
     else if (strcmp(token, "hdrload") == 0)
         hdrload();
@@ -571,13 +571,12 @@ int main(void)
             // Speculative-decode leg: greedy spec is lossless, so the tokens must match
             // the same references; the acc/rej counters show the machinery engaged.
             //
-            // Skipped on big models at boot: on the 1.7B the sequencer stalls here
-            // (SEQSTALL dcount=43/84 eng=301) and keeps the scratchpad port, which leaves
-            // the shell unusable for everything afterwards - and a CPU reset does not clear
-            // it, only reconfiguring the FPGA does. The sim's tiny model still exercises the
-            // leg, and `spec on` still reaches it deliberately on hardware.
+            // Skipped on big models at boot purely for boot time - six more 1.7B tokens.
+            // (It used to be skipped because the sequencer stalled here; that was the
+            // interleaved-gather bug, now fixed.) `spec on` reaches it deliberately, and
+            // the sim's tiny model still runs the leg so the gate keeps checking it.
             if (model_header()->n_layer > 8) {
-                puts("GEN-SP skipped (see SEQSTALL; use `spec on` to run it deliberately)");
+                puts("GEN-SP skipped at boot on this model size (use `spec on` to run it)");
                 goto boot_demo_done;
             }
             infer_spec(1);

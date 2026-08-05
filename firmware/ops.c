@@ -20,24 +20,19 @@
 // fallback path for A/B work.
 uint32_t hwops_mask;
 
-// All-CPU by default, which is slow but finishes. The HW attention path wedges the engine
-// mid-op once a KV channel carries an extra row - position 9 with 8 channels, i.e. the fifth
-// token of any real prompt - and a wedged engine holds the scratchpad grant until the FPGA is
-// reconfigured (a CPU reset does not clear it, and reconfiguring wipes HBM). It is not the
-// sequencer: turning the descriptor lists off (`seq off`, the default) moves the same stall
-// onto the CPU-dispatched path, reported as ENGSTALL with the extra-row channel far behind
-// the others on AR counts.
+// Every op the gateware implements, on by default. This was held at 0 while the interleaved
+// gather could wedge the engine partway through a generation; that is fixed (the gather
+// consumed a merged result on merge_mask but counted it on grant_valid, so a result could
+// vanish without incrementing result_cnt and RUN waited for a total it could never reach).
+// Confirmed on the card: 16 tokens on the prompt that used to stall after four.
 //
-// The fast path is real and correct as far as it gets - `hwops all hw` measures 1.412 tok/s
-// against 0.192 all-CPU (7.4x, two alternating runs each) and answers correctly - so it is
-// worth having once the stall is fixed. Until then it is opt-in.
-//
-// Do NOT reach for a partial mask as a compromise: the resident-BFP loop keeps activations in
-// the scratchpad, so a mixed mask pays a float round-trip every layer and lands at 0.121
-// tok/s, slower than either end.
+// Measured on the 1.7B: 1.177 tok/s here against 0.192 all-CPU. Do NOT reach for a partial
+// mask as a compromise - the resident-BFP loop keeps activations in the scratchpad, so a
+// mixed mask pays a float round-trip every layer and lands at 0.121 tok/s, slower than
+// either end.
 uint32_t hwops_default(void)
 {
-    return 0;
+    return hw_caps();
 }
 
 void hwops_init(void)
