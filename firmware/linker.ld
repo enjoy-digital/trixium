@@ -100,7 +100,13 @@ SECTIONS
 	} > sram
 }
 
-PROVIDE(_fstack = ORIGIN(sram) + LENGTH(sram));
+/* The stack does NOT live in sram: that region is 8 KB shared with .data + .bss, and once
+ * .bss grew past ~6 KB the stack was down to ~1 KB - deep call paths (printf in the token
+ * loop, forward_pair's frames) overflowed it into .bss and the firmware died by silent
+ * corruption, at a location that moved with every relink. main_ram + 3 MB gives it ~3 MB of
+ * downward headroom in the window between the firmware image (~100 KB) and the BONS header
+ * (main_ram + 4 MB), on the sim (8 MB ram) and the card (256 MB) alike. */
+PROVIDE(_fstack = ORIGIN(main_ram) + 0x300000);
 
 PROVIDE(_fdata_rom = LOADADDR(.data));
 PROVIDE(_edata_rom = LOADADDR(.data) + SIZEOF(.data));

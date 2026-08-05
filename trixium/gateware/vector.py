@@ -497,7 +497,14 @@ class BonsaiVectorUnit(LiteXModule):
 
         self.fsm = fsm = FSM(reset_state="IDLE")
 
-        self.comb += imem_r.adr.eq(pc)
+        # Instruction prefetch: the next-sequential word is read during EX1 (address pc+1,
+        # data valid in EX1B, captured into insn_f at the EX1B edge - legal because EX1B/EX2
+        # decode from instr_r, registered at EX1). EX2 then jumps straight to EX0 for
+        # sequential flow, cutting an instruction from 6 cycles to 4; only a taken LOOPE and
+        # the cold start pay the 2-cycle FETCH/FETCHR refill. The EX0->EX2 datapath windows
+        # are untouched, so the vecunit multicycle constraints hold as declared.
+        prefetch = Signal()
+        self.comb += imem_r.adr.eq(Mux(prefetch, pc + 1, pc))
         # Scratchpad read launch (EX1): address from S[sa] byte address.
         self.comb += self.sp_rd_adr.eq(sa_val[5:18])
 
@@ -520,6 +527,7 @@ class BonsaiVectorUnit(LiteXModule):
         )
         fsm.act("EX1",
             in_ex1.eq(1),
+            prefetch.eq(1), # imem read of pc+1 launches here; lands during EX1B.
             NextState("EX1B"),
         )
         fsm.act("EX1B", # Reduction capture window (see red_* regs).
@@ -528,6 +536,7 @@ class BonsaiVectorUnit(LiteXModule):
         )
         self.sync += [
             If(fsm.ongoing("FETCHR"), insn_f.eq(imem_r.dat_r)),
+            If(fsm.ongoing("EX1B"),   insn_f.eq(imem_r.dat_r)), # Prefetched pc+1 word.
             If(fsm.ongoing("EX0"),
                 va_flat.eq(va_flat_c),
                 va_flat_red.eq(va_flat_c),
@@ -566,10 +575,10 @@ class BonsaiVectorUnit(LiteXModule):
             ).Elif((f_op == OP["LOOPE"]) & (loop_cnt > 1),
                 NextValue(loop_cnt, loop_cnt - 1),
                 NextValue(pc, loop_start),
-                NextState("FETCH"),
+                NextState("FETCH"), # Prefetch was sequential: refill from loop_start.
             ).Else(
                 NextValue(pc, pc + 1),
-                NextState("FETCH"),
+                NextState("EX0"),   # insn_f already holds the word at pc+1.
             ),
         )
         fsm.act("FINISH",

@@ -31,7 +31,22 @@ uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
         wr[i]((uint32_t)args[i]);
     vecunit_pc_write(pc);
     vecunit_submit_write(1);
-    while (vecunit_done_count_read() == done);
+    // Spin-capped like engine_run/seq_run: a program that never finishes must say so.
+    // This was the last silent-forever wait - a vecunit wedge showed up as a sim (or card)
+    // that just stopped printing, with nothing to distinguish it from an engine stall.
+    // The status CSR's bad_op field also names a corrupted/unknown instruction directly.
+    uint32_t spins = 0, reports = 0;
+    while (vecunit_done_count_read() == done) {
+        if (++spins < 400000u)
+            continue;
+        spins = 0;
+        printf("VECSTALL pc=%u status=%02lx\n",
+               pc, (unsigned long)vecunit_status_read());
+        if (++reports == 8) {
+            puts("VECSTALL: giving up (results from here are garbage).");
+            break;
+        }
+    }
     return vecunit_res6_read();
 }
 

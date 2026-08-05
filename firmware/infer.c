@@ -2070,6 +2070,17 @@ void infer_vbench(void)
         dt = perf_now() - t0;
         printf("VB fetch_1b         %8lu\n", (unsigned long)(dt/16));
     }
+    { // Long single-channel fetch: sustained per-beat read rate of ONE port. The 8-channel
+      // matvec streams run at ~4.6 cycles/beat with zero AR stalls; if one port alone
+      // sustains ~1 cycle/beat the loss is contention in the HBM AXI switch, if one port
+      // alone is also slow it is a per-port burst-gap problem.
+        t0 = perf_now();
+        for (int i = 0; i < 4; i++)
+            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE, 512, SP_Y); // 16 KB into SP_Y.
+        dt = perf_now() - t0;
+        printf("VB fetch_512b       %8lu  (%lu.%02lu cyc/beat)\n", (unsigned long)(dt/4),
+               (unsigned long)(dt/4/512), (unsigned long)((dt/4*100/512) % 100));
+    }
     { // rmsnorm, staged: the op is fetch + eps glue + one vec program.
         const struct bons_entry *an = model_entry_kind(ROLE_ATTN_NORM, 0, KIND_NORM16);
         t0 = perf_now();
