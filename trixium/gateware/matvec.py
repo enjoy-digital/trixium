@@ -268,7 +268,19 @@ class BonsaiMatVecEngine(LiteXModule):
             rr.ce.eq(1),
         ]
         for i, pipe in enumerate(self.pipes):
-            self.comb += pipe.source.ready.eq(Mux(ilv_mode, merge_mask[i], rr.grant == i))
+            # The merged-ilv beat is consumed on merge_mask but written and counted on
+            # grant_valid (see eng_gw_we_c below), so the two have to agree. They did not:
+            # if the round-robin still pointed at a pipe that had just gone invalid, its
+            # stale slot could match a valid pipe's beat - merge_mask took that pipe's
+            # result while grant_valid held the write enable at 0. The result vanished
+            # without incrementing result_cnt, so RUN waited for a count that could no
+            # longer be reached and the engine sat busy holding the scratchpad grant.
+            #
+            # That needs pipes producing at staggered times, which is why it only bites
+            # from two rows per channel on: with one row they all present together and are
+            # merged in a single beat. Position 9 at 8 channels on the card.
+            self.comb += pipe.source.ready.eq(
+                Mux(ilv_mode, merge_mask[i] & grant_valid, rr.grant == i))
 
         # Merged lane build: within one beat each word lane belongs to at most one pipe.
         lane_we  = Signal(8)
@@ -536,6 +548,12 @@ class BonsaiMatVecEngine(LiteXModule):
         )
         mv_total = Signal(24)
         ax_total = Signal(24)
+        # Test-visible aliases (no hardware: same signals under a name a testbench can find).
+        # A stall in RUN is either "results never produced" or "produced but never retired",
+        # and result_cnt against the expected total is what separates the two.
+        self.dbg_result_cnt = result_cnt
+        self.dbg_mv_total   = mv_total
+        self.dbg_ax_total   = ax_total
         self.comb += [
             mv_total.eq(cmd_r["rows"]*self.n_channels + cmd_r["rem"]),
             ax_total.eq(cmd_r["cols"]*self.n_channels),

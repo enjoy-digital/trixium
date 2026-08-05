@@ -1245,14 +1245,36 @@ def test_engine_back_to_back_scores_axpy_ragged():
                 while not (yield dut.engine.cmd.ready):
                     yield
                 yield dut.engine.cmd.valid.eq(0)
-                for _ in range(60000):
+                for _ in range(30000):
                     if (yield dut.engine.done):
                         break
                     yield
                 else:
+                    # Say which readers are still holding the op, and which ones never
+                    # delivered: the card showed every channel delivering exactly what it
+                    # was commanded, so a match here means the same failure, not a
+                    # test-only artefact.
+                    idle = []
+                    for r in dut.engine.readers:
+                        idle.append((yield r.idle))
+                    rc = (yield dut.engine.dbg_result_cnt)
+                    mv = (yield dut.engine.dbg_mv_total)
+                    ax = (yield dut.engine.dbg_ax_total)
+                    # Every reader idle means the data is all in and consumed, so the
+                    # question is which pipe is still holding a result the gather will not
+                    # take. `wide` is in the merge condition (merge_mask requires ~wide), so
+                    # a stale wide flag from a previous AXPY would strand exactly this.
+                    pipes = []
+                    for pi, p in enumerate(dut.engine.pipes):
+                        v = (yield p.source.valid)
+                        if v:
+                            pipes.append((pi, "row%d" % (yield p.source.row),
+                                          "wide%d" % (yield p.source.wide),
+                                          "head%d" % (yield p.source.head)))
                     raise AssertionError(
-                        f"T={T} rows={rows} rem={rem}: '{tag}' never completed - "
-                        f"the back-to-back wedge")
+                        f"T={T} rows={rows} rem={rem}: '{tag}' never completed. "
+                        f"result_cnt={rc} mv_total={mv} ax_total={ax} reader idle={idle} "
+                        f"pipes waiting={pipes}")
                 yield
                 yield
                 assert (yield dut.engine.error) == 0, tag
