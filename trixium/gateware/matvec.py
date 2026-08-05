@@ -268,19 +268,7 @@ class BonsaiMatVecEngine(LiteXModule):
             rr.ce.eq(1),
         ]
         for i, pipe in enumerate(self.pipes):
-            # The merged-ilv beat is consumed on merge_mask but written and counted on
-            # grant_valid (see eng_gw_we_c below), so the two have to agree. They did not:
-            # if the round-robin still pointed at a pipe that had just gone invalid, its
-            # stale slot could match a valid pipe's beat - merge_mask took that pipe's
-            # result while grant_valid held the write enable at 0. The result vanished
-            # without incrementing result_cnt, so RUN waited for a count that could no
-            # longer be reached and the engine sat busy holding the scratchpad grant.
-            #
-            # That needs pipes producing at staggered times, which is why it only bites
-            # from two rows per channel on: with one row they all present together and are
-            # merged in a single beat. Position 9 at 8 channels on the card.
-            self.comb += pipe.source.ready.eq(
-                Mux(ilv_mode, merge_mask[i] & grant_valid, rr.grant == i))
+            self.comb += pipe.source.ready.eq(Mux(ilv_mode, merge_mask[i], rr.grant == i))
 
         # Merged lane build: within one beat each word lane belongs to at most one pipe.
         lane_we  = Signal(8)
@@ -380,7 +368,23 @@ class BonsaiMatVecEngine(LiteXModule):
             ).Elif(ilv_mode,
                 eng_gw_adr_c.eq(grant_slot[3:]),
                 eng_gw_dat_c.eq(lane_dat),
-                eng_gw_we_c.eq(Mux(grant_valid, lane_we, 0)),
+                # NOT gated on grant_valid. A merged beat is consumed on merge_mask, which
+                # only sets lanes for pipes that are themselves valid and whose slot is in
+                # this beat, so lane_we is already zero when nothing merges. The extra gate
+                # only broke the agreement between consuming and counting: with the
+                # round-robin still pointing at a pipe that had just gone invalid, its stale
+                # slot could match a valid pipe's beat, merge_mask took that pipe's result,
+                # and grant_valid held the write enable at zero. The result vanished without
+                # incrementing result_cnt, RUN waited for a count it could never reach, and
+                # the engine sat busy holding the scratchpad grant (status 0x301).
+                #
+                # It needs pipes presenting at staggered times, so it only bites from two
+                # rows per channel on - with one row all eight merge in a single beat, which
+                # is why rows=1 works at every rem. Position 9 at 8 channels on the card.
+                #
+                # The address is safe without the gate: merge_mask requires
+                # slot_p[i][3:] == grant_slot[3:], so every lane written belongs here.
+                eng_gw_we_c.eq(lane_we),
             ).Elif(axpy_mode,
                 eng_gw_adr_c.eq(slot[3:]),
                 eng_gw_dat_c.eq(grant_data),
