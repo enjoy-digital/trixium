@@ -2228,6 +2228,43 @@ void infer_vbench(void)
         printf("VB matvec_q         %8lu  (%lu beats/chan)\n",
                (unsigned long)(dt/8), (unsigned long)eq->chan_len_beats);
     }
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
+    { // KV store: the pair the token loop runs 448 times per forward (kvquant is 16% of it).
+      // Split so the engine STORE and the vec quant8 that feeds it are separated - the whole
+      // pair measures ~8.5k cycles in `stats` and only ~3.6k of that is accounted for by the
+      // op floor plus the pack, so the remainder has to be named before it can be attacked.
+        int32_t qa[4] = {(int32_t)SP_K, 0, (int32_t)(SP_KVP + 32), head_dim/16};
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++) vec_run(PROG_QUANT8, qa, 4);
+        dt = perf_now() - t0;
+        printf("VB kv_pack_quant8   %8lu\n", (unsigned long)(dt/16));
+
+        struct engine_op op = {0};
+        op.kind  = ENGINE_KIND_STORE;
+        op.chan  = 0;
+        op.wbase = kv_region_addr(0, 0, 0);
+        op.wlen  = kv_rb;
+        op.xsrc  = SP_KVP;
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++) engine_run(&op);
+        dt = perf_now() - t0;
+        printf("VB kv_store_1region %8lu\n", (unsigned long)(dt/16));
+
+        // Faithful to the token loop: 16 stores spread over the (kvh, kind) regions of a
+        // layer, not the same address 16 times. If this is much dearer than the single-region
+        // loop, the cost is in the scatter (row/bank behaviour), not the op.
+        t0 = perf_now();
+        for (int h = 0; h < n_kv_head; h++)
+            for (int kind = 0; kind < 2; kind++) {
+                op.wbase = kv_region_addr(0, h, kind);
+                op.xsrc  = kvp_slot(kind);
+                engine_run(&op);
+            }
+        dt = perf_now() - t0;
+        printf("VB kv_store_layer   %8lu  (%d stores)\n",
+               (unsigned long)dt, 2*n_kv_head);
+    }
+#endif
     { // perf_now itself (measurement overhead per probe pair).
         t0 = perf_now();
         for (int i = 0; i < 64; i++) (void)perf_now();
