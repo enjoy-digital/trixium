@@ -354,11 +354,15 @@ def prog_resid_add():
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("ARG",   "s4", 4), ("ARG", "s5", 5),
         ("MOVSI", "s6", 0),
+        # Both shift amounts are loop constants; broadcasting them per iteration cost 2 of a
+        # 10-instruction body. v2/v3 stay live across the loop instead.
+        ("BCAST", "v2", "s4"),
+        ("BCAST", "v3", "s5"),
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),
         ("LDV",   "v1", "s1"),
-        ("BCAST", "v2", "s4"), ("VSHLV", "v0", "v0", "v2"),
-        ("BCAST", "v2", "s5"), ("VSHLV", "v1", "v1", "v2"),
+        ("VSHLV", "v0", "v0", "v2"),
+        ("VSHLV", "v1", "v1", "v3"),
         ("VADD",  "v0", "v0", "v1"),
         ("VCLAMP16", "v0", "v0"),
         ("REDMAX", "s6", "v0"),
@@ -418,13 +422,15 @@ def prog_norm_i32():
         ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
         ("MOVSI", "s6", 0),
         ("MOVSI", "s5", 0),
+        # -k is a loop constant: build it once. It used to cost two BCASTs and a VSUB on every
+        # iteration, 3 of a 10-instruction body, for a value that never changes.
+        ("BCAST", "v3", "s5"),          # 0
+        ("BCAST", "v2", "s4"),
+        ("VSUB",  "v2", "v3", "v2"),    # -k
         ("LOOPS", "s3"),
         ("LDW",   "v0", "s0"),
         ("LDW",   "v1", "s0"),
         ("VPACK", "v4", "v0", "v1"),
-        ("BCAST", "v3", "s5"),          # 0
-        ("BCAST", "v2", "s4"),
-        ("VSUB",  "v2", "v3", "v2"),    # -k
         ("VSHLV", "v4", "v4", "v2"),    # arith shift right by k (floor)
         ("VCLAMP16", "v4", "v4"),
         ("REDMAX", "s6", "v4"),
@@ -588,16 +594,18 @@ def prog_softmax8():
         ("MOVSI", "s1", -480),
         ("BCAST", "v4", "s1"),
         ("VSHLI", "v4", "v4", 10),      # -15*2^15.
+        # Both shift amounts are loop constants; they used to be rebuilt into v1 on every
+        # iteration of a 19-instruction body. v3/v6 are free across this loop.
+        ("BCAST", "v3", "s4"),
+        ("BCAST", "v6", "s5"),
         ("LOOPS", "s3"),
         ("LDW",   "v0", "s0"),
         ("LDW",   "v1", "s0"),
         ("VPACK", "v0", "v0", "v1"),
-        ("BCAST", "v1", "s4"),
-        ("VSHLV", "v0", "v0", "v1"),    # s >> s1.
+        ("VSHLV", "v0", "v0", "v3"),    # s >> s1.
         ("VSUB",  "v0", "v0", "v7"),    # d' <= 0.
         ("VMUL",  "v0", "v0", "v5"),    # d'*739.
-        ("BCAST", "v1", "s5"),
-        ("VSHLV", "v0", "v0", "v1"),    # f (Q15).
+        ("VSHLV", "v0", "v0", "v6"),    # f (Q15).
         ("VMAX",  "v0", "v0", "v4"),    # clamp at -15*2^15.
         ("VSHRI", "v1", "v0", 15),      # i = floor(f) in [-15, 0].
         ("VSHLI", "v2", "v1", 15),
