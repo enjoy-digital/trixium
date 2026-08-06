@@ -2114,6 +2114,15 @@ int infer_init(void)
     n_pos   = 0;
     rope_init();
 
+    // 16 KV staging slots fill SP_KVP exactly (16 x 512 B, ending at SP_SC). A model with
+    // more KV heads would run the last slots into the score buffer and corrupt attention with
+    // no other symptom, so refuse rather than discover it as wrong tokens.
+    if (2*n_kv_head > KVP_SLOTS) {
+        printf("infer: %d KV heads needs %d staging slots, SP_KVP holds %d\n",
+               n_kv_head, 2*n_kv_head, KVP_SLOTS);
+        return -1;
+    }
+
     // The low heap now lives BELOW engine channel 3's weight window (see layout.py:
     // HBM_WEIGHT_BASE is port-matched, so channel 3 lands inside main_ram at +64 MB).
     // Overrunning it would scribble on that channel's weights and show up as wrong tokens
