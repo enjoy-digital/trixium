@@ -653,38 +653,51 @@ static void vec_quant8_head(uint32_t sp, uint32_t dst, int n)
 // not per store: K's exponent is the constant E_NORM+8 and V's changes once per layer, but
 // this used to rewrite 16 scratchpad halfwords (~1.1k cycles of uncached bus traffic) for
 // every one of the 448 stores per forward.
-static int kvp_scale_e8[2] = {-1000, -1000};
+// One staging slot per (kv_head, kind) - 16 x 512 B fills SP_KVP exactly. Two slots would
+// do if pack and store alternated, but they must not: the vector unit and the engine share
+// the scratchpad port, and interleaving them 32 times per layer measures 1.6x the cost of
+// packing everything first and then storing (vbench kv_pair_alt 74,948 vs 46,167 phased).
+#define KVP_SLOTS 16
+static int kvp_scale_e8[KVP_SLOTS];
 
-static uint32_t kvp_slot(int kind)
+static uint32_t kvp_slot(int kvh, int kind)
 {
-    return SP_KVP + (kind ? 0x200 : 0);
+    return SP_KVP + (uint32_t)(2*kvh + kind)*0x200;
 }
 
-static void kv_store_scale_prep(int kind, int e8)
+static void kv_store_scale_prep(int kvh, int kind, int e8)
 {
-    if (kvp_scale_e8[kind] == e8)
+    int slot = 2*kvh + kind;
+    if (kvp_scale_e8[slot] == e8)
         return;
-    volatile uint16_t *ps = (volatile uint16_t *)(SCRATCHPAD_BASE + kvp_slot(kind));
+    volatile uint16_t *ps = (volatile uint16_t *)(SCRATCHPAD_BASE + kvp_slot(kvh, kind));
     int groups = head_dim/32;
     for (int g = 0; g < 16; g++)
         ps[g] = (g < groups) ? (uint16_t)((e8 + 15) << 10) : 0;
-    kvp_scale_e8[kind] = e8;
+    kvp_scale_e8[slot] = e8;
 }
 
-static void kv_store_row_res(int l, int kvh, int kind, int t, uint32_t sp, int es)
+// Pack phase: quantize the head into its own staging slot. No engine op, so the vector unit
+// keeps the scratchpad for the whole run of heads.
+static void kv_pack_row_res(int l, int kvh, int kind, uint32_t sp, int es)
 {
     int e8 = es + 8;
-    kv_store_scale_prep(kind, e8);
-    vec_quant8_head(sp, kvp_slot(kind) + 32, head_dim);
+    kv_store_scale_prep(kvh, kind, e8);
+    vec_quant8_head(sp, kvp_slot(kvh, kind) + 32, head_dim);
+    int idx = kv_ek_idx(l, kvh, kind);
+    if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
+}
+
+// Store phase: stream the already-packed slots out. Engine only.
+static void kv_store_row_res(int l, int kvh, int kind, int t)
+{
     struct engine_op op = {0};
     op.kind  = ENGINE_KIND_STORE;
     op.chan  = t % n_ch;
     op.wbase = kv_region_addr(l, kvh, kind) + (uint32_t)(t/n_ch)*kv_rb*32;
     op.wlen  = kv_rb;
-    op.xsrc  = kvp_slot(kind);
+    op.xsrc  = kvp_slot(kvh, kind);
     engine_run(&op);
-    int idx = kv_ek_idx(l, kvh, kind);
-    if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
 }
 #endif
 
@@ -1194,9 +1207,13 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
             perf_enter(OP_KVQUANT);
             if (p == 1)
                 ek_capture(l);
-            for (int hh = 0; hh < n_kv_head; hh++) {
-                kv_store_row_res(l, hh, 0, pos + p, SP_K + hh*head_dim*2, E_NORM);
-                kv_store_row_res(l, hh, 1, pos + p, SP_V + hh*head_dim*2, ev_r[p]);
+            for (int hh = 0; hh < n_kv_head; hh++) {   // Pack every head first...
+                kv_pack_row_res(l, hh, 0, SP_K + hh*head_dim*2, E_NORM);
+                kv_pack_row_res(l, hh, 1, SP_V + hh*head_dim*2, ev_r[p]);
+            }
+            for (int hh = 0; hh < n_kv_head; hh++) {   // ...then hand the port to the engine.
+                kv_store_row_res(l, hh, 0, pos + p);
+                kv_store_row_res(l, hh, 1, pos + p);
             }
             perf_exit(OP_KVQUANT);
             attn_seq2_layer(l, pos + p, aw_cp[p], &aw_hmaxp[p]);
@@ -1452,9 +1469,13 @@ embed_done: ;
             perf_exit(OP_ROPE);
 #endif
             perf_enter(OP_KVQUANT);
-            for (int hh = 0; hh < n_kv_head; hh++) {
-                kv_store_row_res(l, hh, 0, pos, SP_K + hh*head_dim*2, E_NORM);
-                kv_store_row_res(l, hh, 1, pos, SP_V + hh*head_dim*2, ev_res);
+            for (int hh = 0; hh < n_kv_head; hh++) {   // Pack every head first...
+                kv_pack_row_res(l, hh, 0, SP_K + hh*head_dim*2, E_NORM);
+                kv_pack_row_res(l, hh, 1, SP_V + hh*head_dim*2, ev_res);
+            }
+            for (int hh = 0; hh < n_kv_head; hh++) {   // ...then hand the port to the engine.
+                kv_store_row_res(l, hh, 0, pos);
+                kv_store_row_res(l, hh, 1, pos);
             }
             perf_exit(OP_KVQUANT);
             eq_res = E_NORM;
@@ -1991,7 +2012,8 @@ attn_heads_done: ;
 
 int infer_init(void)
 {
-    kvp_scale_e8[0] = kvp_scale_e8[1] = -1000; // New image: restage the KV scale beats.
+    for (int i = 0; i < KVP_SLOTS; i++)
+        kvp_scale_e8[i] = -1000; // New image: restage every KV scale beat.
     H = model_header();
     if (H->magic != BONS_MAGIC)
         return -1;
@@ -2244,7 +2266,7 @@ void infer_vbench(void)
         op.chan  = 0;
         op.wbase = kv_region_addr(0, 0, 0);
         op.wlen  = kv_rb;
-        op.xsrc  = SP_KVP;
+        op.xsrc  = kvp_slot(0, 0);
         t0 = perf_now();
         for (int i = 0; i < 16; i++) engine_run(&op);
         dt = perf_now() - t0;
@@ -2257,7 +2279,7 @@ void infer_vbench(void)
         for (int h = 0; h < n_kv_head; h++)
             for (int kind = 0; kind < 2; kind++) {
                 op.wbase = kv_region_addr(0, h, kind);
-                op.xsrc  = kvp_slot(kind);
+                op.xsrc  = kvp_slot(h, kind);
                 engine_run(&op);
             }
         dt = perf_now() - t0;
@@ -2272,10 +2294,10 @@ void infer_vbench(void)
         for (int h = 0; h < n_kv_head; h++)
             for (int kind = 0; kind < 2; kind++) {
                 int32_t qq[4] = {(int32_t)((kind ? SP_V : SP_K) + (uint32_t)h*head_dim*2), 0,
-                                 (int32_t)(kvp_slot(kind) + 32), head_dim/16};
+                                 (int32_t)(kvp_slot(h, kind) + 32), head_dim/16};
                 vec_run(PROG_QUANT8, qq, 4);
                 op.wbase = kv_region_addr(0, h, kind);
-                op.xsrc  = kvp_slot(kind);
+                op.xsrc  = kvp_slot(h, kind);
                 engine_run(&op);
             }
         dt = perf_now() - t0;
