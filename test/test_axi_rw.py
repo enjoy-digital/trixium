@@ -206,3 +206,90 @@ def test_hbm_model_flags_axlen_overflow():
         assert (yield model.axlen_overflow), "model accepted an out-of-range AxLEN"
 
     run_simulation(dut, [driver()])
+
+# Multi-ARID reads --------------------------------------------------------------------------------
+#
+# The Xilinx HBM controller strictly serializes same-ARID reads: measured on the FK33, a
+# single port streamed 33.7 cycles/beat (one 16-beat burst per round trip) while the same
+# RTL sustained 2.35 cycles/beat in the full-SoC sim against the idealized model. The
+# reorder_ids model mode reproduces that behavior (same-ID serialized with a latency gap,
+# different IDs overlapped, response order shuffled across IDs); these tests pin both the
+# correctness of the reorder drain and the performance claim, so the pathology can never
+# ship silently again.
+
+class _ReaderIDDUT(Module):
+    def __init__(self, latency, stall_rate, init_bytes, n_ids, reorder_ids):
+        axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+        self.submodules.reader = BonsaiAXIReader(axi, burst_beats=16, fifo_depth=64,
+                                                 n_ids=n_ids)
+        self.submodules.model  = BonsaiHBMChannelModel(axi, size=MEM_SIZE,
+            init=words_from_bytes(init_bytes), latency=latency, stall_rate=stall_rate,
+            reorder_ids=reorder_ids)
+
+def _run_id_case(latency, stall_rate, n_ids, reorder_ids, seed, backpressure=False):
+    data = _pattern_bytes(seed)
+    dut  = _ReaderIDDUT(latency, stall_rate, data, n_ids, reorder_ids)
+    rng  = random.Random(seed)
+    cmds = []
+    for _ in range(6):
+        nbeats = rng.randrange(1, 70)
+        addr   = 32*rng.randrange(0, MEM_SIZE//32 - nbeats)
+        cmds.append((addr, nbeats))
+
+    received = []
+    cycles   = [0]
+
+    def driver():
+        for addr, nbeats in cmds:
+            yield dut.reader.sink.addr.eq(addr)
+            yield dut.reader.sink.len.eq(nbeats)
+            yield dut.reader.sink.valid.eq(1)
+            yield
+            while not (yield dut.reader.sink.ready):
+                yield
+            yield dut.reader.sink.valid.eq(0)
+            got = 0
+            while got < nbeats:
+                if backpressure and (cycles[0] % 7 < 2):
+                    yield dut.reader.source.ready.eq(0)
+                else:
+                    yield dut.reader.source.ready.eq(1)
+                yield
+                cycles[0] += 1
+                if (yield dut.reader.source.valid) and (yield dut.reader.source.ready):
+                    d = (yield dut.reader.source.data)
+                    l = (yield dut.reader.source.last)
+                    received.append((d, l))
+                    got += 1
+                if cycles[0] > 200000:
+                    raise AssertionError("timeout")
+            yield dut.reader.source.ready.eq(0)
+
+    run_simulation(dut, [driver()])
+    exp = []
+    for addr, nbeats in cmds:
+        beats = _expected_beats(data, addr, nbeats)
+        exp += [(b, 1 if i == nbeats - 1 else 0) for i, b in enumerate(beats)]
+    assert received == exp, "beat/last sequence mismatch"
+    return cycles[0], sum(n for _, n in cmds)
+
+def test_reader_multi_id_correct_under_reorder():
+    # Byte-exact and last-exact through cross-ID response shuffling, at several latencies
+    # and with stall + backpressure jitter.
+    for latency, stall, bp, seed in [(8, 0, False, 1), (40, 0, False, 2),
+                                     (40, 4, True, 3), (64, 2, False, 4)]:
+        _run_id_case(latency, stall, 4, 4, seed, bp)
+
+def test_reader_multi_id_correct_on_inorder_model():
+    # The same reader against the legacy in-order model (reorder off): drain order and
+    # tags must be identical - covers HBM controllers that happen not to interleave.
+    _run_id_case(24, 2, 4, 0, 5)
+
+def test_reader_single_id_slow_multi_id_fast_under_reorder():
+    # The performance claim itself. Same command stream, same model: the single-ID reader
+    # pays a full round trip per burst; four IDs must recover most of the line rate.
+    c1, beats = _run_id_case(40, 0, 1, 4, 6)
+    c4, _     = _run_id_case(40, 0, 4, 4, 6)
+    r1, r4 = c1/beats, c4/beats
+    assert r1 > 2.5, f"single-ID unexpectedly fast ({r1:.2f} cyc/beat) - model not serializing?"
+    assert r4 < r1/2, f"multi-ID did not fix it: {r4:.2f} vs {r1:.2f} cyc/beat"

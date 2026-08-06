@@ -10,7 +10,17 @@ Takes {addr, len} commands (beat-aligned byte address, length in 256-bit beats),
 into INCR bursts (16 beats by default, never crossing a 4 KB boundary), keeps several bursts
 outstanding with credit-based reservation of the output FIFO (so R data is never
 back-pressured by us at the AXI port when credits were granted), and streams beats out with
-`last` on the final beat of each command. Single ARID (in-order R data).
+`last` on the final beat of each command.
+
+**ARIDs.** With n_ids=1 every burst carries ARID 0 and R data is in-order. That is
+functionally fine and catastrophically slow on the real HBM: the Xilinx controller strictly
+serializes same-ID reads (measured on the FK33: 33.7 cycles/beat from one port, one 16-beat
+burst per round trip, while the identical RTL sustains 2.35 in the full-SoC simulation).
+With n_ids=N bursts round-robin over N ARIDs so the controller can pipeline them; R data
+then interleaves across IDs (in-order only per ID), so beats land in N per-ID FIFOs and a
+drain stage replays them in issue order - reordering by construction, no address matching.
+The per-ID FIFOs are sized for the outstanding-burst cap (info FIFO depth), so they can
+never overflow: a third burst on an ID cannot have been issued while two sit unconsumed.
 
 **burst_beats must not exceed 16.** The Xilinx HBM controller's ports are AXI3
 (`AXI_nn_ARLEN[3:0]`, see ip/hbm*/hbm_*_stub.v), so AxLEN is four bits wide and the longest
@@ -37,9 +47,11 @@ from trixium.layout import BEAT_BYTES
 # BonsaiAXIReader ----------------------------------------------------------------------------------
 
 class BonsaiAXIReader(LiteXModule):
-    def __init__(self, axi, burst_beats=16, fifo_depth=512):
+    def __init__(self, axi, burst_beats=16, fifo_depth=512, n_ids=1, max_bursts=8):
         assert axi.data_width == 256
         assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"
+        assert n_ids in (1, 2, 4, 8)
+        assert max_bursts % n_ids == 0
         self.sink   = sink   = stream.Endpoint([("addr", axi.address_width), ("len", 24)])
         self.source = source = stream.Endpoint([("data", 256)])
 
@@ -91,20 +103,25 @@ class BonsaiAXIReader(LiteXModule):
         can_issue = Signal()
         self.comb += can_issue.eq(active & (reserved <= (fifo_depth - burst_len)))
 
-        # Per-burst info (last burst of command?).
-        info = stream.SyncFIFO([("cmd_last", 1)], 16)
+        # Per-burst info in issue order (which ID it went out on, last burst of command?).
+        idbits = max(1, log2_int(n_ids)) if n_ids > 1 else 1
+        info = stream.SyncFIFO([("cmd_last", 1), ("bid", idbits)], max_bursts)
         self.submodules += info
 
+        id_rr = Signal(idbits)
         self.comb += [
             axi.ar.valid.eq(can_issue & info.sink.ready),
             axi.ar.addr.eq(cur_addr),
             axi.ar.len.eq(burst_len - 1),
             axi.ar.size.eq(beat_shift), # 32 bytes/beat.
             axi.ar.burst.eq(BURST_INCR),
-            axi.ar.id.eq(0),
+            axi.ar.id.eq(id_rr if n_ids > 1 else 0),
             info.sink.valid.eq(axi.ar.valid & axi.ar.ready),
             info.sink.cmd_last.eq(beats_left == burst_len),
+            info.sink.bid.eq(id_rr if n_ids > 1 else 0),
         ]
+        if n_ids > 1:
+            self.sync += If(axi.ar.valid & axi.ar.ready, id_rr.eq(id_rr + 1))
         self.sync += [
             If(axi.ar.valid & axi.ar.ready,
                 cur_addr.eq(cur_addr + (burst_len << beat_shift)),
@@ -122,10 +139,12 @@ class BonsaiAXIReader(LiteXModule):
         r_valid  = Signal()
         r_data   = Signal(256)
         r_last   = Signal()
+        r_id     = Signal(idbits)
         r_ready  = Signal()
         rs_valid = Signal()
         rs_data  = Signal(256)
         rs_last  = Signal()
+        rs_id    = Signal(idbits)
         r_infire = Signal()
         self.comb += [
             axi.r.ready.eq(~rs_valid),
@@ -137,16 +156,19 @@ class BonsaiAXIReader(LiteXModule):
                     r_valid.eq(1),
                     r_data.eq(rs_data),
                     r_last.eq(rs_last),
+                    r_id.eq(rs_id),
                     rs_valid.eq(0),
                 ).Else(
                     r_valid.eq(r_infire),
                     r_data.eq(axi.r.data),
                     r_last.eq(axi.r.last),
+                    r_id.eq(axi.r.id[:idbits]),
                 )
             ).Elif(r_infire,
                 rs_valid.eq(1),
                 rs_data.eq(axi.r.data),
                 rs_last.eq(axi.r.last),
+                rs_id.eq(axi.r.id[:idbits]),
             )
         ]
 
@@ -154,16 +176,50 @@ class BonsaiAXIReader(LiteXModule):
         fifo = stream.SyncFIFO([("data", 256)], fifo_depth, buffered=True)
         self.submodules += fifo
 
-        self.comb += [
-            fifo.sink.valid.eq(r_valid),
-            r_ready.eq(fifo.sink.ready),
-            fifo.sink.data.eq(r_data),
-            # Command-last: burst-last AND this burst is the command's final burst. The
-            # info pop tracks the sliced stream, so command tags stay beat-aligned.
-            fifo.sink.last.eq(r_last & info.source.cmd_last),
-            info.source.ready.eq(r_valid & r_ready & r_last),
-            fifo.source.connect(source),
-        ]
+        if n_ids == 1:
+            self.comb += [
+                fifo.sink.valid.eq(r_valid),
+                r_ready.eq(fifo.sink.ready),
+                fifo.sink.data.eq(r_data),
+                # Command-last: burst-last AND this burst is the command's final burst. The
+                # info pop tracks the sliced stream, so command tags stay beat-aligned.
+                fifo.sink.last.eq(r_last & info.source.cmd_last),
+                info.source.ready.eq(r_valid & r_ready & r_last),
+                fifo.source.connect(source),
+            ]
+        else:
+            # Per-ID landing FIFOs: R data is in-order within an ID; depth covers the
+            # outstanding cap (max_bursts/n_ids bursts of burst_beats each).
+            perid_depth = (max_bursts//n_ids)*burst_beats
+            # (`last` is a built-in endpoint flag - SyncFIFO carries it through.)
+            perid = [stream.SyncFIFO([("data", 256)], perid_depth)
+                     for _ in range(n_ids)]
+            self.submodules += perid
+            for i, p in enumerate(perid):
+                self.comb += [
+                    p.sink.valid.eq(r_valid & (r_id == i)),
+                    p.sink.data.eq(r_data),
+                    p.sink.last.eq(r_last),
+                ]
+            self.comb += r_ready.eq(Array([p.sink.ready for p in perid])[r_id])
+
+            # Drain in issue order: the head of `info` names the ID whose burst is next;
+            # its captured rlast marks the burst end, no beat counter needed.
+            sel        = info.source.bid
+            sel_valid  = Array([p.source.valid for p in perid])[sel]
+            sel_data   = Array([p.source.data  for p in perid])[sel]
+            sel_last   = Array([p.source.last  for p in perid])[sel]
+            drain_fire = Signal()
+            self.comb += [
+                fifo.sink.valid.eq(info.source.valid & sel_valid),
+                fifo.sink.data.eq(sel_data),
+                fifo.sink.last.eq(sel_last & info.source.cmd_last),
+                drain_fire.eq(fifo.sink.valid & fifo.sink.ready),
+                info.source.ready.eq(drain_fire & sel_last),
+                fifo.source.connect(source),
+            ]
+            for i, p in enumerate(perid):
+                self.comb += p.source.ready.eq(drain_fire & (sel == i))
 
         # Credits: +burst_len on AR fire, -1 per beat delivered to the consumer.
         ar_fire  = Signal()

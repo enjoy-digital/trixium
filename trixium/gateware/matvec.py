@@ -111,7 +111,9 @@ class BonsaiMatVecEngine(LiteXModule):
         fetch_valids = []
         fetch_datas  = []
         for i, axi in enumerate(hbm_axis):
-            reader = BonsaiAXIReader(axi)
+            # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
+            # per round trip - 33.7 cycles/beat measured); round-robin ARIDs let it pipeline.
+            reader = BonsaiAXIReader(axi, n_ids=4)
             pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n,
                                        dual=dual)
             setattr(self.submodules, f"reader{i}", reader)

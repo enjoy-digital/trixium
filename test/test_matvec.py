@@ -22,7 +22,7 @@ from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 class _EngineDUT(Module):
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
-                 dual=True, xbuf_groups=32):
+                 dual=True, xbuf_groups=32, reorder_ids=0):
         # latency/stall_rate may be a per-channel list: real HBM channels do not respond in
         # lockstep, and several engine bugs only appear once the readers desynchronize.
         lat = latency if isinstance(latency, (list, tuple)) else [latency]*n_channels
@@ -34,7 +34,8 @@ class _EngineDUT(Module):
                                                         xbuf_groups=xbuf_groups, dual=dual)
         for i, axi in enumerate(axis):
             model = BonsaiHBMChannelModel(axi, size=64*1024,
-                init=words_from_bytes(chan_payloads[i]), latency=lat[i], stall_rate=stl[i])
+                init=words_from_bytes(chan_payloads[i]), latency=lat[i], stall_rate=stl[i],
+                reorder_ids=reorder_ids)
             setattr(self.submodules, f"model{i}", model)
 
 def _run_engine(dut, cmd, n_results, dst):
@@ -1332,3 +1333,37 @@ def test_matvec_q8_ilv_multirow_gaps():
                    bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
         got = _run_engine(dut, cmd, T, 0x4000)
         assert np.array_equal(got, expected), f"T={T} stall={stall}: {got} != {expected}"
+
+
+def test_matvec_ternary_under_id_reorder():
+    """Full matvec path against the same-ID-serializing HBM model: the multi-ID readers see
+    cross-ID response shuffling at high latency and the results must stay bit-exact. This is
+    the engine-level guard for the multi-ARID reorder drain."""
+    n_channels, rows_per_chan, cols, seed = 8, 12, 2048, 41
+    rng = np.random.default_rng(seed)
+    M = n_channels*rows_per_chan
+    G = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+    sp = bytearray(64*1024)
+    sp[0:cols] = x8.tobytes()
+    for latency in (8, 48):
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(bytes(sp)),
+                         latency, 0, reorder_ids=4)
+        rb  = layout.row_beats(cols, layout.KIND_TERNARY)
+        cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0, wlen=rows_per_chan*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                   cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                   bias=B, rshift=R, xsrc=0, dst=0x4000)
+        got = _run_engine(dut, cmd, M, 0x4000)
+        # Position order per channel-stripe layout (kind=0 plain: rows land per channel).
+        assert np.array_equal(got, expected), f"latency {latency}"
