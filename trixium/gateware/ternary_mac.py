@@ -254,6 +254,18 @@ class BonsaiChannelPipe(LiteXModule):
         v1_tern  = [v1_rep(f"t{k}") for k in range(8)] # One per 16 ternary lanes.
         v1_q8    = [v1_rep(f"q{k}") for k in range(2)] # One per 16 Q8 lanes.
         v1_scale = v1_rep("scale")
+        # Head-B lanes get the same treatment, with the (op-stable) qn folded INTO the
+        # replica so the lane CE is a single flop output. The dual build's failing-path
+        # family was exactly these captures: 128+32 head-B lane registers CE'd from one
+        # `v1 & qn` term while head A had per-group replicas.
+        def v1b_rep(tag):
+            c = Signal(name=f"v1b_rep_{tag}")
+            c.attr.add(("dont_touch", "true"))
+            self.sync += c.eq(t0_fire & self.qn)
+            _v1_copies.append(c)
+            return c
+        v1b_tern = [v1b_rep(f"t{k}") for k in range(8)] if dual else []
+        v1b_q8   = [v1b_rep(f"q{k}") for k in range(2)] if dual else []
         row1      = _delay(self, row_cnt, 1)
         row_last1 = _delay(self, row_last, 1)
 
@@ -298,7 +310,7 @@ class BonsaiChannelPipe(LiteXModule):
                 }),
             ]
             rbt = Signal((9, True))
-            self.sync += If(v1 & self.qn, rbt.eq(laneb))
+            self.sync += If(v1b_tern[j // 16], rbt.eq(laneb))
             tern_lanesb.append(rbt)
         self.comb += code3_seen.eq(v1 & (self.kind == KIND_OP_TERNARY) & reduce(or_, code3_any))
         self.sync += If(self.start, self.error.eq(0)).Elif(code3_seen, self.error.eq(1))
@@ -352,7 +364,7 @@ class BonsaiChannelPipe(LiteXModule):
                 pb.eq(w_j*xb_j),
             ]
             rb = Signal((16, True))
-            self.sync += If(v1 & self.qn, rb.eq(pb))
+            self.sync += If(v1b_q8[j // 16], rb.eq(pb))
             q8_lanesb.append(rb)
 
         # Scale fp16: mux halfword out of the scale word (registered at T1 for use at T2+).
