@@ -43,5 +43,6 @@ void engine_run(const struct engine_op *op);
 void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst);
 
 extern int engine_wedged; // Set once an op stalled (see ENGSTALL in engine.c).
+extern int engine_diag;   // Opt-in per-op stall diagnostics (cost ~2k cycles/op).
 
 #endif

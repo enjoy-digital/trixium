@@ -15,39 +15,67 @@
 #include "perf.h"
 
 int engine_wedged; // Sticky: an op never completed, so engine results are not trustworthy.
+// Per-op stall diagnostics (pre-op beat snapshots, result-slot markers) cost ~2k cycles of
+// CSR/scratchpad traffic per engine op - ~1.3M cycles per forward at ~760 ops. They were
+// indispensable while the gather wedge was live; now they are opt-in (`engdiag on`). The
+// stall printout itself stays: without the snapshot it shows absolute beat counters, which
+// still names the channel that came up short.
+int engine_diag;
+
+// Shadow of the last-written op CSRs: a CSR access costs ~70 cycles on this SoC (measured
+// via vbench: a minimal vec_run of ~8 accesses is ~570 cycles), and the token loop issues
+// ~760 engine ops per forward whose fields mostly repeat - consecutive KV stores differ
+// only in wbase/chan, a layer's matvecs share every shape field. Writing only what changed
+// cuts an op's programming cost from ~13 accesses to the few that moved. The shadow starts
+// invalid (force = every field written once) and the CSRs are only ever written here or by
+// the sequencer mux - which drives the engine's command wires directly, not the CSRs - so
+// the shadow cannot go stale.
+static struct engine_op eng_shadow;
+static int eng_shadow_valid;
+
+#define ENG_WR(field) do { \
+    if (!eng_shadow_valid || eng_shadow.field != op->field) { \
+        engine_csr_##field##_write(op->field); \
+        eng_shadow.field = op->field; \
+    } } while (0)
 
 void engine_run(const struct engine_op *op)
 {
     perf_enter(OP_ENGINE_WAIT);
     uint32_t done = engine_csr_done_count_read();
 
-    engine_csr_kind_write(op->kind);
-    engine_csr_rows_write(op->rows);
-    engine_csr_cols_write(op->cols);
-    engine_csr_wbase_write(op->wbase);
-    engine_csr_wlen_write(op->wlen);
-    engine_csr_sbeats_write(op->sbeats);
-    engine_csr_cbeats_write(op->cbeats);
-    engine_csr_bias_write(op->bias);
-    engine_csr_rshift_write(op->rshift);
-    engine_csr_xsrc_write(op->xsrc);
-    engine_csr_dst_write(op->dst);
-    engine_csr_chan_write(op->chan);
-    engine_csr_rem_write(op->rem);
-    engine_csr_ilv_write(op->ilv);
-    engine_csr_supw_write(op->supw);
+    ENG_WR(kind);
+    ENG_WR(rows);
+    ENG_WR(cols);
+    ENG_WR(wbase);
+    ENG_WR(wlen);
+    ENG_WR(sbeats);
+    ENG_WR(cbeats);
+    ENG_WR(bias);
+    ENG_WR(rshift);
+    ENG_WR(xsrc);
+    ENG_WR(dst);
+    ENG_WR(chan);
+    ENG_WR(rem);
+    ENG_WR(ilv);
+    ENG_WR(supw);
 #ifdef CSR_ENGINE_CSR_QN_ADDR
-    engine_csr_qn_write(op->qn);
-    engine_csr_qstride_write(op->qstride);
-    engine_csr_rshift2_write(op->rshift2);
+    ENG_WR(qn);
+    ENG_WR(qstride);
+    ENG_WR(rshift2);
 #endif
     // Snapshot each reader's beat counter before the op: on a stall the deltas say exactly
     // which channel came up short, which is the one fact the status bits cannot give.
     // Expected delta per channel = wlen + (chan < rem ? sbeats + cbeats : 0).
     uint32_t beats0[BONSAI_N_CHANNELS];
-    for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
-        engine_csr_perf_chan_write(c);
-        beats0[c] = engine_csr_perf_beats_read();
+    if (engine_diag) {
+        for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
+            engine_csr_perf_chan_write(c);
+            beats0[c] = engine_csr_perf_beats_read();
+        }
+    } else {
+        for (int c = 0; c < BONSAI_N_CHANNELS; c++)
+            beats0[c] = 0; // Stall print falls back to absolute counters.
     }
 
     // Mark the result slots so a stall shows which ones were retired. The interleaved
@@ -55,7 +83,7 @@ void engine_run(const struct engine_op *op)
     // (row, channel) never produced a result.
     volatile uint32_t *rslot = (volatile uint32_t *)(SCRATCHPAD_BASE + op->dst);
     uint32_t nslot = 0;
-    if (op->kind == 1 && op->ilv) {
+    if (engine_diag && op->kind == 1 && op->ilv) {
         nslot = op->rows*BONSAI_N_CHANNELS + op->rem;
         if (nslot > 64) nslot = 64;
         for (uint32_t i = 0; i < nslot; i++)
@@ -63,6 +91,7 @@ void engine_run(const struct engine_op *op)
     }
 
     engine_csr_submit_write(1);
+    eng_shadow_valid = 1;
 
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
     // hanging the boot silently.
