@@ -2263,6 +2263,24 @@ void infer_vbench(void)
         dt = perf_now() - t0;
         printf("VB kv_store_layer   %8lu  (%d stores)\n",
                (unsigned long)dt, 2*n_kv_head);
+
+        // The token loop ALTERNATES pack/store; the two loops above run them in phases. The
+        // vector unit and the engine share the scratchpad port, so alternating may cost
+        // arbitration that phase-separated batches do not. Same 16 pairs either way, so the
+        // difference is the interleaving alone.
+        t0 = perf_now();
+        for (int h = 0; h < n_kv_head; h++)
+            for (int kind = 0; kind < 2; kind++) {
+                int32_t qq[4] = {(int32_t)((kind ? SP_V : SP_K) + (uint32_t)h*head_dim*2), 0,
+                                 (int32_t)(kvp_slot(kind) + 32), head_dim/16};
+                vec_run(PROG_QUANT8, qq, 4);
+                op.wbase = kv_region_addr(0, h, kind);
+                op.xsrc  = kvp_slot(kind);
+                engine_run(&op);
+            }
+        dt = perf_now() - t0;
+        printf("VB kv_pair_alt      %8lu  (%d pack+store pairs, interleaved)\n",
+               (unsigned long)dt, 2*n_kv_head);
     }
 #endif
     { // perf_now itself (measurement overhead per probe pair).
