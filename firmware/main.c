@@ -186,13 +186,17 @@ static void bench_cmd(char *args)
 }
 
 static int gen_emit_to_pbuf;
-static int pbuf[512];   // Chunked prompt buffer (tok/genb).
+// Chunked prompt buffer (tok/genb) - main_ram static window, not .bss (sram is tight;
+// see firmware/linker.ld). BONSAI_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000)
+// and ek_undo (+0x90000).
+#define PBUF_N 512
+static int *const pbuf = (int *)(BONSAI_HDR_ADDR + 0xA0000); // [PBUF_N]
 static int pbuf_n;
 
 static void emit_token(int tok)
 {
     printf(" %d", tok);
-    if (gen_emit_to_pbuf && pbuf_n < (int)(sizeof(pbuf)/sizeof(pbuf[0])))
+    if (gen_emit_to_pbuf && pbuf_n < PBUF_N)
         pbuf[pbuf_n++] = tok;
 }
 
@@ -302,7 +306,7 @@ static void tok_cmd(char *args)
         tok = get_token(&args);
         if (*tok == 0)
             break;
-        if (pbuf_n < (int)(sizeof(pbuf)/sizeof(pbuf[0])))
+        if (pbuf_n < PBUF_N)
             pbuf[pbuf_n++] = parse_int(tok);
     }
     printf("TOK %d\n", pbuf_n); // Host uses this to confirm the running length.
@@ -457,6 +461,12 @@ static void console_service(void)
             seq_use = 0;
         printf("SEQ %s (off runs the same ops CPU-dispatched per head, ~20%% slower)\n",
                seq_use ? "on" : "off");
+    }
+    else if (strcmp(token, "engdiag") == 0) {
+        if (strncmp(str, "on", 2) == 0)  engine_diag = 1;
+        if (strncmp(str, "off", 3) == 0) engine_diag = 0;
+        printf("ENGDIAG %s (per-op stall snapshots, ~2k cycles/op)\n",
+               engine_diag ? "on" : "off");
     }
     else if (strcmp(token, "hdrload") == 0)
         hdrload();

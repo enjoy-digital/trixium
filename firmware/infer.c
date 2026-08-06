@@ -629,20 +629,40 @@ static void vec_quant8_head(uint32_t sp, uint32_t dst, int n)
 }
 
 // Pack a resident head as a KV row packet and store it (scale = 2^(es+8) exactly).
-static void kv_store_row_res(int l, int kvh, int kind, int t, uint32_t sp, int es)
+//
+// Two staging slots (K and V) so the scale beat is written only when the exponent CHANGES,
+// not per store: K's exponent is the constant E_NORM+8 and V's changes once per layer, but
+// this used to rewrite 16 scratchpad halfwords (~1.1k cycles of uncached bus traffic) for
+// every one of the 448 stores per forward.
+static int kvp_scale_e8[2] = {-1000, -1000};
+
+static uint32_t kvp_slot(int kind)
 {
-    volatile uint16_t *ps = (volatile uint16_t *)(SCRATCHPAD_BASE + SP_KVP);
+    return SP_KVP + (kind ? 0x200 : 0);
+}
+
+static void kv_store_scale_prep(int kind, int e8)
+{
+    if (kvp_scale_e8[kind] == e8)
+        return;
+    volatile uint16_t *ps = (volatile uint16_t *)(SCRATCHPAD_BASE + kvp_slot(kind));
     int groups = head_dim/32;
-    int e8 = es + 8;
     for (int g = 0; g < 16; g++)
         ps[g] = (g < groups) ? (uint16_t)((e8 + 15) << 10) : 0;
-    vec_quant8_head(sp, SP_KVP + 32, head_dim);
+    kvp_scale_e8[kind] = e8;
+}
+
+static void kv_store_row_res(int l, int kvh, int kind, int t, uint32_t sp, int es)
+{
+    int e8 = es + 8;
+    kv_store_scale_prep(kind, e8);
+    vec_quant8_head(sp, kvp_slot(kind) + 32, head_dim);
     struct engine_op op = {0};
     op.kind  = ENGINE_KIND_STORE;
     op.chan  = t % n_ch;
     op.wbase = kv_region_addr(l, kvh, kind) + (uint32_t)(t/n_ch)*kv_rb*32;
     op.wlen  = kv_rb;
-    op.xsrc  = SP_KVP;
+    op.xsrc  = kvp_slot(kind);
     engine_run(&op);
     int idx = kv_ek_idx(l, kvh, kind);
     if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
@@ -1037,8 +1057,12 @@ static uint8_t  *spec_succ_v;
 // are captured per layer for exact rollback on draft rejection.
 // Undo records: (index, value) pairs.
 static int     ek_undo_n;
-static int16_t ek_undo_idx[64*8*2];
-static int8_t  ek_undo_val[64*8*2];
+// In the main_ram static window, not .bss: sram is 8 KB *including the stack*, and these
+// 3 KB were a third of it. Same window as model.c's entry cache (BONSAI_HDR_ADDR + 0x80000
+// + 4 KB); data accesses to main_ram are the norm here - the heap is next door.
+#define EK_UNDO_BASE (BONSAI_HDR_ADDR + 0x90000)
+static int16_t *const ek_undo_idx = (int16_t *)EK_UNDO_BASE;
+static int8_t  *const ek_undo_val = (int8_t  *)(EK_UNDO_BASE + sizeof(int16_t)*64*8*2);
 static void ek_capture(int l)
 {
     for (int h = 0; h < n_kv_head; h++)
@@ -1939,6 +1963,7 @@ attn_heads_done: ;
 
 int infer_init(void)
 {
+    kvp_scale_e8[0] = kvp_scale_e8[1] = -1000; // New image: restage the KV scale beats.
     H = model_header();
     if (H->magic != BONS_MAGIC)
         return -1;

@@ -100,13 +100,14 @@ SECTIONS
 	} > sram
 }
 
-/* The stack does NOT live in sram: that region is 8 KB shared with .data + .bss, and once
- * .bss grew past ~6 KB the stack was down to ~1 KB - deep call paths (printf in the token
- * loop, forward_pair's frames) overflowed it into .bss and the firmware died by silent
- * corruption, at a location that moved with every relink. main_ram + 3 MB gives it ~3 MB of
- * downward headroom in the window between the firmware image (~100 KB) and the BONS header
- * (main_ram + 4 MB), on the sim (8 MB ram) and the card (256 MB) alike. */
-PROVIDE(_fstack = ORIGIN(main_ram) + 0x300000);
+/* The stack lives at the top of sram and takes whatever .data/.bss leave it. That number
+ * MUST stay >= ~4 KB: at 1 KB deep call paths overflowed into .bss and the firmware died by
+ * silent corruption at a location that moved with every relink. The fix is keeping large
+ * arrays OUT of .bss (they live in the main_ram static window instead - grep ECACHE_BASE),
+ * NOT moving the stack to main_ram: on the card main_ram is the HBM channel-0 window, and
+ * the one firmware built with its stack there coincided with back-to-back host crashes.
+ * Check after adding statics:  riscv64-unknown-elf-nm bonsai.elf | grep -E "_ebss|_fstack" */
+PROVIDE(_fstack = ORIGIN(sram) + LENGTH(sram));
 
 PROVIDE(_fdata_rom = LOADADDR(.data));
 PROVIDE(_edata_rom = LOADADDR(.data) + SIZEOF(.data));
