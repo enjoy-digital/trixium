@@ -15,6 +15,7 @@
 
 #include <generated/csr.h>
 #include <generated/soc.h>
+#include <generated/mem.h>
 
 #include "bons.h"
 #include "engine.h"
@@ -62,8 +63,15 @@ int *__errno(void) { return &__errno_storage; }
 // Fixed exponent for CPU-produced normed vectors (values bounded ~16 by construction).
 #define E_NORM  (-11)
 
-// Heap: after the BONS header/table area.
-#define HEAP_BASE (BONSAI_HDR_ADDR + 0x100000)
+// Heap: after the BONS header/table area. The CPU's RAM is HBM pseudo-channel 4 and engine
+// channel 3's weight window overlaps it at [64 MB, ~141 MB) (see layout.py HBM_WEIGHT_BASE):
+// the low heap must stay under 64 MB, and anything big goes to the HIGH heap above the
+// weights+KV tail at +144 MB. The low heap holds a few MB of norms and tables; the only big
+// consumer is the CPU-side KV cache, which is a debug fallback (HW attention keeps its own
+// KV in HBM at full context) and is capped at CPU_KV_CTX positions to fit.
+#define HEAP_BASE    (BONSAI_HDR_ADDR + 0x100000)
+#define HEAP_HI_BASE (0x40000000u + 0x09000000u) // Main_ram + 144 MB: above ch3's tail.
+#define CPU_KV_CTX   512
 
 static uint8_t *heap;
 static void *halloc(uint32_t n)
@@ -73,11 +81,22 @@ static void *halloc(uint32_t n)
     return p;
 }
 
+static uint8_t *heap_hi;
+static void *halloc_hi(uint32_t n)
+{
+    if (heap_hi == 0)          // Small main_ram (the sim's 8 MB): no channel-3 overlap to
+        return halloc(n);      // dodge there, the low heap serves everything.
+    void *p = heap_hi;
+    heap_hi = heap_hi + ((n + 63) & ~63u);
+    return p;
+}
+
 // Model state --------------------------------------------------------------------------------
 
 static const struct bons_header *H;
 static int n_ch, head_dim, n_head, n_kv_head, n_embd, ffn_dim, n_layer;
 static int max_ctx;
+static int cpu_kv_ctx; // CPU-side KV cache depth (== max_ctx unless HW attention exists).
 
 static float **attn_norm, **ffn_norm, **q_norm, **k_norm; // Per layer.
 static float *out_norm;
@@ -1464,8 +1483,10 @@ embed_done: ;
         // Append K/V (int8 + per-row scale) to the CPU-side caches.
         perf_enter(OP_KVQUANT);
         {
-            int8_t *kd = k_cache + ((uint64_t)l*max_ctx + pos)*kv_dim;
-            int8_t *vd = v_cache + ((uint64_t)l*max_ctx + pos)*kv_dim;
+            if (pos >= cpu_kv_ctx)
+                goto cpu_kv_full; // Cache capped; HW KV (full ctx) is unaffected.
+            int8_t *kd = k_cache + ((uint64_t)l*cpu_kv_ctx + pos)*kv_dim;
+            int8_t *vd = v_cache + ((uint64_t)l*cpu_kv_ctx + pos)*kv_dim;
             // Per-head scales, not one per token: the head spread of K is large (16x at
             // layer 0 of the 1.7B, head 4 peaking at 311 against head 6 at 18.9), so a single
             // tensor scale leaves the quiet heads under 3 bits and wrecks their scores.
@@ -1476,7 +1497,7 @@ embed_done: ;
                     float a = fabsf(kh[i]); if (a > ka) ka = a;
                     a = fabsf(vh[i]);       if (a > va) va = a;
                 }
-                uint64_t si = ((uint64_t)l*max_ctx + pos)*n_kv_head + h;
+                uint64_t si = ((uint64_t)l*cpu_kv_ctx + pos)*n_kv_head + h;
                 float ks = (ka > 0) ? ka/127.0f : 1.0f, is = 1.0f/ks;
                 for (int i = 0; i < head_dim; i++)
                     kd[h*head_dim + i] = (int8_t)lroundf(kh[i]*is);
@@ -1487,6 +1508,7 @@ embed_done: ;
                 v_scale[si] = vs;
             }
         }
+cpu_kv_full: ;
 #ifdef BONSAI_HAS_KVSTORE
         // Dual-KV: also append Q8 row packets to HBM for the engine scores path.
         if (op_on_hw(OP_KVQUANT)) {
@@ -1712,11 +1734,17 @@ attn_scores: ;
                 }
             } else
 #endif
+            if (pos >= cpu_kv_ctx) {
+                // The CPU fallback cache is capped (see CPU_KV_CTX); results past it would
+                // read out of bounds. The HW path carries full context - switch back.
+                puts("CPU attention past CPU_KV_CTX: use hwops attention or shorter prompts");
+                pos = cpu_kv_ctx - 1;
+            }
             for (int t = 0; t <= pos; t++) {
-                const int8_t *kt = k_cache + ((uint64_t)l*max_ctx + t)*kv_dim + kvh*head_dim;
+                const int8_t *kt = k_cache + ((uint64_t)l*cpu_kv_ctx + t)*kv_dim + kvh*head_dim;
                 float dot = 0;
                 for (int d = 0; d < head_dim; d++) dot += qh[d]*kt[d];
-                float sc = dot*k_scale[((uint64_t)l*max_ctx + t)*n_kv_head + kvh]*scale;
+                float sc = dot*k_scale[((uint64_t)l*cpu_kv_ctx + t)*n_kv_head + kvh]*scale;
                 scores[t] = sc;
                 if (sc > smax) smax = sc;
             }
@@ -1785,8 +1813,8 @@ attn_scores: ;
 #endif
             for (int d = 0; d < head_dim; d++) ah[d] = 0;
             for (int t = 0; t <= pos; t++) {
-                const int8_t *vt = v_cache + ((uint64_t)l*max_ctx + t)*kv_dim + kvh*head_dim;
-                float p = scores[t]*inv*v_scale[((uint64_t)l*max_ctx + t)*n_kv_head + kvh];
+                const int8_t *vt = v_cache + ((uint64_t)l*cpu_kv_ctx + t)*kv_dim + kvh*head_dim;
+                float p = scores[t]*inv*v_scale[((uint64_t)l*cpu_kv_ctx + t)*n_kv_head + kvh];
                 for (int d = 0; d < head_dim; d++) ah[d] += p*vt[d];
             }
             perf_exit(OP_WV);
@@ -1982,7 +2010,8 @@ int infer_init(void)
     head_dim = H->head_dim;
     ffn_dim  = H->ffn_dim;
 
-    heap = (uint8_t *)HEAP_BASE;
+    heap    = (uint8_t *)HEAP_BASE;
+    heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)HEAP_HI_BASE : 0;
     int kv_dim = n_kv_head*head_dim;
     int q_dim  = n_head*head_dim;
 
@@ -2028,6 +2057,15 @@ int infer_init(void)
 
     // KV caches: size to the header ctx (tiny in sim; on hardware capped by the converter).
     max_ctx = H->max_ctx;
+    // The CPU-side KV cache is the debug fallback when HW attention exists (the fast path
+    // keeps its own KV in HBM at full context); cap it so it fits the high heap window
+    // above engine channel 3's weight tail. Without HW attention it is the primary cache
+    // and keeps the full context.
+#ifdef BONSAI_HAS_KVSTORE
+    cpu_kv_ctx = (max_ctx < CPU_KV_CTX) ? max_ctx : CPU_KV_CTX;
+#else
+    cpu_kv_ctx = max_ctx;
+#endif
 #ifdef BONSAI_HAS_KVSTORE
     // KV region: above the per-channel weight payload, 4 KB aligned.
     kv_base   = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
@@ -2041,10 +2079,10 @@ int infer_init(void)
     seq_build_attn2();
 #endif
 #endif
-    k_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
-    v_cache = halloc((uint64_t)n_layer*max_ctx*kv_dim);
-    k_scale = halloc((uint64_t)n_layer*max_ctx*n_kv_head*sizeof(float));
-    v_scale = halloc((uint64_t)n_layer*max_ctx*n_kv_head*sizeof(float));
+    k_cache = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*kv_dim);
+    v_cache = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*kv_dim);
+    k_scale = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*n_kv_head*sizeof(float));
+    v_scale = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*n_kv_head*sizeof(float));
     scores  = halloc(max_ctx*sizeof(float));
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
@@ -2053,6 +2091,31 @@ int infer_init(void)
 #endif
     n_pos   = 0;
     rope_init();
+
+    // The low heap now lives BELOW engine channel 3's weight window (see layout.py:
+    // HBM_WEIGHT_BASE is port-matched, so channel 3 lands inside main_ram at +64 MB).
+    // Overrunning it would scribble on that channel's weights and show up as wrong tokens
+    // with everything else looking healthy - which is exactly the failure mode that cost a
+    // day. Check it, loudly, once per init; the numbers are cheap to print and worth having
+    // in every boot log.
+    {
+        uint32_t lo_used = (uint32_t)(heap - (uint8_t *)HEAP_BASE);
+        uint32_t lo_room = (uint32_t)(BONSAI_CHAN_WEIGHT_BASE + 3*BONSAI_CHAN_STRIDE
+                                      - (uint32_t)HEAP_BASE);
+        printf("infer: low heap %lu KB", (unsigned long)(lo_used >> 10));
+        if (heap_hi)
+            printf(", high heap %lu KB @%08lx",
+                   (unsigned long)((uint32_t)(heap_hi - (uint8_t *)HEAP_HI_BASE) >> 10),
+                   (unsigned long)HEAP_HI_BASE);
+        printf("\n");
+        if ((uint32_t)MAIN_RAM_BASE + MAIN_RAM_SIZE > BONSAI_CHAN_WEIGHT_BASE + 3*BONSAI_CHAN_STRIDE
+            && lo_used > lo_room) {
+            printf("infer: LOW HEAP OVERRUNS engine channel 3's weights "
+                   "(%lu KB used, %lu KB available) - tokens will be wrong\n",
+                   (unsigned long)(lo_used >> 10), (unsigned long)(lo_room >> 10));
+            return -1;
+        }
+    }
     return 0;
 }
 

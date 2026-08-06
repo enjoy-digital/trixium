@@ -303,6 +303,9 @@ int main(int argc, char **argv)
         /* The HBM AXI switch makes the address select the pseudo-channel, so each channel
          * needs its own window - writing them all at one base put every payload on top of
          * the last (confirmed on hardware). The engine adds the same offset on its side. */
+        printf("  -> base %08x, first words %08x %08x\n",
+               (unsigned)(BONSAI_CHAN_WEIGHT_BASE + (uint32_t)c*BONSAI_CHAN_STRIDE),
+               ((uint32_t *)buf)[0], ((uint32_t *)buf)[1]);
         loader_transfer(fd, c, BONSAI_CHAN_WEIGHT_BASE + (uint32_t)c*BONSAI_CHAN_STRIDE,
                         buf, PAD(chan_bytes)/32);
     }

@@ -216,7 +216,22 @@ def crc32(data):
 #  - a power of two, so the engine's STORE path can shift rather than multiply.
 # 2 GB base + 256 MB stride puts N=8 in [2 GB, 4 GB) and leaves the CPU window alone. N=16
 # would need 4 GB of windows and so a different split - revisit with the 8B model.
-HBM_WEIGHT_BASE = 0x8000_0000 # 2 GB: start of the per-channel weight windows.
+# The base is chosen so each engine channel's window lands on its OWN port's pseudo-channel:
+# engine channel c is HBM AXI port c+1 (port 0 = CPU main_ram = PC 0), so its window must be
+# PC c+1 = [(c+1)*256 MB, ...). With the old 2 GB base every engine read went to PC 8..15 -
+# a far pseudo-channel across the AXI switch's segment links for every single burst. On the
+# card that showed up as ~27-34 cycles/beat single-port reads and 4.6 cycles/beat aggregate
+# (the segment links saturating), with a read round trip in the microseconds; the same RTL
+# against the idealized model streams at 1-2 cycles/beat. Port-matched windows keep every
+# read inside its own switch segment.
+# 64 MB into PC 1, not PC 1 exactly: the CPU's main_ram bridge passes addresses through
+# 1:1, so the CPU lives in PC 4 (0x4000_0000..) - engine channel 3 is port 4, and its
+# window necessarily overlaps PC 4. The +64 MB skip keeps that overlap above everything the
+# CPU touches at the bottom of its RAM (firmware, header, low heap - all < 8 MB; the
+# CPU-side KV cache is placed in a HIGH heap region above the weights tail, see infer.c).
+# Payload + KV is ~77 MB < 192 MB, so every channel's data still sits entirely inside its
+# own port's pseudo-channel and no read crosses a switch segment.
+HBM_WEIGHT_BASE = 0x1400_0000 # PC(c+1) + 64 MB per channel c (port-matched, CPU-safe).
 HBM_CHAN_STRIDE = 0x1000_0000 # 256 MB per channel, matching the pseudo-channel size.
 
 # The BONS header+table ("meta") is uploaded by the host to ENGINE channel 0 at this offset
