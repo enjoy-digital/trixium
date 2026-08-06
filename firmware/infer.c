@@ -414,6 +414,33 @@ static inline volatile int8_t  *sp8(uint32_t off)  { return (volatile int8_t  *)
 // image's int16 norm rows (kind norm16, exponent E_W16) into SP_FET and run the vector
 // unit's two-pass program; CPU path: soft-float with the F32 weights from RAM.
 #define E_W16 (-13) // layout.NORM16_EXP.
+
+// rms_eps as an exact integer mantissa/exponent, so the per-call eps does not cost soft-float.
+//
+// The value wanted is lroundf(rms_eps * 2^-2esrc) - a pure power-of-two scaling, so float32
+// computes it with no rounding beyond rms_eps's own representation. Decomposing once into a
+// 24-bit mantissa (all a float32 has) makes the per-call work a shift and a rounding add, and
+// bit-identical to what the float path produced. vec_rmsnorm_head runs per head, ~700 times a
+// forward, and ldexpf+lroundf are hundreds of cycles each on a core with no FPU.
+static uint32_t eps_m;   // rms_eps = eps_m * 2^(eps_e - 24), eps_m in [2^23, 2^24)
+static int      eps_e;
+
+static void eps_init(void)
+{
+    float m = frexpf(H->rms_eps, &eps_e);       // m in [0.5, 1)
+    eps_m   = (uint32_t)(ldexpf(m, 24) + 0.5f); // exact: m has at most 24 significant bits
+}
+
+static int eps_for(int esrc)
+{
+    int s = 24 + 2*esrc - eps_e;
+    if (s <= 0)                                  // float path overflowed int here too
+        return 0x7FFFFFFF;                       // (verified bit-exact for every s > 0)
+    if (s > 31)
+        return 1;                                // rounds to 0; callers clamp to >= 1 anyway
+    uint32_t v = (eps_m + (1u << (s - 1))) >> s; // round half away from zero (values > 0)
+    return (int)(v < 1 ? 1 : v);
+}
 static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
                               const struct bons_entry *w16, int n, uint32_t dst)
 {
@@ -421,8 +448,7 @@ static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
     if (op_on_hw(OP_RMSNORM) && w16) {
         engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
                      w16->chan_len_beats, SP_FET);
-        int eps_int = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*esrc));
-        if (eps_int < 1) eps_int = 1;
+        int eps_int = eps_for(esrc);
         int ln = 0;
         while ((1 << ln) < n) ln++;
         int32_t args[7] = {(int32_t)src, (int32_t)SP_FET, (int32_t)dst, n/16,
@@ -620,8 +646,7 @@ static int attn_all_hw(void)
 // vec rmsnorm of one head slice in place (w16 rows already staged at w_sp).
 static void vec_rmsnorm_head(uint32_t sp, int es, uint32_t w_sp, int n)
 {
-    int eps_int = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*es));
-    if (eps_int < 1) eps_int = 1;
+    int eps_int = eps_for(es);
     int ln = 0;
     while ((1 << ln) < n) ln++;
     int32_t args[7] = {(int32_t)sp, (int32_t)w_sp, (int32_t)sp, n/16,
@@ -2112,6 +2137,7 @@ int infer_init(void)
     spec_succ_v = halloc(H->vocab);
 #endif
     n_pos   = 0;
+    eps_init();
     rope_init();
 
     // 16 KV staging slots fill SP_KVP exactly (16 x 512 B, ending at SP_SC). A model with
