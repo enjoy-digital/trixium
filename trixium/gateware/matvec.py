@@ -16,6 +16,9 @@ One BonsaiAXIReader + BonsaiChannelPipe per HBM pseudo-channel. A matvec command
 The command uses per-channel row counts (rows = M/n_channels) and byte addresses inside the
 per-channel HBM address space. Sequenced by the descriptor engine (or a CSR shim/testbench)."""
 
+from functools import reduce
+from operator import and_
+
 from migen import *
 from migen.genlib.roundrobin import RoundRobin, SP_CE
 
@@ -78,6 +81,13 @@ class BonsaiMatVecEngine(LiteXModule):
                              # (Q8 scores and AXPY kinds only; x holds both vectors).
             ("qstride", 16), # Head-B result offset in words (dst + 4*qstride).
             ("rshift2", 6),  # Head-B AXPY pre-shift (Rpre differs per head).
+            ("xred",   1),   # AXPY only: sum the per-channel partials IN HARDWARE and write
+                             # one cols-long result instead of n_channels of them. Without
+                             # it the firmware pays n_channels-1 reduce_acc calls per head
+                             # (7 at N=8), which measured 3 cycles/element and is 9 of the
+                             # 13 per-head attention descriptors. int32 add wraps and is
+                             # associative, so the tree here is bit-identical to the
+                             # sequential vector-unit reduce it replaces.
         ])
         self.busy   = Signal()
         self.sp_busy = Signal() # busy + 1 cycle: the registered write stage's last beat
@@ -137,7 +147,7 @@ class BonsaiMatVecEngine(LiteXModule):
         cmd_r = {}
         for name in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
                      "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
-                     "qn", "qstride", "rshift2"):
+                     "qn", "qstride", "rshift2", "xred"):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
@@ -265,12 +275,38 @@ class BonsaiMatVecEngine(LiteXModule):
             & (slot_p[i][3:] == grant_slot[3:])
             for i in range(n)]))
 
+        # Cross-channel reduce (AXPY + cmd.xred). Every pipe drains its partial vector as
+        # cols/8 beats in the SAME order - beat k is always lane group k, pushed by the drain
+        # FSM's d_cnt - so the channels are in lockstep by construction and no addressing is
+        # needed to line them up: wait until all n have a beat, add them lane-wise, write one
+        # beat, and consume all n together.
+        #
+        # Head-of-line blocking is not a hazard here: every channel produces exactly cols/8
+        # beats regardless of `rem` (rem varies the number of POSITIONS a channel accumulates,
+        # not the length of its output), and the drain runs after the reader has finished, so
+        # a stalled axw_fifo cannot deadlock against an in-flight read.
+        xred_mode = Signal()
+        xred_all  = Signal()
+        self.comb += [
+            xred_mode.eq(axpy_mode & cmd_r["xred"]),
+            xred_all.eq(xred_mode & reduce(and_, [p.source.valid for p in self.pipes])),
+        ]
+        xred_dat = Signal(256)
+        for l in range(8):
+            # int32 wrap add: the sum is truncated to 32 bits, which is exactly what the
+            # vector unit's VADD does, so the result is bit-identical whatever the order.
+            self.comb += xred_dat[32*l:32*l + 32].eq(
+                reduce(lambda a, b: a + b,
+                       [p.source.data[32*l:32*l + 32] for p in self.pipes])[0:32])
+
         self.comb += [
             rr.request.eq(Cat(*[p.source.valid for p in self.pipes])),
             rr.ce.eq(1),
         ]
         for i, pipe in enumerate(self.pipes):
-            self.comb += pipe.source.ready.eq(Mux(ilv_mode, merge_mask[i], rr.grant == i))
+            self.comb += pipe.source.ready.eq(
+                Mux(xred_mode, xred_all,
+                    Mux(ilv_mode, merge_mask[i], rr.grant == i)))
 
         # Merged lane build: within one beat each word lane belongs to at most one pipe.
         lane_we  = Signal(8)
@@ -357,7 +393,11 @@ class BonsaiMatVecEngine(LiteXModule):
         grant_qoff = Signal(16)
         self.comb += grant_qoff.eq(Mux(grant_head, cmd_r["qstride"], 0))
         self.comb += [
-            If(axpy_mode,
+            If(xred_mode,
+                # One summed vector, so no per-channel stride. Row comes from the granted
+                # pipe, which is safe because all n are on the same beat when xred_all.
+                slot.eq(dstw + grant_qoff + grant_row),
+            ).Elif(axpy_mode,
                 # Wide drain rows are 8-lane group starts; dst must be 32B-aligned.
                 slot.eq(dstw + grant_qoff + rr.grant*cmd_r["cols"] + grant_row),
             ).Else(
@@ -387,6 +427,10 @@ class BonsaiMatVecEngine(LiteXModule):
                 # The address is safe without the gate: merge_mask requires
                 # slot_p[i][3:] == grant_slot[3:], so every lane written belongs here.
                 eng_gw_we_c.eq(lane_we),
+            ).Elif(xred_mode,
+                eng_gw_adr_c.eq(slot[3:]),
+                eng_gw_dat_c.eq(xred_dat),
+                eng_gw_we_c.eq(Mux(xred_all, 0xFF, 0)),
             ).Elif(axpy_mode,
                 eng_gw_adr_c.eq(slot[3:]),
                 eng_gw_dat_c.eq(grant_data),
@@ -562,7 +606,11 @@ class BonsaiMatVecEngine(LiteXModule):
         self.dbg_ax_total   = ax_total
         self.comb += [
             mv_total.eq(cmd_r["rows"]*self.n_channels + cmd_r["rem"]),
-            ax_total.eq(cmd_r["cols"]*self.n_channels),
+            # xred writes ONE cols-long vector, so the retire count drops by n_channels.
+            # result_cnt counts written lanes (popcount of the write enables), so this is
+            # all the accounting the merged beats need.
+            ax_total.eq(Mux(cmd_r["xred"], cmd_r["cols"],
+                            cmd_r["cols"]*self.n_channels)),
         ]
         fsm.act("RUN",
             self.busy.eq(1),

@@ -38,8 +38,10 @@ class _EngineDUT(Module):
                 reorder_ids=reorder_ids)
             setattr(self.submodules, f"model{i}", model)
 
-def _run_engine(dut, cmd, n_results, dst):
+def _run_engine(dut, cmd, n_results, dst, absmax=False):
+    """Results array, or (results, engine.absmax) when absmax=True."""
     results = []
+    extra   = {}
 
     def driver():
         for k, v in cmd.items():
@@ -63,9 +65,11 @@ def _run_engine(dut, cmd, n_results, dst):
             word = (yield dut.scratchpad.mem[(dst + 4*i)//32])
             v    = (word >> (32*(((dst + 4*i)//4) % 8))) & 0xFFFFFFFF
             results.append(v - (1 << 32) if v & (1 << 31) else v)
+        extra["absmax"] = (yield dut.engine.absmax)
 
     run_simulation(dut, [driver()])
-    return np.array(results, dtype=np.int64)
+    arr = np.array(results, dtype=np.int64)
+    return (arr, extra["absmax"]) if absmax else arr
 
 def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed,
                   dual=True):
@@ -608,6 +612,62 @@ def test_engine_axpy():
                    bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem)
         got = _run_engine(dut, cmd, n_channels*cols, 0x4000)
         assert np.array_equal(got, expected), f"T={T}"
+
+def test_engine_axpy_xred():
+    # cmd.xred: the engine sums the per-channel AXPY partials itself and writes ONE
+    # cols-long vector, replacing the n_channels-1 reduce_acc calls the firmware runs per
+    # head. The reference is the exact int32-wrapping sum of the partials that the
+    # unmodified op produces - the same arithmetic the vector unit's VADD does - so this
+    # pins bit-exactness, not just plausibility.
+    #
+    # Covers the ragged cases (rem != 0) on purpose: `rem` changes how many POSITIONS each
+    # channel accumulates, and the lockstep drain is only correct because it does NOT change
+    # how many beats each channel emits. If that ever stops holding, T=9/10/17 catch it.
+    cols, seed = 64, 41
+    for n_channels, T in [(2, 3), (4, 5), (4, 9), (8, 8), (8, 9), (8, 10), (8, 17)]:
+        rng = np.random.default_rng(seed + T)
+        ev  = rng.integers(-9, -4, T)
+        scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+        v8  = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+        p8  = rng.integers(0, 128, T, dtype=np.int8)
+
+        _, e16 = bx.fp16_decompose(scales)
+        B    = 12 - int(e16.max())
+        Rpre = bx.axpy_rpre(int(p8.astype(np.int64).sum()))
+
+        rows, rem = T//n_channels, T % n_channels
+        payloads, parts = [], []
+        for c in range(n_channels):
+            pos = [t for t in range(T) if t % n_channels == c]
+            if pos:
+                spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                                    len(pos), cols, scales=scales[pos], values=v8[pos])
+                payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+                parts.append(bx.axpy_rows(scales[pos], v8[pos], p8[pos], B, Rpre))
+            else:
+                payloads.append(b"")
+                parts.append(np.zeros(cols, dtype=np.int32))
+        maxlen = max(len(p) for p in payloads)
+        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+        # int32 wrap, exactly as VADD accumulates it.
+        expected = np.sum(np.stack(parts).astype(np.int64), axis=0).astype(np.int32)
+
+        x_init = p8.tobytes().ljust(64, b"\0")
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
+        rb  = layout.row_beats(cols, layout.KIND_Q8)
+        cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                   bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem, xred=1)
+        got = _run_engine(dut, cmd, cols, 0x4000, absmax=True)
+        assert np.array_equal(got[0].astype(np.int32), expected), \
+            f"xred N={n_channels} T={T}"
+        # The engine absmax tracker must hold the absmax of the SUMMED vector, because that
+        # is what norm_i32's k comes from once the reduce_acc chain is gone (SEQ_SRC_KABS).
+        # This is only true with xred: without it the tracker sees the per-channel partials,
+        # whose absmax is not the absmax of their sum.
+        assert got[1] == int(np.abs(expected.astype(np.int64)).max()), \
+            f"xred absmax N={n_channels} T={T}"
 
 def test_engine_axpy_dual_head():
     # Dual-Q GQA weighted-V: one V stream serves two heads' AXPYs (qn=1). p8 vectors
