@@ -73,3 +73,4 @@ docs/*.doc
 # Verilator unit-sim build outputs (regenerate with tools/vsim/build_vecunit.py).
 tools/vsim/obj/
 rom*.init
+tools/vsim/obj_engine/
