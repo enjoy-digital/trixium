@@ -476,9 +476,12 @@ def prog_silu_mul():
         ("VMIN",  "v3", "v3", "v2"),    # clamp high at 14*2^15 (e2 <= 2^29: int32-safe)
         # split i/r; e2 = EXP2F(r) << i
         ("VSHRI", "v4", "v3", 15),      # i = floor(f)
-        ("VSHLI", "v5", "v4", 15),
-        ("VSUB",  "v5", "v3", "v5"),    # r = f - (i << 15) in [0, 2^15)
-        ("LUTE2", "v5", "v5"),          # 2^r, Q15 in [2^15, 2^16)
+        # LUTE2 masks its operand to the low 15 bits (interpreter: x & 0x7FFF; RTL:
+        # x15.eq(va[0:15])), and r = f - ((f >> 15) << 15) IS f & 0x7FFF in two's
+        # complement - so splitting r out cost two instructions per iteration for a value
+        # the LUT was going to compute anyway. Safe because the VMIN/VMAX above clamp f,
+        # so neither the shift nor the subtract could have overflowed either.
+        ("LUTE2", "v5", "v3"),          # 2^r, Q15 in [2^15, 2^16)
         ("VSHLV", "v5", "v5", "v4"),    # e2 = 2^f (Q15 integer-scaled)
         # den = e2 + 2^15 ; normalize ; recip
         ("MOVSI", "s7", 1), ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15),
@@ -608,9 +611,9 @@ def prog_softmax8():
         ("VSHLV", "v0", "v0", "v6"),    # f (Q15).
         ("VMAX",  "v0", "v0", "v4"),    # clamp at -15*2^15.
         ("VSHRI", "v1", "v0", 15),      # i = floor(f) in [-15, 0].
-        ("VSHLI", "v2", "v1", 15),
-        ("VSUB",  "v2", "v0", "v2"),    # r in [0, 2^15).
-        ("LUTE2", "v2", "v2"),
+        # Same as silu_mul: LUTE2 masks to the low 15 bits, so r = f - ((f>>15)<<15) was
+        # two instructions per iteration computing what the LUT already does.
+        ("LUTE2", "v2", "v0"),
         ("VSHLV", "v2", "v2", "v1"),    # 2^f, Q15.
         ("VRNE",  "v2", "v2", 8),
         ("VCLAMP8", "v2", "v2"),        # p8 in [0, 127] (max entry 128 -> 127).
