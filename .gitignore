@@ -61,3 +61,7 @@ trixium/software/user/*.o
 trixium/software/user/liblitepcie/*.d
 trixium/software/user/liblitepcie/*.o
 trixium/software/user/liblitepcie/*.a
+
+# Generated from docs/comparison-fpga-llm.md (pandoc / soffice); the markdown is the source.
+docs/*.docx
+docs/*.doc
