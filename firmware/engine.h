@@ -32,6 +32,9 @@ struct engine_op {
     uint8_t  rshift;
     uint8_t  rshift_rpre; // Sequencer only: rshift = bitlen(prev vec res6) + 5 (AXPY Rpre).
     uint8_t  qn;          // Dual-Q GQA mode: one K/V stream serves 2 sibling Q-heads.
+    uint8_t  xred;        // AXPY: engine sums the per-channel partials and writes one
+                          // cols-long vector, replacing n_ch-1 reduce_acc calls. The
+                          // engine absmax then holds the SUMMED vector's absmax.
     uint16_t qstride;     // Head-B result offset in words.
     uint8_t  rshift2;     // Head-B AXPY pre-shift.
     uint32_t xsrc;      // Scratchpad byte address of x8.

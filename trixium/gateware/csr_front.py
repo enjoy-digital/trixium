@@ -40,6 +40,7 @@ class BonsaiEngineCSR(LiteXModule):
         self.ilv     = CSRStorage(1,  description="Interleaved (position-major) gather.")
         self.supw    = CSRStorage(1,  description="Suppress scratchpad result writes (argmax-only ops).")
         self.qn      = CSRStorage(1,  description="Dual-Q GQA mode (2 heads per K/V stream).")
+        self.xred    = CSRStorage(1,  description="AXPY: sum the per-channel partials in hardware.")
         self.qstride = CSRStorage(16, description="Head-B result offset in words.")
         self.rshift2 = CSRStorage(6,  description="Head-B AXPY pre-shift.")
         self.submit  = CSRStorage(1,  description="Write 1 to submit the op.")
@@ -119,6 +120,7 @@ class BonsaiEngineCSR(LiteXModule):
                 engine.cmd.ilv.eq(0 if seq is None else seq.eng_ilv),
                 engine.cmd.supw.eq(0 if seq is None else seq.eng_supw),
                 engine.cmd.qn.eq(0 if seq is None else seq.eng_qn),
+                engine.cmd.xred.eq(0 if seq is None else seq.eng_xred),
                 engine.cmd.qstride.eq(0 if seq is None else seq.eng_qstride),
                 engine.cmd.rshift2.eq(0 if seq is None else seq.eng_rshift2),
             ).Else(
@@ -139,6 +141,7 @@ class BonsaiEngineCSR(LiteXModule):
             engine.cmd.ilv.eq(self.ilv.storage),
             engine.cmd.supw.eq(self.supw.storage),
             engine.cmd.qn.eq(self.qn.storage),
+            engine.cmd.xred.eq(self.xred.storage),
             engine.cmd.qstride.eq(self.qstride.storage),
             engine.cmd.rshift2.eq(self.rshift2.storage),
             ),

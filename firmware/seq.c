@@ -19,8 +19,19 @@ static volatile uint32_t *desc_w(uint32_t idx)
 
 void seq_desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_t srcs)
 {
+    seq_desc_vec_seed(idx, pc, args, n, srcs, 0);
+}
+
+// seed_abs: take the S7 seed from the ENGINE ABSMAX rather than the previous program's res6.
+// Needed once cmd.xred does the cross-channel sum in hardware: the absmax of the summed
+// vector then lives in the engine tracker instead of a reduce_acc's res6. spill ends with
+// SMOV s6, s7, so the value also lands in res6 and a following norm_i32 on KRES6 sees
+// exactly what the reduce chain used to hand it.
+void seq_desc_vec_seed(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_t srcs,
+                       int seed_abs)
+{
     volatile uint32_t *d = desc_w(idx);
-    d[0] = 2u | ((uint32_t)srcs << 16);
+    d[0] = 2u | (seed_abs ? (1u << 4) : 0u) | ((uint32_t)srcs << 16);
     d[1] = pc;
     for (int i = 0; i < 8; i++)
         d[2 + i] = (i < n) ? (uint32_t)args[i] : 0;
@@ -31,7 +42,8 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
     volatile uint32_t *d = desc_w(idx);
     d[0]  = 1;
     d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9)
-                     | ((uint32_t)op->rshift_rpre << 10) | ((uint32_t)op->qn << 11);
+                     | ((uint32_t)op->rshift_rpre << 10) | ((uint32_t)op->qn << 11)
+                     | ((uint32_t)op->xred << 12);
     d[2]  = op->rows | ((uint32_t)op->rem << 16);
     d[3]  = op->cols;
     d[4]  = op->wbase;

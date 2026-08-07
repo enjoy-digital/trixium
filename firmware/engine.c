@@ -64,6 +64,11 @@ void engine_run(const struct engine_op *op)
     ENG_WR(qstride);
     ENG_WR(rshift2);
 #endif
+#ifdef CSR_ENGINE_CSR_XRED_ADDR
+    // Must be written unconditionally, not only when set: the CSR is sticky, so an op that
+    // left xred=1 would silently reshape the next AXPY's result layout.
+    ENG_WR(xred);
+#endif
     // Snapshot each reader's beat counter before the op: on a stall the deltas say exactly
     // which channel came up short, which is the one fact the status bits cannot give.
     // Expected delta per channel = wlen + (chan < rem ? sbeats + cbeats : 0).

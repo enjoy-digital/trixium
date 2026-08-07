@@ -14,13 +14,17 @@ base/count and one start, then polls a single completion.
 
 Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   w0:  [3:0] unit: 0 = stop, 1 = engine op, 2 = vector-unit program.
+       [4] seed S7 from the ENGINE ABSMAX instead of the previous program's res6. Used by
+           the absmax spill once cmd.xred does the cross-channel sum in hardware and the
+           value stops flowing through a vector program's res6.
        [31:16] vec arg sources, 2 bits each (arg i at [16+2i +: 2]):
                0 = immediate (w2+i), 1 = k(engine absmax) = max(0, bitlen(absmax) - 14),
                2 = rpre(prev vec res6) = bitlen(res6) + 5 (bitexact.axpy_rpre),
                3 = k(prev vec res6) = max(0, bitlen(res6) - 14) (norm shift from a
                    reduce_acc absmax result).
   engine: w1 = kind | ilv<<8 | supw<<9 | rshift_rpre<<10 (rshift taken from
-          rpre(prev vec res6) instead of w7) | qn<<11 (dual-Q GQA);
+          rpre(prev vec res6) instead of w7) | qn<<11 (dual-Q GQA)
+          | xred<<12 (AXPY: sum the per-channel partials in hardware);
           w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;  w5 = wlen;
           w6 = sbeats | cbeats<<8 | qstride<<16 (head-B result offset, words);
           w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
@@ -70,6 +74,7 @@ class BonsaiSequencer(LiteXModule):
         self.eng_ilv    = Signal()
         self.eng_supw   = Signal()
         self.eng_qn      = Signal()
+        self.eng_xred   = Signal()  # AXPY cross-channel reduce (engine sums the partials).
         self.eng_qstride = Signal(16)
         self.eng_rshift2 = Signal(6)
         self.eng_done   = Signal()   # From the engine (pulse).
@@ -81,6 +86,8 @@ class BonsaiSequencer(LiteXModule):
         self.vec_args  = [Signal(32, name=f"seq_vec_arg{i}") for i in range(8)]
         self.vec_done  = Signal()    # From the vector unit (pulse).
         self.vec_res6  = Signal(48)  # Vector unit S6 result (registered at DONE).
+        self.vec_seed7 = Signal(48)  # S7 seed for the next program: res6, or the engine
+                                     # absmax when w0[4] is set (see below).
 
         # Scratchpad read (through the engine's fill-port mux).
         self.sp_adr    = Signal(13)
@@ -132,6 +139,16 @@ class BonsaiSequencer(LiteXModule):
             k_res6.eq(Mux(res6_bl > 14, res6_bl - 14, 0)),
         ]
 
+        # S7 seed select (w0[4]). Normally the previous program's res6, which is how a list
+        # chains a hardware result into the next program. With cmd.xred the engine does the
+        # cross-channel sum itself, so the value the CPU needs afterwards - the absmax of the
+        # summed vector - lives in the engine tracker and no longer passes through a vector
+        # program's res6. Seeding S7 from it lets the existing spill program persist it
+        # unchanged, and because spill ends with SMOV s6, s7 the value also lands in res6, so
+        # a following norm_i32 taking k from KRES6 sees exactly what the reduce_acc chain
+        # used to give it. That is what keeps the numerics bit-identical across the switch.
+        self.comb += self.vec_seed7.eq(Mux(w(0, 0)[4], self.absmax, self.vec_res6))
+
         for i in range(8):
             src = Signal(2)
             imm = Signal(32)
@@ -161,6 +178,7 @@ class BonsaiSequencer(LiteXModule):
             self.eng_bias.eq(w(0, 7)[0:7]),
             self.eng_rshift.eq(Mux(w(0, 1)[10], rpre_v[0:6], w(0, 7)[16:22])),
             self.eng_qn.eq(w(0, 1)[11]),
+            self.eng_xred.eq(w(0, 1)[12]),
             self.eng_qstride.eq(w(0, 6)[16:32]),
             self.eng_rshift2.eq(w(0, 7)[22:28]),
             self.eng_xsrc.eq(w(1, 8)[0:24]),

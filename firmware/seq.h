@@ -21,6 +21,8 @@
 #define SEQ_SRC_KRES6  3 // k = max(0, bitlen(prev vec res6) - 14).
 
 void     seq_desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_t srcs);
+void     seq_desc_vec_seed(uint32_t idx, uint16_t pc, const int32_t *args, int n,
+                           uint16_t srcs, int seed_abs); // S7 <- engine absmax.
 void     seq_desc_engine(uint32_t idx, const struct engine_op *op);
 void     seq_desc_stop(uint32_t idx);
 void     seq_patch(uint32_t idx, int word, uint32_t value); // Patch one descriptor word.
