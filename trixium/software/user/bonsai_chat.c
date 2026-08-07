@@ -340,6 +340,14 @@ static int tty_expect(const char *needle, double timeout, char *cap, size_t capm
     double t0 = now_s();
     size_t w = 0;
     size_t nl = strlen(needle);
+    /* Match against a private sliding window, NOT the caller's capture buffer. Keying the
+     * comparison off `cap` meant every tty_expect(..., NULL, 0, ...) could never match - the
+     * prompt sync is exactly that call, so attaching to a running card always burned the full
+     * 120 s and reported "firmware not running" for a perfectly healthy board. It also failed
+     * once a capture buffer filled, because w stops advancing there. */
+    char win[128];
+    size_t ww = 0;
+    if (nl >= sizeof(win)) nl = sizeof(win) - 1;
     if (cap && capmax) cap[0] = 0;
     while (now_s() - t0 < timeout) {
         uint8_t c;
@@ -347,7 +355,13 @@ static int tty_expect(const char *needle, double timeout, char *cap, size_t capm
         if (r <= 0) continue;
         if (echo) { fputc(c, stdout); fflush(stdout); }
         if (cap && w + 1 < capmax) { cap[w++] = (char)c; cap[w] = 0; }
-        if (w >= nl && cap && strcmp(cap + w - nl, needle) == 0)
+        if (ww < nl) {
+            win[ww++] = (char)c;
+        } else {
+            memmove(win, win + 1, nl - 1);
+            win[nl - 1] = (char)c;
+        }
+        if (ww == nl && memcmp(win, needle, nl) == 0)
             return 1;
     }
     return 0;
