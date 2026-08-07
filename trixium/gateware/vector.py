@@ -497,13 +497,27 @@ class BonsaiVectorUnit(LiteXModule):
 
         self.fsm = fsm = FSM(reset_state="IDLE")
 
-        # Instruction prefetch: the next-sequential word is read during EX1 (address pc+1,
-        # data valid in EX1B, captured into insn_f at the EX1B edge - legal because EX1B/EX2
-        # decode from instr_r, registered at EX1). EX2 then jumps straight to EX0 for
-        # sequential flow, cutting an instruction from 6 cycles to 4; only a taken LOOPE and
-        # the cold start pay the 2-cycle FETCH/FETCHR refill. The EX0->EX2 datapath windows
-        # are untouched, so the vecunit multicycle constraints hold as declared.
-        prefetch = Signal()
+        # Instruction prefetch: the next word is read during EX1 (data valid in EX1B,
+        # captured into insn_f at the EX1B edge - legal because EX1B/EX2 decode from
+        # instr_r, registered at EX1). EX2 then jumps straight to EX0, cutting an
+        # instruction from 6 cycles to 4. Only the cold start pays the 2-cycle
+        # FETCH/FETCHR refill. The EX0->EX2 datapath windows are untouched, so the vecunit
+        # multicycle constraints hold as declared.
+        #
+        # The taken loop back-edge used to pay that refill on EVERY iteration: the prefetch
+        # was sequential, so EX2 jumped to FETCH and spent 2 more cycles re-reading
+        # loop_start. On a body costing 4 cycles per instruction that is 7.7% of reduce_acc
+        # and more on shorter bodies, and the vector ops are ~44% of the token.
+        #
+        # It is fixed with a one-entry loop buffer rather than by muxing loop_start into the
+        # imem address. When LOOPS retires, the word at loop_start (= pc+1) is *already* in
+        # insn_f, because EX1 prefetched it - so capture it in loop_first there and restore
+        # insn_f from that register on a taken back-edge. No imem read, and nothing added to
+        # imem_r.adr, which matters: the imem BRAM path is the unit's worst timing path (see
+        # the MCP note below), and a comparator on its address is exactly what it does not
+        # need at WNS -0.234.
+        prefetch   = Signal()
+        loop_first = Signal(32)
         self.comb += imem_r.adr.eq(Mux(prefetch, pc + 1, pc))
         # Scratchpad read launch (EX1): address from S[sa] byte address.
         self.comb += self.sp_rd_adr.eq(sa_val[5:18])
@@ -537,6 +551,14 @@ class BonsaiVectorUnit(LiteXModule):
         self.sync += [
             If(fsm.ongoing("FETCHR"), insn_f.eq(imem_r.dat_r)),
             If(fsm.ongoing("EX1B"),   insn_f.eq(imem_r.dat_r)), # Prefetched pc+1 word.
+            # Loop buffer. At EX2 of LOOPS, insn_f already holds the word at pc+1, which is
+            # exactly loop_start - so stash it, and hand it back on the taken back-edge.
+            # These two states are mutually exclusive with EX1B above, so insn_f has one
+            # writer per cycle.
+            If(fsm.ongoing("EX2"),
+                If(f_op == OP["LOOPS"], loop_first.eq(insn_f)),
+                If((f_op == OP["LOOPE"]) & (loop_cnt > 1), insn_f.eq(loop_first)),
+            ),
             If(fsm.ongoing("EX0"),
                 va_flat.eq(va_flat_c),
                 va_flat_red.eq(va_flat_c),
@@ -575,7 +597,7 @@ class BonsaiVectorUnit(LiteXModule):
             ).Elif((f_op == OP["LOOPE"]) & (loop_cnt > 1),
                 NextValue(loop_cnt, loop_cnt - 1),
                 NextValue(pc, loop_start),
-                NextState("FETCH"), # Prefetch was sequential: refill from loop_start.
+                NextState("EX0"),   # insn_f restored from loop_first this same edge.
             ).Else(
                 NextValue(pc, pc + 1),
                 NextState("EX0"),   # insn_f already holds the word at pc+1.
