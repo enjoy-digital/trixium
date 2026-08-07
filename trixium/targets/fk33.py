@@ -6,7 +6,8 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Build/Use (from the repo root, ip/hbm/hbm_0.xci is resolved relative to CWD):
+# Build/Use (from the repo root: USPHBM2 resolves ip/hbm/<name>.xci relative to CWD, and ip/hbm
+# is a symlink at the TCK variant you are building - ip/hbm900 or ip/hbm800):
 # ./trixium.py --variant=a --build --load
 # litex_server --jtag --jtag-config=prog/openocd_xc7_ft2232.cfg --jtag-chain=2
 # litex_term crossover
@@ -67,8 +68,8 @@ class BonsaiSoC(SoCCore):
                 "exclusive with --with-pcie host access. See docs/phase2.md.")
         assert variant in ["a", "b", "c"]
         # The HBM AXI clock must sit in [tck/4, tck/2] (PG276). tck is the stack clock set
-        # by the IP's PLL divider: 900 MHz (1800 Mbps, ip/hbm/hbm_0.xci) -> 225..450 MHz;
-        # 800 MHz (1600 Mbps, ip/hbm/hbm_800.xci) -> 200..400 MHz at 11% less bandwidth,
+        # by the IP's PLL divider: 900 MHz (1800 Mbps, ip/hbm900/hbm_0.xci) -> 225..450 MHz;
+        # 800 MHz (1600 Mbps, ip/hbm800/hbm_800.xci) -> 200..400 MHz at 11% less bandwidth,
         # which buys timing headroom when the fabric cannot make 225.
         assert hbm_tck in (800, 900)
         assert (hbm_tck/4)*1e6 <= sys_clk_freq <= (hbm_tck/2)*1e6 # HBM AXI clock range.
@@ -246,12 +247,12 @@ def main():
     args = parser.parse_args()
 
     # Builds must run from the repo root: USPHBM2 resolves the XCI as <cwd>/ip/hbm/<name>.xci.
-    # The 800 MHz stack keeps its own directory (ip/hbm800) because Vivado's per-IP support
-    # files collide with the 900 MHz ones - 31 identically named files, among them the
+    # Each TCK variant keeps its own directory (ip/hbm900, ip/hbm800) because Vivado's per-IP
+    # support files collide - 31 identically named files, among them the
     # xpm_internal_config_file_*.mem that encode the PLL divider - so a merged ip/hbm would
-    # silently reconfigure whichever stack was generated second. A full gateware build of the
-    # 800 MHz variant therefore needs ip/hbm pointing at ip/hbm800 (see docs/bringup.md);
-    # header-only runs (--driver) just need the XCI to resolve.
+    # silently reconfigure whichever stack was generated second. ip/hbm is therefore a symlink
+    # at the variant being built (see docs/bringup.md), and is not tracked; header-only runs
+    # (--driver) just need the XCI to resolve, so we make a file symlink and remove it at exit.
     _hbm_ip  = "hbm_0" if args.hbm_tck == 900 else f"hbm_{args.hbm_tck}"
     _hbm_xci = os.path.join("ip", "hbm", _hbm_ip + ".xci")
     _hbm_alt = os.path.join("ip", f"hbm{args.hbm_tck}", _hbm_ip + ".xci")
@@ -260,7 +261,7 @@ def main():
             f"neither {_hbm_xci} nor {_hbm_alt} found; run from the repository root."
         assert not args.build, (
             f"{_hbm_ip} lives in ip/hbm{args.hbm_tck}/ but USPHBM2 reads ip/hbm/; point ip/hbm at "
-            f"it first (e.g. 'mv ip/hbm ip/hbm900 && ln -s hbm{args.hbm_tck} ip/hbm').")
+            f"it first ('rm -f ip/hbm && ln -s hbm{args.hbm_tck} ip/hbm').")
         os.symlink(os.path.join("..", f"hbm{args.hbm_tck}", _hbm_ip + ".xci"), _hbm_xci)
         atexit.register(lambda p=_hbm_xci: os.path.islink(p) and os.unlink(p))
 

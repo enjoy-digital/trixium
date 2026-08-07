@@ -13,9 +13,13 @@ prog/bitstreams/*
 # Models / weight images (regenerable, large)
 models/
 
-# Vivado-generated HBM IP outputs (only the .xci is tracked)
-ip/hbm/*
-!ip/hbm/hbm_0.xci
+# Vivado-generated HBM IP outputs (only the .xci is tracked).
+# Each TCK variant keeps its own directory - the 31 identically named support files would
+# otherwise clobber each other - and ip/hbm is a local symlink at the one the build wants,
+# because USPHBM2 resolves the XCI as <cwd>/ip/hbm/<name>.xci. See trixium.py.
+/ip/hbm
+ip/hbm900/*
+!ip/hbm900/hbm_0.xci
 
 # Build/convert logs at the repo root
 /*.log
