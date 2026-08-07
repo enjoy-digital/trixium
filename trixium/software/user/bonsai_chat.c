@@ -270,18 +270,6 @@ static int tok_encode(const char *text, int *out, int max)
     return w;
 }
 
-static void tok_decode(const int *ids, int n, char *out, size_t max)
-{
-    size_t w = 0;
-    for (int i = 0; i < n; i++) {
-        if (ids[i] < 0 || (uint32_t)ids[i] >= g_nvocab) continue;
-        const struct tok_entry *t = &g_vocab[ids[i]];
-        if (w + t->len + 1 >= max) break;
-        memcpy(out + w, t->bytes, t->len);
-        w += t->len;
-    }
-    out[w] = 0;
-}
 
 /*---------------------------------------------------------------------------------------*/
 /* Console UART: serial boot + line protocol                                              */
@@ -558,20 +546,82 @@ static int send_prompt(const int *ids, int n)
     return 0;
 }
 
-static int parse_gen(const char *buf, int *ids, int max)
+/* How many bytes the UTF-8 sequence starting with `c` occupies (1 for ASCII, continuation
+ * bytes and anything malformed - those just pass through). */
+static int utf8_len(unsigned char c)
 {
-    const char *p = strstr(buf, "GEN:");
-    if (!p) return 0;
-    p += 4;
-    int n = 0;
-    while (*p && n < max) {
-        while (*p == ' ' || *p == '\r') p++;
-        if (!isdigit((unsigned char)*p)) break;
-        ids[n++] = atoi(p);
-        while (isdigit((unsigned char)*p)) p++;
-    }
-    return n;
+    if (c < 0x80)          return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
 }
+
+/* Read the generation as it arrives and print each token the moment it lands.
+ *
+ * The firmware already emits one printf per token, so the ids were streaming over the UART
+ * all along - the tool simply buffered to "GEN DONE" and printed the reply in one lump. The
+ * only real work here is UTF-8: the vocabulary is byte-level BPE, so a single token can end
+ * halfway through a multi-byte character. Bytes are held back until the character is
+ * complete, otherwise the terminal shows replacement junk mid-word.
+ *
+ * Returns the token count, or -1 on timeout. *first_dt gets the time to the first token,
+ * which is the latency a user actually feels. */
+static int stream_generate(double timeout, int *ids, int max, double *first_dt)
+{
+    double t0 = now_s();
+    char win[16];                 /* sliding window, to spot "GEN:" then "GEN DONE" */
+    size_t ww = 0;
+    int started = 0, n = 0;
+    long acc = -1;                /* digits of the id being parsed, -1 = not in a number */
+    unsigned char pend[8];        /* incomplete UTF-8 tail */
+    size_t pendn = 0;
+
+    *first_dt = 0;
+    while (now_s() - t0 < timeout) {
+        unsigned char c;
+        ssize_t r = read(g_tty, &c, 1);
+        if (r <= 0) continue;
+
+        if (ww < sizeof(win) - 1) win[ww++] = (char)c;
+        else { memmove(win, win + 1, sizeof(win) - 2); win[sizeof(win) - 2] = (char)c; }
+        win[ww] = 0;
+
+        if (!started) {                        /* skip the echoed command, wait for GEN: */
+            if (strstr(win, "GEN:")) { started = 1; ww = 0; win[0] = 0; }
+            continue;
+        }
+        if (strstr(win, "GEN DONE")) break;
+
+        if (isdigit(c)) {
+            acc = (acc < 0 ? 0 : acc)*10 + (c - '0');
+            continue;
+        }
+        if (acc < 0) continue;                 /* delimiter with no digits pending */
+
+        /* One complete id: record it, then print its bytes. */
+        if (n < max) ids[n] = (int)acc;
+        n++;
+        if (n == 1) *first_dt = now_s() - t0;
+        if (acc >= 0 && (uint32_t)acc < g_nvocab) {
+            const struct tok_entry *t = &g_vocab[acc];
+            for (size_t i = 0; i < t->len; i++) {
+                if (pendn < sizeof(pend)) pend[pendn++] = (unsigned char)t->bytes[i];
+                size_t need = utf8_len(pend[0]);
+                if (pendn >= need) {           /* character complete: emit it */
+                    fwrite(pend, 1, need, stdout);
+                    memmove(pend, pend + need, pendn - need);
+                    pendn -= need;
+                }
+            }
+            fflush(stdout);
+        }
+        acc = -1;
+    }
+    if (pendn) { fwrite(pend, 1, pendn, stdout); fflush(stdout); }   /* malformed tail */
+    return (now_s() - t0 < timeout) ? n : -1;
+}
+
 
 static int self_test(const char *tests_path)
 {
@@ -712,7 +762,6 @@ int main(int argc, char **argv)
 
     char *linebuf = NULL; size_t linecap = 0;
     int   ids[1024], out[1024];
-    char  text[8192];
     int   fresh = 1;
 
     while (1) {
@@ -743,15 +792,17 @@ int main(int argc, char **argv)
         }
 
         send_line("genb %d", ntok);
-        if (!tty_expect("GEN DONE", 600.0, cap, sizeof(cap), 0)) {
+        printf("bot> ");
+        fflush(stdout);
+        double first_dt = 0;
+        int ng = stream_generate(600.0, out, 1024, &first_dt);
+        if (ng < 0) {
             fprintf(stderr, "\n[timeout waiting for generation]\n");
             continue;
         }
         double dt = now_s() - t0;
-        int ng = parse_gen(cap, out, 1024);
-        tok_decode(out, ng, text, sizeof(text));
-        printf("bot> %s\n", text);
-        printf("     [%d tokens, %.1f s, %.1f tok/s]\n\n", ng, dt, ng/dt);
+        printf("\n     [%d tokens, %.1f s, %.1f tok/s, first token %.1f s]\n\n",
+               ng, dt, ng > 0 ? ng/dt : 0.0, first_dt);
         tty_expect("bonsai>", 5.0, NULL, 0, 0);
     }
     free(linebuf);
