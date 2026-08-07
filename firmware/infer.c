@@ -828,7 +828,11 @@ static void seq_build_attn(void)
     seq_attn_heads = 0;
     if (n_ch < 2)
         return; // n1's absmax lives in the engine CSR; keep CPU-dispatched ops there.
-    int dph = 6 + n_ch;
+    // 7 descriptors per head: quant8, scores, softmax8, spill(p8), axpy(xred),
+    // spill(absmax from the engine tracker), norm_i32. It was 6 + n_ch = 14 before the
+    // engine learned to reduce across channels; at N=8 that halving is what lets all 16
+    // heads fit one list (16*7 + 49 = 161 of 192) so the chunking below stops splitting.
+    int dph = 7;
     int cap = (192 - seq_qkr_count)/dph;
     if (cap <= 0)
         return;
@@ -865,17 +869,18 @@ static void seq_build_attn(void)
         wv.xsrc        = SP_X;
         wv.dst         = SP_AW;
         wv.rshift_rpre = 1;
+        wv.xred        = 1;
         seq_desc_engine(di + 4, &wv);
-        for (int c = 1; c < n_ch; c++) {
-            int32_t rargs[4] = {(int32_t)SP_AW, (int32_t)(SP_AW + (uint32_t)c*head_dim*4),
-                                (int32_t)SP_AW, head_dim/8};
-            seq_desc_vec(di + 4 + c, PROG_REDUCE_ACC, rargs, 4, 0);
-        }
+        // The engine summed the channels itself, so the n_ch-1 reduce_acc calls are gone and
+        // the absmax the CPU fold needs comes from the engine tracker instead of the last
+        // reduce's res6. seq_desc_vec_seed puts it in S7 for the spill, and spill's trailing
+        // SMOV s6, s7 leaves it in res6 - so the norm below keeps taking k from KRES6 and
+        // sees the identical value. Numerics are unchanged by construction, not by luck.
         int32_t p2 = (int32_t)(SP_AWAM + (uint32_t)j*32);
-        seq_desc_vec(di + 4 + n_ch, PROG_SPILL, &p2, 1, 0);
+        seq_desc_vec_seed(di + 5, PROG_SPILL, &p2, 1, 0, 1);
         int32_t nargs[5] = {(int32_t)SP_AW, 0, (int32_t)(SP_H + (uint32_t)j*head_dim*2),
                             head_dim/16, 0};
-        seq_desc_vec(di + 5 + n_ch, PROG_NORM_I32, nargs, 5,
+        seq_desc_vec(di + 6, PROG_NORM_I32, nargs, 5,
                      (uint16_t)(SEQ_SRC_KRES6 << 8)); // A4 = k(res6).
     }
 }
@@ -1620,8 +1625,8 @@ attn_scores: ;
                     seq_patch(di + 4, 4, kv_region_addr(l, kvh, 1));
                     seq_patch(di + 4, 5, wlen);
                     seq_patch(di + 4, 7, (uint32_t)Bv);
-                    seq_patch(di + 4 + n_ch, 2, SP_AWAM + (uint32_t)hh*32);
-                    seq_patch(di + 5 + n_ch, 4, SP_H + (uint32_t)hh*head_dim*2);
+                    seq_patch(di + 5, 2, SP_AWAM + (uint32_t)hh*32);
+                    seq_patch(di + 6, 4, SP_H + (uint32_t)hh*head_dim*2);
                     (void)Rd;
                 }
                 seq_run((uint32_t)seq_attn_base, (uint32_t)nh*seq_attn_dph);

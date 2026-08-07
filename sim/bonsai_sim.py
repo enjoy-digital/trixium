@@ -116,7 +116,11 @@ class BonsaiSimSoC(SoCCore):
             self.vecunit.seq_pc.eq(self.seq.vec_pc),
             self.seq.vec_done.eq(self.vecunit.done),
             self.seq.vec_res6.eq(self.vecunit.res6.status),
-            self.vecunit.seq_seed7.eq(self.seq.vec_res6), # res6 chaining (S7 seed).
+            # Must match trixium.py: res6 chaining, or the engine absmax when the
+            # descriptor sets w0[4]. Wiring this from vec_res6 directly made seed_abs a
+            # silent no-op in sim - the spill then persisted the p8 sum instead of the
+            # absmax, which is what 'am == P8 exactly' in the XPROBE output showed.
+            self.vecunit.seq_seed7.eq(self.seq.vec_seed7),
         ]
         self.comb += [self.vecunit.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
         self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit,

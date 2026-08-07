@@ -97,3 +97,42 @@ def test_tiny_image_roundtrip(tmp_path):
                               reader.tensor_channel_bytes("token_embd.weight", 1))
     assert np.array_equal(reader.tensor_channel_bytes("blk.0.attn_norm.weight", 0),
                           reader.tensor_channel_bytes("blk.0.attn_norm.weight", 1))
+def test_soc_definitions_wire_the_sequencer_alike():
+    """trixium.py and sim/bonsai_sim.py must wire the vecunit/sequencer identically.
+
+    There are two SoC definitions - hardware and Verilator sim - and every integration
+    signal has to be spelled out in both. When they drift, the sim silently stops testing
+    what the hardware does, which is the worst possible failure: gates pass, hardware is
+    wrong, or (as happened) a sim gate fails for a reason that exists only in the sim.
+
+    Paid for twice now. The include-guard case let bonsai_load upload to a stale base. The
+    seq_seed7 case wired the S7 seed straight from vec_res6 in the sim only, which made the
+    descriptor's w0[4] absmax-seed select a no-op there: the spill persisted the softmax p8
+    sum instead of the engine absmax, norm_i32 took its shift from that, and every head came
+    out misscaled. It cost several 12-minute Verilator runs and a wrong root-cause call
+    before an XPROBE showed `am` equal to `P8` exactly.
+
+    A grep is crude, but it is instant and it fails loudly on the one thing that went wrong.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    srcs = {
+        "trixium.py":    (root/"trixium.py").read_text(),
+        "sim/bonsai_sim.py":  (root/"sim/bonsai_sim.py").read_text(),
+    }
+    # (signal, expected right-hand side) for the vecunit<->sequencer seam.
+    seam = [
+        ("seq_seed7", "vec_seed7"),  # NOT vec_res6: that bypasses the w0[4] mux.
+        ("seq_start", "vec_start"),
+        ("seq_pc",    "vec_pc"),
+    ]
+    for fname, text in srcs.items():
+        for sig, want in seam:
+            m = re.search(rf"vecunit\.{sig}\.eq\(\s*(?:self\.)?seq\.(\w+)", text)
+            assert m, f"{fname}: no wiring found for vecunit.{sig}"
+            assert m.group(1) == want, (
+                f"{fname}: vecunit.{sig} is wired from seq.{m.group(1)}, expected "
+                f"seq.{want}. The two SoC definitions have drifted - see this test's "
+                f"docstring for what that costs.")
