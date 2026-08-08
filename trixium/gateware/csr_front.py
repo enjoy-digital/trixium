@@ -73,6 +73,15 @@ class BonsaiEngineCSR(LiteXModule):
         self.perf_ar    = CSRStatus(32, description="AR stall cycles of selected reader.")
         self.perf_r     = CSRStatus(32, description="R stall cycles of selected reader.")
 
+        # Unit-overlap counters (free-running, low 32 bits). Answers the one question that
+        # decides whether a dual-issue sequencer is worth building: how much of a token
+        # already has both units busy, and how much has NEITHER - the latter being pure
+        # serialisation, which is the headroom.
+        self.cyc_total  = CSRStatus(32, description="Free-running cycles.")
+        self.cyc_eng    = CSRStatus(32, description="Cycles with the engine busy.")
+        self.cyc_vec    = CSRStatus(32, description="Cycles with the vector unit busy.")
+        self.cyc_both   = CSRStatus(32, description="Cycles with BOTH busy (overlap).")
+
         # # #
 
         pending = Signal()
@@ -145,6 +154,10 @@ class BonsaiEngineCSR(LiteXModule):
             engine.cmd.qstride.eq(self.qstride.storage),
             engine.cmd.rshift2.eq(self.rshift2.storage),
             ),
+            self.cyc_total.status.eq(engine.cyc_total[:32]),
+            self.cyc_eng.status.eq(engine.cyc_eng[:32]),
+            self.cyc_vec.status.eq(engine.cyc_vec[:32]),
+            self.cyc_both.status.eq(engine.cyc_both[:32]),
             self.status.fields.busy.eq(engine.busy),
             self.status.fields.error.eq(engine.error),
             self.status.fields.pending.eq(pending),
