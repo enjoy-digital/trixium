@@ -13,6 +13,21 @@ include $(SOC_DIRECTORY)/software/common.mak
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o
 
+# Objects are tree-specific: the generated CSR map differs between BUILD_DIRs, so an object
+# compiled against build/sim and linked into a build/n8_200_* binary (or vice versa) produces
+# firmware that reads the wrong register addresses. The failure is not a link error - it boots,
+# jumps to 0x40000000 and then the CPU STALLS on a bus access that never completes, with the
+# console silent after "Liftoff!". Cost half a sim run to diagnose.
+#
+# The %.o rule below depends only on the .c, so nothing forces a rebuild when BUILD_DIR moves.
+# This stamp does: it records the tree the objects were built for and wipes them on a change.
+BUILD_STAMP := .build_dir_stamp
+-include $(BUILD_STAMP)
+ifneq ($(LAST_BUILD_DIR),$(BUILD_DIR))
+$(shell rm -f *.o *.d bonsai.bin bonsai.elf)
+$(shell echo "LAST_BUILD_DIR := $(BUILD_DIR)" > $(BUILD_STAMP))
+endif
+
 COMMA = ,
 REGULAR_LIBS = $(filter-out $(ALWAYS_LINK_LIBS),$(LIBS))
 ALWAYS_LINK_LIBFLAGS = $(if $(ALWAYS_LINK_LIBS),-Wl$(COMMA)--whole-archive $(ALWAYS_LINK_LIBS:lib%=-l%) -Wl$(COMMA)--no-whole-archive)
