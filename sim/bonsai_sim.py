@@ -63,7 +63,7 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 
 class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
-                 dual=True):
+                 dual=True, cpu_type="vexriscv", icache_kb=0):
         platform = Platform()
         self.comb += platform.trace.eq(1)
 
@@ -80,10 +80,36 @@ class BonsaiSimSoC(SoCCore):
             ram[HDR_OFFSET:HDR_OFFSET+len(meta)] = meta
         ram_words = [int.from_bytes(ram[i:i+4], "little") for i in range(0, len(ram), 4)]
 
+        # VexiiRiscv is generated from SpinalHDL at build time, so unlike VexRiscv - whose
+        # I-cache is a fixed 4 KB baked into every pregenerated variant - the cache is a
+        # parameter. That matters here: forward() alone is 12 KB, so a 4 KB I-cache cannot
+        # hold the hot loop, and the PC profiler measures ~49% of CPU cycles retiring nothing.
+        # 64 sets x 4 ways x 64 B lines = 16 KB, which covers forward() with room to spare.
+        if cpu_type == "vexiiriscv":
+            import argparse as _ap
+            from litex.soc.cores.cpu.vexiiriscv.core import VexiiRiscv
+            # VexiiRiscv reads a pile of class attributes (soc_args, soc_keys, update_repo,
+            # vexii_args, ...) that LiteX normally populates from its CLI. Constructing
+            # SoCCore directly bypasses that, so drive the real API with a defaults-only
+            # parser instead of hand-setting attributes - hand-setting works until the next
+            # LiteX bump adds a key, and then fails as an AttributeError deep in codegen.
+            _p = _ap.ArgumentParser()
+            VexiiRiscv.args_fill(_p)
+            _va = _p.parse_args([])
+            _va.cpu_variant = "standard"
+            VexiiRiscv.args_read(_va)
+            # Now override just the fetch cache. 64 sets x 4 ways x 64 B = 16 KB, against a
+            # 12 KB forward() that a 4 KB VexRiscv cache cannot hold.
+            sets = max(16, (icache_kb*1024)//(4*64)) if icache_kb else 64
+            VexiiRiscv.vexii_args = (VexiiRiscv.vexii_args
+                                     .replace("--fetch-l1-ways=2", "--fetch-l1-ways=4")
+                                     + f" --fetch-l1-sets={sets}")
+            print(f"[bonsai] VexiiRiscv args: {VexiiRiscv.vexii_args}")
+
         SoCCore.__init__(self, platform,
             clk_freq                 = int(1e6),
             ident                    = "TriXium Sim",
-            cpu_type                 = "vexriscv",
+            cpu_type                 = cpu_type,
             integrated_rom_size      = 0x20000,
             integrated_main_ram_size = MAIN_RAM_SIZE,
             integrated_main_ram_init = ram_words,
@@ -168,6 +194,12 @@ def main():
     parser.add_argument("--firmware",       default="firmware/bonsai.bin")
     parser.add_argument("--build-software", action="store_true", help="Generate headers + BIOS only.")
     parser.add_argument("--run",            action="store_true", help="Build and run the simulation.")
+    parser.add_argument("--cpu-type",  default="vexriscv",
+                        choices=["vexriscv", "vexiiriscv"],
+                        help="vexiiriscv is SpinalHDL-generated so its I-cache is sizable; "
+                             "vexriscv's is a fixed 4 KB in every variant")
+    parser.add_argument("--icache-kb", type=int, default=0,
+                        help="vexiiriscv only: I-cache size in KB (default 16)")
     parser.add_argument("--pc-profile",     action="store_true",
                         help="compile the VexRiscv PC profiler in (sim/pc_profiler.cpp); "
                              "writes pcprof-*.txt into build/sim/gateware")
@@ -184,6 +216,7 @@ def main():
 
     if args.build_software:
         soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=not args.no_dual,
+        cpu_type=args.cpu_type, icache_kb=args.icache_kb,
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
         builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
         builder.compile_gateware = False
@@ -191,6 +224,7 @@ def main():
         return
 
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=not args.no_dual,
+        cpu_type=args.cpu_type, icache_kb=args.icache_kb,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
