@@ -168,6 +168,9 @@ def main():
     parser.add_argument("--firmware",       default="firmware/bonsai.bin")
     parser.add_argument("--build-software", action="store_true", help="Generate headers + BIOS only.")
     parser.add_argument("--run",            action="store_true", help="Build and run the simulation.")
+    parser.add_argument("--pc-profile",     action="store_true",
+                        help="compile the VexRiscv PC profiler in (sim/pc_profiler.cpp); "
+                             "writes pcprof-*.txt into build/sim/gateware")
     parser.add_argument("--trace",          action="store_true", help="Enable FST tracing.")
     parser.add_argument("--hbm-latency",    default=16, type=int)
     parser.add_argument("--hbm-stall-rate", default=0, type=int)
@@ -190,8 +193,21 @@ def main():
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=not args.no_dual,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
+    # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
+    # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the
+    # VexRiscv retired PC every cycle. That is the only way to attribute the ~69% of a token
+    # in which neither the engine nor the vector unit is busy; perf_print's buckets are
+    # op-class wall time that already contains the CPU glue.
+    #
+    # Note LiteX's build_sim.sh starts with `rm -rf obj_dir/`, so adding this triggers a full
+    # re-verilate the first time.
+    extra_sources = []
+    if args.pc_profile:
+        extra_sources.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "pc_profiler.cpp"))
     builder.build(sim_config=sim_config, run=args.run, opt_level="O3",
-        threads=args.threads, trace=args.trace, trace_fst=args.trace)
+        threads=args.threads, trace=args.trace, trace_fst=args.trace,
+        verilator_extra_sources=extra_sources)
 
 if __name__ == "__main__":
     main()
