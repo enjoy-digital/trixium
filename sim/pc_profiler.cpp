@@ -58,6 +58,20 @@ unsigned g_snap = 0;
 double   g_last_ckpt_s = 0.0, g_ckpt_period_s = 60.0;
 char     g_dir[512] = ".";
 
+// Timeline events for tools/trace_decode.py: 8 bytes each, little-endian.
+//   cycle:u32 | kind:u8 (0 = busy-state edge, 1 = marker) | payload:u8[3]
+//   kind 0: payload[0] = eng | vec<<1 | seq<<2   (state AFTER the edge)
+//   kind 1: payload[0] = marker index into the g_markers order
+FILE    *g_evf = nullptr;
+uint8_t  g_busy_prev = 0xFF;
+
+inline void event(uint32_t cyc, uint8_t kind, uint8_t p0) {
+    if (!g_evf) return;
+    uint8_t rec[8] = {(uint8_t)cyc, (uint8_t)(cyc>>8), (uint8_t)(cyc>>16), (uint8_t)(cyc>>24),
+                      kind, p0, 0, 0};
+    fwrite(rec, 1, 8, g_evf);
+}
+
 char     g_tail[128]; size_t g_tail_n = 0;
 char    *g_markers[32]; size_t g_nmarkers = 0;
 
@@ -99,7 +113,7 @@ void dump(const char *tag) {
     g_snap++;
 }
 
-void dump_final() { dump("final"); }
+void dump_final() { dump("final"); if (g_evf) fclose(g_evf); g_evf = nullptr; }
 
 inline void sample(Vsim_VexRiscv *cpu) {
     g_cycles++;
@@ -142,6 +156,7 @@ inline void uart_sniff(Vsim *sim) {
         // Anchored at the newest byte, so a marker that is a prefix of another cannot fire early.
         if (g_tail_n >= L && !memcmp(g_tail + g_tail_n - L, g_markers[m], L)) {
             char tag[64]; sanitize(g_markers[m], tag, sizeof(tag));
+            event((uint32_t)g_cycles, 1, (uint8_t)m);
             dump(tag);
             g_tail_n = 0; g_tail[0] = 0;
             return;
@@ -170,6 +185,11 @@ extern "C" void litex_sim_user_init(void *vsim) {
     // Covers SIGTERM/SIGINT/$finish, which exit through main(). It does NOT cover SIGKILL -
     // test/test_sim_smoke.py uses p.kill() - which is why the marker snapshots above are the
     // primary mechanism rather than a convenience.
+    {
+        char path[640];
+        snprintf(path, sizeof(path), "%s/trace_events.bin", g_dir);
+        g_evf = fopen(path, "wb");
+    }
     atexit(dump_final);
     fprintf(stderr, "[pcprof] armed: %zu markers, dir=%s\n", g_nmarkers, g_dir);
 }
@@ -182,6 +202,9 @@ extern "C" void litex_sim_user_post_eval(void *vsim, uint64_t time_ps) {
     if (clk && !g_prev_clk && g_ram.cyc) {
         g_time_ps = time_ps;
         sample(sim->sim->VexRiscv);
+        const uint8_t busy = (uint8_t)((sim->prof_eng_busy) | (sim->prof_vec_busy<<1)
+                                       | (sim->prof_seq_busy<<2));
+        if (busy != g_busy_prev) { event((uint32_t)g_cycles, 0, busy); g_busy_prev = busy; }
         uart_sniff(sim);
         if (g_ckpt_period_s > 0.0 && (g_cycles & 0xFFFFF) == 0) {
             const double now = wall_s();

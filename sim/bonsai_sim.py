@@ -117,6 +117,18 @@ class BonsaiSimSoC(SoCCore):
             uart_name                = "sim")
         self.crg = CRG(platform.request("sys_clk"))
 
+        # Profiler pad: unit busy bits as TOP-LEVEL sim ports (prof_eng_busy, prof_vec_busy,
+        # prof_seq_busy on the Vsim). The C++ profiler traces their edges into an event file
+        # for the Perfetto timeline. A pad, not __PVT__ names: Verilator's internal names are
+        # not a stable contract (__PVT__vecunit_busy is already folded away in this build),
+        # while requested pads are emitted verbatim.
+        from litex.build.generic_platform import Subsignal, Pins
+        platform.add_extension([("prof", 0,
+            Subsignal("eng_busy", Pins(1)),
+            Subsignal("vec_busy", Pins(1)),
+            Subsignal("seq_busy", Pins(1)))])
+        self._prof_pads = platform.request("prof")
+
         # Scratchpad + engine + HBM channel models.
         self.scratchpad = BonsaiScratchpad(size=256*1024)
         axis = []
@@ -154,6 +166,11 @@ class BonsaiSimSoC(SoCCore):
                                               seq=self.seq, dual=dual)
         self.engine_csr = BonsaiEngineCSR(self.engine, seq=self.seq)
         self.add_constant("BONSAI_HAS_SEQ")
+        self.comb += [
+            self._prof_pads.eng_busy.eq(self.engine.busy),
+            self._prof_pads.vec_busy.eq(self.vecunit.busy),
+            self._prof_pads.seq_busy.eq(self.seq.busy),
+        ]
         # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
         # kind-3 STORE ops (KV append).
         self.loader = BonsaiHBMLoader(axis)
