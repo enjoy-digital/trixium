@@ -63,7 +63,7 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 
 class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
-                 dual=True, cpu_type="vexriscv", icache_kb=0):
+                 dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra=""):
         platform = Platform()
         self.comb += platform.trace.eq(1)
 
@@ -103,7 +103,8 @@ class BonsaiSimSoC(SoCCore):
             sets = max(16, (icache_kb*1024)//(4*64)) if icache_kb else 64
             VexiiRiscv.vexii_args = (VexiiRiscv.vexii_args
                                      .replace("--fetch-l1-ways=2", "--fetch-l1-ways=4")
-                                     + f" --fetch-l1-sets={sets}")
+                                     + f" --fetch-l1-sets={sets}"
+                                     + (" " + vexii_extra if vexii_extra else ""))
             print(f"[bonsai] VexiiRiscv args: {VexiiRiscv.vexii_args}")
 
         SoCCore.__init__(self, platform,
@@ -200,6 +201,9 @@ def main():
                              "vexriscv's is a fixed 4 KB in every variant")
     parser.add_argument("--icache-kb", type=int, default=0,
                         help="vexiiriscv only: I-cache size in KB (default 16)")
+    parser.add_argument("--vexii-extra", default="",
+                        help="vexiiriscv only: extra SocGen args, e.g. "
+                             "'--with-btb --with-ras --with-gshare'")
     parser.add_argument("--pc-profile",     action="store_true",
                         help="compile the VexRiscv PC profiler in (sim/pc_profiler.cpp); "
                              "writes pcprof-*.txt into build/sim/gateware")
@@ -216,7 +220,7 @@ def main():
 
     if args.build_software:
         soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=not args.no_dual,
-        cpu_type=args.cpu_type, icache_kb=args.icache_kb,
+        cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
         builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
         builder.compile_gateware = False
@@ -224,7 +228,7 @@ def main():
         return
 
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=not args.no_dual,
-        cpu_type=args.cpu_type, icache_kb=args.icache_kb,
+        cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
@@ -236,6 +240,14 @@ def main():
     # Note LiteX's build_sim.sh starts with `rm -rf obj_dir/`, so adding this triggers a full
     # re-verilate the first time.
     extra_sources = []
+    if args.pc_profile and args.cpu_type != "vexriscv":
+        # pc_profiler.cpp includes Vsim_VexRiscv.h and reads lastStagePc/lastStageIsFiring by
+        # name. VexiiRiscv's generated module is VexiiRiscvLitex_<hash> with a different
+        # internal structure, so the profiler would not compile, let alone sample. Refuse
+        # loudly rather than emit a confusing "No such file: Vsim_VexRiscv.h" from verilator.
+        raise SystemExit("--pc-profile currently supports --cpu-type vexriscv only "
+                         "(the profiler reads VexRiscv's lastStagePc by name). "
+                         "Compare CPUs on leg cycle counts instead.")
     if args.pc_profile:
         extra_sources.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                           "pc_profiler.cpp"))
