@@ -19,8 +19,8 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
            collect a SUM of shifts across ops (silu's eg+eu term) while [7:6] keeps each
            op's own k addressable. Firmware zeroes kreg3 by capturing with [7:6]=3 first.
        (vec) w1[31:16]: per-arg 2-bit kreg-add select (arg i at [16+2i +: 2]): 0 = none,
-           n = add kreg[n-1] to the arg AFTER its 2-bit source resolves. Turns
-           "imm + earlier k" - the FFN exponent algebra that forced a CPU round-trip per
+           n = SUBTRACT kreg[n-1] from the arg AFTER its 2-bit source resolves. Turns
+           "imm - earlier k" - the FFN exponent algebra that forced a CPU round-trip per
            op - into descriptor-resident arithmetic. kreg3 is reachable via capture only.
        [4] seed S7 from the ENGINE ABSMAX instead of the previous program's res6. Used by
            the absmax spill once cmd.xred does the cross-channel sum in hardware and the
@@ -162,15 +162,32 @@ class BonsaiSequencer(LiteXModule):
         # KABS/KRES6 sources only expose the LATEST k, so every such arg forced a CPU
         # round-trip - measured as 43% of the GEN-HW window in 200-5k-cycle gaps.
         self.kregs = kregs = Array([Signal(32, name=f"kreg{i}") for i in range(4)])
-        # Gated on self.busy, not an FSM state: eng_done is wired from engine.done
-        # unconditionally, so it also pulses for CPU-dispatched ops - but those never run
-        # while the sequencer is busy (csr_front muxes the command interface to the
-        # sequencer for the whole list), so busy & eng_done is exactly "our engine
-        # descriptor completed" and d0 still holds its words.
-        self.sync += If(self.busy & self.eng_done,
-            If(w(0, 0)[5], kregs[w(0, 0)[6:8]].eq(k_absmax)),
-            If(w(0, 0)[8], kregs[3].eq(kregs[3] + k_absmax)),
-        )
+        # Two subtleties, both load-bearing:
+        # - Gated on self.busy, not an FSM state: eng_done also pulses for CPU-dispatched
+        #   ops, but those never run while the sequencer owns the command interface, so
+        #   busy & eng_done is exactly "our engine descriptor completed".
+        # - The capture is DELAYED two cycles. The engine absmax tracker lags its write
+        #   stage by two cycles (matvec.py: "the tracker lags the write by two cycles;
+        #   every reader trails done by more") - the KABS arg source qualifies because the
+        #   next DISPATCH is >2 cycles away, but a same-edge capture at done would miss a
+        #   max arriving in the final beat. Control bits are latched at done (d0 is
+        #   overwritten by the next descriptor fetch soon after); k is applied at done+2.
+        cap_d   = Signal(2)
+        cap_en  = Signal()
+        cap_acc = Signal()
+        cap_sel = Signal(2)
+        self.sync += [
+            cap_d.eq(Cat(self.busy & self.eng_done, cap_d[0])),
+            If(self.busy & self.eng_done,
+                cap_en.eq(w(0, 0)[5]),
+                cap_acc.eq(w(0, 0)[8]),
+                cap_sel.eq(w(0, 0)[6:8]),
+            ),
+            If(cap_d[1],
+                If(cap_en,  kregs[cap_sel].eq(k_absmax)),
+                If(cap_acc, kregs[3].eq(kregs[3] + k_absmax)),
+            ),
+        ]
 
         for i in range(8):
             src  = Signal(2)
@@ -187,7 +204,10 @@ class BonsaiSequencer(LiteXModule):
                     3: base.eq(k_res6),
                 }),
                 kadd.eq(w(0, 1)[16 + 2*i:18 + 2*i]),
-                self.vec_args[i].eq(base + Mux(kadd == 0, 0, kregs[kadd - 1])),
+                # SUBTRACT, not add: the exponent args have the shape 'constant - k'
+                # (silu A4 = -(eg+6) = C_layer - kg; eg = ex8 - bias + rshift + kg).
+                # The '+latest k' case is already covered by SEQ_SRC_KABS.
+                self.vec_args[i].eq(base - Mux(kadd == 0, 0, kregs[kadd - 1])),
             ]
 
         # Engine fields straight from the descriptor.

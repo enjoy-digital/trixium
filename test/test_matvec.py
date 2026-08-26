@@ -1585,6 +1585,10 @@ def test_sequencer_kreg_capture_and_add():
     ev     = rng.integers(-9, -4, T)
     scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
     v8     = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+    # Force the absmax into the LAST column, i.e. the final drained beat: the engine
+    # absmax tracker lags its write stage by two cycles, so a same-edge kreg capture reads
+    # a value missing exactly that beat. Random data let the race pass on luck.
+    v8[:, -1] = 127
     p8     = rng.integers(1, 128, T, dtype=np.int8)
     _, e16 = bx.fp16_decompose(scales)
     B_ax   = 12 - int(e16.max())
@@ -1621,8 +1625,8 @@ def test_sequencer_kreg_capture_and_add():
                           bias=B_ax, rshift=Rpre, rem=rem, xred=1,
                           kcap=1, kreg=0,                       # capture k -> kreg0
                           xsrc=0x200, dst=0x4000)
-             + _desc_vec(offs["norm_i32"], [0x4000, 0, 0x3000, cols//16, 0],
-                         kadds=[0, 0, 0, 0, 1])                 # A4 = 0 + kreg0
+             + _desc_vec(offs["norm_i32"], [0x4000, 0, 0x3000, cols//16, 2*k_exp],
+                         kadds=[0, 0, 0, 0, 1])                 # A4 = 2k - kreg0 = k
              + _desc_stop())
     sp = bytearray(64*1024)
     sp[0x200:0x200+T]            = p8.tobytes()

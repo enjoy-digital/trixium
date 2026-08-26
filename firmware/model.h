@@ -21,6 +21,9 @@ void model_cache_reset(void); // Invalidate the (role, layer) lookup cache (call
 
 // Run a ternary/q8 matvec for one tensor: x8 at scratchpad `xsrc`, int32 results at `dst`.
 void model_matvec(const struct bons_entry *e, uint32_t xsrc, uint32_t dst);
+struct engine_op; // engine.h; forward-declared so this header stays include-order free.
+void model_matvec_op(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
+                     struct engine_op *op); // Fill without running (descriptor lists).
 void model_matvec2(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
                    uint16_t qstride);
 

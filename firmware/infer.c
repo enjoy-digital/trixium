@@ -58,6 +58,8 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_K    0x3A000 // Resident k int16 (kv_dim <= 1024: 2 KB).
 #define SP_V    0x3B000 // Resident v int16.
 #define SP_TAB  0x3B800 // Rope table row for the current position ([c14 | s14]).
+#define SP_FFSP 0x1D000 // FFN seq spill beats (gate absmax, up absmax): the 0x1D000..0x1E000
+                        // gap between SP_H (ends 0x1C000 + 2*n_embd <= 0x1D000) and SP_XR.
 #define SP_FET2 0x3C000 // Second norm16 staging slot (k_norm while q_norm sits in SP_FET).
 
 // Fixed exponent for CPU-produced normed vectors (values bounded ~16 by construction).
@@ -899,6 +901,52 @@ static void seq_build_attn(void)
 // looked like a sequencer bug and was not: the gather consumed a merged result on merge_mask
 // but counted it on grant_valid, so a result could vanish without incrementing result_cnt.
 // `seq off` still selects the CPU-dispatched path per head.
+// FFN chain as ONE descriptor list (kreg exponent registers, sequencer w0[5]/w1[16+2i]).
+// The gap histogram put 43% of the GEN-HW window in 200-5k-cycle inter-op gaps; the FFN's
+// share exists because eg = ex8 - bias + rshift + kg mixes a per-layer constant with the
+// gate matvec's k - inexpressible with KABS alone. Layout (10 descriptors):
+//   0 gate matvec [capture k -> kreg0]      1 spill engine-absmax -> SP_FFSP+0
+//   2 norm_i32 SP_Y  -> SP_G [A4 = KABS]    3 up matvec
+//   4 spill engine-absmax -> SP_FFSP+32     5 norm_i32 SP_YU -> SP_U [A4 = KABS]
+//   6 silu_mul [A4 = imm(-(ex8 - bias_g + rshift_g + 6)) MINUS kreg0]
+//   7 quant8 SP_G -> SP_X (measured; its res6 = source absmax survives the list)
+//   8 down matvec                           9 stop
+// Post-list the CPU recovers: kg/ku from the two spilled absmaxes, s from vec res6, kd and
+// dmax from the engine absmax CSR (down ran last) - the SAME values the removed round-trips
+// produced, so the numerics are identical by construction. The final norm -> SP_D and
+// resid_add stay CPU-side (they need *omax and the residual ratchet state).
+static int seq_ffn_base = -1;
+static void seq_build_ffn(void)
+{
+#ifdef BONSAI_HAS_DUALQ
+    return; // Dual builds use attn2 lists; FFN list only wired on the shipping non-dual path.
+#else
+    int di = seq_qkr_count + seq_attn_heads*seq_attn_dph;
+    if (di + 10 > 192 || seq_attn_heads == 0)
+        return;
+    seq_ffn_base = di;
+    // Engine descriptors 0/3/8 are fully rebuilt per layer (entries differ); placeholders.
+    struct engine_op z = {0};
+    seq_desc_engine(di + 0, &z);
+    int32_t pa = (int32_t)SP_FFSP;
+    seq_desc_vec_seed(di + 1, PROG_SPILL, &pa, 1, 0, 1);
+    int32_t na[5] = {(int32_t)SP_Y, 0, (int32_t)SP_G, ffn_dim/16, 0};
+    seq_desc_vec(di + 2, PROG_NORM_I32, na, 5, (uint16_t)(SEQ_SRC_KABS << 8));
+    seq_desc_engine(di + 3, &z);
+    int32_t pb = (int32_t)(SP_FFSP + 32);
+    seq_desc_vec_seed(di + 4, PROG_SPILL, &pb, 1, 0, 1);
+    int32_t nb[5] = {(int32_t)SP_YU, 0, (int32_t)SP_U, ffn_dim/16, 0};
+    seq_desc_vec(di + 5, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KABS << 8));
+    int32_t sa[7] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15};
+    seq_desc_vec(di + 6, PROG_SILU_MUL, sa, 7, 0);
+    seq_patch(di + 6, 1, (uint32_t)PROG_SILU_MUL | (1u << (16 + 2*4))); // A4 -= kreg0.
+    int32_t qa[4] = {(int32_t)SP_G, 1, (int32_t)SP_X, ffn_dim/16};
+    seq_desc_vec(di + 7, PROG_QUANT8, qa, 4, 0);
+    seq_desc_engine(di + 8, &z);
+    seq_desc_stop(di + 9);
+#endif
+}
+
 int seq_use = 1;
 
 static int seq_at2_base, seq_at2_p1n, seq_at2_p2n, seq_at2_kvchunk;
@@ -1919,6 +1967,49 @@ attn_heads_done: ;
             int ex8 = E_NORM + op_quant8_sp(SP_H, SP_X, n_embd);
             perf_exit(OP_QUANT8);
 
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
+    && !defined(BONSAI_HAS_DUALQ)
+            if (seq_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
+                && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
+                // One list for gate->norm->up->norm->silu->quant8->down (see seq_build_ffn).
+                // Whole-list time is charged to OP_SILU_MUL: per-op shares are documented as
+                // unreliable under sequencing; totals are the measurement.
+                struct engine_op mo = {0};
+                model_matvec_op(eg_t, SP_X, SP_Y, &mo);
+                seq_desc_engine(seq_ffn_base + 0, &mo);
+                seq_patch(seq_ffn_base + 0, 0, 1u | (1u << 5)); // capture k -> kreg0.
+                model_matvec_op(eu_t, SP_X, SP_YU, &mo);
+                seq_desc_engine(seq_ffn_base + 3, &mo);
+                model_matvec_op(ed_t, SP_X, SP_Y, &mo);
+                seq_desc_engine(seq_ffn_base + 8, &mo);
+                // silu A4 = -(eg + 6) = imm - kreg0, with eg = ex8 - bias_g + rshift_g + kg.
+                seq_patch(seq_ffn_base + 6, 6,
+                          (uint32_t)(-(ex8 - (int)eg_t->bias + (int)eg_t->rshift + 6)));
+                perf_enter(OP_SILU_MUL);
+                seq_run((uint32_t)seq_ffn_base, 10);
+                perf_exit(OP_SILU_MUL);
+                // Recover the folds the removed round-trips produced - identical values:
+                // kg/ku from the spilled engine absmaxes, s from quant8's surviving res6.
+                uint32_t absg = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_FFSP);
+                uint32_t absu = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_FFSP + 32);
+                int kg = 0, ku = 0;
+                while ((absg >> kg) > 16383u) kg++;
+                while ((absu >> ku) > 16383u) ku++;
+                int eg  = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
+                int eu  = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
+                int es8 = (eg + eu + 15)
+                        + quant8_shift((uint32_t)vecunit_res6_read());
+                perf_enter(OP_NORM_I32);
+                uint32_t dmax = 0;
+                int kd = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
+                perf_exit(OP_NORM_I32);
+                int ed = es8 - (int)ed_t->bias + (int)ed_t->rshift + kd;
+                perf_enter(OP_RESID_ADD);
+                ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax);
+                perf_exit(OP_RESID_ADD);
+                goto ffn_done;
+            }
+#endif
             model_matvec(eg_t, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);
             int kg = op_norm_i32_sp(SP_Y, SP_G, ffn_dim);
@@ -1950,6 +2041,10 @@ attn_heads_done: ;
             perf_enter(OP_RESID_ADD);
             ex_state = op_resid_add_sp(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax);
             perf_exit(OP_RESID_ADD);
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
+    && !defined(BONSAI_HAS_DUALQ)
+            ffn_done: ;
+#endif
         }
     }
     n_pos++;
@@ -2128,6 +2223,7 @@ int infer_init(void)
 #ifdef CSR_SEQ_BASE
     seq_build_qkr();
     seq_build_attn();
+    seq_build_ffn();
     seq_build_attn2();
 #endif
 #endif

@@ -117,21 +117,29 @@ void model_info(void)
            (unsigned long)h->payload_beats);
 }
 
-void model_matvec(const struct bons_entry *e, uint32_t xsrc, uint32_t dst)
+// Fill the engine op for a tensor without running it: the FFN descriptor list rebuilds its
+// three matvec descriptors from this per layer, so the encoding lives in exactly one place.
+void model_matvec_op(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
+                     struct engine_op *op)
 {
     const struct bons_header *h = model_header();
+    op->kind   = (e->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
+    op->rows   = e->rows/h->n_channels;
+    op->cols   = e->cols;
+    op->wbase  = BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
+    op->wlen   = e->chan_len_beats;
+    op->sbeats = bons_scale_beats(e->cols, e->group);
+    op->cbeats = bons_code_beats(e->cols, e->kind);
+    op->bias   = e->bias;
+    op->rshift = e->rshift;
+    op->xsrc   = xsrc;
+    op->dst    = dst;
+}
+
+void model_matvec(const struct bons_entry *e, uint32_t xsrc, uint32_t dst)
+{
     struct engine_op op = {0};
-    op.kind   = (e->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
-    op.rows   = e->rows/h->n_channels;
-    op.cols   = e->cols;
-    op.wbase  = BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
-    op.wlen   = e->chan_len_beats;
-    op.sbeats = bons_scale_beats(e->cols, e->group);
-    op.cbeats = bons_code_beats(e->cols, e->kind);
-    op.bias   = e->bias;
-    op.rshift = e->rshift;
-    op.xsrc   = xsrc;
-    op.dst    = dst;
+    model_matvec_op(e, xsrc, dst, &op);
     engine_run(&op);
 }
 
