@@ -96,6 +96,15 @@ class BonsaiSoC(SoCCore):
         self.hbm = hbm = ClockDomainsRenamer({"axi": "sys"})(
             USPHBM2(platform, hbm_ip_name=hbm_ip))
         add_usphbm2_pseudochannels(soc=self, hbm=hbm, channels=(0,), main_channel=0)
+        # VexiiRiscv builds its memory map from region.mode and ENFORCES execute permission;
+        # the HBM main_ram window is added with LiteX's default mode="rw", so the CPU cannot
+        # fetch from it - firmware loads, then every ifetch faults and reads come back 0xFF.
+        # VexRiscv ignored the attribute, which is why this never showed before. Mark the
+        # real (non-linker) region at the main_ram origin executable.
+        for _rn, _r in self.bus.regions.items():
+            if _r.origin == 0x4000_0000 and not _r.linker:
+                _r.mode = "rwx"
+
 
         # The apb<->sys crossings (HBM AXI resets driven from the apb domain, apb_complete
         # status into CSRs) are quasi-static: declare them false paths.
