@@ -948,6 +948,12 @@ static void seq_build_ffn(void)
 }
 
 int seq_use = 1;
+// FFN descriptor list: DEFAULT OFF. Sim tokens (n8 tiny, all legs) are byte-identical and
+// the tiny-sim window improves -3.3% - but the 1.7B card A/B fails TOKENS. That is exactly
+// the exponent-path blind spot the BFP-invariants note warns the tiny gate cannot see
+// (residual ratchet / shift magnitudes the tiny shapes never reach). Off until the 1.7B
+// divergence is diagnosed; enable with `ffnseq on` to reproduce.
+int seq_ffn_use = 0;
 
 static int seq_at2_base, seq_at2_p1n, seq_at2_p2n, seq_at2_kvchunk;
 static int seq_at2_p1dn, seq_at2_p2dn;
@@ -1969,7 +1975,7 @@ attn_heads_done: ;
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && !defined(BONSAI_HAS_DUALQ)
-            if (seq_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
+            if (seq_use && seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
                 && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
                 // One list for gate->norm->up->norm->silu->quant8->down (see seq_build_ffn).
                 // Whole-list time is charged to OP_SILU_MUL: per-op shares are documented as

@@ -454,6 +454,13 @@ static void console_service(void)
         infer_spec_stats(&acc, &rej);
         printf("SPEC acc=%d rej=%d\n", acc, rej);
     }
+    else if (strcmp(token, "ffnseq") == 0) {
+        extern int seq_ffn_use;
+        if (strncmp(str, "on", 2) == 0)  seq_ffn_use = 1;
+        if (strncmp(str, "off", 3) == 0) seq_ffn_use = 0;
+        printf("FFNSEQ %s (1.7B tokens FAIL with it on - debug aid, see infer.c)\n",
+               seq_ffn_use ? "on" : "off");
+    }
     else if (strcmp(token, "seq") == 0) {
         if (strncmp(str, "on", 2) == 0)
             seq_use = 1;
