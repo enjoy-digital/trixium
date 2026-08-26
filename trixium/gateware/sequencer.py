@@ -14,6 +14,14 @@ base/count and one start, then polls a single completion.
 
 Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   w0:  [3:0] unit: 0 = stop, 1 = engine op, 2 = vector-unit program.
+       [5] (engine) capture k(absmax) into kreg[w0[7:6]] when this op completes.
+       [8] (engine) ALSO accumulate that k into kreg[3] (kreg3 += k) - lets one register
+           collect a SUM of shifts across ops (silu's eg+eu term) while [7:6] keeps each
+           op's own k addressable. Firmware zeroes kreg3 by capturing with [7:6]=3 first.
+       (vec) w1[31:16]: per-arg 2-bit kreg-add select (arg i at [16+2i +: 2]): 0 = none,
+           n = add kreg[n-1] to the arg AFTER its 2-bit source resolves. Turns
+           "imm + earlier k" - the FFN exponent algebra that forced a CPU round-trip per
+           op - into descriptor-resident arithmetic. kreg3 is reachable via capture only.
        [4] seed S7 from the ENGINE ABSMAX instead of the previous program's res6. Used by
            the absmax spill once cmd.xred does the cross-channel sum in hardware and the
            value stops flowing through a vector program's res6.
@@ -149,18 +157,37 @@ class BonsaiSequencer(LiteXModule):
         # used to give it. That is what keeps the numerics bit-identical across the switch.
         self.comb += self.vec_seed7.eq(Mux(w(0, 0)[4], self.absmax, self.vec_res6))
 
+        # Exponent register file. The FFN chain needs "per-layer constant + an EARLIER op's
+        # k" as vec args (eg = ex8 - bias + rshift + kg; silu needs both eg and eu); the
+        # KABS/KRES6 sources only expose the LATEST k, so every such arg forced a CPU
+        # round-trip - measured as 43% of the GEN-HW window in 200-5k-cycle gaps.
+        self.kregs = kregs = Array([Signal(32, name=f"kreg{i}") for i in range(4)])
+        # Gated on self.busy, not an FSM state: eng_done is wired from engine.done
+        # unconditionally, so it also pulses for CPU-dispatched ops - but those never run
+        # while the sequencer is busy (csr_front muxes the command interface to the
+        # sequencer for the whole list), so busy & eng_done is exactly "our engine
+        # descriptor completed" and d0 still holds its words.
+        self.sync += If(self.busy & self.eng_done,
+            If(w(0, 0)[5], kregs[w(0, 0)[6:8]].eq(k_absmax)),
+            If(w(0, 0)[8], kregs[3].eq(kregs[3] + k_absmax)),
+        )
+
         for i in range(8):
-            src = Signal(2)
-            imm = Signal(32)
+            src  = Signal(2)
+            imm  = Signal(32)
+            base = Signal(32)
+            kadd = Signal(2)
             self.comb += [
                 src.eq(argsrc[2*i:2*i+2]),
                 imm.eq(w(0, 2 + i) if (2 + i) < 8 else w(1, 2 + i)),
                 Case(src, {
-                    0: self.vec_args[i].eq(imm),
-                    1: self.vec_args[i].eq(k_absmax),
-                    2: self.vec_args[i].eq(rpre_v),
-                    3: self.vec_args[i].eq(k_res6),
+                    0: base.eq(imm),
+                    1: base.eq(k_absmax),
+                    2: base.eq(rpre_v),
+                    3: base.eq(k_res6),
                 }),
+                kadd.eq(w(0, 1)[16 + 2*i:18 + 2*i]),
+                self.vec_args[i].eq(base + Mux(kadd == 0, 0, kregs[kadd - 1])),
             ]
 
         # Engine fields straight from the descriptor.

@@ -794,7 +794,8 @@ def test_engine_argmax_tap_and_suppress():
 
 def _desc_engine(**f):
     w = [0]*16
-    w[0] = 1
+    w[0] = (1 | (f.get("kcap", 0) << 5) | (f.get("kreg", 0) << 6)
+            | (f.get("kacc", 0) << 8))
     w[1] = (f.get("kind", 0) | (f.get("ilv", 0) << 8) | (f.get("supw", 0) << 9)
             | (f.get("rshift_rpre", 0) << 10) | (f.get("qn", 0) << 11)
             | (f.get("xred", 0) << 12))
@@ -809,13 +810,15 @@ def _desc_engine(**f):
     w[10] = f.get("chan", 0)
     return b"".join(x.to_bytes(4, "little") for x in w)
 
-def _desc_vec(pc, args, srcs=None, seed_abs=0):
+def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None):
     w = [0]*16
     sel = 0
     for i, sv in enumerate(srcs or []):
         sel |= (sv & 3) << (2*i)
     w[0] = 2 | ((1 << 4) if seed_abs else 0) | (sel << 16)
     w[1] = pc
+    for i, kv in enumerate(kadds or []):     # 0 = none, n = add kreg[n-1] after the source
+        w[1] |= (kv & 3) << (16 + 2*i)
     for i, a in enumerate(args):
         w[2 + i] = a & 0xFFFFFFFF
     return b"".join(x.to_bytes(4, "little") for x in w)
@@ -1561,5 +1564,130 @@ def test_sequencer_xred_absmax_spill():
         assert np.array_equal(axp, summed), ("xred sum", axp[:8], summed[:8])
         assert np.all(spill == am_exp),  ("head 0 spilled absmax", spill[0], am_exp)
         assert np.all(spill2 == am_exp), ("head 1 spilled absmax", spill2[0], am_exp)
+
+    run_simulation(dut, [driver()])
+
+def test_sequencer_kreg_capture_and_add():
+    # The exponent register file: an engine op captures k(absmax) into kreg[i] (w0[5],[7:6])
+    # and a LATER vec descriptor adds it to an arg (w1[16+2i]). This is what lets the FFN
+    # chain's "per-layer constant + an EARLIER op's k" args live in descriptors instead of
+    # forcing a CPU round-trip per op - the 43% mid-band in the gap histogram.
+    #
+    # Shape: axpy(xred, capture kreg0) -> norm_i32 with A4 = imm(0) + kreg0. The reference k
+    # is bitlen(summed absmax) - 14, i.e. exactly what SEQ_SRC_KABS would give the very next
+    # op - but here it survives an arbitrary distance and combines with an immediate.
+    import trixium.model.asm as vasm
+    from trixium.gateware.vector import BonsaiVectorUnit
+    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+    n_channels, cols, T = 2, 64, 5
+    rng = np.random.default_rng(131)
+    ev     = rng.integers(-9, -4, T)
+    scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+    v8     = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+    p8     = rng.integers(1, 128, T, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B_ax   = 12 - int(e16.max())
+    Rpre   = bx.axpy_rpre(int(p8.astype(np.int64).sum()))
+    rows, rem = T//n_channels, T % n_channels
+    payloads, parts = [], []
+    for c in range(n_channels):
+        pos = [t for t in range(T) if t % n_channels == c]
+        spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                            len(pos), cols, scales=scales[pos], values=v8[pos])
+        payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+        parts.append(bx.axpy_rows(scales[pos], v8[pos], p8[pos], B_ax, Rpre))
+    maxlen   = max(len(pp) for pp in payloads)
+    payloads = [pp.ljust(maxlen, b"\0") for pp in payloads]
+    summed   = np.sum(np.stack(parts).astype(np.int64), axis=0).astype(np.int32)
+    am       = int(np.abs(summed.astype(np.int64)).max())
+    k_exp    = max(0, am.bit_length() - 14)
+
+    words, offs = [], {}
+    for name in ("norm_i32",):
+        offs[name] = len(words)
+        words += vasm.assemble(vasm.PROGRAMS[name]())
+    # Golden: interpreter on the summed buffer with the expected k.
+    ref_sp = bytearray(64*1024)
+    ref_sp[0x4000:0x4000+4*cols] = summed.astype("<i4").tobytes()
+    vasm.VecInterp(ref_sp).run(vasm.assemble(vasm.PROGRAMS["norm_i32"]()),
+                               [0x4000, 0, 0x3000, cols//16, k_exp])
+    nrm_exp = np.frombuffer(bytes(ref_sp[0x3000:0x3000+2*cols]), dtype="<i2")
+
+    rb = layout.row_beats(cols, layout.KIND_Q8)
+    descs = (_desc_engine(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                          sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                          cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                          bias=B_ax, rshift=Rpre, rem=rem, xred=1,
+                          kcap=1, kreg=0,                       # capture k -> kreg0
+                          xsrc=0x200, dst=0x4000)
+             + _desc_vec(offs["norm_i32"], [0x4000, 0, 0x3000, cols//16, 0],
+                         kadds=[0, 0, 0, 0, 1])                 # A4 = 0 + kreg0
+             + _desc_stop())
+    sp = bytearray(64*1024)
+    sp[0x200:0x200+T]            = p8.tobytes()
+    sp[0x6000:0x6000+len(descs)] = descs
+
+    class _DUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+                                                          init=words_from_bytes(bytes(sp)))
+            self.submodules.vu  = BonsaiVectorUnit()
+            self.submodules.seq = BonsaiSequencer()
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                        xbuf_groups=32,
+                                                        vecunit=self.vu, seq=self.seq)
+            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.comb += [
+                self.vu.seq_en.eq(self.seq.busy),
+                self.vu.seq_start.eq(self.seq.vec_start),
+                self.vu.seq_pc.eq(self.seq.vec_pc),
+                self.seq.vec_done.eq(self.vu.done),
+                self.seq.vec_res6.eq(self.vu.res6.status),
+                self.vu.seq_seed7.eq(self.seq.vec_seed7),
+            ]
+            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+            for i, axi in enumerate(axis):
+                setattr(self.submodules, f"model{i}", BonsaiHBMChannelModel(
+                    axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
+
+    dut = _DUT()
+
+    def driver():
+        yield dut.vu.prog_adr.storage.eq(0)
+        yield dut.vu.prog_adr.re.eq(1)
+        yield
+        yield dut.vu.prog_adr.re.eq(0)
+        for wd in words:
+            yield dut.vu.prog.storage.eq(wd)
+            yield dut.vu.prog.re.eq(1)
+            yield
+        yield dut.vu.prog.re.eq(0)
+        yield
+        yield dut.seq.base.storage.eq(0x6000)
+        yield dut.seq.count.storage.eq(3)
+        yield
+        yield dut.seq.start.storage.eq(1)
+        yield dut.seq.start.re.eq(1)
+        yield
+        yield dut.seq.start.re.eq(0)
+        yield
+        for _ in range(200000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("sequencer timeout")
+        yield
+        data = bytearray()
+        for wd in range(0x5000//32):
+            v = (yield dut.scratchpad.mem[wd])
+            data += int(v).to_bytes(32, "little")
+        nrm = np.frombuffer(bytes(data[0x3000:0x3000+2*cols]), dtype="<i2")
+        kr0 = (yield dut.seq.kregs[0])
+        assert kr0 == k_exp, ("kreg0 capture", kr0, k_exp)
+        assert np.array_equal(nrm, nrm_exp), ("norm via kreg", nrm[:8], nrm_exp[:8], k_exp)
 
     run_simulation(dut, [driver()])
