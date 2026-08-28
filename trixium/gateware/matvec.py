@@ -20,6 +20,7 @@ from functools import reduce
 from operator import and_
 
 from migen import *
+from migen.genlib.fifo import SyncFIFO
 from migen.genlib.roundrobin import RoundRobin, SP_CE
 
 from litex.gen import *
@@ -138,6 +139,15 @@ class BonsaiMatVecEngine(LiteXModule):
 
         self.readers = []
         self.pipes   = []
+        # Per-cycle port arbitration state (docs/overlap-design.md). rd_free: the engine
+        # may put an address on the scratchpad R port this cycle. fetch_rdy: the gather
+        # write FIFO has headroom for a fetch beat. gw_pending: engine writes queued but
+        # not yet in RAM (done waits on it). All default to the serial behavior when no
+        # vector unit is integrated.
+        rd_free    = Signal()
+        fetch_rdy  = Signal()
+        gw_pending = Signal()
+
         fetch_valids = []
         fetch_datas  = []
         for i, axi in enumerate(hbm_axis):
@@ -154,9 +164,10 @@ class BonsaiMatVecEngine(LiteXModule):
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
                 pipe.sink.valid.eq(reader.source.valid & ~is_fetch),
                 pipe.sink.data.eq(reader.source.data),
-                # Fetch path always accepts; compute beats honor the pipe's result-FIFO
+                # Fetch beats honor the gather-FIFO headroom (a vec store can steal the
+                # W port for a cycle); compute beats honor the pipe's result-FIFO
                 # backpressure (drops results past N=2 otherwise - N/row_beats > 1 gather/cycle).
-                reader.source.ready.eq(is_fetch | pipe.sink.ready),
+                reader.source.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & pipe.sink.ready)),
             ]
             fetch_valids.append(reader.source.valid & is_fetch)
             fetch_datas.append(reader.source.data)
@@ -373,9 +384,11 @@ class BonsaiMatVecEngine(LiteXModule):
         fetch_valid = Signal()
         fetch_data  = Signal(256)
         fetch_cnt   = Signal(24)
+        fetch_take = Signal() # A fetch beat is actually consumed this cycle.
         self.comb += [
             fetch_valid.eq(reduce_or(fetch_valids)),
             fetch_data.eq(Array(fetch_datas)[fetch_chan]),
+            fetch_take.eq(fetch_valid & fetch_rdy),
         ]
 
         # Scratchpad write port: fetch beats, one merged ilv beat, one wide AXPY beat, or
@@ -403,10 +416,11 @@ class BonsaiMatVecEngine(LiteXModule):
         self.comb += self.sp_busy.eq(self.busy | busy_d)
         self.sync += If(self.cmd.valid & self.cmd.ready,
             fetch_wcnt.eq(0),
-        ).Elif(fetch_mode & fetch_valid,
+        ).Elif(fetch_mode & fetch_take,
             # Equivalent to (eng_gw_we_c != 0) in fetch mode, but off the reader valids
             # directly: the OR-reduce of the muxed write enables dragged the pipes' FIFO
-            # state into this CE (v15's worst path).
+            # state into this CE (v15's worst path; fetch_rdy adds only a small level
+            # compare from the gather FIFO).
             fetch_wcnt.eq(fetch_wcnt + 1),
         )
         grant_head = Array([p.source.head for p in self.pipes])[rr.grant]
@@ -426,7 +440,7 @@ class BonsaiMatVecEngine(LiteXModule):
             If(fetch_mode,
                 eng_gw_adr_c.eq((cmd_r["dst"] >> 5) + fetch_wcnt),
                 eng_gw_dat_c.eq(fetch_data),
-                eng_gw_we_c.eq(Mux(fetch_valid, 0xFF, 0)),
+                eng_gw_we_c.eq(Mux(fetch_take, 0xFF, 0)),
             ).Elif(ilv_mode,
                 eng_gw_adr_c.eq(grant_slot[3:]),
                 eng_gw_dat_c.eq(lane_dat),
@@ -502,32 +516,70 @@ class BonsaiMatVecEngine(LiteXModule):
         self.comb += sp_gw_we.eq(Mux(cmd_r["supw"] & ~fetch_mode, 0, eng_gw_we))
         if vecunit is None:
             self.comb += [
+                rd_free.eq(1),
+                fetch_rdy.eq(1),
+                # gw_pending stays 0: writes hit the RAM directly, done needs no drain.
                 scratchpad.fill.adr.eq(eng_fill_adr),
                 scratchpad.gather.adr.eq(eng_gw_adr),
                 scratchpad.gather.dat_w.eq(eng_gw_dat),
                 scratchpad.gather.we.eq(sp_gw_we),
             ]
         else:
-            grant_vec = Signal()
+            # Per-cycle arbitration (docs/overlap-design.md): the units may run
+            # CONCURRENTLY, so the grant is per cycle, not per op.
+            #
+            # R port: vec > seq > engine. A vec load claims the port for its EX1..EX2
+            # window (sp_rd_req); the engine's fill/store address generation simply does
+            # not advance on those cycles (rd_free below). Seq descriptor fetches still
+            # only happen while both units are idle.
+            #
+            # W port: engine writes are enqueued into a small FIFO instead of driving the
+            # port directly - the merge/counting stage upstream MUST NOT stall (see the
+            # consumed-vs-counted note above). Vec stores get the port while the FIFO has
+            # headroom; at/above the mark the engine drains continuously and the vec unit
+            # holds in EX2 (sp_wr_gnt). Deadlock-free: the engine never waits on the vec
+            # unit mid-op, so the FIFO always drains. Depth 8 suffices: input is <= 1
+            # write/cycle, and above the mark drain matches input.
             grant_seq = Signal()
+            vec_rd    = Signal()
+            vec_wr    = Signal()
+            gw_w      = len(scratchpad.gather.adr) + 8 + 256
+            wr_fifo   = SyncFIFO(width=gw_w, depth=8)
+            self.submodules += wr_fifo
+            f_adr = Signal(len(scratchpad.gather.adr))
+            f_we  = Signal(8)
+            f_dat = Signal(256)
+            self.comb += Cat(f_adr, f_we, f_dat).eq(wr_fifo.dout)
+            self.gw_ovf = Signal() # Sticky: an engine write hit a full FIFO (must never).
+            self.sync += If((sp_gw_we != 0) & ~wr_fifo.writable, self.gw_ovf.eq(1))
             self.comb += [
-                grant_vec.eq(vecunit.busy),
                 grant_seq.eq(0 if seq is None else seq.sp_active),
-                If(grant_vec,
+                vec_rd.eq(vecunit.sp_rd_req),
+                # The seq's fetch FSM holds its address cycle when a vec load outranks it.
+                *([] if seq is None else [seq.sp_gnt.eq(~vec_rd)]),
+                rd_free.eq(~vec_rd & ~grant_seq),
+                vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)),
+                vecunit.sp_wr_gnt.eq(vec_wr),
+                fetch_rdy.eq(wr_fifo.level < 6),
+                gw_pending.eq(wr_fifo.readable | (sp_gw_we != 0)),
+                wr_fifo.din.eq(Cat(eng_gw_adr, sp_gw_we, eng_gw_dat)),
+                wr_fifo.we.eq(sp_gw_we != 0),
+                wr_fifo.re.eq(~vec_wr & wr_fifo.readable),
+                If(vec_rd,
                     scratchpad.fill.adr.eq(vecunit.sp_rd_adr),
+                ).Elif(grant_seq,
+                    scratchpad.fill.adr.eq(0 if seq is None else seq.sp_adr),
+                ).Else(
+                    scratchpad.fill.adr.eq(eng_fill_adr),
+                ),
+                If(vec_wr,
                     scratchpad.gather.adr.eq(vecunit.sp_wr_adr),
                     scratchpad.gather.dat_w.eq(vecunit.sp_wr_dat),
                     scratchpad.gather.we.eq(vecunit.sp_wr_we),
-                ).Elif(grant_seq,
-                    scratchpad.fill.adr.eq(0 if seq is None else seq.sp_adr),
-                    scratchpad.gather.adr.eq(eng_gw_adr),
-                    scratchpad.gather.dat_w.eq(eng_gw_dat),
-                    scratchpad.gather.we.eq(0), # Descriptor fetches never write.
                 ).Else(
-                    scratchpad.fill.adr.eq(eng_fill_adr),
-                    scratchpad.gather.adr.eq(eng_gw_adr),
-                    scratchpad.gather.dat_w.eq(eng_gw_dat),
-                    scratchpad.gather.we.eq(sp_gw_we),
+                    scratchpad.gather.adr.eq(f_adr),
+                    scratchpad.gather.dat_w.eq(f_dat),
+                    scratchpad.gather.we.eq(Mux(wr_fifo.re, f_we, 0)),
                 ),
                 vecunit.sp_rd_dat.eq(scratchpad.fill.dat_r),
             ]
@@ -586,9 +638,12 @@ class BonsaiMatVecEngine(LiteXModule):
         )
         fsm.act("FILL",
             self.busy.eq(1),
-            NextValue(fill_beat, fill_beat + 1),
-            If(fill_beat == fill_total - 1,
-                NextState("FILL_LAST"),
+            # Advance only when the R port is ours this cycle (a vec load may claim it).
+            If(rd_free,
+                NextValue(fill_beat, fill_beat + 1),
+                If(fill_beat == fill_total - 1,
+                    NextState("FILL_LAST"),
+                )
             )
         )
         fsm.act("FILL_LAST", # Drain the registered fill write.
@@ -639,7 +694,8 @@ class BonsaiMatVecEngine(LiteXModule):
                    # Dual-Q ops retire two heads' results per stream.
                    result_cnt == Mux(cmd_r["qn"],
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
-                       Mux(axpy_mode, ax_total, mv_total))),
+                       Mux(axpy_mode, ax_total, mv_total)))
+               & ~gw_pending, # Queued writes must be in RAM before done.
                 self.done.eq(1),
                 NextState("IDLE"),
             )
@@ -647,11 +703,12 @@ class BonsaiMatVecEngine(LiteXModule):
 
         # Fill write-stage delay + result counting.
         self.sync += [
-            fill_active_d.eq(fsm.ongoing("FILL")),
+            fill_active_d.eq(fsm.ongoing("FILL") & rd_free),
             fill_beat_d.eq(fill_beat),
             # STORE stream: the read address holds until the beat is accepted; dat_r is
             # valid one stable-address cycle later (one dead cycle after each advance).
-            st_rdv.eq(fsm.ongoing("ST_RUN") & ~st_advance),
+            # rd_free: dat_r next cycle is ours only if our address was on the port.
+            st_rdv.eq(fsm.ongoing("ST_RUN") & ~st_advance & rd_free),
             If(start_pulse,
                 st_cnt.eq(0),
             ).Elif(st_advance,

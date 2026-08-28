@@ -43,6 +43,11 @@ struct engine_op {
 };
 
 void engine_run(const struct engine_op *op);
+// Overlap split (docs/overlap-design.md): submit returns the pre-op done_count for
+// engine_join; independent VECTOR-UNIT work may run in between. Not for CPU loops
+// (the scratchpad sideband stalls while the engine is busy).
+uint32_t engine_submit(const struct engine_op *op);
+void engine_join(uint32_t done);
 void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst);
 
 extern int engine_wedged; // Set once an op stalled (see ENGSTALL in engine.c).

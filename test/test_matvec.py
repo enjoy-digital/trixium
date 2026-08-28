@@ -795,7 +795,7 @@ def test_engine_argmax_tap_and_suppress():
 def _desc_engine(**f):
     w = [0]*16
     w[0] = (1 | (f.get("kcap", 0) << 5) | (f.get("kreg", 0) << 6)
-            | (f.get("kacc", 0) << 8))
+            | (f.get("kacc", 0) << 8) | (f.get("nowait", 0) << 9))
     w[1] = (f.get("kind", 0) | (f.get("ilv", 0) << 8) | (f.get("supw", 0) << 9)
             | (f.get("rshift_rpre", 0) << 10) | (f.get("qn", 0) << 11)
             | (f.get("xred", 0) << 12))
@@ -810,12 +810,13 @@ def _desc_engine(**f):
     w[10] = f.get("chan", 0)
     return b"".join(x.to_bytes(4, "little") for x in w)
 
-def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None):
+def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None, barrier=0):
     w = [0]*16
     sel = 0
     for i, sv in enumerate(srcs or []):
         sel |= (sv & 3) << (2*i)
-    w[0] = 2 | ((1 << 4) if seed_abs else 0) | (sel << 16)
+    w[0] = (2 | ((1 << 4) if seed_abs else 0) | ((1 << 10) if barrier else 0)
+            | (sel << 16))
     w[1] = pc
     for i, kv in enumerate(kadds or []):     # 0 = none, n = add kreg[n-1] after the source
         w[1] |= (kv & 3) << (16 + 2*i)
@@ -1695,3 +1696,315 @@ def test_sequencer_kreg_capture_and_add():
         assert np.array_equal(nrm, nrm_exp), ("norm via kreg", nrm[:8], nrm_exp[:8], k_exp)
 
     run_simulation(dut, [driver()])
+
+
+# Per-cycle scratchpad arbitration (docs/overlap-design.md) ----------------------------------------
+
+class _OverlapDUT(Module):
+    # Engine + vector unit sharing the scratchpad WITHOUT a sequencer or CSR front:
+    # engine.cmd is testbench-driven, the vector unit runs from its own CSRs, and the
+    # two are launched concurrently - the per-cycle port arbitration is what keeps
+    # both results bit-exact.
+    def __init__(self, n_channels, chan_payloads, sp_init, latency=8):
+        from trixium.gateware.vector import BonsaiVectorUnit
+        axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                for _ in range(n_channels)]
+        self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
+        self.submodules.vu = BonsaiVectorUnit()
+        self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                    xbuf_groups=32, vecunit=self.vu)
+        for i, axi in enumerate(axis):
+            model = BonsaiHBMChannelModel(axi, size=64*1024,
+                init=words_from_bytes(chan_payloads[i]), latency=latency)
+            setattr(self.submodules, f"model{i}", model)
+
+
+def _vec_csr_upload(dut, words):
+    yield dut.vu.prog_adr.storage.eq(0)
+    yield dut.vu.prog_adr.re.eq(1)
+    yield
+    yield dut.vu.prog_adr.re.eq(0)
+    for wd in words:
+        yield dut.vu.prog.storage.eq(wd)
+        yield dut.vu.prog.re.eq(1)
+        yield
+    yield dut.vu.prog.re.eq(0)
+    yield
+
+
+def _vec_csr_submit(dut, args):
+    arg_csrs = [dut.vu.arg0, dut.vu.arg1, dut.vu.arg2, dut.vu.arg3,
+                dut.vu.arg4, dut.vu.arg5, dut.vu.arg6, dut.vu.arg7]
+    for i, a in enumerate(args):
+        yield arg_csrs[i].storage.eq(a & 0xFFFFFFFF)
+    yield dut.vu.pc.storage.eq(0)
+    yield dut.vu.submit.storage.eq(1)
+    yield dut.vu.submit.re.eq(1)
+    yield
+    yield dut.vu.submit.re.eq(0)
+    yield
+
+
+def _overlap_vec_golden(sp, vec_args):
+    from trixium.model import asm as vasm
+    mirror = bytearray(sp)
+    vasm.VecInterp(mirror).run(vasm.assemble(vasm.PROGRAMS["resid_add"]()), list(vec_args))
+    return mirror
+
+
+def _read_sp(dut, start, length):
+    data = bytearray()
+    for wd in range(start//32, (start + length + 31)//32):
+        v = (yield dut.scratchpad.mem[wd])
+        data += int(v).to_bytes(32, "little")
+    return bytes(data[:length])
+
+
+def test_overlap_engine_vec_concurrent():
+    # Engine ternary matvec and a vector resid_add run CONCURRENTLY on disjoint regions.
+    # Both results must equal their serial goldens, cyc_both must show real overlap, and
+    # no gather write may be lost (gw_ovf).
+    n_channels, rows_per_chan, cols, seed = 2, 32, 128, 93
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols).astype(np.int8)
+
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    res_exp = bx.matvec_ternary(scales, codes, x8, B, R)
+
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+
+    # Vec job: resid_add over 1024 int16 (64 iterations, LDV/LDV/STV per beat - the most
+    # port-dense stock program). Regions disjoint from the matvec's x/dst.
+    nv = 1024
+    vec_args = [0x4000, 0x4800, 0x5000, nv//16, -1, -3]
+    sp = bytearray(64*1024)
+    sp[0x1000:0x1000 + cols] = x8.tobytes()
+    sp[0x4000:0x4000 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    sp[0x4800:0x4800 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    mirror = _overlap_vec_golden(sp, vec_args)
+
+    from trixium.model import asm as vasm
+    words = vasm.assemble(vasm.PROGRAMS["resid_add"]())
+    rb    = layout.row_beats(cols, layout.KIND_TERNARY)
+    dut   = _OverlapDUT(n_channels, payloads, words_from_bytes(bytes(sp)))
+    out   = {}
+
+    def driver():
+        yield from _vec_csr_upload(dut, words)
+        # Vec first (it runs ~2k cycles), engine a few cycles later - contention spans
+        # the engine's whole FILL/RUN window.
+        yield from _vec_csr_submit(dut, vec_args)
+        cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0, wlen=rows_per_chan*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                   cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                   bias=B, rshift=R, xsrc=0x1000, dst=0x2000)
+        for k, v in cmd.items():
+            yield getattr(dut.engine.cmd, k).eq(v)
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+        for _ in range(50000):
+            eb = (yield dut.engine.busy)
+            vb = (yield dut.vu.busy)
+            if not eb and not vb:
+                break
+            yield
+        else:
+            raise AssertionError("overlap run timeout")
+        yield
+        out["both"] = (yield dut.engine.cyc_both)
+        out["ovf"]  = (yield dut.engine.gw_ovf)
+        out["res"]  = np.frombuffer((yield from _read_sp(dut, 0x2000, 4*M)), dtype="<i4")
+        out["vec"]  = (yield from _read_sp(dut, 0x5000, 2*nv))
+
+    run_simulation(dut, [driver()])
+    assert out["ovf"] == 0, "gather FIFO overflow"
+    assert np.array_equal(out["res"], res_exp), (out["res"][:8], res_exp[:8])
+    assert out["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
+    assert out["both"] > 50, f"no real overlap measured (cyc_both={out['both']})"
+
+
+def test_overlap_fetch_under_vec():
+    # Engine FETCH (HBM -> scratchpad, 1 write/cycle - the worst-case W-port load, which
+    # must backpressure the reader when a vec store steals the port) under the same
+    # port-dense vec program. Fetched bytes and vec results both bit-exact; no overflow.
+    n_channels, seed = 2, 47
+    rng      = np.random.default_rng(seed)
+    payloads = [rng.integers(0, 256, 4096, dtype=np.uint8).tobytes()
+                for _ in range(n_channels)]
+    fetch_beats = 64  # 2 KB from channel 0.
+
+    nv = 1024
+    vec_args = [0x4000, 0x4800, 0x5000, nv//16, -1, -3]
+    sp = bytearray(64*1024)
+    sp[0x4000:0x4000 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    sp[0x4800:0x4800 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    mirror = _overlap_vec_golden(sp, vec_args)
+
+    from trixium.model import asm as vasm
+    words = vasm.assemble(vasm.PROGRAMS["resid_add"]())
+    dut   = _OverlapDUT(n_channels, payloads, words_from_bytes(bytes(sp)))
+    out   = {}
+
+    def driver():
+        yield from _vec_csr_upload(dut, words)
+        yield from _vec_csr_submit(dut, vec_args)
+        cmd = dict(kind=2, wbase=0, wlen=fetch_beats, dst=0x3000, chan=0)
+        for k, v in cmd.items():
+            yield getattr(dut.engine.cmd, k).eq(v)
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+        for _ in range(50000):
+            if not (yield dut.engine.busy) and not (yield dut.vu.busy):
+                break
+            yield
+        else:
+            raise AssertionError("fetch-under-vec timeout")
+        yield
+        out["both"]  = (yield dut.engine.cyc_both)
+        out["ovf"]   = (yield dut.engine.gw_ovf)
+        out["fetch"] = (yield from _read_sp(dut, 0x3000, 32*fetch_beats))
+        out["vec"]   = (yield from _read_sp(dut, 0x5000, 2*nv))
+
+    run_simulation(dut, [driver()])
+    assert out["ovf"] == 0, "gather FIFO overflow"
+    assert out["fetch"] == payloads[0][:32*fetch_beats], "fetched data corrupted"
+    assert out["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
+    assert out["both"] > 20, f"no real overlap measured (cyc_both={out['both']})"
+
+
+def test_sequencer_nowait_overlap():
+    # NOWAIT engine descriptor (w0[9]): the following independent vec descriptor runs
+    # WHILE the matvec streams; the next descriptor (norm_i32 with A4 = KABS) trips the
+    # hazard interlock and waits for the in-flight op. All three results bit-exact,
+    # real overlap measured, and the interlock's k matches the serial golden.
+    from trixium.gateware.vector import BonsaiVectorUnit
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.model import asm as vasm
+
+    n_channels, rows_per_chan, cols, seed = 2, 32, 128, 57
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols).astype(np.int8)
+
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    res_exp = bx.matvec_ternary(scales, codes, x8, B, R)
+    k_exp   = max(0, int(np.abs(res_exp).max()).bit_length() - 14)
+    nrm_exp = np.clip(res_exp.astype(np.int64) >> k_exp, -32767, 32767).astype("<i2")
+
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+
+    words, offs = [], {}
+    for name in ("resid_add", "norm_i32"):
+        offs[name] = len(words)
+        words += vasm.assemble(vasm.PROGRAMS[name]())
+
+    nv = 1024
+    vec_args = [0x4000, 0x4800, 0x5000, nv//16, -1, -3]
+    rb = layout.row_beats(cols, layout.KIND_TERNARY)
+    descs = (_desc_engine(nowait=1, kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+                          wlen=rows_per_chan*rb,
+                          sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                          cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                          bias=B, rshift=R, xsrc=0x1000, dst=0x2000)
+             + _desc_vec(offs["resid_add"], vec_args)           # Runs UNDER the matvec.
+             + _desc_vec(offs["norm_i32"], [0x2000, 0, 0x3800, M//16, k_exp],
+                         barrier=1)                             # w0[10]: explicit barrier.
+             + _desc_vec(offs["norm_i32"], [0x2000, 0, 0x3000, M//16, 0],
+                         srcs=[0, 0, 0, 0, 1])                  # KABS: interlock waits.
+             + _desc_stop())
+
+    sp = bytearray(64*1024)
+    sp[0x1000:0x1000 + cols]  = x8.tobytes()
+    sp[0x4000:0x4000 + 2*nv]  = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    sp[0x4800:0x4800 + 2*nv]  = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    sp[0x6000:0x6000 + len(descs)] = descs
+    mirror = bytearray(sp)
+    vasm.VecInterp(mirror).run(vasm.assemble(vasm.PROGRAMS["resid_add"]()),
+                               list(vec_args))
+
+    class _NwDUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+                                                          init=words_from_bytes(bytes(sp)))
+            self.submodules.vu  = BonsaiVectorUnit()
+            self.submodules.seq = BonsaiSequencer()
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                        xbuf_groups=32,
+                                                        vecunit=self.vu, seq=self.seq)
+            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.comb += [
+                self.vu.seq_en.eq(self.seq.busy),
+                self.vu.seq_start.eq(self.seq.vec_start),
+                self.vu.seq_pc.eq(self.seq.vec_pc),
+                self.seq.vec_done.eq(self.vu.done),
+                self.seq.vec_res6.eq(self.vu.res6.status),
+                self.vu.seq_seed7.eq(self.seq.vec_seed7),
+            ]
+            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+            for i, axi in enumerate(axis):
+                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                    init=words_from_bytes(payloads[i]), latency=8)
+                setattr(self.submodules, f"model{i}", model)
+
+    dut = _NwDUT()
+    out = {}
+
+    def driver():
+        yield from _vec_csr_upload(dut, words)
+        yield dut.seq.base.storage.eq(0x6000)
+        yield dut.seq.count.storage.eq(5)
+        yield
+        yield dut.seq.start.storage.eq(1)
+        yield dut.seq.start.re.eq(1)
+        yield
+        yield dut.seq.start.re.eq(0)
+        yield
+        for _ in range(100000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("sequencer timeout")
+        yield
+        out["dcount"] = (yield dut.seq.status.fields.dcount)
+        out["both"]   = (yield dut.engine.cyc_both)
+        out["ovf"]    = (yield dut.engine.gw_ovf)
+        out["res"]  = np.frombuffer((yield from _read_sp(dut, 0x2000, 4*M)), dtype="<i4")
+        out["nrm"]  = np.frombuffer((yield from _read_sp(dut, 0x3000, 2*M)), dtype="<i2")
+        out["nrmb"] = np.frombuffer((yield from _read_sp(dut, 0x3800, 2*M)), dtype="<i2")
+        out["vec"]  = (yield from _read_sp(dut, 0x5000, 2*nv))
+
+    run_simulation(dut, [driver()])
+    assert out["ovf"] == 0, "gather FIFO overflow"
+    assert out["dcount"] == 4, out["dcount"]
+    assert np.array_equal(out["res"], res_exp), (out["res"][:8], res_exp[:8])
+    assert np.array_equal(out["nrm"], nrm_exp), (out["nrm"][:8], nrm_exp[:8], k_exp)
+    assert np.array_equal(out["nrmb"], nrm_exp), "w0[10] barrier saw partial results"
+    assert out["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
+    assert out["both"] > 50, f"no overlap through the sequencer (cyc_both={out['both']})"

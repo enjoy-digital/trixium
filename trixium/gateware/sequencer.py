@@ -14,6 +14,16 @@ base/count and one start, then polls a single completion.
 
 Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   w0:  [3:0] unit: 0 = stop, 1 = engine op, 2 = vector-unit program.
+       [9] (engine) NOWAIT: dispatch and move on instead of waiting for done - following
+           VEC descriptors execute while the engine op streams (the per-cycle scratchpad
+           arbitration makes that safe, docs/overlap-design.md). The list author asserts
+           independence; the hardware still interlocks the obvious hazards: a later
+           ENGINE descriptor waits in DISPATCH (engine ready = idle), a VEC descriptor
+           whose args read engine state (KABS source, S7-from-absmax w0[4], any kreg-add)
+           stalls until the in-flight op completes, and list end drains before idle.
+       [10] WAIT-ENGINE barrier: this descriptor does not dispatch until any in-flight
+           NOWAIT engine op has completed. For data dependences the arg-source interlock
+           cannot see (e.g. softmax reading the scores buffer the engine is filling).
        [5] (engine) capture k(absmax) into kreg[w0[7:6]] when this op completes.
        [8] (engine) ALSO accumulate that k into kreg[3] (kreg3 += k) - lets one register
            collect a SUM of shifts across ops (silu's eg+eu term) while [7:6] keeps each
@@ -44,6 +54,9 @@ Numerics are UNCHANGED - sequencing is transparent; the golden mirrors need no u
 Scratchpad access rides the engine fill port (never a fifth RAM port): descriptors are
 fetched only while both units are idle, so the integrator grants the port as
 vec.busy > seq.sp_active > engine."""
+
+from functools import reduce
+from operator import or_
 
 from migen import *
 
@@ -101,6 +114,9 @@ class BonsaiSequencer(LiteXModule):
         self.sp_adr    = Signal(13)
         self.sp_dat    = Signal(256)
         self.sp_active = Signal()
+        self.sp_gnt    = Signal(reset=1) # Integrator: port is the seq's this cycle (a vec
+                                         # load outranks descriptor fetches). Reset-1 keeps
+                                         # unwired unit-test DUTs on the old behavior.
 
         self.busy = Signal()
 
@@ -117,10 +133,35 @@ class BonsaiSequencer(LiteXModule):
 
         unit    = Signal(4)
         argsrc  = Signal(16)
+        nowait  = Signal()
         self.comb += [
             unit.eq(w(0, 0)[0:4]),
             argsrc.eq(w(0, 0)[16:32]),
+            nowait.eq(w(0, 0)[9]),
         ]
+
+        # NOWAIT bookkeeping. eng_disp fires on the engine-dispatch handshake; a NOWAIT
+        # dispatch leaves the op in flight. done can never coincide with the next accept
+        # (the engine's cmd.ready is an IDLE-state signal, one cycle after done), so the
+        # set/clear priority below is safe.
+        eng_disp     = Signal()
+        eng_inflight = Signal()
+        self.sync += [
+            If(eng_disp & nowait,
+                eng_inflight.eq(1),
+            ).Elif(self.eng_done,
+                eng_inflight.eq(0),
+            ),
+        ]
+        # A vec descriptor whose arguments read engine state must not race an in-flight
+        # engine op: KABS source (code 1), S7 seed from absmax (w0[4]), or any kreg-add
+        # (a pending capture lands at done+2). Conservative and cheap.
+        vec_needs_eng = Signal()
+        self.comb += vec_needs_eng.eq(
+            w(0, 0)[4]
+            | w(0, 0)[10] # Explicit barrier for deps the arg sources cannot express.
+            | reduce(or_, [argsrc[2*i:2*i+2] == 1 for i in range(8)])
+            | (w(0, 1)[16:32] != 0))
 
         # Special arg sources (pure bit-length functions, matching the firmware/bitexact).
         def bitlen(sig):
@@ -178,7 +219,10 @@ class BonsaiSequencer(LiteXModule):
         cap_sel = Signal(2)
         self.sync += [
             cap_d.eq(Cat(self.busy & self.eng_done, cap_d[0])),
-            If(self.busy & self.eng_done,
+            # Latched at the DISPATCH handshake: with NOWAIT the descriptor buffer holds a
+            # LATER descriptor when done pulses. Serial lists latch identical values (the
+            # buffer does not move during WAIT_ENG).
+            If(eng_disp,
                 cap_en.eq(w(0, 0)[5]),
                 cap_acc.eq(w(0, 0)[8]),
                 cap_sel.eq(w(0, 0)[6:8]),
@@ -253,12 +297,15 @@ class BonsaiSequencer(LiteXModule):
             self.sp_active.eq(1),
             self.sp_adr.eq(dptr),
             If(left == 0,
-                NextState("IDLE"),
-            ).Else(
+                If(~eng_inflight, # Drain a NOWAIT op before reporting idle.
+                    NextState("IDLE"),
+                )
+            ).Elif(self.sp_gnt, # Hold while a vec load owns the port.
                 NextState("FETCH0_L"),
             )
         )
-        fsm.act("FETCH0_L", # dat valid this cycle (address held from FETCH0's registered mux path).
+        fsm.act("FETCH0_L", # dat valid this cycle: it reflects the address sampled at the
+            # end of the GRANTED FETCH0 cycle, whoever owns the port now.
             self.busy.eq(1),
             self.sp_active.eq(1),
             self.sp_adr.eq(dptr), # Hold.
@@ -269,7 +316,9 @@ class BonsaiSequencer(LiteXModule):
             self.busy.eq(1),
             self.sp_active.eq(1),
             self.sp_adr.eq(dptr + 1),
-            NextState("FETCH1_L"),
+            If(self.sp_gnt,
+                NextState("FETCH1_L"),
+            )
         )
         fsm.act("FETCH1_L",
             self.busy.eq(1),
@@ -281,15 +330,27 @@ class BonsaiSequencer(LiteXModule):
         fsm.act("DISPATCH",
             self.busy.eq(1),
             If(unit == 0,
-                NextState("IDLE"),
+                If(~eng_inflight, # Drain a NOWAIT op before stopping.
+                    NextState("IDLE"),
+                )
             ).Elif(unit == 1,
+                # A second engine descriptor waits here naturally: eng_ready is the
+                # engine's IDLE-state cmd.ready.
                 self.eng_valid.eq(1),
                 If(self.eng_ready,
-                    NextState("WAIT_ENG"),
+                    eng_disp.eq(1),
+                    If(nowait,
+                        NextState("NEXT"),
+                    ).Else(
+                        NextState("WAIT_ENG"),
+                    )
                 )
             ).Elif(unit == 2,
-                self.vec_start.eq(1),
-                NextState("WAIT_VEC"),
+                # Hazard interlock: args reading engine state wait for the in-flight op.
+                If(~(vec_needs_eng & eng_inflight),
+                    self.vec_start.eq(1),
+                    NextState("WAIT_VEC"),
+                )
             ).Else(
                 NextState("IDLE"), # Unknown unit: stop (firmware bug guard).
             )

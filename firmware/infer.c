@@ -525,21 +525,11 @@ static int op_quant8_sp(uint32_t src, uint32_t dst, int n)
 // norm_i32: SP int32 -> SP int16 (floor >> k chosen from the engine absmax CSR).
 // Returns k (caller: out exponent = in exponent + k); *omax (optional) = output absmax,
 // which resid_add needs to size its own shifts.
-static int op_norm_i32_sp_m(uint32_t src, uint32_t dst, int n, uint32_t *omax)
+// _a: absmax supplied by the caller - the overlap path captures the PREVIOUS engine
+// op's absmax before submitting the next one (the tracker resets on command accept).
+static int op_norm_i32_sp_a(uint32_t src, uint32_t dst, int n, uint32_t amax,
+                            uint32_t *omax)
 {
-#ifdef CSR_ENGINE_CSR_ABSMAX_ADDR
-    uint32_t amax = engine_csr_absmax_read();
-#else
-    // Pre-absmax gateware (the archived variant-b bitstream): scan on the CPU.
-    uint32_t amax = 0;
-    {
-        volatile int32_t *pa = sp32(src);
-        for (int i = 0; i < n; i++) {
-            uint32_t a = (uint32_t)((pa[i] < 0) ? -pa[i] : pa[i]);
-            if (a > amax) amax = a;
-        }
-    }
-#endif
     int k = 0;
     while ((amax >> k) > 16383u) k++;
     if (omax) *omax = amax >> k;
@@ -559,6 +549,24 @@ static int op_norm_i32_sp_m(uint32_t src, uint32_t dst, int n, uint32_t *omax)
         pd[i] = (int16_t)v;
     }
     return k;
+}
+
+static int op_norm_i32_sp_m(uint32_t src, uint32_t dst, int n, uint32_t *omax)
+{
+#ifdef CSR_ENGINE_CSR_ABSMAX_ADDR
+    uint32_t amax = engine_csr_absmax_read();
+#else
+    // Pre-absmax gateware (the archived variant-b bitstream): scan on the CPU.
+    uint32_t amax = 0;
+    {
+        volatile int32_t *pa = sp32(src);
+        for (int i = 0; i < n; i++) {
+            uint32_t a = (uint32_t)((pa[i] < 0) ? -pa[i] : pa[i]);
+            if (a > amax) amax = a;
+        }
+    }
+#endif
+    return op_norm_i32_sp_a(src, dst, n, amax, omax);
 }
 
 static inline int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
@@ -954,6 +962,10 @@ int seq_use = 1;
 // (residual ratchet / shift magnitudes the tiny shapes never reach). Off until the 1.7B
 // divergence is diagnosed; enable with `ffnseq on` to reproduce.
 int seq_ffn_use = 0;
+// Engine/vec overlap (docs/overlap-design.md): run the FFN up-projection stream UNDER the
+// gate-norm vector program (disjoint regions; gate absmax captured before the submit, so
+// numerics are byte-identical by construction). `ovl off` for same-binary A/B.
+int ovl_use = 1;
 
 static int seq_at2_base, seq_at2_p1n, seq_at2_p2n, seq_at2_kvchunk;
 static int seq_at2_p1dn, seq_at2_p2dn;
@@ -1512,14 +1524,42 @@ embed_done: ;
             const struct bons_entry *ekt = model_entry(ROLE_ATTN_K, l);
             const struct bons_entry *evt = model_entry(ROLE_ATTN_V, l);
             perf_enter(OP_NORM_I32);
-            model_matvec(eqt, SP_X, SP_Y);
-            int kq = op_norm_i32_sp(SP_Y, SP_Q, q_dim);
+            int kq, kk2, kv2;
+#if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
+            if (ovl_use && op_on_hw(OP_NORM_I32)) {
+                // Overlap: each norm runs UNDER the next projection's stream. Distinct
+                // result buffers inside the SP_Y region (q 16 KB max, then k/v) keep the
+                // in-flight dst disjoint from the norm's src; each op's absmax is captured
+                // before the next submit. Same k's, same programs - byte-identical.
+                struct engine_op mo = {0};
+                model_matvec(eqt, SP_X, SP_Y);
+                uint32_t aq = engine_csr_absmax_read();
+                model_matvec_op(ekt, SP_X, SP_Y + 0x4000, &mo);
+                uint32_t dk = engine_submit(&mo);
+                kq = op_norm_i32_sp_a(SP_Y, SP_Q, q_dim, aq, 0);
+                perf_enter(OP_ENGINE_WAIT);
+                engine_join(dk);
+                perf_exit(OP_ENGINE_WAIT);
+                uint32_t ak = engine_csr_absmax_read();
+                model_matvec_op(evt, SP_X, SP_Y + 0x5000, &mo);
+                uint32_t dv = engine_submit(&mo);
+                kk2 = op_norm_i32_sp_a(SP_Y + 0x4000, SP_K, kv_dim, ak, 0);
+                perf_enter(OP_ENGINE_WAIT);
+                engine_join(dv);
+                perf_exit(OP_ENGINE_WAIT);
+                kv2 = op_norm_i32_sp(SP_Y + 0x5000, SP_V, kv_dim);
+            } else
+#endif
+            {
+                model_matvec(eqt, SP_X, SP_Y);
+                kq = op_norm_i32_sp(SP_Y, SP_Q, q_dim);
+                model_matvec(ekt, SP_X, SP_Y);
+                kk2 = op_norm_i32_sp(SP_Y, SP_K, kv_dim);
+                model_matvec(evt, SP_X, SP_Y);
+                kv2 = op_norm_i32_sp(SP_Y, SP_V, kv_dim);
+            }
             int eq_r = (E_NORM + sx8) - (int)eqt->bias + (int)eqt->rshift + kq;
-            model_matvec(ekt, SP_X, SP_Y);
-            int kk2 = op_norm_i32_sp(SP_Y, SP_K, kv_dim);
             int ek_r = (E_NORM + sx8) - (int)ekt->bias + (int)ekt->rshift + kk2;
-            model_matvec(evt, SP_X, SP_Y);
-            int kv2 = op_norm_i32_sp(SP_Y, SP_V, kv_dim);
             ev_res = (E_NORM + sx8) - (int)evt->bias + (int)evt->rshift + kv2;
             perf_exit(OP_NORM_I32);
             perf_enter(OP_QKNORM);
@@ -2020,12 +2060,33 @@ attn_heads_done: ;
             }
 #endif
             model_matvec(eg_t, SP_X, SP_Y);
-            perf_enter(OP_NORM_I32);
-            int kg = op_norm_i32_sp(SP_Y, SP_G, ffn_dim);
-            perf_exit(OP_NORM_I32);
+            int kg;
+#if defined(CSR_ENGINE_CSR_ABSMAX_ADDR) && defined(CSR_VECUNIT_BASE)
+            if (ovl_use && op_on_hw(OP_NORM_I32)) {
+                // Overlap: the up stream runs UNDER the gate norm. Gate absmax is read
+                // BEFORE the submit (the tracker resets on accept); regions are disjoint
+                // (up: SP_X -> SP_YU, norm: SP_Y -> SP_G). Same kg, same program, same
+                // args as the serial order - byte-identical by construction.
+                uint32_t ag = engine_csr_absmax_read();
+                struct engine_op mo = {0};
+                model_matvec_op(eu_t, SP_X, SP_YU, &mo);
+                uint32_t d0 = engine_submit(&mo);
+                perf_enter(OP_NORM_I32);
+                kg = op_norm_i32_sp_a(SP_Y, SP_G, ffn_dim, ag, 0);
+                perf_exit(OP_NORM_I32);
+                perf_enter(OP_ENGINE_WAIT);
+                engine_join(d0);
+                perf_exit(OP_ENGINE_WAIT);
+            } else
+#endif
+            {
+                perf_enter(OP_NORM_I32);
+                kg = op_norm_i32_sp(SP_Y, SP_G, ffn_dim);
+                perf_exit(OP_NORM_I32);
+                model_matvec(eu_t, SP_X, SP_YU);
+            }
             int eg = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
 
-            model_matvec(eu_t, SP_X, SP_YU);
             perf_enter(OP_NORM_I32);
             int ku = op_norm_i32_sp(SP_YU, SP_U, ffn_dim);
             perf_exit(OP_NORM_I32);

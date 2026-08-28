@@ -39,9 +39,20 @@ static int eng_shadow_valid;
         eng_shadow.field = op->field; \
     } } while (0)
 
-void engine_run(const struct engine_op *op)
+// Submit/join split: engine_submit programs and launches the op, returning the
+// done_count to hand to engine_join; the caller may run INDEPENDENT vector-unit work
+// in between (the scratchpad ports arbitrate per cycle - docs/overlap-design.md).
+// Rules for the window between submit and join:
+//  - do not read engine absmax/argmax (they belong to the streaming op),
+//  - do not submit another engine op,
+//  - only touch scratchpad regions disjoint from the op's xsrc/dst,
+//  - CPU sideband scratchpad access stalls until the engine idles, so keep the
+//    in-between work on the vector unit (op_on_hw), not CPU loops.
+static uint32_t eng_beats0[BONSAI_N_CHANNELS];
+static uint32_t eng_nslot;
+
+uint32_t engine_submit(const struct engine_op *op)
 {
-    perf_enter(OP_ENGINE_WAIT);
     uint32_t done = engine_csr_done_count_read();
 
     ENG_WR(kind);
@@ -72,31 +83,39 @@ void engine_run(const struct engine_op *op)
     // Snapshot each reader's beat counter before the op: on a stall the deltas say exactly
     // which channel came up short, which is the one fact the status bits cannot give.
     // Expected delta per channel = wlen + (chan < rem ? sbeats + cbeats : 0).
-    uint32_t beats0[BONSAI_N_CHANNELS];
     if (engine_diag) {
         for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
             engine_csr_perf_chan_write(c);
-            beats0[c] = engine_csr_perf_beats_read();
+            eng_beats0[c] = engine_csr_perf_beats_read();
         }
     } else {
         for (int c = 0; c < BONSAI_N_CHANNELS; c++)
-            beats0[c] = 0; // Stall print falls back to absolute counters.
+            eng_beats0[c] = 0; // Stall print falls back to absolute counters.
     }
 
     // Mark the result slots so a stall shows which ones were retired. The interleaved
     // gather writes slot = row*n_channels + chan, so the pattern says exactly which
     // (row, channel) never produced a result.
     volatile uint32_t *rslot = (volatile uint32_t *)(SCRATCHPAD_BASE + op->dst);
-    uint32_t nslot = 0;
+    eng_nslot = 0;
     if (engine_diag && op->kind == 1 && op->ilv) {
-        nslot = op->rows*BONSAI_N_CHANNELS + op->rem;
-        if (nslot > 64) nslot = 64;
-        for (uint32_t i = 0; i < nslot; i++)
+        eng_nslot = op->rows*BONSAI_N_CHANNELS + op->rem;
+        if (eng_nslot > 64) eng_nslot = 64;
+        for (uint32_t i = 0; i < eng_nslot; i++)
             rslot[i] = 0xDEADBEEFu;
     }
 
     engine_csr_submit_write(1);
     eng_shadow_valid = 1;
+    return done;
+}
+
+void engine_join(uint32_t done)
+{
+    const struct engine_op *op = &eng_shadow; // Valid: submit always fills the shadow.
+    volatile uint32_t *rslot = (volatile uint32_t *)(SCRATCHPAD_BASE + op->dst);
+    uint32_t nslot = eng_nslot;
+    uint32_t *beats0 = eng_beats0;
 
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
     // hanging the boot silently.
@@ -142,6 +161,12 @@ void engine_run(const struct engine_op *op)
             break;
         }
     }
+}
+
+void engine_run(const struct engine_op *op)
+{
+    perf_enter(OP_ENGINE_WAIT);
+    engine_join(engine_submit(op));
     perf_exit(OP_ENGINE_WAIT);
 }
 

@@ -461,6 +461,13 @@ static void console_service(void)
         printf("FFNSEQ %s (1.7B tokens FAIL with it on - debug aid, see infer.c)\n",
                seq_ffn_use ? "on" : "off");
     }
+    else if (strcmp(token, "ovl") == 0) {
+        extern int ovl_use;
+        if (strncmp(str, "on", 2) == 0)  ovl_use = 1;
+        if (strncmp(str, "off", 3) == 0) ovl_use = 0;
+        printf("OVL %s (engine/vec overlap - off serializes for A/B)\n",
+               ovl_use ? "on" : "off");
+    }
     else if (strcmp(token, "seq") == 0) {
         if (strncmp(str, "on", 2) == 0)
             seq_use = 1;

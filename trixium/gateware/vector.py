@@ -56,6 +56,14 @@ class BonsaiVectorUnit(LiteXModule):
         self.sp_wr_adr = Signal(13)
         self.sp_wr_we  = Signal(8)   # 32-bit lane enables.
         self.sp_wr_dat = Signal(256)
+        # Per-cycle port claims (docs/overlap-design.md). rd_req covers the full EX1..EX2
+        # window of a load: dat_r must stay ours through the EX2 capture. wr_req is the
+        # EX2 cycle of a store; when the integrator withholds wr_gnt the FSM HOLDS in EX2
+        # (identical data re-driven, post-increment gated), so numerics cannot change.
+        # wr_gnt resets to 1: unwired DUTs (unit tests, the vecunit bench) are unchanged.
+        self.sp_rd_req = Signal()
+        self.sp_wr_req = Signal()
+        self.sp_wr_gnt = Signal(reset=1)
 
         self.busy = Signal()
         self.done = Signal() # Pulse at program completion (sequencer handshake).
@@ -167,6 +175,20 @@ class BonsaiVectorUnit(LiteXModule):
         pc         = Signal(16)
         loop_start = Signal(16)
         loop_cnt   = Signal(32)
+
+        # Port-claim decode (f_op is the CURRENT instruction in EX1 via insn_f and the
+        # registered copy in EX1B/EX2, so it is stable across the claim window).
+        in_ex2   = Signal()
+        is_load  = Signal()
+        is_store = Signal()
+        ex2_adv  = Signal() # EX2 may commit its effects and advance this cycle.
+        self.comb += [
+            is_load.eq((f_op == OP["LDV"]) | (f_op == OP["LDW"])),
+            is_store.eq((f_op == OP["STV"]) | (f_op == OP["STB"]) | (f_op == OP["STW"])),
+            self.sp_rd_req.eq((in_ex1 | in_ex1b | in_ex2) & is_load),
+            self.sp_wr_req.eq(in_ex2 & is_store),
+            ex2_adv.eq(~is_store | self.sp_wr_gnt),
+        ]
 
         # Operand fetch registers (EX0): the register-file Array muxes + their fanout to
         # the multiplier/ROM/scratchpad launches were the residual critical path once the
@@ -581,6 +603,7 @@ class BonsaiVectorUnit(LiteXModule):
         ]
 
         fsm.act("EX2",
+            in_ex2.eq(1),
             # Store port drive.
             If(f_op == OP["STV"],
                 self.sp_wr_adr.eq(sa_val[5:18]),
@@ -602,16 +625,18 @@ class BonsaiVectorUnit(LiteXModule):
                 self.sp_wr_we.eq(0xFF),
                 self.sp_wr_dat.eq(va_flat[0:256]), # Lanes 0..7 as 8 x int32.
             ),
-            # PC update.
-            If(f_op == OP["DONE"],
-                NextState("FINISH"),
-            ).Elif((f_op == OP["LOOPE"]) & (loop_cnt > 1),
-                NextValue(loop_cnt, loop_cnt - 1),
-                NextValue(pc, loop_start),
-                NextState("EX0"),   # insn_f restored from loop_first this same edge.
-            ).Else(
-                NextValue(pc, pc + 1),
-                NextState("EX0"),   # insn_f already holds the word at pc+1.
+            # PC update - only when the cycle commits (a store waiting on wr_gnt holds).
+            If(ex2_adv,
+                If(f_op == OP["DONE"],
+                    NextState("FINISH"),
+                ).Elif((f_op == OP["LOOPE"]) & (loop_cnt > 1),
+                    NextValue(loop_cnt, loop_cnt - 1),
+                    NextValue(pc, loop_start),
+                    NextState("EX0"),   # insn_f restored from loop_first this same edge.
+                ).Else(
+                    NextValue(pc, pc + 1),
+                    NextState("EX0"),   # insn_f already holds the word at pc+1.
+                ),
             ),
         )
         fsm.act("FINISH",
@@ -620,9 +645,9 @@ class BonsaiVectorUnit(LiteXModule):
             NextState("IDLE"),
         )
 
-        # EX2 effects (sync).
+        # EX2 effects (sync) - gated on ex2_adv so a held store applies them exactly once.
         self.sync += [
-            If(fsm.ongoing("EX2"),
+            If(fsm.ongoing("EX2") & ex2_adv,
                 # Vector writeback.
                 If(is_vec_wb,
                     V[f_vd].eq(wb_val),
