@@ -85,6 +85,12 @@ OPCODES = [
     # M8 additions (softmax/reduce programs).
     "REDSMAX",  # sd = max(sd, max(lanes)) SIGNED (REDMAX is an abs-max).
     "STW",      # store lanes 0..7 as 8 x int32 (32 bytes; S[sa] += 32).
+    # Scalar-B ALU forms: b comes from S[sa] instead of a vector register. The BCAST+V<op>
+    # idiom costs 1-3 body instructions per use to materialise a per-iteration-constant
+    # vector; at 4 cycles/instruction on a non-overlapped FSM that idiom was 8 of
+    # silu_mul's 36 body instructions. RTL cost: one 2:1 mux on the shared b-lane feed.
+    "VSHLS",  # vd = va shifted lanewise by S[sa]: left if >= 0, arith right if < 0 (+-31).
+    "VMULS",  # vd = low 32 bits of va * S[sa].
 ]
 OP = {name: i for i, name in enumerate(OPCODES)}
 
@@ -141,6 +147,8 @@ def assemble(program):
             vd = take_v(); va = take_v(); vb = take_v()
         elif op in ("VSHRI", "VSHLI", "VRNE"):
             vd = take_v(); va = take_v(); imm = take_i()
+        elif op in ("VSHLS", "VMULS"):
+            vd = take_v(); va = take_v(); sa = take_s()
         elif op in ("VCLAMP8", "VCLAMP16", "VABS", "VCLZN", "LUTE2", "LUTRECIP", "LUTRSQRT"):
             vd = take_v(); va = take_v()
         elif op in ("REDSUM", "REDSSQ", "REDMAX", "REDSMAX"):
@@ -278,17 +286,21 @@ class VecInterp:
                 S[sa] = _s48(S[sa] + 16)
             elif op == "BCAST":
                 V[vd] = np.full(LANES, _s32(S[sa]), dtype=np.int64)
-            elif op in ("VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK"):
-                a, b = V[va], V[vb]
+            elif op in ("VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK",
+                        "VSHLS", "VMULS"):
+                a = V[va]
+                b = (np.full(LANES, _s32(S[sa]), dtype=np.int64)
+                     if op in ("VSHLS", "VMULS") else V[vb])
                 if   op == "VADD":    r = a + b
                 elif op == "VSUB":    r = a - b
                 elif op == "VMUL":    r = a*b
                 elif op == "VMULH15": r = (a*b) >> 15
                 elif op == "VMIN":    r = np.minimum(a, b)
                 elif op == "VMAX":    r = np.maximum(a, b)
-                elif op == "VSHLV":
+                elif op in ("VSHLV", "VSHLS"):
                     amt = np.clip(b, -31, 31)
                     r = np.where(amt >= 0, a << np.maximum(amt, 0), a >> np.maximum(-amt, 0))
+                elif op == "VMULS":  r = a*b
                 elif op == "VPACK":
                     r = np.concatenate([a[:8], b[:8]])
                 V[vd] = np.asarray([_s32(x) for x in r], dtype=np.int64)
@@ -441,63 +453,44 @@ def prog_norm_i32():
 
 def prog_silu_mul():
     """dst_i16 = clamp16(silu(gate) * up >> 15-ish), all Q15 fixed point.
-    gate value = mg * 2^A4 (A4 = e_gate), up value = mu * 2^A5. Firmware supplies:
-      A4 = right-shift such that f = (mg * C_LOG2E) >> A4 is the Q15 value of gate*log2(e)
-           (C_LOG2E = round(log2(e) * 2^9) = 739 => f_int = mg*739*2^(eg+6); A4 = -(eg+6)).
-      A6 = output shift so that dst mantissa = (sig_q15 * mg * mu-ish) fits int16
-    Pipeline per beat:
-      f   = clamp((mg * C) >> A4, -15*2^15, 14*2^15)  # log2-domain input
-      i   = f >> 15 (floor), r = f & 0x7FFF
-      e2  = EXP2F(r) << i                              # 2^f, integer-scaled Q15
-      den = e2 + 2^15                                  # 1 + 2^f
-      n   = VCLZN(den); m = den << n (Q15 mantissa in [2^14, 2^15))
-      rec = RECIP(m)                                   # Q15-ish of 1/m
-      sig = (e2 * rec) >> 15, then >> (correction from n and den exponent) via VSHLV
-      out = ((mg * sig) >> 15) * mu >> A6
+    gate value = mg * 2^eg, up value = mu * 2^eu. Firmware supplies:
+      A4 = eg + 6, the DIRECT (usually negative => right) shift for f = (mg*C_LOG2E) << A4.
+           CONVENTION CHANGE 2026-08-28: this used to be -(eg+6), negated in-loop; VSHLS
+           shifts by the scalar directly, so the negation moved to the caller.
+      A6 = output shift so that dst mantissa = (sig_q15 * mg * mu-ish) fits int16 (direct).
+    Body is 25 instructions (was 36): VMULS/VSHLS replace the BCAST+V<op> constant idiom,
+    v2 holds 2^15 persistently across iterations, and the clamp scratch moved to v4 (dead
+    until VSHRI writes it). Same arithmetic, instruction for instruction, as before -
+    verified against the float reference in test_asm, not just against this interpreter.
     """
     C_LOG2E = 739 # round(log2(e) * 2^9) - fits the 11-bit immediate; A4 folds the 2^9 scale.
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("ARG",   "s4", 4), ("ARG", "s6", 6),
         ("MOVSI", "s5", C_LOG2E),
+        ("MOVSI", "s7", 1), ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # v2 = 2^15
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),          # mg
         ("LDV",   "v1", "s1"),          # mu
-        # f = (mg * C_LOG2E) >> A4, clamped to [-15, 8] in Q15.
-        ("BCAST", "v2", "s5"),
-        ("VMUL",  "v3", "v0", "v2"),
-        ("BCAST", "v2", "s4"),
-        ("VSUB",  "v4", "v4", "v4"),
-        ("VSUB",  "v2", "v4", "v2"),    # -A4
-        ("VSHLV", "v3", "v3", "v2"),    # f (Q15)
-        ("MOVSI", "s7", -480), ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 10),
-        ("VMAX",  "v3", "v3", "v2"),    # clamp low at -480*2^10 = -15*2^15
-        ("MOVSI", "s7", 448), ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 10),
-        ("VMIN",  "v3", "v3", "v2"),    # clamp high at 14*2^15 (e2 <= 2^29: int32-safe)
-        # split i/r; e2 = EXP2F(r) << i
+        ("VMULS", "v3", "v0", "s5"),    # mg * C_LOG2E
+        ("VSHLS", "v3", "v3", "s4"),    # f (Q15): << A4 (negative = right shift)
+        ("MOVSI", "s7", -480), ("BCAST", "v4", "s7"), ("VSHLI", "v4", "v4", 10),
+        ("VMAX",  "v3", "v3", "v4"),    # clamp low at -15*2^15
+        ("MOVSI", "s7", 448), ("BCAST", "v4", "s7"), ("VSHLI", "v4", "v4", 10),
+        ("VMIN",  "v3", "v3", "v4"),    # clamp high at 14*2^15 (e2 <= 2^29: int32-safe)
         ("VSHRI", "v4", "v3", 15),      # i = floor(f)
-        # LUTE2 masks its operand to the low 15 bits (interpreter: x & 0x7FFF; RTL:
-        # x15.eq(va[0:15])), and r = f - ((f >> 15) << 15) IS f & 0x7FFF in two's
-        # complement - so splitting r out cost two instructions per iteration for a value
-        # the LUT was going to compute anyway. Safe because the VMIN/VMAX above clamp f,
-        # so neither the shift nor the subtract could have overflowed either.
-        ("LUTE2", "v5", "v3"),          # 2^r, Q15 in [2^15, 2^16)
+        ("LUTE2", "v5", "v3"),          # 2^r (LUTE2 masks to low 15 bits itself)
         ("VSHLV", "v5", "v5", "v4"),    # e2 = 2^f (Q15 integer-scaled)
-        # den = e2 + 2^15 ; normalize ; recip
-        ("MOVSI", "s7", 1), ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15),
-        ("VADD",  "v6", "v5", "v2"),    # den
-        ("VCLZN", "v7", "v6"),          # n (<= 0 here: den >= 2^15)
+        ("VADD",  "v6", "v5", "v2"),    # den = e2 + 2^15 (v2 persistent)
+        ("VCLZN", "v7", "v6"),          # n (<= 0: den >= 2^15)
         ("VSHLV", "v6", "v6", "v7"),    # mantissa in [2^14, 2^15)
-        ("LUTRECIP", "v6", "v6"),       # ~ (2^29)/den_mantissa, Q15 of 1/m in [2^14, 2^15]
-        # sig = e2 * rec adjusted: sig_q15 = (e2 * rec) >> (15 - n)  (n <= 0)
+        ("LUTRECIP", "v6", "v6"),
         ("VMULH15", "v5", "v5", "v6"),  # (e2 * rec) >> 15
-        ("VSHLV", "v5", "v5", "v7"),    # >> -n more  => sigmoid in Q14 (rec is Q15 of 1/(2m))
+        ("VSHLV", "v5", "v5", "v7"),
         ("VSHLI", "v5", "v5", 1),       # Q14 -> Q15
-        # out = ((mg * sig) >> 15) * mu >> A6
         ("VMULH15", "v0", "v0", "v5"),
         ("VMUL",  "v0", "v0", "v1"),
-        ("BCAST", "v2", "s6"),
-        ("VSHLV", "v0", "v0", "v2"),    # >> A6 (A6 negative shift amount from firmware)
+        ("VSHLS", "v0", "v0", "s6"),    # >> A6
         ("VCLAMP16", "v0", "v0"),
         ("STV",   "v0", "s2"),
         ("LOOPE",),

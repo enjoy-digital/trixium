@@ -202,7 +202,13 @@ class BonsaiVectorUnit(LiteXModule):
             a = Signal((32, True))
             b = Signal((32, True))
             self.comb += a.eq(va_flat[32*i:32*(i+1)])
-            self.comb += b.eq(vb_flat[32*i:32*(i+1)])
+            # Scalar-B forms (VSHLS/VMULS): b comes from S[sa]. Muxing at the shared b-lane
+            # feed makes every downstream net (multipliers, the VSHLV shifter) serve both
+            # the vector and scalar forms - the ops then just alias the existing results.
+            # sa_val registers at EX0 exactly like the V operands, so timing is unchanged
+            # in kind; the mux adds one 2:1 level inside the EX multicycle cone.
+            self.comb += b.eq(Mux((f_op == OP["VSHLS"]) | (f_op == OP["VMULS"]),
+                                  sa_val[0:32], vb_flat[32*i:32*(i+1)]))
             a_l.append(a)
             b_l.append(b)
 
@@ -404,9 +410,14 @@ class BonsaiVectorUnit(LiteXModule):
             interp(rom_rsq[i], fq7, 7, lane(res["LUTRSQRT"], i))
 
         # Vector writeback mux.
+        # VSHLS/VMULS share the VSHLV/VMUL nets (the b-lane mux above selects the scalar);
+        # they only need their own writeback selections.
+        res["VSHLS"] = res["VSHLV"]
+        res["VMULS"] = res["VMUL"]
         vec_wb_ops = ["VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHRI", "VSHLI",
                       "VSHLV", "VRNE", "VCLAMP8", "VCLAMP16", "VABS", "VCLZN", "VPACK",
-                      "LDV", "LDW", "BCAST", "LUTE2", "LUTRECIP", "LUTRSQRT"]
+                      "LDV", "LDW", "BCAST", "LUTE2", "LUTRECIP", "LUTRSQRT",
+                      "VSHLS", "VMULS"]
         # Writeback value. The 21-way 512-bit opcode mux was the EX2 critical path
         # (FSM state -> mux -> V register D). Everything except the two load ops is
         # computed from registers that are stable by EX1B, so that part is selected and

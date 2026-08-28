@@ -72,7 +72,7 @@ def test_sim_selftest_checksums():
         ("quant8f",  "quant8",     [0x8000, 0, 0xB200, 8], 0xB200),   # A1 = 0: fixed >>8.
         ("norm_i32", "norm_i32",   [0x8000, 0, 0xA200, 4, 13], 0xA200),
         ("resid",    "resid_add",  [0x8000, 0x8400, 0xA400, 8, 1, 2], 0xA400),
-        ("silu",     "silu_mul",   [0x8000, 0x8400, 0xA600, 8, 6, 0, -15], 0xA600),
+        ("silu",     "silu_mul",   [0x8000, 0x8400, 0xA600, 8, -6, 0, -15], 0xA600),
         ("rmsnorm",  "rmsnorm",    [0x8000, 0x8400, 0xA800, 8, -7, 17, -17], 0xA800),
         ("rope",     "rope",       [0x8000, 0x8080, 0x8400, 0x8480, 4, 0xAA00, 0xAA80], 0xAA00),
         ("softmax8", "softmax8",   [0x8000, 739, 0xAC00, 4, -11, 17], 0xAC00),
@@ -236,7 +236,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
             sp[0:2*n]         = gm.astype("<i2").tobytes()
             sp[8192:8192+2*n] = um.astype("<i2").tobytes()
             words = vasm.assemble(vasm.PROGRAMS["silu_mul"]())
-            vasm.VecInterp(sp).run(words, [0, 8192, 16384, n//16, -(eg + 6), 0, -15])
+            vasm.VecInterp(sp).run(words, [0, 8192, 16384, n//16, eg + 6, 0, -15])
             return np.frombuffer(bytes(sp[16384:16384+2*n]), dtype="<i2").astype(np.int64)
         g = gm.astype(f32)*f32(np.exp2(eg))
         u = um.astype(f32)*f32(np.exp2(eu))

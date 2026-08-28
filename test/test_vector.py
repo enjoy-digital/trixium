@@ -116,7 +116,7 @@ def test_rtl_silu_mul():
     sp  = bytearray(SP_SIZE)
     sp[0:2*n]         = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
     sp[2048:2048+2*n] = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
-    _compare("silu_mul", sp, [0, 2048, 4096, n//16, 6, 0, -15]) # eg = -12 -> A4 = 6.
+    _compare("silu_mul", sp, [0, 2048, 4096, n//16, -6, 0, -15]) # eg = -12 -> A4 = eg+6 = -6.
 
 def test_rtl_rmsnorm():
     rng = np.random.default_rng(31)

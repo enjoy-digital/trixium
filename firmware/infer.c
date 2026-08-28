@@ -572,7 +572,7 @@ static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n)
 #ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_SILU_MUL)) {
         int32_t args[7] = {(int32_t)gsrc, (int32_t)usrc, (int32_t)gsrc, n/16,
-                           -(eg + 6), 0, -15};
+                           eg + 6, 0, -15}; // A4 = direct shift (VSHLS convention 2026-08-28).
         vec_run(PROG_SILU_MUL, args, 7);
         return;
     }
@@ -1988,9 +1988,12 @@ attn_heads_done: ;
                 seq_desc_engine(seq_ffn_base + 3, &mo);
                 model_matvec_op(ed_t, SP_X, SP_Y, &mo);
                 seq_desc_engine(seq_ffn_base + 8, &mo);
-                // silu A4 = -(eg + 6) = imm - kreg0, with eg = ex8 - bias_g + rshift_g + kg.
+                // silu A4 = eg + 6 = imm + kg under the 2026-08-28 VSHLS convention - but the
+                // kreg arg path SUBTRACTS (chosen for the old -(eg+6) shape). The list is
+                // default-off with an undiagnosed 1.7B divergence anyway; when revived, the
+                // kadd polarity needs a descriptor bit (or flip to add) alongside that fix.
                 seq_patch(seq_ffn_base + 6, 6,
-                          (uint32_t)(-(ex8 - (int)eg_t->bias + (int)eg_t->rshift + 6)));
+                          (uint32_t)(ex8 - (int)eg_t->bias + (int)eg_t->rshift + 6));
                 perf_enter(OP_SILU_MUL);
                 seq_run((uint32_t)seq_ffn_base, 10);
                 perf_exit(OP_SILU_MUL);

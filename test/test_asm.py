@@ -73,8 +73,8 @@ def test_silu_mul_accuracy():
     sp = bytearray(8192)
     sp[0:2*n]         = g16.tobytes()
     sp[2048:2048+2*n] = u16.tobytes()
-    # A4 = right-shift for f: f_int = mg*739*2^(eg+6) => shift right by -(eg+6).
-    a4 = -(eg + 6)
+    # A4 = eg + 6, the DIRECT (negative = right) shift for f (2026-08-28 VSHLS convention).
+    a4 = eg + 6
     a6 = -15 # (mg*sig>>15)*mu >> 15; output exponent eo = eg+eu+15.
     _run("silu_mul", sp, [0, 2048, 4096, n//16, a4, 0, a6])
     got = np.frombuffer(bytes(sp[4096:4096+2*n]), dtype=np.int16).astype(np.float64)
@@ -96,7 +96,7 @@ def test_silu_mul_zero_and_extremes():
     sp[0:32]   = g16.tobytes()
     sp[512:544] = u16.tobytes()
     asm.VecInterp(sp).run(asm.assemble(asm.prog_silu_mul()),
-                          [0, 512, 1024, 1, -(eg + 6), 0, -15])
+                          [0, 512, 1024, 1, eg + 6, 0, -15])
     got = np.frombuffer(bytes(sp[1024:1056]), dtype=np.int16).astype(np.float64)
     got_val = got*2.0**(eg + eu + 15)
     gv = g16.astype(np.float64)*2.0**eg
