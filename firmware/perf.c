@@ -33,6 +33,13 @@ static uint32_t ovl0_tot, ovl0_eng, ovl0_vec, ovl0_both;
 
 void perf_reset(void)
 {
+    {
+        extern uint32_t eng_poll_spins, eng_poll_waits, vec_poll_spins, vec_poll_waits,
+                        seq_poll_spins, seq_poll_waits;
+        eng_poll_spins = eng_poll_waits = 0;
+        vec_poll_spins = vec_poll_waits = 0;
+        seq_poll_spins = seq_poll_waits = 0;
+    }
     // Snapshot the free-running overlap counters too. Without this the percentages are
     // computed over everything since reset - boot, selftest and the weight load - which on
     // the n8 sim is ~40M cycles against ~1.7M for a generation leg, so the token loop is
@@ -82,6 +89,16 @@ void perf_print(void)
                i == OP_ENGINE_WAIT ? " (within ops above)" : "");
     }
     printf("total (excl. engine_wait overlap): %lu cycles\n", (unsigned long)total);
+    {
+        // Completion-poll census: iterations x ~70cy CSR read bounds what IRQ completion
+        // could recover. Deltas since perf_reset.
+        extern uint32_t eng_poll_spins, eng_poll_waits, vec_poll_spins, vec_poll_waits,
+                        seq_poll_spins, seq_poll_waits;
+        printf("poll: eng %lu/%lu  vec %lu/%lu  seq %lu/%lu (spins/waits; x~70cy = bound)\n",
+               (unsigned long)eng_poll_spins, (unsigned long)eng_poll_waits,
+               (unsigned long)vec_poll_spins, (unsigned long)vec_poll_waits,
+               (unsigned long)seq_poll_spins, (unsigned long)seq_poll_waits);
+    }
     perf_print_overlap();
 }
 

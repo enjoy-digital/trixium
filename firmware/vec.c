@@ -20,6 +20,8 @@ void vec_init(void)
         vecunit_prog_write(bonsai_progs[i]);
 }
 
+uint32_t vec_poll_spins, vec_poll_waits;
+
 uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
 {
     static void (* const wr[8])(uint32_t) = {
@@ -36,7 +38,9 @@ uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
     // that just stopped printing, with nothing to distinguish it from an engine stall.
     // The status CSR's bad_op field also names a corrupted/unknown instruction directly.
     uint32_t spins = 0, reports = 0;
+    vec_poll_waits++;
     while (vecunit_done_count_read() == done) {
+        vec_poll_spins++;
         if (++spins < 400000u)
             continue;
         spins = 0;

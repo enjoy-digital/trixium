@@ -67,6 +67,8 @@ void seq_patch(uint32_t idx, int word, uint32_t value)
 
 int seq_wedged; // Sticky: a list never finished, so the engine state is not trustworthy.
 
+uint32_t seq_poll_spins, seq_poll_waits;
+
 void seq_run(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged) // Nothing will complete until the FPGA is reconfigured.
@@ -82,7 +84,9 @@ void seq_run(uint32_t idx0, uint32_t count)
     // SPTEST reports 64 errors - and a CPU reset does not clear either. Only reconfiguring
     // the FPGA does. Giving up at least keeps the console alive to say so.
     uint32_t spins = 0, reports = 0;
+    seq_poll_waits++;
     while (seq_status_read() & 1) {
+        seq_poll_spins++;
         if (++spins < 200000u)
             continue;
         spins = 0;

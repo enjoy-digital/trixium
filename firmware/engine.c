@@ -22,6 +22,9 @@ int engine_wedged; // Sticky: an op never completed, so engine results are not t
 // still names the channel that came up short.
 int engine_diag;
 
+// Completion-poll census (spins x ~70cy CSR read = the IRQ opportunity, upper bound).
+uint32_t eng_poll_spins, eng_poll_waits;
+
 // Shadow of the last-written op CSRs: a CSR access costs ~70 cycles on this SoC (measured
 // via vbench: a minimal vec_run of ~8 accesses is ~570 cycles), and the token loop issues
 // ~760 engine ops per forward whose fields mostly repeat - consecutive KV stores differ
@@ -120,7 +123,9 @@ void engine_join(uint32_t done)
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
     // hanging the boot silently.
     uint32_t spins = 0, reports = 0;
+    eng_poll_waits++;
     while (engine_csr_done_count_read() == done) {
+        eng_poll_spins++;
         if (++spins < 200000u)
             continue;
         spins = 0;
