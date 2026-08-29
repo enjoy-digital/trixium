@@ -110,6 +110,11 @@ class BonsaiMatVecEngine(LiteXModule):
                              # 13 per-head attention descriptors. int32 add wraps and is
                              # associative, so the tree here is bit-identical to the
                              # sequential vector-unit reduce it replaces.
+            ("rep",    5),   # STORE only: number of packets (0/1 = one). Packet r goes to
+                             # wbase + r*dstride beats from xsrc + r*sstride beats - the
+                             # 16 per-layer KV packets in ONE op (F1-1, 2026-08-29).
+            ("dstride", 24), # STORE: HBM beats between consecutive packets.
+            ("sstride", 8),  # STORE: scratchpad beats between consecutive source slots.
         ])
         self.sp_busy = Signal() # busy + 1 cycle: the registered write stage's last beat
                                 # lands the cycle after busy drops; sideband arbitration
@@ -178,6 +183,7 @@ class BonsaiMatVecEngine(LiteXModule):
         cmd_r = {}
         for name in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
                      "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
+                     "rep", "dstride", "sstride",
                      "qn", "qstride", "rshift2", "xred"):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
@@ -224,8 +230,17 @@ class BonsaiMatVecEngine(LiteXModule):
         fill_beat_d   = Signal(10)
         st_cnt        = Signal(13) # STORE beat counter (address holds until accepted).
         st_rdv        = Signal()   # fill.dat_r valid for the STORE stream.
+        # Multi-packet STORE state: packet index, running HBM address, running source
+        # beat offset (all reset on accept; advanced between packets).
+        st_rep        = Signal(5)
+        st_addr_r     = Signal(32)
+        st_src_off    = Signal(13)
+        st_last_pkt   = Signal()
+        st_next       = Signal()   # Pulse: advance to the next packet.
+        self.comb += st_last_pkt.eq((st_rep + 1 >= cmd_r["rep"]))
         eng_fill_adr = Signal(len(scratchpad.fill.adr))
-        self.comb += eng_fill_adr.eq((cmd_r["xsrc"] >> 5) + Mux(store_mode, st_cnt, fill_beat))
+        self.comb += eng_fill_adr.eq((cmd_r["xsrc"] >> 5)
+                                     + Mux(store_mode, st_src_off + st_cnt, fill_beat))
         self.comb += [
             self.store_data.valid.eq(st_rdv),
             self.store_data.data.eq(scratchpad.fill.dat_r),
@@ -528,9 +543,10 @@ class BonsaiMatVecEngine(LiteXModule):
             # Per-cycle arbitration (docs/overlap-design.md): the units may run
             # CONCURRENTLY, so the grant is per cycle, not per op.
             #
-            # R port: vec > seq > engine. A vec load claims the port for its EX1..EX2
-            # window (sp_rd_req); the engine's fill/store address generation simply does
-            # not advance on those cycles (rd_free below). Seq descriptor fetches still
+            # R port: vec > seq > engine. A vec load claims the port for exactly its
+            # E1 (address) cycle since the V1 pipeline (sp_rd_req; it was a 3-cycle EX1..EX2
+            # window on the FSM unit); the engine's fill/store address generation simply
+            # does not advance on those cycles (rd_free below). Seq descriptor fetches still
             # only happen while both units are idle.
             #
             # W port: engine writes are enqueued into a small FIFO instead of driving the
@@ -616,7 +632,7 @@ class BonsaiMatVecEngine(LiteXModule):
             self.store_cmd.chan.eq(cmd_r["chan"]),
             # STORE targets the one channel in cmd.chan, so it needs the same per-channel
             # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
-            self.store_cmd.addr.eq(cmd_r["wbase"] +
+            self.store_cmd.addr.eq(st_addr_r +
                 (cmd_r["chan"] << chan_shift if chan_stride else 0)),
             self.store_cmd.len.eq(cmd_r["wlen"]),
             If(self.store_cmd.ready,
@@ -626,7 +642,14 @@ class BonsaiMatVecEngine(LiteXModule):
         fsm.act("ST_RUN",
             self.busy.eq(1),
             If(st_advance & (st_cnt == cmd_r["wlen"] - 1),
-                NextState("ST_DRAIN"),
+                If(st_last_pkt,
+                    NextState("ST_DRAIN"),
+                ).Else(
+                    # Next packet: the loader accepts the command once it has drained
+                    # this one (its store FSM returns to idle), so no extra wait here.
+                    st_next.eq(1),
+                    NextState("ST_CMD"),
+                )
             )
         )
         fsm.act("ST_DRAIN", # Wait for the loader's B-channel drain: data is then readable.
@@ -711,6 +734,14 @@ class BonsaiMatVecEngine(LiteXModule):
             st_rdv.eq(fsm.ongoing("ST_RUN") & ~st_advance & rd_free),
             If(start_pulse,
                 st_cnt.eq(0),
+                st_rep.eq(0),
+                st_addr_r.eq(cmd_r["wbase"]),
+                st_src_off.eq(0),
+            ).Elif(st_next,
+                st_cnt.eq(0),
+                st_rep.eq(st_rep + 1),
+                st_addr_r.eq(st_addr_r + (cmd_r["dstride"] << 5)),
+                st_src_off.eq(st_src_off + cmd_r["sstride"]),
             ).Elif(st_advance,
                 st_cnt.eq(st_cnt + 1),
             ),

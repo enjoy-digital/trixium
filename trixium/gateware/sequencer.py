@@ -48,7 +48,8 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;  w5 = wlen;
           w6 = sbeats | cbeats<<8 | qstride<<16 (head-B result offset, words);
           w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
-          w8 = xsrc;  w9 = dst;  w10 = chan.
+          w8 = xsrc;  w9 = dst;  w10 = chan;
+          w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE, F1-1).
   vec:    w1 = pc;  w2..w9 = args 0..7.
 
 Numerics are UNCHANGED - sequencing is transparent; the golden mirrors need no update.
@@ -100,6 +101,9 @@ class BonsaiSequencer(LiteXModule):
         self.eng_xred   = Signal()  # AXPY cross-channel reduce (engine sums the partials).
         self.eng_qstride = Signal(16)
         self.eng_rshift2 = Signal(6)
+        self.eng_rep     = Signal(5)   # Multi-packet STORE (words 11-13).
+        self.eng_dstride = Signal(24)
+        self.eng_sstride = Signal(8)
         self.eng_done   = Signal()   # From the engine (pulse).
         self.absmax     = Signal(32) # From the engine tracker.
 
@@ -300,6 +304,9 @@ class BonsaiSequencer(LiteXModule):
             self.eng_xsrc.eq(w(1, 8)[0:24]),
             self.eng_dst.eq(w(1, 9)[0:24]),
             self.eng_chan.eq(w(1, 10)[0:5]),
+            self.eng_rep.eq(w(1, 11)[0:5]),
+            self.eng_dstride.eq(w(1, 12)[0:24]),
+            self.eng_sstride.eq(w(1, 13)[0:8]),
             self.vec_pc.eq(w(0, 1)[0:16]),
         ]
 

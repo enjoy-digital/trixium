@@ -2132,3 +2132,79 @@ def test_sequencer_kadd_interlock_precise():
     # window is small in absolute cycles; > 10 is well above zero and below any run.
     assert out["both"] > 10, f"kreg0 consumer did not overlap B (cyc_both={out['both']})"
 
+
+@pytest.mark.parametrize("chan_stride", [0, 0x1000])
+def test_engine_multi_store(chan_stride):
+    # F1-1: one STORE op scatters `rep` packets - packet r from scratchpad
+    # xsrc + r*sstride beats to HBM wbase + r*dstride beats - the per-layer KV append as
+    # a single dispatch. Fetch every region back and compare; a wrong stride or a packet
+    # count off by one shows as a mismatch in exactly one region.
+    from trixium.gateware.loader import BonsaiHBMLoader
+
+    n_channels = 2
+    rng   = np.random.default_rng(29)
+    rep   = 5
+    beats = 3                      # kv_rb-sized packets.
+    sstride = 16                   # 0x200 B slots, as kvp_slot().
+    dstride = 64                   # 2 KB regions.
+    sp = bytearray(64*1024)
+    pk = []
+    for r in range(rep):
+        p = rng.integers(0, 256, 32*beats, dtype=np.uint8).tobytes()
+        pk.append(p)
+        sp[r*32*sstride:r*32*sstride + len(p)] = p
+
+    class _MStoreDUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(
+                size=64*1024, init=words_from_bytes(bytes(sp)))
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+                                                        chan_stride=chan_stride)
+            self.submodules.loader = BonsaiHBMLoader(axis)
+            self.comb += [
+                self.engine.store_cmd.connect(self.loader.store_cmd),
+                self.engine.store_data.connect(self.loader.store_data),
+                self.engine.store_busy.eq(self.loader.store_busy),
+            ]
+            for i, axi in enumerate(axis):
+                model = BonsaiHBMChannelModel(axi, size=64*1024, latency=8)
+                setattr(self.submodules, f"model{i}", model)
+
+    dut = _MStoreDUT()
+
+    def submit(c):
+        for k in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
+                  "bias", "rshift", "xsrc", "dst", "chan", "rep", "dstride", "sstride"):
+            yield getattr(dut.engine.cmd, k).eq(c.get(k, 0))
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+
+    def wait_done():
+        for _ in range(50000):
+            if (yield dut.engine.done):
+                return
+            yield
+        raise AssertionError("timeout")
+
+    def driver():
+        yield from submit(dict(kind=3, chan=1, wbase=0x2000, wlen=beats, xsrc=0,
+                               rep=rep, dstride=dstride, sstride=sstride))
+        yield from wait_done()
+        yield
+        for r in range(rep):
+            yield from submit(dict(kind=2, chan=1, wbase=0x2000 + r*32*dstride, wlen=beats,
+                                   dst=0x8000 + r*0x100))
+            yield from wait_done()
+            yield
+            got = bytearray()
+            for w in range(beats):
+                v = (yield dut.scratchpad.mem[(0x8000 + r*0x100 + 32*w)//32])
+                got += int(v).to_bytes(32, "little")
+            assert bytes(got) == pk[r], f"multi-store packet {r} mismatch"
+
+    run_simulation(dut, [driver()])

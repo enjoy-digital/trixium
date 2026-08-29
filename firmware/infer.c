@@ -1718,10 +1718,27 @@ embed_done: ;
                 kv_pack_row_res(l, hh, 1, SP_V + hh*head_dim*2, ev_res);
 #endif
             }
+#ifdef CSR_ENGINE_CSR_REP_ADDR
+            {   // ...then ONE multi-packet store for all 2*n_kv_head slots (F1-1): the
+                // (kvh, kind) regions of a layer are consecutive (kv_region beats apart)
+                // and the staging slots 0x200 B apart, so one op scatters them all.
+                struct engine_op op = {0};
+                op.kind    = ENGINE_KIND_STORE;
+                op.chan    = pos % n_ch;
+                op.wbase   = kv_region_addr(l, 0, 0) + (uint32_t)(pos/n_ch)*kv_rb*32;
+                op.wlen    = kv_rb;
+                op.xsrc    = kvp_slot(0, 0);
+                op.rep     = (uint8_t)(2*n_kv_head);
+                op.dstride = kv_region;
+                op.sstride = 0x200/32;
+                engine_run(&op);
+            }
+#else
             for (int hh = 0; hh < n_kv_head; hh++) {   // ...then hand the port to the engine.
                 kv_store_row_res(l, hh, 0, pos);
                 kv_store_row_res(l, hh, 1, pos);
             }
+#endif
             perf_exit(OP_KVQUANT);
             eq_res = E_NORM;
             (void)eq_res;

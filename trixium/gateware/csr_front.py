@@ -43,6 +43,9 @@ class BonsaiEngineCSR(LiteXModule):
         self.xred    = CSRStorage(1,  description="AXPY: sum the per-channel partials in hardware.")
         self.qstride = CSRStorage(16, description="Head-B result offset in words.")
         self.rshift2 = CSRStorage(6,  description="Head-B AXPY pre-shift.")
+        self.rep     = CSRStorage(5,  description="STORE: packets per op (0/1 = one).")
+        self.dstride = CSRStorage(24, description="STORE: HBM beats between packets.")
+        self.sstride = CSRStorage(8,  description="STORE: scratchpad beats between source slots.")
         self.submit  = CSRStorage(1,  description="Write 1 to submit the op.")
         self.status  = CSRStatus(fields=[
             CSRField("busy",     size=1),
@@ -132,6 +135,9 @@ class BonsaiEngineCSR(LiteXModule):
                 engine.cmd.xred.eq(0 if seq is None else seq.eng_xred),
                 engine.cmd.qstride.eq(0 if seq is None else seq.eng_qstride),
                 engine.cmd.rshift2.eq(0 if seq is None else seq.eng_rshift2),
+                engine.cmd.rep.eq(0 if seq is None else seq.eng_rep),
+                engine.cmd.dstride.eq(0 if seq is None else seq.eng_dstride),
+                engine.cmd.sstride.eq(0 if seq is None else seq.eng_sstride),
             ).Else(
             engine.cmd.valid.eq(pending | (self.submit.re & self.submit.storage)),
             engine.cmd.kind.eq(self.kind.storage),
@@ -153,6 +159,9 @@ class BonsaiEngineCSR(LiteXModule):
             engine.cmd.xred.eq(self.xred.storage),
             engine.cmd.qstride.eq(self.qstride.storage),
             engine.cmd.rshift2.eq(self.rshift2.storage),
+            engine.cmd.rep.eq(self.rep.storage),
+            engine.cmd.dstride.eq(self.dstride.storage),
+            engine.cmd.sstride.eq(self.sstride.storage),
             ),
             self.cyc_total.status.eq(engine.cyc_total[:32]),
             self.cyc_eng.status.eq(engine.cyc_eng[:32]),

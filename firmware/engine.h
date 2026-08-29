@@ -40,6 +40,9 @@ struct engine_op {
     uint32_t xsrc;      // Scratchpad byte address of x8.
     uint32_t dst;       // Scratchpad byte address for results.
     uint8_t  chan;      // Fetch source channel.
+    uint8_t  rep;       // STORE: packets per op (0/1 = one) - F1-1 multi-store.
+    uint32_t dstride;   // STORE: HBM beats between packets.
+    uint8_t  sstride;   // STORE: scratchpad beats between source slots.
 };
 
 void engine_run(const struct engine_op *op);

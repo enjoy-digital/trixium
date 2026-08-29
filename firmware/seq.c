@@ -53,6 +53,9 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
     d[8]  = op->xsrc;
     d[9]  = op->dst;
     d[10] = op->chan;
+    d[11] = op->rep;
+    d[12] = op->dstride;
+    d[13] = op->sstride;
 }
 
 void seq_desc_stop(uint32_t idx)
