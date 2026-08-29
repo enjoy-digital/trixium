@@ -239,6 +239,60 @@ static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 
 // AXPY pre-shift keeping the int32 lane accumulators safe (bitexact.axpy_rpre):
 // pure bit-length form so the descriptor sequencer can compute it in hardware.
+// F1-5 (2026-08-29): the per-head attention fold in integers, emulating the float32 path
+// bit-for-bit so tokens stay byte-identical. The float path (kept below `ifold_use`) is
+// soft-float on VexiiRiscv - a divide, ldexpf, a multiply and frexpf per head, then
+// lroundf(ldexpf()) per head for the scale8 multiplier: ~1.4k cycles per head, 448 per token.
+//   q  = RN24(1.0f / (float)P8)            -> (qm, qe): q = qm * 2^qe, qm in [2^23, 2^24)
+//   c2 = ldexpf(q, E1)                     -> (qm, qe + E1), no rounding
+//   hm = (float)(am >> k2) * c2            -> RN24 of the product: (m2, e2)
+//   ea8 = frexpf(max hm) - 7               -> e2max + 24 - 7
+//   Mh  = lroundf(ldexpf(c2, 15 - ea8))    -> qm * 2^(qe + E1 + 15 - ea8), half away from 0
+int ifold_use = 0; // Default OFF until the card tokens pass with it on (2026-08-30).
+static void attn_f32_recip(uint32_t p8, uint32_t *qm, int *qe)
+{
+    int L = 0;
+    while ((p8 >> L) != 0) L++;                  // bitlen: 2^(L-1) <= p8 < 2^L
+    uint64_t num = (uint64_t)1 << (23 + L);      // 2^(23+L)/p8 in (2^23, 2^24]
+    uint64_t m = num/p8, r = num - m*p8;
+    if (2*r > p8 || (2*r == p8 && (m & 1))) m++; // round to nearest even
+    int e = -(23 + L);
+    if (m == ((uint64_t)1 << 24)) { m >>= 1; e++; }
+    *qm = (uint32_t)m;
+    *qe = e;
+}
+static void attn_f32_mul(uint32_t a, uint32_t qm, int qe, uint32_t *m2, int *e2)
+{
+    uint64_t p = (uint64_t)a*qm;                 // a <= 2^14, qm < 2^24: p < 2^38
+    int L = 0;
+    while ((p >> L) != 0) L++;
+    int sh = L - 24;                             // p >= 2^23 -> sh >= 0
+    uint64_t m = p >> sh;
+    if (sh > 0) {
+        uint64_t rem = p & (((uint64_t)1 << sh) - 1), half = (uint64_t)1 << (sh - 1);
+        if (rem > half || (rem == half && (m & 1))) m++;
+    }
+    if (m == ((uint64_t)1 << 24)) { m >>= 1; sh++; }
+    *m2 = (uint32_t)m;
+    *e2 = qe + sh;
+}
+static int32_t attn_mh_int(uint32_t qm, int sh)
+{
+    if (sh >= 0) {
+        if (sh >= 8) return 32767;               // qm >= 2^23 -> >= 2^31 -> clamps
+        uint64_t v = (uint64_t)qm << sh;
+        return (v > 32767) ? 32767 : (int32_t)v;
+    }
+    int r = -sh;
+    if (r >= 40) return 0;
+    uint64_t v = ((uint64_t)qm + ((uint64_t)1 << (r - 1))) >> r; // lroundf: half away from 0
+    return (v > 32767) ? 32767 : (int32_t)v;
+}
+static uint32_t aw_qm[32];   // Per-head c2 mantissa (float32 emulation).
+static int      aw_qe[32];   // Per-head c2 exponent (qe + E1).
+static uint32_t aw_hm2;      // max hm mantissa/exponent over heads.
+static int      aw_he2, aw_hvalid;
+
 static int axpy_rpre_c(uint64_t p8sum)
 {
     int bl = 0;
@@ -1861,6 +1915,7 @@ attn_scores: ;
             perf_exit(OP_SCORES);
             // One float fold per head from the spilled p8 sums / absmaxes.
             perf_enter(OP_WV);
+            aw_hvalid = 0;
             for (int hh = 0; hh < n_head; hh++) {
                 int kvh = hh/n_rep;
                 uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8
@@ -1872,10 +1927,27 @@ attn_scores: ;
                 int Rpre = axpy_rpre_c(P8 ? P8 : 1);
                 int k2 = 0;
                 while ((am >> k2) > 16383u) k2++;
-                float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), Rpre - Bv + k2);
-                aw_c[hh] = c2;
-                float hm2 = (float)(am >> k2)*c2;
-                if (hm2 > aw_hmax) aw_hmax = hm2;
+                int E1 = Rpre - Bv + k2;
+                if (ifold_use) {
+                    // Integer emulation of the float32 fold (F1-5): same bits, no soft-float.
+                    uint32_t qm; int qe;
+                    attn_f32_recip(P8 ? P8 : 1, &qm, &qe);
+                    aw_qm[hh] = qm;
+                    aw_qe[hh] = qe + E1;
+                    uint32_t a = am >> k2;
+                    if (a) {
+                        uint32_t m2; int e2;
+                        attn_f32_mul(a, qm, qe + E1, &m2, &e2);
+                        if (!aw_hvalid || e2 > aw_he2 || (e2 == aw_he2 && m2 > aw_hm2)) {
+                            aw_hm2 = m2; aw_he2 = e2; aw_hvalid = 1;
+                        }
+                    }
+                } else {
+                    float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), E1);
+                    aw_c[hh] = c2;
+                    float hm2 = (float)(am >> k2)*c2;
+                    if (hm2 > aw_hmax) aw_hmax = hm2;
+                }
                 (void)Rd;
             }
             perf_exit(OP_WV);
@@ -2109,11 +2181,20 @@ attn_heads_done: ;
             if (attn_hw) {
                 perf_enter(OP_QUANT8);
                 ea8 = 0;
-                if (aw_hmax > 0) { frexpf(aw_hmax, &ea8); ea8 -= 7; }
+                if (ifold_use) {
+                    if (aw_hvalid) ea8 = aw_he2 + 24 - 7;   // frexpf exponent of max hm, -7.
+                } else {
+                    if (aw_hmax > 0) { frexpf(aw_hmax, &ea8); ea8 -= 7; }
+                }
                 for (int hh = 0; hh < n_head; hh++) {
-                    int32_t Mh = (int32_t)lroundf(ldexpf(aw_c[hh], 15 - ea8));
-                    if (Mh > 32767) Mh = 32767;
-                    if (Mh < 0)     Mh = 0;
+                    int32_t Mh;
+                    if (ifold_use) {
+                        Mh = attn_mh_int(aw_qm[hh], aw_qe[hh] + 15 - ea8);
+                    } else {
+                        Mh = (int32_t)lroundf(ldexpf(aw_c[hh], 15 - ea8));
+                        if (Mh > 32767) Mh = 32767;
+                        if (Mh < 0)     Mh = 0;
+                    }
 #ifdef CSR_SEQ_BASE
                     if (seq_use && seq_scale8_base >= 0) {
                         seq_patch((uint32_t)(seq_scale8_base + hh), 6, (uint32_t)Mh);
@@ -2603,8 +2684,8 @@ void infer_vbench(void)
       // per-channel stream counters around it: AR-stall cycles say whether the HBM side
       // limits, near-zero everywhere says the engine's own drain does.
         const struct bons_entry *eg = model_entry(ROLE_FFN_GATE, 0);
-        uint32_t b0[8], a0[8];
-        for (int c = 0; c < n_ch && c < 8; c++) {
+        uint32_t b0[32], a0[32];
+        for (int c = 0; c < n_ch && c < 32; c++) {
             engine_csr_perf_chan_write(c);
             b0[c] = engine_csr_perf_beats_read();
             a0[c] = engine_csr_perf_ar_read();
@@ -2614,7 +2695,7 @@ void infer_vbench(void)
         dt = perf_now() - t0;
         printf("VB matvec_gate      %8lu  (%lu beats/chan)\n",
                (unsigned long)(dt/4), (unsigned long)eg->chan_len_beats);
-        for (int c = 0; c < n_ch && c < 8; c += 4) {
+        for (int c = 0; c < n_ch && c < 32; c += 4) {
             engine_csr_perf_chan_write(c);
             printf("VB   ch%d beats %lu arstall %lu\n", c,
                    (unsigned long)((engine_csr_perf_beats_read() - b0[c])/4),
