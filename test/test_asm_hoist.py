@@ -87,8 +87,46 @@ def _softmax8_before():
     return prog[:i+1] + hoisted + prog[i+1:]
 
 
+
+def _silu_mul_before():
+    # 2026-08-29: the two clamp constants (-15*2^15, 14*2^15) were rebuilt in v4 every
+    # iteration (MOVSI/BCAST/VSHLI x2 = 6 of 27 body instructions) because no vreg was free.
+    C_LOG2E = 739
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s6", 6),
+        ("MOVSI", "s5", C_LOG2E),
+        ("MOVSI", "s7", 1), ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("LDV",   "v1", "s1"),
+        ("VMULS", "v3", "v0", "s5"),
+        ("VSHLS", "v3", "v3", "s4"),
+        ("MOVSI", "s7", -480), ("BCAST", "v4", "s7"), ("VSHLI", "v4", "v4", 10),
+        ("VMAX",  "v3", "v3", "v4"),
+        ("MOVSI", "s7", 448), ("BCAST", "v4", "s7"), ("VSHLI", "v4", "v4", 10),
+        ("VMIN",  "v3", "v3", "v4"),
+        ("VSHRI", "v4", "v3", 15),
+        ("LUTE2", "v5", "v3"),
+        ("VSHLV", "v5", "v5", "v4"),
+        ("VADD",  "v6", "v5", "v2"),
+        ("VCLZN", "v7", "v6"),
+        ("VSHLV", "v6", "v6", "v7"),
+        ("LUTRECIP", "v6", "v6"),
+        ("VMULH15", "v5", "v5", "v6"),
+        ("VSHLV", "v5", "v5", "v7"),
+        ("VSHLI", "v5", "v5", 1),
+        ("VMULH15", "v0", "v0", "v5"),
+        ("VMUL",  "v0", "v0", "v1"),
+        ("VSHLS", "v0", "v0", "s6"),
+        ("VCLAMP16", "v0", "v0"),
+        ("STV",   "v0", "s2"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 BEFORE = {"norm_i32": _norm_i32_before, "resid_add": _resid_add_before,
-          "softmax8": _softmax8_before}
+          "softmax8": _softmax8_before, "silu_mul": _silu_mul_before}
 
 # Argument sets and the destination window each program writes, per program.
 CASES = {
@@ -96,6 +134,8 @@ CASES = {
     "norm_i32":  ([0x8000, 0, 0xA000, 8, 5],            0xA000, 8*32),
     "resid_add": ([0x8000, 0x9000, 0xA000, 8, 1, 2],    0xA000, 8*32),
     "softmax8":  ([0x8000, 739, 0xA000, 4, -11, 17],    0xA000, 4*32),
+    # A4 = -12 lands random int16 gates across the clamp window and its interior; A6 = -15.
+    "silu_mul":  ([0x8000, 0x9000, 0xA000, 8, -12, 0, -15], 0xA000, 8*32),
 }
 
 

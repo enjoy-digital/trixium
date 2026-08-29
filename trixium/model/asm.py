@@ -464,38 +464,39 @@ def prog_silu_mul():
            CONVENTION CHANGE 2026-08-28: this used to be -(eg+6), negated in-loop; VSHLS
            shifts by the scalar directly, so the negation moved to the caller.
       A6 = output shift so that dst mantissa = (sig_q15 * mg * mu-ish) fits int16 (direct).
-    Body is 25 instructions (was 36): VMULS/VSHLS replace the BCAST+V<op> constant idiom,
-    v2 holds 2^15 persistently across iterations, and the clamp scratch moved to v4 (dead
-    until VSHRI writes it). Same arithmetic, instruction for instruction, as before -
-    verified against the float reference in test_asm, not just against this interpreter.
+    Body is 21 instructions (was 27 on 2026-08-28, 36 before that). 2026-08-29: the two
+    clamp constants are hoisted - v1 = -15*2^15 and v7 = 14*2^15 live across the loop; the
+    register plan that frees them: VCLZN's n goes to v4 (i = floor(f) is dead after the
+    e2 shift) and mu is loaded late into v3 (f is dead after LUTE2). Same arithmetic,
+    instruction for instruction, as the pinned pre-hoist program in test_asm_hoist.
     """
     C_LOG2E = 739 # round(log2(e) * 2^9) - fits the 11-bit immediate; A4 folds the 2^9 scale.
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("ARG",   "s4", 4), ("ARG", "s6", 6),
         ("MOVSI", "s5", C_LOG2E),
-        ("MOVSI", "s7", 1), ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # v2 = 2^15
+        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # v2 = 2^15
+        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10), # -15*2^15
+        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10), # 14*2^15
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),          # mg
-        ("LDV",   "v1", "s1"),          # mu
         ("VMULS", "v3", "v0", "s5"),    # mg * C_LOG2E
         ("VSHLS", "v3", "v3", "s4"),    # f (Q15): << A4 (negative = right shift)
-        ("MOVSI", "s7", -480), ("BCAST", "v4", "s7"), ("VSHLI", "v4", "v4", 10),
-        ("VMAX",  "v3", "v3", "v4"),    # clamp low at -15*2^15
-        ("MOVSI", "s7", 448), ("BCAST", "v4", "s7"), ("VSHLI", "v4", "v4", 10),
-        ("VMIN",  "v3", "v3", "v4"),    # clamp high at 14*2^15 (e2 <= 2^29: int32-safe)
+        ("VMAX",  "v3", "v3", "v1"),    # clamp low at -15*2^15
+        ("VMIN",  "v3", "v3", "v7"),    # clamp high at 14*2^15 (e2 <= 2^29: int32-safe)
         ("VSHRI", "v4", "v3", 15),      # i = floor(f)
         ("LUTE2", "v5", "v3"),          # 2^r (LUTE2 masks to low 15 bits itself)
-        ("VSHLV", "v5", "v5", "v4"),    # e2 = 2^f (Q15 integer-scaled)
+        ("VSHLV", "v5", "v5", "v4"),    # e2 = 2^f (Q15 integer-scaled); i dead from here
         ("VADD",  "v6", "v5", "v2"),    # den = e2 + 2^15 (v2 persistent)
-        ("VCLZN", "v7", "v6"),          # n (<= 0: den >= 2^15)
-        ("VSHLV", "v6", "v6", "v7"),    # mantissa in [2^14, 2^15)
+        ("VCLZN", "v4", "v6"),          # n (<= 0: den >= 2^15)
+        ("VSHLV", "v6", "v6", "v4"),    # mantissa in [2^14, 2^15)
         ("LUTRECIP", "v6", "v6"),
         ("VMULH15", "v5", "v5", "v6"),  # (e2 * rec) >> 15
-        ("VSHLV", "v5", "v5", "v7"),
+        ("VSHLV", "v5", "v5", "v4"),
         ("VSHLI", "v5", "v5", 1),       # Q14 -> Q15
         ("VMULH15", "v0", "v0", "v5"),
-        ("VMUL",  "v0", "v0", "v1"),
+        ("LDV",   "v3", "s1"),          # mu (late: f is dead after LUTE2)
+        ("VMUL",  "v0", "v0", "v3"),
         ("VSHLS", "v0", "v0", "s6"),    # >> A6
         ("VCLAMP16", "v0", "v0"),
         ("STV",   "v0", "s2"),
