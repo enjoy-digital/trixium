@@ -121,13 +121,20 @@ def gen_program(rng):
     if rng.random() < 0.4:
         prog += [("SMOV", "s1", "s2"), ("STV", vsrc(), "s2"), ("LDV", "v3", "s1")]
         wrote("v3")
-    # Loop.
+    # Loop, sometimes nested in an outer LOOPS2..LOOPE2 (the per-head shape).
+    nested = rng.random() < 0.5
+    if nested:
+        prog.append(("LOOPS2", rng.randint(2, 3)))
+        prog += emit_random(rng.randint(0, 3), allow_mem=False)
     if rng.random() < 0.5:
         prog.append(("LOOPS", "s3"))
     else:
         prog.append(("LOOPS", rng.randint(2, 4)))   # Immediate-count form.
     prog += emit_random(rng.randint(2, 8))
     prog.append(("LOOPE",))
+    if nested:
+        prog += emit_random(rng.randint(0, 3), allow_mem=False)
+        prog.append(("LOOPE2",))
     prog += emit_random(rng.randint(1, 6))
     # Sometimes end right after a reduction or a store.
     tail = rng.random()

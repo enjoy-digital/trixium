@@ -272,3 +272,28 @@ def test_scale8():
     got = np.frombuffer(bytes(sp[1024:1024+n]), dtype=np.int8).astype(np.int64)
     exp = np.clip(bx.rne_shift(m*M, 15), -127, 127)
     assert np.array_equal(got, exp)
+
+
+def test_nested_loops_loops2():
+    # LOOPS2/LOOPE2 (2026-08-30): an outer loop over "heads" around an inner loop over
+    # beats, the shape the whole-tensor per-head programs use. Inner count re-initialises
+    # on every outer iteration; the counters are independent.
+    import numpy as np
+    sp = bytearray(4096)
+    src = np.arange(1, 65, dtype="<i2")            # 4 beats of int16.
+    sp[0:128] = src.tobytes()
+    prog = [("ARG", "s0", 0), ("ARG", "s2", 2), ("MOVSI", "s5", 0),
+            ("LOOPS2", 3),                          # 3 "heads"
+            ("ARG", "s0", 0),                       # rewind the source each head
+            ("LOOPS", 4),                           # 4 beats
+            ("LDV", "v0", "s0"),
+            ("VSHLI", "v0", "v0", 1),
+            ("STV", "v0", "s2"),
+            ("REDSUM", "s5", "v0"),
+            ("LOOPE",),
+            ("LOOPE2",),
+            ("DONE",)]
+    S, _ = asm.VecInterp(sp).run(asm.assemble(prog), [0, 0, 1024])
+    out = np.frombuffer(bytes(sp[1024:1024 + 3*128]), dtype="<i2")
+    assert np.array_equal(out, np.tile(src*2, 3))
+    assert S[5] == 3*int((src*2).sum())

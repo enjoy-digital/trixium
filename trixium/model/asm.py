@@ -91,6 +91,12 @@ OPCODES = [
     # silu_mul's 36 body instructions. RTL cost: one 2:1 mux on the shared b-lane feed.
     "VSHLS",  # vd = va shifted lanewise by S[sa]: left if >= 0, arith right if < 0 (+-31).
     "VMULS",  # vd = low 32 bits of va * S[sa].
+    # Second (outer) loop level, 2026-08-30: independent count/start registers, so a
+    # per-head body (LOOPS..LOOPE over beats) can be wrapped in LOOPS2..LOOPE2 over heads
+    # and the 24+16 per-head descriptors of the qk-norm/rope/KV-pack lists become one
+    # program each. Same encoding rules as LOOPS/LOOPE.
+    "LOOPS2", # loop2 count = S[sa] if imm == 0 else imm; body starts at the next instr.
+    "LOOPE2", # if --count2 > 0: pc = loop2 start.
 ]
 OP = {name: i for i, name in enumerate(OPCODES)}
 
@@ -130,12 +136,12 @@ def assemble(program):
             imm = take_i()
         elif op in ("SMOV", "SADD", "SSHLV", "SNORME"):
             sd = take_s(); sa = take_s()
-        elif op == "LOOPS":
+        elif op in ("LOOPS", "LOOPS2"):
             if isinstance(args[0], str):
                 sa = take_s()
             else:
                 imm = take_i()
-        elif op == "LOOPE":
+        elif op in ("LOOPE", "LOOPE2"):
             pass
         elif op in ("LDV", "LDW"):
             vd = take_v(); sa = take_s()
@@ -156,8 +162,8 @@ def assemble(program):
         else:
             raise ValueError(op)
         assert not args, f"extra operands in {ins}"
-        assert -1024 <= imm <= 1023 or op in ("MOVSI", "LOOPS"), f"imm out of range in {ins}"
-        if op in ("MOVSI", "LOOPS"):
+        assert -1024 <= imm <= 1023 or op in ("MOVSI", "LOOPS", "LOOPS2"), f"imm out of range in {ins}"
+        if op in ("MOVSI", "LOOPS", "LOOPS2"):
             assert -1024 <= imm <= 1023, f"imm out of range in {ins} (11-bit)"
         words.append((OP[op] << 26) | (vd << 23) | (va << 20) | (vb << 17)
                      | (sd << 14) | (sa << 11) | (imm & 0x7FF))
@@ -218,6 +224,7 @@ class VecInterp:
         A = list(args) + [0]*(8 - len(args))
         pc = 0
         loop_start = loop_cnt = 0
+        loop_start2 = loop_cnt2 = 0
         steps = 0
         while steps < max_steps:
             steps += 1
@@ -264,6 +271,13 @@ class VecInterp:
                 loop_cnt -= 1
                 if loop_cnt > 0:
                     npc = loop_start
+            elif op == "LOOPS2":
+                loop_cnt2   = (S[sa] & MASK32) if imm == 0 else imm
+                loop_start2 = npc
+            elif op == "LOOPE2":
+                loop_cnt2 -= 1
+                if loop_cnt2 > 0:
+                    npc = loop_start2
             elif op == "LDV":
                 a = S[sa] & 0xFFFFFF
                 assert a % 32 == 0, f"LDV address {a:#x} not 32-byte aligned (RTL is beat-addressed)"
@@ -320,7 +334,10 @@ class VecInterp:
             elif op == "VCLAMP16":
                 V[vd] = np.clip(V[va], -32767, 32767)
             elif op == "VABS":
-                V[vd] = np.abs([_s32(x) for x in V[va]])
+                # Wraps like the 32-bit lane does: |INT_MIN| = 2^31 does not fit, so the
+                # result is INT_MIN again (the FSM and V1 units both do this; the random
+                # hazard stress found the interpreter keeping +2^31, 2026-08-30).
+                V[vd] = np.asarray([_s32(abs(_s32(x))) for x in V[va]], dtype=np.int64)
             elif op == "VCLZN":
                 r = []
                 for x in V[va]:

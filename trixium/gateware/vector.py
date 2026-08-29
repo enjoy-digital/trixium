@@ -179,8 +179,8 @@ class BonsaiVectorUnit(LiteXModule):
                    "LUTE2", "LUTRECIP", "LUTRSQRT", "VSHLS", "VMULS",
                    "STV", "STB", "STW", "REDSUM", "REDSSQ", "REDMAX", "REDSMAX"]
         USES_VB = ["VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK"]
-        USES_SA = ["SMOV", "SADD", "SSHLV", "SNORME", "LOOPS", "LDV", "LDW", "STV", "STB",
-                   "STW", "VSHLS", "VMULS", "BCAST"]
+        USES_SA = ["SMOV", "SADD", "SSHLV", "SNORME", "LOOPS", "LOOPS2", "LDV", "LDW",
+                   "STV", "STB", "STW", "VSHLS", "VMULS", "BCAST"]
         USES_SD = SCW_OPS # Non-reduction readers/writers of S[sd] (reductions read late).
 
         # F / D state -----------------------------------------------------------------------
@@ -194,6 +194,12 @@ class BonsaiVectorUnit(LiteXModule):
         loop_start = Signal(16)
         loop_cnt   = Signal(32)
         lf_arm     = Signal()       # The word after a LOOPS is the loop's first instruction.
+        # Second (outer) loop level: independent registers, same mechanism.
+        use_lf2     = Signal()
+        loop_first2 = Signal(32)
+        loop_start2 = Signal(16)
+        loop_cnt2   = Signal(32)
+        lf2_arm     = Signal()
         running    = Signal()
         bad_op     = Signal()
         finish     = Signal()
@@ -201,7 +207,7 @@ class BonsaiVectorUnit(LiteXModule):
         self.comb += imem_r.adr.eq(pc)
 
         d_word = Signal(32)
-        self.comb += d_word.eq(Mux(use_lf, loop_first, insn_d))
+        self.comb += d_word.eq(Mux(use_lf, loop_first, Mux(use_lf2, loop_first2, insn_d)))
         d_op  = Signal(6)
         d_vd  = Signal(3)
         d_va  = Signal(3)
@@ -363,6 +369,9 @@ class BonsaiVectorUnit(LiteXModule):
         d_is_loops = Signal()
         d_is_loope = Signal()
         loope_taken = Signal()
+        d_is_loops2 = Signal()
+        d_is_loope2 = Signal()
+        loope2_taken = Signal()
         self.comb += [
             d_is_done.eq(d_op == OP["DONE"]),
             d_is_loops.eq(d_op == OP["LOOPS"]),
@@ -380,6 +389,9 @@ class BonsaiVectorUnit(LiteXModule):
             hold_e2.eq(e2_valid & e2_is_store & ~self.sp_wr_gnt),
             d_go.eq(d_valid & ~stall_d & ~hold_e2),
             loope_taken.eq(d_go & d_is_loope & (loop_cnt > 1)),
+            d_is_loops2.eq(d_op == OP["LOOPS2"]),
+            d_is_loope2.eq(d_op == OP["LOOPE2"]),
+            loope2_taken.eq(d_go & d_is_loope2 & (loop_cnt2 > 1)),
         ]
 
         start = Signal()
@@ -681,6 +693,8 @@ class BonsaiVectorUnit(LiteXModule):
                 d_valid.eq(0),
                 use_lf.eq(0),
                 lf_arm.eq(0),
+                use_lf2.eq(0),
+                lf2_arm.eq(0),
                 bad_op.eq(0),
                 *[S[i].eq(0) for i in range(7)],
                 S[7].eq(Mux(self.seq_en, self.seq_seed7, 0)),
@@ -688,20 +702,32 @@ class BonsaiVectorUnit(LiteXModule):
                 If(loope_taken,
                     pc.eq(loop_start + 1),
                     use_lf.eq(1),
+                    use_lf2.eq(0),
                     d_pc.eq(loop_start),
+                    d_valid.eq(fetch_en),
+                ).Elif(loope2_taken,
+                    pc.eq(loop_start2 + 1),
+                    use_lf2.eq(1),
+                    use_lf.eq(0),
+                    d_pc.eq(loop_start2),
                     d_valid.eq(fetch_en),
                 ).Else(
                     insn_d.eq(imem_r.dat_r),
                     d_pc.eq(pc),
                     pc.eq(pc + 1),
                     use_lf.eq(0),
+                    use_lf2.eq(0),
                     d_valid.eq(fetch_en & ~(d_go & d_is_done)),
                 ),
             ),
-            # Loop buffer: the word after a LOOPS is the loop's first instruction.
+            # Loop buffers: the word after a LOOPS/LOOPS2 is that loop's first instruction.
             If(lf_arm & d_valid,
                 loop_first.eq(d_word),
                 lf_arm.eq(0),
+            ),
+            If(lf2_arm & d_valid,
+                loop_first2.eq(d_word),
+                lf2_arm.eq(0),
             ),
             # --- D commits (exactly once, on d_go) ---
             If(d_go,
@@ -722,6 +748,16 @@ class BonsaiVectorUnit(LiteXModule):
                     lf_arm.eq(1),
                 ),
                 If(loope_taken, loop_cnt.eq(loop_cnt - 1)),
+                If(d_is_loops2,
+                    If(d_imm == 0,
+                        loop_cnt2.eq(sa_d[0:32]),
+                    ).Else(
+                        loop_cnt2.eq(d_imm),
+                    ),
+                    loop_start2.eq(d_pc + 1),
+                    lf2_arm.eq(1),
+                ),
+                If(loope2_taken, loop_cnt2.eq(loop_cnt2 - 1)),
                 If((d_op == OP["LDV"]) | (d_op == OP["LDW"]) | (d_op == OP["STV"])
                    | (d_op == OP["STW"]),
                     S[d_sa].eq(sa_d + 32),
