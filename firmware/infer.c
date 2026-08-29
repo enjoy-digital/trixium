@@ -947,7 +947,8 @@ static void seq_build_ffn(void)
     seq_desc_vec(di + 5, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KABS << 8));
     int32_t sa[7] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15};
     seq_desc_vec(di + 6, PROG_SILU_MUL, sa, 7, 0);
-    seq_patch(di + 6, 1, (uint32_t)PROG_SILU_MUL | (1u << (16 + 2*4))); // A4 -= kreg0.
+    seq_patch(di + 6, 1, (uint32_t)PROG_SILU_MUL | (1u << (16 + 2*4))); // A4 kreg0 term...
+    seq_patch(di + 6, 0, 2u | (1u << 11)); // ...ADDS (w0[11]): A4 = imm + kg (VSHLS conv).
     int32_t qa[4] = {(int32_t)SP_G, 1, (int32_t)SP_X, ffn_dim/16};
     seq_desc_vec(di + 7, PROG_QUANT8, qa, 4, 0);
     seq_desc_engine(di + 8, &z);
@@ -2028,10 +2029,10 @@ attn_heads_done: ;
                 seq_desc_engine(seq_ffn_base + 3, &mo);
                 model_matvec_op(ed_t, SP_X, SP_Y, &mo);
                 seq_desc_engine(seq_ffn_base + 8, &mo);
-                // silu A4 = eg + 6 = imm + kg under the 2026-08-28 VSHLS convention - but the
-                // kreg arg path SUBTRACTS (chosen for the old -(eg+6) shape). The list is
-                // default-off with an undiagnosed 1.7B divergence anyway; when revived, the
-                // kadd polarity needs a descriptor bit (or flip to add) alongside that fix.
+                // silu A4 = eg + 6 = imm + kg (VSHLS convention); the descriptor carries
+                // w0[11] so its kreg0 term ADDS. Requires a post-2026-08-29 bitstream -
+                // earlier sequencers only subtract and the list computes garbage. The list
+                // stays default-off pending the 1.7B divergence diagnosis either way.
                 seq_patch(seq_ffn_base + 6, 6,
                           (uint32_t)(ex8 - (int)eg_t->bias + (int)eg_t->rshift + 6));
                 perf_enter(OP_SILU_MUL);

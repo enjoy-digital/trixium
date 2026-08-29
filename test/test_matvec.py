@@ -810,13 +810,13 @@ def _desc_engine(**f):
     w[10] = f.get("chan", 0)
     return b"".join(x.to_bytes(4, "little") for x in w)
 
-def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None, barrier=0):
+def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None, barrier=0, kadd_add=0):
     w = [0]*16
     sel = 0
     for i, sv in enumerate(srcs or []):
         sel |= (sv & 3) << (2*i)
     w[0] = (2 | ((1 << 4) if seed_abs else 0) | ((1 << 10) if barrier else 0)
-            | (sel << 16))
+            | ((1 << 11) if kadd_add else 0) | (sel << 16))
     w[1] = pc
     for i, kv in enumerate(kadds or []):     # 0 = none, n = add kreg[n-1] after the source
         w[1] |= (kv & 3) << (16 + 2*i)
@@ -1628,6 +1628,8 @@ def test_sequencer_kreg_capture_and_add():
                           xsrc=0x200, dst=0x4000)
              + _desc_vec(offs["norm_i32"], [0x4000, 0, 0x3000, cols//16, 2*k_exp],
                          kadds=[0, 0, 0, 0, 1])                 # A4 = 2k - kreg0 = k
+             + _desc_vec(offs["norm_i32"], [0x4000, 0, 0x3400, cols//16, 0],
+                         kadds=[0, 0, 0, 0, 1], kadd_add=1)     # w0[11]: A4 = 0 + kreg0 = k
              + _desc_stop())
     sp = bytearray(64*1024)
     sp[0x200:0x200+T]            = p8.tobytes()
@@ -1672,7 +1674,7 @@ def test_sequencer_kreg_capture_and_add():
         yield dut.vu.prog.re.eq(0)
         yield
         yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(3)
+        yield dut.seq.count.storage.eq(4)
         yield
         yield dut.seq.start.storage.eq(1)
         yield dut.seq.start.re.eq(1)
@@ -1690,10 +1692,13 @@ def test_sequencer_kreg_capture_and_add():
         for wd in range(0x5000//32):
             v = (yield dut.scratchpad.mem[wd])
             data += int(v).to_bytes(32, "little")
-        nrm = np.frombuffer(bytes(data[0x3000:0x3000+2*cols]), dtype="<i2")
+        nrm  = np.frombuffer(bytes(data[0x3000:0x3000+2*cols]), dtype="<i2")
+        nrmA = np.frombuffer(bytes(data[0x3400:0x3400+2*cols]), dtype="<i2")
         kr0 = (yield dut.seq.kregs[0])
         assert kr0 == k_exp, ("kreg0 capture", kr0, k_exp)
         assert np.array_equal(nrm, nrm_exp), ("norm via kreg", nrm[:8], nrm_exp[:8], k_exp)
+        assert np.array_equal(nrmA, nrm_exp), ("norm via kreg ADD (w0[11])",
+                                               nrmA[:8], nrm_exp[:8], k_exp)
 
     run_simulation(dut, [driver()])
 

@@ -29,7 +29,9 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
            collect a SUM of shifts across ops (silu's eg+eu term) while [7:6] keeps each
            op's own k addressable. Firmware zeroes kreg3 by capturing with [7:6]=3 first.
        (vec) w1[31:16]: per-arg 2-bit kreg-add select (arg i at [16+2i +: 2]): 0 = none,
-           n = SUBTRACT kreg[n-1] from the arg AFTER its 2-bit source resolves. Turns
+           n = SUBTRACT kreg[n-1] from the arg AFTER its 2-bit source resolves - or ADD it
+           when w0[11] is set (the 2026-08-28 VSHLS convention turned silu's A4 into
+           imm + kg, which the subtract-only form cannot express). Turns
            "imm - earlier k" - the FFN exponent algebra that forced a CPU round-trip per
            op - into descriptor-resident arithmetic. kreg3 is reachable via capture only.
        [4] seed S7 from the ENGINE ABSMAX instead of the previous program's res6. Used by
@@ -248,10 +250,14 @@ class BonsaiSequencer(LiteXModule):
                     3: base.eq(k_res6),
                 }),
                 kadd.eq(w(0, 1)[16 + 2*i:18 + 2*i]),
-                # SUBTRACT, not add: the exponent args have the shape 'constant - k'
-                # (silu A4 = -(eg+6) = C_layer - kg; eg = ex8 - bias + rshift + kg).
-                # The '+latest k' case is already covered by SEQ_SRC_KABS.
-                self.vec_args[i].eq(base - Mux(kadd == 0, 0, kregs[kadd - 1])),
+                # SUBTRACT by default: the old exponent args had the shape 'constant - k'
+                # (pre-VSHLS silu A4 = -(eg+6) = C_layer - kg). w0[11] flips this
+                # descriptor's kreg terms to ADD for the direct-shift convention
+                # (A4 = eg + 6 = C_layer + kg). The '+latest k' case without a register
+                # is already covered by SEQ_SRC_KABS.
+                self.vec_args[i].eq(Mux(w(0, 0)[11],
+                    base + Mux(kadd == 0, 0, kregs[kadd - 1]),
+                    base - Mux(kadd == 0, 0, kregs[kadd - 1]))),
             ]
 
         # Engine fields straight from the descriptor.
