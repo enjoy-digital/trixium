@@ -58,7 +58,11 @@ def test_norm_i32():
     got = np.frombuffer(bytes(sp[2048:2048+2*n]), dtype=np.int16)
     expect = np.clip(v.astype(np.int64) >> k, -32767, 32767)
     assert np.array_equal(got, expect)
-    assert S[6] == int(np.abs(expect).max())
+    # The program's contract (asm.py): k = bitlen(absmax) - 14 keeps every lane inside
+    # 2^14, so the clip above is a no-op and the program carries no clamp. S6 is 0 since
+    # 2026-08-29 (the output-absmax REDMAX had no consumer).
+    assert int(np.abs(v.astype(np.int64) >> k).max()) < 2**14
+    assert S[6] == 0
 
 def test_silu_mul_accuracy():
     rng = np.random.default_rng(4)

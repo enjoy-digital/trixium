@@ -429,7 +429,15 @@ def prog_norm_i32():
     IS the spec). A0 src (int32), A2 dst, A3 = loop count = source beats / 2 (two 8xint32
     source beats -> one 16xint16 beat out), A4 = right-shift k >= 0 (firmware computes
     bitlen(absmax) - 14 from the engine absmax tracker; output exponent += k).
-    Returns S6 = output absmax (post-shift sanity/renorm check)."""
+
+    CONTRACT (2026-08-29): k MUST come from the absmax of the source - the engine tracker,
+    a spilled copy of it, or a CPU scan - i.e. bitlen(absmax) - 14. Then |v >> k| < 2^14
+    for every lane, so the old VCLAMP16 could never fire and was dropped; an out-of-
+    contract smaller k now wraps in the int16 store instead of saturating. The old REDMAX
+    into S6 (output absmax) had no consumer anywhere - every KRES6 reader follows a spill
+    and both CPU call sites discard the result - so it was dropped too. Body 8 -> 6
+    instructions on a 4-cycle-per-instruction unit: -25% on the top op of the token.
+    Returns S6 = 0."""
     return [
         ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
         ("MOVSI", "s6", 0),
@@ -444,8 +452,6 @@ def prog_norm_i32():
         ("LDW",   "v1", "s0"),
         ("VPACK", "v4", "v0", "v1"),
         ("VSHLV", "v4", "v4", "v2"),    # arith shift right by k (floor)
-        ("VCLAMP16", "v4", "v4"),
-        ("REDMAX", "s6", "v4"),
         ("STV",   "v4", "s2"),
         ("LOOPE",),
         ("DONE",),
