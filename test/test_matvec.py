@@ -2208,3 +2208,104 @@ def test_engine_multi_store(chan_stride):
             assert bytes(got) == pk[r], f"multi-store packet {r} mismatch"
 
     run_simulation(dut, [driver()])
+
+
+def test_engine_n16_ternary_and_store_window():
+    # N=16 enablement (2026-08-29): the shipping sharding at sixteen channels - a ternary
+    # matvec across 16 readers with the 16-input xred-free gather - and the 33-bit STORE
+    # address: channel 15's port-matched window is 0x1_0400_0000 (PC16, stack 1), which
+    # a 32-bit write path silently wraps into PC0. The AW address on channel 15's AXI is
+    # captured and checked against the full 33-bit value.
+    from trixium.gateware.loader import BonsaiHBMLoader
+    from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
+
+    n_channels, rows_per_chan, cols, seed = 16, 4, 256, 173
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols).astype(np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+    maxlen   = max(len(p) for p in payloads)
+    payloads = [p.ljust(maxlen, b"\0") for p in payloads]
+
+    class _N16DUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.axis = axis
+            self.submodules.scratchpad = BonsaiScratchpad(
+                size=64*1024, init=words_from_bytes(x8.tobytes()))
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+                                                        chan_stride=HBM_CHAN_STRIDE)
+            self.submodules.loader = BonsaiHBMLoader(axis)
+            self.comb += [
+                self.engine.store_cmd.connect(self.loader.store_cmd),
+                self.engine.store_data.connect(self.loader.store_data),
+                self.engine.store_busy.eq(self.loader.store_busy),
+            ]
+            for i, axi in enumerate(axis):
+                # The models are 64 KB windows; reads/writes are addressed modulo the
+                # window, so the 33-bit AW address is checked on the bus, not the model.
+                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                                              init=words_from_bytes(payloads[i]), latency=4)
+                setattr(self.submodules, f"model{i}", model)
+
+    dut = _N16DUT()
+    out = {"aw": []}
+
+    def submit(c):
+        for k in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
+                  "bias", "rshift", "xsrc", "dst", "chan"):
+            yield getattr(dut.engine.cmd, k).eq(c.get(k, 0))
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+
+    def wait_done():
+        for _ in range(60000):
+            if (yield dut.engine.done):
+                return
+            yield
+        raise AssertionError("timeout")
+
+    def aw_probe():
+        # Record every AW handshake on channel 15.
+        axi = dut.axis[15]
+        for _ in range(60000):
+            if (yield axi.aw.valid) and (yield axi.aw.ready):
+                out["aw"].append((yield axi.aw.addr))
+            yield
+
+    def driver():
+        rb = layout.row_beats(cols, layout.KIND_TERNARY)
+        yield from submit(dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+                               wlen=rows_per_chan*rb,
+                               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                               bias=B, rshift=R, xsrc=0, dst=0x4000))
+        yield from wait_done()
+        yield
+        got = np.frombuffer((yield from _read_sp(dut, 0x4000, 4*M)), dtype="<i4")
+        assert np.array_equal(got, expected), (got[:8], expected[:8])
+        # STORE 2 beats to channel 15 at the port-matched weight base: the bus must see
+        # the 33-bit address.
+        yield from submit(dict(kind=3, chan=15, wbase=HBM_WEIGHT_BASE, wlen=2, xsrc=0))
+        yield from wait_done()
+        yield
+        want = HBM_WEIGHT_BASE + 15*HBM_CHAN_STRIDE
+        assert want >= (1 << 32), "test premise: channel 15 is above 4 GB"
+        assert out["aw"] and out["aw"][0] == want, (
+            [hex(a) for a in out["aw"][:2]], hex(want))
+
+    run_simulation(dut, [driver(), aw_probe()])

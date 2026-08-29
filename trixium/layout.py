@@ -215,7 +215,10 @@ def crc32(data):
 #  - within one stack: the engine's ports are 1..N, all on stack 0, which is the low 4 GB;
 #  - a power of two, so the engine's STORE path can shift rather than multiply.
 # 2 GB base + 256 MB stride puts N=8 in [2 GB, 4 GB) and leaves the CPU window alone. N=16
-# would need 4 GB of windows and so a different split - revisit with the 8B model.
+# (2026-08-29): channel 15's window is PC16 = 0x1_0400_0000 - stack 1's first
+# pseudo-channel, still its own port's - so no re-layout; the write path (engine STORE and
+# the host-upload loader) carries 33-bit addresses with the channel offset added in
+# hardware, like the read path always did.
 # The base is chosen so each engine channel's window lands on its OWN port's pseudo-channel:
 # engine channel c is HBM AXI port c+1 (port 0 = CPU main_ram = PC 0), so its window must be
 # PC c+1 = [(c+1)*256 MB, ...). With the old 2 GB base every engine read went to PC 8..15 -

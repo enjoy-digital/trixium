@@ -503,7 +503,12 @@ static int upload_model(int devnum, const char *path)
         if (fread(buf, 1, chan_bytes, f) != chan_bytes) { perror("fread"); return -1; }
         memset(buf + chan_bytes, 0, PAD(chan_bytes) - chan_bytes);
         printf("\r[load] channel %u/%u", c + 1, h.n_channels); fflush(stdout);
+#ifdef BONSAI_LOADER_ADDS_CHAN_OFFSET
         loader_transfer(fd, c, BONSAI_CHAN_WEIGHT_BASE, buf, PAD(chan_bytes)/32);
+#else
+        loader_transfer(fd, c, BONSAI_CHAN_WEIGHT_BASE + (uint32_t)c*BONSAI_CHAN_STRIDE,
+                        buf, PAD(chan_bytes)/32);
+#endif
     }
     rd.enable = 0;
     ioctl(fd, LITEPCIE_IOCTL_DMA_READER, &rd);

@@ -132,7 +132,9 @@ class BonsaiMatVecEngine(LiteXModule):
         # per-channel AXI writers (wired by the integrator; a kind-3 op hangs if absent -
         # firmware only issues it when BONSAI_HAS_KVSTORE is set). cmd reuse: chan = dest
         # channel, wbase = HBM byte address, wlen = beats, xsrc = scratchpad byte source.
-        self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 32), ("len", 24)])
+        self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 33), ("len", 24)])
+        # addr is 33 bits: with port-matched 256 MB windows channel 15 lives at
+        # PC16 = 0x1_0400_0000 (stack 1's first pseudo-channel, N=16 - 2026-08-29).
         self.store_data = stream.Endpoint([("data", 256)])
         self.store_busy = Signal() # From the loader: executing our store (incl. B drain).
 

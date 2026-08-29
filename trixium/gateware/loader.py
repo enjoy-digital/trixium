@@ -29,7 +29,14 @@ SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 # BonsaiHBMLoader ----------------------------------------------------------------------------------
 
 class BonsaiHBMLoader(LiteXModule):
-    def __init__(self, hbm_axis, data_width=128):
+    def __init__(self, hbm_axis, data_width=128, chan_stride=0):
+        # chan_stride: byte distance between channel windows, added IN HARDWARE to host
+        # uploads (base + chan*stride, 33 bits) exactly as the engine adds it for reads
+        # and stores - so the host writes the channel-relative base and channel 15's
+        # window above 4 GB needs no wider CSR. The SoC exports
+        # BONSAI_LOADER_ADDS_CHAN_OFFSET so the host tools know not to add it themselves.
+        assert chan_stride == 0 or (chan_stride & (chan_stride - 1)) == 0
+        chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
         self.sink = stream.Endpoint([("data", data_width)]) # From PCIe DMA (host->device).
 
         self.chan   = CSRStorage(5,  description="Destination channel.")
@@ -59,7 +66,7 @@ class BonsaiHBMLoader(LiteXModule):
         # Engine STORE source (scratchpad -> HBM, KV append): granted only from IDLE, so
         # host uploads and engine stores serialize on the shared per-channel writers.
         # Firmware never overlaps them (weight upload happens before generation).
-        self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 32), ("len", 24)])
+        self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 33), ("len", 24)])
         self.store_data = stream.Endpoint([("data", 256)])
         self.store_busy = Signal()
 
@@ -105,7 +112,7 @@ class BonsaiHBMLoader(LiteXModule):
         chan  = self.chan.storage
 
         st_chan = Signal(5)
-        st_addr = Signal(32)
+        st_addr  = Signal(33)
         st_len  = Signal(24)
         st_cnt  = Signal(24)
 
@@ -191,7 +198,9 @@ class BonsaiHBMLoader(LiteXModule):
                                         | fsm.ongoing("EST_DRAIN"))
         fsm.act("CMD",
             *[w.sink_cmd.valid.eq(chan == i) for i, w in enumerate(self.writers)],
-            *[w.sink_cmd.addr.eq(self.base.storage) for w in self.writers],
+            *[w.sink_cmd.addr.eq(self.base.storage
+                                 + ((chan << chan_shift) if chan_stride else 0))
+              for w in self.writers],
             *[w.sink_cmd.len.eq(self.length.storage) for w in self.writers],
             If(Array([w.sink_cmd.ready for w in self.writers])[chan],
                 If(sync_hunt,

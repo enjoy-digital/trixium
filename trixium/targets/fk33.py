@@ -176,6 +176,7 @@ class BonsaiSoC(SoCCore):
                 # namer-collided name and the ROM output cells are absorbed into the
                 # RAMB18 output stage, so the regexes matched nothing.)
             from trixium.layout import HBM_CHAN_STRIDE
+            self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
             self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
                                                  seq=seq, dual=with_dual,
                                                  chan_stride=HBM_CHAN_STRIDE)
@@ -183,7 +184,12 @@ class BonsaiSoC(SoCCore):
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
                 self.add_constant("BONSAI_HAS_DUALQ")
             self.engine_csr = BonsaiEngineCSR(self.engine, seq=seq)
-            self.loader     = BonsaiHBMLoader(engine_axis, data_width=128)
+            from trixium.layout import HBM_CHAN_STRIDE as _LOADER_STRIDE
+            # Channel offsets added in hardware on the upload path too (33-bit windows,
+            # N=16 puts channel 15 above 4 GB); the host tools read
+            # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
+            self.loader     = BonsaiHBMLoader(engine_axis, data_width=128,
+                                              chan_stride=_LOADER_STRIDE)
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
