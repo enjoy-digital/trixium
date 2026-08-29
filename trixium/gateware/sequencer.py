@@ -148,22 +148,27 @@ class BonsaiSequencer(LiteXModule):
         # set/clear priority below is safe.
         eng_disp     = Signal()
         eng_inflight = Signal()
+        # Capture target of the IN-FLIGHT op (for the per-register kadd hazard below).
+        infl_cap_en  = Signal()
+        infl_cap_sel = Signal(2)
         self.sync += [
             If(eng_disp & nowait,
                 eng_inflight.eq(1),
+                infl_cap_en.eq(w(0, 0)[5]),
+                infl_cap_sel.eq(w(0, 0)[6:8]),
             ).Elif(self.eng_done,
                 eng_inflight.eq(0),
             ),
         ]
         # A vec descriptor whose arguments read engine state must not race an in-flight
-        # engine op: KABS source (code 1), S7 seed from absmax (w0[4]), or any kreg-add
-        # (a pending capture lands at done+2). Conservative and cheap.
+        # engine op: KABS source (code 1) and S7-seed-from-absmax (w0[4]) read the LIVE
+        # tracker, so any in-flight op poisons them. A kreg-add only hazards against the
+        # SPECIFIC register the in-flight op will capture (or a capture still in its
+        # done+2 pipe) - the first interlock was register-blind and serialized the
+        # FFN list's norm-under-stream, costing 4% (2026-08-29). kadd reaches kreg0-2
+        # only, so the kreg3 accumulator never hazards a kadd.
         vec_needs_eng = Signal()
-        self.comb += vec_needs_eng.eq(
-            w(0, 0)[4]
-            | w(0, 0)[10] # Explicit barrier for deps the arg sources cannot express.
-            | reduce(or_, [argsrc[2*i:2*i+2] == 1 for i in range(8)])
-            | (w(0, 1)[16:32] != 0))
+        kadd_hazard   = Signal() # Driven after the capture block (needs cap_d/cap_sel).
 
         # Special arg sources (pure bit-length functions, matching the firmware/bitexact).
         def bitlen(sig):
@@ -233,6 +238,20 @@ class BonsaiSequencer(LiteXModule):
                 If(cap_en,  kregs[cap_sel].eq(k_absmax)),
                 If(cap_acc, kregs[3].eq(kregs[3] + k_absmax)),
             ),
+        ]
+        kadds_i = [w(0, 1)[16 + 2*i:18 + 2*i] for i in range(8)]
+        self.comb += [
+            kadd_hazard.eq(reduce(or_, [
+                (ka != 0) & (
+                    (eng_inflight & infl_cap_en & (infl_cap_sel == (ka - 1)))
+                    | ((cap_d != 0) & cap_en & (cap_sel == (ka - 1))))
+                for ka in kadds_i])),
+            vec_needs_eng.eq(
+                ((w(0, 0)[4]
+                  | reduce(or_, [argsrc[2*i:2*i+2] == 1 for i in range(8)]))
+                 & eng_inflight)
+                | (w(0, 0)[10] & eng_inflight) # Explicit barrier.
+                | kadd_hazard),
         ]
 
         for i in range(8):
@@ -352,8 +371,9 @@ class BonsaiSequencer(LiteXModule):
                     )
                 )
             ).Elif(unit == 2,
-                # Hazard interlock: args reading engine state wait for the in-flight op.
-                If(~(vec_needs_eng & eng_inflight),
+                # Hazard interlock: args reading engine state wait for the in-flight op
+                # (and kadd consumers for their register's capture pipe).
+                If(~vec_needs_eng,
                     self.vec_start.eq(1),
                     NextState("WAIT_VEC"),
                 )

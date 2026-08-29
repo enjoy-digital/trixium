@@ -2013,3 +2013,119 @@ def test_sequencer_nowait_overlap():
     assert np.array_equal(out["nrmb"], nrm_exp), "w0[10] barrier saw partial results"
     assert out["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
     assert out["both"] > 50, f"no overlap through the sequencer (cyc_both={out['both']})"
+
+
+def test_sequencer_kadd_interlock_precise():
+    # The kadd hazard interlock is per-REGISTER: matvec A captures k -> kreg0 (serial),
+    # matvec B is NOWAIT and captures k -> kreg1. A norm reading kreg0 must dispatch UNDER
+    # B's stream (real overlap), while a norm reading kreg1 must wait for B's capture
+    # (done+2) and see the right k. The register-blind interlock serialized the FFN
+    # list's norm-under-stream on the card (13.60M vs 13.45M cycles/token, 2026-08-29).
+    from trixium.gateware.vector import BonsaiVectorUnit
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.model import asm as vasm
+
+    n_channels, rows_per_chan, cols = 2, 32, 128
+    rng = np.random.default_rng(211)
+    M   = n_channels*rows_per_chan
+    G   = cols//layout.GROUP_TERNARY
+    x8  = rng.integers(-127, 128, cols).astype(np.int8)
+
+    def build(seed_scale, tag):
+        scales = rng.uniform(seed_scale, seed_scale*4, (M, G)).astype(np.float16)
+        codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+        _, e16 = bx.fp16_decompose(scales)
+        B = bx.choose_scale_bias(e16)
+        R = bx.choose_result_shift(scales, B)
+        res = bx.matvec_ternary(scales, codes, x8, B, R)
+        k   = max(0, int(np.abs(res).max()).bit_length() - 14)
+        nrm = np.clip(res.astype(np.int64) >> k, -32767, 32767).astype("<i2")
+        spec = TensorSpec(tag, layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                          scales=scales, values=codes)
+        pay = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+               for c in range(n_channels)]
+        return B, R, k, nrm, pay
+
+    # Two magnitudes so the two k's differ - a norm on the wrong register is visible.
+    Ba, Ra, ka, nrm_a, pay_a = build(0.01, "a")
+    Bb, Rb, kb, nrm_b, pay_b = build(0.5,  "b")
+    assert ka != kb, (ka, kb)
+    rb = layout.row_beats(cols, layout.KIND_TERNARY)
+    off_b = len(pay_a[0])                     # B's weights follow A's in every channel.
+    assert off_b % 32 == 0
+    payloads = [pay_a[c] + pay_b[c] for c in range(n_channels)]
+
+    words = vasm.assemble(vasm.PROGRAMS["norm_i32"]())
+    common = dict(kind=0, rows=rows_per_chan, cols=cols, wlen=rows_per_chan*rb,
+                  sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                  cbeats=layout.code_beats(cols, layout.KIND_TERNARY), xsrc=0x1000)
+    descs = (_desc_engine(wbase=0, bias=Ba, rshift=Ra, dst=0x2000,
+                          kcap=1, kreg=0, **common)              # A: k -> kreg0 (serial)
+             + _desc_engine(wbase=off_b, bias=Bb, rshift=Rb, dst=0x2800,
+                            kcap=1, kreg=1, nowait=1, **common)  # B: k -> kreg1, NOWAIT
+             + _desc_vec(0, [0x2000, 0, 0x3000, M//16, 0],
+                         kadds=[0, 0, 0, 0, 1], kadd_add=1)      # kreg0: runs UNDER B
+             + _desc_vec(0, [0x2800, 0, 0x3800, M//16, 0],
+                         kadds=[0, 0, 0, 0, 2], kadd_add=1)      # kreg1: waits for B
+             + _desc_stop())
+    sp = bytearray(64*1024)
+    sp[0x1000:0x1000 + cols] = x8.tobytes()
+    sp[0x6000:0x6000 + len(descs)] = descs
+
+    class _DUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+                                                          init=words_from_bytes(bytes(sp)))
+            self.submodules.vu  = BonsaiVectorUnit()
+            self.submodules.seq = BonsaiSequencer()
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                        xbuf_groups=32,
+                                                        vecunit=self.vu, seq=self.seq)
+            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.comb += [
+                self.vu.seq_en.eq(self.seq.busy),
+                self.vu.seq_start.eq(self.seq.vec_start),
+                self.vu.seq_pc.eq(self.seq.vec_pc),
+                self.seq.vec_done.eq(self.vu.done),
+                self.seq.vec_res6.eq(self.vu.res6.status),
+                self.vu.seq_seed7.eq(self.seq.vec_seed7),
+            ]
+            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+            for i, axi in enumerate(axis):
+                setattr(self.submodules, f"model{i}", BonsaiHBMChannelModel(
+                    axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
+
+    dut = _DUT()
+    out = {}
+
+    def driver():
+        yield from _vec_csr_upload(dut, words)
+        yield dut.seq.base.storage.eq(0x6000)
+        yield dut.seq.count.storage.eq(5)
+        yield
+        yield dut.seq.start.storage.eq(1)
+        yield dut.seq.start.re.eq(1)
+        yield
+        yield dut.seq.start.re.eq(0)
+        yield
+        for _ in range(200000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("sequencer timeout")
+        yield
+        out["both"] = (yield dut.engine.cyc_both)
+        out["k0"]   = (yield dut.seq.kregs[0])
+        out["k1"]   = (yield dut.seq.kregs[1])
+        out["na"]   = np.frombuffer((yield from _read_sp(dut, 0x3000, 2*M)), dtype="<i2")
+        out["nb"]   = np.frombuffer((yield from _read_sp(dut, 0x3800, 2*M)), dtype="<i2")
+
+    run_simulation(dut, [driver()])
+    assert (out["k0"], out["k1"]) == (ka, kb), (out["k0"], out["k1"], ka, kb)
+    assert np.array_equal(out["na"], nrm_a), "norm via kreg0 (under the stream)"
+    assert np.array_equal(out["nb"], nrm_b), "norm via kreg1 (after the capture)"
+    assert out["both"] > 50, f"kreg0 consumer did not overlap B (cyc_both={out['both']})"

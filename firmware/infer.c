@@ -933,18 +933,33 @@ static void seq_build_ffn(void)
     if (di + 10 > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
-    // Engine descriptors 0/3/8 are fully rebuilt per layer (entries differ); placeholders.
+    // Pipelined order (2026-08-29): the up matvec is NOWAIT and the gate norm runs UNDER
+    // its stream - the list keeps the `ovl` overlap it used to lose. The norms take k
+    // from kregs (captured at each matvec) instead of KABS, so they no longer read the
+    // live absmax and can float across engine ops. kreg consumers are all >= one
+    // interlocked spill program past the capturing op's done, which covers the
+    // capture-at-done+2 lag on this bitstream.
+    //   0 gate mv [cap k->kreg0]    1 spill gate-absmax (seed_abs, engine idle here)
+    //   2 up mv NOWAIT [cap k->kreg1]
+    //   3 norm_g SP_Y -> SP_G [A4 = 0 + kreg0]   <- runs under the up stream
+    //   4 spill up-absmax (seed_abs: interlock waits the stream)
+    //   5 norm_u SP_YU -> SP_U [A4 = 0 + kreg1]
+    //   6 silu [A4 = imm + kreg0]   7 quant8   8 down mv   9 stop
     struct engine_op z = {0};
     seq_desc_engine(di + 0, &z);
     int32_t pa = (int32_t)SP_FFSP;
     seq_desc_vec_seed(di + 1, PROG_SPILL, &pa, 1, 0, 1);
+    seq_desc_engine(di + 2, &z);
+    // norm k via KRES6, NOT a kreg-add: desc1's spill left the gate absmax in res6
+    // (SMOV s6,s7), and KRES6 is not in the hazard interlock - so this descriptor
+    // dispatches UNDER the NOWAIT up stream. A kadd arg would stall on the (currently
+    // register-blind) interlock and serialize the list - measured 13.60M vs 13.45M.
     int32_t na[5] = {(int32_t)SP_Y, 0, (int32_t)SP_G, ffn_dim/16, 0};
-    seq_desc_vec(di + 2, PROG_NORM_I32, na, 5, (uint16_t)(SEQ_SRC_KABS << 8));
-    seq_desc_engine(di + 3, &z);
+    seq_desc_vec(di + 3, PROG_NORM_I32, na, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
     int32_t pb = (int32_t)(SP_FFSP + 32);
     seq_desc_vec_seed(di + 4, PROG_SPILL, &pb, 1, 0, 1);
     int32_t nb[5] = {(int32_t)SP_YU, 0, (int32_t)SP_U, ffn_dim/16, 0};
-    seq_desc_vec(di + 5, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KABS << 8));
+    seq_desc_vec(di + 5, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
     int32_t sa[7] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15};
     seq_desc_vec(di + 6, PROG_SILU_MUL, sa, 7, 0);
     seq_patch(di + 6, 1, (uint32_t)PROG_SILU_MUL | (1u << (16 + 2*4))); // A4 kreg0 term...
@@ -2026,7 +2041,9 @@ attn_heads_done: ;
                 seq_desc_engine(seq_ffn_base + 0, &mo);
                 seq_patch(seq_ffn_base + 0, 0, 1u | (1u << 5)); // capture k -> kreg0.
                 model_matvec_op(eu_t, SP_X, SP_YU, &mo);
-                seq_desc_engine(seq_ffn_base + 3, &mo);
+                seq_desc_engine(seq_ffn_base + 2, &mo);
+                // NOWAIT: the gate norm (KRES6, uninterlocked) runs under this stream.
+                seq_patch(seq_ffn_base + 2, 0, 1u | (1u << 9));
                 model_matvec_op(ed_t, SP_X, SP_Y, &mo);
                 seq_desc_engine(seq_ffn_base + 8, &mo);
                 // silu A4 = eg + 6 = imm + kg (VSHLS convention); the descriptor carries
