@@ -730,6 +730,16 @@ static void kv_pack_row_res(int l, int kvh, int kind, uint32_t sp, int es)
     if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
 }
 
+// Pack prep only: the qkr sequencer list carries the quant8 itself (seq_build_qkr, F0-4);
+// the CPU side is the scale beat and the exponent ratchet - identical bookkeeping.
+static void kv_pack_prep_res(int l, int kvh, int kind, int es)
+{
+    int e8 = es + 8;
+    kv_store_scale_prep(kvh, kind, e8);
+    int idx = kv_ek_idx(l, kvh, kind);
+    if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
+}
+
 // Store phase: stream the already-packed slots out. Engine only.
 static void kv_store_row_res(int l, int kvh, int kind, int t)
 {
@@ -823,6 +833,27 @@ static void seq_build_qkr(void)
                             (int32_t)sp, (int32_t)(sp + head_dim)};
         seq_desc_vec(di++, PROG_ROPE, pargs, 7, 0);
     }
+    // F0-4 (2026-08-29): the 2*n_kv_head fixed-shift KV-pack quant8s ride the same list.
+    // K's pack follows K's rope in list order; V is resident before the list runs. The
+    // CPU keeps only the scale-beat prep and the kv_ekmax ratchet (kv_pack_prep_res).
+    // An in-list descriptor measures ~50 cycles against ~420 for a CPU vec_run.
+    for (int kvh = 0; kvh < n_kv_head; kvh++)
+        for (int kind = 0; kind < 2; kind++) {
+            uint32_t src = (kind ? SP_V : SP_K) + (uint32_t)kvh*head_dim*2;
+            int32_t qargs[4] = {(int32_t)src, 0, (int32_t)(kvp_slot(kvh, kind) + 32),
+                                head_dim/16};                       // A1 = 0: fixed >>8.
+            seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
+        }
+    // F0-5: ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB
+    // post-increments 16 B, so head j lands at +j*head_dim); the attention list's
+    // per-head quant8 descriptor is gone and its scores read x from there. The region
+    // is dead during attention: softmax p8 lives at SP_X[0, ctx) and nothing else
+    // touches SP_X until the FFN quant8 overwrites it.
+    {
+        int32_t qargs[4] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
+                            (n_head*head_dim)/16};
+        seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
+    }
     seq_desc_stop(di++);
     seq_qkr_count = di;
 }
@@ -845,11 +876,12 @@ static void seq_build_attn(void)
     seq_attn_heads = 0;
     if (n_ch < 2)
         return; // n1's absmax lives in the engine CSR; keep CPU-dispatched ops there.
-    // 7 descriptors per head: quant8, scores, softmax8, spill(p8), axpy(xred),
-    // spill(absmax from the engine tracker), norm_i32. It was 6 + n_ch = 14 before the
-    // engine learned to reduce across channels; at N=8 that halving is what lets all 16
-    // heads fit one list (16*7 + 49 = 161 of 192) so the chunking below stops splitting.
-    int dph = 7;
+    // 5 descriptors per head: scores, softmax8 (self-spills its p8 sum), axpy(xred),
+    // spill(absmax from the engine tracker), norm_i32. It was 7 until F0-5 moved the
+    // per-head quant8 into the qkr list (one batched call) and the p8 spill into
+    // softmax8's tail, and 6 + n_ch = 14 before the engine learned to reduce across
+    // channels. 16*5 + 66 = 146 of 192, so the FFN and scale8 lists fit behind it.
+    int dph = 5;
     int cap = (192 - seq_qkr_count)/dph;
     if (cap <= 0)
         return;
@@ -862,22 +894,18 @@ static void seq_build_attn(void)
     seq_attn_heads = chunk;
     for (int j = 0; j < chunk; j++) {
         uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*dph;
-        int32_t qargs[4] = {(int32_t)(SP_Q + (uint32_t)j*head_dim*2), 0,
-                            (int32_t)SP_X, head_dim/16};
-        seq_desc_vec(di + 0, PROG_QUANT8, qargs, 4, 0);
         struct engine_op sc = {0};
         sc.kind   = ENGINE_KIND_Q8;
         sc.ilv    = 1;
         sc.cols   = head_dim;
         sc.sbeats = 1;
         sc.cbeats = head_dim/32;
-        sc.xsrc   = SP_X;
+        sc.xsrc   = SP_X + 0x1000 + (uint32_t)j*head_dim; // Batched q8 (qkr list).
         sc.dst    = SP_SC;
-        seq_desc_engine(di + 1, &sc);
-        int32_t sargs[6] = {(int32_t)SP_SC, Ceff, (int32_t)SP_X, 0, -11, 0};
-        seq_desc_vec(di + 2, PROG_SOFTMAX8, sargs, 6, 0);
-        int32_t p1 = (int32_t)(SP_AWP8 + (uint32_t)j*32);
-        seq_desc_vec(di + 3, PROG_SPILL, &p1, 1, 0);
+        seq_desc_engine(di + 0, &sc);
+        int32_t sargs[7] = {(int32_t)SP_SC, Ceff, (int32_t)SP_X, 0, -11, 0,
+                            (int32_t)(SP_AWP8 + (uint32_t)j*32)}; // A6: p8-sum self-spill.
+        seq_desc_vec(di + 1, PROG_SOFTMAX8, sargs, 7, 0);
         struct engine_op wv = {0};
         wv.kind        = ENGINE_KIND_AXPY;
         wv.cols        = head_dim;
@@ -887,17 +915,17 @@ static void seq_build_attn(void)
         wv.dst         = SP_AW;
         wv.rshift_rpre = 1;
         wv.xred        = 1;
-        seq_desc_engine(di + 4, &wv);
+        seq_desc_engine(di + 2, &wv);
         // The engine summed the channels itself, so the n_ch-1 reduce_acc calls are gone and
         // the absmax the CPU fold needs comes from the engine tracker instead of the last
         // reduce's res6. seq_desc_vec_seed puts it in S7 for the spill, and spill's trailing
         // SMOV s6, s7 leaves it in res6 - so the norm below keeps taking k from KRES6 and
         // sees the identical value. Numerics are unchanged by construction, not by luck.
         int32_t p2 = (int32_t)(SP_AWAM + (uint32_t)j*32);
-        seq_desc_vec_seed(di + 5, PROG_SPILL, &p2, 1, 0, 1);
+        seq_desc_vec_seed(di + 3, PROG_SPILL, &p2, 1, 0, 1);
         int32_t nargs[5] = {(int32_t)SP_AW, 0, (int32_t)(SP_H + (uint32_t)j*head_dim*2),
                             head_dim/16, 0};
-        seq_desc_vec(di + 6, PROG_NORM_I32, nargs, 5,
+        seq_desc_vec(di + 4, PROG_NORM_I32, nargs, 5,
                      (uint16_t)(SEQ_SRC_KRES6 << 8)); // A4 = k(res6).
     }
 }
@@ -978,6 +1006,31 @@ static void seq_build_ffn(void)
 #endif
 }
 
+// F0-6 (2026-08-29): the per-head attention-output scale8 as one n_head-descriptor list.
+// Only A4 (the per-head Q15 multiplier Mh) changes per layer; a CPU vec_run costs ~500
+// cycles of dispatch against ~50 for an in-list descriptor, x16 heads x 28 layers.
+// Placed behind the FFN list (which is behind the attention list); 156..172 of 192 on
+// the 1.7B. Not built on dual-Q images (their two-phase lists own that region).
+static int seq_scale8_base = -1;
+static void seq_build_scale8(void)
+{
+#ifndef BONSAI_HAS_DUALQ
+    if (seq_attn_heads == 0)
+        return;
+    int di = (seq_ffn_base >= 0) ? seq_ffn_base + 10
+                                 : seq_qkr_count + seq_attn_heads*seq_attn_dph;
+    if (di + n_head + 1 > 192)
+        return;
+    seq_scale8_base = di;
+    for (int hh = 0; hh < n_head; hh++) {
+        int32_t sa[5] = {(int32_t)(SP_H + hh*head_dim*2), 0, (int32_t)(SP_X + hh*head_dim),
+                         head_dim/16, 0};                   // A4 = Mh, patched per layer.
+        seq_desc_vec(di + hh, PROG_SCALE8, sa, 5, 0);
+    }
+    seq_desc_stop(di + n_head);
+#endif
+}
+
 int seq_use = 1;
 // FFN descriptor list: DEFAULT OFF. Sim tokens (n8 tiny, all legs) are byte-identical and
 // the tiny-sim window improves -3.3% - but the 1.7B card A/B fails TOKENS. That is exactly
@@ -1036,12 +1089,14 @@ static void seq_build_attn2(void)
         sc.qn      = 1;
         sc.qstride = 0x800;
         seq_desc_engine(d1 + 2, &sc);
-        int32_t sa[6] = {(int32_t)SP_Y, Ceff, (int32_t)SP_X, 0, -11, 0};
-        seq_desc_vec(d1 + 3, PROG_SOFTMAX8, sa, 6, 0);
+        int32_t sa[7] = {(int32_t)SP_Y, Ceff, (int32_t)SP_X, 0, -11, 0,
+                         (int32_t)(SP_A2P8 + (uint32_t)hA*32)};
+        seq_desc_vec(d1 + 3, PROG_SOFTMAX8, sa, 7, 0);
         int32_t pa = (int32_t)(SP_A2P8 + (uint32_t)hA*32);
         seq_desc_vec(d1 + 4, PROG_SPILL, &pa, 1, 0);
-        int32_t sb[6] = {(int32_t)SP_SCB, Ceff, 0, 0, -11, 0}; // A2 (p8B dst) per token.
-        seq_desc_vec(d1 + 5, PROG_SOFTMAX8, sb, 6, 0);
+        int32_t sb[7] = {(int32_t)SP_SCB, Ceff, 0, 0, -11, 0,     // A2 (p8B dst) per token.
+                         (int32_t)(SP_A2P8 + (uint32_t)hB*32)};
+        seq_desc_vec(d1 + 5, PROG_SOFTMAX8, sb, 7, 0);
         int32_t pb = (int32_t)(SP_A2P8 + (uint32_t)hB*32);
         seq_desc_vec(d1 + 6, PROG_SPILL, &pb, 1, 0);
 
@@ -1500,11 +1555,11 @@ static void attn_list_prep_token(int pos)
     uint32_t blocks = (uint32_t)(cnt + padn)/16;
     for (int j = 0; j < seq_attn_heads; j++) {
         uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*seq_attn_dph;
-        seq_patch(di + 1, 2, rowsw);
-        seq_patch(di + 1, 5, wlen);
-        seq_patch(di + 2, 5, blocks);          // softmax8 A3 (blocks).
-        seq_patch(di + 4, 2, rowsw);
-        seq_patch(di + 4, 5, wlen);
+        seq_patch(di + 0, 2, rowsw);           // scores rows|rem.
+        seq_patch(di + 0, 5, wlen);
+        seq_patch(di + 1, 5, blocks);          // softmax8 A3 (blocks).
+        seq_patch(di + 2, 2, rowsw);           // AXPY rows|rem.
+        seq_patch(di + 2, 5, wlen);
     }
 }
 #endif
@@ -1654,8 +1709,14 @@ embed_done: ;
 #endif
             perf_enter(OP_KVQUANT);
             for (int hh = 0; hh < n_kv_head; hh++) {   // Pack every head first...
+#ifdef CSR_SEQ_BASE
+                // ...the quant8s already ran inside the qkr list (F0-4); prep only.
+                kv_pack_prep_res(l, hh, 0, E_NORM);
+                kv_pack_prep_res(l, hh, 1, ev_res);
+#else
                 kv_pack_row_res(l, hh, 0, SP_K + hh*head_dim*2, E_NORM);
                 kv_pack_row_res(l, hh, 1, SP_V + hh*head_dim*2, ev_res);
+#endif
             }
             for (int hh = 0; hh < n_kv_head; hh++) {   // ...then hand the port to the engine.
                 kv_store_row_res(l, hh, 0, pos);
@@ -1766,16 +1827,16 @@ attn_scores: ;
                     kv_scores_br(l, kvh, 1, &Bv, &Rd);
                     int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
                     if (chunked) {
-                        seq_patch(di + 0, 2, SP_Q + (uint32_t)hh*head_dim*2);
-                        seq_patch(di + 3, 2, SP_AWP8 + (uint32_t)hh*32);
-                        seq_patch(di + 5, 2, SP_AWAM + (uint32_t)hh*32);
-                        seq_patch(di + 6, 4, SP_H + (uint32_t)hh*head_dim*2);
+                        seq_patch(di + 0, 8, SP_X + 0x1000 + (uint32_t)hh*head_dim);
+                        seq_patch(di + 1, 8, SP_AWP8 + (uint32_t)hh*32);
+                        seq_patch(di + 3, 2, SP_AWAM + (uint32_t)hh*32);
+                        seq_patch(di + 4, 4, SP_H + (uint32_t)hh*head_dim*2);
                     }
-                    seq_patch(di + 1, 4, kv_region_addr(l, kvh, 0));
-                    seq_patch(di + 1, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
-                    seq_patch(di + 2, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
-                    seq_patch(di + 4, 4, kv_region_addr(l, kvh, 1));
-                    seq_patch(di + 4, 7, (uint32_t)Bv);
+                    seq_patch(di + 0, 4, kv_region_addr(l, kvh, 0));
+                    seq_patch(di + 0, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
+                    seq_patch(di + 1, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
+                    seq_patch(di + 2, 4, kv_region_addr(l, kvh, 1));
+                    seq_patch(di + 2, 7, (uint32_t)Bv);
                     (void)Rd;
                 }
                 seq_run((uint32_t)seq_attn_base, (uint32_t)nh*seq_attn_dph);
@@ -1858,9 +1919,9 @@ attn_scores: ;
                 int Ceff  = (lg & 1) ? 523 : 739;
                 int sigma = eq - Bk + Rk - (lg >> 1);
                 int s1v = 11;
-                int32_t sargs[6] = {(int32_t)SP_SC, Ceff, (int32_t)SP_X, (cnt + padn)/16,
-                                    -s1v, sigma + 6 + s1v};
-                uint64_t P8 = vec_run(PROG_SOFTMAX8, sargs, 6);
+                int32_t sargs[7] = {(int32_t)SP_SC, Ceff, (int32_t)SP_X, (cnt + padn)/16,
+                                    -s1v, sigma + 6 + s1v, (int32_t)(SP_AWP8 + hh*32)};
+                uint64_t P8 = vec_run(PROG_SOFTMAX8, sargs, 7);
                 perf_exit(OP_SOFTMAX);
                 perf_enter(OP_WV);
                 int Bv, Rd;
@@ -2036,10 +2097,20 @@ attn_heads_done: ;
                     int32_t Mh = (int32_t)lroundf(ldexpf(aw_c[hh], 15 - ea8));
                     if (Mh > 32767) Mh = 32767;
                     if (Mh < 0)     Mh = 0;
+#ifdef CSR_SEQ_BASE
+                    if (seq_use && seq_scale8_base >= 0) {
+                        seq_patch((uint32_t)(seq_scale8_base + hh), 6, (uint32_t)Mh);
+                        continue;                       // One list run below (F0-6).
+                    }
+#endif
                     int32_t sa2[5] = {(int32_t)(SP_H + hh*head_dim*2), 0,
                                       (int32_t)(SP_X + hh*head_dim), head_dim/16, Mh};
                     vec_run(PROG_SCALE8, sa2, 5);
                 }
+#ifdef CSR_SEQ_BASE
+                if (seq_use && seq_scale8_base >= 0)
+                    seq_run((uint32_t)seq_scale8_base, (uint32_t)n_head);
+#endif
                 perf_exit(OP_QUANT8);
             } else
 #endif
@@ -2351,6 +2422,7 @@ int infer_init(void)
     seq_build_qkr();
     seq_build_attn();
     seq_build_ffn();
+    seq_build_scale8();
     seq_build_attn2();
 #endif
 #endif

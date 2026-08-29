@@ -574,7 +574,11 @@ def prog_softmax8():
                 (s - smax)*2^sigma*log2(e), sigma including the whole-power part of the
                 attention scale.
 
-    Padding entries clamp to f = -15*2^15 -> p8 = 0."""
+    Padding entries clamp to f = -15*2^15 -> p8 = 0.
+
+      A6 = spill address (32 B beat): the exact p8 sum (S6) is ALSO written there as 8 int32
+           copies, replacing the separate PROG_SPILL descriptor the attention list used to
+           run after every softmax (F0-5, 2026-08-29). S6/S7 are unchanged by the tail."""
     return [
         ("ARG",   "s0", 0), ("ARG", "s3", 3),
         ("MOVSI", "s5", 47),
@@ -620,6 +624,9 @@ def prog_softmax8():
         ("REDSUM", "s6", "v2"),         # Exact sum of emitted p8.
         ("STB",   "v2", "s2"),
         ("LOOPE",),
+        ("ARG",   "s1", 6),             # Self-spill: 8 copies of S6 at A6 (was PROG_SPILL).
+        ("BCAST", "v0", "s6"),
+        ("STW",   "v0", "s1"),
         ("DONE",),
     ]
 

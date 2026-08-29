@@ -133,7 +133,7 @@ CASES = {
     # (args, dst, dst_bytes, src_setup)
     "norm_i32":  ([0x8000, 0, 0xA000, 8, 5],            0xA000, 8*32),
     "resid_add": ([0x8000, 0x9000, 0xA000, 8, 1, 2],    0xA000, 8*32),
-    "softmax8":  ([0x8000, 739, 0xA000, 4, -11, 17],    0xA000, 4*32),
+    "softmax8":  ([0x8000, 739, 0xA000, 4, -11, 17, 0xB800], 0xA000, 4*32),
     # A4 = -12 lands random int16 gates across the clamp window and its interior; A6 = -15.
     "silu_mul":  ([0x8000, 0x9000, 0xA000, 8, -12, 0, -15], 0xA000, 8*32),
 }

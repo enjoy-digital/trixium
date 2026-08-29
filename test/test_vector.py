@@ -166,7 +166,8 @@ def test_rtl_softmax8():
     sp  = bytearray(SP_SIZE)
     sp[0:4*pad] = buf.astype("<i4").tobytes()
     sigma, s1 = -18, 11
-    _compare("softmax8", bytes(sp), [0, 739, 8192, pad//16, -s1, -(-(sigma + 6) - s1)])
+    _compare("softmax8", bytes(sp), [0, 739, 8192, pad//16, -s1, -(-(sigma + 6) - s1),
+                                     12288])
 
 def test_rtl_reduce_acc():
     rng = np.random.default_rng(62)

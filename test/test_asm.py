@@ -213,7 +213,7 @@ def test_softmax8_accuracy():
         sp[0:4*pad] = buf.astype("<i4").tobytes()
         s1 = 11                      # |s>>s1| <= 2^18: subtract and *739 int32-safe.
         s2 = -(sigma + 6) - s1
-        S, _ = _run("softmax8", sp, [0, 739, 4096, pad//16, -s1, -s2])
+        S, _ = _run("softmax8", sp, [0, 739, 4096, pad//16, -s1, -s2, 6144])
         got  = np.frombuffer(bytes(sp[4096:4096+pad]), dtype=np.int8).astype(np.float64)
         ref  = np.exp((s32 - s32.max()).astype(np.float64)*(2.0**sigma))
         # got/128 approximates ref (relative to the max entry).

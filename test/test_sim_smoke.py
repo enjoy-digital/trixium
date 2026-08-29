@@ -75,7 +75,7 @@ def test_sim_selftest_checksums():
         ("silu",     "silu_mul",   [0x8000, 0x8400, 0xA600, 8, -6, 0, -15], 0xA600),
         ("rmsnorm",  "rmsnorm",    [0x8000, 0x8400, 0xA800, 8, -7, 17, -17], 0xA800),
         ("rope",     "rope",       [0x8000, 0x8080, 0x8400, 0x8480, 4, 0xAA00, 0xAA80], 0xAA00),
-        ("softmax8", "softmax8",   [0x8000, 739, 0xAC00, 4, -11, 17], 0xAC00),
+        ("softmax8", "softmax8",   [0x8000, 739, 0xAC00, 4, -11, 17, 0xB400], 0xAC00),
         ("reduce",   "reduce_acc", [0xA200, 0x8400, 0xAE00, 4], 0xAE00),
         ("scale8",   "scale8",     [0x8000, 0, 0xB000, 8, 19571], 0xB000),
     ]
@@ -358,7 +358,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         s1v = 11
         words = vasm.assemble(vasm.PROGRAMS["softmax8"]())
         S, _ = vasm.VecInterp(spb).run(words, [0, Ceff, 4096, len(buf)//16,
-                                               -s1v, sigma + 6 + s1v])
+                                               -s1v, sigma + 6 + s1v, 6144])
         p8 = np.frombuffer(bytes(spb[4096:4096+len(buf)]), dtype=np.int8).astype(np.int64)
         P8 = int(S[6]) if S[6] else 1
         rowsv = hbm_kv[(l, kvh, 1)]
@@ -404,7 +404,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         s1v   = 11
         words = vasm.assemble(vasm.PROGRAMS["softmax8"]())
         S, _  = vasm.VecInterp(spb).run(words, [0, Ceff, 4096, len(buf)//16,
-                                                -s1v, sigma + 6 + s1v])
+                                                -s1v, sigma + 6 + s1v, 6144])
         p8 = np.frombuffer(bytes(spb[4096:4096+len(buf)]), dtype=np.int8).astype(np.int64)
         P8 = int(S[6]) if S[6] else 1
         rowsv = hbm_kv[(l, kvh, 1)]
