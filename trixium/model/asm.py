@@ -35,7 +35,7 @@ LANES = 16
 # init. Overflowing it does NOT fail loudly - the write pointer wraps and quietly overwrites
 # the programs at offset 0 (one added program once corrupted resid_add's ARG setup, and only
 # that program's CRC moved). emit_c() asserts against this, so keep it in step with the RTL.
-IMEM_DEPTH = 256
+IMEM_DEPTH = 512 # 256 until 2026-08-29 (V1 pipeline; 512 x 32 distributed RAM).
 
 # Opcodes ------------------------------------------------------------------------------------------
 
@@ -266,21 +266,25 @@ class VecInterp:
                     npc = loop_start
             elif op == "LDV":
                 a = S[sa] & 0xFFFFFF
+                assert a % 32 == 0, f"LDV address {a:#x} not 32-byte aligned (RTL is beat-addressed)"
                 V[vd] = np.frombuffer(bytes(self.sp[a:a+32]), dtype="<i2").astype(np.int64)
                 S[sa] = _s48(S[sa] + 32)
             elif op == "LDW":
                 a = S[sa] & 0xFFFFFF
+                assert a % 32 == 0, f"LDW address {a:#x} not 32-byte aligned (RTL is beat-addressed)"
                 v = np.zeros(LANES, dtype=np.int64)
                 v[:8] = np.frombuffer(bytes(self.sp[a:a+32]), dtype="<i4").astype(np.int64)
                 V[vd] = v
                 S[sa] = _s48(S[sa] + 32)
             elif op == "STV":
                 a = S[sa] & 0xFFFFFF
+                assert a % 32 == 0, f"STV address {a:#x} not 32-byte aligned (RTL is beat-addressed)"
                 self.sp[a:a+32] = np.asarray([_s32(x) for x in V[va]], dtype="<i4") \
                     .astype("<i2").tobytes()
                 S[sa] = _s48(S[sa] + 32)
             elif op == "STB":
                 a = S[sa] & 0xFFFFFF
+                assert a % 16 == 0, f"STB address {a:#x} not 16-byte aligned (RTL writes half-beats)"
                 self.sp[a:a+16] = np.asarray([_s32(x) for x in V[va]], dtype="<i4") \
                     .astype("<i1").tobytes()
                 S[sa] = _s48(S[sa] + 16)
@@ -333,6 +337,7 @@ class VecInterp:
                 S[sd] = max(S[sd], int(np.max([_s32(x) for x in V[va]])))
             elif op == "STW":
                 a = S[sa] & 0xFFFFFF
+                assert a % 32 == 0, f"STW address {a:#x} not 32-byte aligned (RTL is beat-addressed)"
                 self.sp[a:a+32] = np.asarray([_s32(x) for x in V[va][:8]],
                                              dtype="<i4").tobytes()
                 S[sa] = _s48(S[sa] + 32)

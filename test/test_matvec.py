@@ -2128,4 +2128,7 @@ def test_sequencer_kadd_interlock_precise():
     assert (out["k0"], out["k1"]) == (ka, kb), (out["k0"], out["k1"], ka, kb)
     assert np.array_equal(out["na"], nrm_a), "norm via kreg0 (under the stream)"
     assert np.array_equal(out["nb"], nrm_b), "norm via kreg1 (after the capture)"
-    assert out["both"] > 50, f"kreg0 consumer did not overlap B (cyc_both={out['both']})"
+    # The norm under the stream is short (V1 pipelined unit: ~8 cy/beat), so the overlap
+    # window is small in absolute cycles; > 10 is well above zero and below any run.
+    assert out["both"] > 10, f"kreg0 consumer did not overlap B (cyc_both={out['both']})"
+
