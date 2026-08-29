@@ -705,10 +705,17 @@ static void kv_store_scale_prep(int kvh, int kind, int e8)
     int slot = 2*kvh + kind;
     if (kvp_scale_e8[slot] == e8)
         return;
-    volatile uint16_t *ps = (volatile uint16_t *)(SCRATCHPAD_BASE + kvp_slot(kvh, kind));
+    // Eight word stores instead of sixteen halfword stores: the beat is byte-identical
+    // (halfword g = scale for g < groups, else 0) and uncached scratchpad stores are the
+    // cost here, not the arithmetic (F0-3, 2026-08-29).
+    volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + kvp_slot(kvh, kind));
     int groups = head_dim/32;
-    for (int g = 0; g < 16; g++)
-        ps[g] = (g < groups) ? (uint16_t)((e8 + 15) << 10) : 0;
+    uint32_t sc = (uint32_t)(uint16_t)((e8 + 15) << 10);
+    for (int w = 0; w < 8; w++) {
+        uint32_t lo = (2*w     < groups) ? sc : 0;
+        uint32_t hi = (2*w + 1 < groups) ? sc : 0;
+        pw[w] = lo | (hi << 16);
+    }
     kvp_scale_e8[slot] = e8;
 }
 
@@ -1472,6 +1479,36 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
 
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
+#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
+// Token-invariant words of the attention list, patched ONCE per forward instead of once
+// per layer per head (F0-2 patch hygiene, 2026-08-29): rowsw/wlen (scores + AXPY) and the
+// softmax block count depend on pos only, and the score-slot padding survives across heads
+// and layers because only the scores op writes SP_SC (exactly cnt slots). Same values as
+// before, written 28x less often - uncached scratchpad stores are ~25-70 cycles each.
+static void attn_list_prep_token(int pos)
+{
+    if (seq_attn_heads <= 0)
+        return;
+    int cnt  = pos + 1;
+    int padn = (16 - (cnt & 15)) & 15;
+    volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
+    for (int i2 = 0; i2 < padn; i2++)
+        sc32[cnt + i2] = (int32_t)0x80000000;
+    uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
+    uint32_t wlen  = rows*kv_rb;
+    uint32_t rowsw = rows | (rem << 16);
+    uint32_t blocks = (uint32_t)(cnt + padn)/16;
+    for (int j = 0; j < seq_attn_heads; j++) {
+        uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*seq_attn_dph;
+        seq_patch(di + 1, 2, rowsw);
+        seq_patch(di + 1, 5, wlen);
+        seq_patch(di + 2, 5, blocks);          // softmax8 A3 (blocks).
+        seq_patch(di + 4, 2, rowsw);
+        seq_patch(di + 4, 5, wlen);
+    }
+}
+#endif
+
 static int forward(int token, int want_logits)
 {
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
@@ -1519,6 +1556,13 @@ embed_done: ;
         uint32_t rb = (2u*head_dim + 31)/32;
         engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + (rt->chan_base_beats + (uint64_t)pos*rb)*32,
                      rb, SP_TAB);
+#ifdef CSR_SEQ_BASE
+        if (seq_use) {
+            perf_enter(OP_SCORES);
+            attn_list_prep_token(pos);
+            perf_exit(OP_SCORES);
+        }
+#endif
     }
 #endif
 
@@ -1702,17 +1746,15 @@ attn_scores: ;
             // collapse into one submit per chunk; the AXPY rshift and norm k are computed
             // in-sequencer from the chained res6. Numerics identical to the fused path.
             perf_enter(OP_SCORES);
-            int cnt  = pos + 1;
-            int padn = (16 - (cnt & 15)) & 15;
-            volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
-            for (int i2 = 0; i2 < padn; i2++)
-                sc32[cnt + i2] = (int32_t)0x80000000;
-            uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
-            uint32_t wlen  = rows*kv_rb;
-            uint32_t rowsw = rows | (rem << 16);
+            // Token-invariant words (rowsw/wlen/blocks, score padding) were patched once
+            // per forward by attn_list_prep_token(); per layer only the KV addresses and
+            // the B/R/sigma exponents move. The four head-static words (q src, spill
+            // addresses, norm dst) are already what seq_build_attn wrote for slot j
+            // whenever the list holds every head (hh == j); they are re-patched only in
+            // the chunked case, where a slot serves several heads.
+            int chunked = (seq_attn_heads < n_head);
             int lg = 0;
             while ((1 << lg) < head_dim) lg++;
-            uint32_t blocks = (uint32_t)(cnt + padn)/16;
             for (int h0 = 0; h0 < n_head; h0 += seq_attn_heads) {
                 int nh = n_head - h0;
                 if (nh > seq_attn_heads) nh = seq_attn_heads;
@@ -1723,20 +1765,17 @@ attn_scores: ;
                     kv_scores_br(l, kvh, 0, &Bk, &Rk);
                     kv_scores_br(l, kvh, 1, &Bv, &Rd);
                     int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
-                    seq_patch(di + 0, 2, SP_Q + (uint32_t)hh*head_dim*2);
-                    seq_patch(di + 1, 2, rowsw);
+                    if (chunked) {
+                        seq_patch(di + 0, 2, SP_Q + (uint32_t)hh*head_dim*2);
+                        seq_patch(di + 3, 2, SP_AWP8 + (uint32_t)hh*32);
+                        seq_patch(di + 5, 2, SP_AWAM + (uint32_t)hh*32);
+                        seq_patch(di + 6, 4, SP_H + (uint32_t)hh*head_dim*2);
+                    }
                     seq_patch(di + 1, 4, kv_region_addr(l, kvh, 0));
-                    seq_patch(di + 1, 5, wlen);
                     seq_patch(di + 1, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
-                    seq_patch(di + 2, 5, blocks);          // softmax8 A3 (blocks).
                     seq_patch(di + 2, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
-                    seq_patch(di + 3, 2, SP_AWP8 + (uint32_t)hh*32);
-                    seq_patch(di + 4, 2, rowsw);
                     seq_patch(di + 4, 4, kv_region_addr(l, kvh, 1));
-                    seq_patch(di + 4, 5, wlen);
                     seq_patch(di + 4, 7, (uint32_t)Bv);
-                    seq_patch(di + 5, 2, SP_AWAM + (uint32_t)hh*32);
-                    seq_patch(di + 6, 4, SP_H + (uint32_t)hh*head_dim*2);
                     (void)Rd;
                 }
                 seq_run((uint32_t)seq_attn_base, (uint32_t)nh*seq_attn_dph);
@@ -2382,6 +2421,33 @@ void infer_vbench(void)
         dt = perf_now() - t0;
         printf("VB vec_1beat        %8lu\n", (unsigned long)(dt/16));
     }
+    { // Uncached scratchpad word stores: the cost of every seq_patch / scale-prep write.
+        volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_FET);
+        t0 = perf_now();
+        for (int i = 0; i < 64; i++) pw[i] = (uint32_t)i;
+        dt = perf_now() - t0;
+        printf("VB sp_write_64w     %8lu  (per store %lu)\n", (unsigned long)dt,
+               (unsigned long)(dt/64));
+    }
+#ifdef CSR_SEQ_BASE
+    { // One-descriptor sequencer list (spill): the in-list dispatch floor.
+        int32_t pa = (int32_t)SP_FET;
+        seq_desc_vec(191, PROG_SPILL, &pa, 1, 0);
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++) seq_run(191, 1);
+        dt = perf_now() - t0;
+        printf("VB seq_1desc        %8lu\n", (unsigned long)(dt/16));
+    }
+#endif
+#if defined(BONSAI_HAS_KVSTORE)
+    { // KV scale-beat prep with a forced exponent change every call.
+        t0 = perf_now();
+        for (int i = 0; i < 16; i++) kv_store_scale_prep(0, 0, (i & 1) ? -20 : -21);
+        dt = perf_now() - t0;
+        kvp_scale_e8[0] = -9999; // Leave the slot marked stale for the next real pack.
+        printf("VB scale_prep       %8lu\n", (unsigned long)(dt/16));
+    }
+#endif
     { // Vec throughput: resid_add over n_embd (128 beats, ~1.3k instructions).
         int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 128, 0, -1};
         t0 = perf_now();
