@@ -506,8 +506,12 @@ def prog_silu_mul():
         ("VSHLS", "v3", "v3", "s4"),    # f (Q15): << A4 (negative = right shift)
         ("VMAX",  "v3", "v3", "v1"),    # clamp low at -15*2^15
         ("VMIN",  "v3", "v3", "v7"),    # clamp high at 14*2^15 (e2 <= 2^29: int32-safe)
-        ("VSHRI", "v4", "v3", 15),      # i = floor(f)
         ("LUTE2", "v5", "v3"),          # 2^r (LUTE2 masks to low 15 bits itself)
+        # The next two are independent of the LUT result and fill its latency (4 since the
+        # E2/E3 split): i from the clamped f (unchanged by LUTE2), and mu early - f is dead
+        # once LUTE2 and VSHRI have read it. Bit-identical, order only.
+        ("VSHRI", "v4", "v3", 15),      # i = floor(f)
+        ("LDV",   "v3", "s1"),          # mu
         ("VSHLV", "v5", "v5", "v4"),    # e2 = 2^f (Q15 integer-scaled); i dead from here
         ("VADD",  "v6", "v5", "v2"),    # den = e2 + 2^15 (v2 persistent)
         ("VCLZN", "v4", "v6"),          # n (<= 0: den >= 2^15)
@@ -517,7 +521,6 @@ def prog_silu_mul():
         ("VSHLV", "v5", "v5", "v4"),
         ("VSHLI", "v5", "v5", 1),       # Q14 -> Q15
         ("VMULH15", "v0", "v0", "v5"),
-        ("LDV",   "v3", "s1"),          # mu (late: f is dead after LUTE2)
         ("VMUL",  "v0", "v0", "v3"),
         ("VSHLS", "v0", "v0", "s6"),    # >> A6
         ("VCLAMP16", "v0", "v0"),
@@ -636,10 +639,11 @@ def prog_softmax8():
         ("VMUL",  "v0", "v0", "v5"),    # d'*739.
         ("VSHLV", "v0", "v0", "v6"),    # f (Q15).
         ("VMAX",  "v0", "v0", "v4"),    # clamp at -15*2^15.
-        ("VSHRI", "v1", "v0", 15),      # i = floor(f) in [-15, 0].
         # Same as silu_mul: LUTE2 masks to the low 15 bits, so r = f - ((f>>15)<<15) was
-        # two instructions per iteration computing what the LUT already does.
+        # two instructions per iteration computing what the LUT already does. The VSHRI is
+        # independent of the LUT result and fills one slot of its latency.
         ("LUTE2", "v2", "v0"),
+        ("VSHRI", "v1", "v0", 15),      # i = floor(f) in [-15, 0].
         ("VSHLV", "v2", "v2", "v1"),    # 2^f, Q15.
         ("VRNE",  "v2", "v2", 8),
         ("VCLAMP8", "v2", "v2"),        # p8 in [0, 127] (max entry 128 -> 127).
@@ -841,8 +845,9 @@ def prog_silu_q8():
         ("VSHLS", "v3", "v3", "s4"),
         ("VMAX",  "v3", "v3", "v1"),
         ("VMIN",  "v3", "v3", "v7"),
-        ("VSHRI", "v4", "v3", 15),
         ("LUTE2", "v5", "v3"),
+        ("VSHRI", "v4", "v3", 15),      # LUT-shadow fill, as in prog_silu_mul.
+        ("LDV",   "v3", "s1"),
         ("VSHLV", "v5", "v5", "v4"),
         ("VADD",  "v6", "v5", "v2"),
         ("VCLZN", "v4", "v6"),
@@ -852,7 +857,6 @@ def prog_silu_q8():
         ("VSHLV", "v5", "v5", "v4"),
         ("VSHLI", "v5", "v5", 1),
         ("VMULH15", "v0", "v0", "v5"),
-        ("LDV",   "v3", "s1"),
         ("VMUL",  "v0", "v0", "v3"),
         ("VSHLS", "v0", "v0", "s6"),
         ("VCLAMP16", "v0", "v0"),
