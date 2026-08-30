@@ -256,3 +256,12 @@ def test_rtl_kvpack_h():
     sp[0:2*hd*H] = rng.integers(-30000, 30000, hd*H).astype("<i2").tobytes()
     _compare_words(asm.prog_kvpack_h(), sp,
                    [0, 0, 0x2020, hd//16, 0, 0, stride - 16*(hd//16), H])
+
+
+def test_rtl_rmsnorm_q8():
+    rng = np.random.default_rng(44)
+    n = 256
+    sp = bytearray(SP_SIZE)
+    sp[0:2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
+    sp[0x2000:0x2000 + 2*n] = rng.integers(-8000, 8000, n).astype("<i2").tobytes()
+    _compare_words(asm.prog_rmsnorm_q8(), sp, [0, 0x2000, 0x1000, n//16, -8, 17, -17, 0x3000])

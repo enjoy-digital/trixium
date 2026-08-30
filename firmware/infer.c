@@ -563,6 +563,38 @@ static int quant8_shift(uint32_t amax)
     return b - 7;
 }
 
+// rmsnorm + measured quant8 in one program (F1-3, 2026-08-30): saves a dispatch and
+// quant8's absmax pass at every norm->x8 site. Returns the quant8 shift like op_quant8_sp;
+// falls back to the two ops when either is off the hardware or the NORM16 row is absent.
+static int op_quant8_sp(uint32_t src, uint32_t dst, int n);
+static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
+                            const struct bons_entry *w16, int n, uint32_t dst16,
+                            uint32_t dst8)
+{
+#if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
+    if (op_on_hw(OP_RMSNORM) && op_on_hw(OP_QUANT8) && w16) {
+        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
+                     w16->chan_len_beats, SP_FET);
+        int eps_int = eps_for(esrc);
+        int ln = 0;
+        while ((1 << ln) < n) ln++;
+        int32_t args[8] = {(int32_t)src, (int32_t)SP_FET, (int32_t)dst16, n/16,
+                           -ln, eps_int, E_W16 - E_NORM - 15, (int32_t)dst8};
+        perf_enter(OP_RMSNORM);
+        uint32_t amax = (uint32_t)vec_run(PROG_RMSNORM_Q8, args, 8);
+        perf_exit(OP_RMSNORM);
+        return quant8_shift(amax);
+    }
+#endif
+    perf_enter(OP_RMSNORM);
+    op_rmsnorm_sp(src, esrc, w, w16, n, dst16);
+    perf_exit(OP_RMSNORM);
+    perf_enter(OP_QUANT8);
+    int s = op_quant8_sp(dst16, dst8, n);
+    perf_exit(OP_QUANT8);
+    return s;
+}
+
 static int op_quant8_sp(uint32_t src, uint32_t dst, int n)
 {
 #ifdef CSR_VECUNIT_BASE
@@ -1729,13 +1761,9 @@ embed_done: ;
 
     for (int l = 0; l < n_layer; l++) {
         // Attention block.
-        perf_enter(OP_RMSNORM);
-        op_rmsnorm_sp(SP_XR, ex_state, attn_norm[l],
-                      model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16), n_embd, SP_H);
-        perf_exit(OP_RMSNORM);
-        perf_enter(OP_QUANT8);
-        int sx8 = op_quant8_sp(SP_H, SP_X, n_embd);
-        perf_exit(OP_QUANT8);
+        int sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, attn_norm[l],
+                                   model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16),
+                                   n_embd, SP_H, SP_X);
         int eq_res = 0, ev_res = 0;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
         if (attn_hw) {
@@ -2286,13 +2314,9 @@ attn_heads_done: ;
             const struct bons_entry *eg_t = model_entry(ROLE_FFN_GATE, l);
             const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
             const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
-            perf_enter(OP_RMSNORM);
-            op_rmsnorm_sp(SP_XR, ex_state, ffn_norm[l],
-                          model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16), n_embd, SP_H);
-            perf_exit(OP_RMSNORM);
-            perf_enter(OP_QUANT8);
-            int ex8 = E_NORM + op_quant8_sp(SP_H, SP_X, n_embd);
-            perf_exit(OP_QUANT8);
+            int ex8 = E_NORM + op_rmsnorm_q8_sp(SP_XR, ex_state, ffn_norm[l],
+                                                model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16),
+                                                n_embd, SP_H, SP_X);
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && !defined(BONSAI_HAS_DUALQ)
@@ -2406,13 +2430,8 @@ attn_heads_done: ;
         return -1;
 
     // Final norm + LM head (tied or separate), chunked over rows to fit the scratchpad.
-    perf_enter(OP_RMSNORM);
-    op_rmsnorm_sp(SP_XR, ex_state, out_norm,
-                  model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16), n_embd, SP_H);
-    perf_exit(OP_RMSNORM);
-    perf_enter(OP_QUANT8);
-    op_quant8_sp(SP_H, SP_X, n_embd);
-    perf_exit(OP_QUANT8);
+    (void)op_rmsnorm_q8_sp(SP_XR, ex_state, out_norm,
+                           model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16), n_embd, SP_H, SP_X);
     perf_enter(OP_LMHEAD);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head)

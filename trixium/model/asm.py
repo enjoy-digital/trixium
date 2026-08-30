@@ -762,6 +762,64 @@ def prog_kvpack_h():
         ("DONE",),
     ]
 
+def prog_rmsnorm_q8():
+    """prog_rmsnorm followed by a measured-mode quant8 of its own output, in one program
+    (F1-3, 2026-08-30): the int16 result still lands at A2 (SP_H, the attention/FFN
+    input the rest of the layer reads) and the int8 x8 at A7. Pass 2 REDMAXes the clamped
+    int16 values it stores - exactly what quant8's first pass measured - so pass 3 is
+    quant8's second pass verbatim. S6 = that absmax (firmware: s = quant8_shift(S6)).
+      A0..A6 as prog_rmsnorm, A7 = int8 dst."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s5", 5), ("ARG", "s6", 6),
+        ("MOVSI", "s7", 0),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("REDSSQ", "s7", "v0"),
+        ("LOOPE",),
+        ("SSHLV", "s7", "s4"),
+        ("SADD",  "s7", "s5"),
+        ("SNORME", "s4", "s7"),
+        ("SSHLV", "s7", "s4"),
+        ("BCAST", "v7", "s7"),
+        ("LUTRSQRT", "v7", "v7"),
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s4", "s5"),
+        ("SADD",  "s4", "s6"),
+        ("BCAST", "v6", "s4"),
+        ("VSUB",  "v5", "v5", "v5"),
+        ("VSUB",  "v5", "v5", "v6"),
+        ("MOVSI", "s5", 1),
+        ("BCAST", "v4", "s5"),
+        ("VSUB",  "v3", "v5", "v4"),
+        ("VSHLV", "v4", "v4", "v3"),
+        ("ARG",   "s0", 0),
+        ("MOVSI", "s6", 0),             # absmax of the int16 output (quant8's pass 1).
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("LDV",   "v1", "s1"),
+        ("VMUL",  "v2", "v0", "v1"),
+        ("VMULH15", "v2", "v2", "v7"),
+        ("VADD",  "v2", "v2", "v4"),
+        ("VSHLV", "v2", "v2", "v6"),
+        ("VCLAMP16", "v2", "v2"),
+        ("REDMAX", "s6", "v2"),
+        ("STV",   "v2", "s2"),
+        ("LOOPE",),
+        ("BCAST", "v1", "s6"),
+        ("VCLZN", "v1", "v1"),          # 15 - bitlen(absmax): measured mode (A1 = 1).
+        ("ARG",   "s2", 2),             # Rewind the int16 output.
+        ("ARG",   "s7", 7),             # int8 dst.
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s2"),
+        ("VSHLV", "v0", "v0", "v1"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("STB",   "v0", "s7"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 def prog_reduce_acc():
     """acc_i32 += src_i32 (8 int32 per iteration); S6 = |max| of the post-add values
     (the last call of an N-way reduce returns the true absmax for the norm shift).
@@ -856,6 +914,7 @@ PROGRAMS = {
     "rmsnorm_h":  prog_rmsnorm_h,
     "rope_h":     prog_rope_h,
     "kvpack_h":   prog_kvpack_h,
+    "rmsnorm_q8": prog_rmsnorm_q8,
 }
 
 def emit_c(out):

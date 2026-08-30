@@ -361,3 +361,23 @@ def test_kvpack_h_matches_per_head_fixed_quant8():
     _run_words(asm.assemble(asm.prog_kvpack_h()), got,
                [0, 0, 0x2020, hd//16, 0, 0, stride - 16*(hd//16), H])
     assert bytes(got) == bytes(ref)
+
+
+def test_rmsnorm_q8_matches_rmsnorm_then_quant8():
+    import numpy as np
+    rng = np.random.default_rng(34)
+    n = 256
+    x = rng.integers(-20000, 20000, n).astype("<i2")
+    w = rng.integers(-8000, 8000, n).astype("<i2")
+    base = bytearray(16*1024)
+    base[0:2*n] = x.tobytes()
+    base[0x2000:0x2000 + 2*n] = w.tobytes()
+    A4, A5, A6 = -8, 17, -17
+    ref = bytearray(base)
+    _run_words(asm.assemble(asm.prog_rmsnorm()), ref, [0, 0x2000, 0x1000, n//16, A4, A5, A6])
+    Sr, _ = _run_words(asm.assemble(asm.prog_quant8()), ref, [0x1000, 1, 0x3000, n//16])
+    got = bytearray(base)
+    Sg, _ = _run_words(asm.assemble(asm.prog_rmsnorm_q8()), got,
+                       [0, 0x2000, 0x1000, n//16, A4, A5, A6, 0x3000])
+    assert bytes(got) == bytes(ref)
+    assert Sg[6] == Sr[6]
