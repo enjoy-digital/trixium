@@ -165,19 +165,26 @@ class BonsaiMatVecEngine(LiteXModule):
                                        dual=dual)
             setattr(self.submodules, f"reader{i}", reader)
             setattr(self.submodules, f"pipe{i}",   pipe)
+            # Relay register between the reader (its FIFO sits at the HBM port, bottom of
+            # the die) and the pipe: n16 timing #3c had the FIFO output reaching codes_r
+            # with zero logic levels and 4.5 ns of route. Latency only.
+            rbuf = stream.Buffer([("data", 256)])
+            setattr(self.submodules, f"rbuf{i}", rbuf)
+            self.comb += reader.source.connect(rbuf.sink)
+            rsrc = rbuf.source
             is_fetch = Signal()
             self.comb += [
                 is_fetch.eq(fetch_mode & (fetch_chan == i)),
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
-                pipe.sink.valid.eq(reader.source.valid & ~is_fetch),
-                pipe.sink.data.eq(reader.source.data),
+                pipe.sink.valid.eq(rsrc.valid & ~is_fetch),
+                pipe.sink.data.eq(rsrc.data),
                 # Fetch beats honor the gather-FIFO headroom (a vec store can steal the
                 # W port for a cycle); compute beats honor the pipe's result-FIFO
                 # backpressure (drops results past N=2 otherwise - N/row_beats > 1 gather/cycle).
-                reader.source.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & pipe.sink.ready)),
+                rsrc.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & pipe.sink.ready)),
             ]
-            fetch_valids.append(reader.source.valid & is_fetch)
-            fetch_datas.append(reader.source.data)
+            fetch_valids.append(rsrc.valid & is_fetch)
+            fetch_datas.append(rsrc.data)
             self.readers.append(reader)
             self.pipes.append(pipe)
 
@@ -199,9 +206,13 @@ class BonsaiMatVecEngine(LiteXModule):
             fetch_chan.eq(cmd_r["chan"]),
         ]
 
-        # Broadcast op params to pipes (channels < rem run one extra row).
+        # Broadcast op params to pipes (channels < rem run one extra row). REGISTERED
+        # per pipe (n16 timing #3c: the combinational broadcast reached a far pipe's
+        # x-buffer address with 3.9 ns of route). They load during START from the new
+        # cmd_r and are stable one cycle later, together with the registered start pulse
+        # below - the first beat or fill write reaches a pipe later than that.
         for i, pipe in enumerate(self.pipes):
-            self.comb += [
+            self.sync += [
                 pipe.kind.eq(Mux(axpy_mode, 2,
                              Mux(fetch_mode | store_mode, 0, cmd_r["kind"][0:2]))),
                 pipe.rows.eq(cmd_r["rows"] + (i < cmd_r["rem"])),
@@ -274,6 +285,18 @@ class BonsaiMatVecEngine(LiteXModule):
         # Per-pipe copies (dont_touch): a single stage-2 register driving every pipe's
         # x-buffer write port was the v13 route-spread path; each pipe now owns a local
         # copy the placer can pull next to its x-buffer.
+        # Relay stage first (n16 timing #3c): the BRAM output fanned out to sixteen
+        # per-pipe copies across the die. One register next to the scratchpad, then the
+        # per-pipe copies off a flop the tool may replicate. Adds a cycle to the fill; the
+        # last writes still land during ISSUE.
+        fill_act1 = Signal()
+        fill_pos1 = Signal(10)
+        fill_dat1 = Signal(256)
+        self.sync += [
+            fill_act1.eq(fill_active_d),
+            fill_pos1.eq(fill_pos),
+            fill_dat1.eq(scratchpad.fill.dat_r),
+        ]
         for i, pipe in enumerate(self.pipes):
             fa2 = Signal(name=f"fill_act2_{i}")
             fp2 = Signal(10, name=f"fill_pos2_{i}")
@@ -281,9 +304,9 @@ class BonsaiMatVecEngine(LiteXModule):
             for sig in (fa2, fp2, fd2):
                 sig.attr.add(("dont_touch", "true"))
             self.sync += [
-                fa2.eq(fill_active_d),
-                fp2.eq(fill_pos),
-                fd2.eq(scratchpad.fill.dat_r),
+                fa2.eq(fill_act1),
+                fp2.eq(fill_pos1),
+                fd2.eq(fill_dat1),
             ]
             self.comb += [
                 pipe.xw_group.eq(fp2[2:]),
@@ -295,32 +318,58 @@ class BonsaiMatVecEngine(LiteXModule):
         # Gather ------------------------------------------------------------------------------
         self.rr = rr = RoundRobin(n, SP_CE)
         result_cnt  = Signal(32)
-        grant_valid = Array([p.source.valid for p in self.pipes])[rr.grant]
-        grant_row   = Array([p.source.row   for p in self.pipes])[rr.grant]
-        grant_data  = Array([p.source.data  for p in self.pipes])[rr.grant]
-        grant_wide  = Array([p.source.wide  for p in self.pipes])[rr.grant]
-
         # Interleaved (position-major) ops merge every pipe whose head falls in the same
         # scratchpad beat as the granted head: slot = row*N + chan, so within one beat all
         # lanes map to distinct pipes (N power-of-2) and up to 8 results retire per cycle.
         # This is the gather-widen: at N channels the aggregate score rate N/row_beats
         # exceeds 1/cycle from N=4 up, and merged retirement keeps the drain above it.
-        ilv_mode = Signal()
-        dstw     = Signal(24)
+        ilv_mode  = Signal()
+        xred_mode = Signal()
+        dstw      = Signal(24)
         self.comb += [
             ilv_mode.eq(cmd_r["ilv"] & ~axpy_mode & ~fetch_mode & ~store_mode),
+            xred_mode.eq(axpy_mode & cmd_r["xred"]),
             dstw.eq(cmd_r["dst"] >> 2),
         ]
-        slot_p     = [Signal(24, name=f"slot_p{i}") for i in range(n)]
-        merge_mask = Signal(n)
-        grant_slot = Signal(24)
+        # Per-pipe relay register in front of the gather (n16 timing #3c: the result
+        # FIFO's asynchronous read fed the slot arithmetic, the merge compare and the lane
+        # muxes in one cycle - 14 levels, 6.4 ns). The scratchpad slot of each result is
+        # computed HERE, from the pipe's FIFO output and the (op-static) command fields,
+        # and travels registered with the result: the gather then only compares and
+        # selects. Every mode's addressing is folded into one field:
+        #   ilv      slot = dst + qoff + row*N + chan       (position-major, merged beats)
+        #   xred     slot = dst + qoff + row                (one summed vector)
+        #   axpy     slot = dst + qoff + chan*cols + row    (wide drain rows)
+        #   default  slot = dst + qoff + chan*rows + row    (channel-major)
+        # The pipe's stream handshake is unchanged (consumed == counted still holds: the
+        # counting stage sits after the relay, on the same signals it always used).
+        gsrc = []
         for i, pipe in enumerate(self.pipes):
-            self.comb += slot_p[i].eq(dstw + Mux(pipe.source.head, cmd_r["qstride"], 0)
-                                      + pipe.source.row*n + i)
-        self.comb += grant_slot.eq(Array(slot_p)[rr.grant])
+            gb = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
+                                ("slot", 24)])
+            setattr(self.submodules, f"gbuf{i}", gb)
+            self.comb += [
+                gb.sink.valid.eq(pipe.source.valid),
+                pipe.source.ready.eq(gb.sink.ready),
+                gb.sink.row.eq(pipe.source.row),
+                gb.sink.data.eq(pipe.source.data),
+                gb.sink.wide.eq(pipe.source.wide),
+                gb.sink.head.eq(pipe.source.head),
+                gb.sink.slot.eq(dstw + Mux(pipe.source.head, cmd_r["qstride"], 0)
+                    + Mux(ilv_mode, pipe.source.row*n + i,
+                      Mux(xred_mode, pipe.source.row,
+                          pipe.source.row + Mux(axpy_mode, i*cmd_r["cols"], i*cmd_r["rows"])))),
+            ]
+            gsrc.append(gb.source)
+        grant_valid = Array([g.valid for g in gsrc])[rr.grant]
+        grant_row   = Array([g.row   for g in gsrc])[rr.grant]
+        grant_data  = Array([g.data  for g in gsrc])[rr.grant]
+        grant_wide  = Array([g.wide  for g in gsrc])[rr.grant]
+        grant_slot  = Signal(24)
+        merge_mask  = Signal(n)
+        self.comb += grant_slot.eq(Array([g.slot for g in gsrc])[rr.grant])
         self.comb += merge_mask.eq(Cat(*[
-            self.pipes[i].source.valid & ~self.pipes[i].source.wide
-            & (slot_p[i][3:] == grant_slot[3:])
+            gsrc[i].valid & ~gsrc[i].wide & (gsrc[i].slot[3:] == grant_slot[3:])
             for i in range(n)]))
 
         # Cross-channel reduce (AXPY + cmd.xred). Every pipe drains its partial vector as
@@ -333,26 +382,34 @@ class BonsaiMatVecEngine(LiteXModule):
         # beats regardless of `rem` (rem varies the number of POSITIONS a channel accumulates,
         # not the length of its output), and the drain runs after the reader has finished, so
         # a stalled axw_fifo cannot deadlock against an in-flight read.
-        xred_mode = Signal()
         xred_all  = Signal()
-        self.comb += [
-            xred_mode.eq(axpy_mode & cmd_r["xred"]),
-            xred_all.eq(xred_mode & reduce(and_, [p.source.valid for p in self.pipes])),
-        ]
+        self.comb += xred_all.eq(xred_mode & reduce(and_, [g.valid for g in gsrc]))
         xred_dat = Signal(256)
+        def _addtree(sigs):
+            # Balanced: a left fold is a chain of n-1 adders (15 carry chains deep at
+            # N=16); the tree is log2(n) deep and, being wrap-add, bit-identical.
+            while len(sigs) > 1:
+                nxt = []
+                for a, b in zip(sigs[::2], sigs[1::2]):
+                    m = Signal(32)
+                    self.comb += m.eq(a + b)
+                    nxt.append(m)
+                if len(sigs) % 2:
+                    nxt.append(sigs[-1])
+                sigs = nxt
+            return sigs[0]
         for l in range(8):
             # int32 wrap add: the sum is truncated to 32 bits, which is exactly what the
             # vector unit's VADD does, so the result is bit-identical whatever the order.
             self.comb += xred_dat[32*l:32*l + 32].eq(
-                reduce(lambda a, b: a + b,
-                       [p.source.data[32*l:32*l + 32] for p in self.pipes])[0:32])
+                _addtree([g.data[32*l:32*l + 32] for g in gsrc]))
 
         self.comb += [
-            rr.request.eq(Cat(*[p.source.valid for p in self.pipes])),
+            rr.request.eq(Cat(*[g.valid for g in gsrc])),
             rr.ce.eq(1),
         ]
-        for i, pipe in enumerate(self.pipes):
-            self.comb += pipe.source.ready.eq(
+        for i in range(n):
+            self.comb += gsrc[i].ready.eq(
                 Mux(xred_mode, xred_all,
                     Mux(ilv_mode, merge_mask[i], rr.grant == i)))
 
@@ -360,10 +417,10 @@ class BonsaiMatVecEngine(LiteXModule):
         lane_we  = Signal(8)
         lane_dat = Signal(256)
         for l in range(8):
-            sels = [merge_mask[i] & (slot_p[i][0:3] == l) for i in range(n)]
+            sels = [merge_mask[i] & (gsrc[i].slot[0:3] == l) for i in range(n)]
             self.comb += lane_we[l].eq(reduce_or(sels))
             self.comb += lane_dat[32*l:32*l+32].eq(reduce_or(
-                [Replicate(sels[i], 32) & self.pipes[i].source.data[0:32]
+                [Replicate(sels[i], 32) & gsrc[i].data[0:32]
                  for i in range(n)]))
 
         is_matvec = Signal() # Kinds 0/1 only (not fetch/store/axpy partials).
@@ -440,20 +497,11 @@ class BonsaiMatVecEngine(LiteXModule):
             # compare from the gather FIFO).
             fetch_wcnt.eq(fetch_wcnt + 1),
         )
-        grant_head = Array([p.source.head for p in self.pipes])[rr.grant]
-        grant_qoff = Signal(16)
-        self.comb += grant_qoff.eq(Mux(grant_head, cmd_r["qstride"], 0))
+        # The granted result's slot, precomputed per pipe at the relay register (xred:
+        # all n are on the same beat when xred_all, so the granted one's row is the row;
+        # axpy: wide drain rows are 8-lane group starts, dst must be 32B-aligned).
+        self.comb += slot.eq(grant_slot)
         self.comb += [
-            If(xred_mode,
-                # One summed vector, so no per-channel stride. Row comes from the granted
-                # pipe, which is safe because all n are on the same beat when xred_all.
-                slot.eq(dstw + grant_qoff + grant_row),
-            ).Elif(axpy_mode,
-                # Wide drain rows are 8-lane group starts; dst must be 32B-aligned.
-                slot.eq(dstw + grant_qoff + rr.grant*cmd_r["cols"] + grant_row),
-            ).Else(
-                slot.eq(dstw + grant_qoff + rr.grant*cmd_r["rows"] + grant_row),
-            ),
             If(fetch_mode,
                 eng_gw_adr_c.eq((cmd_r["dst"] >> 5) + fetch_wcnt),
                 eng_gw_dat_c.eq(fetch_data),
@@ -476,7 +524,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 # is why rows=1 works at every rem. Position 9 at 8 channels on the card.
                 #
                 # The address is safe without the gate: merge_mask requires
-                # slot_p[i][3:] == grant_slot[3:], so every lane written belongs here.
+                # gsrc[i].slot[3:] == grant_slot[3:], so every lane written belongs here.
                 eng_gw_we_c.eq(lane_we),
             ).Elif(xred_mode,
                 eng_gw_adr_c.eq(slot[3:]),
@@ -608,7 +656,7 @@ class BonsaiMatVecEngine(LiteXModule):
         self.fsm = fsm = FSM(reset_state="IDLE")
         start_pulse = Signal()
         for pipe in self.pipes:
-            self.comb += pipe.start.eq(start_pulse)
+            self.sync += pipe.start.eq(start_pulse) # One cycle behind, with the params.
 
         fsm.act("IDLE",
             self.cmd.ready.eq(1),
