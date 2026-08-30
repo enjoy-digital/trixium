@@ -172,9 +172,12 @@ class BonsaiMatVecEngine(LiteXModule):
             setattr(self.submodules, f"rbuf{i}", rbuf)
             self.comb += reader.source.connect(rbuf.sink)
             rsrc = rbuf.source
-            is_fetch = Signal()
+            # Registered per channel (n16 timing #3d: the combinational decode from cmd_r
+            # reached a far pipe's scale-RAM write enables with 5.4 ns of route). Stable
+            # from the cycle after START; the reader is commanded later than that.
+            is_fetch = Signal(name=f"is_fetch{i}")
+            self.sync += is_fetch.eq(fetch_mode & (fetch_chan == i))
             self.comb += [
-                is_fetch.eq(fetch_mode & (fetch_chan == i)),
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
                 pipe.sink.valid.eq(rsrc.valid & ~is_fetch),
                 pipe.sink.data.eq(rsrc.data),
@@ -251,9 +254,13 @@ class BonsaiMatVecEngine(LiteXModule):
         st_last_pkt   = Signal()
         st_next       = Signal()   # Pulse: advance to the next packet.
         self.comb += st_last_pkt.eq((st_rep + 1 >= cmd_r["rep"]))
+        # Scratchpad read address for the fill and the STORE stream, kept as a COUNTER
+        # (n16 timing #3d: xsrc + Mux(store_mode, off + cnt, beat) put two carry chains and
+        # the store_mode decode in front of a 64-BRAM address net). Reset to xsrc at START,
+        # advanced exactly when fill_beat / st_cnt advance, re-based on each STORE packet.
         eng_fill_adr = Signal(len(scratchpad.fill.adr))
-        self.comb += eng_fill_adr.eq((cmd_r["xsrc"] >> 5)
-                                     + Mux(store_mode, st_src_off + st_cnt, fill_beat))
+        xsrc_w = Signal(len(scratchpad.fill.adr))
+        self.comb += xsrc_w.eq(cmd_r["xsrc"] >> 5)
         self.comb += [
             self.store_data.valid.eq(st_rdv),
             self.store_data.data.eq(scratchpad.fill.dat_r),
@@ -387,22 +394,48 @@ class BonsaiMatVecEngine(LiteXModule):
         xred_dat = Signal(256)
         def _addtree(sigs):
             # Balanced: a left fold is a chain of n-1 adders (15 carry chains deep at
-            # N=16); the tree is log2(n) deep and, being wrap-add, bit-identical.
+            # N=16); the tree is log2(n) deep and, being wrap-add, bit-identical. Exactly
+            # ONE level is registered whatever the depth (n16 timing #3d: four carry levels
+            # behind a far-placed relay were the eng_gw_dat worst path) - the second level
+            # when there is one, else the only level, else the lone input - so the summed
+            # beat always lands one cycle later and the xred write below follows it. (An
+            # earlier form registered "level 1" only: at N=2 there is no level 1, nothing
+            # was registered, and the data ran a cycle ahead of its write enable.)
+            depth = (len(sigs) - 1).bit_length()
+            if depth == 0:
+                r = Signal(32)
+                self.sync += r.eq(sigs[0])
+                return r
+            reg_level = min(1, depth - 1)
+            level = 0
             while len(sigs) > 1:
+                reg = (level == reg_level)
                 nxt = []
                 for a, b in zip(sigs[::2], sigs[1::2]):
                     m = Signal(32)
-                    self.comb += m.eq(a + b)
+                    if reg:
+                        self.sync += m.eq(a + b)
+                    else:
+                        self.comb += m.eq(a + b)
                     nxt.append(m)
                 if len(sigs) % 2:
-                    nxt.append(sigs[-1])
+                    if reg:
+                        r = Signal(32)
+                        self.sync += r.eq(sigs[-1])
+                        nxt.append(r)
+                    else:
+                        nxt.append(sigs[-1])
                 sigs = nxt
+                level += 1
             return sigs[0]
         for l in range(8):
             # int32 wrap add: the sum is truncated to 32 bits, which is exactly what the
             # vector unit's VADD does, so the result is bit-identical whatever the order.
             self.comb += xred_dat[32*l:32*l + 32].eq(
                 _addtree([g.data[32*l:32*l + 32] for g in gsrc]))
+        # xred write follows the registered tree level by one cycle.
+        xred_all_d  = Signal()
+        xred_slot_d = Signal(len(scratchpad.gather.adr))
 
         self.comb += [
             rr.request.eq(Cat(*[g.valid for g in gsrc])),
@@ -501,6 +534,10 @@ class BonsaiMatVecEngine(LiteXModule):
         # all n are on the same beat when xred_all, so the granted one's row is the row;
         # axpy: wide drain rows are 8-lane group starts, dst must be 32B-aligned).
         self.comb += slot.eq(grant_slot)
+        self.sync += [
+            xred_all_d.eq(xred_all),
+            xred_slot_d.eq(slot[3:]),
+        ]
         self.comb += [
             If(fetch_mode,
                 eng_gw_adr_c.eq((cmd_r["dst"] >> 5) + fetch_wcnt),
@@ -527,9 +564,9 @@ class BonsaiMatVecEngine(LiteXModule):
                 # gsrc[i].slot[3:] == grant_slot[3:], so every lane written belongs here.
                 eng_gw_we_c.eq(lane_we),
             ).Elif(xred_mode,
-                eng_gw_adr_c.eq(slot[3:]),
+                eng_gw_adr_c.eq(xred_slot_d),
                 eng_gw_dat_c.eq(xred_dat),
-                eng_gw_we_c.eq(Mux(xred_all, 0xFF, 0)),
+                eng_gw_we_c.eq(Mux(xred_all_d, 0xFF, 0)),
             ).Elif(axpy_mode,
                 eng_gw_adr_c.eq(slot[3:]),
                 eng_gw_dat_c.eq(grant_data),
@@ -782,6 +819,16 @@ class BonsaiMatVecEngine(LiteXModule):
             # valid one stable-address cycle later (one dead cycle after each advance).
             # rd_free: dat_r next cycle is ours only if our address was on the port.
             st_rdv.eq(fsm.ongoing("ST_RUN") & ~st_advance & rd_free),
+            # Fill/STORE read address counter (see eng_fill_adr above).
+            If(start_pulse,
+                eng_fill_adr.eq(xsrc_w),
+            ).Elif(st_next,
+                eng_fill_adr.eq(xsrc_w + st_src_off + cmd_r["sstride"]),
+            ).Elif(fsm.ongoing("FILL") & rd_free,
+                eng_fill_adr.eq(eng_fill_adr + 1),
+            ).Elif(st_advance,
+                eng_fill_adr.eq(eng_fill_adr + 1),
+            ),
             If(start_pulse,
                 st_cnt.eq(0),
                 st_rep.eq(0),
