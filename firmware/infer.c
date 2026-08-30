@@ -595,6 +595,29 @@ static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
     return s;
 }
 
+// silu_mul + measured quant8 in one program (2026-08-30). Returns the quant8 shift.
+static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n);
+static int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, uint32_t dst8)
+{
+#ifdef CSR_VECUNIT_BASE
+    if (op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
+        int32_t args[8] = {(int32_t)gsrc, (int32_t)usrc, (int32_t)gsrc, n/16,
+                           eg + 6, 0, -15, (int32_t)dst8};
+        perf_enter(OP_SILU_MUL);
+        uint32_t amax = (uint32_t)vec_run(PROG_SILU_Q8, args, 8);
+        perf_exit(OP_SILU_MUL);
+        return quant8_shift(amax);
+    }
+#endif
+    perf_enter(OP_SILU_MUL);
+    op_silu_mul_sp(gsrc, eg, usrc, eu, n);
+    perf_exit(OP_SILU_MUL);
+    perf_enter(OP_QUANT8);
+    int s = op_quant8_sp(gsrc, dst8, n);
+    perf_exit(OP_QUANT8);
+    return s;
+}
+
 static int op_quant8_sp(uint32_t src, uint32_t dst, int n)
 {
 #ifdef CSR_VECUNIT_BASE
@@ -2399,14 +2422,8 @@ attn_heads_done: ;
             perf_exit(OP_NORM_I32);
             int eu = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
 
-            perf_enter(OP_SILU_MUL);
-            op_silu_mul_sp(SP_G, eg, SP_U, eu, ffn_dim);
-            perf_exit(OP_SILU_MUL);
             int es = eg + eu + 15;
-
-            perf_enter(OP_QUANT8);
-            int es8 = es + op_quant8_sp(SP_G, SP_X, ffn_dim);
-            perf_exit(OP_QUANT8);
+            int es8 = es + op_silu_q8_sp(SP_G, eg, SP_U, eu, ffn_dim, SP_X);
 
             model_matvec(ed_t, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);

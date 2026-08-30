@@ -381,3 +381,21 @@ def test_rmsnorm_q8_matches_rmsnorm_then_quant8():
                        [0, 0x2000, 0x1000, n//16, A4, A5, A6, 0x3000])
     assert bytes(got) == bytes(ref)
     assert Sg[6] == Sr[6]
+
+
+def test_silu_q8_matches_silu_then_quant8():
+    import numpy as np
+    rng = np.random.default_rng(35)
+    n = 256
+    base = bytearray(16*1024)
+    base[0:2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
+    base[0x1000:0x1000 + 2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
+    a4, a6 = -12, -15
+    ref = bytearray(base)
+    _run_words(asm.assemble(asm.prog_silu_mul()), ref, [0, 0x1000, 0, n//16, a4, 0, a6])
+    Sr, _ = _run_words(asm.assemble(asm.prog_quant8()), ref, [0, 1, 0x3000, n//16])
+    got = bytearray(base)
+    Sg, _ = _run_words(asm.assemble(asm.prog_silu_q8()), got,
+                       [0, 0x1000, 0, n//16, a4, 0, a6, 0x3000])
+    assert bytes(got) == bytes(ref)
+    assert Sg[6] == Sr[6]

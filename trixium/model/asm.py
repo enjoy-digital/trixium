@@ -820,6 +820,60 @@ def prog_rmsnorm_q8():
         ("DONE",),
     ]
 
+def prog_silu_q8():
+    """prog_silu_mul followed by a measured-mode quant8 of its output in one program
+    (2026-08-30): the int16 result still lands at A2 (SP_G) and the int8 x8 at A7. The loop
+    REDMAXes the clamped output it stores (quant8's first pass), then quant8's rescale
+    pass runs over the int16 output. S6 = the absmax (firmware: s = quant8_shift(S6)).
+      A0..A6 as prog_silu_mul, A7 = int8 dst."""
+    C_LOG2E = 739
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s6", 6),
+        ("MOVSI", "s5", C_LOG2E),
+        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # v2 = 2^15
+        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10), # -15*2^15
+        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10), # 14*2^15
+        ("MOVSI", "s7", 0),             # absmax accumulator (quant8's pass 1).
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("VMULS", "v3", "v0", "s5"),
+        ("VSHLS", "v3", "v3", "s4"),
+        ("VMAX",  "v3", "v3", "v1"),
+        ("VMIN",  "v3", "v3", "v7"),
+        ("VSHRI", "v4", "v3", 15),
+        ("LUTE2", "v5", "v3"),
+        ("VSHLV", "v5", "v5", "v4"),
+        ("VADD",  "v6", "v5", "v2"),
+        ("VCLZN", "v4", "v6"),
+        ("VSHLV", "v6", "v6", "v4"),
+        ("LUTRECIP", "v6", "v6"),
+        ("VMULH15", "v5", "v5", "v6"),
+        ("VSHLV", "v5", "v5", "v4"),
+        ("VSHLI", "v5", "v5", 1),
+        ("VMULH15", "v0", "v0", "v5"),
+        ("LDV",   "v3", "s1"),
+        ("VMUL",  "v0", "v0", "v3"),
+        ("VSHLS", "v0", "v0", "s6"),
+        ("VCLAMP16", "v0", "v0"),
+        ("REDMAX", "s7", "v0"),
+        ("STV",   "v0", "s2"),
+        ("LOOPE",),
+        ("SMOV",  "s6", "s7"),          # S6 = absmax (returned in res6).
+        ("BCAST", "v1", "s7"),
+        ("VCLZN", "v1", "v1"),          # measured-mode shift.
+        ("ARG",   "s2", 2),             # Rewind the int16 output.
+        ("ARG",   "s7", 7),             # int8 dst.
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s2"),
+        ("VSHLV", "v0", "v0", "v1"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("STB",   "v0", "s7"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 def prog_reduce_acc():
     """acc_i32 += src_i32 (8 int32 per iteration); S6 = |max| of the post-add values
     (the last call of an N-way reduce returns the true absmax for the norm shift).
@@ -915,6 +969,7 @@ PROGRAMS = {
     "rope_h":     prog_rope_h,
     "kvpack_h":   prog_kvpack_h,
     "rmsnorm_q8": prog_rmsnorm_q8,
+    "silu_q8":    prog_silu_q8,
 }
 
 def emit_c(out):
