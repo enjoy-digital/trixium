@@ -315,6 +315,7 @@ class BonsaiVectorUnit(LiteXModule):
         e1_scalar_b = Signal()
         e1_redssq   = Signal()
         e1_is_ldw   = Signal()
+        e1_is_mul   = Signal()
 
         # E2 record ---------------------------------------------------------------------------
         e2_valid    = Signal()
@@ -377,6 +378,7 @@ class BonsaiVectorUnit(LiteXModule):
                     | (e2_valid & e2_is_red & (e2_sd == x))
                     | (e3_valid & e3_is_red & (e3_sd == x)))
         stall_ld   = Signal()
+        stall_mul  = Signal()
         stall_lut  = Signal()
         stall_waw  = Signal()
         stall_s    = Signal()
@@ -397,6 +399,10 @@ class BonsaiVectorUnit(LiteXModule):
             d_is_loops.eq(d_op == OP["LOOPS"]),
             d_is_loope.eq(d_op == OP["LOOPE"]),
             stall_ld.eq(e1_valid & e1_is_load & vd_match(e1_vd)),
+            # Multiply results are NOT forwarded into E1 (n16 timing #3d: the DSP output ->
+            # mulh select -> forward mux -> ALU -> select cone was the worst path, 15 levels).
+            # A dependent one behind waits a cycle and takes the D-side wb2 path instead.
+            stall_mul.eq(e1_valid & e1_is_mul & vd_match(e1_vd)),
             stall_lut.eq((e1_valid & e1_is_lut & vd_match(e1_vd))
                          | (e2_valid & e2_is_lut & vd_match(e2_vd))
                          | (e3_valid & e3_is_lut & vd_match(e3_vd))),
@@ -410,8 +416,8 @@ class BonsaiVectorUnit(LiteXModule):
             stall_mem.eq(d_is_load & e1_valid & e1_is_store
                          & (e1_sa_r[5:18] == sa_d[5:18])),
             done_wait.eq(d_is_done & (e1_valid | e2_valid | e3_valid | e4_valid)),
-            stall_d.eq(d_valid & (stall_ld | stall_lut | stall_waw | stall_s | stall_mem
-                                  | done_wait)),
+            stall_d.eq(d_valid & (stall_ld | stall_mul | stall_lut | stall_waw | stall_s
+                                  | stall_mem | done_wait)),
             hold_e2.eq(e2_valid & e2_is_store & ~self.sp_wr_gnt),
             d_go.eq(d_valid & ~stall_d & ~hold_e2),
             loope_taken.eq(d_go & d_is_loope & (loop_cnt > 1)),
@@ -458,7 +464,7 @@ class BonsaiVectorUnit(LiteXModule):
         fwd_b = Signal()
         e2_fwd_ok = Signal()
         self.comb += [
-            e2_fwd_ok.eq(e2_valid & e2_wr_v & ~e2_is_load & ~e2_is_lut),
+            e2_fwd_ok.eq(e2_valid & e2_wr_v & ~e2_is_load & ~e2_is_lut & ~e2_is_mul),
             fwd_a.eq(e2_fwd_ok & (e2_vd == e1_va)),
             fwd_b.eq(e2_fwd_ok & (e2_vd == e1_vb)),
         ]
@@ -830,6 +836,7 @@ class BonsaiVectorUnit(LiteXModule):
                 e1_scalar_b.eq((d_op == OP["VSHLS"]) | (d_op == OP["VMULS"])),
                 e1_redssq.eq(d_op == OP["REDSSQ"]),
                 e1_is_ldw.eq(d_op == OP["LDW"]),
+                e1_is_mul.eq(is_in(d_op, MUL_OPS)),
                 # --- E2 record (from E1) ---
                 e2_valid.eq(e1_valid),
                 e2_op.eq(e1_op),
@@ -839,7 +846,7 @@ class BonsaiVectorUnit(LiteXModule):
                 e2_is_store.eq(e1_is_store),
                 e2_is_lut.eq(e1_is_lut),
                 e2_is_red.eq(e1_is_red),
-                e2_is_mul.eq(is_in(e1_op, MUL_OPS)),
+                e2_is_mul.eq(e1_is_mul),
                 e2_is_mulh.eq(e1_op == OP["VMULH15"]),
                 e2_wr_v.eq(e1_wr_v),
                 *[e2_f_lut[n].eq(e1_f[n]) for n in LUT_OPS],
