@@ -117,33 +117,50 @@ class BonsaiScratchpad(LiteXModule):
         Declared with byte addressing (what the SoC bus hands slaves in current LiteX -
         verified empirically in simulation: adr LSBs advance by 4 per 32-bit word)."""
         bus = wishbone.Interface(data_width=32, address_width=32, addressing="byte")
-        sel_r = Signal(3)
+        # The request is REGISTERED at the scratchpad (n16 timing #3c: the CPU's bus
+        # decode reached the memory address pins combinationally - 5 ns of route from the
+        # core to a 64-BRAM address net, the largest failing family). adr/sel/dat_w/we are
+        # latched in IDLE and presented from flops; the read data is latched too, so the
+        # return trip is FF -> FF as well. +2 cycles per CPU access (a few thousand per
+        # token: noise).
+        adr_r  = Signal(len(self._sb_adr[0]))
+        sel_r  = Signal(3)
+        bsel_r = Signal(4)
+        wdat_r = Signal(32)
+        we_r   = Signal()
+        rdat_r = Signal(32)
         self.comb += [
-            self._sb_adr[0].eq(bus.adr[5:]),   # 32-byte beat index.
-            self._sb_sel[0].eq(bus.adr[2:5]),  # 32-bit word within the beat.
-            self._sb_bsel[0].eq(bus.sel),
-            self._sb_wdat[0].eq(bus.dat_w),
+            self._sb_adr[0].eq(adr_r),
+            self._sb_sel[0].eq(sel_r),
+            self._sb_bsel[0].eq(bsel_r),
+            self._sb_wdat[0].eq(wdat_r),
+            self._sb_we[0].eq(we_r),
+            bus.dat_r.eq(rdat_r),
         ]
-        self.sync += sel_r.eq(self._sb_sel[0])
-        self.comb += Case(sel_r,
-            {i: bus.dat_r.eq(self._sb_rdat[32*i:32*(i+1)]) for i in range(8)})
         self.bus_fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(bus.cyc & bus.stb,
-                self._sb_req[0].eq(1),
-                self._sb_we[0].eq(bus.we),
-                If(self._sb_gnt[0],
-                    If(bus.we,
-                        NextState("ACK"), # Registered ack (comb ack races pipelined masters).
-                    ).Else(
-                        NextState("READ"), # One cycle of read latency.
-                    )
+                NextValue(adr_r,  bus.adr[5:]),   # 32-byte beat index.
+                NextValue(sel_r,  bus.adr[2:5]),  # 32-bit word within the beat.
+                NextValue(bsel_r, bus.sel),
+                NextValue(wdat_r, bus.dat_w),
+                NextValue(we_r,   bus.we),
+                NextState("REQ"),
+            )
+        )
+        fsm.act("REQ",
+            self._sb_req[0].eq(1),
+            If(self._sb_gnt[0],
+                If(we_r,
+                    NextState("ACK"), # Registered ack (comb ack races pipelined masters).
+                ).Else(
+                    NextState("READ"), # One cycle of read latency.
                 )
             )
         )
         fsm.act("READ",
-            bus.ack.eq(1),
-            NextState("IDLE"),
+            Case(sel_r, {i: NextValue(rdat_r, self._sb_rdat[32*i:32*(i+1)]) for i in range(8)}),
+            NextState("ACK"),
         )
         fsm.act("ACK",
             bus.ack.eq(1),
