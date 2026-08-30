@@ -102,11 +102,29 @@ class BonsaiHBMLoader(LiteXModule):
         ]
 
         # One writer per channel; command + data demuxed by `chan`.
+        #
+        # Data reaches the writers through register slices at both ends of the crossing
+        # (n16 timing #3c: the store data was the scratchpad BRAM output, combinational
+        # through the state mux into every writer's W register - 5.8 ns of pure route to
+        # the far HBM ports, two logic levels). `sbuf` registers the engine's store beats
+        # once at the loader; `wbuf[i]` registers them again next to each writer, so the
+        # 16-way fan-out is FF -> FF and Vivado can replicate the source. The DMA upload
+        # path shares the per-writer slices. Latency only: +1 cycle per beat at each slice,
+        # and the drain states still wait on the writers (w_active holds until the last
+        # beat has left the slice).
         self.writers = []
+        self.wbufs   = []
         for i, axi in enumerate(hbm_axis):
             writer = BonsaiAXIWriter(axi)
             setattr(self.submodules, f"writer{i}", writer)
             self.writers.append(writer)
+            wbuf = stream.Buffer([("data", 256)])
+            setattr(self.submodules, f"wbuf{i}", wbuf)
+            self.comb += wbuf.source.connect(writer.sink_data)
+            self.wbufs.append(wbuf)
+        self.submodules.sbuf = sbuf = stream.Buffer([("data", 256)])
+        self.comb += self.store_data.connect(sbuf.sink)
+        st_src = sbuf.source
 
         beats = Signal(24)
         chan  = self.chan.storage
@@ -178,11 +196,11 @@ class BonsaiHBMLoader(LiteXModule):
             )
         )
         fsm.act("EST_DATA",
-            *[w.sink_data.valid.eq((st_chan == i) & self.store_data.valid)
-              for i, w in enumerate(self.writers)],
-            *[w.sink_data.data.eq(self.store_data.data) for w in self.writers],
-            self.store_data.ready.eq(Array([w.sink_data.ready for w in self.writers])[st_chan]),
-            If(self.store_data.valid & self.store_data.ready,
+            *[w.sink.valid.eq((st_chan == i) & st_src.valid)
+              for i, w in enumerate(self.wbufs)],
+            *[w.sink.data.eq(st_src.data) for w in self.wbufs],
+            st_src.ready.eq(Array([w.sink.ready for w in self.wbufs])[st_chan]),
+            If(st_src.valid & st_src.ready,
                 NextValue(st_cnt, st_cnt + 1),
                 If(st_cnt == st_len - 1,
                     NextState("EST_DRAIN"),
@@ -228,10 +246,10 @@ class BonsaiHBMLoader(LiteXModule):
             )
         )
         fsm.act("DATA",
-            *[w.sink_data.valid.eq((chan == i) & src.valid)
-              for i, w in enumerate(self.writers)],
-            *[w.sink_data.data.eq(src.data) for w in self.writers],
-            src.ready.eq(Array([w.sink_data.ready for w in self.writers])[chan]),
+            *[w.sink.valid.eq((chan == i) & src.valid)
+              for i, w in enumerate(self.wbufs)],
+            *[w.sink.data.eq(src.data) for w in self.wbufs],
+            src.ready.eq(Array([w.sink.ready for w in self.wbufs])[chan]),
             If(src.valid & src.ready,
                 NextValue(beats, beats + 1),
                 If(beats == self.length.storage - 1,
