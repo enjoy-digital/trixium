@@ -2210,6 +2210,7 @@ def test_engine_multi_store(chan_stride):
     run_simulation(dut, [driver()])
 
 
+@pytest.mark.slow  # sixteen Migen channel models: hours; run explicitly (-m slow or -k n16)
 def test_engine_n16_ternary_and_store_window():
     # N=16 enablement (2026-08-29): the shipping sharding at sixteen channels - a ternary
     # matvec across 16 readers with the 16-input xred-free gather - and the 33-bit STORE
