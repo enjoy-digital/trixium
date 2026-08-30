@@ -24,12 +24,13 @@ the ISA, the microcode and every port, and is ~3.4x on the same programs.
        address launch; loads drive the scratchpad read address (sp_rd_req, ONE cycle);
        stores pack their data.
   E2 : wb2 = load data / multiply / ex1_r -> V (write port 2); reduction stage 2; LUT
-       interpolation -> lut_r; stores drive the write port and HOLD here while the
-       integrator withholds sp_wr_gnt (F/D/E1 freeze, E3 drains).
-  E3 : lut_r -> V (write port 3); reductions read S[sd] late and write it.
-  FINISH: after DONE has drained E1..E3, latch res5/6/7 and pulse done.
+       ROM read + operand select (e_a, e_b - e_a, frac); stores drive the write port and
+       HOLD here while the integrator withholds sp_wr_gnt (F/D/E1 freeze, E3/E4 drain).
+  E3 : LUT interpolation multiply-add -> lut_r; reductions read S[sd] late and write it.
+  E4 : lut_r -> V (write port 3).
+  FINISH: after DONE has drained E1..E4, latch res5/6/7 and pulse done.
 
-Latencies (producer's D to the earliest dependent D): ALU/multiply 1, load 2, LUT 3,
+Latencies (producer's D to the earliest dependent D): ALU/multiply 1, load 2, LUT 4,
 scalar 1, reductions into S: back-to-back reductions to the same S need no stall (the late
 E3 read sees the previous E3 write); any other touch of a pending S stalls. Forwarding is
 youngest-first: E1 operand mux (ex1_r/mul of the instruction in E2) > D-side wb2 (E2) >
@@ -309,6 +310,11 @@ class BonsaiVectorUnit(LiteXModule):
         e1_is_red   = Signal()
         e1_wr_v     = Signal()
         e1_f = {n: Signal(name=f"e1_f_{n.lower()}") for n in VEC_WB + ST_OPS + RED_OPS}
+        # Decoded at D, registered: no opcode compare in the E1 cone (n16 timing #3c had
+        # the scalar-B select decoded from e1_op fanning out to every lane's operand mux).
+        e1_scalar_b = Signal()
+        e1_redssq   = Signal()
+        e1_is_ldw   = Signal()
 
         # E2 record ---------------------------------------------------------------------------
         e2_valid    = Signal()
@@ -344,11 +350,24 @@ class BonsaiVectorUnit(LiteXModule):
         e3_is_lut   = Signal()
         e3_is_red   = Signal()
         e3_f_red    = {n: Signal(name=f"e3_f_{n.lower()}") for n in RED_OPS}
-        lut_r       = Signal(32*LANES)
+        # LUT interpolation is split across E2/E3 (n16 timing #3c: ROM read + subtract +
+        # unregistered DSP multiply + add + select was a 16-level, 5.9 ns cone). E2 reads
+        # the ROM and selects (e_a, e_b - e_a, frac) for the op; E3 multiplies and adds;
+        # the result lands in lut_r at the E3/E4 edge and is written from E4. LUT latency
+        # is 4 (a dependent one behind stalls three cycles instead of two).
+        e3_lea      = [Signal((18, True), name=f"e3_lea{i}") for i in range(LANES)]
+        e3_ld       = [Signal((19, True), name=f"e3_ld{i}") for i in range(LANES)]
+        e3_lfr      = [Signal(8, name=f"e3_lfr{i}") for i in range(LANES)]
         red2_sum    = Signal((48, True))
         red2_ssq    = [Signal((64, True), name=f"red2_ssq{k}") for k in range(4)]
         red2_max    = Signal(32)
         red2_smax   = Signal((32, True))
+
+        # E4 record (LUT writeback only) --------------------------------------------------------
+        e4_valid    = Signal()
+        e4_vd       = Signal(3)
+        e4_is_lut   = Signal()
+        lut_r       = Signal(32*LANES)
 
         # Hazards / pipeline control ----------------------------------------------------------
         def vd_match(stage_vd):
@@ -359,6 +378,7 @@ class BonsaiVectorUnit(LiteXModule):
                     | (e3_valid & e3_is_red & (e3_sd == x)))
         stall_ld   = Signal()
         stall_lut  = Signal()
+        stall_waw  = Signal()
         stall_s    = Signal()
         stall_mem  = Signal()
         done_wait  = Signal()
@@ -378,14 +398,20 @@ class BonsaiVectorUnit(LiteXModule):
             d_is_loope.eq(d_op == OP["LOOPE"]),
             stall_ld.eq(e1_valid & e1_is_load & vd_match(e1_vd)),
             stall_lut.eq((e1_valid & e1_is_lut & vd_match(e1_vd))
-                         | (e2_valid & e2_is_lut & vd_match(e2_vd))),
+                         | (e2_valid & e2_is_lut & vd_match(e2_vd))
+                         | (e3_valid & e3_is_lut & vd_match(e3_vd))),
+            # WAW: a LUT op writes at E4, everything else at E2. A non-LUT writer exactly
+            # one behind a LUT op to the same vd would land first and be clobbered; hold
+            # it one cycle so the two writes fall on the same edge (E2 wins there).
+            stall_waw.eq(d_wr_v & ~d_is_lut & e1_valid & e1_is_lut & (e1_vd == d_vd)),
             stall_s.eq((d_uses_sa & red_pending(d_sa)) | (d_uses_sd & red_pending(d_sd))),
             # A load one behind a store to the same beat would read the RAM on the
             # edge the store writes it (read-during-write across ports): wait one cycle.
             stall_mem.eq(d_is_load & e1_valid & e1_is_store
                          & (e1_sa_r[5:18] == sa_d[5:18])),
-            done_wait.eq(d_is_done & (e1_valid | e2_valid | e3_valid)),
-            stall_d.eq(d_valid & (stall_ld | stall_lut | stall_s | stall_mem | done_wait)),
+            done_wait.eq(d_is_done & (e1_valid | e2_valid | e3_valid | e4_valid)),
+            stall_d.eq(d_valid & (stall_ld | stall_lut | stall_waw | stall_s | stall_mem
+                                  | done_wait)),
             hold_e2.eq(e2_valid & e2_is_store & ~self.sp_wr_gnt),
             d_go.eq(d_valid & ~stall_d & ~hold_e2),
             loope_taken.eq(d_go & d_is_loope & (loop_cnt > 1)),
@@ -416,12 +442,12 @@ class BonsaiVectorUnit(LiteXModule):
             wb2.eq(Mux(e2_is_load, ld_val, wb2_nl)),
         ]
 
-        # D-side operand capture with forwarding: wb2 (E2) > lut_r (E3 LUT) > regfile.
+        # D-side operand capture with forwarding: wb2 (E2) > lut_r (E4 LUT) > regfile.
         def d_operand(idx):
             v = Signal(32*LANES)
             self.comb += v.eq(
                 Mux(e2_valid & e2_wr_v & ~e2_is_lut & (e2_vd == idx), wb2,
-                Mux(e3_valid & e3_is_lut & (e3_vd == idx), lut_r,
+                Mux(e4_valid & e4_is_lut & (e4_vd == idx), lut_r,
                     V[idx])))
             return v
         va_d = d_operand(d_va)
@@ -441,12 +467,6 @@ class BonsaiVectorUnit(LiteXModule):
         self.comb += [
             a_flat.eq(Mux(fwd_a, wb2_nl, e1_va_r)),
             b_flat.eq(Mux(fwd_b, wb2_nl, e1_vb_r)),
-        ]
-        e1_scalar_b = Signal()
-        e1_redssq   = Signal()
-        self.comb += [
-            e1_scalar_b.eq((e1_op == OP["VSHLS"]) | (e1_op == OP["VMULS"])),
-            e1_redssq.eq(e1_op == OP["REDSSQ"]),
         ]
         a_l, b_l = [], []
         for i in range(LANES):
@@ -603,13 +623,13 @@ class BonsaiVectorUnit(LiteXModule):
         st_we_c  = Signal(8)
         st_dat_c = Signal(256)
         self.comb += [
-            If(e1_op == OP["STB"],
+            If(e1_f["STB"],
                 If(e1_sa_r[4],
                     st_we_c.eq(0xF0), st_dat_c.eq(Cat(C(0, 128), st8)),
                 ).Else(
                     st_we_c.eq(0x0F), st_dat_c.eq(Cat(st8, C(0, 128))),
                 ),
-            ).Elif(e1_op == OP["STW"],
+            ).Elif(e1_f["STW"],
                 st_we_c.eq(0xFF), st_dat_c.eq(a_flat[0:256]), # Lanes 0..7 as 8 x int32.
             ).Else(
                 st_we_c.eq(0xFF), st_dat_c.eq(st16),
@@ -626,28 +646,45 @@ class BonsaiVectorUnit(LiteXModule):
             self.sp_wr_we.eq(Mux(e2_valid & e2_is_store, e2_st_we, 0)),
         ]
 
-        # E2 datapath: LUT interpolation and reduction stage 2 -------------------------------
-        lut_val = Signal(32*LANES)
+        # E2 datapath: LUT operand select and reduction stage 2 -------------------------------
+        # E2 picks (e_a, d = e_b - e_a, frac) for the op; E3 does e_a + ((d*frac) >> 7).
+        # The recip table's 6-bit fraction is doubled so one shift serves all three:
+        # (d*(2f)) >> 7 == (d*f) >> 6 exactly (floor on both sides).
+        lea_c, ld_c, lfr_c = [], [], []
         for i in range(LANES):
-            def interp(port, frac, fbits):
+            def endpoints(port):
                 e_a = Signal((18, True))
                 e_b = Signal((18, True))
                 d   = Signal((19, True))
-                pr  = Signal((19 + 7, True))
-                out = Signal((32, True))
                 self.comb += [
                     e_a.eq(port.dat_r[0:17]),
                     e_b.eq(port.dat_r[17:34]),
                     d.eq(e_b - e_a),
-                    pr.eq(d*frac),
-                    out.eq(e_a + (pr >> fbits)),
                 ]
-                return out
-            o_e2  = interp(rom_e2[i],  e2_fr7[i], 7)
-            o_rec = interp(rom_rec[i], e2_fr6[i], 6)
-            o_rsq = interp(rom_rsq[i], e2_fq7[i], 7)
-            self.comb += lane(lut_val, i).eq(
-                Mux(e2_f_lut["LUTE2"], o_e2, Mux(e2_f_lut["LUTRECIP"], o_rec, o_rsq)))
+                return e_a, d
+            ea_e2,  d_e2  = endpoints(rom_e2[i])
+            ea_rec, d_rec = endpoints(rom_rec[i])
+            ea_rsq, d_rsq = endpoints(rom_rsq[i])
+            lea = Signal((18, True), name=f"lea_c{i}")
+            ld  = Signal((19, True), name=f"ld_c{i}")
+            lfr = Signal(8, name=f"lfr_c{i}")
+            self.comb += [
+                lea.eq(Mux(e2_f_lut["LUTE2"], ea_e2, Mux(e2_f_lut["LUTRECIP"], ea_rec, ea_rsq))),
+                ld.eq(Mux(e2_f_lut["LUTE2"], d_e2, Mux(e2_f_lut["LUTRECIP"], d_rec, d_rsq))),
+                lfr.eq(Mux(e2_f_lut["LUTE2"], e2_fr7[i],
+                       Mux(e2_f_lut["LUTRECIP"], Cat(C(0, 1), e2_fr6[i]), e2_fq7[i]))),
+            ]
+            lea_c.append(lea); ld_c.append(ld); lfr_c.append(lfr)
+        # E3 datapath: LUT interpolation multiply-add.
+        lut_val = Signal(32*LANES)
+        for i in range(LANES):
+            pr  = Signal((19 + 8, True), name=f"lut_pr{i}")
+            out = Signal((32, True), name=f"lut_out{i}")
+            self.comb += [
+                pr.eq(e3_ld[i]*e3_lfr[i]),
+                out.eq(e3_lea[i] + (pr >> 7)),
+                lane(lut_val, i).eq(out),
+            ]
         red2_sum_c  = Signal((48, True))
         red2_max_c  = Signal(32)
         red2_smax_c = Signal((32, True))
@@ -790,12 +827,15 @@ class BonsaiVectorUnit(LiteXModule):
                 e1_is_red.eq(d_is_red),
                 e1_wr_v.eq(d_wr_v),
                 *[e1_f[n].eq(d_op == OP[n]) for n in e1_f],
+                e1_scalar_b.eq((d_op == OP["VSHLS"]) | (d_op == OP["VMULS"])),
+                e1_redssq.eq(d_op == OP["REDSSQ"]),
+                e1_is_ldw.eq(d_op == OP["LDW"]),
                 # --- E2 record (from E1) ---
                 e2_valid.eq(e1_valid),
                 e2_op.eq(e1_op),
                 e2_vd.eq(e1_vd), e2_sd.eq(e1_sd),
                 e2_is_load.eq(e1_is_load),
-                e2_is_ldw.eq(e1_op == OP["LDW"]),
+                e2_is_ldw.eq(e1_is_ldw),
                 e2_is_store.eq(e1_is_store),
                 e2_is_lut.eq(e1_is_lut),
                 e2_is_red.eq(e1_is_red),
@@ -821,7 +861,9 @@ class BonsaiVectorUnit(LiteXModule):
                 e3_is_lut.eq(e2_is_lut),
                 e3_is_red.eq(e2_is_red),
                 *[e3_f_red[n].eq(e2_f_red[n]) for n in RED_OPS],
-                lut_r.eq(lut_val),
+                *[e3_lea[i].eq(lea_c[i]) for i in range(LANES)],
+                *[e3_ld[i].eq(ld_c[i]) for i in range(LANES)],
+                *[e3_lfr[i].eq(lfr_c[i]) for i in range(LANES)],
                 red2_sum.eq(red2_sum_c),
                 *[red2_ssq[k].eq(red2_ssq_c[k]) for k in range(4)],
                 red2_max.eq(red2_max_c),
@@ -830,8 +872,13 @@ class BonsaiVectorUnit(LiteXModule):
                 # A held store freezes everything upstream and nothing downstream.
                 e3_valid.eq(0),
             ),
-            # --- V writes: E3 (LUT) first, E2 second so the younger instruction wins ---
-            If(e3_valid & e3_is_lut, V[e3_vd].eq(lut_r)),
+            # --- E4 record (from E3): always advances, held store or not ---
+            e4_valid.eq(e3_valid),
+            e4_vd.eq(e3_vd),
+            e4_is_lut.eq(e3_is_lut),
+            lut_r.eq(lut_val),
+            # --- V writes: E4 (LUT) first, E2 second so the younger instruction wins ---
+            If(e4_valid & e4_is_lut, V[e4_vd].eq(lut_r)),
             If(e2_valid & ~hold_e2 & e2_wr_v, V[e2_vd].eq(wb2)),
             # --- E3 reductions (late S read; the scoreboard keeps every other writer off) ---
             If(e3_valid & e3_is_red,
