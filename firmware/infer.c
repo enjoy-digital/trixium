@@ -248,24 +248,38 @@ static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 //   hm = (float)(am >> k2) * c2            -> RN24 of the product: (m2, e2)
 //   ea8 = frexpf(max hm) - 7               -> e2max + 24 - 7
 //   Mh  = lroundf(ldexpf(c2, 15 - ea8))    -> qm * 2^(qe + E1 + 15 - ea8), half away from 0
-int ifold_use = 0; // Default OFF until the card tokens pass with it on (2026-08-30).
+int ifold_use = 1; // Second version (2026-08-30): 32-bit hardware divides + clz.
+static inline int bitlen32(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
 static void attn_f32_recip(uint32_t p8, uint32_t *qm, int *qe)
 {
-    int L = 0;
-    while ((p8 >> L) != 0) L++;                  // bitlen: 2^(L-1) <= p8 < 2^L
-    uint64_t num = (uint64_t)1 << (23 + L);      // 2^(23+L)/p8 in (2^23, 2^24]
-    uint64_t m = num/p8, r = num - m*p8;
+    // m = 2^(23+L)/p8 in (2^23, 2^24] with an exact remainder, on the 32-bit divider:
+    // for sh = 23+L <= 31 directly; above that 2^sh = 2^k * 2^32 with k = sh-32 <= 9 and
+    // 2^32 = q1*p8 + r1, so m = (q1 << k) + ((r1 << k) / p8) (r1 << k < 2^27 fits).
+    int L = bitlen32(p8);                        // 2^(L-1) <= p8 < 2^L
+    int sh = 23 + L;
+    uint32_t m, r;
+    if (sh <= 31) {
+        uint32_t num = 1u << sh;
+        m = num/p8; r = num - m*p8;
+    } else {
+        int k = sh - 32;
+        uint32_t q1 = 0xFFFFFFFFu/p8;
+        uint32_t r1 = 0xFFFFFFFFu - q1*p8 + 1u;  // 2^32 - q1*p8 in [1, p8]
+        if (r1 == p8) { q1++; r1 = 0; }
+        uint32_t t = r1 << k;
+        m = (q1 << k) + t/p8; r = t - (t/p8)*p8;
+    }
     if (2*r > p8 || (2*r == p8 && (m & 1))) m++; // round to nearest even
-    int e = -(23 + L);
-    if (m == ((uint64_t)1 << 24)) { m >>= 1; e++; }
-    *qm = (uint32_t)m;
+    int e = -sh;
+    if (m == (1u << 24)) { m >>= 1; e++; }
+    *qm = m;
     *qe = e;
 }
 static void attn_f32_mul(uint32_t a, uint32_t qm, int qe, uint32_t *m2, int *e2)
 {
     uint64_t p = (uint64_t)a*qm;                 // a <= 2^14, qm < 2^24: p < 2^38
-    int L = 0;
-    while ((p >> L) != 0) L++;
+    uint32_t ph = (uint32_t)(p >> 32), pl = (uint32_t)p;
+    int L = ph ? 32 + bitlen32(ph) : bitlen32(pl);
     int sh = L - 24;                             // p >= 2^23 -> sh >= 0
     uint64_t m = p >> sh;
     if (sh > 0) {
