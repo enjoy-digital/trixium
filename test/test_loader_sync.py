@@ -66,10 +66,21 @@ def _run(garbage_beats, payload, chan=0, addr=0x400, use_sync=True, markers=1):
         stream_beats += payload
 
         for w in stream_beats:
+            # The loader is deliberately not ready while idle (commit 458b070), so a stream
+            # longer than the transfer - the no-sync case, where the garbage IS the transfer -
+            # is never fully consumed: stop feeding once the loader reports done, and bound
+            # the ready wait so a real stall fails instead of hanging the suite.
+            if (yield dut.loader.status.fields.done):
+                break
             yield dut.loader.sink.data.eq(w)
             yield dut.loader.sink.valid.eq(1)
             yield
+            waited = 0
             while not (yield dut.loader.sink.ready):
+                if (yield dut.loader.status.fields.done):
+                    break
+                waited += 1
+                assert waited < 2000, "loader stalled mid-transfer"
                 yield
         yield dut.loader.sink.valid.eq(0)
 
