@@ -874,6 +874,36 @@ static void seq_build_qkr(void)
     int ln = 0;
     while ((1 << ln) < head_dim) ln++;
     uint32_t di = 0;
+#ifdef BONSAI_VEC_LOOPS2
+    // Whole-tensor per-head programs (2026-08-30): the 2*(n_head+n_kv_head) rmsnorm/rope
+    // descriptors and the 2*n_kv_head KV-pack ones become one program each - the
+    // per-descriptor fixed cost was 8-12x the work at V1 rates (qknorm 749k, kvquant 514k
+    // cycles/token measured vs 87k + 44k attainable). Same instruction sequence per head,
+    // so byte-identical by construction; only A5 (eps) of the two norms is patched per layer.
+    {
+        int32_t nq[8] = {(int32_t)SP_Q, (int32_t)SP_FET, (int32_t)SP_Q, head_dim/16,
+                         -ln, 1, E_W16 - E_NORM - 15, n_head};
+        seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);                  // 0: q-norm (A5 patched)
+        int32_t nk[8] = {(int32_t)SP_K, (int32_t)SP_FET2, (int32_t)SP_K, head_dim/16,
+                         -ln, 1, E_W16 - E_NORM - 15, n_kv_head};
+        seq_desc_vec(di++, PROG_RMSNORM_H, nk, 8, 0);                  // 1: k-norm (A5 patched)
+        int32_t rq[8] = {(int32_t)SP_Q, (int32_t)(SP_Q + head_dim), (int32_t)SP_TAB,
+                         (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_Q,
+                         head_dim, n_head};
+        seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                     // 2: q-rope
+        int32_t rk[8] = {(int32_t)SP_K, (int32_t)(SP_K + head_dim), (int32_t)SP_TAB,
+                         (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_K,
+                         head_dim, n_kv_head};
+        seq_desc_vec(di++, PROG_ROPE_H, rk, 8, 0);                     // 3: k-rope
+        int32_t pk[8] = {(int32_t)SP_K, 0, (int32_t)(kvp_slot(0, 0) + 32), head_dim/16, 0, 0,
+                         0x400 - 16*(head_dim/16), n_kv_head};
+        seq_desc_vec(di++, PROG_KVPACK_H, pk, 8, 0);                   // 4: K packs
+        int32_t pv[8] = {(int32_t)SP_V, 0, (int32_t)(kvp_slot(0, 1) + 32), head_dim/16, 0, 0,
+                         0x400 - 16*(head_dim/16), n_kv_head};
+        seq_desc_vec(di++, PROG_KVPACK_H, pv, 8, 0);                   // 5: V packs
+    }
+    if (0)
+#endif
     for (int hh = 0; hh < n_head + n_kv_head; hh++) {
         int      is_q = hh < n_head;
         uint32_t sp   = is_q ? (SP_Q + hh*head_dim*2)
@@ -891,6 +921,9 @@ static void seq_build_qkr(void)
     // K's pack follows K's rope in list order; V is resident before the list runs. The
     // CPU keeps only the scale-beat prep and the kv_ekmax ratchet (kv_pack_prep_res).
     // An in-list descriptor measures ~50 cycles against ~420 for a CPU vec_run.
+#ifdef BONSAI_VEC_LOOPS2
+    if (0)
+#endif
     for (int kvh = 0; kvh < n_kv_head; kvh++)
         for (int kind = 0; kind < 2; kind++) {
             uint32_t src = (kind ? SP_V : SP_K) + (uint32_t)kvh*head_dim*2;
@@ -1428,8 +1461,13 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
                             + (rt->chan_base_beats + (uint64_t)(pos + p)*rb)*32,
                          rb, SP_TAB);
             int epq = seq_eps_int(eq_r[p]), epk = seq_eps_int(ek_r[p]);
+#ifdef BONSAI_VEC_LOOPS2
+            seq_patch(0, 7, (uint32_t)epq);
+            seq_patch(1, 7, (uint32_t)epk);
+#else
             for (int hh = 0; hh < n_head + n_kv_head; hh++)
                 seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
+#endif
             seq_run(0, seq_qkr_count);
             perf_exit(OP_QKNORM);
             perf_enter(OP_KVQUANT);
@@ -1743,8 +1781,13 @@ embed_done: ;
                 // One sequencer run replaces the 2*(n_head+n_kv) per-head dispatches;
                 // only the eps args change per layer (descriptor word 7 = A5).
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
+#ifdef BONSAI_VEC_LOOPS2
+                seq_patch(0, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
+                seq_patch(1, 7, (uint32_t)epk);   // rmsnorm_h A5 (k heads).
+#else
                 for (int hh = 0; hh < n_head + n_kv_head; hh++)
                     seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
+#endif
                 seq_run(0, seq_qkr_count);
             }
             perf_exit(OP_QKNORM);

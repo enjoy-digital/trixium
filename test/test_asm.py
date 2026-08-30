@@ -297,3 +297,67 @@ def test_nested_loops_loops2():
     out = np.frombuffer(bytes(sp[1024:1024 + 3*128]), dtype="<i2")
     assert np.array_equal(out, np.tile(src*2, 3))
     assert S[5] == 3*int((src*2).sum())
+
+
+def _run_words(words, sp, args):
+    return asm.VecInterp(sp).run(words, list(args))
+
+
+def test_rmsnorm_h_matches_per_head_rmsnorm():
+    # One program over H contiguous heads == H runs of prog_rmsnorm (in place), byte for byte.
+    import numpy as np
+    rng = np.random.default_rng(31)
+    hd, H = 128, 3
+    x = rng.integers(-20000, 20000, hd*H).astype("<i2")
+    w = rng.integers(-8000, 8000, hd).astype("<i2")
+    base = bytearray(16*1024)
+    base[0:2*hd*H] = x.tobytes()
+    base[0x2000:0x2000 + 2*hd] = w.tobytes()
+    A4, A5, A6 = -7, 17, -17
+    ref = bytearray(base)
+    for h in range(H):
+        _run_words(asm.assemble(asm.prog_rmsnorm()), ref,
+                   [2*hd*h, 0x2000, 2*hd*h, hd//16, A4, A5, A6])
+    got = bytearray(base)
+    _run_words(asm.assemble(asm.prog_rmsnorm_h()), got,
+               [0, 0x2000, 0, hd//16, A4, A5, A6, H])
+    assert bytes(got) == bytes(ref)
+
+
+def test_rope_h_matches_per_head_rope():
+    import numpy as np
+    rng = np.random.default_rng(32)
+    hd, H = 128, 3
+    x = rng.integers(-20000, 20000, hd*H).astype("<i2")
+    c = rng.integers(-16384, 16384, hd//2).astype("<i2")
+    s = rng.integers(-16384, 16384, hd//2).astype("<i2")
+    base = bytearray(16*1024)
+    base[0:2*hd*H] = x.tobytes()
+    base[0x2000:0x2000 + hd] = c.tobytes()
+    base[0x2000 + hd:0x2000 + 2*hd] = s.tobytes()
+    ref = bytearray(base)
+    for h in range(H):
+        x0 = 2*hd*h
+        _run_words(asm.assemble(asm.prog_rope()), ref,
+                   [x0, x0 + hd, 0x2000, 0x2000 + hd, (hd//2)//16, x0, x0 + hd])
+    got = bytearray(base)
+    _run_words(asm.assemble(asm.prog_rope_h()), got,
+               [0, hd, 0x2000, 0x2000 + hd, (hd//2)//16, 0, hd, H])
+    assert bytes(got) == bytes(ref)
+
+
+def test_kvpack_h_matches_per_head_fixed_quant8():
+    import numpy as np
+    rng = np.random.default_rng(33)
+    hd, H, stride = 128, 4, 0x400
+    x = rng.integers(-30000, 30000, hd*H).astype("<i2")
+    base = bytearray(16*1024)
+    base[0:2*hd*H] = x.tobytes()
+    ref = bytearray(base)
+    for h in range(H):
+        _run_words(asm.assemble(asm.prog_quant8()), ref,
+                   [2*hd*h, 0, 0x2020 + h*stride, hd//16])
+    got = bytearray(base)
+    _run_words(asm.assemble(asm.prog_kvpack_h()), got,
+               [0, 0, 0x2020, hd//16, 0, 0, stride - 16*(hd//16), H])
+    assert bytes(got) == bytes(ref)

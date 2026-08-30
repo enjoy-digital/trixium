@@ -652,6 +652,116 @@ def prog_softmax8():
         ("DONE",),
     ]
 
+def prog_rmsnorm_h():
+    """rmsnorm over H contiguous heads with one weight row (the qk-norm of every head in ONE
+    program, 2026-08-30). Per head exactly prog_rmsnorm's instruction sequence, so the
+    numerics are identical head for head; the outer LOOPS2 walks the heads.
+      A0 = src of head 0, A1 = w (rewound per head), A2 = dst of head 0 (may equal A0),
+      A3 = beats per head, A4 = -log2(hd), A5 = eps_int, A6 = e_w - E_NORM - 15,
+      A7 = head count.
+    Scalars: s0 and s2 walk the heads (post-increment); the pass-2 read pointer is s6 (A6
+    is consumed into K before pass 2), s7 the REDSSQ accumulator (LOOPS2 latched the head
+    count from it first)."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s7", 7),
+        ("LOOPS2", "s7"),
+        ("ARG",   "s1", 1), ("ARG", "s4", 4), ("ARG", "s5", 5), ("ARG", "s6", 6),
+        ("MOVSI", "s7", 0),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("REDSSQ", "s7", "v0"),
+        ("LOOPE",),
+        ("SSHLV", "s7", "s4"),      # ss / n (A4 negative).
+        ("SADD",  "s7", "s5"),      # + eps_int.
+        ("SNORME", "s4", "s7"),     # e (even).
+        ("SSHLV", "s7", "s4"),      # normalize into [2^30, 2^32).
+        ("BCAST", "v7", "s7"),
+        ("LUTRSQRT", "v7", "v7"),   # r_q15 in every lane.
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s4", "s5"),      # e/2 (e even: arith halving is exact).
+        ("SADD",  "s4", "s6"),      # K = A6 + e/2.
+        ("BCAST", "v6", "s4"),      # K lanes.
+        ("VSUB",  "v5", "v5", "v5"),
+        ("VSUB",  "v5", "v5", "v6"),  # -K.
+        ("MOVSI", "s5", 1),
+        ("BCAST", "v4", "s5"),        # ones.
+        ("VSUB",  "v3", "v5", "v4"),  # -K - 1.
+        ("VSHLV", "v4", "v4", "v3"),  # bias = 1 << (-K-1) (0 if K >= 0).
+        ("SMOV",  "s6", "s2"),        # pass-2 read pointer = this head's dst (in place).
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s6"),        # m.
+        ("LDV",   "v1", "s1"),        # w.
+        ("VMUL",  "v2", "v0", "v1"),  # m*w (<= 2^30: no wrap).
+        ("VMULH15", "v2", "v2", "v7"),# * r_q15 >> 15 (<= 2^30 post-shift: no wrap).
+        ("VADD",  "v2", "v2", "v4"),  # + bias.
+        ("VSHLV", "v2", "v2", "v6"),  # >> -K.
+        ("VCLAMP16", "v2", "v2"),
+        ("STV",   "v2", "s2"),
+        ("LOOPE",),
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
+def prog_rope_h():
+    """prog_rope over H contiguous heads (one program for all q or all k heads).
+      A0 = x0 of head 0, A1 = x1 of head 0, A2 = c table, A3 = s table,
+      A4 = beats per head (hd/2/16), A5 = x0 write ptr (in place: = A0),
+      A6 = half-head span in bytes (x1 - x0; the x1 write ptr is A5 + A6), A7 = head count.
+    After a head's beats the read/write pointers sit at that head's x1 (x0 side) and the
+    next head's x0 (x1 side): each advances by the span, and the tables rewind."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s4", 4), ("ARG", "s5", 5),
+        ("ARG",   "s7", 7),
+        ("LOOPS2", "s7"),               # Head count latched; s7 is free from here.
+        ("ARG",   "s7", 6),             # Span.
+        ("SMOV",  "s6", "s5"), ("SADD", "s6", "s7"), # x1 write ptr = x0 write ptr + span.
+        ("ARG",   "s2", 2), ("ARG", "s3", 3),        # Tables rewind per head.
+        ("LOOPS", "s4"),
+        ("LDV",   "v0", "s0"),          # x0.
+        ("LDV",   "v1", "s1"),          # x1.
+        ("LDV",   "v2", "s2"),          # c.
+        ("LDV",   "v3", "s3"),          # s.
+        ("VMUL",  "v4", "v0", "v2"),    # x0*c.
+        ("VMUL",  "v5", "v1", "v3"),    # x1*s.
+        ("VSUB",  "v4", "v4", "v5"),
+        ("VRNE",  "v4", "v4", 14),
+        ("VCLAMP16", "v4", "v4"),
+        ("VMUL",  "v5", "v0", "v3"),    # x0*s.
+        ("VMUL",  "v6", "v1", "v2"),    # x1*c.
+        ("VADD",  "v5", "v5", "v6"),
+        ("VRNE",  "v5", "v5", 14),
+        ("VCLAMP16", "v5", "v5"),
+        ("STV",   "v4", "s5"),
+        ("STV",   "v5", "s6"),
+        ("LOOPE",),
+        ("SADD",  "s0", "s7"), ("SADD", "s1", "s7"), ("SADD", "s5", "s7"),
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
+def prog_kvpack_h():
+    """Fixed-shift quant8 (>>8) of H contiguous heads into strided KV packet slots - the
+    16 per-layer KV-pack descriptors as two programs (K heads, V heads).
+      A0 = src of head 0 (int16, contiguous heads), A2 = dst of head 0 (int8, +32 into its
+      packet slot), A3 = beats per head, A6 = dst advance between heads MINUS the bytes the
+      STBs already advanced (slot stride - 16*beats), A7 = head count.
+    Same instruction sequence per element as prog_quant8 in fixed mode (its VSHLV by 0 is
+    the identity and is dropped)."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s6", 6),
+        ("ARG",   "s7", 7),
+        ("LOOPS2", "s7"),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("STB",   "v0", "s2"),
+        ("LOOPE",),
+        ("SADD",  "s2", "s6"),          # Next packet slot.
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
 def prog_reduce_acc():
     """acc_i32 += src_i32 (8 int32 per iteration); S6 = |max| of the post-add values
     (the last call of an N-way reduce returns the true absmax for the norm shift).
@@ -743,6 +853,9 @@ PROGRAMS = {
     "rope":       prog_rope,
     "scale8":     prog_scale8,
     "spill":      prog_spill,
+    "rmsnorm_h":  prog_rmsnorm_h,
+    "rope_h":     prog_rope_h,
+    "kvpack_h":   prog_kvpack_h,
 }
 
 def emit_c(out):

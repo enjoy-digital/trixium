@@ -189,6 +189,7 @@ class BonsaiSimSoC(SoCCore):
             self.add_constant("BONSAI_HAS_DUALQ")
         self.add_constant("BONSAI_HAS_VECUNIT")
         self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set (rmsnorm scalar ops + rsqrt fix).
+        self.add_constant("BONSAI_VEC_LOOPS2")   # Second loop level (2026-08-30).
 
         self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
             SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))

@@ -150,6 +150,7 @@ class BonsaiSoC(SoCCore):
                 vecunit = self.vecunit = BonsaiVectorUnit()
                 self.add_constant("BONSAI_HAS_VECUNIT")
                 self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set.
+                self.add_constant("BONSAI_VEC_LOOPS2")   # Second loop level (2026-08-30).
             seq = None
             if with_vecunit:
                 from trixium.gateware.sequencer import BonsaiSequencer

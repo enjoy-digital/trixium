@@ -193,3 +193,66 @@ def test_rtl_scale8():
     sp  = bytearray(SP_SIZE)
     sp[0:2*n] = rng.integers(-16000, 16000, n).astype("<i2").tobytes()
     _compare("scale8", bytes(sp), [0, 1024, 2048, n//16, 19571])
+
+
+def _compare_words(prog, sp_bytes, args):
+    # Like _compare but for programs not (yet) in the per-op RTL list: whole scratchpad.
+    ref = bytearray(sp_bytes)
+    asm.VecInterp(ref).run(asm.assemble(prog), list(args))
+    words = asm.assemble(prog)
+    dut   = _VecDUT(words_from_bytes(bytes(sp_bytes)))
+    out   = {}
+
+    def gen():
+        yield from _csr_write(dut.vu.prog_adr, 0)
+        for w in words:
+            yield from _csr_write(dut.vu.prog, w)
+        arg_csrs = [dut.vu.arg0, dut.vu.arg1, dut.vu.arg2, dut.vu.arg3,
+                    dut.vu.arg4, dut.vu.arg5, dut.vu.arg6, dut.vu.arg7]
+        for i, a in enumerate(args):
+            yield from _csr_write(arg_csrs[i], a & 0xFFFFFFFF)
+        yield from _csr_write(dut.vu.pc, 0)
+        yield from _csr_write(dut.vu.submit, 1)
+        for _ in range(200000):
+            if not (yield dut.vu.busy):
+                break
+            yield
+        else:
+            raise AssertionError("vector unit timeout")
+        yield
+        data = bytearray()
+        for w in range(SP_SIZE//32):
+            v = (yield dut.sp.mem[w])
+            data += int(v).to_bytes(32, "little")
+        out["sp"] = bytes(data)
+
+    run_simulation(dut, [gen()])
+    assert out["sp"] == bytes(ref), "RTL differs from the interpreter"
+
+
+def test_rtl_rmsnorm_h():
+    rng = np.random.default_rng(41)
+    hd, H = 128, 3
+    sp = bytearray(SP_SIZE)
+    sp[0:2*hd*H] = rng.integers(-20000, 20000, hd*H).astype("<i2").tobytes()
+    sp[0x2000:0x2000 + 2*hd] = rng.integers(-8000, 8000, hd).astype("<i2").tobytes()
+    _compare_words(asm.prog_rmsnorm_h(), sp, [0, 0x2000, 0, hd//16, -7, 17, -17, H])
+
+
+def test_rtl_rope_h():
+    rng = np.random.default_rng(42)
+    hd, H = 128, 3
+    sp = bytearray(SP_SIZE)
+    sp[0:2*hd*H] = rng.integers(-20000, 20000, hd*H).astype("<i2").tobytes()
+    sp[0x2000:0x2000 + hd] = rng.integers(-16384, 16384, hd//2).astype("<i2").tobytes()
+    sp[0x2000 + hd:0x2000 + 2*hd] = rng.integers(-16384, 16384, hd//2).astype("<i2").tobytes()
+    _compare_words(asm.prog_rope_h(), sp, [0, hd, 0x2000, 0x2000 + hd, (hd//2)//16, 0, hd, H])
+
+
+def test_rtl_kvpack_h():
+    rng = np.random.default_rng(43)
+    hd, H, stride = 128, 4, 0x400
+    sp = bytearray(SP_SIZE)
+    sp[0:2*hd*H] = rng.integers(-30000, 30000, hd*H).astype("<i2").tobytes()
+    _compare_words(asm.prog_kvpack_h(), sp,
+                   [0, 0, 0x2020, hd//16, 0, 0, stride - 16*(hd//16), H])
