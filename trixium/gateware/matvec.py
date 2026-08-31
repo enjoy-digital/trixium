@@ -646,6 +646,7 @@ class BonsaiMatVecEngine(LiteXModule):
             grant_seq = Signal()
             vec_rd    = Signal()
             vec_wr    = Signal()
+            sb_headroom_r = Signal() # Registered W-FIFO headroom for the sideband grant.
             gw_w      = len(scratchpad.gather.adr) + 8 + 256
             wr_fifo   = SyncFIFO(width=gw_w, depth=8)
             self.submodules += wr_fifo
@@ -661,18 +662,18 @@ class BonsaiMatVecEngine(LiteXModule):
                 # The seq's fetch FSM holds its address cycle when a vec load outranks it.
                 *([] if seq is None else [seq.sp_gnt.eq(~vec_rd)]),
                 # Sideband slot (CPU/host): granted on any cycle BOTH ports are free -
-                # below vec and seq, above the engine (which tolerates the pause through
-                # rd_free and the write FIFO). The FIFO-headroom term keeps the drain-rate
-                # argument intact: at/above the mark the engine drains every cycle and the
-                # CPU waits, so gw_ovf stays impossible. A granted sideband access borrows
-                # both ports for exactly one cycle (the scratchpad muxes it in above the
-                # fill/gather inputs); its duty is bounded by the wishbone FSM's >= 4
-                # cycles per access, so nothing starves.
-                scratchpad.sb_allow.eq(~vec_rd & ~grant_seq
-                                       & ~(vecunit.sp_wr_req & (wr_fifo.level < 6))
-                                       & (wr_fifo.level < 6)),
+                # below vec loads and seq, above vec STORES (which hold in E2 via the
+                # withheld sp_wr_gnt, the mechanism the hazard stress already covers) and
+                # above the engine (rd_free / the write FIFO). The W-headroom term is
+                # REGISTERED with one entry of margin (#4: the live level compare put the
+                # engine region in the CPU -> BRAM grant cone): level(T-1) < 5 bounds
+                # level(T) <= 6 < 8, so gw_ovf stays impossible even though the FIFO does
+                # not drain on a granted cycle. Duty is bounded by the wishbone FSM's
+                # >= 4 cycles per access, so nothing starves.
+                scratchpad.sb_allow.eq(sb_headroom_r & ~vec_rd & ~grant_seq),
                 rd_free.eq(~vec_rd & ~grant_seq & ~scratchpad.sb_gnt_any),
-                vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)),
+                vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)
+                          & ~scratchpad.sb_gnt_any),
                 vecunit.sp_wr_gnt.eq(vec_wr),
                 fetch_rdy.eq(wr_fifo.level < 6),
                 gw_pending.eq(wr_fifo.readable | (sp_gw_we != 0)),
@@ -697,6 +698,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 ),
                 vecunit.sp_rd_dat.eq(scratchpad.fill.dat_r),
             ]
+            self.sync += sb_headroom_r.eq(wr_fifo.level < 5)
             if seq is not None:
                 self.comb += seq.sp_dat.eq(scratchpad.fill.dat_r)
 

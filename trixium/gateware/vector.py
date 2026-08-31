@@ -470,9 +470,14 @@ class BonsaiVectorUnit(LiteXModule):
         ]
         a_flat = Signal(32*LANES)
         b_flat = Signal(32*LANES)
+        # Forward from ex1_r ONLY (n16 #4: e2_fwd_ok already excludes muls, but wb2_nl
+        # still carried mul_val into this mux as a never-selected input - static timing
+        # cannot see the exclusion, so the whole DSP -> mulh select -> forward -> ALU ->
+        # one-hot cone stayed the worst family, 1024 endpoints at -1.14. Bit-identical:
+        # for every case fwd_a/fwd_b can select, wb2_nl equals ex1_r.)
         self.comb += [
-            a_flat.eq(Mux(fwd_a, wb2_nl, e1_va_r)),
-            b_flat.eq(Mux(fwd_b, wb2_nl, e1_vb_r)),
+            a_flat.eq(Mux(fwd_a, ex1_r, e1_va_r)),
+            b_flat.eq(Mux(fwd_b, ex1_r, e1_vb_r)),
         ]
         a_l, b_l = [], []
         for i in range(LANES):
