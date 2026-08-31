@@ -1027,6 +1027,34 @@ static int seq_eps_int(int es)
 //   words are patched before each run. Spills feed the one CPU float fold per head
 //   (c2/hmax) after the list - identical numerics to the CPU-dispatched fused path.
 static int seq_attn_base, seq_attn_dph, seq_attn_heads;
+// Pipelined attention list (probe 1, 2026-08-31): head j+1's scores op is dispatched
+// NOWAIT before head j's softmax8, so the engine streams K(j+1) while the vector unit
+// works. Scores double-buffer between the two HALVES of the SP_SC region - both halves
+// are written only by scores ops, so the INT32_MIN padding written once per forward
+// survives across layers, the same invariant the single buffer relied on. (SP_G was the
+// first choice and was wrong: the FFN rewrites it every layer, so from layer 1 on the
+// odd heads' softmax read gate garbage where the padding had been - the n8 sim's GEN-HW
+// tokens caught it.) The serialization softmax8(j) needs against scores(j) comes free from the
+// dispatch of scores(j+1) - an engine descriptor only dispatches when the engine is
+// idle - so no barrier bits are required. Layout when active:
+//   base+0                 scores(slot 0), NOWAIT           (prologue)
+//   base+1+j*5 .. +4       [scores(slot j+1) NOWAIT | nopd] softmax8(j) wv(j) spill(j) norm(j)
+static int attn_pipe = 1;        // Requested (aovl console toggle).
+static int attn_pipe_active = 0; // What the built list uses.
+static inline uint32_t attn_grp(int j) {
+    return (uint32_t)seq_attn_base + (attn_pipe_active ? 1u : 0u)
+           + (uint32_t)j*(uint32_t)seq_attn_dph;
+}
+static inline uint32_t attn_di_sc(int j) { // scores descriptor serving slot j
+    if (!attn_pipe_active) return attn_grp(j);
+    return (j == 0) ? (uint32_t)seq_attn_base : attn_grp(j - 1);
+}
+static inline uint32_t attn_sc_dst(int j) {
+    return (uint32_t)SP_SC + ((j & 1) ? 0x3800u : 0u); // 14 KB halves (ctx <= ~3568).
+}
+static inline int attn_list_len(int nh) {
+    return nh*seq_attn_dph + (attn_pipe_active ? 1 : 0);
+}
 static void seq_build_attn(void)
 {
     seq_attn_heads = 0;
@@ -1038,7 +1066,7 @@ static void seq_build_attn(void)
     // softmax8's tail, and 6 + n_ch = 14 before the engine learned to reduce across
     // channels. 16*5 + 66 = 146 of 192, so the FFN and scale8 lists fit behind it.
     int dph = 5;
-    int cap = (192 - seq_qkr_count)/dph;
+    int cap = (192 - seq_qkr_count - (attn_pipe ? 1 : 0))/dph;
     if (cap <= 0)
         return;
     int chunk = (cap < n_head) ? cap : n_head;
@@ -1048,8 +1076,9 @@ static void seq_build_attn(void)
     seq_attn_base  = seq_qkr_count;
     seq_attn_dph   = dph;
     seq_attn_heads = chunk;
+    attn_pipe_active = attn_pipe;
     for (int j = 0; j < chunk; j++) {
-        uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*dph;
+        uint32_t di = attn_grp(j);
         struct engine_op sc = {0};
         sc.kind   = ENGINE_KIND_Q8;
         sc.ilv    = 1;
@@ -1057,9 +1086,16 @@ static void seq_build_attn(void)
         sc.sbeats = 1;
         sc.cbeats = head_dim/32;
         sc.xsrc   = SP_X + 0x1000 + (uint32_t)j*head_dim; // Batched q8 (qkr list).
-        sc.dst    = SP_SC;
-        seq_desc_engine(di + 0, &sc);
-        int32_t sargs[7] = {(int32_t)SP_SC, Ceff, (int32_t)SP_X, 0, -11, 0,
+        sc.dst    = attn_sc_dst(j);
+        seq_desc_engine(attn_di_sc(j), &sc);
+        if (attn_pipe_active) {
+            seq_patch(attn_di_sc(j), 0, 1u | (1u << 9)); // NOWAIT.
+            if (j == chunk - 1) { // Last group's scores slot: a one-DONE placeholder.
+                int32_t z = 0;
+                seq_desc_vec(di + 0, PROG_NOPD, &z, 0, 0);
+            }
+        }
+        int32_t sargs[7] = {(int32_t)attn_sc_dst(j), Ceff, (int32_t)SP_X, 0, -11, 0,
                             (int32_t)(SP_AWP8 + (uint32_t)j*32)}; // A6: p8-sum self-spill.
         seq_desc_vec(di + 1, PROG_SOFTMAX8, sargs, 7, 0);
         struct engine_op wv = {0};
@@ -1120,7 +1156,7 @@ static void seq_build_ffn(void)
 #ifdef BONSAI_HAS_DUALQ
     return; // Dual builds use attn2 lists; FFN list only wired on the shipping non-dual path.
 #else
-    int di = seq_qkr_count + seq_attn_heads*seq_attn_dph;
+    int di = seq_qkr_count + attn_list_len(seq_attn_heads);
     if (di + 10 > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
@@ -1174,7 +1210,7 @@ static void seq_build_scale8(void)
     if (seq_attn_heads == 0)
         return;
     int di = (seq_ffn_base >= 0) ? seq_ffn_base + 10
-                                 : seq_qkr_count + seq_attn_heads*seq_attn_dph;
+                                 : seq_qkr_count + attn_list_len(seq_attn_heads);
     if (di + n_head + 1 > 192)
         return;
     seq_scale8_base = di;
@@ -1701,23 +1737,46 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
 // softmax block count depend on pos only, and the score-slot padding survives across heads
 // and layers because only the scores op writes SP_SC (exactly cnt slots). Same values as
 // before, written 28x less often - uncached scratchpad stores are ~25-70 cycles each.
+// Console toggle (aovl): rebuild the three dependent lists in either layout.
+void infer_attn_pipe(int on)
+{
+    attn_pipe = on ? 1 : 0;
+    seq_ffn_base = -1;
+    seq_build_attn();
+    seq_build_ffn();
+    seq_build_scale8();
+}
+int infer_attn_pipe_state(void) { return attn_pipe_active; }
+
 static void attn_list_prep_token(int pos)
 {
     if (seq_attn_heads <= 0)
         return;
     int cnt  = pos + 1;
     int padn = (16 - (cnt & 15)) & 15;
+    if (attn_pipe_active && (uint32_t)(cnt + padn)*4u > 0x3800u) {
+        // The context outgrew the second scores buffer: fall back to the plain list
+        // (the FFN/scale8 bases shift with the prologue, so rebuild all three).
+        attn_pipe = 0;
+        seq_ffn_base = -1;
+        seq_build_attn(); seq_build_ffn(); seq_build_scale8();
+    }
     volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
     for (int i2 = 0; i2 < padn; i2++)
         sc32[cnt + i2] = (int32_t)0x80000000;
+    if (attn_pipe_active) {
+        volatile int32_t *sc32b = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC + 0x3800);
+        for (int i2 = 0; i2 < padn; i2++)
+            sc32b[cnt + i2] = (int32_t)0x80000000;
+    }
     uint32_t rows  = (uint32_t)cnt/n_ch, rem = (uint32_t)cnt % n_ch;
     uint32_t wlen  = rows*kv_rb;
     uint32_t rowsw = rows | (rem << 16);
     uint32_t blocks = (uint32_t)(cnt + padn)/16;
     for (int j = 0; j < seq_attn_heads; j++) {
-        uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*seq_attn_dph;
-        seq_patch(di + 0, 2, rowsw);           // scores rows|rem.
-        seq_patch(di + 0, 5, wlen);
+        uint32_t di = attn_grp(j);
+        seq_patch(attn_di_sc(j), 2, rowsw);    // scores rows|rem.
+        seq_patch(attn_di_sc(j), 5, wlen);
         seq_patch(di + 1, 5, blocks);          // softmax8 A3 (blocks).
         seq_patch(di + 2, 2, rowsw);           // AXPY rows|rem.
         seq_patch(di + 2, 5, wlen);
@@ -2000,25 +2059,26 @@ attn_scores: ;
                 if (nh > seq_attn_heads) nh = seq_attn_heads;
                 for (int j = 0; j < nh; j++) {
                     int hh = h0 + j, kvh = hh/n_rep;
-                    uint32_t di = (uint32_t)seq_attn_base + (uint32_t)j*seq_attn_dph;
+                    uint32_t di = attn_grp(j);
+                    uint32_t ds = attn_di_sc(j);
                     int Bk, Rk, Bv, Rd;
                     kv_scores_br(l, kvh, 0, &Bk, &Rk);
                     kv_scores_br(l, kvh, 1, &Bv, &Rd);
                     int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
                     if (chunked) {
-                        seq_patch(di + 0, 8, SP_X + 0x1000 + (uint32_t)hh*head_dim);
+                        seq_patch(ds, 8, SP_X + 0x1000 + (uint32_t)hh*head_dim);
                         seq_patch(di + 1, 8, SP_AWP8 + (uint32_t)hh*32);
                         seq_patch(di + 3, 2, SP_AWAM + (uint32_t)hh*32);
                         seq_patch(di + 4, 4, SP_H + (uint32_t)hh*head_dim*2);
                     }
-                    seq_patch(di + 0, 4, kv_region_addr(l, kvh, 0));
-                    seq_patch(di + 0, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
+                    seq_patch(ds, 4, kv_region_addr(l, kvh, 0));
+                    seq_patch(ds, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
                     seq_patch(di + 1, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
                     seq_patch(di + 2, 4, kv_region_addr(l, kvh, 1));
                     seq_patch(di + 2, 7, (uint32_t)Bv);
                     (void)Rd;
                 }
-                seq_run((uint32_t)seq_attn_base, (uint32_t)nh*seq_attn_dph);
+                seq_run((uint32_t)seq_attn_base, (uint32_t)attn_list_len(nh));
             }
             perf_exit(OP_SCORES);
             // One float fold per head from the spilled p8 sums / absmaxes.

@@ -461,6 +461,12 @@ static void console_service(void)
         printf("FFNSEQ %s (1.7B tokens FAIL with it on - debug aid, see infer.c)\n",
                seq_ffn_use ? "on" : "off");
     }
+    else if (strcmp(token, "aovl") == 0) {
+        if (strncmp(str, "on", 2) == 0)  infer_attn_pipe(1);
+        if (strncmp(str, "off", 3) == 0) infer_attn_pipe(0);
+        printf("AOVL %s (pipelined attention list: next head's scores stream under softmax)\n",
+               infer_attn_pipe_state() ? "on" : "off");
+    }
     else if (strcmp(token, "ifold") == 0) {
         extern int ifold_use;
         if (strncmp(str, "on", 2) == 0)  ifold_use = 1;

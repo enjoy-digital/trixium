@@ -824,6 +824,11 @@ def prog_rmsnorm_q8():
         ("DONE",),
     ]
 
+def prog_nopd():
+    """One DONE. A placeholder slot for descriptor lists whose geometry wants a uniform
+    group size (the pipelined attention list's last group has no next-head scores op)."""
+    return [("DONE",)]
+
 def prog_silu_q8():
     """prog_silu_mul followed by a measured-mode quant8 of its output in one program
     (2026-08-30): the int16 result still lands at A2 (SP_G) and the int8 x8 at A7. The loop
@@ -974,6 +979,7 @@ PROGRAMS = {
     "kvpack_h":   prog_kvpack_h,
     "rmsnorm_q8": prog_rmsnorm_q8,
     "silu_q8":    prog_silu_q8,
+    "nopd": prog_nopd,
 }
 
 def emit_c(out):
