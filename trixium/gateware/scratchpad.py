@@ -24,6 +24,8 @@ from migen import *
 
 from litex.gen import *
 
+from migen.genlib.fifo import SyncFIFO
+
 from litex.soc.interconnect import wishbone
 from litex.soc.interconnect.csr import *
 
@@ -44,14 +46,18 @@ class BonsaiScratchpad(LiteXModule):
         # borrow window). Left at 0 (never granted) when unwired - unit-test DUTs and
         # configurations without a bus port need no changes.
         self.units_idle = Signal()
-        # Per-cycle sideband slot (2026-08-31): the integrator may raise sb_allow on any
-        # cycle the R and W ports are both free, so CPU/host accesses no longer wait for
-        # ALL units to go idle - the change that lets firmware patch the next descriptor
-        # list or read spills while the sequencer is running one. units_idle remains a
-        # sufficient condition, so integrators that never drive sb_allow are unchanged.
-        self.sb_allow  = Signal()
-        self.sb_req_any = Signal() # For the integrator's arbitration.
-        self.sb_gnt_any = Signal()
+        # Posted sideband writes (2026-08-31, second form): the per-cycle both-port
+        # grant (#4/#4b) pulled CPU-region terms into the port cones and both builds
+        # blew up in congestion. Writes now land in a small FIFO - the wishbone ack
+        # fires on FIFO-accept - and the integrator drains it onto the W port with an
+        # ENGINE-LOCAL grant (sbw_gnt): no CPU-region signal in any port cone, and the
+        # R port arbitration is untouched. Reads keep the units_idle gate plus
+        # FIFO-empty (so a read always sees every posted write), and the integrator
+        # holds the sequencer's descriptor fetch while the FIFO is non-empty - a list
+        # can never read a stale descriptor, with no firmware ordering burden. The
+        # firmware overlap (patch-under-list) is write-only, so it keeps its win.
+        self.sbw_pending = Signal() # FIFO non-empty (integrator: drain + seq interlock).
+        self.sbw_gnt     = Signal() # Integrator grant: drain one write this cycle.
 
         # # #
 
@@ -81,17 +87,48 @@ class BonsaiScratchpad(LiteXModule):
         self._sb_gnt  = [Signal(name=f"sb{i}_gnt")  for i in range(2)]
         self._sb_rdat = Signal(256) # port_r.dat_r, valid the cycle after a granted read.
 
+        # Posted-write FIFO: two push slots (0 = wishbone, priority; 1 = CSR poke).
+        aw = len(self._sb_adr[0])
+        self._sbw_req  = [Signal(name=f"sbw{i}_req") for i in range(2)]
+        self._sbw_ok   = [Signal(name=f"sbw{i}_ok")  for i in range(2)]
+        self._sbw_adr  = [Signal(aw, name=f"sbw{i}_adr") for i in range(2)]
+        self._sbw_sel  = [Signal(3, name=f"sbw{i}_sel") for i in range(2)]
+        self._sbw_bsel = [Signal(4, name=f"sbw{i}_bsel") for i in range(2)]
+        self._sbw_wdat = [Signal(32, name=f"sbw{i}_wdat") for i in range(2)]
+        sbw = SyncFIFO(width=aw + 3 + 4 + 32, depth=4)
+        self.submodules += sbw
+        dr_adr  = Signal(aw)
+        dr_sel  = Signal(3)
+        dr_bsel = Signal(4)
+        dr_wdat = Signal(32)
+        self.comb += [
+            self._sbw_ok[0].eq(self._sbw_req[0] & sbw.writable),
+            self._sbw_ok[1].eq(self._sbw_req[1] & ~self._sbw_req[0] & sbw.writable),
+            sbw.we.eq(self._sbw_req[0] | self._sbw_req[1]),
+            sbw.din.eq(Mux(self._sbw_req[0],
+                Cat(self._sbw_adr[0], self._sbw_sel[0], self._sbw_bsel[0], self._sbw_wdat[0]),
+                Cat(self._sbw_adr[1], self._sbw_sel[1], self._sbw_bsel[1], self._sbw_wdat[1]))),
+            Cat(dr_adr, dr_sel, dr_bsel, dr_wdat).eq(sbw.dout),
+            self.sbw_pending.eq(sbw.readable),
+            sbw.re.eq(self.sbw_gnt),
+        ]
         gather_bwe = Signal(32)
         self.comb += [
             gather_bwe.eq(Cat(*[Replicate(self.gather.we[i], 4) for i in range(8)])),
-            self._sb_gnt[0].eq(self._sb_req[0] & (self.units_idle | self.sb_allow)),
-            self._sb_gnt[1].eq(self._sb_req[1] & (self.units_idle | self.sb_allow)
+            self._sb_gnt[0].eq(self._sb_req[0] & self.units_idle & ~sbw.readable),
+            self._sb_gnt[1].eq(self._sb_req[1] & self.units_idle & ~sbw.readable
                                & ~self._sb_req[0]),
-            self.sb_req_any.eq(self._sb_req[0] | self._sb_req[1]),
-            self.sb_gnt_any.eq(self._sb_gnt[0] | self._sb_gnt[1]),
             self.fill.dat_r.eq(port_r.dat_r),
             self._sb_rdat.eq(port_r.dat_r),
-            If(self._sb_gnt[0],
+            # W port: a granted drain outranks everything (the integrator only grants
+            # when the vector store slot is free and the gather FIFO has headroom);
+            # granted reads still borrow both ports (units_idle: nothing else runs).
+            If(self.sbw_gnt & sbw.readable,
+                port_w.adr.eq(dr_adr),
+                port_w.dat_w.eq(Replicate(dr_wdat, 8)),
+                Case(dr_sel, {i: port_w.we.eq(dr_bsel << (4*i)) for i in range(8)}),
+                port_r.adr.eq(self.fill.adr),
+            ).Elif(self._sb_gnt[0],
                 port_r.adr.eq(self._sb_adr[0]),
                 port_w.adr.eq(self._sb_adr[0]),
                 port_w.dat_w.eq(Replicate(self._sb_wdat[0], 8)),
@@ -138,14 +175,18 @@ class BonsaiScratchpad(LiteXModule):
         sel_r  = Signal(3)
         bsel_r = Signal(4)
         wdat_r = Signal(32)
-        we_r   = Signal()
         rdat_r = Signal(32)
         self.comb += [
             self._sb_adr[0].eq(adr_r),
             self._sb_sel[0].eq(sel_r),
             self._sb_bsel[0].eq(bsel_r),
             self._sb_wdat[0].eq(wdat_r),
-            self._sb_we[0].eq(we_r),
+            # Writes are POSTED through the sbw FIFO (slot 0); the read path below never
+            # writes, so _sb_we[0] stays 0.
+            self._sbw_adr[0].eq(adr_r),
+            self._sbw_sel[0].eq(sel_r),
+            self._sbw_bsel[0].eq(bsel_r),
+            self._sbw_wdat[0].eq(wdat_r),
             bus.dat_r.eq(rdat_r),
         ]
         self.bus_fsm = fsm = FSM(reset_state="IDLE")
@@ -155,18 +196,23 @@ class BonsaiScratchpad(LiteXModule):
                 NextValue(sel_r,  bus.adr[2:5]),  # 32-bit word within the beat.
                 NextValue(bsel_r, bus.sel),
                 NextValue(wdat_r, bus.dat_w),
-                NextValue(we_r,   bus.we),
-                NextState("REQ"),
+                If(bus.we,
+                    NextState("WPUSH"),
+                ).Else(
+                    NextState("REQ"),
+                )
+            )
+        )
+        fsm.act("WPUSH", # Posted: ack as soon as the write is in the sbw FIFO.
+            self._sbw_req[0].eq(1),
+            If(self._sbw_ok[0],
+                NextState("ACK"),
             )
         )
         fsm.act("REQ",
             self._sb_req[0].eq(1),
             If(self._sb_gnt[0],
-                If(we_r,
-                    NextState("ACK"), # Registered ack (comb ack races pipelined masters).
-                ).Else(
-                    NextState("READ"), # One cycle of read latency.
-                )
+                NextState("READ"), # One cycle of read latency.
             )
         )
         fsm.act("READ",
@@ -198,9 +244,12 @@ class _ScratchpadCSR(LiteXModule):
             sp._sb_adr[1].eq(self.adr.storage[5:]),
             sp._sb_sel[1].eq(self.adr.storage[2:5]),
             sp._sb_bsel[1].eq(0xF),
-            sp._sb_wdat[1].eq(self.data_w.storage),
-            sp._sb_req[1].eq(rd_p | wr_p),
-            sp._sb_we[1].eq(wr_p),
+            sp._sb_req[1].eq(rd_p),
+            sp._sbw_adr[1].eq(self.adr.storage[5:]),
+            sp._sbw_sel[1].eq(self.adr.storage[2:5]),
+            sp._sbw_bsel[1].eq(0xF),
+            sp._sbw_wdat[1].eq(self.data_w.storage),
+            sp._sbw_req[1].eq(wr_p),
         ]
         self.sync += [
             If(self.adr.re,
@@ -210,7 +259,7 @@ class _ScratchpadCSR(LiteXModule):
             ),
             If(self.data_w.re,
                 wr_p.eq(1),
-            ).Elif(sp._sb_gnt[1] & wr_p,
+            ).Elif(sp._sbw_ok[1],
                 wr_p.eq(0),
             ),
             cap.eq(sp._sb_gnt[1] & ~wr_p),

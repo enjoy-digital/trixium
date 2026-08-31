@@ -620,6 +620,8 @@ class BonsaiMatVecEngine(LiteXModule):
             self.comb += [
                 rd_free.eq(1),
                 fetch_rdy.eq(1),
+                # Posted sideband writes drain whenever the engine is not writing.
+                scratchpad.sbw_gnt.eq(scratchpad.sbw_pending & (sp_gw_we == 0)),
                 # gw_pending stays 0: writes hit the RAM directly, done needs no drain.
                 scratchpad.fill.adr.eq(eng_fill_adr),
                 scratchpad.gather.adr.eq(eng_gw_adr),
@@ -659,27 +661,27 @@ class BonsaiMatVecEngine(LiteXModule):
             self.comb += [
                 grant_seq.eq(0 if seq is None else seq.sp_active),
                 vec_rd.eq(vecunit.sp_rd_req),
-                # The seq's fetch FSM holds its address cycle when a vec load outranks it.
-                *([] if seq is None else [seq.sp_gnt.eq(~vec_rd)]),
-                # Sideband slot (CPU/host): granted on any cycle BOTH ports are free -
-                # below vec loads and seq, above vec STORES (which hold in E2 via the
-                # withheld sp_wr_gnt, the mechanism the hazard stress already covers) and
-                # above the engine (rd_free / the write FIFO). The W-headroom term is
-                # REGISTERED with one entry of margin (#4: the live level compare put the
-                # engine region in the CPU -> BRAM grant cone): level(T-1) < 5 bounds
-                # level(T) <= 6 < 8, so gw_ovf stays impossible even though the FIFO does
-                # not drain on a granted cycle. Duty is bounded by the wishbone FSM's
-                # >= 4 cycles per access, so nothing starves.
-                scratchpad.sb_allow.eq(sb_headroom_r & ~vec_rd & ~grant_seq),
-                rd_free.eq(~vec_rd & ~grant_seq & ~scratchpad.sb_gnt_any),
-                vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)
-                          & ~scratchpad.sb_gnt_any),
+                # The seq's fetch FSM holds its address cycle when a vec load outranks
+                # it, and while posted sideband writes are still in flight - a descriptor
+                # read must never see a stale word (the ordering interlock that lets
+                # firmware patch lists with zero care).
+                *([] if seq is None else [seq.sp_gnt.eq(~vec_rd
+                                                        & ~scratchpad.sbw_pending)]),
+                # Posted sideband writes (see scratchpad.py): the drain takes the W
+                # port on any cycle the vector store slot is idle and the gather FIFO
+                # has registered headroom - an engine-local grant with no CPU-region
+                # term in the cone, and the R port arbitration is untouched. The
+                # headroom margin keeps gw_ovf impossible (level(T-1) < 5 bounds
+                # level(T) <= 6 < 8 on a non-draining cycle).
+                scratchpad.sbw_gnt.eq(scratchpad.sbw_pending & ~vec_wr & sb_headroom_r),
+                rd_free.eq(~vec_rd & ~grant_seq),
+                vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)),
                 vecunit.sp_wr_gnt.eq(vec_wr),
                 fetch_rdy.eq(wr_fifo.level < 6),
                 gw_pending.eq(wr_fifo.readable | (sp_gw_we != 0)),
                 wr_fifo.din.eq(Cat(eng_gw_adr, sp_gw_we, eng_gw_dat)),
                 wr_fifo.we.eq(sp_gw_we != 0),
-                wr_fifo.re.eq(~vec_wr & wr_fifo.readable & ~scratchpad.sb_gnt_any),
+                wr_fifo.re.eq(~vec_wr & wr_fifo.readable & ~scratchpad.sbw_gnt),
                 If(vec_rd,
                     scratchpad.fill.adr.eq(vecunit.sp_rd_adr),
                 ).Elif(grant_seq,

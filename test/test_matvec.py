@@ -1718,6 +1718,9 @@ class _OverlapDUT(Module):
         self.submodules.vu = BonsaiVectorUnit()
         self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
                                                     xbuf_groups=32, vecunit=self.vu)
+        # Mirror the SoC's sideband idle wiring (no sequencer in this DUT): the posted-
+        # write drain works without it, but read grants are units_idle-gated.
+        self.comb += self.scratchpad.units_idle.eq(~self.engine.sp_busy & ~self.vu.busy)
         for i, axi in enumerate(axis):
             model = BonsaiHBMChannelModel(axi, size=64*1024,
                 init=words_from_bytes(chan_payloads[i]), latency=latency)
@@ -1766,11 +1769,11 @@ def _read_sp(dut, start, length):
 
 
 def test_overlap_sideband_slot():
-    # A CPU/host sideband stream runs DURING a concurrent engine matvec + vec resid_add
-    # (2026-08-31 per-cycle sideband slot): sideband writes and reads to a disjoint
-    # region must be correct, both unit results must equal their serial goldens, and no
-    # gather write may be lost. Before the slot, the sideband was granted only with every
-    # unit idle - this test would have hung at the first access.
+    # Posted sideband writes stream in DURING a concurrent engine matvec + vec resid_add
+    # (2026-08-31 second form): each push must be accepted within a bounded wait, the
+    # FIFO must drain (sbw_pending falls), reads AFTER the run (units_idle + FIFO-empty
+    # gated) must see every posted write and the untouched known block, both unit
+    # results must equal their serial goldens, and no gather write may be lost.
     from trixium.model import asm as vasm
     n_channels, rows_per_chan, cols, seed = 2, 32, 128, 95
     rng    = np.random.default_rng(seed)
@@ -1794,47 +1797,43 @@ def test_overlap_sideband_slot():
     sp[0x4000:0x4000 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
     sp[0x4800:0x4800 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
     mirror = _overlap_vec_golden(sp, vec_args)
-    # Known data for sideband reads at 0x7000; sideband writes go to 0x7800.
     sb_src = rng.integers(0, 2**32, 64, dtype=np.uint32)
     sp[0x7000:0x7000 + 256] = sb_src.astype("<u4").tobytes()
     dut = _OverlapDUT(n_channels, payloads, sp_init=words_from_bytes(bytes(sp)))
 
-    wrote = []
-    got   = []
+    wrote = {}
 
-    def sb_access(dut, we, beat, sel, wdat=0):
+    def sb_post(beat, sel, wdat):
+        yield dut.scratchpad._sbw_req[1].eq(1)
+        yield dut.scratchpad._sbw_adr[1].eq(beat)
+        yield dut.scratchpad._sbw_sel[1].eq(sel)
+        yield dut.scratchpad._sbw_bsel[1].eq(0xF)
+        yield dut.scratchpad._sbw_wdat[1].eq(wdat)
+        yield
+        waited = 0
+        while not (yield dut.scratchpad._sbw_ok[1]):
+            waited += 1
+            assert waited < 300, "posted write starved during concurrent units"
+            yield
+        yield dut.scratchpad._sbw_req[1].eq(0)
+        yield
+
+    def sb_read(beat, sel):
         yield dut.scratchpad._sb_req[1].eq(1)
-        yield dut.scratchpad._sb_we[1].eq(1 if we else 0)
         yield dut.scratchpad._sb_adr[1].eq(beat)
         yield dut.scratchpad._sb_sel[1].eq(sel)
-        yield dut.scratchpad._sb_bsel[1].eq(0xF)
-        yield dut.scratchpad._sb_wdat[1].eq(wdat)
         yield
         waited = 0
         while not (yield dut.scratchpad._sb_gnt[1]):
             waited += 1
-            assert waited < 300, "sideband starved during concurrent units"
+            assert waited < 3000, "sideband read never granted after done"
             yield
         yield dut.scratchpad._sb_req[1].eq(0)
-        yield  # read data valid one cycle after the granted read.
-        if not we:
-            rd = (yield dut.scratchpad._sb_rdat)
-            return (rd >> (32*sel)) & 0xFFFFFFFF
-        return None
+        yield
+        rd = (yield dut.scratchpad._sb_rdat)
+        return (rd >> (32*sel)) & 0xFFFFFFFF
 
-    def sb_traffic():
-        # Interleave reads of the known block with writes; pause a bit between accesses
-        # (a real wishbone FSM is >= 4 cycles per access).
-        for i in range(48):
-            v = (yield from sb_access(dut, False, 0x7000//32 + (i % 8), i % 8))
-            got.append((i, v))
-            w = (0xC0DE0000 + i) & 0xFFFFFFFF
-            yield from sb_access(dut, True, 0x7800//32 + (i % 4), (i // 4) % 8, w)
-            wrote.append(((0x7800//32 + (i % 4)), (i // 4) % 8, w))
-            for _ in range(3):
-                yield
-
-    def eng_driver():
+    def driver():
         yield from _vec_csr_upload(dut, vasm.assemble(vasm.PROGRAMS["resid_add"]()))
         yield dut.engine.cmd.kind.eq(0)
         yield dut.engine.cmd.rows.eq(rows_per_chan)
@@ -1854,10 +1853,23 @@ def test_overlap_sideband_slot():
             yield
         yield dut.engine.cmd.valid.eq(0)
         yield from _vec_csr_submit(dut, vec_args)
-        yield from sb_traffic()
+        # Posted writes streamed while both units run.
+        for i in range(48):
+            beat, sel = 0x7800//32 + (i % 4), (i // 4) % 8
+            w = (0xC0DE0000 + i) & 0xFFFFFFFF
+            yield from sb_post(beat, sel, w)
+            wrote[(beat, sel)] = w
+            for _ in range(2):
+                yield
         for _ in range(30000):
             if (yield dut.engine.done):
                 break
+            yield
+        # FIFO must drain once granted cycles exist.
+        waited = 0
+        while (yield dut.scratchpad.sbw_pending):
+            waited += 1
+            assert waited < 1000, "posted-write FIFO never drained"
             yield
         for _ in range(200):
             yield
@@ -1868,17 +1880,14 @@ def test_overlap_sideband_slot():
         got_vec = yield from _read_sp(dut, 0x5000, 2*nv)
         assert got_vec == bytes(mirror[0x5000:0x5000 + 2*nv]), \
             "vec result changed under sideband traffic"
-        got_wr = yield from _read_sp(dut, 0x7800, 4*32)
-        wr_words = np.frombuffer(got_wr, dtype="<u4").copy()
-        for beat, sel, w in wrote:  # Later writes win; replay in order over the init.
-            wr_words[(beat - 0x7800//32)*8 + sel] = w
-        assert np.array_equal(np.frombuffer(got_wr, dtype="<u4"), wr_words), \
-            "sideband writes lost or corrupted"
-        for i, v in got:
-            assert v == int(sb_src[(i % 8)*8 + (i % 8)]), \
-                f"sideband read {i} returned {v:#x}"
+        for (beat, sel), w in wrote.items():
+            v = yield from sb_read(beat, sel)
+            assert v == w, f"posted write at beat {beat} sel {sel}: {v:#x} != {w:#x}"
+        for i in range(8):
+            v = yield from sb_read(0x7000//32 + i, i)
+            assert v == int(sb_src[i*8 + i]), f"known block read {i} returned {v:#x}"
 
-    run_simulation(dut, [eng_driver()])
+    run_simulation(dut, [driver()])
 
 
 def test_overlap_engine_vec_concurrent():
