@@ -171,6 +171,13 @@ def test_optimized_program_matches_the_one_it_replaced(name):
             assert int(s_new[6]) == int(s_old[6]), f"{name}: S6 result changed (seed {seed})"
 
     # And the point of the exercise: it should be shorter.
+    # Deliberate unrolls trade words for cycles; list them here so accidental bloat
+    # still fails. Value = the expected word count of the unrolled form.
+    UNROLLED = {"norm_i32": 24}
+    if name in UNROLLED:
+        assert len(new_words) == UNROLLED[name], (
+            f"{name}: {len(new_words)} words vs the documented unroll {UNROLLED[name]}")
+        return
     assert len(new_words) <= len(old_words), (
         f"{name}: {len(new_words)} words vs {len(old_words)} before - no saving")
 

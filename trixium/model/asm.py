@@ -427,9 +427,16 @@ def prog_quant8():
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("MOVSI", "s6", 0),
+        # x2 unroll (2026-08-31): both passes are pure chains, so two interleaved chains
+        # hide the load-use stalls. A3 still arrives as beats (call sites unchanged, all
+        # even - batched q8 128, kvpack 8, FFN 384, VECCRC 8); the program halves it.
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s3", "s5"),         # iterations = beats / 2
         ("LOOPS", "s3"),               # Pass 1: absmax.
         ("LDV",   "v0", "s0"),
+        ("LDV",   "v3", "s0"),
         ("REDMAX", "s6", "v0"),
+        ("REDMAX", "s6", "v3"),
         ("LOOPE",),
         ("BCAST", "v1", "s6"),
         ("VCLZN", "v1", "v1"),         # 15 - bitlen(absmax) in every lane.
@@ -438,10 +445,15 @@ def prog_quant8():
         ("ARG",   "s0", 0),            # Rewind src.
         ("LOOPS", "s3"),               # Pass 2: scale, round, store.
         ("LDV",   "v0", "s0"),
+        ("LDV",   "v3", "s0"),
         ("VSHLV", "v0", "v0", "v1"),
+        ("VSHLV", "v3", "v3", "v1"),
         ("VRNE",  "v0", "v0", 8),
+        ("VRNE",  "v3", "v3", 8),
         ("VCLAMP8", "v0", "v0"),
+        ("VCLAMP8", "v3", "v3"),
         ("STB",   "v0", "s2"),
+        ("STB",   "v3", "s2"),
         ("LOOPE",),
         ("DONE",),
     ]
@@ -469,12 +481,24 @@ def prog_norm_i32():
         ("BCAST", "v3", "s5"),          # 0
         ("BCAST", "v2", "s4"),
         ("VSUB",  "v2", "v3", "v2"),    # -k
+        # x2 unroll (2026-08-31): two independent LDW->VPACK->VSHLV->STV chains interleave,
+        # so the load-use and pack-use stalls of one chain fill under the other - the body
+        # was 2 stalls per output beat on a pure chain. A3 still arrives as output beats
+        # (call sites unchanged, all even - q/kv/ffn/embd widths and head_dim/16 = 8);
+        # the program halves it itself.
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s3", "s5"),          # iterations = output beats / 2
         ("LOOPS", "s3"),
         ("LDW",   "v0", "s0"),
         ("LDW",   "v1", "s0"),
+        ("LDW",   "v5", "s0"),
+        ("LDW",   "v6", "s0"),
         ("VPACK", "v4", "v0", "v1"),
+        ("VPACK", "v7", "v5", "v6"),
         ("VSHLV", "v4", "v4", "v2"),    # arith shift right by k (floor)
+        ("VSHLV", "v7", "v7", "v2"),
         ("STV",   "v4", "s2"),
+        ("STV",   "v7", "s2"),
         ("LOOPE",),
         ("DONE",),
     ]
