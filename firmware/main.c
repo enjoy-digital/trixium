@@ -461,6 +461,12 @@ static void console_service(void)
         printf("FFNSEQ %s (1.7B tokens FAIL with it on - debug aid, see infer.c)\n",
                seq_ffn_use ? "on" : "off");
     }
+    else if (strcmp(token, "povl") == 0) {
+        extern int prep_ovl;
+        if (strncmp(str, "on", 2) == 0)  prep_ovl = 1;
+        if (strncmp(str, "off", 3) == 0) prep_ovl = 0;
+        printf("POVL %s (attention patches under the qkr list)\n", prep_ovl ? "on" : "off");
+    }
     else if (strcmp(token, "kovl") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_kv_pipe(1);
         if (strncmp(str, "off", 3) == 0) infer_kv_pipe(0);

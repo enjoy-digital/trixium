@@ -1789,6 +1789,7 @@ int infer_attn_pipe_state(void) { return attn_pipe_active; }
 // (kv_ekmax ratchet, region addresses) is CPU-side state settled before the list
 // started. attn_prepatched tells the attention section its work is already done.
 static int attn_prepatched;
+int prep_ovl = 1; // povl console toggle: patch-under-list overlap (needs BONSAI_SP_SB_SLOT).
 static void attn_patch_slots(int l, int h0, int nh, int chunked)
 {
     int lg = 0;
@@ -1999,7 +2000,7 @@ embed_done: ;
                     }
                 }
 #ifdef BONSAI_SP_SB_SLOT
-                if (seq_use && seq_attn_heads >= n_head
+                if (prep_ovl && seq_use && seq_attn_heads >= n_head
                     && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
                     // Overlap (sideband slot): the attention list's per-layer patches
                     // run while the sequencer executes the qkr list. Without the slot
