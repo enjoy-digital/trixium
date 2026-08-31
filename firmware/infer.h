@@ -18,6 +18,8 @@ extern int seq_use;
 
 void infer_vbench(void);  // Stage-by-stage cycle microbenchmark (run after hdrload).
 void infer_attn_pipe(int on);   // Pipelined attention list on/off (aovl; rebuilds lists).
+void infer_kv_pipe(int on);     // In-list NOWAIT KV stores on/off (kovl; rebuilds lists).
+int  infer_kv_pipe_state(void);
 int  infer_attn_pipe_state(void);
 void infer_spec(int on);                    // Speculative decode on/off (lossless, greedy).
 void infer_spec_stats(int *acc, int *rej);  // Accepted / rejected draft counts.

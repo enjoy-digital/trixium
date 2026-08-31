@@ -938,6 +938,16 @@ static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
 // head-relative inside SP_Q/SP_K, so the list is layer-independent; per layer only the
 // rmsnorm eps_int args (A5 = descriptor word 7) change. Built once at init.
 static int seq_qkr_count;
+// In-list KV stores (probe-1 follow-up, 2026-08-31): each (kvh, kind) staging slot's
+// engine STORE rides the qkr list as a NOWAIT descriptor right after the pack quant8
+// that fills the slot - the next head's quant8 (vec) runs under the store's stream, so
+// the ~9k cycles/layer of serial CPU-dispatched stores hide under vector work the layer
+// does anyway. Needs the scale-beat prep to run BEFORE the list (the store streams the
+// scale beat), which is equally correct in the CPU-store layout. kovl on|off rebuilds
+// the four lists (the attention/FFN/scale8 bases shift with the 2*n_kv_head extras).
+static int kv_pipe = 1;         // Requested (kovl console toggle).
+static int kv_pipe_active = 0;  // What the built list uses.
+static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2 + kind).
 static void seq_build_qkr(void)
 {
     int ln = 0;
@@ -993,12 +1003,25 @@ static void seq_build_qkr(void)
 #ifdef BONSAI_VEC_LOOPS2
     if (0)
 #endif
+    kv_pipe_active = 0;
     for (int kvh = 0; kvh < n_kv_head; kvh++)
         for (int kind = 0; kind < 2; kind++) {
             uint32_t src = (kind ? SP_V : SP_K) + (uint32_t)kvh*head_dim*2;
             int32_t qargs[4] = {(int32_t)src, 0, (int32_t)(kvp_slot(kvh, kind) + 32),
                                 head_dim/16};                       // A1 = 0: fixed >>8.
             seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
+            if (kv_pipe && 2*n_kv_head <= 32) {
+                // NOWAIT store of the slot just packed; wbase/wlen/chan patched per
+                // layer/forward (kv_rb is set after the first build).
+                struct engine_op st = {0};
+                st.kind = ENGINE_KIND_STORE;
+                st.xsrc = kvp_slot(kvh, kind);
+                seq_desc_engine(di, &st);
+                seq_patch(di, 0, 1u | (1u << 9)); // NOWAIT.
+                seq_kvst_di[kvh*2 + kind] = (uint8_t)di;
+                kv_pipe_active = 1;
+                di++;
+            }
         }
     // F0-5: ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB
     // post-increments 16 B, so head j lands at +j*head_dim); the attention list's
@@ -1737,6 +1760,18 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
 // softmax block count depend on pos only, and the score-slot padding survives across heads
 // and layers because only the scores op writes SP_SC (exactly cnt slots). Same values as
 // before, written 28x less often - uncached scratchpad stores are ~25-70 cycles each.
+// Console toggle (kovl): the qkr list length changes, so every downstream base shifts.
+void infer_kv_pipe(int on)
+{
+    kv_pipe = on ? 1 : 0;
+    seq_ffn_base = -1;
+    seq_build_qkr();
+    seq_build_attn();
+    seq_build_ffn();
+    seq_build_scale8();
+}
+int infer_kv_pipe_state(void) { return kv_pipe_active; }
+
 // Console toggle (aovl): rebuild the three dependent lists in either layout.
 void infer_attn_pipe(int on)
 {
@@ -1912,6 +1947,23 @@ embed_done: ;
                 for (int hh = 0; hh < n_head + n_kv_head; hh++)
                     seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
 #endif
+                if (kv_pipe_active) {
+                    // In-list stores: the scale beats must exist before the list runs
+                    // (the store streams them), and each store's target row moves per
+                    // layer/token. The exponent ratchet is identical bookkeeping to the
+                    // post-list placement it replaces.
+                    uint32_t rowoff = (uint32_t)(pos/n_ch)*kv_rb*32;
+                    for (int hh = 0; hh < n_kv_head; hh++) {
+                        kv_pack_prep_res(l, hh, 0, E_NORM);
+                        kv_pack_prep_res(l, hh, 1, ev_res);
+                        for (int kind = 0; kind < 2; kind++) {
+                            uint32_t sdi = seq_kvst_di[hh*2 + kind];
+                            seq_patch(sdi, 4, kv_region_addr(l, hh, kind) + rowoff);
+                            seq_patch(sdi, 5, (uint32_t)kv_rb);
+                            seq_patch(sdi, 10, (uint32_t)(pos % n_ch));
+                        }
+                    }
+                }
                 seq_run(0, seq_qkr_count);
             }
             perf_exit(OP_QKNORM);
@@ -1929,9 +1981,10 @@ embed_done: ;
             perf_exit(OP_ROPE);
 #endif
             perf_enter(OP_KVQUANT);
-            for (int hh = 0; hh < n_kv_head; hh++) {   // Pack every head first...
+            for (int hh = 0; hh < n_kv_head && !kv_pipe_active; hh++) {
 #ifdef CSR_SEQ_BASE
                 // ...the quant8s already ran inside the qkr list (F0-4); prep only.
+                // (With kovl the prep AND the stores already ran with the list.)
                 kv_pack_prep_res(l, hh, 0, E_NORM);
                 kv_pack_prep_res(l, hh, 1, ev_res);
 #else
@@ -1955,10 +2008,11 @@ embed_done: ;
                 engine_run(&op);
             }
 #else
-            for (int hh = 0; hh < n_kv_head; hh++) {   // ...then hand the port to the engine.
-                kv_store_row_res(l, hh, 0, pos);
-                kv_store_row_res(l, hh, 1, pos);
-            }
+            if (!kv_pipe_active)
+                for (int hh = 0; hh < n_kv_head; hh++) { // ...hand the port to the engine.
+                    kv_store_row_res(l, hh, 0, pos);
+                    kv_store_row_res(l, hh, 1, pos);
+                }
 #endif
             perf_exit(OP_KVQUANT);
             eq_res = E_NORM;
