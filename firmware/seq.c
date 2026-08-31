@@ -72,6 +72,44 @@ int seq_wedged; // Sticky: a list never finished, so the engine state is not tru
 
 uint32_t seq_poll_spins, seq_poll_waits;
 
+// Split form (2026-08-31, per-cycle sideband slot): start a list and return; the CPU
+// may then patch OTHER lists' descriptors or do host-memory work while it runs, and
+// seq_join() polls completion. On bitstreams without BONSAI_SP_SB_SLOT the first
+// scratchpad access after seq_list_start() simply stalls until the list finishes -
+// correct either way, only the overlap is lost.
+void seq_join(void)
+{
+    if (seq_wedged)
+        return;
+    uint32_t spins = 0, reports = 0;
+    seq_poll_waits++;
+    while (seq_status_read() & 1) {
+        seq_poll_spins++;
+        if (++spins < 200000u)
+            continue;
+        spins = 0;
+        printf("SEQSTALL dcount=%lu eng=%02lx\n",
+               (unsigned long)(seq_status_read() >> 8),
+               (unsigned long)engine_csr_status_read());
+        if (++reports == 8) {
+            seq_wedged = 1;
+            puts("SEQSTALL: giving up. The engine is stuck mid-op and holds the scratchpad;\n"
+                 "results from here are garbage. Reconfigure the FPGA to recover (a CPU\n"
+                 "reset will not do it) - and note this wipes HBM, so reupload the weights.");
+            return;
+        }
+    }
+}
+
+void seq_list_start(uint32_t idx0, uint32_t count)
+{
+    if (seq_wedged)
+        return;
+    seq_base_write(SP_DESC + idx0*64);
+    seq_count_write(count);
+    seq_start_write(1);
+}
+
 void seq_run(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged) // Nothing will complete until the FPGA is reconfigured.

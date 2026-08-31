@@ -1783,6 +1783,40 @@ void infer_attn_pipe(int on)
 }
 int infer_attn_pipe_state(void) { return attn_pipe_active; }
 
+// Per-layer attention slot patches, extracted so they can run UNDER the qkr list
+// (per-cycle sideband slot): the sequencer is executing qkr descriptors and never
+// dispatches attention ones, so patching them mid-list is safe; every input
+// (kv_ekmax ratchet, region addresses) is CPU-side state settled before the list
+// started. attn_prepatched tells the attention section its work is already done.
+static int attn_prepatched;
+static void attn_patch_slots(int l, int h0, int nh, int chunked)
+{
+    int lg = 0;
+    while ((1 << lg) < head_dim) lg++;
+    int nrep = n_head/n_kv_head;
+    for (int j = 0; j < nh; j++) {
+        int hh = h0 + j, kvh = hh/nrep;
+        uint32_t di = attn_grp(j);
+        uint32_t ds = attn_di_sc(j);
+        int Bk, Rk, Bv, Rd;
+        kv_scores_br(l, kvh, 0, &Bk, &Rk);
+        kv_scores_br(l, kvh, 1, &Bv, &Rd);
+        int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
+        if (chunked) {
+            seq_patch(ds, 8, SP_X + 0x1000 + (uint32_t)hh*head_dim);
+            seq_patch(di + 1, 8, SP_AWP8 + (uint32_t)hh*32);
+            seq_patch(di + 3, 2, SP_AWAM + (uint32_t)hh*32);
+            seq_patch(di + 4, 4, SP_H + (uint32_t)hh*head_dim*2);
+        }
+        seq_patch(ds, 4, kv_region_addr(l, kvh, 0));
+        seq_patch(ds, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
+        seq_patch(di + 1, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
+        seq_patch(di + 2, 4, kv_region_addr(l, kvh, 1));
+        seq_patch(di + 2, 7, (uint32_t)Bv);
+        (void)Rd;
+    }
+}
+
 static void attn_list_prep_token(int pos)
 {
     if (seq_attn_heads <= 0)
@@ -1964,6 +1998,18 @@ embed_done: ;
                         }
                     }
                 }
+#ifdef BONSAI_SP_SB_SLOT
+                if (seq_use && seq_attn_heads >= n_head
+                    && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
+                    // Overlap (sideband slot): the attention list's per-layer patches
+                    // run while the sequencer executes the qkr list. Without the slot
+                    // the first patch would simply stall until the list finished.
+                    seq_list_start(0, seq_qkr_count);
+                    attn_patch_slots(l, 0, n_head, 0);
+                    attn_prepatched = 1;
+                    seq_join();
+                } else
+#endif
                 seq_run(0, seq_qkr_count);
             }
             perf_exit(OP_QKNORM);
@@ -2106,34 +2152,14 @@ attn_scores: ;
             // whenever the list holds every head (hh == j); they are re-patched only in
             // the chunked case, where a slot serves several heads.
             int chunked = (seq_attn_heads < n_head);
-            int lg = 0;
-            while ((1 << lg) < head_dim) lg++;
             for (int h0 = 0; h0 < n_head; h0 += seq_attn_heads) {
                 int nh = n_head - h0;
                 if (nh > seq_attn_heads) nh = seq_attn_heads;
-                for (int j = 0; j < nh; j++) {
-                    int hh = h0 + j, kvh = hh/n_rep;
-                    uint32_t di = attn_grp(j);
-                    uint32_t ds = attn_di_sc(j);
-                    int Bk, Rk, Bv, Rd;
-                    kv_scores_br(l, kvh, 0, &Bk, &Rk);
-                    kv_scores_br(l, kvh, 1, &Bv, &Rd);
-                    int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
-                    if (chunked) {
-                        seq_patch(ds, 8, SP_X + 0x1000 + (uint32_t)hh*head_dim);
-                        seq_patch(di + 1, 8, SP_AWP8 + (uint32_t)hh*32);
-                        seq_patch(di + 3, 2, SP_AWAM + (uint32_t)hh*32);
-                        seq_patch(di + 4, 4, SP_H + (uint32_t)hh*head_dim*2);
-                    }
-                    seq_patch(ds, 4, kv_region_addr(l, kvh, 0));
-                    seq_patch(ds, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
-                    seq_patch(di + 1, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
-                    seq_patch(di + 2, 4, kv_region_addr(l, kvh, 1));
-                    seq_patch(di + 2, 7, (uint32_t)Bv);
-                    (void)Rd;
-                }
+                if (!attn_prepatched)
+                    attn_patch_slots(l, h0, nh, chunked);
                 seq_run((uint32_t)seq_attn_base, (uint32_t)attn_list_len(nh));
             }
+            attn_prepatched = 0;
             perf_exit(OP_SCORES);
             // One float fold per head from the spilled p8 sums / absmaxes.
             perf_enter(OP_WV);
