@@ -2892,10 +2892,12 @@ void infer_vbench(void)
       // limits, near-zero everywhere says the engine's own drain does.
         const struct bons_entry *eg = model_entry(ROLE_FFN_GATE, 0);
         uint32_t b0[32], a0[32];
+        uint32_t r0[32];
         for (int c = 0; c < n_ch && c < 32; c++) {
             engine_csr_perf_chan_write(c);
             b0[c] = engine_csr_perf_beats_read();
             a0[c] = engine_csr_perf_ar_read();
+            r0[c] = engine_csr_perf_r_read();
         }
         t0 = perf_now();
         for (int i = 0; i < 4; i++) model_matvec(eg, SP_X, SP_Y);
@@ -2904,9 +2906,10 @@ void infer_vbench(void)
                (unsigned long)(dt/4), (unsigned long)eg->chan_len_beats);
         for (int c = 0; c < n_ch && c < 32; c += 4) {
             engine_csr_perf_chan_write(c);
-            printf("VB   ch%d beats %lu arstall %lu\n", c,
+            printf("VB   ch%d beats %lu arstall %lu rstall %lu\n", c,
                    (unsigned long)((engine_csr_perf_beats_read() - b0[c])/4),
-                   (unsigned long)((engine_csr_perf_ar_read()   - a0[c])/4));
+                   (unsigned long)((engine_csr_perf_ar_read()   - a0[c])/4),
+                   (unsigned long)((engine_csr_perf_r_read()    - r0[c])/4));
         }
     }
     { // Small weight stream: attn_q matvec.
