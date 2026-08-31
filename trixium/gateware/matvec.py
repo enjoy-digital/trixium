@@ -660,14 +660,25 @@ class BonsaiMatVecEngine(LiteXModule):
                 vec_rd.eq(vecunit.sp_rd_req),
                 # The seq's fetch FSM holds its address cycle when a vec load outranks it.
                 *([] if seq is None else [seq.sp_gnt.eq(~vec_rd)]),
-                rd_free.eq(~vec_rd & ~grant_seq),
+                # Sideband slot (CPU/host): granted on any cycle BOTH ports are free -
+                # below vec and seq, above the engine (which tolerates the pause through
+                # rd_free and the write FIFO). The FIFO-headroom term keeps the drain-rate
+                # argument intact: at/above the mark the engine drains every cycle and the
+                # CPU waits, so gw_ovf stays impossible. A granted sideband access borrows
+                # both ports for exactly one cycle (the scratchpad muxes it in above the
+                # fill/gather inputs); its duty is bounded by the wishbone FSM's >= 4
+                # cycles per access, so nothing starves.
+                scratchpad.sb_allow.eq(~vec_rd & ~grant_seq
+                                       & ~(vecunit.sp_wr_req & (wr_fifo.level < 6))
+                                       & (wr_fifo.level < 6)),
+                rd_free.eq(~vec_rd & ~grant_seq & ~scratchpad.sb_gnt_any),
                 vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)),
                 vecunit.sp_wr_gnt.eq(vec_wr),
                 fetch_rdy.eq(wr_fifo.level < 6),
                 gw_pending.eq(wr_fifo.readable | (sp_gw_we != 0)),
                 wr_fifo.din.eq(Cat(eng_gw_adr, sp_gw_we, eng_gw_dat)),
                 wr_fifo.we.eq(sp_gw_we != 0),
-                wr_fifo.re.eq(~vec_wr & wr_fifo.readable),
+                wr_fifo.re.eq(~vec_wr & wr_fifo.readable & ~scratchpad.sb_gnt_any),
                 If(vec_rd,
                     scratchpad.fill.adr.eq(vecunit.sp_rd_adr),
                 ).Elif(grant_seq,

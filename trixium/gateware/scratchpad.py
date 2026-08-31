@@ -44,6 +44,14 @@ class BonsaiScratchpad(LiteXModule):
         # borrow window). Left at 0 (never granted) when unwired - unit-test DUTs and
         # configurations without a bus port need no changes.
         self.units_idle = Signal()
+        # Per-cycle sideband slot (2026-08-31): the integrator may raise sb_allow on any
+        # cycle the R and W ports are both free, so CPU/host accesses no longer wait for
+        # ALL units to go idle - the change that lets firmware patch the next descriptor
+        # list or read spills while the sequencer is running one. units_idle remains a
+        # sufficient condition, so integrators that never drive sb_allow are unchanged.
+        self.sb_allow  = Signal()
+        self.sb_req_any = Signal() # For the integrator's arbitration.
+        self.sb_gnt_any = Signal()
 
         # # #
 
@@ -76,8 +84,11 @@ class BonsaiScratchpad(LiteXModule):
         gather_bwe = Signal(32)
         self.comb += [
             gather_bwe.eq(Cat(*[Replicate(self.gather.we[i], 4) for i in range(8)])),
-            self._sb_gnt[0].eq(self._sb_req[0] & self.units_idle),
-            self._sb_gnt[1].eq(self._sb_req[1] & self.units_idle & ~self._sb_req[0]),
+            self._sb_gnt[0].eq(self._sb_req[0] & (self.units_idle | self.sb_allow)),
+            self._sb_gnt[1].eq(self._sb_req[1] & (self.units_idle | self.sb_allow)
+                               & ~self._sb_req[0]),
+            self.sb_req_any.eq(self._sb_req[0] | self._sb_req[1]),
+            self.sb_gnt_any.eq(self._sb_gnt[0] | self._sb_gnt[1]),
             self.fill.dat_r.eq(port_r.dat_r),
             self._sb_rdat.eq(port_r.dat_r),
             If(self._sb_gnt[0],

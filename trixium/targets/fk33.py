@@ -206,6 +206,7 @@ class BonsaiSoC(SoCCore):
             if seq is not None:
                 units_idle = units_idle & ~seq.busy
             self.comb += self.scratchpad.units_idle.eq(units_idle)
+            self.add_constant("BONSAI_SP_SB_SLOT", 1) # Per-cycle sideband slot present.
             self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
 
             # Scratchpad on the SoC bus (uncached: shared with the engine).
