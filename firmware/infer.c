@@ -1884,6 +1884,15 @@ int infer_attn_pipe_state(void) { return attn_pipe_active; }
 // started. attn_prepatched tells the attention section its work is already done.
 static int attn_prepatched;
 static int ffn_prepatched;
+int eovl_use = 1; // C2-2: fold head j under the still-running attention list (needs RSLOT).
+// List-relative dcount ("descriptors completed") threshold after which head j's fold
+// inputs (softmax8's AWP8 self-spill and spill(j)'s AWAM) are certainly written: one
+// past norm(j), whose producers are all earlier vec descriptors in the same list.
+static inline uint32_t attn_fold_ready(int j, int chunk) {
+    if (!attn_pipe_active) return (uint32_t)(j*5 + 5);
+    if (j >= chunk - 2)    return (uint32_t)(1 + (j + 1)*5 + 2); // last-group/epilogue slots.
+    return (uint32_t)(1 + (j + 1)*5 + 3);
+}
 // Per-layer FFN list rebuild (three engine descriptors + their flag words), extracted so
 // it can POST under the qkr list in the povl window (all inputs are layer-known: model
 // entries and static scratchpad addresses; only the silu A4 imm needs ex8 and stays at
@@ -1963,6 +1972,40 @@ static void attn_list_prep_token(int pos)
     }
 }
 #endif
+
+static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
+{
+    int kvh = hh/(n_head/n_kv_head);
+    uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8 + (uint32_t)hh*32);
+    uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWAM + (uint32_t)hh*32);
+    int Bv, Rd;
+    kv_scores_br(l, kvh, 1, &Bv, &Rd);
+    int Rpre = axpy_rpre_c(P8 ? P8 : 1);
+    int k2 = 0;
+    while ((am >> k2) > 16383u) k2++;
+    int E1 = Rpre - Bv + k2;
+    if (ifold_use) {
+        // Integer emulation of the float32 fold (F1-5): same bits, no soft-float.
+        uint32_t qm; int qe;
+        attn_f32_recip(P8 ? P8 : 1, &qm, &qe);
+        aw_qm[hh] = qm;
+        aw_qe[hh] = qe + E1;
+        uint32_t a = am >> k2;
+        if (a) {
+            uint32_t m2; int e2;
+            attn_f32_mul(a, qm, qe + E1, &m2, &e2);
+            if (!aw_hvalid || e2 > aw_he2 || (e2 == aw_he2 && m2 > aw_hm2)) {
+                aw_hm2 = m2; aw_he2 = e2; aw_hvalid = 1;
+            }
+        }
+    } else {
+        float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), E1);
+        aw_c[hh] = c2;
+        float hm2 = (float)(am >> k2)*c2;
+        if (hm2 > *aw_hmax_p) *aw_hmax_p = hm2;
+    }
+    (void)Rd;
+}
 
 static int forward(int token, int want_logits)
 {
@@ -2268,6 +2311,36 @@ attn_scores: ;
             // whenever the list holds every head (hh == j); they are re-patched only in
             // the chunked case, where a slot serves several heads.
             int chunked = (seq_attn_heads < n_head);
+#ifdef BONSAI_SP_SB_RSLOT
+            if (eovl_use && !chunked) {
+                // C2-2: fold head j while heads j+2.. still execute. The read slot lets
+                // the spill reads grant mid-list; dcount ("descriptors completed")
+                // past norm(j) proves j's spills are written. The fold work and the
+                // per-head CSR polls replace seq_join's idle spin.
+                if (!attn_prepatched)
+                    attn_patch_slots(l, 0, n_head, 0);
+                attn_prepatched = 0;
+                seq_list_start((uint32_t)seq_attn_base, (uint32_t)attn_list_len(n_head));
+                perf_exit(OP_SCORES);
+                perf_enter(OP_WV);
+                aw_hvalid = 0;
+                for (int hh = 0; hh < n_head; hh++) {
+                    uint32_t ready = attn_fold_ready(hh, n_head), spins = 0;
+                    for (;;) {
+                        uint32_t st = seq_status_read();
+                        if (!(st & 1) || ((st >> 8) >= ready))
+                            break;
+                        if (++spins > 4000000u) break; // seq_join below reports the wedge.
+                    }
+                    attn_fold_head(l, hh, aw_c, &aw_hmax);
+                }
+                perf_exit(OP_WV);
+                perf_enter(OP_SCORES);
+                seq_join();
+                perf_exit(OP_SCORES);
+                goto attn_heads_done;
+            }
+#endif
             for (int h0 = 0; h0 < n_head; h0 += seq_attn_heads) {
                 int nh = n_head - h0;
                 if (nh > seq_attn_heads) nh = seq_attn_heads;
@@ -2277,43 +2350,11 @@ attn_scores: ;
             }
             attn_prepatched = 0;
             perf_exit(OP_SCORES);
-            // One float fold per head from the spilled p8 sums / absmaxes.
+            // One fold per head from the spilled p8 sums / absmaxes (attn_fold_head).
             perf_enter(OP_WV);
             aw_hvalid = 0;
-            for (int hh = 0; hh < n_head; hh++) {
-                int kvh = hh/n_rep;
-                uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8
-                                                     + (uint32_t)hh*32);
-                uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWAM
-                                                     + (uint32_t)hh*32);
-                int Bv, Rd;
-                kv_scores_br(l, kvh, 1, &Bv, &Rd);
-                int Rpre = axpy_rpre_c(P8 ? P8 : 1);
-                int k2 = 0;
-                while ((am >> k2) > 16383u) k2++;
-                int E1 = Rpre - Bv + k2;
-                if (ifold_use) {
-                    // Integer emulation of the float32 fold (F1-5): same bits, no soft-float.
-                    uint32_t qm; int qe;
-                    attn_f32_recip(P8 ? P8 : 1, &qm, &qe);
-                    aw_qm[hh] = qm;
-                    aw_qe[hh] = qe + E1;
-                    uint32_t a = am >> k2;
-                    if (a) {
-                        uint32_t m2; int e2;
-                        attn_f32_mul(a, qm, qe + E1, &m2, &e2);
-                        if (!aw_hvalid || e2 > aw_he2 || (e2 == aw_he2 && m2 > aw_hm2)) {
-                            aw_hm2 = m2; aw_he2 = e2; aw_hvalid = 1;
-                        }
-                    }
-                } else {
-                    float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), E1);
-                    aw_c[hh] = c2;
-                    float hm2 = (float)(am >> k2)*c2;
-                    if (hm2 > aw_hmax) aw_hmax = hm2;
-                }
-                (void)Rd;
-            }
+            for (int hh = 0; hh < n_head; hh++)
+                attn_fold_head(l, hh, aw_c, &aw_hmax);
             perf_exit(OP_WV);
             goto attn_heads_done;
         }

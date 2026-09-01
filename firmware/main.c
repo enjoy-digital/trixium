@@ -467,6 +467,13 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) prep_ovl = 0;
         printf("POVL %s (attention patches under the qkr list)\n", prep_ovl ? "on" : "off");
     }
+    else if (strcmp(token, "eovl") == 0) {
+        extern int eovl_use;
+        if (strncmp(str, "on", 2) == 0)  eovl_use = 1;
+        if (strncmp(str, "off", 3) == 0) eovl_use = 0;
+        printf("EOVL %s (fold heads under the running attention list)\n",
+               eovl_use ? "on" : "off");
+    }
     else if (strcmp(token, "fprof") == 0) {
         extern int fprof_use; extern void fprof_reset(void), fprof_print(void);
         if (strncmp(str, "on", 2) == 0)  { fprof_use = 1; fprof_reset(); }
