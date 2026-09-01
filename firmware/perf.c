@@ -106,6 +106,44 @@ void perf_print(void)
 // array is idle ~92% of a token and the sequencer issues one descriptor at a time, so
 // `neither` is the number that decides whether a dual-issue sequencer is worth building:
 // it is the time no unit is doing work at all, i.e. pure serialisation and dispatch.
+// Windowed overlap accounting (C2-1a): mark at a window's start, accumulate the four
+// counter deltas at its end. Callers keep their own acc[4] = {tot, eng, vec, both}.
+static uint32_t ovlw_tot, ovlw_eng, ovlw_vec, ovlw_both;
+
+void perf_ovl_mark(void)
+{
+#ifdef CSR_ENGINE_CSR_CYC_TOTAL_ADDR
+    ovlw_tot  = engine_csr_cyc_total_read();
+    ovlw_eng  = engine_csr_cyc_eng_read();
+    ovlw_vec  = engine_csr_cyc_vec_read();
+    ovlw_both = engine_csr_cyc_both_read();
+#endif
+}
+
+void perf_ovl_acc(uint32_t acc[4])
+{
+#ifdef CSR_ENGINE_CSR_CYC_TOTAL_ADDR
+    acc[0] += engine_csr_cyc_total_read() - ovlw_tot;
+    acc[1] += engine_csr_cyc_eng_read()   - ovlw_eng;
+    acc[2] += engine_csr_cyc_vec_read()   - ovlw_vec;
+    acc[3] += engine_csr_cyc_both_read()  - ovlw_both;
+#else
+    (void)acc;
+#endif
+}
+
+void perf_ovl_report(const char *tag, const uint32_t acc[4])
+{
+    uint32_t tot = acc[0] ? acc[0] : 1;
+    printf("OVLW %-10s tot %9lu  eng %2lu%%  vec %2lu%%  both %2lu%%  neither %2lu%%\n",
+           tag, (unsigned long)acc[0],
+           (unsigned long)((uint64_t)acc[1]*100/tot),
+           (unsigned long)((uint64_t)acc[2]*100/tot),
+           (unsigned long)((uint64_t)acc[3]*100/tot),
+           (unsigned long)((acc[0] + acc[3] >= acc[1] + acc[2])
+               ? (uint64_t)(acc[0] + acc[3] - acc[1] - acc[2])*100/tot : 0));
+}
+
 void perf_print_overlap(void)
 {
 #ifdef CSR_ENGINE_CSR_CYC_TOTAL_ADDR

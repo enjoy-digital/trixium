@@ -36,6 +36,9 @@ uint32_t perf_now(void); // Free-running cycle counter (wraps; deltas are valid)
 void     perf_enter(enum perf_op op);
 void     perf_exit(enum perf_op op);
 void     perf_print(void); // Dump per-op {calls, cycles} table + engine counters.
+void     perf_ovl_mark(void);               // C2-1a: overlap-window start.
+void     perf_ovl_acc(uint32_t acc[4]);     // C2-1a: add window deltas to acc[tot,eng,vec,both].
+void     perf_ovl_report(const char *tag, const uint32_t acc[4]);
 
 // Accumulators exposed for bench.
 extern uint32_t perf_cycles[OP_COUNT];

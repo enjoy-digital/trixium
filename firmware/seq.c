@@ -101,6 +101,38 @@ void seq_join(void)
     }
 }
 
+// Traced run (C2-1a): like seq_run, but records perf_now() at every dcount transition
+// (seq_status[8:...]) into ts[0..max-1]; ts[0] at start, last entry at done. Returns
+// entries used. ~70-cycle CSR-poll resolution vs multi-thousand-cycle descriptors.
+int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
+{
+    if (seq_wedged)
+        return 0;
+    int n = 0;
+    uint32_t last = 0xFFFFFFFF, spins = 0;
+    if (n < max) ts[n++] = perf_now();
+    seq_base_write(SP_DESC + idx0*64);
+    seq_count_write(count);
+    seq_start_write(1);
+    for (;;) {
+        uint32_t st = seq_status_read();
+        uint32_t dc = st >> 8;
+        if (dc != last) {
+            last = dc;
+            if (n < max) ts[n++] = perf_now();
+        }
+        if (!(st & 1))
+            break;
+        if (++spins > 4000000u) { // Wedge guard (diagnostic path: just stop).
+            seq_wedged = 1;
+            puts("SEQSTALL (trace): giving up - reconfigure to recover.");
+            break;
+        }
+    }
+    if (n < max) ts[n++] = perf_now();
+    return n;
+}
+
 void seq_list_start(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged)

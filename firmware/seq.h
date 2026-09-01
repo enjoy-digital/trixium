@@ -28,6 +28,8 @@ void     seq_desc_stop(uint32_t idx);
 void     seq_patch(uint32_t idx, int word, uint32_t value); // Patch one descriptor word.
 void     seq_run(uint32_t idx0, uint32_t count);            // Run + wait (gives up if wedged).
 void     seq_list_start(uint32_t idx0, uint32_t count);     // Start only; overlap CPU work...
+int      seq_run_trace(uint32_t idx0, uint32_t count,
+                       uint32_t *ts, int max);              // C2-1a: per-dcount timestamps.
 void     seq_join(void);                                    // ...then wait (same wedge guard).
 extern int seq_wedged; // Set once a list stalled: every later seq_run() is a no-op.
 

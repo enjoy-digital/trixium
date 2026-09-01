@@ -1226,6 +1226,39 @@ static void seq_build_attn(void)
 // dmax from the engine absmax CSR (down ran last) - the SAME values the removed round-trips
 // produced, so the numerics are identical by construction. The final norm -> SP_D and
 // resid_add stay CPU-side (they need *omax and the residual ratchet state).
+// C2-1a FFN diagnosis (fprof console command): windowed overlap accumulators over the
+// FFN block on whichever path ran, plus one layer's fine-grained trace per forward
+// (layer 0): descriptor timestamps for the list path, step timestamps for the op path.
+int fprof_use = 0;
+static uint32_t fprof_acc_list[4], fprof_acc_ops[4];
+static uint32_t fprof_nlist, fprof_nops;
+static uint32_t fprof_ts[16]; static int fprof_nts;
+static uint32_t fprof_steps[8]; static int fprof_nsteps;
+void fprof_reset(void)
+{
+    for (int i = 0; i < 4; i++) fprof_acc_list[i] = fprof_acc_ops[i] = 0;
+    fprof_nlist = fprof_nops = 0; fprof_nts = 0; fprof_nsteps = 0;
+}
+void fprof_print(void)
+{
+    if (fprof_nlist) { perf_ovl_report("FFN-list", fprof_acc_list);
+                       printf("  windows %lu\n", (unsigned long)fprof_nlist); }
+    if (fprof_nops)  { perf_ovl_report("FFN-ops", fprof_acc_ops);
+                       printf("  windows %lu\n", (unsigned long)fprof_nops); }
+    if (fprof_nts) {
+        printf("FFNTRACE list dcounts (deltas):");
+        for (int i = 1; i < fprof_nts; i++)
+            printf(" %lu", (unsigned long)(fprof_ts[i] - fprof_ts[i-1]));
+        printf("\n");
+    }
+    if (fprof_nsteps) {
+        printf("FFNTRACE ops steps (deltas):");
+        for (int i = 1; i < fprof_nsteps; i++)
+            printf(" %lu", (unsigned long)(fprof_steps[i] - fprof_steps[i-1]));
+        printf("\n");
+    }
+}
+
 static int seq_ffn_base = -1;
 static void seq_build_ffn(void)
 {
@@ -2558,7 +2591,15 @@ attn_heads_done: ;
                 seq_patch(seq_ffn_base + 6, 6,
                           (uint32_t)(ex8 - (int)eg_t->bias + (int)eg_t->rshift + 6));
                 perf_enter(OP_SILU_MUL);
-                seq_run((uint32_t)seq_ffn_base, 10);
+                if (fprof_use) {
+                    perf_ovl_mark();
+                    if (l == 0)
+                        fprof_nts = seq_run_trace((uint32_t)seq_ffn_base, 10, fprof_ts, 16);
+                    else
+                        seq_run((uint32_t)seq_ffn_base, 10);
+                    perf_ovl_acc(fprof_acc_list); fprof_nlist++;
+                } else
+                    seq_run((uint32_t)seq_ffn_base, 10);
                 perf_exit(OP_SILU_MUL);
                 // Recover the folds the removed round-trips produced - identical values:
                 // kg/ku from the spilled engine absmaxes, s from quant8's surviving res6.
@@ -2582,7 +2623,12 @@ attn_heads_done: ;
                 goto ffn_done;
             }
 #endif
+            if (fprof_use) {
+                perf_ovl_mark();
+                if (l == 0) { fprof_nsteps = 0; fprof_steps[fprof_nsteps++] = perf_now(); }
+            }
             model_matvec(eg_t, SP_X, SP_Y);
+            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int kg;
 #if defined(CSR_ENGINE_CSR_ABSMAX_ADDR) && defined(CSR_VECUNIT_BASE)
             if (ovl_use && op_on_hw(OP_NORM_I32)) {
@@ -2608,17 +2654,24 @@ attn_heads_done: ;
                 perf_exit(OP_NORM_I32);
                 model_matvec(eu_t, SP_X, SP_YU);
             }
+            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int eg = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
 
             perf_enter(OP_NORM_I32);
             int ku = op_norm_i32_sp(SP_YU, SP_U, ffn_dim);
             perf_exit(OP_NORM_I32);
+            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int eu = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
 
             int es = eg + eu + 15;
             int es8 = es + op_silu_q8_sp(SP_G, eg, SP_U, eu, ffn_dim, SP_X);
+            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
 
             model_matvec(ed_t, SP_X, SP_Y);
+            if (fprof_use) {
+                if (l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
+                perf_ovl_acc(fprof_acc_ops); fprof_nops++;
+            }
             perf_enter(OP_NORM_I32);
             uint32_t dmax = 0;
             int kd = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);

@@ -467,6 +467,13 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) prep_ovl = 0;
         printf("POVL %s (attention patches under the qkr list)\n", prep_ovl ? "on" : "off");
     }
+    else if (strcmp(token, "fprof") == 0) {
+        extern int fprof_use; extern void fprof_reset(void), fprof_print(void);
+        if (strncmp(str, "on", 2) == 0)  { fprof_use = 1; fprof_reset(); }
+        if (strncmp(str, "off", 3) == 0) fprof_use = 0;
+        if (strncmp(str, "print", 5) == 0) fprof_print();
+        printf("FPROF %s\n", fprof_use ? "on" : "off");
+    }
     else if (strcmp(token, "kovl") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_kv_pipe(1);
         if (strncmp(str, "off", 3) == 0) infer_kv_pipe(0);
