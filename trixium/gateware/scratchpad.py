@@ -58,6 +58,14 @@ class BonsaiScratchpad(LiteXModule):
         # firmware overlap (patch-under-list) is write-only, so it keeps its win.
         self.sbw_pending = Signal() # FIFO non-empty (integrator: drain + seq interlock).
         self.sbw_gnt     = Signal() # Integrator grant: drain one write this cycle.
+        # Read slot (C2-2): the integrator may raise sbr_allow on any cycle the R port is
+        # free (below vec loads and the seq fetch; the engine fill yields via rd_free), so
+        # CPU/host READS no longer wait for all units idle either. FIFO-empty still gates
+        # every read, so a read always sees every posted write. Reads only ever borrow the
+        # R port - with writes posted, the legacy both-port borrow was pointless and, if
+        # granted mid-activity, would have eaten a gather write's cycle.
+        self.sbr_allow   = Signal()
+        self.sbr_gnt_any = Signal() # For the integrator's rd_free gating.
 
         # # #
 
@@ -115,9 +123,11 @@ class BonsaiScratchpad(LiteXModule):
         gather_bwe = Signal(32)
         self.comb += [
             gather_bwe.eq(Cat(*[Replicate(self.gather.we[i], 4) for i in range(8)])),
-            self._sb_gnt[0].eq(self._sb_req[0] & self.units_idle & ~sbw.readable),
-            self._sb_gnt[1].eq(self._sb_req[1] & self.units_idle & ~sbw.readable
-                               & ~self._sb_req[0]),
+            self._sb_gnt[0].eq(self._sb_req[0] & (self.units_idle | self.sbr_allow)
+                               & ~sbw.readable),
+            self._sb_gnt[1].eq(self._sb_req[1] & (self.units_idle | self.sbr_allow)
+                               & ~sbw.readable & ~self._sb_req[0]),
+            self.sbr_gnt_any.eq(self._sb_gnt[0] | self._sb_gnt[1]),
             self.fill.dat_r.eq(port_r.dat_r),
             self._sb_rdat.eq(port_r.dat_r),
             # W port: a granted drain outranks everything (the integrator only grants
@@ -128,27 +138,18 @@ class BonsaiScratchpad(LiteXModule):
                 port_w.dat_w.eq(Replicate(dr_wdat, 8)),
                 Case(dr_sel, {i: port_w.we.eq(dr_bsel << (4*i)) for i in range(8)}),
                 port_r.adr.eq(self.fill.adr),
-            ).Elif(self._sb_gnt[0],
-                port_r.adr.eq(self._sb_adr[0]),
-                port_w.adr.eq(self._sb_adr[0]),
-                port_w.dat_w.eq(Replicate(self._sb_wdat[0], 8)),
-                If(self._sb_we[0],
-                    Case(self._sb_sel[0],
-                         {i: port_w.we.eq(self._sb_bsel[0] << (4*i)) for i in range(8)}),
-                )
-            ).Elif(self._sb_gnt[1],
-                port_r.adr.eq(self._sb_adr[1]),
-                port_w.adr.eq(self._sb_adr[1]),
-                port_w.dat_w.eq(Replicate(self._sb_wdat[1], 8)),
-                If(self._sb_we[1],
-                    Case(self._sb_sel[1],
-                         {i: port_w.we.eq(self._sb_bsel[1] << (4*i)) for i in range(8)}),
-                )
             ).Else(
-                port_r.adr.eq(self.fill.adr),
                 port_w.adr.eq(self.gather.adr),
                 port_w.dat_w.eq(self.gather.dat_w),
                 port_w.we.eq(gather_bwe),
+                # R port: granted reads take it for exactly one cycle; else fill.
+                If(self._sb_gnt[0],
+                    port_r.adr.eq(self._sb_adr[0]),
+                ).Elif(self._sb_gnt[1],
+                    port_r.adr.eq(self._sb_adr[1]),
+                ).Else(
+                    port_r.adr.eq(self.fill.adr),
+                )
             )
         ]
 

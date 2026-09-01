@@ -1890,6 +1890,118 @@ def test_overlap_sideband_slot():
     run_simulation(dut, [driver()])
 
 
+def test_overlap_sideband_read_slot():
+    # C2-2: sideband READS grant during a concurrent engine matvec + vec resid_add (the
+    # R-port-only slot), return correct data, and never outrun the posted-write FIFO -
+    # a read issued right after a posted write to the same word must return the NEW
+    # value (the FIFO-empty gate is a tested contract). Unit results stay bit-exact and
+    # no gather write is lost (reads must never disturb the W port).
+    from trixium.model import asm as vasm
+    n_channels, rows_per_chan, cols, seed = 2, 32, 128, 97
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols).astype(np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    res_exp = bx.matvec_ternary(scales, codes, x8, B, R)
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+    nv = 1024
+    vec_args = [0x4000, 0x4800, 0x5000, nv//16, -1, -3]
+    sp = bytearray(64*1024)
+    sp[0x1000:0x1000 + cols] = x8.tobytes()
+    sp[0x4000:0x4000 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    sp[0x4800:0x4800 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    mirror = _overlap_vec_golden(sp, vec_args)
+    sb_src = rng.integers(0, 2**32, 64, dtype=np.uint32)
+    sp[0x7000:0x7000 + 256] = sb_src.astype("<u4").tobytes()
+    dut = _OverlapDUT(n_channels, payloads, sp_init=words_from_bytes(bytes(sp)))
+
+    def sb_post(beat, sel, wdat):
+        yield dut.scratchpad._sbw_req[1].eq(1)
+        yield dut.scratchpad._sbw_adr[1].eq(beat)
+        yield dut.scratchpad._sbw_sel[1].eq(sel)
+        yield dut.scratchpad._sbw_bsel[1].eq(0xF)
+        yield dut.scratchpad._sbw_wdat[1].eq(wdat)
+        yield
+        waited = 0
+        while not (yield dut.scratchpad._sbw_ok[1]):
+            waited += 1
+            assert waited < 300, "posted write starved"
+            yield
+        yield dut.scratchpad._sbw_req[1].eq(0)
+        yield
+
+    def sb_read(beat, sel, bound, tag):
+        yield dut.scratchpad._sb_req[1].eq(1)
+        yield dut.scratchpad._sb_adr[1].eq(beat)
+        yield dut.scratchpad._sb_sel[1].eq(sel)
+        yield
+        waited = 0
+        while not (yield dut.scratchpad._sb_gnt[1]):
+            waited += 1
+            assert waited < bound, f"read not granted ({tag})"
+            yield
+        yield dut.scratchpad._sb_req[1].eq(0)
+        yield
+        rd = (yield dut.scratchpad._sb_rdat)
+        return (rd >> (32*sel)) & 0xFFFFFFFF
+
+    def driver():
+        yield from _vec_csr_upload(dut, vasm.assemble(vasm.PROGRAMS["resid_add"]()))
+        yield dut.engine.cmd.kind.eq(0)
+        yield dut.engine.cmd.rows.eq(rows_per_chan)
+        yield dut.engine.cmd.cols.eq(cols)
+        yield dut.engine.cmd.rem.eq(0)
+        yield dut.engine.cmd.sbeats.eq((G*2 + 31)//32)
+        yield dut.engine.cmd.cbeats.eq((cols + 127)//128)
+        yield dut.engine.cmd.wbase.eq(0)
+        yield dut.engine.cmd.wlen.eq(len(payloads[0])//32)
+        yield dut.engine.cmd.bias.eq(B)
+        yield dut.engine.cmd.rshift.eq(R)
+        yield dut.engine.cmd.xsrc.eq(0x1000)
+        yield dut.engine.cmd.dst.eq(0x2000)
+        yield dut.engine.cmd.valid.eq(1)
+        yield
+        while not (yield dut.engine.cmd.ready):
+            yield
+        yield dut.engine.cmd.valid.eq(0)
+        yield from _vec_csr_submit(dut, vec_args)
+        # Mid-activity reads of the known block: must grant within a small bound.
+        for i in range(24):
+            v = yield from sb_read(0x7000//32 + (i % 8), i % 8, 300, "mid-activity")
+            assert v == int(sb_src[(i % 8)*8 + (i % 8)]), f"read {i} returned {v:#x}"
+            for _ in range(2):
+                yield
+        # Read-after-posted-write: the read must wait for the drain and see the NEW value.
+        for i in range(8):
+            w = (0xFEED0000 + i) & 0xFFFFFFFF
+            yield from sb_post(0x7800//32, i, w)
+            v = yield from sb_read(0x7800//32, i, 600, "after-post")
+            assert v == w, f"read-after-post {i}: {v:#x} != {w:#x}"
+        for _ in range(30000):
+            if (yield dut.engine.done):
+                break
+            yield
+        for _ in range(200):
+            yield
+        assert (yield dut.engine.gw_ovf) == 0, "gather write lost under read traffic"
+        got_res = yield from _read_sp(dut, 0x2000, 4*M)
+        assert np.array_equal(np.frombuffer(got_res, dtype="<i4"), res_exp), \
+            "matvec result changed under sideband reads"
+        got_vec = yield from _read_sp(dut, 0x5000, 2*nv)
+        assert got_vec == bytes(mirror[0x5000:0x5000 + 2*nv]), \
+            "vec result changed under sideband reads"
+
+    run_simulation(dut, [driver()])
+
+
 def test_overlap_engine_vec_concurrent():
     # Engine ternary matvec and a vector resid_add run CONCURRENTLY on disjoint regions.
     # Both results must equal their serial goldens, cyc_both must show real overlap, and

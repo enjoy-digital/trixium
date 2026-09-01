@@ -622,6 +622,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 fetch_rdy.eq(1),
                 # Posted sideband writes drain whenever the engine is not writing.
                 scratchpad.sbw_gnt.eq(scratchpad.sbw_pending & (sp_gw_we == 0)),
+                scratchpad.sbr_allow.eq(1), # No vec/seq in this configuration.
                 # gw_pending stays 0: writes hit the RAM directly, done needs no drain.
                 scratchpad.fill.adr.eq(eng_fill_adr),
                 scratchpad.gather.adr.eq(eng_gw_adr),
@@ -674,7 +675,10 @@ class BonsaiMatVecEngine(LiteXModule):
                 # headroom margin keeps gw_ovf impossible (level(T-1) < 5 bounds
                 # level(T) <= 6 < 8 on a non-draining cycle).
                 scratchpad.sbw_gnt.eq(scratchpad.sbw_pending & ~vec_wr & sb_headroom_r),
-                rd_free.eq(~vec_rd & ~grant_seq),
+                # Read slot (C2-2): reads take the R port on any free cycle, below vec
+                # loads and the seq fetch; the fill/store address just holds (rd_free).
+                scratchpad.sbr_allow.eq(~vec_rd & ~grant_seq),
+                rd_free.eq(~vec_rd & ~grant_seq & ~scratchpad.sbr_gnt_any),
                 vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)),
                 vecunit.sp_wr_gnt.eq(vec_wr),
                 fetch_rdy.eq(wr_fifo.level < 6),
