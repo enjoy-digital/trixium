@@ -1060,8 +1060,15 @@ static int seq_attn_base, seq_attn_dph, seq_attn_heads;
 // tokens caught it.) The serialization softmax8(j) needs against scores(j) comes free from the
 // dispatch of scores(j+1) - an engine descriptor only dispatches when the engine is
 // idle - so no barrier bits are required. Layout when active:
-//   base+0                 scores(slot 0), NOWAIT           (prologue)
-//   base+1+j*5 .. +4       [scores(slot j+1) NOWAIT | nopd] softmax8(j) wv(j) spill(j) norm(j)
+//   base+0                 scores(slot 0), NOWAIT                    (prologue)
+//   base+1+j*5 .. +4       [spill(j-1)|nopd] [scores(j+1) NOWAIT|nopd] [norm(j-1)|nopd]
+//                          softmax8(j)  wv(j) NOWAIT
+//   base+1+chunk*5 .. +1   spill(chunk-1)  norm(chunk-1)              (epilogue, static)
+// Deep form (2026-08-31 night): wv(j) is NOWAIT; the next group's spill(j) stalls on the
+// absmax interlock until wv(j) completes (the tracker is safe - scores(j+2) sits AFTER
+// the spill in list order), and norm(j-1)+softmax8(j) execute under scores(j+1)'s
+// stream. The engine idles only for the ~20-cycle spill instead of spill+norm, and the
+// vector unit fills the scores streams completely. Non-chunked only.
 static int attn_pipe = 1;        // Requested (aovl console toggle).
 static int attn_pipe_active = 0; // What the built list uses.
 static inline uint32_t attn_grp(int j) {
@@ -1070,13 +1077,29 @@ static inline uint32_t attn_grp(int j) {
 }
 static inline uint32_t attn_di_sc(int j) { // scores descriptor serving slot j
     if (!attn_pipe_active) return attn_grp(j);
-    return (j == 0) ? (uint32_t)seq_attn_base : attn_grp(j - 1);
+    // Deep layout: slot 1 of the previous group (slot 0 is that group's spill). The
+    // aovl-era +0 here made sc(j) clobber spill(j-1) and left every slot 1 unwritten -
+    // w0 = 0 is a STOP, so the list ended after two scores ops; the descriptor dump
+    // made it obvious after three wrong-token hunts in the execution semantics.
+    return (j == 0) ? (uint32_t)seq_attn_base : attn_grp(j - 1) + 1u;
+}
+static inline uint32_t attn_di_sm(int j) { // softmax8 slot
+    return attn_grp(j) + (attn_pipe_active ? 3u : 1u);
+}
+static inline uint32_t attn_di_wv(int j) { // wv (AXPY) slot
+    return attn_grp(j) + (attn_pipe_active ? 4u : 2u);
 }
 static inline uint32_t attn_sc_dst(int j) {
-    return (uint32_t)SP_SC + ((j & 1) ? 0x3800u : 0u); // 14 KB halves (ctx <= ~3568).
+    // Double-buffered ONLY in the pipelined layout. The plain list never needed it, and
+    // its INT32_MIN padding is only maintained for the active layout - alternating here
+    // unconditionally left aovl-off reading an unpadded second buffer for odd heads
+    // (latent since the aovl commit: every sim gate ran the pipelined default and the
+    // card's aovl-off benches never token-checked; the pipe-off bisect exposed it).
+    return (uint32_t)SP_SC
+           + ((attn_pipe_active && (j & 1)) ? 0x3800u : 0u); // 14 KB halves (ctx <= ~3568).
 }
 static inline int attn_list_len(int nh) {
-    return nh*seq_attn_dph + (attn_pipe_active ? 1 : 0);
+    return nh*seq_attn_dph + (attn_pipe_active ? 3 : 0); // Prologue + 2-slot epilogue.
 }
 static void seq_build_attn(void)
 {
@@ -1089,7 +1112,7 @@ static void seq_build_attn(void)
     // softmax8's tail, and 6 + n_ch = 14 before the engine learned to reduce across
     // channels. 16*5 + 66 = 146 of 192, so the FFN and scale8 lists fit behind it.
     int dph = 5;
-    int cap = (192 - seq_qkr_count - (attn_pipe ? 1 : 0))/dph;
+    int cap = (192 - seq_qkr_count - (attn_pipe ? 3 : 0))/dph;
     if (cap <= 0)
         return;
     int chunk = (cap < n_head) ? cap : n_head;
@@ -1099,7 +1122,8 @@ static void seq_build_attn(void)
     seq_attn_base  = seq_qkr_count;
     seq_attn_dph   = dph;
     seq_attn_heads = chunk;
-    attn_pipe_active = attn_pipe;
+    attn_pipe_active = attn_pipe && (chunk == n_head); // Deep layout: non-chunked only.
+    int32_t z = 0;
     for (int j = 0; j < chunk; j++) {
         uint32_t di = attn_grp(j);
         struct engine_op sc = {0};
@@ -1113,14 +1137,17 @@ static void seq_build_attn(void)
         seq_desc_engine(attn_di_sc(j), &sc);
         if (attn_pipe_active) {
             seq_patch(attn_di_sc(j), 0, 1u | (1u << 9)); // NOWAIT.
-            if (j == chunk - 1) { // Last group's scores slot: a one-DONE placeholder.
-                int32_t z = 0;
-                seq_desc_vec(di + 0, PROG_NOPD, &z, 0, 0);
-            }
+            // No scores(chunk) exists: the placeholder goes in the LAST group's slot 2,
+            // and its norm(chunk-2) moves up to slot 1 (see below). A NOPD is a vec
+            // program and a program start ZEROES the scalar file, so a NOPD between a
+            // spill and its KRES6-consuming norm hands the norm k = 0 - the tiny sim's
+            // GEN-HW tokens caught exactly that.
+            if (j == chunk - 1)
+                seq_desc_vec(di + 2, PROG_NOPD, &z, 0, 0);
         }
         int32_t sargs[7] = {(int32_t)attn_sc_dst(j), Ceff, (int32_t)SP_X, 0, -11, 0,
                             (int32_t)(SP_AWP8 + (uint32_t)j*32)}; // A6: p8-sum self-spill.
-        seq_desc_vec(di + 1, PROG_SOFTMAX8, sargs, 7, 0);
+        seq_desc_vec(attn_di_sm(j), PROG_SOFTMAX8, sargs, 7, 0);
         struct engine_op wv = {0};
         wv.kind        = ENGINE_KIND_AXPY;
         wv.cols        = head_dim;
@@ -1130,18 +1157,44 @@ static void seq_build_attn(void)
         wv.dst         = SP_AW;
         wv.rshift_rpre = 1;
         wv.xred        = 1;
-        seq_desc_engine(di + 2, &wv);
+        seq_desc_engine(attn_di_wv(j), &wv);
+        // wv stays BLOCKING even in the deep layout: the next descriptor is its own
+        // spill either way, so NOWAIT buys nothing - and it bites: the absmax tracker
+        // settles at done+2, the kreg capture path delays for exactly that (cap_d), but
+        // a NOWAIT-released dispatch fires within a cycle of eng_inflight clearing, so
+        // the spill's S7 seed sampled a not-yet-settled absmax (tiny-sim GEN-HW tokens
+        // caught it - deterministically wrong on every head). The WAIT_ENG path's
+        // descriptor fetch gives the settle time for free, as it always has.
         // The engine summed the channels itself, so the n_ch-1 reduce_acc calls are gone and
         // the absmax the CPU fold needs comes from the engine tracker instead of the last
         // reduce's res6. seq_desc_vec_seed puts it in S7 for the spill, and spill's trailing
         // SMOV s6, s7 leaves it in res6 - so the norm below keeps taking k from KRES6 and
         // sees the identical value. Numerics are unchanged by construction, not by luck.
+        // Deep layout: head j's spill/norm live in group j+1 (or the epilogue), so they
+        // run while scores(j+1) streams; their content is head-static either way.
         int32_t p2 = (int32_t)(SP_AWAM + (uint32_t)j*32);
-        seq_desc_vec_seed(di + 3, PROG_SPILL, &p2, 1, 0, 1);
         int32_t nargs[5] = {(int32_t)SP_AW, 0, (int32_t)(SP_H + (uint32_t)j*head_dim*2),
                             head_dim/16, 0};
-        seq_desc_vec(di + 4, PROG_NORM_I32, nargs, 5,
-                     (uint16_t)(SEQ_SRC_KRES6 << 8)); // A4 = k(res6).
+        if (!attn_pipe_active) {
+            seq_desc_vec_seed(di + 3, PROG_SPILL, &p2, 1, 0, 1);
+            seq_desc_vec(di + 4, PROG_NORM_I32, nargs, 5,
+                         (uint16_t)(SEQ_SRC_KRES6 << 8)); // A4 = k(res6).
+        } else {
+            uint32_t sp_di = (j == chunk - 1)
+                ? (uint32_t)seq_attn_base + 1u + (uint32_t)chunk*5u      // epilogue+0
+                : attn_grp(j + 1) + 0u;
+            uint32_t nm_di = (j == chunk - 1)
+                ? (uint32_t)seq_attn_base + 1u + (uint32_t)chunk*5u + 1u // epilogue+1
+                : ((j == chunk - 2) ? attn_grp(j + 1) + 1u   // last group: norm at slot 1
+                                    : attn_grp(j + 1) + 2u); // (slot 2 holds the NOPD)
+            seq_desc_vec_seed(sp_di, PROG_SPILL, &p2, 1, 0, 1);
+            seq_desc_vec(nm_di, PROG_NORM_I32, nargs, 5,
+                         (uint16_t)(SEQ_SRC_KRES6 << 8)); // A4 = k(res6).
+            if (j == 0) { // Group 0 has no previous head: placeholders.
+                seq_desc_vec(di + 0, PROG_NOPD, &z, 0, 0);
+                seq_desc_vec(di + 2, PROG_NOPD, &z, 0, 0);
+            }
+        }
     }
 }
 
@@ -1803,7 +1856,7 @@ static void attn_patch_slots(int l, int h0, int nh, int chunked)
         kv_scores_br(l, kvh, 0, &Bk, &Rk);
         kv_scores_br(l, kvh, 1, &Bv, &Rd);
         int sigma = (E_NORM + 8) - Bk + Rk - (lg >> 1);
-        if (chunked) {
+        if (chunked) { // Chunked implies the plain layout (grp offsets 1/3/4).
             seq_patch(ds, 8, SP_X + 0x1000 + (uint32_t)hh*head_dim);
             seq_patch(di + 1, 8, SP_AWP8 + (uint32_t)hh*32);
             seq_patch(di + 3, 2, SP_AWAM + (uint32_t)hh*32);
@@ -1811,9 +1864,9 @@ static void attn_patch_slots(int l, int h0, int nh, int chunked)
         }
         seq_patch(ds, 4, kv_region_addr(l, kvh, 0));
         seq_patch(ds, 7, (uint32_t)Bk | ((uint32_t)Rk << 16));
-        seq_patch(di + 1, 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
-        seq_patch(di + 2, 4, kv_region_addr(l, kvh, 1));
-        seq_patch(di + 2, 7, (uint32_t)Bv);
+        seq_patch(attn_di_sm(j), 7, (uint32_t)(sigma + 6 + 11)); // A5 (s2 shift).
+        seq_patch(attn_di_wv(j), 4, kv_region_addr(l, kvh, 1));
+        seq_patch(attn_di_wv(j), 7, (uint32_t)Bv);
         (void)Rd;
     }
 }
@@ -1844,12 +1897,11 @@ static void attn_list_prep_token(int pos)
     uint32_t rowsw = rows | (rem << 16);
     uint32_t blocks = (uint32_t)(cnt + padn)/16;
     for (int j = 0; j < seq_attn_heads; j++) {
-        uint32_t di = attn_grp(j);
         seq_patch(attn_di_sc(j), 2, rowsw);    // scores rows|rem.
         seq_patch(attn_di_sc(j), 5, wlen);
-        seq_patch(di + 1, 5, blocks);          // softmax8 A3 (blocks).
-        seq_patch(di + 2, 2, rowsw);           // AXPY rows|rem.
-        seq_patch(di + 2, 5, wlen);
+        seq_patch(attn_di_sm(j), 5, blocks);   // softmax8 A3 (blocks).
+        seq_patch(attn_di_wv(j), 2, rowsw);    // AXPY rows|rem.
+        seq_patch(attn_di_wv(j), 5, wlen);
     }
 }
 #endif
