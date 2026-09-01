@@ -1260,15 +1260,17 @@ void fprof_print(void)
 }
 
 static int seq_ffn_base = -1;
+static int seq_ffn_len  = 0;
 static void seq_build_ffn(void)
 {
 #ifdef BONSAI_HAS_DUALQ
     return; // Dual builds use attn2 lists; FFN list only wired on the shipping non-dual path.
 #else
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
-    if (di + 10 > 192 || seq_attn_heads == 0)
+    if (di + 9 > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
+    seq_ffn_len  = 9;
     // Pipelined order (2026-08-29): the up matvec is NOWAIT and the gate norm runs UNDER
     // its stream - the list keeps the `ovl` overlap it used to lose. The norms take k
     // from kregs (captured at each matvec) instead of KABS, so they no longer read the
@@ -1280,7 +1282,12 @@ static void seq_build_ffn(void)
     //   3 norm_g SP_Y -> SP_G [A4 = 0 + kreg0]   <- runs under the up stream
     //   4 spill up-absmax (seed_abs: interlock waits the stream)
     //   5 norm_u SP_YU -> SP_U [A4 = 0 + kreg1]
-    //   6 silu [A4 = imm + kreg0]   7 quant8   8 down mv   9 stop
+    //   6 silu_q8 fused [A4 = imm + kreg0; res6 = source absmax, read by the CPU
+    //     after the list - desc 7 is an engine op and leaves it alone]
+    //   7 down mv   8 stop
+    // (C2-1b: descriptors 6+7 used to be the UNFUSED silu_mul + measured quant8 pair
+    // while the op-by-op path ran the fused PROG_SILU_Q8 - a whole extra ffn_dim pass
+    // x28 layers rode the list side of every A/B. Same kreg0 A4 mechanics.)
     struct engine_op z = {0};
     seq_desc_engine(di + 0, &z);
     int32_t pa = (int32_t)SP_FFSP;
@@ -1296,14 +1303,13 @@ static void seq_build_ffn(void)
     seq_desc_vec_seed(di + 4, PROG_SPILL, &pb, 1, 0, 1);
     int32_t nb[5] = {(int32_t)SP_YU, 0, (int32_t)SP_U, ffn_dim/16, 0};
     seq_desc_vec(di + 5, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
-    int32_t sa[7] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15};
-    seq_desc_vec(di + 6, PROG_SILU_MUL, sa, 7, 0);
-    seq_patch(di + 6, 1, (uint32_t)PROG_SILU_MUL | (1u << (16 + 2*4))); // A4 kreg0 term...
+    int32_t sa[8] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
+                     (int32_t)SP_X};
+    seq_desc_vec(di + 6, PROG_SILU_Q8, sa, 8, 0);
+    seq_patch(di + 6, 1, (uint32_t)PROG_SILU_Q8 | (1u << (16 + 2*4))); // A4 kreg0 term...
     seq_patch(di + 6, 0, 2u | (1u << 11)); // ...ADDS (w0[11]): A4 = imm + kg (VSHLS conv).
-    int32_t qa[4] = {(int32_t)SP_G, 1, (int32_t)SP_X, ffn_dim/16};
-    seq_desc_vec(di + 7, PROG_QUANT8, qa, 4, 0);
-    seq_desc_engine(di + 8, &z);
-    seq_desc_stop(di + 9);
+    seq_desc_engine(di + 7, &z);
+    seq_desc_stop(di + 8);
 #endif
 }
 
@@ -1318,7 +1324,7 @@ static void seq_build_scale8(void)
 #ifndef BONSAI_HAS_DUALQ
     if (seq_attn_heads == 0)
         return;
-    int di = (seq_ffn_base >= 0) ? seq_ffn_base + 10
+    int di = (seq_ffn_base >= 0) ? seq_ffn_base + seq_ffn_len
                                  : seq_qkr_count + attn_list_len(seq_attn_heads);
     if (di + n_head + 1 > 192)
         return;
@@ -2583,7 +2589,7 @@ attn_heads_done: ;
                 // NOWAIT: the gate norm (KRES6, uninterlocked) runs under this stream.
                 seq_patch(seq_ffn_base + 2, 0, 1u | (1u << 9));
                 model_matvec_op(ed_t, SP_X, SP_Y, &mo);
-                seq_desc_engine(seq_ffn_base + 8, &mo);
+                seq_desc_engine(seq_ffn_base + 7, &mo);
                 // silu A4 = eg + 6 = imm + kg (VSHLS convention); the descriptor carries
                 // w0[11] so its kreg0 term ADDS. Requires a post-2026-08-29 bitstream -
                 // earlier sequencers only subtract and the list computes garbage. The list
@@ -2594,12 +2600,13 @@ attn_heads_done: ;
                 if (fprof_use) {
                     perf_ovl_mark();
                     if (l == 0)
-                        fprof_nts = seq_run_trace((uint32_t)seq_ffn_base, 10, fprof_ts, 16);
+                        fprof_nts = seq_run_trace((uint32_t)seq_ffn_base,
+                                                  (uint32_t)seq_ffn_len, fprof_ts, 16);
                     else
-                        seq_run((uint32_t)seq_ffn_base, 10);
+                        seq_run((uint32_t)seq_ffn_base, (uint32_t)seq_ffn_len);
                     perf_ovl_acc(fprof_acc_list); fprof_nlist++;
                 } else
-                    seq_run((uint32_t)seq_ffn_base, 10);
+                    seq_run((uint32_t)seq_ffn_base, (uint32_t)seq_ffn_len);
                 perf_exit(OP_SILU_MUL);
                 // Recover the folds the removed round-trips produced - identical values:
                 // kg/ku from the spilled engine absmaxes, s from quant8's surviving res6.
