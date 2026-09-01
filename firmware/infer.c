@@ -1070,6 +1070,7 @@ static int seq_attn_base, seq_attn_dph, seq_attn_heads;
 // stream. The engine idles only for the ~20-cycle spill instead of spill+norm, and the
 // vector unit fills the scores streams completely. Non-chunked only.
 static int attn_pipe = 1;        // Requested (aovl console toggle).
+static int attn_prep_pos = -1;   // Position attn_list_prep_token last ran for (lovl dedup).
 static int attn_pipe_active = 0; // What the built list uses.
 static inline uint32_t attn_grp(int j) {
     return (uint32_t)seq_attn_base + (attn_pipe_active ? 1u : 0u)
@@ -1104,6 +1105,7 @@ static inline int attn_list_len(int nh) {
 static void seq_build_attn(void)
 {
     seq_attn_heads = 0;
+    attn_prep_pos = -1; // Rebuild wipes the per-token patch words; force a re-prep.
     if (n_ch < 2)
         return; // n1's absmax lives in the engine CSR; keep CPU-dispatched ops there.
     // 5 descriptors per head: scores, softmax8 (self-spills its p8 sum), axpy(xred),
@@ -1885,6 +1887,7 @@ int infer_attn_pipe_state(void) { return attn_pipe_active; }
 static int attn_prepatched;
 static int ffn_prepatched;
 int eovl_use = 1; // C2-2: fold head j under the still-running attention list (needs RSLOT).
+int lovl_use = 1; // C2-3: next forward's list prep posts under the LM-head argmax stream.
 // List-relative dcount ("descriptors completed") threshold after which head j's fold
 // inputs (softmax8's AWP8 self-spill and spill(j)'s AWAM) are certainly written: one
 // past norm(j), whose producers are all earlier vec descriptors in the same list.
@@ -1942,6 +1945,8 @@ static void attn_list_prep_token(int pos)
 {
     if (seq_attn_heads <= 0)
         return;
+    if (pos == attn_prep_pos)
+        return; // Already posted under the previous forward's LM-head stream (lovl).
     int cnt  = pos + 1;
     int padn = (16 - (cnt & 15)) & 15;
     if (attn_pipe_active && (uint32_t)(cnt + padn)*4u > 0x3800u) {
@@ -1970,6 +1975,7 @@ static void attn_list_prep_token(int pos)
         seq_patch(attn_di_wv(j), 2, rowsw);    // AXPY rows|rem.
         seq_patch(attn_di_wv(j), 5, wlen);
     }
+    attn_prep_pos = pos;
 }
 #endif
 
@@ -2789,6 +2795,17 @@ attn_heads_done: ;
         op.xsrc   = SP_X;
         op.dst    = SP_Y;
         op.supw   = 1;
+#ifdef CSR_SEQ_BASE
+        if (lovl_use && seq_use) {
+            // C2-3: the next forward's per-token list prep (score padding + the
+            // rowsw/wlen/blocks patches) depends only on the position, never on the
+            // token this argmax is about to pick - post it under the argmax stream.
+            // supw=1 leaves the W port idle, so the posted writes drain freely.
+            uint32_t dl = engine_submit(&op);
+            attn_list_prep_token(n_pos);
+            engine_join(dl);
+        } else
+#endif
         engine_run(&op);
         uint32_t idx = engine_csr_argmax_idx_read();
         if (idx < H->vocab) {

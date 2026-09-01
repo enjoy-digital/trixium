@@ -474,6 +474,13 @@ static void console_service(void)
         printf("EOVL %s (fold heads under the running attention list)\n",
                eovl_use ? "on" : "off");
     }
+    else if (strcmp(token, "lovl") == 0) {
+        extern int lovl_use;
+        if (strncmp(str, "on", 2) == 0)  lovl_use = 1;
+        if (strncmp(str, "off", 3) == 0) lovl_use = 0;
+        printf("LOVL %s (next-token list prep under the LM-head stream)\n",
+               lovl_use ? "on" : "off");
+    }
     else if (strcmp(token, "fprof") == 0) {
         extern int fprof_use; extern void fprof_reset(void), fprof_print(void);
         if (strncmp(str, "on", 2) == 0)  { fprof_use = 1; fprof_reset(); }
