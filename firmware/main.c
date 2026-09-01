@@ -458,7 +458,7 @@ static void console_service(void)
         extern int seq_ffn_use;
         if (strncmp(str, "on", 2) == 0)  seq_ffn_use = 1;
         if (strncmp(str, "off", 3) == 0) seq_ffn_use = 0;
-        printf("FFNSEQ %s (1.7B tokens FAIL with it on - debug aid, see infer.c)\n",
+        printf("FFNSEQ %s (whole-layer FFN list; default on since C2-1c)\n",
                seq_ffn_use ? "on" : "off");
     }
     else if (strcmp(token, "povl") == 0) {
