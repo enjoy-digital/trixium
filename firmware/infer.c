@@ -1339,12 +1339,14 @@ static void seq_build_scale8(void)
 }
 
 int seq_use = 1;
-// FFN descriptor list: DEFAULT OFF. Sim tokens (n8 tiny, all legs) are byte-identical and
-// the tiny-sim window improves -3.3% - but the 1.7B card A/B fails TOKENS. That is exactly
-// the exponent-path blind spot the BFP-invariants note warns the tiny gate cannot see
-// (residual ratchet / shift magnitudes the tiny shapes never reach). Off until the 1.7B
-// divergence is diagnosed; enable with `ffnseq on` to reproduce.
-int seq_ffn_use = 0;
+// FFN descriptor list: DEFAULT ON since C2-1b/1c (2026-09-01). History, kept because it
+// carries two lessons: the list was default-off first for a 1.7B tokens failure (fixed
+// long ago by the silu rewrite) and then because it measured +8.5% SLOWER - but that
+// comparison was never like-for-like (the list ran the UNFUSED silu_mul+quant8 pair
+// while the op path ran the fused silu_q8). With the fused descriptor the same-boot
+// windowed counters read list 12.03M vs ops 14.32M per bench-8 (neither-busy 4% vs 19%)
+// and bench-64 is -2.0%/token. `ffnseq off` selects the op-by-op path.
+int seq_ffn_use = 1;
 // Engine/vec overlap (docs/overlap-design.md): run the FFN up-projection stream UNDER the
 // gate-norm vector program (disjoint regions; gate absmax captured before the submit, so
 // numerics are byte-identical by construction). `ovl off` for same-binary A/B.
