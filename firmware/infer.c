@@ -1883,6 +1883,23 @@ int infer_attn_pipe_state(void) { return attn_pipe_active; }
 // (kv_ekmax ratchet, region addresses) is CPU-side state settled before the list
 // started. attn_prepatched tells the attention section its work is already done.
 static int attn_prepatched;
+static int ffn_prepatched;
+// Per-layer FFN list rebuild (three engine descriptors + their flag words), extracted so
+// it can POST under the qkr list in the povl window (all inputs are layer-known: model
+// entries and static scratchpad addresses; only the silu A4 imm needs ex8 and stays at
+// FFN time). The sequencer-fetch interlock orders these writes before the FFN list runs.
+static void ffn_prep_layer(int l)
+{
+    struct engine_op mo = {0};
+    model_matvec_op(model_entry(ROLE_FFN_GATE, l), SP_X, SP_Y, &mo);
+    seq_desc_engine(seq_ffn_base + 0, &mo);
+    seq_patch(seq_ffn_base + 0, 0, 1u | (1u << 5)); // capture k -> kreg0.
+    model_matvec_op(model_entry(ROLE_FFN_UP, l), SP_X, SP_YU, &mo);
+    seq_desc_engine(seq_ffn_base + 2, &mo);
+    seq_patch(seq_ffn_base + 2, 0, 1u | (1u << 9)); // NOWAIT: norm_g under the stream.
+    model_matvec_op(model_entry(ROLE_FFN_DOWN, l), SP_X, SP_Y, &mo);
+    seq_desc_engine(seq_ffn_base + 7, &mo);
+}
 int prep_ovl = 1; // povl console toggle: patch-under-list overlap (needs BONSAI_SP_SB_SLOT).
 static void attn_patch_slots(int l, int h0, int nh, int chunked)
 {
@@ -2101,6 +2118,11 @@ embed_done: ;
                     seq_list_start(0, seq_qkr_count);
                     attn_patch_slots(l, 0, n_head, 0);
                     attn_prepatched = 1;
+                    if (seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
+                        && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
+                        ffn_prep_layer(l); // C2-1c: the FFN rebuild rides the same window.
+                        ffn_prepatched = 1;
+                    }
                     seq_join();
                 } else
 #endif
@@ -2582,16 +2604,9 @@ attn_heads_done: ;
                 // One list for gate->norm->up->norm->silu->quant8->down (see seq_build_ffn).
                 // Whole-list time is charged to OP_SILU_MUL: per-op shares are documented as
                 // unreliable under sequencing; totals are the measurement.
-                struct engine_op mo = {0};
-                model_matvec_op(eg_t, SP_X, SP_Y, &mo);
-                seq_desc_engine(seq_ffn_base + 0, &mo);
-                seq_patch(seq_ffn_base + 0, 0, 1u | (1u << 5)); // capture k -> kreg0.
-                model_matvec_op(eu_t, SP_X, SP_YU, &mo);
-                seq_desc_engine(seq_ffn_base + 2, &mo);
-                // NOWAIT: the gate norm (KRES6, uninterlocked) runs under this stream.
-                seq_patch(seq_ffn_base + 2, 0, 1u | (1u << 9));
-                model_matvec_op(ed_t, SP_X, SP_Y, &mo);
-                seq_desc_engine(seq_ffn_base + 7, &mo);
+                if (!ffn_prepatched)
+                    ffn_prep_layer(l);
+                ffn_prepatched = 0;
                 // silu A4 = eg + 6 = imm + kg (VSHLS convention); the descriptor carries
                 // w0[11] so its kreg0 term ADDS. Requires a post-2026-08-29 bitstream -
                 // earlier sequencers only subtract and the list computes garbage. The list
