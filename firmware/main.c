@@ -474,6 +474,19 @@ static void console_service(void)
         printf("EOVL %s (fold heads under the running attention list)\n",
                eovl_use ? "on" : "off");
     }
+    else if (strcmp(token, "fovl") == 0) {
+        extern int fovl_use;
+        if (strncmp(str, "on", 2) == 0)  fovl_use = 1;
+        if (strncmp(str, "off", 3) == 0) fovl_use = 0;
+        printf("FOVL %s (norm-row fetches under resid_add / KV prep)\n", fovl_use ? "on" : "off");
+    }
+    else if (strcmp(token, "qkvl") == 0) {
+        extern int qkvl_use;
+        if (strncmp(str, "on", 2) == 0)  qkvl_use = 1;
+        if (strncmp(str, "off", 3) == 0) qkvl_use = 0;
+        printf("QKVL %s (q/k/v projections + norms as one sequencer list)\n",
+               qkvl_use ? "on" : "off");
+    }
     else if (strcmp(token, "lovl") == 0) {
         extern int lovl_use;
         if (strncmp(str, "on", 2) == 0)  lovl_use = 1;
