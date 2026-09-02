@@ -502,6 +502,13 @@ static void console_service(void)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
     }
+    else if (strcmp(token, "atrace") == 0) {
+        extern int atrace_use;
+        int n = parse_int(str);
+        atrace_use = n > 0 ? n : 1;
+        printf("ATRACE armed: layer 0 of generated token #%d traces per-descriptor\n",
+               atrace_use);
+    }
     else if (strcmp(token, "kovl") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_kv_pipe(1);
         if (strncmp(str, "off", 3) == 0) infer_kv_pipe(0);

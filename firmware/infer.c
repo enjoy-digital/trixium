@@ -317,14 +317,15 @@ static int axpy_rpre_c(uint64_t p8sum)
 // B/R for a scores op over a region: pow-2 scales make e16 + B == 12 exactly
 // (fp16_decompose: 2^ek = 1024 * 2^(ek-10); B = 12 - (ekmax - 10) = 22 - ekmax), so the
 // worst-row acc bound is closed-form: groups * (32*127*127) * 1024 << 12.
+static int kv_br_r = -1; // Model constant (head_dim only); computed once at infer_init.
+                         // Recomputing it here was 13 iterations of 64-bit shifts per
+                         // call x 32 calls/layer - ~7k cycles/layer of pure waste
+                         // (found by qtrace, 2026-09-02).
+
 static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
 {
-    int ekmax = kv_ekmax[kv_ek_idx(l, kvh, kind)];
-    *B = 22 - ekmax;
-    uint64_t bound = (uint64_t)(head_dim/32)*32u*127u*127u*1024u << 12;
-    int r = 0;
-    while ((bound >> r) >= (1ull << 31)) r++;
-    *R = r;
+    *B = 22 - kv_ekmax[kv_ek_idx(l, kvh, kind)];
+    *R = kv_br_r;
 }
 #endif
 
@@ -1037,10 +1038,21 @@ static void seq_build_qkr(void)
     seq_qkr_count = di;
 }
 
+static int16_t eps_memo[64]; // seq_eps_int cache, index es+32; 0 = not computed yet.
+
 static int seq_eps_int(int es)
 {
+    // Soft-float (lroundf/ldexpf) costs hundreds of cycles on this FPU-less core and
+    // es takes a handful of values - memoize (qtrace, 2026-09-02). e >= 1 always, so
+    // 0 doubles as the empty marker.
+    int mi = es + 32;
+    if (mi >= 0 && mi < 64 && eps_memo[mi])
+        return eps_memo[mi];
     int e = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*es));
-    return (e < 1) ? 1 : e;
+    if (e < 1) e = 1;
+    if (mi >= 0 && mi < 64 && e <= 0x7FFF)
+        eps_memo[mi] = (int16_t)e;
+    return e;
 }
 
 // Sequencer descriptor list for the fused per-head attention chain:
@@ -1888,6 +1900,8 @@ static int attn_prepatched;
 static int ffn_prepatched;
 int eovl_use = 1; // C2-2: fold head j under the still-running attention list (needs RSLOT).
 int lovl_use = 1; // C2-3: next forward's list prep posts under the LM-head argmax stream.
+int atrace_use;   // Diagnostic: =N traces layer 0's attention list (per-descriptor deltas)
+                  // on the Nth generated token, one-shot, serial folds for that layer.
 // List-relative dcount ("descriptors completed") threshold after which head j's fold
 // inputs (softmax8's AWP8 self-spill and spill(j)'s AWAM) are certainly written: one
 // past norm(j), whose producers are all earlier vec descriptors in the same list.
@@ -2127,6 +2141,10 @@ embed_done: ;
             ev_res = (E_NORM + sx8) - (int)evt->bias + (int)evt->rshift + kv2;
             perf_exit(OP_NORM_I32);
             perf_enter(OP_QKNORM);
+            uint32_t qt[8]; int qtn = 0;
+            // qtrace piggybacks on the atrace arm: fires at layer 1 one forward early.
+            int qtr = (atrace_use == 1 && l == 1);
+            if (qtr) qt[qtn++] = perf_now();
             const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
             const struct bons_entry *kn16 = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
             engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + qn16->chan_base_beats*32,
@@ -2137,6 +2155,7 @@ embed_done: ;
             {
                 // One sequencer run replaces the 2*(n_head+n_kv) per-head dispatches;
                 // only the eps args change per layer (descriptor word 7 = A5).
+                if (qtr) qt[qtn++] = perf_now(); // [1] fetches + entry lookups done.
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
 #ifdef BONSAI_VEC_LOOPS2
                 seq_patch(0, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
@@ -2162,6 +2181,7 @@ embed_done: ;
                         }
                     }
                 }
+                if (qtr) qt[qtn++] = perf_now(); // [2] kv scale-preps + store patches done.
 #ifdef BONSAI_SP_SB_SLOT
                 if (prep_ovl && seq_use && seq_attn_heads >= n_head
                     && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
@@ -2171,12 +2191,21 @@ embed_done: ;
                     seq_list_start(0, seq_qkr_count);
                     attn_patch_slots(l, 0, n_head, 0);
                     attn_prepatched = 1;
+                    if (qtr) qt[qtn++] = perf_now(); // [3] attn_patch_slots done.
                     if (seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
                         && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
                         ffn_prep_layer(l); // C2-1c: the FFN rebuild rides the same window.
                         ffn_prepatched = 1;
                     }
+                    if (qtr) qt[qtn++] = perf_now(); // [4] ffn_prep_layer done.
                     seq_join();
+                    if (qtr) {
+                        qt[qtn++] = perf_now(); // [5] qkr list joined.
+                        printf("QTRACE fetch+kv %lu %lu attnpatch %lu ffnprep %lu join %lu\n",
+                               (unsigned long)(qt[1]-qt[0]), (unsigned long)(qt[2]-qt[1]),
+                               (unsigned long)(qt[3]-qt[2]), (unsigned long)(qt[4]-qt[3]),
+                               (unsigned long)(qt[5]-qt[4]));
+                    }
                 } else
 #endif
                 seq_run(0, seq_qkr_count);
@@ -2321,6 +2350,28 @@ attn_scores: ;
             // whenever the list holds every head (hh == j); they are re-patched only in
             // the chunked case, where a slot serves several heads.
             int chunked = (seq_attn_heads < n_head);
+            if (atrace_use && l == 0 && !chunked && --atrace_use == 0) {
+                // One-shot per-descriptor wall-clock of the attention list: run it under
+                // seq_run_trace (tight dcount poll, no folds) and fold serially after.
+                // Numerics identical - only this layer's fold overlap is lost.
+                if (!attn_prepatched)
+                    attn_patch_slots(l, 0, n_head, 0);
+                attn_prepatched = 0;
+                static uint32_t ats[192];
+                int an = seq_run_trace((uint32_t)seq_attn_base,
+                                       (uint32_t)attn_list_len(n_head), ats, 192);
+                printf("ATRACE %d marks (deltas):", an);
+                for (int i = 1; i < an; i++)
+                    printf(" %lu", (unsigned long)(ats[i] - ats[i-1]));
+                printf("\n");
+                perf_exit(OP_SCORES);
+                perf_enter(OP_WV);
+                aw_hvalid = 0;
+                for (int hh = 0; hh < n_head; hh++)
+                    attn_fold_head(l, hh, aw_c, &aw_hmax);
+                perf_exit(OP_WV);
+                goto attn_heads_done;
+            }
 #ifdef BONSAI_SP_SB_RSLOT
             if (eovl_use && !chunked) {
                 // C2-2: fold head j while heads j+2.. still execute. The read slot lets
@@ -2885,6 +2936,14 @@ int infer_init(void)
 
     heap    = (uint8_t *)HEAP_BASE;
     tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
+    {
+        // kv_scores_br's R: depends only on head_dim - once, not 1792x/token.
+        uint64_t bound = (uint64_t)(head_dim/32)*32u*127u*127u*1024u << 12;
+        int r = 0;
+        while ((bound >> r) >= (1ull << 31)) r++;
+        kv_br_r = r;
+        for (int i = 0; i < 64; i++) eps_memo[i] = 0; // New image: new rms_eps.
+    }
     heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)HEAP_HI_BASE : 0;
     int kv_dim = n_kv_head*head_dim;
     int q_dim  = n_head*head_dim;
