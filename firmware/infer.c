@@ -309,8 +309,10 @@ static int      aw_he2, aw_hvalid;
 
 static int axpy_rpre_c(uint64_t p8sum)
 {
-    int bl = 0;
-    while ((p8sum >> bl) != 0) bl++;
+    // Bit length via clz - the 64-bit shift loop it replaces cost ~300-450 cycles per
+    // fold on RV32 (etrace, 2026-09-02). Identical result for every input.
+    uint32_t hi = (uint32_t)(p8sum >> 32), lo = (uint32_t)p8sum;
+    int bl = hi ? 32 + bitlen32(hi) : bitlen32(lo);
     return bl + 5;
 }
 
@@ -1553,7 +1555,7 @@ static void attn_seq2_layer(int l, int pos, float *aw_c, float *aw_hmax)
         kv_scores_br(l, kvh, 1, &Bv, &Rd);
         int Rpre = axpy_rpre_c(P8 ? P8 : 1);
         int k2 = 0;
-        while ((am >> k2) > 16383u) k2++;
+        k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
         float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), Rpre - Bv + k2);
         aw_c[hh] = c2;
         float hm2 = (float)(am >> k2)*c2;
@@ -2002,7 +2004,7 @@ static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
     kv_scores_br(l, kvh, 1, &Bv, &Rd);
     int Rpre = axpy_rpre_c(P8 ? P8 : 1);
     int k2 = 0;
-    while ((am >> k2) > 16383u) k2++;
+    k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
     int E1 = Rpre - Bv + k2;
     if (ifold_use) {
         // Integer emulation of the float32 fold (F1-5): same bits, no soft-float.
@@ -2385,6 +2387,10 @@ attn_scores: ;
                 perf_exit(OP_SCORES);
                 perf_enter(OP_WV);
                 aw_hvalid = 0;
+                // etrace: one-shot split of this loop into wait vs fold time (piggybacks
+                // the atrace arm at layer 2, one forward early - like qtrace).
+                int etr = (atrace_use == 1 && l == 2);
+                uint32_t et0 = etr ? perf_now() : 0, et_fold = 0, et_spins = 0;
                 for (int hh = 0; hh < n_head; hh++) {
                     uint32_t ready = attn_fold_ready(hh, n_head), spins = 0;
                     for (;;) {
@@ -2394,11 +2400,19 @@ attn_scores: ;
                             break;
                         if (++spins > 4000000u) break; // seq_join below reports the wedge.
                     }
+                    et_spins += spins;
+                    uint32_t f0 = etr ? perf_now() : 0;
                     attn_fold_head(l, hh, aw_c, &aw_hmax);
+                    if (etr) et_fold += perf_now() - f0;
                 }
                 perf_exit(OP_WV);
                 perf_enter(OP_SCORES);
+                uint32_t j0 = etr ? perf_now() : 0;
                 seq_join();
+                if (etr)
+                    printf("ETRACE loop %lu fold16 %lu spins %lu join %lu\n",
+                           (unsigned long)(j0 - et0), (unsigned long)et_fold,
+                           (unsigned long)et_spins, (unsigned long)(perf_now() - j0));
                 perf_exit(OP_SCORES);
                 goto attn_heads_done;
             }
@@ -2506,7 +2520,7 @@ attn_scores: ;
                 if (n_ch == 1)
                     am = engine_csr_absmax_read(); // AXPY partials tracked too.
                 int k2 = 0;
-                while ((am >> k2) > 16383u) k2++;
+                k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
                 int32_t nargs[5] = {(int32_t)SP_SC, 0,
                                     (int32_t)(SP_H + hh*head_dim*2), head_dim/16, k2};
                 vec_run(PROG_NORM_I32, nargs, 5);
