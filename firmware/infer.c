@@ -1927,6 +1927,10 @@ static void ffn_prep_layer(int l)
     seq_patch(seq_ffn_base + 2, 0, 1u | (1u << 9)); // NOWAIT: norm_g under the stream.
     model_matvec_op(model_entry(ROLE_FFN_DOWN, l), SP_X, SP_Y, &mo);
     seq_desc_engine(seq_ffn_base + 7, &mo);
+    // Tried 2026-09-02: writing only the two layer-dependent words (wbase, bias|rshift)
+    // instead of all 15 - the prep window lost 6.7M cycles per 64 tokens as predicted
+    // and the token gained nothing: wv/rmsnorm/scores absorbed it (the pipeline behind
+    // this window is unit-bound, so CPU time here is slack). Not worth the state.
 }
 int prep_ovl = 1; // povl console toggle: patch-under-list overlap (needs BONSAI_SP_SB_SLOT).
 static void attn_patch_slots(int l, int h0, int nh, int chunked)
