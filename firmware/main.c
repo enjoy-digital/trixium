@@ -488,6 +488,16 @@ static void console_service(void)
         if (strncmp(str, "print", 5) == 0) fprof_print();
         printf("FPROF %s\n", fprof_use ? "on" : "off");
     }
+    else if (strcmp(token, "tprof") == 0) {
+        if (strncmp(str, "arm", 3) == 0) {
+            tprof_armed = 1;
+            puts("TPROF armed: the next generated token traces itself (gen or bench)");
+        }
+        if (strncmp(str, "dump", 4) == 0) tprof_dump();
+        if (str[0] == 0)
+            printf("TPROF %s (arm | dump)\n",
+                   tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
+    }
     else if (strcmp(token, "kovl") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_kv_pipe(1);
         if (strncmp(str, "off", 3) == 0) infer_kv_pipe(0);

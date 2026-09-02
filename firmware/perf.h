@@ -44,4 +44,19 @@ void     perf_ovl_report(const char *tag, const uint32_t acc[4]);
 extern uint32_t perf_cycles[OP_COUNT];
 extern uint32_t perf_calls[OP_COUNT];
 
+// tprof: full-token trace. `tprof arm` on the console arms it; the next want_logits
+// forward records events (tag, t, cyc_eng, cyc_vec) until it returns, then disarms.
+// tag[31:28] = kind: 1 op-enter, 2 op-exit (op in tag[15:8]), 3 layer mark (layer in
+// [15:8]), 4 dcount transition (dcount in [19:0]), 5 list start (idx0 in [15:8], count
+// in [7:0]), 6 forward start, 7 forward end. Events cost ~2 CSR reads + 4 stores each
+// (~7% of a traced token) - a diagnostic run, not a benchmark. Inert when not tracing:
+// one predictable branch per hook.
+extern int tprof_armed, tprof_active;
+void tprof_setbuf(void *p, int max_events); // Buffer lives in main_ram (halloc'd).
+void tprof_begin(void);
+void tprof_end(void);
+void tprof_event(uint32_t tag);
+void tprof_dcount(uint32_t st); // Feed seq_status; logs kind-4 on dcount change.
+void tprof_dump(void);          // TP <tag> <t> <eng> <vec> lines over the console.
+
 #endif

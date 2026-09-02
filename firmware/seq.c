@@ -9,6 +9,7 @@
 #include <generated/soc.h>
 
 #include "seq.h"
+#include "perf.h"
 
 #ifdef CSR_SEQ_BASE
 
@@ -83,7 +84,11 @@ void seq_join(void)
         return;
     uint32_t spins = 0, reports = 0;
     seq_poll_waits++;
-    while (seq_status_read() & 1) {
+    for (;;) {
+        uint32_t st = seq_status_read();
+        tprof_dcount(st);
+        if (!(st & 1))
+            break;
         seq_poll_spins++;
         if (++spins < 200000u)
             continue;
@@ -137,6 +142,8 @@ void seq_list_start(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged)
         return;
+    if (tprof_active)
+        tprof_event((5u << 28) | ((idx0 & 0xFF) << 8) | (count & 0xFF));
     seq_base_write(SP_DESC + idx0*64);
     seq_count_write(count);
     seq_start_write(1);

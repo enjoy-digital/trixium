@@ -2016,6 +2016,8 @@ static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
 static int forward(int token, int want_logits)
 {
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
+    if (tprof_armed && want_logits)
+        tprof_begin(); // Trace this one generated token; disarms itself.
     perf_enter(OP_EMBED);
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     if (attn_all_hw()) {
@@ -2071,6 +2073,8 @@ embed_done: ;
 #endif
 
     for (int l = 0; l < n_layer; l++) {
+        if (tprof_active)
+            tprof_event((3u << 28) | ((uint32_t)l << 8));
         // Attention block.
         int sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, attn_norm[l],
                                    model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16),
@@ -2334,6 +2338,7 @@ attn_scores: ;
                     uint32_t ready = attn_fold_ready(hh, n_head), spins = 0;
                     for (;;) {
                         uint32_t st = seq_status_read();
+                        tprof_dcount(st);
                         if (!(st & 1) || ((st >> 8) >= ready))
                             break;
                         if (++spins > 4000000u) break; // seq_join below reports the wedge.
@@ -2810,6 +2815,8 @@ attn_heads_done: ;
         uint32_t idx = engine_csr_argmax_idx_read();
         if (idx < H->vocab) {
             perf_exit(OP_LMHEAD);
+            if (tprof_active)
+                tprof_end();
             return (int)idx;
         }
     }
@@ -2847,6 +2854,8 @@ attn_heads_done: ;
     }
     (void)sc;
     perf_exit(OP_LMHEAD);
+    if (tprof_active)
+        tprof_end();
     return best_tok;
 }
 
@@ -2875,6 +2884,7 @@ int infer_init(void)
     ffn_dim  = H->ffn_dim;
 
     heap    = (uint8_t *)HEAP_BASE;
+    tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
     heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)HEAP_HI_BASE : 0;
     int kv_dim = n_kv_head*head_dim;
     int q_dim  = n_head*head_dim;

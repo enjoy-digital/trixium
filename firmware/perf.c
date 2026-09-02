@@ -65,12 +65,80 @@ uint32_t perf_now(void)
 void perf_enter(enum perf_op op)
 {
     perf_t0[op] = perf_now();
+    if (tprof_active)
+        tprof_event((1u << 28) | ((uint32_t)op << 8));
 }
 
 void perf_exit(enum perf_op op)
 {
     perf_cycles[op] += perf_now() - perf_t0[op];
     perf_calls[op]  += 1;
+    if (tprof_active)
+        tprof_event((2u << 28) | ((uint32_t)op << 8));
+}
+
+// tprof ------------------------------------------------------------------------------------
+
+int tprof_armed, tprof_active;
+static uint32_t *tprof_buf;
+static int tprof_n, tprof_cap; // Words used / word capacity (4 words per event).
+static uint32_t tprof_last_dc;
+
+void tprof_setbuf(void *p, int max_events)
+{
+    tprof_buf = (uint32_t *)p;
+    tprof_cap = max_events*4;
+}
+
+void tprof_event(uint32_t tag)
+{
+    if (!tprof_active || !tprof_buf || tprof_n > tprof_cap - 4)
+        return;
+    tprof_buf[tprof_n++] = tag;
+    tprof_buf[tprof_n++] = perf_now();
+#ifdef CSR_ENGINE_CSR_CYC_ENG_ADDR
+    tprof_buf[tprof_n++] = engine_csr_cyc_eng_read();
+    tprof_buf[tprof_n++] = engine_csr_cyc_vec_read();
+#else
+    tprof_buf[tprof_n++] = 0;
+    tprof_buf[tprof_n++] = 0;
+#endif
+}
+
+void tprof_begin(void)
+{
+    tprof_armed   = 0;
+    tprof_n       = 0;
+    tprof_last_dc = 0xFFFFFFFF;
+    tprof_active  = 1;
+    tprof_event(6u << 28);
+}
+
+void tprof_end(void)
+{
+    tprof_event(7u << 28);
+    tprof_active = 0;
+}
+
+void tprof_dcount(uint32_t st)
+{
+    if (!tprof_active)
+        return;
+    uint32_t dc = st >> 8;
+    if (dc == tprof_last_dc)
+        return;
+    tprof_last_dc = dc;
+    tprof_event((4u << 28) | (dc & 0xFFFFF));
+}
+
+void tprof_dump(void)
+{
+    printf("TPROF %d events (cap %d)%s\n", tprof_n/4, tprof_cap/4,
+           tprof_n > tprof_cap - 4 ? " TRUNCATED" : "");
+    for (int i = 0; i < tprof_n; i += 4)
+        printf("TP %08lx %lu %lu %lu\n",
+               (unsigned long)tprof_buf[i],   (unsigned long)tprof_buf[i+1],
+               (unsigned long)tprof_buf[i+2], (unsigned long)tprof_buf[i+3]);
 }
 
 void perf_print(void)
