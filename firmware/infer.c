@@ -3428,6 +3428,24 @@ void infer_vbench(void)
         dt = perf_now() - t0;
         printf("VB perf_now         %8lu\n", (unsigned long)(dt/64));
     }
+    { // CSR write cost by bank: engine op field vs timer vs a scratchpad posted word.
+        t0 = perf_now();
+        for (int i = 0; i < 64; i++) engine_csr_rows_write((uint32_t)(i & 1));
+        dt = perf_now() - t0;
+        printf("VB csr_wr_engine    %8lu\n", (unsigned long)(dt/64));
+        t0 = perf_now();
+        for (int i = 0; i < 64; i++) timer0_load_write(0xFFFFFFFFu - (uint32_t)(i & 1));
+        dt = perf_now() - t0;
+        printf("VB csr_wr_timer     %8lu\n", (unsigned long)(dt/64));
+        t0 = perf_now();
+        for (int i = 0; i < 64; i++) (void)engine_csr_status_read();
+        dt = perf_now() - t0;
+        printf("VB csr_rd_engine    %8lu\n", (unsigned long)(dt/64));
+        t0 = perf_now();
+        for (int i = 0; i < 64; i++) (void)seq_status_read();
+        dt = perf_now() - t0;
+        printf("VB csr_rd_seq       %8lu\n", (unsigned long)(dt/64));
+    }
     puts("VB done");
 }
 
