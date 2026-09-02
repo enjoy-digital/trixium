@@ -490,8 +490,12 @@ static void console_service(void)
     }
     else if (strcmp(token, "tprof") == 0) {
         if (strncmp(str, "arm", 3) == 0) {
-            tprof_armed = 1;
-            puts("TPROF armed: the next generated token traces itself (gen or bench)");
+            const char *p = str + 3;
+            while (*p == ' ') p++;
+            int n = parse_int(p);
+            tprof_armed = n > 0 ? n : 1;
+            printf("TPROF armed: generated token #%d traces itself (gen or bench)\n",
+                   tprof_armed);
         }
         if (strncmp(str, "dump", 4) == 0) tprof_dump();
         if (str[0] == 0)

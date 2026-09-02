@@ -2016,8 +2016,8 @@ static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
 static int forward(int token, int want_logits)
 {
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
-    if (tprof_armed && want_logits)
-        tprof_begin(); // Trace this one generated token; disarms itself.
+    if (tprof_armed && want_logits && --tprof_armed == 0)
+        tprof_begin(); // armed=N traces the Nth generated token; disarms itself.
     perf_enter(OP_EMBED);
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     if (attn_all_hw()) {
