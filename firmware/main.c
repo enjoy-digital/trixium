@@ -474,6 +474,12 @@ static void console_service(void)
         printf("EOVL %s (fold heads under the running attention list)\n",
                eovl_use ? "on" : "off");
     }
+    else if (strcmp(token, "qres") == 0) {
+        extern int qres_use;
+        if (strncmp(str, "on", 2) == 0)  qres_use = 1;
+        if (strncmp(str, "off", 3) == 0) qres_use = 0;
+        printf("QRES %s (resident qk-norm rows)\n", qres_use ? "on" : "off");
+    }
     else if (strcmp(token, "fovl") == 0) {
         extern int fovl_use;
         if (strncmp(str, "on", 2) == 0)  fovl_use = 1;

@@ -61,6 +61,12 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_FFSP 0x1D000 // FFN seq spill beats (gate absmax, up absmax): the 0x1D000..0x1E000
                         // gap between SP_H (ends 0x1C000 + 2*n_embd <= 0x1D000) and SP_XR.
 #define SP_FET2 0x3C000 // Second norm16 staging slot (k_norm while q_norm sits in SP_FET).
+// Resident qk-norm weight rows (qres, 2026-09-03): head_dim int16 = 256 B per layer per
+// kind, 28 layers = 7 KB each, in the tails of the SP_FET and SP_D regions (their live
+// occupants are <= 4 KB). Fetched once; the qkr list's rmsnorm_h A1 is patched per layer
+// instead of two 8-beat engine fetches paid at ~1.5k cycles of op latency each, x56/token.
+#define SP_QNW  (SP_FET + 0x1000)
+#define SP_KNW  (SP_D + 0x1000)
 
 // Fixed exponent for CPU-produced normed vectors (values bounded ~16 by construction).
 #define E_NORM  (-11)
@@ -2015,6 +2021,8 @@ static int ffn_prepatched;
 int eovl_use = 1; // C2-2: fold head j under the still-running attention list (needs RSLOT).
 int lovl_use = 1; // C2-3: next forward's list prep posts under the LM-head argmax stream.
 int qkvl_use = 1; // QKV projections + norms as one sequencer list (seq_build_qkv).
+int qres_use = 1; // Resident qk-norm rows (SP_QNW/SP_KNW) instead of per-layer fetches.
+static int qkn_resident;   // 1 once every layer's q/k norm rows sit in SP_QNW/SP_KNW.
 int atrace_use;   // Diagnostic: =N traces layer 0's attention list (per-descriptor deltas)
                   // on the Nth generated token, one-shot, serial folds for that layer.
 // List-relative dcount ("descriptors completed") threshold after which head j's fold
@@ -2301,14 +2309,33 @@ embed_done: ;
             const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
             const struct bons_entry *kn16 = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
             uint32_t dqn = 0;
-            if (fovl_use)   // fovl: the q-norm row streams under the eps/KV prep below.
+            int qres = 0;
+#ifdef BONSAI_VEC_LOOPS2
+            qres = qres_use && (uint32_t)n_layer*head_dim*2 <= 0x1C00 && qn16 && kn16;
+            if (qres && !qkn_resident) {
+                // One-time residency: every layer's q/k norm row (8 beats each).
+                for (int ll = 0; ll < n_layer; ll++) {
+                    const struct bons_entry *q = model_entry_kind(ROLE_ATTN_Q_NORM, ll, KIND_NORM16);
+                    const struct bons_entry *k = model_entry_kind(ROLE_ATTN_K_NORM, ll, KIND_NORM16);
+                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + q->chan_base_beats*32,
+                                 q->chan_len_beats, SP_QNW + (uint32_t)ll*head_dim*2);
+                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + k->chan_base_beats*32,
+                                 k->chan_len_beats, SP_KNW + (uint32_t)ll*head_dim*2);
+                }
+                qkn_resident = 1;
+            }
+#endif
+            if (qres) {
+                seq_patch(0, 3, SP_QNW + (uint32_t)l*head_dim*2);   // rmsnorm_h A1 (q heads).
+                seq_patch(1, 3, SP_KNW + (uint32_t)l*head_dim*2);   // rmsnorm_h A1 (k heads).
+            } else if (fovl_use) {  // fovl: the q-norm row streams under the eps/KV prep below.
                 dqn = norm_fetch_submit(qn16);
-            else
+            } else {
                 engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + qn16->chan_base_beats*32,
                              qn16->chan_len_beats, SP_FET);
-            if (!fovl_use)
                 engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
                              kn16->chan_len_beats, SP_FET2);
+            }
 #ifdef CSR_SEQ_BASE
             {
                 // One sequencer run replaces the 2*(n_head+n_kv) per-head dispatches;
@@ -2339,7 +2366,7 @@ embed_done: ;
                         }
                     }
                 }
-                if (fovl_use) {
+                if (fovl_use && !qres) {
                     engine_join(dqn);
                     engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
                                  kn16->chan_len_beats, SP_FET2);
@@ -2375,7 +2402,7 @@ embed_done: ;
             }
             perf_exit(OP_QKNORM);
 #else
-            if (fovl_use) {
+            if (fovl_use && !qres) {
                 engine_join(dqn);
                 engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
                              kn16->chan_len_beats, SP_FET2);
@@ -3127,6 +3154,7 @@ int infer_init(void)
     ffn_dim  = H->ffn_dim;
 
     heap    = (uint8_t *)HEAP_BASE;
+    qkn_resident = 0; // New image / re-init: the resident qk-norm rows must be refetched.
     tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
     {
         // kv_scores_br's R: depends only on head_dim - once, not 1792x/token.
