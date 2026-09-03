@@ -165,7 +165,22 @@ class BonsaiVectorUnit(LiteXModule):
         assert vregs in (8, 16), vregs
         self.vregs = vregs
         VBITS = 4 if vregs == 16 else 3
-        V = Array([Signal(32*LANES, name=f"vr{i}") for i in range(vregs)])
+        # The register file is two LUTRAM banks with a live-value table (2026-09-03): the
+        # unit has two write ports (E2 writeback, E4 LUT result) and a distributed RAM has
+        # one, so each writer owns a bank and a per-register bit says which bank holds the
+        # latest value; reads mux the two async ports by that bit. As flip-flops plus
+        # 16:1 read muxes the 16-entry file cost ~8k FFs and ~7.6k LUTs and pushed the
+        # full die past the endpoint gate (v7: 21,660). Same-cycle writes to the same
+        # register: E2 wins (the LVT update order below), as before.
+        vbank_a = Memory(32*LANES, vregs, name="vrf_a")   # E2 writes.
+        vbank_b = Memory(32*LANES, vregs, name="vrf_b")   # E4 (LUT) writes.
+        vwa = vbank_a.get_port(write_capable=True)
+        vwb = vbank_b.get_port(write_capable=True)
+        vra = [vbank_a.get_port(async_read=True) for _ in range(2)]
+        vrb = [vbank_b.get_port(async_read=True) for _ in range(2)]
+        self.specials += vbank_a, vbank_b, vwa, vwb, *vra, *vrb
+        vlvt = Array([Signal(name=f"vlvt{i}") for i in range(vregs)])
+        # (write enables/data are assigned below, once wb2/lut_r and the E-stage tags exist)
         S = Array([Signal((48, True), name=f"sr{i}") for i in range(8)])
 
         def lane(sig, i):
@@ -466,18 +481,25 @@ class BonsaiVectorUnit(LiteXModule):
         self.comb += [
             wb2_nl.eq(Mux(e2_is_mul, mul_val, ex1_r)),
             wb2.eq(Mux(e2_is_load, ld_val, wb2_nl)),
+            # Register-file write ports (one bank per writer; see the LVT above).
+            vwa.adr.eq(e2_vd), vwa.dat_w.eq(wb2), vwa.we.eq(e2_valid & ~hold_e2 & e2_wr_v),
+            vwb.adr.eq(e4_vd), vwb.dat_w.eq(lut_r), vwb.we.eq(e4_valid & e4_is_lut),
         ]
 
         # D-side operand capture with forwarding: wb2 (E2) > lut_r (E4 LUT) > regfile.
-        def d_operand(idx):
+        def d_operand(idx, port):
             v = Signal(32*LANES)
-            self.comb += v.eq(
-                Mux(e2_valid & e2_wr_v & ~e2_is_lut & (e2_vd == idx), wb2,
-                Mux(e4_valid & e4_is_lut & (e4_vd == idx), lut_r,
-                    V[idx])))
+            self.comb += [
+                vra[port].adr.eq(idx),
+                vrb[port].adr.eq(idx),
+                v.eq(
+                    Mux(e2_valid & e2_wr_v & ~e2_is_lut & (e2_vd == idx), wb2,
+                    Mux(e4_valid & e4_is_lut & (e4_vd == idx), lut_r,
+                    Mux(vlvt[idx], vrb[port].dat_r, vra[port].dat_r)))),
+            ]
             return v
-        va_d = d_operand(d_va)
-        vb_d = d_operand(d_vb)
+        va_d = d_operand(d_va, 0)
+        vb_d = d_operand(d_vb, 1)
 
         # E1 datapath -------------------------------------------------------------------------
         fwd_a = Signal()
@@ -910,8 +932,8 @@ class BonsaiVectorUnit(LiteXModule):
             e4_is_lut.eq(e3_is_lut),
             lut_r.eq(lut_val),
             # --- V writes: E4 (LUT) first, E2 second so the younger instruction wins ---
-            If(e4_valid & e4_is_lut, V[e4_vd].eq(lut_r)),
-            If(e2_valid & ~hold_e2 & e2_wr_v, V[e2_vd].eq(wb2)),
+            If(vwb.we, vlvt[e4_vd].eq(1)),
+            If(vwa.we, vlvt[e2_vd].eq(0)),          # Listed last: E2 wins a same-reg collision.
             # --- E3 reductions (late S read; the scoreboard keeps every other writer off) ---
             If(e3_valid & e3_is_red,
                 If(e3_f_red["REDSUM"], S[e3_sd].eq(sd3 + red2_sum)),
