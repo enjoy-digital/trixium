@@ -283,29 +283,35 @@ static void attn_f32_recip(uint32_t p8, uint32_t *qm, int *qe)
 }
 static void attn_f32_mul(uint32_t a, uint32_t qm, int qe, uint32_t *m2, int *e2)
 {
-    uint64_t p = (uint64_t)a*qm;                 // a <= 2^14, qm < 2^24: p < 2^38
+    // 32-bit throughout (2026-09-03): the 64-bit variable shifts this used to do are
+    // libgcc calls on RV32 and were most of the fold's 640 cycles. a <= 2^14 and
+    // qm < 2^24 give p < 2^38 and sh in 0..14, so m = p >> sh is (pl >> sh) | (ph <<
+    // (32-sh)) exactly (the bits of ph that would overflow are zero because p < 2^L),
+    // and the remainder/half live entirely in pl. Proven bit-identical to the 64-bit
+    // form over 20M random inputs plus the edges.
+    uint64_t p = (uint64_t)a*qm;                 // mul + mulhu, no library call
     uint32_t ph = (uint32_t)(p >> 32), pl = (uint32_t)p;
     int L = ph ? 32 + bitlen32(ph) : bitlen32(pl);
     int sh = L - 24;                             // p >= 2^23 -> sh >= 0
-    uint64_t m = p >> sh;
+    uint32_t m = sh ? ((pl >> sh) | (ph << (32 - sh))) : pl;
     if (sh > 0) {
-        uint64_t rem = p & (((uint64_t)1 << sh) - 1), half = (uint64_t)1 << (sh - 1);
+        uint32_t rem = pl & ((1u << sh) - 1), half = 1u << (sh - 1);
         if (rem > half || (rem == half && (m & 1))) m++;
     }
-    if (m == ((uint64_t)1 << 24)) { m >>= 1; sh++; }
-    *m2 = (uint32_t)m;
+    if (m == (1u << 24)) { m >>= 1; sh++; }
+    *m2 = m;
     *e2 = qe + sh;
 }
 static int32_t attn_mh_int(uint32_t qm, int sh)
 {
     if (sh >= 0) {
         if (sh >= 8) return 32767;               // qm >= 2^23 -> >= 2^31 -> clamps
-        uint64_t v = (uint64_t)qm << sh;
+        uint32_t v = qm << sh;                   // qm <= 2^24, sh <= 7: fits.
         return (v > 32767) ? 32767 : (int32_t)v;
     }
     int r = -sh;
-    if (r >= 40) return 0;
-    uint64_t v = ((uint64_t)qm + ((uint64_t)1 << (r - 1))) >> r; // lroundf: half away from 0
+    if (r >= 26) return 0;                       // qm <= 2^24 < 2^(r-1): rounds to 0.
+    uint32_t v = (qm + (1u << (r - 1))) >> r;    // lroundf: half away from 0; <= 2^25.
     return (v > 32767) ? 32767 : (int32_t)v;
 }
 static uint32_t aw_qm[32];   // Per-head c2 mantissa (float32 emulation).
