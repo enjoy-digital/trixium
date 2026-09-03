@@ -13,6 +13,7 @@ include $(SOC_DIRECTORY)/software/common.mak
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o
 
+
 # Objects are tree-specific: the generated CSR map differs between BUILD_DIRs, so an object
 # compiled against build/sim and linked into a build/n8_200_* binary (or vice versa) produces
 # firmware that reads the wrong register addresses. The failure is not a link error - it boots,
@@ -33,6 +34,17 @@ REGULAR_LIBS = $(filter-out $(ALWAYS_LINK_LIBS),$(LIBS))
 ALWAYS_LINK_LIBFLAGS = $(if $(ALWAYS_LINK_LIBS),-Wl$(COMMA)--whole-archive $(ALWAYS_LINK_LIBS:lib%=-l%) -Wl$(COMMA)--no-whole-archive)
 
 all: bonsai.bin
+
+# progs.h (the vector microcode) is regenerated on EVERY build for the encoding the build
+# tree's bitstream uses (BONSAI_VEC_VREGS in soc.h; absent = the original 8-register
+# encoding). A mismatch is not a build error - the unit rejects the words via the sticky
+# bad_op, or worse decodes them as something else - so this is forced, not dependency-driven.
+VREGS := $(shell grep -oE 'define BONSAI_VEC_VREGS [0-9]+' $(BUILD_DIR)/software/include/generated/soc.h 2>/dev/null | grep -oE '[0-9]+$$')
+VREGS := $(if $(VREGS),$(VREGS),8)
+progs.h: FORCE
+	cd .. && python3 -m trixium.model.asm firmware/progs.h --vregs $(VREGS)
+FORCE:
+infer.o main.o vec.o: progs.h
 
 %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@

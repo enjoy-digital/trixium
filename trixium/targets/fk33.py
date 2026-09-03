@@ -208,6 +208,9 @@ class BonsaiSoC(SoCCore):
             self.comb += self.scratchpad.units_idle.eq(units_idle)
             self.add_constant("BONSAI_SP_SB_SLOT", 1) # Per-cycle sideband slot present.
             self.add_constant("BONSAI_SP_SB_RSLOT", 1) # Read slot: reads grant mid-list.
+            # Vector ISA encoding (model.asm): the firmware Makefile reads this to emit a
+            # progs.h that matches the bitstream. Absent = the original 8-register encoding.
+            self.add_constant("BONSAI_VEC_VREGS", vecunit.vregs)
             self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
 
             # Scratchpad on the SoC bus (uncached: shared with the engine).

@@ -19,10 +19,18 @@ The INTERPRETER IS THE GOLDEN MODEL: the RTL must execute the same binary with i
 results; programs are validated against numpy/float references here first (accuracy study),
 then the RTL against the interpreter (bit-exact).
 
-Instruction word (32 bits):
-  [31:26] opcode | [25:23] vd | [22:20] va | [19:17] vb | [16:14] sd | [13:11] sa | [10:0] imm
-imm is signed 11-bit unless noted. Memory ops use byte addresses in scalar regs,
-post-incremented by 32 (one 256-bit beat).
+Instruction word (32 bits), two encodings selected by VREGS (the SoC exports
+BONSAI_VEC_VREGS; firmware and bitstream must agree or the sticky bad_op/garbage follows):
+
+  VREGS = 8  (bitstreams up to n16_200_v6c):
+    [31:26] opcode | [25:23] vd | [22:20] va | [19:17] vb | [16:14] sd | [13:11] sa | [10:0] imm11
+  VREGS = 16 (ISA rev 2, 2026-09-03: sixteen vector registers so the single-chain hot
+             programs can be unrolled x2 - silu_q8's body alone needed all eight):
+    [31:26] opcode | [25:22] vd | [21:18] va | [17:14] vb | [13:11] sd | [10:8] sa | [7:0] imm8
+    and for the scalar-only IMM11 ops (MOVSI, ARG, SADDI, LOOPS, LOOPS2), which have no
+    vector operands: imm11 = [25:15] instead (sd/sa stay at [13:11]/[10:8]).
+imm is signed. Vector ops' immediates are shift counts (fit 8 bits). Memory ops use byte
+addresses in scalar regs, post-incremented by 32 (one 256-bit beat).
 """
 
 import numpy as np
@@ -36,6 +44,46 @@ LANES = 16
 # the programs at offset 0 (one added program once corrupted resid_add's ARG setup, and only
 # that program's CRC moved). emit_c() asserts against this, so keep it in step with the RTL.
 IMEM_DEPTH = 512 # 256 until 2026-08-29 (V1 pipeline; 512 x 32 distributed RAM).
+
+# Vector register count = encoding (see the module docstring). set_vregs() switches the
+# assembler, the interpreter and emit_c() together; the firmware Makefile passes the
+# build tree's BONSAI_VEC_VREGS so progs.h always matches the bitstream it links against.
+VREGS = 16
+IMM11_OPS = ("MOVSI", "ARG", "SADDI", "LOOPS", "LOOPS2")
+
+def set_vregs(n):
+    global VREGS
+    assert n in (8, 16), n
+    VREGS = n
+
+def encode_fields(op, vd, va, vb, sd, sa, imm):
+    if VREGS == 8:
+        return ((OP[op] << 26) | (vd << 23) | (va << 20) | (vb << 17)
+                | (sd << 14) | (sa << 11) | (imm & 0x7FF))
+    w = (OP[op] << 26) | (sd << 11) | (sa << 8)
+    if op in IMM11_OPS:
+        return w | ((imm & 0x7FF) << 15)
+    assert -128 <= imm <= 127, f"{op}: imm {imm} does not fit 8 bits (VREGS=16 encoding)"
+    return w | (vd << 22) | (va << 18) | (vb << 14) | (imm & 0xFF)
+
+def decode_fields(w):
+    """-> (op, vd, va, vb, sd, sa, imm) under the current VREGS encoding."""
+    op = OPCODES[(w >> 26) & 0x3F]
+    if VREGS == 8:
+        vd, va, vb = (w >> 23) & 7, (w >> 20) & 7, (w >> 17) & 7
+        sd, sa = (w >> 14) & 7, (w >> 11) & 7
+        imm = w & 0x7FF
+        if imm & 0x400: imm -= 0x800
+        return op, vd, va, vb, sd, sa, imm
+    vd, va, vb = (w >> 22) & 15, (w >> 18) & 15, (w >> 14) & 15
+    sd, sa = (w >> 11) & 7, (w >> 8) & 7
+    if op in IMM11_OPS:
+        imm = (w >> 15) & 0x7FF
+        if imm & 0x400: imm -= 0x800
+    else:
+        imm = w & 0xFF
+        if imm & 0x80: imm -= 0x100
+    return op, vd, va, vb, sd, sa, imm
 
 # Opcodes ------------------------------------------------------------------------------------------
 
@@ -114,7 +162,8 @@ def _s48(v):
 # Assembler ----------------------------------------------------------------------------------------
 
 def _reg(name, prefix):
-    assert isinstance(name, str) and name[0].lower() == prefix and 0 <= int(name[1:]) <= 7, name
+    lim = VREGS - 1 if prefix == "v" else 7
+    assert isinstance(name, str) and name[0].lower() == prefix and 0 <= int(name[1:]) <= lim, name
     return int(name[1:])
 
 def assemble(program):
@@ -165,8 +214,7 @@ def assemble(program):
         assert -1024 <= imm <= 1023 or op in ("MOVSI", "LOOPS", "LOOPS2"), f"imm out of range in {ins}"
         if op in ("MOVSI", "LOOPS", "LOOPS2"):
             assert -1024 <= imm <= 1023, f"imm out of range in {ins} (11-bit)"
-        words.append((OP[op] << 26) | (vd << 23) | (va << 20) | (vb << 17)
-                     | (sd << 14) | (sa << 11) | (imm & 0x7FF))
+        words.append(encode_fields(op, vd, va, vb, sd, sa, imm))
     return words
 
 # Interpreter (the golden model) -------------------------------------------------------------------
@@ -219,7 +267,7 @@ class VecInterp:
     def run(self, words, args, max_steps=1_000_000, s7_seed=0):
         # s7_seed models the sequencer's res6-chaining (S7 starts as the previous
         # program's res6 under direct drive; 0 for CSR dispatch).
-        V = [np.zeros(LANES, dtype=np.int64) for _ in range(8)]
+        V = [np.zeros(LANES, dtype=np.int64) for _ in range(VREGS)]
         S = [0]*7 + [_s48(s7_seed)]
         A = list(args) + [0]*(8 - len(args))
         pc = 0
@@ -229,15 +277,7 @@ class VecInterp:
         while steps < max_steps:
             steps += 1
             w = words[pc]
-            op   = OPCODES[(w >> 26) & 0x3F]
-            vd   = (w >> 23) & 7
-            va   = (w >> 20) & 7
-            vb   = (w >> 17) & 7
-            sd   = (w >> 14) & 7
-            sa   = (w >> 11) & 7
-            imm  = w & 0x7FF
-            if imm & 0x400:
-                imm -= 0x800
+            op, vd, va, vb, sd, sa, imm = decode_fields(w)
             npc = pc + 1
 
             if op == "NOP":
@@ -1012,6 +1052,7 @@ def emit_c(out):
              "#include <stdint.h>", ""]
     all_words = []
     offsets = {}
+    lines.append(f"#define BONSAI_PROGS_VREGS {VREGS}")
     for name, fn in PROGRAMS.items():
         offsets[name] = len(all_words)
         all_words += assemble(fn())
@@ -1030,5 +1071,8 @@ def emit_c(out):
 
 if __name__ == "__main__":
     import sys
-    emit_c(sys.argv[1] if len(sys.argv) > 1 else "firmware/progs.h")
-    print("emitted")
+    argv = sys.argv[1:]
+    if "--vregs" in argv:                       # python -m ... progs.h --vregs 8|16
+        i = argv.index("--vregs"); set_vregs(int(argv[i + 1])); del argv[i:i + 2]
+    emit_c(argv[0] if argv else "firmware/progs.h")
+    print(f"emitted (VREGS={VREGS})")

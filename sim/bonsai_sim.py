@@ -185,6 +185,7 @@ class BonsaiSimSoC(SoCCore):
         ]
         self.add_constant("BONSAI_SP_SB_SLOT", 1) # Per-cycle sideband slot present.
         self.add_constant("BONSAI_SP_SB_RSLOT", 1) # Read slot: reads grant mid-list.
+        self.add_constant("BONSAI_VEC_VREGS", self.vecunit.vregs) # Encoding (model.asm).
         self.add_constant("BONSAI_HAS_KVSTORE")
         self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
         if dual: # Matches the hardware --with-dual option.

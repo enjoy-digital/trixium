@@ -61,7 +61,7 @@ LANES = 16
 # BonsaiVectorUnit ---------------------------------------------------------------------------------
 
 class BonsaiVectorUnit(LiteXModule):
-    def __init__(self, imem_depth=None):
+    def __init__(self, imem_depth=None, vregs=16):
         # Kept in step with model.asm.IMEM_DEPTH, which asserts the programs fit: an
         # overflowing upload wraps and silently overwrites the program at offset 0.
         if imem_depth is None:
@@ -159,7 +159,13 @@ class BonsaiVectorUnit(LiteXModule):
         rom_rsq = make_rom(bx.rsqrt_lut(), int(round((2**15)/2.0)))
 
         # Register files.
-        V = Array([Signal(32*LANES, name=f"vr{i}") for i in range(8)])
+        # ISA rev 2 (2026-09-03): 16 vector registers so the single-chain hot programs can
+        # be unrolled x2; the encoding moves with it (model.asm docstring). vregs=8 keeps
+        # the original encoding for reference builds.
+        assert vregs in (8, 16), vregs
+        self.vregs = vregs
+        VBITS = 4 if vregs == 16 else 3
+        V = Array([Signal(32*LANES, name=f"vr{i}") for i in range(vregs)])
         S = Array([Signal((48, True), name=f"sr{i}") for i in range(8)])
 
         def lane(sig, i):
@@ -210,21 +216,35 @@ class BonsaiVectorUnit(LiteXModule):
         d_word = Signal(32)
         self.comb += d_word.eq(Mux(use_lf, loop_first, Mux(use_lf2, loop_first2, insn_d)))
         d_op  = Signal(6)
-        d_vd  = Signal(3)
-        d_va  = Signal(3)
-        d_vb  = Signal(3)
+        d_vd  = Signal(VBITS)
+        d_va  = Signal(VBITS)
+        d_vb  = Signal(VBITS)
         d_sd  = Signal(3)
         d_sa  = Signal(3)
         d_imm = Signal((11, True))
-        self.comb += [
-            d_op.eq(d_word[26:32]),
-            d_vd.eq(d_word[23:26]),
-            d_va.eq(d_word[20:23]),
-            d_vb.eq(d_word[17:20]),
-            d_sd.eq(d_word[14:17]),
-            d_sa.eq(d_word[11:14]),
-            d_imm.eq(d_word[0:11]),
-        ]
+        self.comb += d_op.eq(d_word[26:32])
+        if vregs == 8:
+            self.comb += [
+                d_vd.eq(d_word[23:26]),
+                d_va.eq(d_word[20:23]),
+                d_vb.eq(d_word[17:20]),
+                d_sd.eq(d_word[14:17]),
+                d_sa.eq(d_word[11:14]),
+                d_imm.eq(d_word[0:11]),
+            ]
+        else:
+            # Scalar-only IMM11 ops carry their immediate where the vreg fields sit.
+            d_imm11 = Signal()
+            self.comb += [
+                d_imm11.eq(is_in(d_op, list(vasm.IMM11_OPS))),
+                d_vd.eq(d_word[22:26]),
+                d_va.eq(d_word[18:22]),
+                d_vb.eq(d_word[14:18]),
+                d_sd.eq(d_word[11:14]),
+                d_sa.eq(d_word[8:11]),
+                d_imm.eq(Mux(d_imm11, d_word[15:26],
+                             Cat(d_word[0:8], Replicate(d_word[7], 3)))),
+            ]
         d_is_load  = Signal()
         d_is_store = Signal()
         d_is_lut   = Signal()
@@ -296,9 +316,9 @@ class BonsaiVectorUnit(LiteXModule):
         # E1 record ---------------------------------------------------------------------------
         e1_valid    = Signal()
         e1_op       = Signal(6)
-        e1_vd       = Signal(3)
-        e1_va       = Signal(3)
-        e1_vb       = Signal(3)
+        e1_vd       = Signal(VBITS)
+        e1_va       = Signal(VBITS)
+        e1_vb       = Signal(VBITS)
         e1_sd       = Signal(3)
         e1_imm      = Signal((11, True))
         e1_va_r     = Signal(32*LANES)
@@ -320,7 +340,7 @@ class BonsaiVectorUnit(LiteXModule):
         # E2 record ---------------------------------------------------------------------------
         e2_valid    = Signal()
         e2_op       = Signal(6)
-        e2_vd       = Signal(3)
+        e2_vd       = Signal(VBITS)
         e2_sd       = Signal(3)
         e2_is_load  = Signal()
         e2_is_ldw   = Signal()
@@ -346,7 +366,7 @@ class BonsaiVectorUnit(LiteXModule):
 
         # E3 record ---------------------------------------------------------------------------
         e3_valid    = Signal()
-        e3_vd       = Signal(3)
+        e3_vd       = Signal(VBITS)
         e3_sd       = Signal(3)
         e3_is_lut   = Signal()
         e3_is_red   = Signal()
@@ -366,7 +386,7 @@ class BonsaiVectorUnit(LiteXModule):
 
         # E4 record (LUT writeback only) --------------------------------------------------------
         e4_valid    = Signal()
-        e4_vd       = Signal(3)
+        e4_vd       = Signal(VBITS)
         e4_is_lut   = Signal()
         lut_r       = Signal(32*LANES)
 

@@ -13,6 +13,15 @@
 
 #include "progs.h"
 
+// The microcode encoding must be the bitstream's (model.asm docstring). The Makefile
+// regenerates progs.h per build tree; this catches a stale header before it costs a boot.
+#ifndef BONSAI_VEC_VREGS
+#define BONSAI_VEC_VREGS 8
+#endif
+#if BONSAI_PROGS_VREGS != BONSAI_VEC_VREGS
+#error "progs.h was emitted for a different vector register count than this bitstream"
+#endif
+
 void vec_init(void)
 {
     vecunit_prog_adr_write(0);

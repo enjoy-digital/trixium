@@ -30,6 +30,10 @@ SP_SIZE = 16*1024
 SRC0, SRC1, DST = 0x0000, 0x0800, 0x1000
 
 
+# The constant register is the top vreg; random operands span the rest (ISA rev 2: 16).
+VCONST = f"v{asm.VREGS - 1}"
+VMAX   = asm.VREGS - 2
+
 def gen_program(rng):
     """One random program. v7 holds a positive constant (LUTRECIP operands must be
     nonzero); s0/s1 are load pointers, s2 the store pointer, s3 the loop count, s4 a
@@ -38,7 +42,7 @@ def gen_program(rng):
             ("MOVSI", "s4", rng.randint(1, 1000)),
             ("MOVSI", "s5", rng.randint(-1000, 1000)), ("MOVSI", "s6", 0),
             ("MOVSI", "s7", rng.randint(-5, 5)),
-            ("BCAST", "v7", "s4")]
+            ("BCAST", VCONST, "s4")]
     last = ["v0", "v1"]   # Recently written vregs, most recent first (dependency bias).
 
     def vsrc():
@@ -47,10 +51,10 @@ def gen_program(rng):
             return last[0]
         if r < 0.75 and len(last) > 1:
             return last[1]
-        return f"v{rng.randint(0, 6)}"
+        return f"v{rng.randint(0, VMAX)}"
 
     def vdst():
-        return f"v{rng.randint(0, 6)}"
+        return f"v{rng.randint(0, VMAX)}"
 
     def wrote(v):
         if v in last:
@@ -106,7 +110,7 @@ def gen_program(rng):
             elif k < 0.95:
                 # LUTRECIP idiom on a normalized nonzero mantissa.
                 x, z, w = vdst(), vdst(), vdst()
-                out += [("VABS", x, vsrc()), ("VMAX", x, x, "v7"), ("VCLZN", z, x),
+                out += [("VABS", x, vsrc()), ("VMAX", x, x, VCONST), ("VCLZN", z, x),
                         ("VSHLV", x, x, z), ("LUTRECIP", w, x)]
                 wrote(x); wrote(z); wrote(w)
             else:
