@@ -76,3 +76,4 @@ rom*.init
 tools/vsim/obj_engine/
 firmware/.build_dir_stamp
 /trace.json
+firmware/progs.h

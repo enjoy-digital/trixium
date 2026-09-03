@@ -1323,6 +1323,7 @@ void fprof_print(void)
 
 static int seq_ffn_base = -1;
 static int seq_ffn_len  = 0;
+static int ffn_shape_base = -1; // seq_ffn_base the FFN engine shape images were written for.
 static void seq_build_ffn(void)
 {
 #ifdef BONSAI_HAS_DUALQ
@@ -1333,6 +1334,7 @@ static void seq_build_ffn(void)
         return;
     seq_ffn_base = di;
     seq_ffn_len  = 9;
+    ffn_shape_base = -1; // Engine slots are placeholders until ffn_prep_layer.
     // Pipelined order (2026-08-29): the up matvec is NOWAIT and the gate norm runs UNDER
     // its stream - the list keeps the `ovl` overlap it used to lose. The norms take k
     // from kregs (captured at each matvec) instead of KABS, so they no longer read the
@@ -2027,21 +2029,31 @@ static inline uint32_t attn_fold_ready(int j, int chunk) {
 // it can POST under the qkr list in the povl window (all inputs are layer-known: model
 // entries and static scratchpad addresses; only the silu A4 imm needs ex8 and stays at
 // FFN time). The sequencer-fetch interlock orders these writes before the FFN list runs.
+static inline void ffn_patch_lw(uint32_t di, const struct engine_op *mo)
+{
+    seq_patch(di, 4, mo->wbase);
+    seq_patch(di, 7, mo->bias | ((uint32_t)mo->rshift << 16) | ((uint32_t)mo->rshift2 << 22));
+}
+
 static void ffn_prep_layer(int l)
 {
+    // Only wbase (4) and bias|rshift (7) change with the layer; the 13 shape words are
+    // per-role constants and the flag patches are build-time. Full images once per list
+    // build, then 6 posted words per layer instead of 45. (Measured neutral on v5d -
+    // absorbed downstream, an I$ artefact; re-measured on v7c with the 32 KB I$.)
     struct engine_op mo = {0};
+    int full = (ffn_shape_base != seq_ffn_base);
+    uint32_t b = (uint32_t)seq_ffn_base;
     model_matvec_op(model_entry(ROLE_FFN_GATE, l), SP_X, SP_Y, &mo);
-    seq_desc_engine(seq_ffn_base + 0, &mo);
-    seq_patch(seq_ffn_base + 0, 0, 1u | (1u << 5)); // capture k -> kreg0.
+    if (full) { seq_desc_engine(b + 0, &mo); seq_patch(b + 0, 0, 1u | (1u << 5)); }
+    else ffn_patch_lw(b + 0, &mo);
     model_matvec_op(model_entry(ROLE_FFN_UP, l), SP_X, SP_YU, &mo);
-    seq_desc_engine(seq_ffn_base + 2, &mo);
-    seq_patch(seq_ffn_base + 2, 0, 1u | (1u << 9)); // NOWAIT: norm_g under the stream.
+    if (full) { seq_desc_engine(b + 2, &mo); seq_patch(b + 2, 0, 1u | (1u << 9)); }
+    else ffn_patch_lw(b + 2, &mo);
     model_matvec_op(model_entry(ROLE_FFN_DOWN, l), SP_X, SP_Y, &mo);
-    seq_desc_engine(seq_ffn_base + 7, &mo);
-    // Tried 2026-09-02: writing only the two layer-dependent words (wbase, bias|rshift)
-    // instead of all 15 - the prep window lost 6.7M cycles per 64 tokens as predicted
-    // and the token gained nothing: wv/rmsnorm/scores absorbed it (the pipeline behind
-    // this window is unit-bound, so CPU time here is slack). Not worth the state.
+    if (full) seq_desc_engine(b + 7, &mo);
+    else ffn_patch_lw(b + 7, &mo);
+    ffn_shape_base = seq_ffn_base;
 }
 int prep_ovl = 1; // povl console toggle: patch-under-list overlap (needs BONSAI_SP_SB_SLOT).
 static void attn_patch_slots(int l, int h0, int nh, int chunked)
