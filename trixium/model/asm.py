@@ -43,7 +43,8 @@ LANES = 16
 # init. Overflowing it does NOT fail loudly - the write pointer wraps and quietly overwrites
 # the programs at offset 0 (one added program once corrupted resid_add's ARG setup, and only
 # that program's CRC moved). emit_c() asserts against this, so keep it in step with the RTL.
-IMEM_DEPTH = 512 # 256 until 2026-08-29 (V1 pipeline; 512 x 32 distributed RAM).
+IMEM_DEPTH = 1024 # 256 until 2026-08-29, 512 until 2026-09-03 (ISA rev 2: the x2 unrolls
+                  # cost ~30 words each; 1024 x 32 distributed RAM, 4 KB).
 
 # Vector register count = encoding (see the module docstring). set_vregs() switches the
 # assembler, the interpreter and emit_c() together; the firmware Makefile passes the
@@ -1027,6 +1028,230 @@ def prog_spill():
         ("DONE",),
     ]
 
+
+# ISA rev 2 unrolls (2026-09-03): two interleaved chains per iteration, chain B in v8..
+# The interpreter proves them byte-identical to the single-chain programs (in place too);
+# the win is RTL-only - the second chain fills the LUT/load-use/mul stalls the first one
+# exposes at 1 IPC. emit_c() substitutes them under the same PROG_ name when VREGS == 16.
+# CONTRACTS: silu_q8_x2 needs an even beat count (ffn_dim/16 always is on the 1.7B);
+# softmax8_x2 an even block count - the firmware pads scores to a 32-multiple when
+# BONSAI_PROGS_VREGS == 16 (INT32_MIN entries emit p8 = 0: sum and AXPY unchanged).
+
+def prog_silu_q8_x2():
+    C_LOG2E = 739
+    A = dict(x="v0", g="v3", sh="v4", p="v5", r="v6")
+    B = dict(x="v8", g="v9", sh="v10", p="v11", r="v12")
+    def chain_pre(c):   # up to and including the LUT issue
+        return [
+            ("LDV",   c["x"], "s0"),
+            ("VMULS", c["g"], c["x"], "s5"),
+            ("VSHLS", c["g"], c["g"], "s4"),
+            ("VMAX",  c["g"], c["g"], "v1"),
+            ("VMIN",  c["g"], c["g"], "v7"),
+            ("LUTE2", c["p"], c["g"]),
+            ("VSHRI", c["sh"], c["g"], 15),
+            ("LDV",   c["g"], "s1"),
+        ]
+    def chain_mid(c):   # LUT result -> reciprocal LUT issue
+        return [
+            ("VSHLV", c["p"], c["p"], c["sh"]),
+            ("VADD",  c["r"], c["p"], "v2"),
+            ("VCLZN", c["sh"], c["r"]),
+            ("VSHLV", c["r"], c["r"], c["sh"]),
+            ("LUTRECIP", c["r"], c["r"]),
+        ]
+    def chain_post(c):  # reciprocal -> product -> store
+        return [
+            ("VMULH15", c["p"], c["p"], c["r"]),
+            ("VSHLV",   c["p"], c["p"], c["sh"]),
+            ("VSHLI",   c["p"], c["p"], 1),
+            ("VMULH15", c["x"], c["x"], c["p"]),
+            ("VMUL",    c["x"], c["x"], c["g"]),
+            ("VSHLS",   c["x"], c["x"], "s6"),
+            ("VCLAMP16", c["x"], c["x"]),
+            ("REDMAX",  "s7", c["x"]),
+            ("STV",     c["x"], "s2"),
+        ]
+    def zip2(a, b):
+        out = []
+        for i in range(max(len(a), len(b))):
+            if i < len(a): out.append(a[i])
+            if i < len(b): out.append(b[i])
+        return out
+    body = (zip2(chain_pre(A), chain_pre(B))
+            + zip2(chain_mid(A), chain_mid(B))
+            + zip2(chain_post(A), chain_post(B)))
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s6", 6),
+        ("MOVSI", "s5", C_LOG2E),
+        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15),
+        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10),
+        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10),
+        ("MOVSI", "s7", 0),
+        ("MOVSI", "s5", -1), ("SSHLV", "s3", "s5"),   # A3 /= 2 (even beat counts).
+        ("MOVSI", "s5", C_LOG2E),
+        ("LOOPS", "s3"),
+    ] + body + [
+        ("LOOPE",),
+        ("SMOV",  "s6", "s7"),
+        ("BCAST", "v1", "s7"),
+        ("VCLZN", "v1", "v1"),
+        ("ARG",   "s2", 2),
+        ("ARG",   "s7", 7),
+        ("LOOPS", "s3"),                              # s3 still holds A3/2 (LOOPS only reads it).
+        ("LDV",   "v0", "s2"),
+        ("LDV",   "v8", "s2"),
+        ("VSHLV", "v0", "v0", "v1"),
+        ("VSHLV", "v8", "v8", "v1"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VRNE",  "v8", "v8", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("VCLAMP8", "v8", "v8"),
+        ("STB",   "v0", "s7"),
+        ("STB",   "v8", "s7"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
+def prog_softmax8_x2():
+    A = dict(x="v0", y="v1", p="v2")
+    B = dict(x="v8", y="v9", p="v10")
+    def pass1(c):
+        return [("LDW", c["x"], "s0"), ("LDW", c["y"], "s0"),
+                ("VPACK", c["x"], c["x"], c["y"]), ("REDSMAX", "s7", c["x"])]
+    def pre(c):
+        return [
+            ("LDW",   c["x"], "s0"),
+            ("LDW",   c["y"], "s0"),
+            ("VPACK", c["x"], c["x"], c["y"]),
+            ("VSHLV", c["x"], c["x"], "v3"),
+            ("VSUB",  c["x"], c["x"], "v7"),
+            ("VMUL",  c["x"], c["x"], "v5"),
+            ("VSHLV", c["x"], c["x"], "v6"),
+            ("VMAX",  c["x"], c["x"], "v4"),
+            ("LUTE2", c["p"], c["x"]),
+            ("VSHRI", c["y"], c["x"], 15),
+        ]
+    def post(c):
+        return [
+            ("VSHLV", c["p"], c["p"], c["y"]),
+            ("VRNE",  c["p"], c["p"], 8),
+            ("VCLAMP8", c["p"], c["p"]),
+            ("REDSUM", "s6", c["p"]),
+            ("STB",   c["p"], "s2"),
+        ]
+    def zip2(a, b):
+        out = []
+        for i in range(max(len(a), len(b))):
+            if i < len(a): out.append(a[i])
+            if i < len(b): out.append(b[i])
+        return out
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s3", 3),
+        ("MOVSI", "s5", 47),
+        ("MOVSI", "s7", -1),
+        ("SSHLV", "s7", "s5"),          # smax accumulator = -2^47.
+        ("MOVSI", "s5", -1), ("SSHLV", "s3", "s5"),   # blocks / 2 (even by contract).
+        ("LOOPS", "s3"),
+    ] + pass1(A)[:2] + pass1(B)[:2] + zip2(pass1(A)[2:], pass1(B)[2:]) + [
+        ("LOOPE",),
+        ("ARG",   "s0", 0), ("ARG", "s2", 2),         # s3 still holds blocks/2.
+        ("ARG",   "s4", 4), ("ARG", "s5", 5),
+        ("MOVSI", "s6", 0),
+        ("BCAST", "v7", "s7"),          # smax.
+        ("BCAST", "v6", "s4"),
+        ("VSHLV", "v7", "v7", "v6"),    # smax >> s1.
+        ("ARG",   "s1", 1),
+        ("BCAST", "v5", "s1"),
+        ("MOVSI", "s1", -480),
+        ("BCAST", "v4", "s1"),
+        ("VSHLI", "v4", "v4", 10),      # -15*2^15.
+        ("BCAST", "v3", "s4"),
+        ("BCAST", "v6", "s5"),
+        ("LOOPS", "s3"),
+    ] + pre(A)[:2] + pre(B)[:2] + zip2(pre(A)[2:], pre(B)[2:]) + zip2(post(A), post(B)) + [
+        ("LOOPE",),
+        ("ARG",   "s1", 6),
+        ("BCAST", "v0", "s6"),
+        ("STW",   "v0", "s1"),
+        ("DONE",),
+    ]
+
+def prog_rmsnorm_q8_x2():
+    def zip2(a, b):
+        out = []
+        for i in range(max(len(a), len(b))):
+            if i < len(a): out.append(a[i])
+            if i < len(b): out.append(b[i])
+        return out
+    A = dict(x="v0", w="v1", y="v2"); B = dict(x="v8", w="v9", y="v10")
+    def main(c):
+        return [
+            ("LDV",   c["x"], "s0"),
+            ("LDV",   c["w"], "s1"),
+            ("VMUL",  c["y"], c["x"], c["w"]),
+            ("VMULH15", c["y"], c["y"], "v7"),
+            ("VADD",  c["y"], c["y"], "v4"),
+            ("VSHLV", c["y"], c["y"], "v6"),
+            ("VCLAMP16", c["y"], c["y"]),
+            ("REDMAX", "s6", c["y"]),
+            ("STV",   c["y"], "s2"),
+        ]
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s5", 5), ("ARG", "s6", 6),
+        ("MOVSI", "s7", -1), ("SSHLV", "s3", "s7"),   # A3 /= 2: every loop below is x2.
+        ("MOVSI", "s7", 0),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("LDV",   "v8", "s0"),
+        ("REDSSQ", "s7", "v0"),
+        ("REDSSQ", "s7", "v8"),
+        ("LOOPE",),
+        ("SSHLV", "s7", "s4"),
+        ("SADD",  "s7", "s5"),
+        ("SNORME", "s4", "s7"),
+        ("SSHLV", "s7", "s4"),
+        ("BCAST", "v7", "s7"),
+        ("LUTRSQRT", "v7", "v7"),
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s4", "s5"),
+        ("SADD",  "s4", "s6"),
+        ("BCAST", "v6", "s4"),
+        ("VSUB",  "v5", "v5", "v5"),
+        ("VSUB",  "v5", "v5", "v6"),
+        ("MOVSI", "s5", 1),
+        ("BCAST", "v4", "s5"),
+        ("VSUB",  "v3", "v5", "v4"),
+        ("VSHLV", "v4", "v4", "v3"),
+        ("ARG",   "s0", 0),
+        ("MOVSI", "s6", 0),
+        ("LOOPS", "s3"),
+    ] + main(A)[:2] + main(B)[:2] + zip2(main(A)[2:], main(B)[2:]) + [
+        ("LOOPE",),
+        ("BCAST", "v1", "s6"),
+        ("VCLZN", "v1", "v1"),
+        ("ARG",   "s2", 2),
+        ("ARG",   "s7", 7),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s2"),
+        ("LDV",   "v8", "s2"),
+        ("VSHLV", "v0", "v0", "v1"),
+        ("VSHLV", "v8", "v8", "v1"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VRNE",  "v8", "v8", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("VCLAMP8", "v8", "v8"),
+        ("STB",   "v0", "s7"),
+        ("STB",   "v8", "s7"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
+UNROLL16 = {"silu_q8": prog_silu_q8_x2, "softmax8": prog_softmax8_x2,
+            "rmsnorm_q8": prog_rmsnorm_q8_x2}
+
 PROGRAMS = {
     "resid_add":  prog_resid_add,
     "quant8":     prog_quant8,
@@ -1055,6 +1280,8 @@ def emit_c(out):
     lines.append(f"#define BONSAI_PROGS_VREGS {VREGS}")
     for name, fn in PROGRAMS.items():
         offsets[name] = len(all_words)
+        if VREGS == 16 and name in UNROLL16:
+            fn = UNROLL16[name]
         all_words += assemble(fn())
     assert len(all_words) <= IMEM_DEPTH, (
         f"programs need {len(all_words)} words but the instruction BRAM holds {IMEM_DEPTH}: "

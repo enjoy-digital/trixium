@@ -472,6 +472,16 @@ static void rope_apply(float *vec, int n_heads_v, int pos)
 
 #ifdef CSR_VECUNIT_BASE
 #include "progs.h"
+
+// Score padding granule: softmax8's x2 unroll (ISA rev 2 microcode) walks two 16-entry
+// blocks per iteration and has no odd-tail form, so scores are padded to a 32-multiple
+// with INT32_MIN there (those entries emit p8 = 0 - the sum and the AXPY do not change).
+#if BONSAI_PROGS_VREGS >= 16
+#define SC_PAD 32
+#else
+#define SC_PAD 16
+#endif
+#define SC_PADN(cnt) ((SC_PAD - ((cnt) & (SC_PAD - 1))) & (SC_PAD - 1))
 #endif
 
 // Resident-BFP op layer: every op has a CPU implementation (float math over the int16
@@ -1573,7 +1583,7 @@ static void attn_seq2_layer(int l, int pos, float *aw_c, float *aw_hmax)
     // CPU Rpre patch between them; numerics identical to the single-head chain.
     perf_enter(OP_SCORES);
     int cnt  = pos + 1;
-    int padn = (16 - (cnt & 15)) & 15;
+    int padn = SC_PADN(cnt);
     volatile int32_t *scA = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
     volatile int32_t *scB = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SCB);
     for (int i2 = 0; i2 < padn; i2++) {
@@ -2069,7 +2079,7 @@ static void attn_list_prep_token(int pos)
     if (pos == attn_prep_pos)
         return; // Already posted under the previous forward's LM-head stream (lovl).
     int cnt  = pos + 1;
-    int padn = (16 - (cnt & 15)) & 15;
+    int padn = SC_PADN(cnt);
     if (attn_pipe_active && (uint32_t)(cnt + padn)*4u > 0x3800u) {
         // The context outgrew the second scores buffer: fall back to the plain list
         // (the FFN/scale8 bases shift with the prologue, so rebuild all three).
@@ -2622,7 +2632,7 @@ attn_scores: ;
                 perf_exit(OP_SCORES);
                 perf_enter(OP_SOFTMAX);
                 int cnt = pos + 1;
-                int padn = (16 - (cnt & 15)) & 15;
+                int padn = SC_PADN(cnt);
                 volatile int32_t *sc32 = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC);
                 for (int i2 = 0; i2 < padn; i2++)
                     sc32[cnt + i2] = (int32_t)0x80000000;
@@ -3087,6 +3097,13 @@ int infer_init(void)
         printf("infer: image channels (%lu) != engine channels (%u)\n",
                (unsigned long)H->n_channels, BONSAI_N_CHANNELS);
         return -3;
+    }
+#endif
+#if BONSAI_PROGS_VREGS >= 16
+    if (H->ffn_dim % 32) { // silu_q8_x2 walks two beats per iteration (no odd tail).
+        printf("infer: ffn_dim %lu is not a multiple of 32 (ISA rev 2 microcode)\n",
+               (unsigned long)H->ffn_dim);
+        return -4;
     }
 #endif
     n_ch     = H->n_channels;

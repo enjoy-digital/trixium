@@ -165,7 +165,7 @@ class BonsaiSoC(SoCCore):
                 ]
                 self.comb += [vecunit.seq_args[i].eq(seq.vec_args[i]) for i in range(8)]
                 self.add_constant("BONSAI_HAS_SEQ")
-                # The 1KB vec imem must stay in distributed RAM: as BRAM, Vivado packs the
+                # The 4KB vec imem must stay in distributed RAM: as BRAM, Vivado packs the
                 # FETCHR register into the BRAM output stage, re-anchoring the decode
                 # launch to the BRAM's clock-to-out + placement (the overnight worst path).
                 platform.add_platform_command(
