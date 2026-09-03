@@ -255,7 +255,7 @@ static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 //   ea8 = frexpf(max hm) - 7               -> e2max + 24 - 7
 //   Mh  = lroundf(ldexpf(c2, 15 - ea8))    -> qm * 2^(qe + E1 + 15 - ea8), half away from 0
 int ifold_use = 1; // Second version (2026-08-30): 32-bit hardware divides + clz.
-static inline int bitlen32(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
+static inline __attribute__((always_inline)) int bitlen32(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
 static void attn_f32_recip(uint32_t p8, uint32_t *qm, int *qe)
 {
     // m = 2^(23+L)/p8 in (2^23, 2^24] with an exact remainder, on the 32-bit divider:
@@ -2136,16 +2136,15 @@ static void attn_list_prep_token(int pos)
 }
 #endif
 
+static int fold_nrep_sh = 1; // log2(n_head/n_kv_head) when a power of two (set at init).
 static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
 {
-    int kvh = hh/(n_head/n_kv_head);
+    int kvh = hh >> fold_nrep_sh;
     uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8 + (uint32_t)hh*32);
     uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWAM + (uint32_t)hh*32);
-    int Bv, Rd;
-    kv_scores_br(l, kvh, 1, &Bv, &Rd);
+    int Bv = 22 - kv_ekmax[kv_ek_idx(l, kvh, 1)];   // kv_scores_br's B; R unused here.
     int Rpre = axpy_rpre_c(P8 ? P8 : 1);
-    int k2 = 0;
-    k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
+    int k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
     int E1 = Rpre - Bv + k2;
     if (ifold_use) {
         // Integer emulation of the float32 fold (F1-5): same bits, no soft-float.
@@ -2167,7 +2166,6 @@ static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
         float hm2 = (float)(am >> k2)*c2;
         if (hm2 > *aw_hmax_p) *aw_hmax_p = hm2;
     }
-    (void)Rd;
 }
 
 // The norm16 row the layer after l opens with (attention norm), or the final norm.
@@ -3160,6 +3158,12 @@ int infer_init(void)
     ffn_dim  = H->ffn_dim;
 
     heap    = (uint8_t *)HEAP_BASE;
+    {
+        int nrep = n_head/n_kv_head, sh = 0;
+        while ((1 << sh) < nrep) sh++;
+        if ((1 << sh) != nrep) { printf("infer: n_head/n_kv_head must be a power of two\n"); return -5; }
+        fold_nrep_sh = sh;
+    }
     qkn_resident = 0; // New image / re-init: the resident qk-norm rows must be refetched.
     tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
     {
