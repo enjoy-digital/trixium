@@ -966,29 +966,39 @@ static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
     }
     // Two passes (no buffer: SRAM is tight): amax of |(q-1)*m11 << sh| per group is just
     // |m11[g]| << sh over any nonzero code - scan codes once for group nonzero-ness.
+    // Scratchpad accesses are uncached bus transactions (~30 cycles each), so the codes
+    // are read as 32-bit words (16 codes per read) and the int16 results are stored two
+    // per word: the byte/halfword version of these loops was ~85k cycles per token
+    // for 2048 elements (2026-09-04). Same arithmetic, same bytes.
+    const volatile uint32_t *cw = (const volatile uint32_t *)(pb + sb*32);
     int32_t amax = 0;
     for (int g = 0; g < G; g++) {
         int sh = e16[g] - e16min;
         if (sh > 20) sh = 20;
         int32_t gm = ((m11[g] < 0) ? -m11[g] : m11[g]) << sh;
         if (gm <= amax) continue;
-        for (int j = 0; j < 32; j++) { // Any nonzero 2-bit code pair in the group?
-            uint8_t b3 = codes[g*32 + j];
-            if (b3 != 0x55) { amax = gm; break; } // 0x55 = four "code 1" (zero weight).
+        for (int j = 0; j < 8; j++) {  // Any nonzero code in the group? (0x55 = "1" x4.)
+            if (cw[g*8 + j] != 0x55555555u) { amax = gm; break; }
         }
     }
-    int bl = 0;
-    while ((amax >> bl) != 0) bl++;      // Bit length.
+    int bl = bitlen32((uint32_t)amax);   // Bit length (amax >= 0).
     int k2 = bl - 15;                    // Mantissas into [2^14, 2^15); may be negative.
-    volatile int16_t *pd = sp16(sp_dst);
+    volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + sp_dst);
     for (int g = 0; g < G; g++) {
         int sh = e16[g] - e16min;
         if (sh > 20) sh = 20;
         int net = sh - k2;               // Combined shift, sign either way.
-        for (int j = 0; j < 128; j++) {
-            int q2 = (codes[g*32 + j/4] >> ((j & 3)*2)) & 3;
-            int32_t v2 = (int32_t)(q2 - 1)*m11[g];
-            pd[g*128 + j] = (int16_t)((net >= 0) ? (v2 << net) : (v2 >> -net));
+        int32_t m = m11[g];
+        volatile uint32_t *dst = pw + g*64;
+        for (int w = 0; w < 8; w++) {
+            uint32_t c = cw[g*8 + w];    // 16 codes, element i at bits [2i+1:2i].
+            for (int i = 0; i < 16; i += 2) {
+                int32_t v0 = (int32_t)(((c >> (2*i)) & 3) - 1)*m;
+                int32_t v1 = (int32_t)(((c >> (2*i + 2)) & 3) - 1)*m;
+                int16_t o0 = (int16_t)((net >= 0) ? (v0 << net) : (v0 >> -net));
+                int16_t o1 = (int16_t)((net >= 0) ? (v1 << net) : (v1 >> -net));
+                dst[w*8 + i/2] = (uint32_t)(uint16_t)o0 | ((uint32_t)(uint16_t)o1 << 16);
+            }
         }
     }
     return e16min + k2;
