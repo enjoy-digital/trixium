@@ -1249,8 +1249,129 @@ def prog_rmsnorm_q8_x2():
         ("DONE",),
     ]
 
+def prog_rmsnorm_h_x2():
+    def zip2(a, b):
+        out = []
+        for i in range(max(len(a), len(b))):
+            if i < len(a): out.append(a[i])
+            if i < len(b): out.append(b[i])
+        return out
+    A = dict(m="v0", w="v1", o="v2"); B = dict(m="v8", w="v9", o="v10")
+    def p2(c):
+        return [
+            ("LDV",   c["m"], "s6"),
+            ("LDV",   c["w"], "s1"),
+            ("VMUL",  c["o"], c["m"], c["w"]),
+            ("VMULH15", c["o"], c["o"], "v7"),
+            ("VADD",  c["o"], c["o"], "v4"),
+            ("VSHLV", c["o"], c["o"], "v6"),
+            ("VCLAMP16", c["o"], c["o"]),
+            ("STV",   c["o"], "s2"),
+        ]
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s7", 7),
+        ("MOVSI", "s1", -1), ("SSHLV", "s3", "s1"),   # beats per head / 2 (even).
+        ("LOOPS2", "s7"),
+        ("ARG",   "s1", 1), ("ARG", "s4", 4), ("ARG", "s5", 5), ("ARG", "s6", 6),
+        ("MOVSI", "s7", 0),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("LDV",   "v8", "s0"),
+        ("REDSSQ", "s7", "v0"),
+        ("REDSSQ", "s7", "v8"),
+        ("LOOPE",),
+        ("SSHLV", "s7", "s4"),
+        ("SADD",  "s7", "s5"),
+        ("SNORME", "s4", "s7"),
+        ("SSHLV", "s7", "s4"),
+        ("BCAST", "v7", "s7"),
+        ("LUTRSQRT", "v7", "v7"),
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s4", "s5"),
+        ("SADD",  "s4", "s6"),
+        ("BCAST", "v6", "s4"),
+        ("VSUB",  "v5", "v5", "v5"),
+        ("VSUB",  "v5", "v5", "v6"),
+        ("MOVSI", "s5", 1),
+        ("BCAST", "v4", "s5"),
+        ("VSUB",  "v3", "v5", "v4"),
+        ("VSHLV", "v4", "v4", "v3"),
+        ("SMOV",  "s6", "s2"),
+        ("LOOPS", "s3"),
+    ] + p2(A)[:2] + p2(B)[:2] + zip2(p2(A)[2:], p2(B)[2:]) + [
+        ("LOOPE",),
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
+def _zip2(a, b):
+    out = []
+    for i in range(max(len(a), len(b))):
+        if i < len(a): out.append(a[i])
+        if i < len(b): out.append(b[i])
+    return out
+
+def prog_rope_h_x2():
+    A = dict(x0="v0", x1="v1", c="v2", s="v3", t0="v4", t1="v5", t2="v6")
+    B = dict(x0="v8", x1="v9", c="v10", s="v11", t0="v12", t1="v13", t2="v14")
+    def ld(k):
+        return [("LDV", k["x0"], "s0"), ("LDV", k["x1"], "s1"),
+                ("LDV", k["c"], "s2"),  ("LDV", k["s"], "s3")]
+    def body(k):
+        return [
+            ("VMUL",  k["t0"], k["x0"], k["c"]),
+            ("VMUL",  k["t1"], k["x1"], k["s"]),
+            ("VSUB",  k["t0"], k["t0"], k["t1"]),
+            ("VRNE",  k["t0"], k["t0"], 14),
+            ("VCLAMP16", k["t0"], k["t0"]),
+            ("VMUL",  k["t1"], k["x0"], k["s"]),
+            ("VMUL",  k["t2"], k["x1"], k["c"]),
+            ("VADD",  k["t1"], k["t1"], k["t2"]),
+            ("VRNE",  k["t1"], k["t1"], 14),
+            ("VCLAMP16", k["t1"], k["t1"]),
+        ]
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s4", 4), ("ARG", "s5", 5),
+        ("ARG",   "s7", 7),
+        ("MOVSI", "s6", -1), ("SSHLV", "s4", "s6"),   # half-span beats / 2 (even).
+        ("LOOPS2", "s7"),
+        ("ARG",   "s7", 6),
+        ("SMOV",  "s6", "s5"), ("SADD", "s6", "s7"),
+        ("ARG",   "s2", 2), ("ARG", "s3", 3),
+        ("LOOPS", "s4"),
+    ] + ld(A) + ld(B) + _zip2(body(A), body(B)) + [
+        ("STV",   A["t0"], "s5"), ("STV", A["t1"], "s6"),
+        ("STV",   B["t0"], "s5"), ("STV", B["t1"], "s6"),
+        ("LOOPE",),
+        ("SADD",  "s0", "s7"), ("SADD", "s1", "s7"), ("SADD", "s5", "s7"),
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
+def prog_kvpack_h_x2():
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s6", 6),
+        ("ARG",   "s7", 7),
+        ("MOVSI", "s1", -1), ("SSHLV", "s3", "s1"),   # beats per head / 2 (even).
+        ("LOOPS2", "s7"),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("LDV",   "v8", "s0"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VRNE",  "v8", "v8", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("VCLAMP8", "v8", "v8"),
+        ("STB",   "v0", "s2"),
+        ("STB",   "v8", "s2"),
+        ("LOOPE",),
+        ("SADD",  "s2", "s6"),
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
 UNROLL16 = {"silu_q8": prog_silu_q8_x2, "softmax8": prog_softmax8_x2,
-            "rmsnorm_q8": prog_rmsnorm_q8_x2}
+            "rmsnorm_q8": prog_rmsnorm_q8_x2, "rmsnorm_h": prog_rmsnorm_h_x2,
+            "rope_h": prog_rope_h_x2, "kvpack_h": prog_kvpack_h_x2}
 
 PROGRAMS = {
     "resid_add":  prog_resid_add,

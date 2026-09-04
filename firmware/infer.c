@@ -3153,9 +3153,13 @@ int infer_init(void)
     }
 #endif
 #if BONSAI_PROGS_VREGS >= 16
-    if (H->ffn_dim % 32) { // silu_q8_x2 walks two beats per iteration (no odd tail).
-        printf("infer: ffn_dim %lu is not a multiple of 32 (ISA rev 2 microcode)\n",
-               (unsigned long)H->ffn_dim);
+    // The x2-unrolled programs walk two beats per iteration and have no odd tail:
+    // silu_q8 needs an even ffn_dim/16; rmsnorm_h and kvpack_h an even head_dim/16;
+    // rope_h an even head_dim/32 (its loop is the half-span).
+    if (H->ffn_dim % 32 || H->head_dim % 64) {
+        printf("infer: ffn_dim %lu / head_dim %lu do not meet the ISA rev 2 microcode "
+               "contracts (multiples of 32 / 64)\n",
+               (unsigned long)H->ffn_dim, (unsigned long)H->head_dim);
         return -4;
     }
 #endif
