@@ -2178,11 +2178,25 @@ static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
     }
 }
 
+// Per-layer norm16 entries, resolved once at init into .bss - which lives in the 8 KB
+// tightly-coupled SRAM. model_entry_kind() walks the entry cache and the tensor table,
+// both in HBM-backed main_ram behind a 2-way L1 with no L2, so each of these lookups
+// was a couple of ~150-cycle misses, 5+ times a layer (2026-09-04).
+#define NRM_MAXL 64
+static const struct bons_entry *nrm_attn16[NRM_MAXL], *nrm_ffn16[NRM_MAXL], *nrm_out16;
+static void norm16_cache_build(void)
+{
+    for (int l = 0; l < n_layer && l < NRM_MAXL; l++) {
+        nrm_attn16[l] = model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16);
+        nrm_ffn16[l]  = model_entry_kind(ROLE_FFN_NORM,  l, KIND_NORM16);
+    }
+    nrm_out16 = model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16);
+}
+
 // The norm16 row the layer after l opens with (attention norm), or the final norm.
 static const struct bons_entry *next_norm16(int l)
 {
-    return (l + 1 < n_layer) ? model_entry_kind(ROLE_ATTN_NORM, l + 1, KIND_NORM16)
-                             : model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16);
+    return (l + 1 < n_layer) ? nrm_attn16[l + 1] : nrm_out16;
 }
 
 static int forward(int token, int want_logits)
@@ -2250,7 +2264,7 @@ embed_done: ;
             tprof_event((3u << 28) | ((uint32_t)l << 8));
         // Attention block.
         int sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, attn_norm[l],
-                                   model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16),
+                                   nrm_attn16[l],
                                    n_embd, SP_H, SP_X);
         int eq_res = 0, ev_res = 0;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
@@ -2908,7 +2922,7 @@ attn_heads_done: ;
             perf_exit(OP_NORM_I32);
             int ed = ea8 - (int)eo->bias + (int)eo->rshift + kk;
             ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
-                                    model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16));
+                                    nrm_ffn16[l]);
         }
 
         // FFN (fully resident: no float round-trips).
@@ -2917,7 +2931,7 @@ attn_heads_done: ;
             const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
             const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
             int ex8 = E_NORM + op_rmsnorm_q8_sp(SP_XR, ex_state, ffn_norm[l],
-                                                model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16),
+                                                nrm_ffn16[l],
                                                 n_embd, SP_H, SP_X);
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
@@ -3045,7 +3059,7 @@ attn_heads_done: ;
 
     // Final norm + LM head (tied or separate), chunked over rows to fit the scratchpad.
     (void)op_rmsnorm_q8_sp(SP_XR, ex_state, out_norm,
-                           model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16), n_embd, SP_H, SP_X);
+                           nrm_out16, n_embd, SP_H, SP_X);
     perf_enter(OP_LMHEAD);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head)
@@ -3179,6 +3193,7 @@ int infer_init(void)
         fold_nrep_sh = sh;
     }
     qkn_resident = 0; // New image / re-init: the resident qk-norm rows must be refetched.
+    norm16_cache_build();
     tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
     {
         // kv_scores_br's R: depends only on head_dim - once, not 1792x/token.
