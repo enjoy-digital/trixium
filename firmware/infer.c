@@ -1019,8 +1019,11 @@ static int seq_qkr_count;
 static int kv_pipe = 1;         // Requested (kovl console toggle).
 static int kv_pipe_active = 0;  // What the built list uses.
 static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2 + kind).
+// What the store descriptors' constant words currently hold (~0 = unknown/rebuilt).
+static uint32_t kvst_rb_set = 0xFFFFFFFFu, kvst_chan_set = 0xFFFFFFFFu;
 static void seq_build_qkr(void)
 {
+    kvst_rb_set = kvst_chan_set = 0xFFFFFFFFu; // The store slots below are rewritten.
     int ln = 0;
     while ((1 << ln) < head_dim) ln++;
     uint32_t di = 0;
@@ -2382,17 +2385,30 @@ embed_done: ;
                     // (the store streams them), and each store's target row moves per
                     // layer/token. The exponent ratchet is identical bookkeeping to the
                     // post-list placement it replaces.
+                    // Only the target address is per (layer, slot). The beat count is a
+                    // model constant once kv_rb is known, and the channel is per TOKEN -
+                    // both used to be rewritten for all 16 slots every layer, i.e. 32 of
+                    // the 48 writes here were rewriting values that were already there.
+                    // Posted writes under a running list cost ~80 cycles each (v8 qtrace),
+                    // so they were ~2.6k cycles a layer. Note this removes writes, not the
+                    // arithmetic between them: that arithmetic is what keeps the
+                    // sequencer's descriptor fetch alive (see the patch-write wall).
                     uint32_t rowoff = (uint32_t)(pos/n_ch)*kv_rb*32;
+                    uint32_t chan   = (uint32_t)(pos % n_ch);
+                    int wr_rb   = (kvst_rb_set   != (uint32_t)kv_rb);
+                    int wr_chan = (kvst_chan_set != chan);
                     for (int hh = 0; hh < n_kv_head; hh++) {
                         kv_pack_prep_res(l, hh, 0, E_NORM);
                         kv_pack_prep_res(l, hh, 1, ev_res);
                         for (int kind = 0; kind < 2; kind++) {
                             uint32_t sdi = seq_kvst_di[hh*2 + kind];
                             seq_patch(sdi, 4, kv_region_addr(l, hh, kind) + rowoff);
-                            seq_patch(sdi, 5, (uint32_t)kv_rb);
-                            seq_patch(sdi, 10, (uint32_t)(pos % n_ch));
+                            if (wr_rb)   seq_patch(sdi, 5, (uint32_t)kv_rb);
+                            if (wr_chan) seq_patch(sdi, 10, chan);
                         }
                     }
+                    kvst_rb_set   = (uint32_t)kv_rb;
+                    kvst_chan_set = chan;
                 }
                 if (fovl_use && !qres) {
                     engine_join(dqn);
