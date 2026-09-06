@@ -548,6 +548,12 @@ static void console_service(void)
         printf("KOVL %s (in-list NOWAIT KV stores under the pack quant8s)\n",
                infer_kv_pipe_state() ? "on" : "off");
     }
+    else if (strcmp(token, "kvq") == 0) {
+        if (strncmp(str, "on", 2) == 0)  infer_kvq_redundant(1);
+        if (strncmp(str, "off", 3) == 0) infer_kvq_redundant(0);
+        printf("KVQ %s (per-slot KV-pack quant8s; kvpack_h already does them)\n",
+               infer_kvq_redundant_state() ? "on" : "off");
+    }
     else if (strcmp(token, "aovl") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_attn_pipe(1);
         if (strncmp(str, "off", 3) == 0) infer_attn_pipe(0);

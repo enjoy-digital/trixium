@@ -1018,6 +1018,14 @@ static int seq_qkr_count;
 // the four lists (the attention/FFN/scale8 bases shift with the 2*n_kv_head extras).
 static int kv_pipe = 1;         // Requested (kovl console toggle).
 static int kv_pipe_active = 0;  // What the built list uses.
+// Emit the per-slot KV-pack quant8 descriptors that PROG_KVPACK_H makes redundant (see
+// the loop below). Only useful to A/B the two list shapes in one boot; without LOOPS2
+// there is no kvpack_h descriptor and they are the real thing, so it is forced on.
+#ifdef BONSAI_VEC_LOOPS2
+static int kvq_redundant = 0;
+#else
+static const int kvq_redundant = 1;
+#endif
 static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2 + kind).
 // What the store descriptors' constant words currently hold (~0 = unknown/rebuilt).
 static uint32_t kvst_rb_set = 0xFFFFFFFFu, kvst_chan_set = 0xFFFFFFFFu;
@@ -1074,16 +1082,24 @@ static void seq_build_qkr(void)
     // K's pack follows K's rope in list order; V is resident before the list runs. The
     // CPU keeps only the scale-beat prep and the kv_ekmax ratchet (kv_pack_prep_res).
     // An in-list descriptor measures ~50 cycles against ~420 for a CPU vec_run.
-#ifdef BONSAI_VEC_LOOPS2
-    if (0)
-#endif
+    // The per-slot quant8s above were meant to disappear under BONSAI_VEC_LOOPS2 - the
+    // whole-tensor PROG_KVPACK_H descriptors 4/5 already pack every kv head - but the
+    // `if (0)` that should have guarded this loop landed on the `kv_pipe_active = 0`
+    // statement that was later inserted between it and the loop, so on v8 all 16 ran and
+    // redid work descriptor 4/5 had just done (2026-09-06). Proven redundant in the
+    // interpreter: kvpack_h over n_kv_head heads and the 8 per-slot quant8s leave a
+    // byte-identical scratchpad. The ENGINE STORES in this loop are NOT redundant, which
+    // is why the loop still runs and only the quant8 is skipped.
+    // Note kv_pipe_active must be reset unconditionally: leaving it stale is what made
+    // `kovl off` patch descriptors that had become the attention list's.
     kv_pipe_active = 0;
     for (int kvh = 0; kvh < n_kv_head; kvh++)
         for (int kind = 0; kind < 2; kind++) {
             uint32_t src = (kind ? SP_V : SP_K) + (uint32_t)kvh*head_dim*2;
             int32_t qargs[4] = {(int32_t)src, 0, (int32_t)(kvp_slot(kvh, kind) + 32),
                                 head_dim/16};                       // A1 = 0: fixed >>8.
-            seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
+            if (kvq_redundant)
+                seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
             if (kv_pipe && 2*n_kv_head <= 32) {
                 // NOWAIT store of the slot just packed; wbase/wlen/chan patched per
                 // layer/forward (kv_rb is set after the first build).
@@ -2017,6 +2033,24 @@ void infer_kv_pipe(int on)
     seq_build_qkv();
 }
 int infer_kv_pipe_state(void) { return kv_pipe_active; }
+
+// Console toggle (kvq): re-emit the redundant per-slot KV-pack quant8 descriptors. Same
+// base shifts as kovl, so the same five rebuilds.
+void infer_kvq_redundant(int on)
+{
+#ifdef BONSAI_VEC_LOOPS2
+    kvq_redundant = on ? 1 : 0;
+    seq_ffn_base = -1;
+    seq_build_qkr();
+    seq_build_attn();
+    seq_build_ffn();
+    seq_build_scale8();
+    seq_build_qkv();
+#else
+    (void)on;
+#endif
+}
+int infer_kvq_redundant_state(void) { return kvq_redundant; }
 
 // Console toggle (aovl): rebuild the three dependent lists in either layout.
 void infer_attn_pipe(int on)

@@ -20,6 +20,8 @@ void infer_vbench(void);  // Stage-by-stage cycle microbenchmark (run after hdrl
 void infer_attn_pipe(int on);   // Pipelined attention list on/off (aovl; rebuilds lists).
 void infer_kv_pipe(int on);     // In-list NOWAIT KV stores on/off (kovl; rebuilds lists).
 int  infer_kv_pipe_state(void);
+void infer_kvq_redundant(int on); // Redundant per-slot KV-pack quant8s (kvq; rebuilds lists).
+int  infer_kvq_redundant_state(void);
 int  infer_attn_pipe_state(void);
 void infer_spec(int on);                    // Speculative decode on/off (lossless, greedy).
 void infer_spec_stats(int *acc, int *rej);  // Accepted / rejected draft counts.
