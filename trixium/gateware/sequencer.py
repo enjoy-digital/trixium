@@ -74,6 +74,12 @@ class BonsaiSequencer(LiteXModule):
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
         self.count  = CSRStorage(16, description="Descriptor count (stop descriptor also ends).")
         self.start  = CSRStorage(1,  description="Write 1 to run the list.")
+        self.sbmode = CSRStorage(1, reset=0, description=
+            "Posted-write ordering. 0 = legacy: the descriptor fetch stalls while any "
+            "posted write is in flight. 1 = drain-at-start only (see sbw_pending). Exists "
+            "so the two can be A/B'd in one boot, which is the only measurement this "
+            "project trusts; the start drain runs in both modes (harmless under legacy, "
+            "which is strictly stronger), so this bit is the whole behavioural difference.")
         self.status = CSRStatus(fields=[
             CSRField("busy",   size=1),
             CSRField("dcount", size=16, offset=8, description="Descriptors completed."),
@@ -120,6 +126,26 @@ class BonsaiSequencer(LiteXModule):
         self.sp_adr    = Signal(13)
         self.sp_dat    = Signal(256)
         self.sp_active = Signal()
+        # Posted sideband writes still sitting in the scratchpad's FIFO. The descriptor
+        # fetch used to be held for as long as ANY write was in flight, which was correct
+        # but made the CPU's patch burst starve a running list: ~7.5k cycles/layer for 80
+        # writes (v8 qtrace), and two attempts to cut the CPU work around those writes
+        # each cost ~5% because they only bunched the writes tighter. The ordering that is
+        # actually required is "every patch for a list has landed before that list starts",
+        # so the FIFO is drained once at START instead (SBDRAIN below).
+        #
+        # TWO INVARIANTS this relies on, both firmware-side:
+        #  1. A list's descriptors are never patched while THAT list is running. Patching
+        #     other lists under a running one is the whole point of the sideband slot and
+        #     stays safe.
+        #  2. A patch store is in the FIFO before the `start` CSR write is issued - i.e.
+        #     the CPU's descriptor stores are ordered ahead of the start. The scratchpad
+        #     window is mapped cached=False (trixium.py) and the core is in-order, so
+        #     this holds. NOT a new requirement: a store still sitting in a CPU-side buffer
+        #     never raised sbw_pending either, so the old fetch interlock needed it too.
+        #     What is new is only (1).
+        # Unwired (reset 0) this is a no-op, which keeps unit-test DUTs on FETCH-at-start.
+        self.sbw_pending = Signal()
         self.sp_gnt    = Signal(reset=1) # Integrator: port is the seq's this cycle (a vec
                                          # load outranks descriptor fetches). Reset-1 keeps
                                          # unwired unit-test DUTs on the old behavior.
@@ -321,6 +347,12 @@ class BonsaiSequencer(LiteXModule):
                 NextValue(dptr, self.base.storage[5:]),
                 NextValue(left, self.count.storage),
                 NextValue(dcount, 0),
+                NextState("SBDRAIN"),
+            )
+        )
+        fsm.act("SBDRAIN", # Let every patch posted for this list land before fetching it.
+            self.busy.eq(1),
+            If(~self.sbw_pending,
                 NextState("FETCH0"),
             )
         )

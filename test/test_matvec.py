@@ -827,6 +827,52 @@ def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None, barrier=0, kadd_add=0
 def _desc_stop():
     return (0).to_bytes(4, "little")*16
 
+def test_sequencer_start_drains_posted_writes():
+    # The list-start ordering contract (2026-09-06). CPU patches reach the scratchpad
+    # through a posted-write FIFO; the descriptor fetch no longer waits on that FIFO
+    # cycle by cycle (matvec.py sp_gnt), so the guarantee that a list sees its own
+    # patches rests entirely on this: START must not fetch descriptor 0 while any
+    # posted write is still in flight.
+    #
+    # Driven at the FSM boundary on purpose. The integration-level version of this test
+    # has no teeth: sbw_gnt is blocked only by a vec store or a full write FIFO, so on
+    # any quiet cycle the patch lands within a cycle or two and a broken design passes
+    # by luck. Holding sbw_pending here makes the contract the only thing under test.
+    from trixium.gateware.sequencer import BonsaiSequencer
+
+    class _DUT(Module):
+        def __init__(self):
+            self.submodules.seq = BonsaiSequencer()
+
+    dut = _DUT()
+
+    def tb():
+        yield dut.seq.base.storage.eq(0x6000)
+        yield dut.seq.count.storage.eq(4)
+        yield dut.seq.sbw_pending.eq(1)      # a patch for this list is still in the FIFO
+        yield
+        yield dut.seq.start.storage.eq(1)
+        yield dut.seq.start.re.eq(1)
+        yield
+        yield dut.seq.start.re.eq(0)
+        # While the write is in flight the list may not read a single descriptor word,
+        # and it must already report busy (firmware polls this to know the list is live).
+        for cyc in range(20):
+            yield
+            assert not (yield dut.seq.sp_active), \
+                f"descriptor fetched at cycle {cyc} with a posted write still in flight"
+            assert (yield dut.seq.busy), f"not busy at cycle {cyc} of the drain"
+        # The write lands: the list proceeds, and reads descriptor 0 at its own base.
+        yield dut.seq.sbw_pending.eq(0)
+        for _ in range(8):
+            yield
+            if (yield dut.seq.sp_active):
+                assert (yield dut.seq.sp_adr) == 0x6000 >> 5, (yield dut.seq.sp_adr)
+                return
+        raise AssertionError("the sequencer never left the drain")
+
+    run_simulation(dut, tb())
+
 def test_sequencer_v2_chaining():
     # Sequencer v2 primitives in one list, the way seq_build_attn will use them:
     #   reduce_acc (res6 = absmax) -> spill (S7 seeded with prev res6, persisted to SP,

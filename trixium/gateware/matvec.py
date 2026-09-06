@@ -650,6 +650,11 @@ class BonsaiMatVecEngine(LiteXModule):
             vec_rd    = Signal()
             vec_wr    = Signal()
             sb_headroom_r = Signal() # Registered W-FIFO headroom for the sideband grant.
+            # Engine-local copy of seq.sbmode (see sequencer.py): a rarely-changing CSR
+            # bit re-registered here so the fetch-grant cone stays engine-local.
+            sbmode_r = Signal()
+            if seq is not None:
+                self.sync += sbmode_r.eq(seq.sbmode.storage)
             gw_w      = len(scratchpad.gather.adr) + 8 + 256
             wr_fifo   = SyncFIFO(width=gw_w, depth=8)
             self.submodules += wr_fifo
@@ -662,12 +667,20 @@ class BonsaiMatVecEngine(LiteXModule):
             self.comb += [
                 grant_seq.eq(0 if seq is None else seq.sp_active),
                 vec_rd.eq(vecunit.sp_rd_req),
-                # The seq's fetch FSM holds its address cycle when a vec load outranks
-                # it, and while posted sideband writes are still in flight - a descriptor
-                # read must never see a stale word (the ordering interlock that lets
-                # firmware patch lists with zero care).
-                *([] if seq is None else [seq.sp_gnt.eq(~vec_rd
-                                                        & ~scratchpad.sbw_pending)]),
+                # The seq's fetch FSM holds its address cycle when a vec load outranks it.
+                # It no longer also waits on posted sideband writes: that interlock was
+                # correct but made a CPU patch burst starve a running list (~7.5k cycles
+                # per layer for 80 writes, v8 qtrace). The ordering firmware actually
+                # needs is "every patch for a list has landed before that list starts",
+                # so the sequencer drains the FIFO once at START instead (sequencer.py
+                # SBDRAIN). See the invariant recorded there.
+                # sbmode picks which of the two orderings is live, so both can be measured
+                # in one boot. It is used through a LOCAL register (sbmode_r below): a CSR
+                # storage bit routed straight into this cone is a CPU-region signal in a
+                # port cone, the family that cost two unroutable builds.
+                *([] if seq is None else [
+                    seq.sp_gnt.eq(~vec_rd & (~scratchpad.sbw_pending | sbmode_r)),
+                    seq.sbw_pending.eq(scratchpad.sbw_pending)]),
                 # Posted sideband writes (see scratchpad.py): the drain takes the W
                 # port on any cycle the vector store slot is idle and the gather FIFO
                 # has registered headroom - an engine-local grant with no CPU-region

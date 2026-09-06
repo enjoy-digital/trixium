@@ -23,6 +23,7 @@
 #include "infer.h"
 #include "ops.h"
 #include "perf.h"
+#include "seq.h"
 #include "vec.h"
 #include "progs.h"
 
@@ -493,6 +494,19 @@ static void console_service(void)
         printf("QKVL %s (q/k/v projections + norms as one sequencer list)\n",
                qkvl_use ? "on" : "off");
     }
+#ifdef CSR_SEQ_BASE
+    else if (strcmp(token, "sbdrain") == 0) {
+        if (!seq_sbmode_available())
+            puts("SBDRAIN unsupported on this bitstream (no sbmode CSR)");
+        else {
+            if (strncmp(str, "on", 2) == 0)  seq_sbmode_set(1);
+            if (strncmp(str, "off", 3) == 0) seq_sbmode_set(0);
+            printf("SBDRAIN %s (%s)\n", seq_sbdrain_use ? "on" : "off",
+                   seq_sbdrain_use ? "posted patches drained at list start only"
+                                   : "legacy: descriptor fetch stalls on any posted write");
+        }
+    }
+#endif
     else if (strcmp(token, "lovl") == 0) {
         extern int lovl_use;
         if (strncmp(str, "on", 2) == 0)  lovl_use = 1;
