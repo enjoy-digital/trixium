@@ -1427,6 +1427,15 @@ static int seq_scale8_base = -1;
 static void seq_build_scale8(void)
 {
 #ifndef BONSAI_HAS_DUALQ
+    // Invalidate first, like seq_build_qkv does with its own base. Both early returns below
+    // used to leave a STALE base behind, and seq_build_qkv derives seq_qkv_base from it - so
+    // a stale (smaller) value could place the qkv list on top of the FFN list's descriptors.
+    // qkv_prep_layer(l+1) runs UNDER the FFN list, which would then be a patch of a RUNNING
+    // list: exactly the invariant the start-drain interlock relies on (gateware/sequencer.py).
+    // Not reachable on the 1.7B - 159 of 192 descriptors, neither return fires - but it is
+    // one larger model away, and every consumer already guards on >= 0, so -1 degrades
+    // cleanly to the CPU path instead of corrupting a list.
+    seq_scale8_base = -1;
     if (seq_attn_heads == 0)
         return;
     int di = (seq_ffn_base >= 0) ? seq_ffn_base + seq_ffn_len
