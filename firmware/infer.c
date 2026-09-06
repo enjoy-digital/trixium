@@ -2476,6 +2476,11 @@ embed_done: ;
 #endif
             }
 #ifdef CSR_ENGINE_CSR_REP_ADDR
+            // The !kv_pipe_active guard was on the #else twin below but not here, so with
+            // the in-list NOWAIT stores on (the shipping default) BOTH paths ran and every
+            // KV row was written to HBM twice per layer - same bytes to the same addresses,
+            // so it cost time and never showed up as a wrong token (2026-09-06).
+            if (!kv_pipe_active)
             {   // ...then ONE multi-packet store for all 2*n_kv_head slots (F1-1): the
                 // (kvh, kind) regions of a layer are consecutive (kv_region beats apart)
                 // and the staging slots 0x200 B apart, so one op scatters them all.
