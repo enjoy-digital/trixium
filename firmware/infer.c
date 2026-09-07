@@ -2926,6 +2926,11 @@ attn_scores: ;
                 }
             } else
 #endif
+            { // The whole CPU fallback. This brace used to be missing: the else bound only
+              // to the context-limit check below and the CPU score loop ran after HARDWARE
+              // scores too, overwriting them from a k_cache the HW path never fills and
+              // skipping the bounds check (2026-09-07, from the external review). Only the
+              // mixed hwops configurations (HW scores, CPU softmax/WV) reached it.
             if (pos >= cpu_kv_ctx) {
                 // The CPU fallback cache is capped (see CPU_KV_CTX); results past it would
                 // read out of bounds. The HW path carries full context - switch back.
@@ -2939,6 +2944,7 @@ attn_scores: ;
                 float sc = dot*k_scale[((uint64_t)l*cpu_kv_ctx + t)*n_kv_head + kvh]*scale;
                 scores[t] = sc;
                 if (sc > smax) smax = sc;
+            }
             }
             perf_exit(OP_SCORES);
             perf_enter(OP_SOFTMAX);
