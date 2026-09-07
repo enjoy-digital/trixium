@@ -170,10 +170,12 @@ static void bench_cmd(char *args)
     int n = (*tok) ? parse_int(tok) : 4;
     static const int prompt[3] = {1, 2, 3};
     perf_reset();
+    uint32_t f0 = infer_forwards;
     uint32_t t0 = perf_now();
     printf("GEN:");
     int count = infer_generate(prompt, 3, n, emit_token);
     uint32_t dt = perf_now() - t0;
+    uint32_t fwd = infer_forwards - f0;
     puts("");
     perf_print();
     printf("BENCH: %d tokens, %lu cycles total", count, (unsigned long)dt);
@@ -183,6 +185,10 @@ static void bench_cmd(char *args)
                (unsigned long)(((uint64_t)CONFIG_CLOCK_FREQUENCY*count)/dt),
                (unsigned long)((((uint64_t)CONFIG_CLOCK_FREQUENCY*count*1000)/dt) % 1000),
                (unsigned long)(CONFIG_CLOCK_FREQUENCY/1000000));
+    // Per FORWARD: the comparable figure across the 2026-09-07 change that stopped
+    // running the unused final forward (bench 64 = 3 prompt + 63 = 66 forwards, was 67).
+    if (fwd > 0)
+        printf(", %lu forwards, %lu cycles/fwd", (unsigned long)fwd, (unsigned long)(dt/fwd));
     puts("");
 }
 

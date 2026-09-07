@@ -2332,9 +2332,11 @@ static const struct bons_entry *next_norm16(int l)
     return (l + 1 < n_layer) ? nrm_attn16[l + 1] : nrm_out16;
 }
 
+uint32_t infer_forwards; // Forwards run since boot (bench reports cycles per forward too).
 static int forward(int token, int want_logits)
 {
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
+    infer_forwards++;
     if (tprof_armed && want_logits && --tprof_armed == 0)
         tprof_begin(); // armed=N traces the Nth generated token; disarms itself.
     rq8_prefetched = 0; // A logits-less forward leaves the out-norm row prefetched; drop it.
@@ -3785,7 +3787,13 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
             continue;
         }
 #endif
-        tok = forward(tok, 1);
+        // The forward after the LAST emitted token computes a successor nobody emits and
+        // stores a KV row nobody reads (every caller restarts at n_pos = 0), so skip it:
+        // one full forward per request, ~1.5% of a 64-token reply. bench 64 therefore runs
+        // 66 forwards where it ran 67 - compare cycles/FORWARD across that boundary, not
+        // cycles/token (2026-09-07, from the external review).
+        if (i + 1 < max_new)
+            tok = forward(tok, 1);
     }
     return count;
 }
