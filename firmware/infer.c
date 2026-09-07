@@ -3706,6 +3706,15 @@ void infer_spec_stats(int *acc, int *rej)
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {
     n_pos = 0; // Reset the KV cache (fresh generation).
+#ifdef BONSAI_HAS_KVSTORE
+    // ...and its exponent ratchet. kv_ekmax is the running max over every row ever
+    // stored in a region and picks the KV scale bias (B = 22 - ekmax), so without this
+    // a generation inherited the previous request's maxima: its arithmetic depended on
+    // request history, and only the FIRST generation after a boot matched the reference
+    // (2026-09-07, from the external review). Rows are overwritten from position 0 anyway.
+    if (kv_ekmax)
+        for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
+#endif
     int tok = -1;
     for (int i = 0; i < n_prompt; i++)
         tok = forward(prompt[i], i == n_prompt - 1);
