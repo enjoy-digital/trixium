@@ -2269,11 +2269,16 @@ static void attn_list_prep_token(int pos)
 #endif
 
 static int fold_nrep_sh = 1; // log2(n_head/n_kv_head) when a power of two (set at init).
-static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
+// The per-head fold from its two hardware results (softmax8's p8 sum, the AXPY absmax),
+// in whichever form the output projection will consume (ifold_use). ONE producer for
+// both the list path (spilled values, attn_fold_head) and the seq-off op-by-op path:
+// the latter used to fill only the float fold while the consumer read the integer one
+// under the default ifold_use, so `seq off` ran the projection on stale or zero fold
+// state (2026-09-07, from the external review).
+static void attn_fold_vals(int l, int hh, uint32_t P8, uint32_t am,
+                           float *aw_c, float *aw_hmax_p)
 {
     int kvh = hh >> fold_nrep_sh;
-    uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8 + (uint32_t)hh*32);
-    uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWAM + (uint32_t)hh*32);
     int Bv = 22 - kv_ekmax[kv_ek_idx(l, kvh, 1)];   // kv_scores_br's B; R unused here.
     int Rpre = axpy_rpre_c(P8 ? P8 : 1);
     int k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
@@ -2298,6 +2303,12 @@ static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
         float hm2 = (float)(am >> k2)*c2;
         if (hm2 > *aw_hmax_p) *aw_hmax_p = hm2;
     }
+}
+static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
+{
+    uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8 + (uint32_t)hh*32);
+    uint32_t am = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWAM + (uint32_t)hh*32);
+    attn_fold_vals(l, hh, P8, am, aw_c, aw_hmax_p);
 }
 
 // Per-layer norm16 entries, resolved once at init into .bss - which lives in the 8 KB
@@ -2691,6 +2702,8 @@ attn_scores: ;
         // aligned to a common ea8 and scale8-ed into SP_X after the head loop.
         float aw_c[32];
         float aw_hmax = 0;
+        aw_hvalid = 0; // Both fold forms start empty for every path below (the list paths
+                       // reset it again where they fold; the op-by-head path relies on this).
 #endif
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
@@ -2885,11 +2898,10 @@ attn_scores: ;
                 int32_t nargs[5] = {(int32_t)SP_SC, 0,
                                     (int32_t)(SP_H + hh*head_dim*2), head_dim/16, k2};
                 vec_run(PROG_NORM_I32, nargs, 5);
-                float c2 = ldexpf(1.0f/(float)(uint32_t)P8, Rpre - Bv + k2);
-                aw_c[hh] = c2;
-                float hm2 = (float)(uint32_t)(am >> k2)*c2;
-                if (hm2 > aw_hmax) aw_hmax = hm2;
-                (void)ah;
+                // Both fold forms, same producer as the list path (see attn_fold_vals):
+                // Bv/Rpre/k2 there are exactly the ones computed above.
+                attn_fold_vals(l, hh, (uint32_t)P8, (uint32_t)am, aw_c, &aw_hmax);
+                (void)Rpre; (void)Bv; (void)ah;
                 perf_exit(OP_WV);
                 continue;
             }
