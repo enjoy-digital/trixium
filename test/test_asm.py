@@ -399,3 +399,41 @@ def test_silu_q8_matches_silu_then_quant8():
                        [0, 0x1000, 0, n//16, a4, 0, a6, 0x3000])
     assert bytes(got) == bytes(ref)
     assert Sg[6] == Sr[6]
+
+
+def test_silu_split_matches_fused():
+    """The FFN SiLU split (2026-09-07): prog_silu_gate then prog_mul_q8 must leave the
+    scratchpad and res6 byte-identical to the fused prog_silu_q8, in place (A2 == A0, as
+    the FFN list runs it), for every shift the firmware can hand it and at the int16
+    extremes - x1 and x2 flavours alike. The split's only new rounding boundary is the
+    int16 round trip of x*sigmoid(x), which is lossless iff |mulh15(x, p)| <= |x|."""
+    import numpy as np
+    rng = np.random.default_rng(36)
+    n = 512
+    fused    = asm.assemble(asm.prog_silu_q8())
+    fused_x2 = asm.assemble(asm.prog_silu_q8_x2())
+    gate, gate_x2 = asm.assemble(asm.prog_silu_gate()), asm.assemble(asm.prog_silu_gate_x2())
+    mul, mul_x2   = asm.assemble(asm.prog_mul_q8()), asm.assemble(asm.prog_mul_q8_x2())
+    cases = 0
+    for trial in range(6):
+        base = bytearray(16*1024)
+        if trial == 0:   # every int16 extreme in both operands
+            g = np.array([-32768, -32767, 32767, 32766, 0, 1, -1] * (n//7 + 1))[:n].astype("<i2")
+            u = np.array([32767, -32768, -32768, 32767, 32767, -1, 1] * (n//7 + 1))[:n].astype("<i2")
+        else:
+            g = rng.integers(-32768, 32768, n).astype("<i2")
+            u = rng.integers(-32768, 32768, n).astype("<i2")
+        base[0:2*n] = g.tobytes()
+        base[0x1000:0x1000 + 2*n] = u.tobytes()
+        for a4 in (-14, -12, -8, -4, 0, 2):        # gate shift (imm + k)
+            for a6 in (-15, -13, -10):             # output shift
+                for f, gp, mp in ((fused, gate, mul), (fused_x2, gate_x2, mul_x2)):
+                    ref = bytearray(base)
+                    Sr, _ = _run_words(f, ref, [0, 0x1000, 0, n//16, a4, 0, a6, 0x3000])
+                    got = bytearray(base)
+                    _run_words(gp, got, [0, 0, 0, n//16, a4])
+                    Sg, _ = _run_words(mp, got, [0, 0x1000, 0, n//16, 0, 0, a6, 0x3000])
+                    assert bytes(got) == bytes(ref), (trial, a4, a6, len(f))
+                    assert Sg[6] == Sr[6], (trial, a4, a6, Sg[6], Sr[6])
+                    cases += 1
+    assert cases == 6*6*3*2

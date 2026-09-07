@@ -1379,16 +1379,30 @@ void fprof_print(void)
 static int seq_ffn_base = -1;
 static int seq_ffn_len  = 0;
 static int ffn_shape_base = -1; // seq_ffn_base the FFN engine shape images were written for.
+// The SiLU split (2026-09-07, from the external review): everything in silu_q8 up to the
+// x*sigmoid(x) product is a function of the GATE alone, so that half could run UNDER the
+// up matvec's stream (where norm_g already runs) and only the multiply/absmax/quant8 tail
+// would wait for up. Byte-identical by construction (asm.py, test_silu_split_matches_fused);
+// the list grows 9 -> 10 descriptors. MEASURED +0.42% (slower), same boot, 3 pairs, so it
+// stays OFF. The fprof per-descriptor trace says why: the vector unit runs ~2.9x SLOWER
+// under an engine stream (norm_g 6,096 cycles under the up stream vs the identical norm_u
+// 2,133 idle), so norm_g alone fills the 6.7k-cycle window and silu_gate ran after the
+// stream, adding its own pass (silu_gate 7,130 + mul_q8 5,006 vs silu_q8 11,180). Kept as a
+// toggle (fsplit): with the throttle removed the same trace says it is worth ~3.7k/layer.
+static int ffn_split = 0;
+static int ffn_di_down = 7; // Down matvec's descriptor (b + 7 fused, b + 8 split).
+static int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
 static void seq_build_ffn(void)
 {
 #ifdef BONSAI_HAS_DUALQ
     return; // Dual builds use attn2 lists; FFN list only wired on the shipping non-dual path.
 #else
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
-    if (di + 9 > 192 || seq_attn_heads == 0)
+    int len = ffn_split ? 10 : 9;
+    if (di + len > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
-    seq_ffn_len  = 9;
+    seq_ffn_len  = len;
     ffn_shape_base = -1; // Engine slots are placeholders until ffn_prep_layer.
     // Pipelined order (2026-08-29): the up matvec is NOWAIT and the gate norm runs UNDER
     // its stream - the list keeps the `ovl` overlap it used to lose. The norms take k
@@ -1418,19 +1432,46 @@ static void seq_build_ffn(void)
     // register-blind) interlock and serialize the list - measured 13.60M vs 13.45M.
     int32_t na[5] = {(int32_t)SP_Y, 0, (int32_t)SP_G, ffn_dim/16, 0};
     seq_desc_vec(di + 3, PROG_NORM_I32, na, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
+    int d = di + 4; // Next free descriptor.
+    if (ffn_split) {
+        // 4: silu_gate SP_G -> SP_G in place [A4 = imm + kreg0], still UNDER the up
+        //    stream. kreg0 was captured by desc 0 (long done) and the per-register
+        //    interlock lets a kreg0 consumer dispatch under kreg1's NOWAIT stream
+        //    (test_sequencer_kadd_interlock_precise).
+        int32_t ga[5] = {(int32_t)SP_G, 0, (int32_t)SP_G, ffn_dim/16, 0};
+        seq_desc_vec(d, PROG_SILU_GATE, ga, 5, 0);
+        seq_patch(d, 1, (uint32_t)PROG_SILU_GATE | (1u << (16 + 2*4))); // A4 kreg0 term...
+        seq_patch(d, 0, 2u | (1u << 11)); // ...ADDS (w0[11]): A4 = imm + kg (VSHLS conv).
+        ffn_di_a4 = d - di;
+        d++;
+    }
     int32_t pb = (int32_t)(SP_FFSP + 32);
-    seq_desc_vec_seed(di + 4, PROG_SPILL, &pb, 1, 0, 1);
+    seq_desc_vec_seed(d, PROG_SPILL, &pb, 1, 0, 1);                      // spill up-absmax
+    d++;
     int32_t nb[5] = {(int32_t)SP_YU, 0, (int32_t)SP_U, ffn_dim/16, 0};
-    seq_desc_vec(di + 5, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
-    int32_t sa[8] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
-                     (int32_t)SP_X};
-    seq_desc_vec(di + 6, PROG_SILU_Q8, sa, 8, 0);
-    seq_patch(di + 6, 1, (uint32_t)PROG_SILU_Q8 | (1u << (16 + 2*4))); // A4 kreg0 term...
-    seq_patch(di + 6, 0, 2u | (1u << 11)); // ...ADDS (w0[11]): A4 = imm + kg (VSHLS conv).
-    seq_desc_engine(di + 7, &z);
-    seq_desc_stop(di + 8);
+    seq_desc_vec(d, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KRES6 << 8)); // norm_u
+    d++;
+    if (ffn_split) {
+        // mul_q8: (silu * up) << A6, clamp, absmax (res6 for the CPU), quant8 -> SP_X.
+        int32_t ma[8] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
+                         (int32_t)SP_X};
+        seq_desc_vec(d, PROG_MUL_Q8, ma, 8, 0);
+    } else {
+        int32_t sa[8] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
+                         (int32_t)SP_X};
+        seq_desc_vec(d, PROG_SILU_Q8, sa, 8, 0);
+        seq_patch(d, 1, (uint32_t)PROG_SILU_Q8 | (1u << (16 + 2*4))); // A4 kreg0 term...
+        seq_patch(d, 0, 2u | (1u << 11)); // ...ADDS (w0[11]): A4 = imm + kg (VSHLS conv).
+        ffn_di_a4 = d - di;
+    }
+    d++;
+    seq_desc_engine(d, &z);                                               // down mv
+    ffn_di_down = d - di;
+    d++;
+    seq_desc_stop(d);
 #endif
 }
+
 
 // F0-6 (2026-08-29): the per-head attention-output scale8 as one n_head-descriptor list.
 // Only A4 (the per-head Q15 multiplier Mh) changes per layer; a CPU vec_run costs ~500
@@ -2074,6 +2115,16 @@ void infer_kvq_redundant(int on)
 #endif
 }
 int infer_kvq_redundant_state(void) { return kvq_redundant; }
+// Console toggle (fsplit): same base shifts as the other list toggles.
+void infer_ffn_split(int on)
+{
+    ffn_split = on ? 1 : 0;
+    seq_ffn_base = -1;
+    seq_build_ffn();
+    seq_build_scale8();
+    seq_build_qkv();
+}
+int infer_ffn_split_state(void) { return ffn_split; }
 
 // Console toggle (aovl): rebuild the three dependent lists in either layout.
 void infer_attn_pipe(int on)
@@ -2136,8 +2187,8 @@ static void ffn_prep_layer(int l)
     if (full) { seq_desc_engine(b + 2, &mo); seq_patch(b + 2, 0, 1u | (1u << 9)); }
     else ffn_patch_lw(b + 2, &mo);
     model_matvec_op(model_entry(ROLE_FFN_DOWN, l), SP_X, SP_Y, &mo);
-    if (full) seq_desc_engine(b + 7, &mo);
-    else ffn_patch_lw(b + 7, &mo);
+    if (full) seq_desc_engine(b + (uint32_t)ffn_di_down, &mo);
+    else ffn_patch_lw(b + (uint32_t)ffn_di_down, &mo);
     ffn_shape_base = seq_ffn_base;
 }
 int prep_ovl = 1; // povl console toggle: patch-under-list overlap (needs BONSAI_SP_SB_SLOT).
@@ -3030,7 +3081,7 @@ attn_heads_done: ;
                 // w0[11] so its kreg0 term ADDS. Requires a post-2026-08-29 bitstream -
                 // earlier sequencers only subtract and the list computes garbage. The list
                 // stays default-off pending the 1.7B divergence diagnosis either way.
-                seq_patch(seq_ffn_base + 6, 6,
+                seq_patch((uint32_t)(seq_ffn_base + ffn_di_a4), 6,
                           (uint32_t)(ex8 - (int)eg_t->bias + (int)eg_t->rshift + 6));
                 perf_enter(OP_SILU_MUL);
                 if (fprof_use) {

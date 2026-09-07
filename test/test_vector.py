@@ -274,3 +274,20 @@ def test_rtl_silu_q8():
     sp[0:2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
     sp[0x1000:0x1000 + 2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
     _compare_words(asm.prog_silu_q8(), sp, [0, 0x1000, 0, n//16, -12, 0, -15, 0x3000])
+
+
+def test_rtl_silu_gate_and_mul_q8():
+    # The FFN SiLU split (2026-09-07): both halves, x1 and x2, RTL vs interpreter over the
+    # whole scratchpad, run in place the way the FFN list runs them (A2 == A0).
+    rng = np.random.default_rng(46)
+    n = 256
+    for gate, mul in ((asm.prog_silu_gate(), asm.prog_mul_q8()),
+                      (asm.prog_silu_gate_x2(), asm.prog_mul_q8_x2())):
+        sp = bytearray(SP_SIZE)
+        sp[0:2*n] = rng.integers(-32768, 32768, n).astype("<i2").tobytes()
+        sp[0x1000:0x1000 + 2*n] = rng.integers(-32768, 32768, n).astype("<i2").tobytes()
+        _compare_words(gate, sp, [0, 0, 0, n//16, -12])
+        # Feed the mul half the gate half's OUTPUT (interpreter-produced, already proven
+        # equal to the RTL's by the line above).
+        asm.VecInterp(sp).run(asm.assemble(gate), [0, 0, 0, n//16, -12])
+        _compare_words(mul, sp, [0, 0x1000, 0, n//16, 0, 0, -15, 0x3000])

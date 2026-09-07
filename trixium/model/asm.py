@@ -948,6 +948,82 @@ def prog_silu_q8():
         ("DONE",),
     ]
 
+# The FFN SiLU split (2026-09-07). In prog_silu_q8 everything up to and including the
+# VMULH15 that forms x*sigmoid(x) is a function of the GATE alone; the up operand is first
+# touched by the VMUL after it. So the gate half can run under the up-projection's stream
+# (the FFN list already runs norm_g there) and only the multiply/shift/clamp/absmax/quant8
+# tail waits for up. BYTE-IDENTICAL by construction, not by luck: the Q15 multiplier p is
+# in [0, 32766] for every clamped input (checked exhaustively), so |mulh15(x, p)| <= |x|
+# fits int16 and the round trip through the scratchpad loses nothing; the VMUL then sees
+# the identical int32 product, and the tail is the fused program's tail verbatim.
+# test_asm.py proves fused == gate-half then mul-half over the whole scratchpad + res6.
+
+def prog_silu_gate():
+    """x*sigmoid(x) of the normalized gate, int16 in place: the gate-only half of
+    prog_silu_q8. A0 = gate src, A2 = dst (may equal A0), A3 = beats, A4 = shift
+    (firmware: imm + kreg0, VSHLS convention). Leaves S6 = 0; nothing downstream reads it."""
+    C_LOG2E = 739
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
+        ("MOVSI", "s5", C_LOG2E),
+        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # 2^15
+        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10), # -15*2^15
+        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10), # 14*2^15
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("VMULS", "v3", "v0", "s5"),
+        ("VSHLS", "v3", "v3", "s4"),
+        ("VMAX",  "v3", "v3", "v1"),
+        ("VMIN",  "v3", "v3", "v7"),
+        ("LUTE2", "v5", "v3"),
+        ("VSHRI", "v4", "v3", 15),
+        ("VSHLV", "v5", "v5", "v4"),
+        ("VADD",  "v6", "v5", "v2"),
+        ("VCLZN", "v4", "v6"),
+        ("VSHLV", "v6", "v6", "v4"),
+        ("LUTRECIP", "v6", "v6"),
+        ("VMULH15", "v5", "v5", "v6"),
+        ("VSHLV", "v5", "v5", "v4"),
+        ("VSHLI", "v5", "v5", 1),
+        ("VMULH15", "v0", "v0", "v5"),
+        ("STV",   "v0", "s2"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
+def prog_mul_q8():
+    """The up-dependent tail of prog_silu_q8: int16 out = clamp16((silu * up) << A6) with
+    its absmax, then quant8 of that output in measured mode. A0 = silu src (prog_silu_gate's
+    output), A1 = up src, A2 = int16 dst (may equal A0), A3 = beats, A6 = shift, A7 = int8
+    dst. S6 = the absmax (res6), exactly as prog_silu_q8 returned it."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s6", 6),
+        ("MOVSI", "s7", 0),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("LDV",   "v3", "s1"),
+        ("VMUL",  "v0", "v0", "v3"),
+        ("VSHLS", "v0", "v0", "s6"),
+        ("VCLAMP16", "v0", "v0"),
+        ("REDMAX", "s7", "v0"),
+        ("STV",   "v0", "s2"),
+        ("LOOPE",),
+        ("SMOV",  "s6", "s7"),
+        ("BCAST", "v1", "s7"),
+        ("VCLZN", "v1", "v1"),
+        ("ARG",   "s2", 2),
+        ("ARG",   "s7", 7),
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s2"),
+        ("VSHLV", "v0", "v0", "v1"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("STB",   "v0", "s7"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
 def prog_reduce_acc():
     """acc_i32 += src_i32 (8 int32 per iteration); S6 = |max| of the post-add values
     (the last call of an N-way reduce returns the true absmax for the norm shift).
@@ -1100,6 +1176,102 @@ def prog_silu_q8_x2():
         ("ARG",   "s2", 2),
         ("ARG",   "s7", 7),
         ("LOOPS", "s3"),                              # s3 still holds A3/2 (LOOPS only reads it).
+        ("LDV",   "v0", "s2"),
+        ("LDV",   "v8", "s2"),
+        ("VSHLV", "v0", "v0", "v1"),
+        ("VSHLV", "v8", "v8", "v1"),
+        ("VRNE",  "v0", "v0", 8),
+        ("VRNE",  "v8", "v8", 8),
+        ("VCLAMP8", "v0", "v0"),
+        ("VCLAMP8", "v8", "v8"),
+        ("STB",   "v0", "s7"),
+        ("STB",   "v8", "s7"),
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
+def prog_silu_gate_x2():
+    """prog_silu_gate, two interleaved chains (even beat count: ffn_dim/16 always is)."""
+    C_LOG2E = 739
+    A = dict(x="v0", g="v3", sh="v4", p="v5", r="v6")
+    B = dict(x="v8", g="v9", sh="v10", p="v11", r="v12")
+    def chain_pre(c):
+        return [
+            ("LDV",   c["x"], "s0"),
+            ("VMULS", c["g"], c["x"], "s5"),
+            ("VSHLS", c["g"], c["g"], "s4"),
+            ("VMAX",  c["g"], c["g"], "v1"),
+            ("VMIN",  c["g"], c["g"], "v7"),
+            ("LUTE2", c["p"], c["g"]),
+            ("VSHRI", c["sh"], c["g"], 15),
+        ]
+    def chain_mid(c):
+        return [
+            ("VSHLV", c["p"], c["p"], c["sh"]),
+            ("VADD",  c["r"], c["p"], "v2"),
+            ("VCLZN", c["sh"], c["r"]),
+            ("VSHLV", c["r"], c["r"], c["sh"]),
+            ("LUTRECIP", c["r"], c["r"]),
+        ]
+    def chain_post(c):
+        return [
+            ("VMULH15", c["p"], c["p"], c["r"]),
+            ("VSHLV",   c["p"], c["p"], c["sh"]),
+            ("VSHLI",   c["p"], c["p"], 1),
+            ("VMULH15", c["x"], c["x"], c["p"]),
+            ("STV",     c["x"], "s2"),
+        ]
+    def zip2(a, b):
+        out = []
+        for i in range(max(len(a), len(b))):
+            if i < len(a): out.append(a[i])
+            if i < len(b): out.append(b[i])
+        return out
+    body = (zip2(chain_pre(A), chain_pre(B))
+            + zip2(chain_mid(A), chain_mid(B))
+            + zip2(chain_post(A), chain_post(B)))
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
+        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15),
+        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10),
+        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10),
+        ("MOVSI", "s5", -1), ("SSHLV", "s3", "s5"),   # A3 /= 2 (even beat counts).
+        ("MOVSI", "s5", C_LOG2E),
+        ("LOOPS", "s3"),
+    ] + body + [
+        ("LOOPE",),
+        ("DONE",),
+    ]
+
+def prog_mul_q8_x2():
+    """prog_mul_q8, two interleaved chains (even beat count)."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s6", 6),
+        ("MOVSI", "s7", 0),
+        ("MOVSI", "s5", -1), ("SSHLV", "s3", "s5"),   # A3 /= 2 (even beat counts).
+        ("LOOPS", "s3"),
+        ("LDV",   "v0", "s0"),
+        ("LDV",   "v8", "s0"),
+        ("LDV",   "v3", "s1"),
+        ("LDV",   "v9", "s1"),
+        ("VMUL",  "v0", "v0", "v3"),
+        ("VMUL",  "v8", "v8", "v9"),
+        ("VSHLS", "v0", "v0", "s6"),
+        ("VSHLS", "v8", "v8", "s6"),
+        ("VCLAMP16", "v0", "v0"),
+        ("VCLAMP16", "v8", "v8"),
+        ("REDMAX", "s7", "v0"),
+        ("REDMAX", "s7", "v8"),
+        ("STV",   "v0", "s2"),
+        ("STV",   "v8", "s2"),
+        ("LOOPE",),
+        ("SMOV",  "s6", "s7"),
+        ("BCAST", "v1", "s7"),
+        ("VCLZN", "v1", "v1"),
+        ("ARG",   "s2", 2),
+        ("ARG",   "s7", 7),
+        ("LOOPS", "s3"),                              # s3 still holds A3/2.
         ("LDV",   "v0", "s2"),
         ("LDV",   "v8", "s2"),
         ("VSHLV", "v0", "v0", "v1"),
@@ -1371,7 +1543,8 @@ def prog_kvpack_h_x2():
 
 UNROLL16 = {"silu_q8": prog_silu_q8_x2, "softmax8": prog_softmax8_x2,
             "rmsnorm_q8": prog_rmsnorm_q8_x2, "rmsnorm_h": prog_rmsnorm_h_x2,
-            "rope_h": prog_rope_h_x2, "kvpack_h": prog_kvpack_h_x2}
+            "rope_h": prog_rope_h_x2, "kvpack_h": prog_kvpack_h_x2,
+            "silu_gate": prog_silu_gate_x2, "mul_q8": prog_mul_q8_x2}
 
 PROGRAMS = {
     "resid_add":  prog_resid_add,
@@ -1389,6 +1562,8 @@ PROGRAMS = {
     "kvpack_h":   prog_kvpack_h,
     "rmsnorm_q8": prog_rmsnorm_q8,
     "silu_q8":    prog_silu_q8,
+    "silu_gate":  prog_silu_gate,   # FFN split: gate half, runs under the up stream.
+    "mul_q8":     prog_mul_q8,      # FFN split: up-dependent tail (was silu_q8's tail).
     "nopd": prog_nopd,
 }
 

@@ -548,6 +548,12 @@ static void console_service(void)
         printf("KOVL %s (in-list NOWAIT KV stores under the pack quant8s)\n",
                infer_kv_pipe_state() ? "on" : "off");
     }
+    else if (strcmp(token, "fsplit") == 0) {
+        if (strncmp(str, "on", 2) == 0)  infer_ffn_split(1);
+        if (strncmp(str, "off", 3) == 0) infer_ffn_split(0);
+        printf("FSPLIT %s (gate-only SiLU under the up stream; mul+quant8 after)\n",
+               infer_ffn_split_state() ? "on" : "off");
+    }
     else if (strcmp(token, "kvq") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_kvq_redundant(1);
         if (strncmp(str, "off", 3) == 0) infer_kvq_redundant(0);
