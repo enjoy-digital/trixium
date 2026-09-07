@@ -1170,9 +1170,22 @@ static int seq_attn_base, seq_attn_dph, seq_attn_heads;
 // the spill in list order), and norm(j-1)+softmax8(j) execute under scores(j+1)'s
 // stream. The engine idles only for the ~20-cycle spill instead of spill+norm, and the
 // vector unit fills the scores streams completely. Non-chunked only.
-static int attn_pipe = 1;        // Requested (aovl console toggle).
+static int attn_pipe = 1;        // What the NEXT build will use (see attn_pipe_req).
+static int attn_pipe_req = 1;    // Requested (aovl console toggle). attn_list_prep_token
+                                 // clears attn_pipe when the context outgrows the second
+                                 // scores buffer and restores it when it fits again; the
+                                 // request itself must survive that, or one long generation
+                                 // would leave aovl off for every generation after it.
 static int attn_prep_pos = -1;   // Position attn_list_prep_token last ran for (lovl dedup).
 static int attn_pipe_active = 0; // What the built list uses.
+// The second scores buffer (odd heads, deep layout) sits at SP_SC + 0x3800 and resident K
+// starts at SP_K: 0x800 bytes = 512 int32 entries, NOT the 14 KB the "halves" comment
+// used to claim. Its INT32_MIN padding is written once per token, and every layer's QKV
+// stage rewrites SP_K - so from ctx 513 the padding beyond entry 512 was K data by the
+// time softmax read it (and V data from 1537). Bench runs at ctx~67 and the tokens gate
+// is short, so it never showed. Buffer A is safe: ceil32(cnt) <= 2048 = max_ctx ends it
+// exactly at SP_Q. (Found by the 2026-09-07 external review.)
+#define SC_B_CAP_BYTES ((uint32_t)SP_K - ((uint32_t)SP_SC + 0x3800u))
 static inline uint32_t attn_grp(int j) {
     return (uint32_t)seq_attn_base + (attn_pipe_active ? 1u : 0u)
            + (uint32_t)j*(uint32_t)seq_attn_dph;
@@ -1198,7 +1211,8 @@ static inline uint32_t attn_sc_dst(int j) {
     // (latent since the aovl commit: every sim gate ran the pipelined default and the
     // card's aovl-off benches never token-checked; the pipe-off bisect exposed it).
     return (uint32_t)SP_SC
-           + ((attn_pipe_active && (j & 1)) ? 0x3800u : 0u); // 14 KB halves (ctx <= ~3568).
+           + ((attn_pipe_active && (j & 1)) ? 0x3800u : 0u); // B holds 512 entries, not 14 KB
+                                                             // (SC_B_CAP_BYTES): K is at SP_K.
 }
 static inline int attn_list_len(int nh) {
     return nh*seq_attn_dph + (attn_pipe_active ? 3 : 0); // Prologue + 2-slot epilogue.
@@ -2064,7 +2078,8 @@ int infer_kvq_redundant_state(void) { return kvq_redundant; }
 // Console toggle (aovl): rebuild the three dependent lists in either layout.
 void infer_attn_pipe(int on)
 {
-    attn_pipe = on ? 1 : 0;
+    attn_pipe_req = on ? 1 : 0;
+    attn_pipe = attn_pipe_req;
     seq_ffn_base = -1;
     seq_build_attn();
     seq_build_ffn();
@@ -2162,10 +2177,13 @@ static void attn_list_prep_token(int pos)
         return; // Already posted under the previous forward's LM-head stream (lovl).
     int cnt  = pos + 1;
     int padn = SC_PADN(cnt);
-    if (attn_pipe_active && (uint32_t)(cnt + padn)*4u > 0x3800u) {
-        // The context outgrew the second scores buffer: fall back to the plain list
-        // (the FFN/scale8 bases shift with the prologue, so rebuild all three).
-        attn_pipe = 0;
+    // The deep layout needs the padded score count to fit the second buffer's REAL
+    // capacity (SC_B_CAP_BYTES, see above). Beyond it fall back to the plain list, and
+    // come back to the deep one as soon as a new generation fits again - both directions
+    // shift the FFN/scale8/qkv bases with the prologue, so all four lists rebuild.
+    int want_pipe = attn_pipe_req && ((uint32_t)(cnt + padn)*4u <= SC_B_CAP_BYTES);
+    if (want_pipe != attn_pipe) {
+        attn_pipe = want_pipe;
         seq_ffn_base = -1;
         seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
     }
