@@ -887,15 +887,22 @@ static uint32_t kvp_slot(int kvh, int kind)
 static void kv_store_scale_prep(int kvh, int kind, int e8)
 {
     int slot = 2*kvh + kind;
-    if (kvp_scale_e8[slot] == e8)
+    int prev = kvp_scale_e8[slot];
+    if (prev == e8)
         return;
     // Eight word stores instead of sixteen halfword stores: the beat is byte-identical
     // (halfword g = scale for g < groups, else 0) and uncached scratchpad stores are the
     // cost here, not the arithmetic (F0-3, 2026-08-29).
+    // Only the words that carry a scale change with the exponent - ceil(groups/2) = 2 of
+    // 8 on the 1.7B (head_dim 128 -> 4 groups). The other six are constant zero and
+    // nothing else ever writes the scale beat, so they are staged once per slot epoch (a
+    // sentinel in kvp_scale_e8: init, vbench) and left alone after: 6 posted stores per
+    // exponent change, V changes every layer (2026-09-07, from the external review).
     volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + kvp_slot(kvh, kind));
     int groups = head_dim/32;
+    int nw = (prev <= -1000) ? 8 : (groups + 1)/2;
     uint32_t sc = (uint32_t)(uint16_t)((e8 + 15) << 10);
-    for (int w = 0; w < 8; w++) {
+    for (int w = 0; w < nw; w++) {
         uint32_t lo = (2*w     < groups) ? sc : 0;
         uint32_t hi = (2*w + 1 < groups) ? sc : 0;
         pw[w] = lo | (hi << 16);
