@@ -2593,3 +2593,168 @@ def test_engine_n16_ternary_and_store_window():
             [hex(a) for a in out["aw"][:2]], hex(want))
 
     run_simulation(dut, [driver(), aw_probe()])
+
+
+def test_matvec_packed_writes():
+    # The result packer (2026-09-07): a plain matvec must reach the W port as full 8-lane
+    # beats, not one lane per result. Counts the cycles the engine drives a write during
+    # the op and checks the results are still byte-exact. Two shapes: rows a multiple of 8
+    # (every beat full: writes == results/8) and rows = 12 (each channel's last beat is
+    # shared with the next channel's first: two partial flushes per boundary).
+    for n_channels, rows_per_chan, max_writes in ((2, 16, 4), (4, 12, 6 + 8)):
+        rng    = np.random.default_rng(300 + rows_per_chan)
+        cols   = 128
+        M      = n_channels*rows_per_chan
+        G      = cols//layout.GROUP_TERNARY
+        scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+        codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+        x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+        _, e16 = bx.fp16_decompose(scales)
+        B = bx.choose_scale_bias(e16); R = bx.choose_result_shift(scales, B)
+        expected = bx.matvec_ternary(scales, codes, x8, B, R)
+        spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                          scales=scales, values=codes)
+        payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                    for c in range(n_channels)]
+        dst = 0x4000
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0, dual=False)
+        cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+                   wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
+                   sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                   cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                   bias=B, rshift=R, xsrc=0, dst=dst)
+        writes = []
+        results = []
+
+        def driver():
+            for k, v in cmd.items():
+                yield getattr(dut.engine.cmd, k).eq(v)
+            yield dut.engine.cmd.valid.eq(1)
+            yield
+            while not (yield dut.engine.cmd.ready):
+                yield
+            yield dut.engine.cmd.valid.eq(0)
+            w = 0
+            for _ in range(50000):
+                if (yield dut.engine.dbg_gw_we):
+                    w += 1
+                if (yield dut.engine.done):
+                    break
+                yield
+            else:
+                raise AssertionError("engine timeout")
+            writes.append(w)
+            yield; yield
+            assert (yield dut.engine.error) == 0
+            for i in range(M):
+                word = (yield dut.scratchpad.mem[(dst + 4*i)//32])
+                v = (word >> (32*(((dst + 4*i)//4) % 8))) & 0xFFFFFFFF
+                results.append(v - (1 << 32) if v & (1 << 31) else v)
+
+        run_simulation(dut, [driver()])
+        assert np.array_equal(np.array(results, dtype=np.int64), expected), rows_per_chan
+        assert writes[0] <= max_writes, (n_channels, rows_per_chan, writes[0], max_writes)
+        assert writes[0] >= M//8, (n_channels, rows_per_chan, writes[0])
+
+
+def test_overlap_vec_throughput_under_stream():
+    # The mechanism behind the result packer (docs/performance.md 2026-09-07): with one
+    # result per W-port write, a saturating plain-matvec stream held the port ~92% of the
+    # time and a vector STORE was granted about one cycle in twelve - norm_i32 ran 2.9x
+    # slower under the up projection than idle. This pins the property: the same
+    # store-dense vector program (resid_add: 2 loads + 1 store per beat) must complete
+    # under a saturating stream within 1.3x its idle time. Eight channels x 5-beat rows
+    # demand 1.6 results/cycle, so the grant runs every cycle - the card's condition.
+    n_channels, rows_per_chan, cols, seed = 8, 160, 128, 94
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols).astype(np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16); R = bx.choose_result_shift(scales, B)
+    res_exp = bx.matvec_ternary(scales, codes, x8, B, R)
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+    nv = 512 # ~300 cycles of vector work: the 160-row stream (800 beats/channel, the sim
+             # streams ~1 beat/cycle/channel) outlasts it, and the test asserts that, so the
+             # ratio is measured entirely under the stream.
+    vec_args = [0x8000, 0x9000, 0xA000, nv//16, -1, -3]
+    sp = bytearray(64*1024)
+    sp[0x1000:0x1000 + cols] = x8.tobytes()
+    sp[0x8000:0x8000 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    sp[0x9000:0x9000 + 2*nv] = rng.integers(-30000, 30000, nv).astype("<i2").tobytes()
+    mirror = _overlap_vec_golden(sp, vec_args)
+    from trixium.model import asm as vasm
+    words = vasm.assemble(vasm.PROGRAMS["resid_add"]())
+    rb    = layout.row_beats(cols, layout.KIND_TERNARY)
+    cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0, wlen=rows_per_chan*rb,
+               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+               bias=B, rshift=R, xsrc=0x1000, dst=0x2000)
+
+    def measure(with_engine):
+        dut = _OverlapDUT(n_channels, payloads, words_from_bytes(bytes(sp)))
+        out = {}
+
+        def driver():
+            yield from _vec_csr_upload(dut, words)
+            if with_engine:
+                for k, v in cmd.items():
+                    yield getattr(dut.engine.cmd, k).eq(v)
+                yield dut.engine.cmd.valid.eq(1)
+                yield
+                while not (yield dut.engine.cmd.ready):
+                    yield
+                yield dut.engine.cmd.valid.eq(0)
+                # Let the stream reach steady state before the vector job starts.
+                for _ in range(40):
+                    yield
+            yield from _vec_csr_submit(dut, vec_args)
+            t = 0
+            w = 0
+            for _ in range(60000):
+                if with_engine and (yield dut.engine.dbg_gw_we):
+                    w += 1
+                if not (yield dut.vu.busy):
+                    break
+                t += 1
+                yield
+            else:
+                raise AssertionError("vec timeout")
+            out["vec_cycles"] = t
+            if with_engine:
+                out["eng_busy_at_vec_end"] = (yield dut.engine.busy)
+                for _ in range(60000):
+                    if (yield dut.engine.dbg_gw_we):
+                        w += 1
+                    if not (yield dut.engine.busy):
+                        break
+                    yield
+                else:
+                    raise AssertionError("engine timeout")
+                out["writes"] = w
+                yield
+                out["ovf"] = (yield dut.engine.gw_ovf)
+                out["res"] = np.frombuffer((yield from _read_sp(dut, 0x2000, 4*M)), dtype="<i4")
+            out["vec"] = (yield from _read_sp(dut, 0xA000, 2*nv))
+
+        run_simulation(dut, [driver()])
+        return out
+
+    idle  = measure(False)
+    under = measure(True)
+    assert under["ovf"] == 0, "gather FIFO overflow"
+    assert np.array_equal(under["res"], res_exp)
+    assert idle["vec"] == bytes(mirror[0xA000:0xA000 + 2*nv])
+    assert under["vec"] == bytes(mirror[0xA000:0xA000 + 2*nv])
+    ratio = under["vec_cycles"]/idle["vec_cycles"]
+    print(f"\nvec under stream: {ratio:.2f}x ({under['vec_cycles']} vs {idle['vec_cycles']} "
+          f"cycles); engine writes {under['writes']} for {M} results")
+    assert under["eng_busy_at_vec_end"], "stream ended before the vector job: not measured under stream"
+    assert under["writes"] <= M//8 + n_channels, (under["writes"], M)
+    assert ratio <= 1.3, (f"vector program {ratio:.2f}x slower under the stream "
+                          f"({under['vec_cycles']} vs {idle['vec_cycles']} cycles)")

@@ -681,7 +681,11 @@ class BonsaiChannelPipe(LiteXModule):
             ).Else(
                 self.source.valid.eq(out_fifo.source.valid),
                 self.source.row.eq(out_fifo.source.row),
-                self.source.data.eq(out_fifo.source.data),
+                # The 32-bit result in EVERY lane: the engine's result packer keeps a
+                # per-lane register and enables only the lane this result belongs to, so
+                # replicating here (pure fanout) is what lets the packer carry no data mux.
+                # Lane 0 still holds the result for every existing consumer.
+                self.source.data.eq(Replicate(out_fifo.source.data, 8)),
                 self.source.head.eq(out_fifo.source.head),
                 out_fifo.source.ready.eq(self.source.ready),
             ),

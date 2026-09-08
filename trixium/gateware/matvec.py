@@ -33,6 +33,114 @@ from trixium.gateware.ternary_mac import BonsaiChannelPipe
 
 # BonsaiMatVecEngine -------------------------------------------------------------------------------
 
+class _ResultPacker(Module):
+    """The per-pipe relay register in front of the gather, which in plain-matvec mode also
+    coalesces a channel's consecutive results into full 8-lane beats.
+
+    Why (2026-09-07, docs/performance.md "The vector unit runs 2.9x slower under an engine
+    stream"): a plain matvec wrote ONE int32 result per W-port beat, so the up projection's
+    6,144 results were 6,144 port cycles in a ~6.7k-cycle stream. The engine's result FIFO
+    drains only on cycles the vector unit is not storing, so it pinned at its threshold and
+    a vector store was granted about one cycle in twelve - norm_i32 ran at 15.9 cy/beat under
+    the stream against 5.6 idle. Plain-mode rows are channel-major and contiguous per channel
+    (slot = dst + chan*rows + row), so a channel's 8 consecutive results are one aligned beat.
+
+    Structure, chosen for timing (the first version, v10, failed the gate at 31k endpoints):
+    - This IS the relay: its registers feed the gather's 16:1 mux and the round-robin, so
+      the grant side sees exactly what the old stream.Buffer relay gave it.
+    - Its input is registered too (the engine puts a stream.Buffer in front), so every cone
+      here starts at flops: the pipe FIFO's asynchronous read and the slot arithmetic - the
+      chain the n16 #3c fix moved off the critical path - never reach the merge compare.
+    - No data mux: the pipe replicates its 32-bit result across all 8 lanes, so lane l's
+      register always loads bits [32l:32l+32] of the input and only its ENABLE depends on
+      the lane. Bypass modes (ilv/AXPY/xred/fetch) load all 8 lanes and behave as the
+      plain register they replaced.
+    - Flush is LOCAL: the pipe's last row is static per op (rows_last), so the packer
+      flushes its own partial beat when it has consumed that row - no cross-die count.
+
+    In pack mode a result whose beat matches the held one merges into its lane; otherwise
+    the held beat is emitted (displace) and the new result loads. A full beat is presented
+    as soon as it is full. Byte-exact: the memory sees the same lanes with the same data,
+    only in fewer, wider writes."""
+    def __init__(self):
+        layout = [("row", 16), ("data", 256), ("wide", 1), ("head", 1), ("slot", 24)]
+        self.sink   = stream.Endpoint(layout)
+        self.source = stream.Endpoint(layout + [("lanes", 8)])
+        self.enable    = Signal()   # Plain-matvec mode: pack. Otherwise a plain relay.
+        self.clear     = Signal()   # Op start.
+        self.rows_last = Signal(16) # This pipe's last row index (static per op).
+        self.qn        = Signal()   # Dual-Q: the last result is (rows_last, head 1).
+
+        p_v     = Signal()
+        p_row   = Signal(16)
+        p_dat   = Signal(256)
+        p_wide  = Signal()
+        p_head  = Signal()
+        p_slot  = Signal(24)
+        p_lanes = Signal(8)
+        last_seen = Signal()        # The pipe's final result has been consumed.
+
+        in_v    = Signal()
+        lane    = Signal(3)
+        merge   = Signal()          # Same beat as the held one: add a lane.
+        displace = Signal()         # A new entry that cannot merge: emit the held one.
+        full    = Signal()
+        is_last = Signal()
+        accept  = Signal()
+        self.comb += [
+            in_v.eq(self.sink.valid),
+            lane.eq(self.sink.slot[0:3]),
+            merge.eq(self.enable & p_v & (p_slot[3:] == self.sink.slot[3:])),
+            displace.eq(in_v & p_v & ~merge),
+            full.eq(p_lanes == 0xFF),
+            is_last.eq((self.sink.row == self.rows_last) & (~self.qn | self.sink.head)),
+            # Emit: as a plain relay whenever something is held; packing, when the beat is
+            # full, when a new beat needs the slot, or when the pipe is done and this is
+            # its partial tail.
+            self.source.valid.eq(p_v & (~self.enable | full | displace
+                                        | (last_seen & ~in_v))),
+            self.source.row.eq(p_row),
+            self.source.data.eq(p_dat),
+            self.source.wide.eq(p_wide),
+            self.source.head.eq(p_head),
+            self.source.slot.eq(p_slot),
+            self.source.lanes.eq(p_lanes),
+            # Take the input when the slot is free, when it merges, or when the held
+            # entry leaves this cycle.
+            accept.eq(in_v & (~p_v | merge | self.source.ready)),
+            self.sink.ready.eq(accept),
+        ]
+        load = Signal()
+        self.comb += load.eq(accept & ~merge)
+        self.sync += [
+            If(self.clear,
+                p_v.eq(0),
+                last_seen.eq(0),
+            ).Else(
+                If(load,
+                    p_v.eq(1),
+                    p_row.eq(self.sink.row),
+                    p_wide.eq(self.sink.wide),
+                    p_head.eq(self.sink.head),
+                    p_slot.eq(self.sink.slot),
+                    p_lanes.eq(Mux(self.enable, 1 << lane, 0xFF)),
+                ).Elif(accept & merge,
+                    p_lanes.eq(p_lanes | (1 << lane)),
+                ).Elif(self.source.valid & self.source.ready,
+                    p_v.eq(0),
+                ),
+                If(accept & is_last,
+                    last_seen.eq(1),
+                ),
+            ),
+        ]
+        # Lane registers: no data mux - the pipe replicates a plain result into every
+        # lane, so lane l always loads its own bits; only the enable is lane-dependent.
+        for l in range(8):
+            self.sync += If(accept & (~self.enable | (lane == l)),
+                            p_dat[32*l:32*l + 32].eq(self.sink.data[32*l:32*l + 32]))
+
+
 class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  dual=True, chan_stride=0):
@@ -350,28 +458,46 @@ class BonsaiMatVecEngine(LiteXModule):
         #   default  slot = dst + qoff + chan*rows + row    (channel-major)
         # The pipe's stream handshake is unchanged (consumed == counted still holds: the
         # counting stage sits after the relay, on the same signals it always used).
+        # Plain-matvec results are packed into full beats per channel in the relay stage
+        # (_ResultPacker above). pack_en excludes every mode with its own retirement path.
+        pack_en = Signal()
+        self.comb += pack_en.eq(~fetch_mode & ~store_mode & ~axpy_mode & ~ilv_mode)
         gsrc = []
+        packs = []
         for i, pipe in enumerate(self.pipes):
-            gb = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
+            # Registered input stage: the slot arithmetic below is computed from the pipe
+            # FIFO's asynchronous read and lands in flops here, so the packer's merge
+            # compare starts from registers (n16 #3c, kept).
+            ib = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
                                 ("slot", 24)])
-            setattr(self.submodules, f"gbuf{i}", gb)
+            setattr(self.submodules, f"gin{i}", ib)
+            pk = _ResultPacker()
+            setattr(self.submodules, f"pack{i}", pk)
+            rows_last_i = Signal(16)
+            self.sync += rows_last_i.eq(cmd_r["rows"] - 1 + (i < cmd_r["rem"]))
             self.comb += [
-                gb.sink.valid.eq(pipe.source.valid),
-                pipe.source.ready.eq(gb.sink.ready),
-                gb.sink.row.eq(pipe.source.row),
-                gb.sink.data.eq(pipe.source.data),
-                gb.sink.wide.eq(pipe.source.wide),
-                gb.sink.head.eq(pipe.source.head),
-                gb.sink.slot.eq(dstw + Mux(pipe.source.head, cmd_r["qstride"], 0)
+                ib.sink.valid.eq(pipe.source.valid),
+                pipe.source.ready.eq(ib.sink.ready),
+                ib.sink.row.eq(pipe.source.row),
+                ib.sink.data.eq(pipe.source.data),
+                ib.sink.wide.eq(pipe.source.wide),
+                ib.sink.head.eq(pipe.source.head),
+                ib.sink.slot.eq(dstw + Mux(pipe.source.head, cmd_r["qstride"], 0)
                     + Mux(ilv_mode, pipe.source.row*n + i,
                       Mux(xred_mode, pipe.source.row,
                           pipe.source.row + Mux(axpy_mode, i*cmd_r["cols"], i*cmd_r["rows"])))),
+                ib.source.connect(pk.sink),
+                pk.enable.eq(pack_en),
+                pk.rows_last.eq(rows_last_i),
+                pk.qn.eq(cmd_r["qn"]),
             ]
-            gsrc.append(gb.source)
+            gsrc.append(pk.source)
+            packs.append(pk)
         grant_valid = Array([g.valid for g in gsrc])[rr.grant]
         grant_row   = Array([g.row   for g in gsrc])[rr.grant]
         grant_data  = Array([g.data  for g in gsrc])[rr.grant]
         grant_wide  = Array([g.wide  for g in gsrc])[rr.grant]
+        grant_lanes = Array([g.lanes for g in gsrc])[rr.grant]
         grant_slot  = Signal(24)
         merge_mask  = Signal(n)
         self.comb += grant_slot.eq(Array([g.slot for g in gsrc])[rr.grant])
@@ -458,28 +584,73 @@ class BonsaiMatVecEngine(LiteXModule):
 
         is_matvec = Signal() # Kinds 0/1 only (not fetch/store/axpy partials).
         gidx      = Signal(24)
-        grant_s   = Signal((32, True))
         self.comb += [
-            grant_s.eq(grant_data[0:32]),
             is_matvec.eq((cmd_r["kind"] == 0) | (cmd_r["kind"] == 1)),
-            gidx.eq(rr.grant*cmd_r["rows"] + grant_row),
+            # Logical row index of the packed beat's LANE 0: the packer carries the first
+            # result's row and lane (slot[:3]), and lanes are consecutive rows of one
+            # channel, so lane l is row0 + (l - lane0). Wraps mod 2^24 for lanes below
+            # lane0, which are never valid.
+            gidx.eq(rr.grant*cmd_r["rows"] + grant_row - grant_slot[0:3]),
         ]
-        # Argmax tap rides the single-grant path only: it is used exclusively by the
-        # chan-major LM-head op (never ilv, never AXPY), where grants stay 1/cycle.
-        # Argmax compare runs one stage after the grant (same lag argument as absmax).
+        # Argmax tap rides the plain-matvec grant path only: it is used exclusively by the
+        # chan-major LM-head op (never ilv, never AXPY). A grant is now a PACKED beat of up
+        # to 8 results (_ResultPacker), so the tap reduces 8 lanes to one (value, index)
+        # with np.argmax's tie-break (smallest index) through a registered tree - three
+        # levels, one per cycle - and then the running compare. Invalid lanes enter as
+        # (INT32_MIN, 0xFFFFFF), which no valid lane loses to. `done` waits for this
+        # pipeline to empty (am_busy), so no reader can see a stale argmax.
         am_v_r  = Signal()
-        am_s_r  = Signal((32, True))
-        am_i_r  = Signal(24)
+        am_l_r  = Signal(8)
+        am_d_r  = Signal(256)
+        am_b_r  = Signal(24)
         self.sync += [
             am_v_r.eq(is_matvec & ~ilv_mode & grant_valid & ~grant_wide),
-            am_s_r.eq(grant_s),
-            am_i_r.eq(gidx),
+            am_l_r.eq(grant_lanes),
+            am_d_r.eq(grant_data),
+            am_b_r.eq(gidx),
         ]
+        NEG = -(1 << 31)
+        def _pick(va, ia, vb, ib):
+            v = Signal((32, True)); i = Signal(24)
+            self.comb += If((va > vb) | ((va == vb) & (ia <= ib)),
+                             v.eq(va), i.eq(ia)).Else(v.eq(vb), i.eq(ib))
+            return v, i
+        lv = []
+        for l in range(8):
+            v = Signal((32, True), name=f"am_lv{l}"); i = Signal(24, name=f"am_li{l}")
+            self.comb += [
+                v.eq(Mux(am_l_r[l], am_d_r[32*l:32*l + 32], NEG)),
+                i.eq(Mux(am_l_r[l], am_b_r + l, 0xFFFFFF)),
+            ]
+            lv.append((v, i))
+        # Level 1: 8 -> 4 (registered).
+        am_v2 = Signal(); l2 = []
+        for k in range(4):
+            v, i = _pick(*lv[2*k], *lv[2*k + 1])
+            vr = Signal((32, True), name=f"am_v2_{k}"); ir = Signal(24, name=f"am_i2_{k}")
+            self.sync += [vr.eq(v), ir.eq(i)]
+            l2.append((vr, ir))
+        self.sync += am_v2.eq(am_v_r)
+        # Level 2: 4 -> 2 (registered).
+        am_v3 = Signal(); l3 = []
+        for k in range(2):
+            v, i = _pick(*l2[2*k], *l2[2*k + 1])
+            vr = Signal((32, True), name=f"am_v3_{k}"); ir = Signal(24, name=f"am_i3_{k}")
+            self.sync += [vr.eq(v), ir.eq(i)]
+            l3.append((vr, ir))
+        self.sync += am_v3.eq(am_v2)
+        # Level 3: 2 -> 1 (registered).
+        am_v4 = Signal()
+        v, i = _pick(*l3[0], *l3[1])
+        am_s_r = Signal((32, True)); am_i_r = Signal(24)
+        self.sync += [am_s_r.eq(v), am_i_r.eq(i), am_v4.eq(am_v3)]
+        am_busy = Signal()
+        self.comb += am_busy.eq(am_v_r | am_v2 | am_v3 | am_v4)
         self.sync += [
             If(self.cmd.valid & self.cmd.ready,
                 self.argmax_val.eq(-(1 << 31)),
                 self.argmax_idx.eq(0xFFFFFF),
-            ).Elif(am_v_r &
+            ).Elif(am_v4 &
                    ((am_s_r > self.argmax_val)
                     | ((am_s_r == self.argmax_val) & (am_i_r < self.argmax_idx))),
                 self.argmax_val.eq(am_s_r),
@@ -572,9 +743,12 @@ class BonsaiMatVecEngine(LiteXModule):
                 eng_gw_dat_c.eq(grant_data),
                 eng_gw_we_c.eq(Mux(grant_valid, 0xFF, 0)),
             ).Else(
+                # Plain matvec: a packed beat from the channel's _ResultPacker - up to 8
+                # results, lanes as written. Was one lane per write (Replicate + 1 << lane),
+                # which held the W port ~92% of a stream and starved the vector unit.
                 eng_gw_adr_c.eq(slot[3:]),
-                eng_gw_dat_c.eq(Replicate(grant_data[0:32], 8)),
-                eng_gw_we_c.eq(Mux(grant_valid, 1 << slot[:3], 0)),
+                eng_gw_dat_c.eq(grant_data),
+                eng_gw_we_c.eq(Mux(grant_valid, grant_lanes, 0)),
             )
         ]
 
@@ -726,6 +900,8 @@ class BonsaiMatVecEngine(LiteXModule):
         start_pulse = Signal()
         for pipe in self.pipes:
             self.sync += pipe.start.eq(start_pulse) # One cycle behind, with the params.
+        for pk in packs:
+            self.comb += pk.clear.eq(start_pulse)   # No partial beat survives an op boundary.
 
         fsm.act("IDLE",
             self.cmd.ready.eq(1),
@@ -819,6 +995,7 @@ class BonsaiMatVecEngine(LiteXModule):
         # A stall in RUN is either "results never produced" or "produced but never retired",
         # and result_cnt against the expected total is what separates the two.
         self.dbg_result_cnt = result_cnt
+        self.dbg_gw_we      = sp_gw_we  # W-port write cycles (a testbench counts them).
         self.dbg_mv_total   = mv_total
         self.dbg_ax_total   = ax_total
         self.comb += [
@@ -837,7 +1014,8 @@ class BonsaiMatVecEngine(LiteXModule):
                    result_cnt == Mux(cmd_r["qn"],
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
                        Mux(axpy_mode, ax_total, mv_total)))
-               & ~gw_pending, # Queued writes must be in RAM before done.
+               & ~gw_pending  # Queued writes must be in RAM before done.
+               & ~am_busy,    # ...and the argmax tree drained (packed beats, 4 stages).
                 self.done.eq(1),
                 NextState("IDLE"),
             )
