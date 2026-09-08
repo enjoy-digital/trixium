@@ -1390,13 +1390,13 @@ static int ffn_shape_base = -1; // seq_ffn_base the FFN engine shape images were
 // x*sigmoid(x) product is a function of the GATE alone, so that half could run UNDER the
 // up matvec's stream (where norm_g already runs) and only the multiply/absmax/quant8 tail
 // would wait for up. Byte-identical by construction (asm.py, test_silu_split_matches_fused);
-// the list grows 9 -> 10 descriptors. MEASURED +0.42% (slower), same boot, 3 pairs, so it
-// stays OFF. The fprof per-descriptor trace says why: the vector unit runs ~2.9x SLOWER
-// under an engine stream (norm_g 6,096 cycles under the up stream vs the identical norm_u
-// 2,133 idle), so norm_g alone fills the 6.7k-cycle window and silu_gate ran after the
-// stream, adding its own pass (silu_gate 7,130 + mul_q8 5,006 vs silu_q8 11,180). Kept as a
-// toggle (fsplit): with the throttle removed the same trace says it is worth ~3.7k/layer.
-static int ffn_split = 0;
+// the list grows 9 -> 10 descriptors. On v9 it measured +0.42% (slower): the vector unit
+// ran ~2.9x slower under an engine stream (norm_g 6,096 cycles under the up stream vs the
+// identical norm_u 2,133 idle), so norm_g alone filled the window and silu_gate ran after
+// the stream. The v11 result packer (gateware/matvec.py _ResultPacker) removed that
+// throttle - norm_g under the stream is 2,108 on v11 - and the split is now worth
+// -4.07% same-boot (2,477,618 vs 2,582,600 cycles/token, 3 pairs, 2026-09-08). Default ON.
+static int ffn_split = 1;
 static int ffn_di_down = 7; // Down matvec's descriptor (b + 7 fused, b + 8 split).
 static int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
 static void seq_build_ffn(void)
