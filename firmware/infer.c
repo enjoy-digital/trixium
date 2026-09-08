@@ -1016,6 +1016,15 @@ static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
 // head-relative inside SP_Q/SP_K, so the list is layer-independent; per layer only the
 // rmsnorm eps_int args (A5 = descriptor word 7) change. Built once at init.
 static int seq_qkr_count;
+// Descriptor indices of the q-norm and k-norm in the qkr list (their A1/A5 are patched
+// per layer). Fixed at 0/1 until the reorder below moved the q chain behind the store.
+static int seq_qkr_di_qn = 0, seq_qkr_di_kn = 1;
+// qkr list order (2026-09-08): K chain -> packs -> multi-store (NOWAIT) -> Q chain -> Q
+// quant8. The q-side work (rmsnorm_h/rope_h over 16 heads, ~3k cycles) is independent of
+// K/V, so behind the store it absorbs the store's ~1k tail that the stop descriptor used
+// to wait out (16 packets at ~65 cycles of write latency each, per-descriptor trace).
+// Same ops, same numerics. Toggle qkro selects the old order for a same-boot A/B.
+static int qkr_reorder = 1;
 // In-list KV stores (probe-1 follow-up, 2026-08-31): each (kvh, kind) staging slot's
 // engine STORE rides the qkr list as a NOWAIT descriptor right after the pack quant8
 // that fills the slot - the next head's quant8 (vec) runs under the store's stream, so
@@ -1060,21 +1069,26 @@ static void seq_build_qkr(void)
     // per-descriptor fixed cost was 8-12x the work at V1 rates (qknorm 749k, kvquant 514k
     // cycles/token measured vs 87k + 44k attainable). Same instruction sequence per head,
     // so byte-identical by construction; only A5 (eps) of the two norms is patched per layer.
+    int32_t nq[8] = {(int32_t)SP_Q, (int32_t)SP_FET, (int32_t)SP_Q, head_dim/16,
+                     -ln, 1, E_W16 - E_NORM - 15, n_head};
+    int32_t rq[8] = {(int32_t)SP_Q, (int32_t)(SP_Q + head_dim), (int32_t)SP_TAB,
+                     (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_Q,
+                     head_dim, n_head};
     {
-        int32_t nq[8] = {(int32_t)SP_Q, (int32_t)SP_FET, (int32_t)SP_Q, head_dim/16,
-                         -ln, 1, E_W16 - E_NORM - 15, n_head};
-        seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);                  // 0: q-norm (A5 patched)
+        if (!qkr_reorder) {
+            seq_qkr_di_qn = (int)di;
+            seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);              // q-norm (A5 patched)
+        }
         int32_t nk[8] = {(int32_t)SP_K, (int32_t)SP_FET2, (int32_t)SP_K, head_dim/16,
                          -ln, 1, E_W16 - E_NORM - 15, n_kv_head};
-        seq_desc_vec(di++, PROG_RMSNORM_H, nk, 8, 0);                  // 1: k-norm (A5 patched)
-        int32_t rq[8] = {(int32_t)SP_Q, (int32_t)(SP_Q + head_dim), (int32_t)SP_TAB,
-                         (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_Q,
-                         head_dim, n_head};
-        seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                     // 2: q-rope
+        seq_qkr_di_kn = (int)di;
+        seq_desc_vec(di++, PROG_RMSNORM_H, nk, 8, 0);                  // k-norm (A5 patched)
+        if (!qkr_reorder)
+            seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                 // q-rope
         int32_t rk[8] = {(int32_t)SP_K, (int32_t)(SP_K + head_dim), (int32_t)SP_TAB,
                          (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_K,
                          head_dim, n_kv_head};
-        seq_desc_vec(di++, PROG_ROPE_H, rk, 8, 0);                     // 3: k-rope
+        seq_desc_vec(di++, PROG_ROPE_H, rk, 8, 0);                     // k-rope
         int32_t pk[8] = {(int32_t)SP_K, 0, (int32_t)(kvp_slot(0, 0) + 32), head_dim/16, 0, 0,
                          0x400 - 16*(head_dim/16), n_kv_head};
         seq_desc_vec(di++, PROG_KVPACK_H, pk, 8, 0);                   // 4: K packs
@@ -1150,6 +1164,13 @@ static void seq_build_qkr(void)
         kv_mstore_active = 1;
         di++;
     }
+#ifdef BONSAI_VEC_LOOPS2
+    if (qkr_reorder) { // Q chain behind the (NOWAIT) store: absorbs its write-latency tail.
+        seq_qkr_di_qn = (int)di;
+        seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);                  // q-norm (A5 patched)
+        seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                     // q-rope
+    }
+#endif
     // F0-5: ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB
     // post-increments 16 B, so head j lands at +j*head_dim); the attention list's
     // per-head quant8 descriptor is gone and its scores read x from there. The region
@@ -1557,6 +1578,8 @@ static void seq_build_scale8(void)
 // Engine words (wbase/bias per layer) come from qkv_prep_layer, posted under the
 // previous layer's FFN list (or the LM-head stream for layer 0).
 #define SP_QKSP (SP_FFSP + 64)
+#define NRM_MAXL 64
+
 static int seq_qkv_base = -1;
 static int qkv_prepped  = -1; // Layer whose projections are currently in the slots.
 static void seq_build_qkv(void)
@@ -1952,8 +1975,8 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
                          rb, SP_TAB);
             int epq = seq_eps_int(eq_r[p]), epk = seq_eps_int(ek_r[p]);
 #ifdef BONSAI_VEC_LOOPS2
-            seq_patch(0, 7, (uint32_t)epq);
-            seq_patch(1, 7, (uint32_t)epk);
+            seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);
+            seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);
 #else
             for (int hh = 0; hh < n_head + n_kv_head; hh++)
                 seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
@@ -2169,6 +2192,21 @@ void infer_kv_mstore(int on)
 #endif
 }
 int infer_kv_mstore_state(void) { return kv_mstore_active; }
+
+// Console toggle (qkro): qkr list order. Same base shifts as kovl (count unchanged, but
+// the norm indices move), so the same five rebuilds.
+void infer_qkr_reorder(int on)
+{
+    qkr_reorder = on ? 1 : 0;
+    seq_ffn_base = -1;
+    seq_build_qkr();
+    seq_build_attn();
+    seq_build_ffn();
+    seq_build_scale8();
+    seq_build_qkv();
+}
+int infer_qkr_reorder_state(void) { return qkr_reorder; }
+
 // Console toggle (fsplit): same base shifts as the other list toggles.
 void infer_ffn_split(int on)
 {
@@ -2362,7 +2400,6 @@ static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
 // tightly-coupled SRAM. model_entry_kind() walks the entry cache and the tensor table,
 // both in HBM-backed main_ram behind a 2-way L1 with no L2, so each of these lookups
 // was a couple of ~150-cycle misses, 5+ times a layer (2026-09-04).
-#define NRM_MAXL 64
 static const struct bons_entry *nrm_attn16[NRM_MAXL], *nrm_ffn16[NRM_MAXL], *nrm_out16;
 static void norm16_cache_build(void)
 {
@@ -2536,8 +2573,8 @@ embed_done: ;
             }
 #endif
             if (qres) {
-                seq_patch(0, 3, SP_QNW + (uint32_t)l*head_dim*2);   // rmsnorm_h A1 (q heads).
-                seq_patch(1, 3, SP_KNW + (uint32_t)l*head_dim*2);   // rmsnorm_h A1 (k heads).
+                seq_patch((uint32_t)seq_qkr_di_qn, 3, SP_QNW + (uint32_t)l*head_dim*2); // rmsnorm_h A1 (q).
+                seq_patch((uint32_t)seq_qkr_di_kn, 3, SP_KNW + (uint32_t)l*head_dim*2); // rmsnorm_h A1 (k).
             } else if (fovl_use) {  // fovl: the q-norm row streams under the eps/KV prep below.
                 dqn = norm_fetch_submit(qn16);
             } else {
@@ -2553,8 +2590,8 @@ embed_done: ;
                 if (qtr) qt[qtn++] = perf_now(); // [1] fetches + entry lookups done.
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
 #ifdef BONSAI_VEC_LOOPS2
-                seq_patch(0, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
-                seq_patch(1, 7, (uint32_t)epk);   // rmsnorm_h A5 (k heads).
+                seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
+                seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);   // rmsnorm_h A5 (k heads).
 #else
                 for (int hh = 0; hh < n_head + n_kv_head; hh++)
                     seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
