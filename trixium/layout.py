@@ -63,7 +63,13 @@ FLAG_REPLICATED = 0x01 # Tensor payload identical in every channel (not row-shar
  ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
  ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
  ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
- ROLE_ROPE_TAB) = range(15)
+ ROLE_ROPE_TAB,
+ ROLE_TOK_EMB16, ROLE_TOK_EMB16_EXP) = range(17)
+# ROLE_TOK_EMB16: the token embedding rows pre-dequantized to the firmware's int16 BFP form
+# (bit-exact with embed_row_bfp / the sim's embed_bfp_int), one NORM16 row per token, so a
+# forward starts with a 128-beat engine fetch instead of ~47k cycles of CPU decode and
+# uncached scratchpad stores (2026-09-08). ROLE_TOK_EMB16_EXP: the per-row exponent, 16
+# int16 per beat, replicated.
 
 ROLE_NAMES = {
     ROLE_TOK_EMB     : "tok_emb",     ROLE_OUT_NORM  : "out_norm",  ROLE_LM_HEAD  : "lm_head",
@@ -72,6 +78,7 @@ ROLE_NAMES = {
     ROLE_ATTN_K_NORM : "attn_k_norm", ROLE_FFN_NORM  : "ffn_norm",  ROLE_FFN_GATE : "ffn_gate",
     ROLE_FFN_UP      : "ffn_up",      ROLE_FFN_DOWN  : "ffn_down",
     ROLE_ROPE_TAB    : "rope_tab",
+    ROLE_TOK_EMB16   : "tok_emb16",   ROLE_TOK_EMB16_EXP: "tok_emb16_exp",
 }
 
 # Row packet math ----------------------------------------------------------------------------------

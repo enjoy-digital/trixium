@@ -25,6 +25,8 @@ extern uint32_t infer_forwards;  // Forwards run since boot.
 void infer_kv_mstore(int on);     // In-list KV multi-store vs per-slot stores (kvms).
 void infer_qkr_reorder(int on);   // qkr list: Q chain behind the store (qkro).
 void infer_qfix(int on);          // Scan-free fixed-shift Q quant8 in the qkr list (qfix).
+void infer_embfetch(int on);      // Embedding row fetched pre-dequantized from the image (embf).
+int  infer_embfetch_state(void);
 int  infer_qfix_state(void);
 int  infer_qkr_reorder_state(void);
 int  infer_kv_mstore_state(void);

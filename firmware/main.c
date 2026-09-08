@@ -560,6 +560,12 @@ static void console_service(void)
         printf("FSPLIT %s (gate-only SiLU under the up stream; mul+quant8 after)\n",
                infer_ffn_split_state() ? "on" : "off");
     }
+    else if (strcmp(token, "embf") == 0) {
+        if (strncmp(str, "on", 2) == 0)  infer_embfetch(1);
+        if (strncmp(str, "off", 3) == 0) infer_embfetch(0);
+        printf("EMBF %s (embedding row fetched pre-dequantized)\n",
+               infer_embfetch_state() ? "on" : "off");
+    }
     else if (strcmp(token, "qfix") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_qfix(1);
         if (strncmp(str, "off", 3) == 0) infer_qfix(0);

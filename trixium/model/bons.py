@@ -128,6 +128,40 @@ def decode_rows(spec_entry, payload):
 
 # Writer -------------------------------------------------------------------------------------------
 
+def embed_bfp_rows(spec):
+    from trixium.model import bitexact as bx
+    """Every embedding row in the firmware's int16 BFP form: (mantissas int16 (rows, cols),
+    exponents int32 (rows,)). Vectorized transcription of embed_row_bfp (firmware/infer.c)
+    and the sim reference embed_bfp_int (test_sim_smoke.py): per group g the fp16 scale
+    splits into (m11, e16); every group's (q-1)*m11 is aligned to the row's smallest e16
+    (shift capped at 20); the row's absmax over groups with any nonzero code sets
+    k2 = bitlen(absmax) - 15 so mantissas land in [2^14, 2^15); net = sh - k2 shifts left
+    or arithmetic-right; the result is truncated to int16."""
+    m11, e16 = bx.fp16_decompose(spec.scales.astype(np.float16))          # (rows, G)
+    m11 = m11.astype(np.int64); e16 = e16.astype(np.int64)
+    rows, cols = spec.values.shape
+    G = cols//layout.GROUP_TERNARY
+    q = spec.values.astype(np.int64).reshape(rows, G, layout.GROUP_TERNARY) - 1
+    e16min = e16.min(axis=1, keepdims=True)
+    sh = np.minimum(e16 - e16min, 20)                                       # (rows, G)
+    nonzero = np.any(q != 0, axis=2)                                         # (rows, G)
+    gm = np.where(nonzero, np.abs(m11) << sh, 0)
+    amax = gm.max(axis=1)                                                    # (rows,)
+    bl = np.zeros(rows, dtype=np.int64)
+    nz = amax > 0
+    bl[nz] = np.floor(np.log2(amax[nz].astype(np.float64))).astype(np.int64) + 1
+    # log2 rounding guard: exact bit_length check for the values near a power of two.
+    bl[nz] = np.where((1 << bl[nz]) <= amax[nz], bl[nz] + 1, bl[nz])
+    bl[nz] = np.where((1 << (bl[nz] - 1)) > amax[nz], bl[nz] - 1, bl[nz])
+    k2 = bl - 15
+    net = sh - k2[:, None]                                                    # (rows, G)
+    v2 = q*m11[:, :, None]                                                   # (rows, G, 128)
+    netc = net[:, :, None]
+    out = np.where(netc >= 0, v2 << np.maximum(netc, 0), v2 >> np.maximum(-netc, 0))
+    mant = out.reshape(rows, cols).astype(np.int16)                         # truncation, as the firmware
+    exps = (e16min[:, 0] + k2).astype(np.int32)
+    return mant, exps
+
 def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_path=None):
     """Write a BONS image + JSON manifest. Returns the manifest dict."""
     chan_payloads = [bytearray() for _ in range(n_channels)]
@@ -158,6 +192,24 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
         tensors.append(TensorSpec(n16_name, spec.role, spec.layer,
                                   layout.KIND_NORM16, spec.rows, spec.cols,
                                   values=q, flags=spec.flags))
+
+    # The token embedding pre-dequantized to int16 BFP rows (ROLE_TOK_EMB16) plus the
+    # per-row exponent (ROLE_TOK_EMB16_EXP), bit-exact with the firmware's embed_row_bfp.
+    emb = [t for t in tensors if t.role == layout.ROLE_TOK_EMB and t.kind == KIND_TERNARY]
+    if emb and not any(t.role == layout.ROLE_TOK_EMB16 for t in tensors):
+        mant, exps = embed_bfp_rows(emb[0])
+        tensors.append(TensorSpec("token_embd.bfp16", layout.ROLE_TOK_EMB16, 0,
+                                  layout.KIND_NORM16, mant.shape[0], mant.shape[1],
+                                  values=mant, flags=0))
+        # 16 exponents per beat; rows padded to a multiple of 16 tokens. Replicated: the
+        # firmware fetches one beat from channel 0 per token.
+        ne  = mant.shape[0]
+        erows = (ne + 15)//16
+        etab = np.zeros((erows, 16), dtype=np.int16)
+        etab.reshape(-1)[:ne] = exps.astype(np.int16)
+        tensors.append(TensorSpec("token_embd.bfp16_exp", layout.ROLE_TOK_EMB16_EXP, 0,
+                                  layout.KIND_NORM16, erows, 16, values=etab,
+                                  flags=FLAG_REPLICATED))
 
     for spec in tensors:
         base_beats = len(chan_payloads[0])//BEAT_BYTES

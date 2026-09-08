@@ -28,6 +28,7 @@ enum {
     ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
     ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
     ROLE_ROPE_TAB,
+    ROLE_TOK_EMB16, ROLE_TOK_EMB16_EXP, // Pre-dequantized int16 embedding rows + exponents.
 };
 
 struct __attribute__((packed)) bons_header {
@@ -81,6 +82,10 @@ static inline uint32_t bons_code_beats(uint32_t cols, uint8_t kind) {
     if (kind == KIND_TERNARY) return cols/128;
     if (kind == KIND_Q8)      return cols/32;
     if (kind == KIND_F16)     return (2*cols + 31)/32;
+    // NORM16 is int16 too (layout.code_beats agrees). It fell through to the F32 branch
+    // until 2026-09-08 - every earlier NORM16 consumer sized its rows by hand, and the
+    // first one to trust this (the pre-dequantized embedding fetch) read past its table.
+    if (kind == KIND_NORM16)  return (2*cols + 31)/32;
     return (4*cols + 31)/32; // F32
 }
 

@@ -947,6 +947,30 @@ static void kv_store_row_res(int l, int kvh, int kind, int t)
 // Integer embedding: fetch the ternary row, dequantize with exact fp16 decomposition
 // ((q-1)*m11 aligned to the smallest group exponent), then normalize to int16 BFP.
 // Pure integer (~6 ops/element vs ~50 soft-float ones); exponent returned.
+static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst);
+// The embedding row already in int16 BFP form in the image (ROLE_TOK_EMB16, bit-exact
+// with embed_row_bfp below - bons.py embed_bfp_rows): one 128-beat engine fetch straight
+// into the residual buffer plus one beat for the exponent, instead of ~47k cycles of CPU
+// decode and 1,024 uncached scratchpad stores (2026-09-08). Falls back to the decode when
+// the image predates the table. `embf` toggles it.
+static int embfetch_use = 1;
+static int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
+{
+    const struct bons_entry *e16 = model_entry(ROLE_TOK_EMB16, 0);
+    const struct bons_entry *ee  = model_entry(ROLE_TOK_EMB16_EXP, 0);
+    if (!embfetch_use || !e16 || !ee || e16->kind != KIND_NORM16 || ee->kind != KIND_NORM16
+        || (uint32_t)e16->cols != (uint32_t)e->cols || row < 0 || (uint32_t)row >= e16->rows)
+        return embed_row_bfp(e, row, sp_dst);
+    uint32_t rb  = bons_row_beats(e16->cols, e16->kind, e16->group); // 128 at cols 2048.
+    uint32_t rpc = e16->rows/n_ch;
+    engine_fetch((uint32_t)row/rpc,
+                 BONSAI_CHAN_WEIGHT_BASE + (e16->chan_base_beats + (uint64_t)((uint32_t)row % rpc)*rb)*32,
+                 rb, sp_dst);
+    // Exponents: 16 per beat, replicated - one beat from channel 0.
+    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + (ee->chan_base_beats + (uint64_t)((uint32_t)row/16))*32,
+                 1, SP_FET);
+    return *(volatile int16_t *)(SCRATCHPAD_BASE + SP_FET + 2*((uint32_t)row % 16));
+}
 static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
@@ -2227,6 +2251,8 @@ void infer_qfix(int on)
     seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
 }
 int infer_qfix_state(void) { return qfix_use; }
+void infer_embfetch(int on) { embfetch_use = on ? 1 : 0; }
+int  infer_embfetch_state(void) { return embfetch_use && model_entry(ROLE_TOK_EMB16, 0) != 0; }
 
 // Console toggle (fsplit): same base shifts as the other list toggles.
 void infer_ffn_split(int on)
@@ -2448,7 +2474,7 @@ static int forward(int token, int want_logits)
     perf_enter(OP_EMBED);
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     if (attn_all_hw()) {
-        ex_state = embed_row_bfp(emb, token, SP_XR);
+        ex_state = embed_row_fetch(emb, token, SP_XR);
         x_amax   = X_AMAX_AFTER_EMBED;
         perf_exit(OP_EMBED);
         goto embed_done;

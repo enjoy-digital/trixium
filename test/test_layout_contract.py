@@ -72,10 +72,19 @@ def test_tiny_image_roundtrip(tmp_path):
     # vector, so the image legitimately carries more tensors than make_tiny_tensors returns.
     f32 = [t for t in tensors if t.kind == layout.KIND_F32]
     n_derived = len(f32) + (1 if BONSAI_TINY.max_ctx and BONSAI_TINY.head_dim else 0)
+    # ...and the pre-dequantized embedding table (mantissas + exponents) for the token
+    # embedding (test_embed_table.py covers its numerics).
+    emb = [t for t in tensors if t.role == layout.ROLE_TOK_EMB and t.kind == layout.KIND_TERNARY]
+    n_derived += 2*len(emb)
     assert reader.header["n_tensors"] == len(tensors) + n_derived
     assert reader.header["n_channels"] == 2
     if BONSAI_TINY.max_ctx and BONSAI_TINY.head_dim:
         assert "rope_tab" in reader.by_name
+    if emb:
+        assert "token_embd.bfp16" in reader.by_name and "token_embd.bfp16_exp" in reader.by_name
+        e16 = reader.by_name["token_embd.bfp16"]
+        assert e16["kind"] == layout.KIND_NORM16 and e16["rows"] == emb[0].rows
+        assert e16["cols"] == emb[0].cols
     for spec in f32:
         assert spec.name.replace(".weight", "") + ".w16" in reader.by_name
     for spec in tensors:
