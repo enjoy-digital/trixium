@@ -18,7 +18,7 @@ include $(SOC_DIRECTORY)/software/common.mak
 # A/Bs on v11 (tools/fk33_ab2.sh, 4 reps each, tokens OK): -O2 -7.9% vs -Os; -flto a
 # further -1.1% (cross-file inlining of the per-layer helpers); -O3 +0.17% = noise, so the
 # smaller -O2 stays. Text: -Os 83.6 KB, -O2 90.9, -O2 -flto 100.8.
-OPT ?= -O2 -flto
+OPT ?= -O2 -flto -freorder-blocks-and-partition
 CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o

@@ -21,6 +21,19 @@
 #include "engine.h"
 #include "model.h"
 #include "infer.h"
+
+// Code layout only (2026-09-08): the per-layer hot path is ~28 KB of text against a 32 KB
+// I$ with no L2 behind it (a miss is a ~150-cycle HBM round trip), and tprof showed the
+// same helper running 1.1k cycles slower the first time in a layer than the second. These
+// hints and the cold attributes below move the CPU fallback paths out of the hot text
+// (-freorder-blocks-and-partition, firmware/Makefile) - same instructions, same numerics.
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#define COLD        __attribute__((cold, noinline))
+// A call to a cold function is the one thing GCC's partitioner treats as "never executed"
+// (__builtin_expect is only 90%): placed first in a branch that is dead on the card (the
+// op-by-op paths behind the sequencer lists), it moves that whole branch to .text.unlikely.
+static COLD void cold_path(void) { __asm__ volatile("" ::: "memory"); }
 #include "ops.h"
 #include "perf.h"
 #include "vec.h"
@@ -144,7 +157,7 @@ static float fp16_to_float(uint16_t b)
     return u.f;
 }
 
-static void rmsnorm_f(float *dst, const float *src, const float *w, int n, float eps)
+COLD static void rmsnorm_f(float *dst, const float *src, const float *w, int n, float eps)
 {
     float ss = 0;
     for (int i = 0; i < n; i++) ss += src[i]*src[i];
@@ -154,7 +167,7 @@ static void rmsnorm_f(float *dst, const float *src, const float *w, int n, float
 
 // Quantize a float vector to int8 with a power-of-two scale 2^e8 (so downstream exponent
 // algebra stays integer). Returns e8.
-static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
+COLD static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
 {
     perf_enter(OP_QUANT8);
     float amax = 0;
@@ -204,7 +217,7 @@ static int kv_ek_idx(int l, int kvh, int kind)
 }
 
 // Quantize one head slice to a Q8 row packet in SP_KVP and store it to HBM.
-static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
+COLD static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 {
     float amax = 0;
     for (int i = 0; i < head_dim; i++) {
@@ -345,7 +358,7 @@ static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
 
 // Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
 // scaled by xscale) into dst[gathered global order: chan*rows + row].
-static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t rows,
+COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t rows,
                           float xscale, float *dst)
 {
     uint32_t rb = bons_row_beats(e->cols, e->kind, e->group);
@@ -379,7 +392,7 @@ static void matvec_f(const struct bons_entry *e, const float *src, float *dst)
 }
 
 // Embedding row: fetch the row packet from HBM and dequantize (ternary).
-static void embed_row_f(const struct bons_entry *e, int row, float *dst)
+COLD static void embed_row_f(const struct bons_entry *e, int row, float *dst)
 {
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
     uint32_t rpc = e->rows/n_ch; // Rows per channel.
@@ -467,7 +480,7 @@ static void rope_pos(int pos)
     rope_pos_cached = pos;
 }
 
-static void rope_apply(float *vec, int n_heads_v, int pos)
+COLD static void rope_apply(float *vec, int n_heads_v, int pos)
 {
     int D = head_dim;
     rope_pos(pos);
@@ -536,7 +549,7 @@ static int eps_for(int esrc)
     uint32_t v = (eps_m + (1u << (s - 1))) >> s; // round half away from zero (values > 0)
     return (int)(v < 1 ? 1 : v);
 }
-static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
+COLD static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
                               const struct bons_entry *w16, int n, uint32_t dst)
 {
 #if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
@@ -679,7 +692,7 @@ static int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, ui
     return s;
 }
 
-static int op_quant8_sp(uint32_t src, uint32_t dst, int n)
+COLD static int op_quant8_sp(uint32_t src, uint32_t dst, int n)
 {
 #ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_QUANT8)) {
@@ -759,7 +772,7 @@ static inline int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
 }
 
 // silu_mul: SP int16(gate,eg) x SP int16(up,eu) -> SP int16(gate) at eg+eu+15.
-static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n)
+COLD static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n)
 {
 #ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_SILU_MUL)) {
@@ -974,7 +987,7 @@ static int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
                  1, SP_FET);
     return *(volatile int16_t *)(SCRATCHPAD_BASE + SP_FET + 2*((uint32_t)row % 16));
 }
-static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
+COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
     uint32_t rpc = e->rows/n_ch;
@@ -2478,7 +2491,7 @@ static int forward(int token, int want_logits)
     rq8_prefetched = 0; // A logits-less forward leaves the out-norm row prefetched; drop it.
     perf_enter(OP_EMBED);
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
-    if (attn_all_hw()) {
+    if (likely(attn_all_hw())) {
         ex_state = embed_row_fetch(emb, token, SP_XR);
         x_amax   = X_AMAX_AFTER_EMBED;
         perf_exit(OP_EMBED);
@@ -2514,14 +2527,14 @@ embed_done: ;
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     int attn_hw = attn_all_hw();
-    if (attn_hw) {
+    if (likely(attn_hw)) {
         // Rope table row for this position ([c14 | s14], Q14, from the image).
         const struct bons_entry *rt = model_entry_kind(ROLE_ROPE_TAB, 0, KIND_NORM16);
         uint32_t rb = (2u*head_dim + 31)/32;
         engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + (rt->chan_base_beats + (uint64_t)pos*rb)*32,
                      rb, SP_TAB);
 #ifdef CSR_SEQ_BASE
-        if (seq_use) {
+        if (likely(seq_use)) {
             perf_enter(OP_SCORES);
             attn_list_prep_token(pos);
             perf_exit(OP_SCORES);
@@ -2531,7 +2544,7 @@ embed_done: ;
 #endif
 
     for (int l = 0; l < n_layer; l++) {
-        if (tprof_active)
+        if (unlikely(tprof_active))
             tprof_event((3u << 28) | ((uint32_t)l << 8));
         // Attention block.
         int sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, attn_norm[l],
@@ -2539,7 +2552,7 @@ embed_done: ;
                                    n_embd, SP_H, SP_X);
         int eq_res = 0, ev_res = 0;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
-        if (attn_hw) {
+        if (likely(attn_hw)) {
             // q/k/v: engine matvec -> vec norm_i32 -> int16 resident; qk-norm + rope on
             // the vector unit; K/V packed and stored to HBM. No CPU floats anywhere.
             const struct bons_entry *eqt = model_entry(ROLE_ATTN_Q, l);
@@ -2548,7 +2561,7 @@ embed_done: ;
             perf_enter(OP_NORM_I32);
             int kq, kk2, kv2;
 #ifdef CSR_SEQ_BASE
-            if (qkvl_use && seq_use && seq_qkv_base >= 0 && op_on_hw(OP_NORM_I32)) {
+            if (likely(qkvl_use && seq_use && seq_qkv_base >= 0 && op_on_hw(OP_NORM_I32))) {
                 // One sequencer run for q/k/v + norms (seq_build_qkv). The engine words
                 // were posted under the previous FFN list (or the LM-head stream); the
                 // call below is a no-op then. kq/kk/kv from the spilled absmaxes, the
@@ -2565,6 +2578,7 @@ embed_done: ;
 #endif
 #if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
             if (ovl_use && op_on_hw(OP_NORM_I32)) {
+                cold_path(); // Dead on the card: the qkv list above runs instead.
                 // Overlap: each norm runs UNDER the next projection's stream. Distinct
                 // result buffers inside the SP_Y region (q 16 KB max, then k/v) keep the
                 // in-flight dst disjoint from the norm's src; each op's absmax is captured
@@ -2589,6 +2603,7 @@ embed_done: ;
             } else
 #endif
             {
+                cold_path();
                 model_matvec(eqt, SP_X, SP_Y);
                 kq = op_norm_i32_sp(SP_Y, SP_Q, q_dim);
                 model_matvec(ekt, SP_X, SP_Y);
@@ -2693,8 +2708,8 @@ embed_done: ;
                 }
                 if (qtr) qt[qtn++] = perf_now(); // [2] kv scale-preps + store patches done.
 #ifdef BONSAI_SP_SB_SLOT
-                if (prep_ovl && seq_use && seq_attn_heads >= n_head
-                    && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
+                if (likely(prep_ovl && seq_use && seq_attn_heads >= n_head
+                    && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
                     // Overlap (sideband slot): the attention list's per-layer patches
                     // run while the sequencer executes the qkr list. Without the slot
                     // the first patch would simply stall until the list finished.
@@ -2859,8 +2874,8 @@ attn_scores: ;
             attn_seq2_layer(l, pos, aw_c, &aw_hmax);
             goto attn_heads_done;
         }
-        if (seq_use && attn_hw && seq_attn_heads > 0
-            && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
+        if (likely(seq_use && attn_hw && seq_attn_heads > 0
+            && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
             // Whole-head-loop descriptor lists: ~6 dispatch/poll round-trips per head
             // collapse into one submit per chunk; the AXPY rshift and norm k are computed
             // in-sequencer from the chained res6. Numerics identical to the fused path.
@@ -2872,7 +2887,7 @@ attn_scores: ;
             // whenever the list holds every head (hh == j); they are re-patched only in
             // the chunked case, where a slot serves several heads.
             int chunked = (seq_attn_heads < n_head);
-            if (atrace_use && l == 0 && !chunked && --atrace_use == 0) {
+            if (unlikely(atrace_use) && l == 0 && !chunked && --atrace_use == 0) {
                 // One-shot per-descriptor wall-clock of the attention list: run it under
                 // seq_run_trace (tight dcount poll, no folds) and fold serially after.
                 // Numerics identical - only this layer's fold overlap is lost.
@@ -2895,7 +2910,7 @@ attn_scores: ;
                 goto attn_heads_done;
             }
 #ifdef BONSAI_SP_SB_RSLOT
-            if (eovl_use && !chunked) {
+            if (likely(eovl_use && !chunked)) {
                 // C2-2: fold head j while heads j+2.. still execute. The read slot lets
                 // the spill reads grant mid-list; dcount ("descriptors completed")
                 // past norm(j) proves j's spills are written. The fold work and the
@@ -2955,19 +2970,20 @@ attn_scores: ;
             goto attn_heads_done;
         }
 #endif
+        cold_path(); // Dead on the card: the attention list above runs instead.
         for (int hh = 0; hh < n_head; hh++) {
             int kvh = hh/n_rep;
             const float *qh = q + hh*head_dim;
             float smax = -1e30f;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
-            if (op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
+            if (likely(op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
                 // Fused resident path: scores (engine) -> softmax8 (vec, p8 + exact sum)
                 // -> weighted-V (engine AXPY) -> cross-channel reduce (vec). Scores never
                 // touch the CPU; the 1/sum fold is one float divide per head.
                 float *ah = attn + hh*head_dim;
                 perf_enter(OP_SCORES);
                 int eq;
-                if (attn_hw) {
+                if (likely(attn_hw)) {
                     vec_quant8_head(SP_Q + hh*head_dim*2, SP_X, head_dim);
                     eq = E_NORM + 8;
                 } else {
@@ -3054,7 +3070,7 @@ attn_scores: ;
 #endif
             perf_enter(OP_SCORES);
 #ifdef BONSAI_HAS_KVSTORE
-            if (op_on_hw(OP_SCORES)) {
+            if (likely(op_on_hw(OP_SCORES))) {
                 // q head -> int8 @ 2^eq in SP_X, one striped+interleaved Q8 op over the
                 // K region: int32 scores land position-major in SP_SC.
                 int eq = quantize_f_pow2(qh, head_dim, SP_X);
@@ -3116,7 +3132,7 @@ attn_scores: ;
             perf_enter(OP_WV);
             float *ah = attn + hh*head_dim;
 #ifdef BONSAI_HAS_KVSTORE
-            if (op_on_hw(OP_WV)) {
+            if (likely(op_on_hw(OP_WV))) {
                 // Probs -> int8 @ 2^ep (position-major in SP_X), one AXPY op over the V
                 // region; each channel lands head_dim int32 partials chan-major in SP_SC.
                 float pmax = 0;
@@ -3184,17 +3200,17 @@ attn_heads_done: ;
             const struct bons_entry *eo = model_entry(ROLE_ATTN_OUT, l);
             int ea8;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
-            if (attn_hw) {
+            if (likely(attn_hw)) {
                 perf_enter(OP_QUANT8);
                 ea8 = 0;
-                if (ifold_use) {
+                if (likely(ifold_use)) {
                     if (aw_hvalid) ea8 = aw_he2 + 24 - 7;   // frexpf exponent of max hm, -7.
                 } else {
                     if (aw_hmax > 0) { frexpf(aw_hmax, &ea8); ea8 -= 7; }
                 }
                 for (int hh = 0; hh < n_head; hh++) {
                     int32_t Mh;
-                    if (ifold_use) {
+                    if (likely(ifold_use)) {
                         Mh = attn_mh_int(aw_qm[hh], aw_qe[hh] + 15 - ea8);
                     } else {
                         Mh = (int32_t)lroundf(ldexpf(aw_c[hh], 15 - ea8));
@@ -3202,7 +3218,7 @@ attn_heads_done: ;
                         if (Mh < 0)     Mh = 0;
                     }
 #ifdef CSR_SEQ_BASE
-                    if (seq_use && seq_scale8_base >= 0) {
+                    if (likely(seq_use && seq_scale8_base >= 0)) {
                         seq_patch((uint32_t)(seq_scale8_base + hh), 6, (uint32_t)Mh);
                         continue;                       // One list run below (F0-6).
                     }
@@ -3212,7 +3228,7 @@ attn_heads_done: ;
                     vec_run(PROG_SCALE8, sa2, 5);
                 }
 #ifdef CSR_SEQ_BASE
-                if (seq_use && seq_scale8_base >= 0)
+                if (likely(seq_use && seq_scale8_base >= 0))
                     seq_run((uint32_t)seq_scale8_base, (uint32_t)n_head);
 #endif
                 perf_exit(OP_QUANT8);
@@ -3240,8 +3256,8 @@ attn_heads_done: ;
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && !defined(BONSAI_HAS_DUALQ)
-            if (seq_use && seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
-                && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
+            if (likely(seq_use && seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
+                && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8))) {
                 // One list for gate->norm->up->norm->silu->quant8->down (see seq_build_ffn).
                 // Whole-list time is charged to OP_SILU_MUL: per-op shares are documented as
                 // unreliable under sequencing; totals are the measurement.
@@ -3255,7 +3271,7 @@ attn_heads_done: ;
                 seq_patch((uint32_t)(seq_ffn_base + ffn_di_a4), 6,
                           (uint32_t)(ex8 - (int)eg_t->bias + (int)eg_t->rshift + 6));
                 perf_enter(OP_SILU_MUL);
-                if (fprof_use) {
+                if (unlikely(fprof_use)) {
                     perf_ovl_mark();
                     if (l == 0)
                         fprof_nts = seq_run_trace((uint32_t)seq_ffn_base,
@@ -3266,7 +3282,7 @@ attn_heads_done: ;
                 } else {
 #ifdef BONSAI_SP_SB_SLOT
                     seq_list_start((uint32_t)seq_ffn_base, (uint32_t)seq_ffn_len);
-                    if (qkvl_use && l + 1 < n_layer)
+                    if (likely(qkvl_use) && l + 1 < n_layer)
                         qkv_prep_layer(l + 1); // Next layer's projections, under this stream.
                     seq_join();
 #else
@@ -3294,12 +3310,13 @@ attn_heads_done: ;
                 goto ffn_done;
             }
 #endif
-            if (fprof_use) {
+            cold_path(); // Dead on the card: the FFN list above runs instead.
+            if (unlikely(fprof_use)) {
                 perf_ovl_mark();
                 if (l == 0) { fprof_nsteps = 0; fprof_steps[fprof_nsteps++] = perf_now(); }
             }
             model_matvec(eg_t, SP_X, SP_Y);
-            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
+            if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int kg;
 #if defined(CSR_ENGINE_CSR_ABSMAX_ADDR) && defined(CSR_VECUNIT_BASE)
             if (ovl_use && op_on_hw(OP_NORM_I32)) {
@@ -3325,21 +3342,21 @@ attn_heads_done: ;
                 perf_exit(OP_NORM_I32);
                 model_matvec(eu_t, SP_X, SP_YU);
             }
-            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
+            if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int eg = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
 
             perf_enter(OP_NORM_I32);
             int ku = op_norm_i32_sp(SP_YU, SP_U, ffn_dim);
             perf_exit(OP_NORM_I32);
-            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
+            if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int eu = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
 
             int es = eg + eu + 15;
             int es8 = es + op_silu_q8_sp(SP_G, eg, SP_U, eu, ffn_dim, SP_X);
-            if (fprof_use && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
+            if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
 
             model_matvec(ed_t, SP_X, SP_Y);
-            if (fprof_use) {
+            if (unlikely(fprof_use)) {
                 if (l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
                 perf_ovl_acc(fprof_acc_ops); fprof_nops++;
             }
@@ -3374,7 +3391,7 @@ attn_heads_done: ;
     if (chunk_rpc > rpc) chunk_rpc = rpc;
 
 #ifdef BONSAI_HAS_TOPK
-    if (op_on_hw(OP_LMHEAD)) {
+    if (likely(op_on_hw(OP_LMHEAD))) {
         // One suppressed-write op over every row; the argmax tap returns value+index
         // (global row order, ties to smallest - same as the CPU scan). Padding rows
         // (vocab not divisible by n_ch) can win with garbage logits: fall through to
@@ -3394,14 +3411,14 @@ attn_heads_done: ;
         op.dst    = SP_Y;
         op.supw   = 1;
 #ifdef CSR_SEQ_BASE
-        if (lovl_use && seq_use) {
+        if (likely(lovl_use && seq_use)) {
             // C2-3: the next forward's per-token list prep (score padding + the
             // rowsw/wlen/blocks patches) depends only on the position, never on the
             // token this argmax is about to pick - post it under the argmax stream.
             // supw=1 leaves the W port idle, so the posted writes drain freely.
             uint32_t dl = engine_submit(&op);
             attn_list_prep_token(n_pos);
-            if (qkvl_use)
+            if (likely(qkvl_use))
                 qkv_prep_layer(0);   // Next forward's layer-0 projections ride here too.
             engine_join(dl);
         } else
@@ -3410,7 +3427,7 @@ attn_heads_done: ;
         uint32_t idx = engine_csr_argmax_idx_read();
         if (idx < H->vocab) {
             perf_exit(OP_LMHEAD);
-            if (tprof_active)
+            if (unlikely(tprof_active))
                 tprof_end();
             return (int)idx;
         }
@@ -3449,7 +3466,7 @@ attn_heads_done: ;
     }
     (void)sc;
     perf_exit(OP_LMHEAD);
-    if (tprof_active)
+    if (unlikely(tprof_active))
         tprof_end();
     return best_tok;
 }
