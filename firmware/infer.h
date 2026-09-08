@@ -24,6 +24,8 @@ void infer_kvq_redundant(int on); // Redundant per-slot KV-pack quant8s (kvq; re
 extern uint32_t infer_forwards;  // Forwards run since boot.
 void infer_kv_mstore(int on);     // In-list KV multi-store vs per-slot stores (kvms).
 void infer_qkr_reorder(int on);   // qkr list: Q chain behind the store (qkro).
+void infer_qfix(int on);          // Scan-free fixed-shift Q quant8 in the qkr list (qfix).
+int  infer_qfix_state(void);
 int  infer_qkr_reorder_state(void);
 int  infer_kv_mstore_state(void);
 void infer_ffn_split(int on);     // FFN SiLU split: gate half under the up stream (fsplit).

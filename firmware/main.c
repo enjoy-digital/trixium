@@ -560,6 +560,11 @@ static void console_service(void)
         printf("FSPLIT %s (gate-only SiLU under the up stream; mul+quant8 after)\n",
                infer_ffn_split_state() ? "on" : "off");
     }
+    else if (strcmp(token, "qfix") == 0) {
+        if (strncmp(str, "on", 2) == 0)  infer_qfix(1);
+        if (strncmp(str, "off", 3) == 0) infer_qfix(0);
+        printf("QFIX %s (scan-free fixed-shift Q quant8)\n", infer_qfix_state() ? "on" : "off");
+    }
     else if (strcmp(token, "qkro") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_qkr_reorder(1);
         if (strncmp(str, "off", 3) == 0) infer_qkr_reorder(0);

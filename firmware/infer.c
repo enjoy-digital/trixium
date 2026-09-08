@@ -1025,6 +1025,7 @@ static int seq_qkr_di_qn = 0, seq_qkr_di_kn = 1;
 // to wait out (16 packets at ~65 cycles of write latency each, per-descriptor trace).
 // Same ops, same numerics. Toggle qkro selects the old order for a same-boot A/B.
 static int qkr_reorder = 1;
+static int qfix_use = 1;     // Console toggle (qfix): scan-free fixed-shift Q quant8.
 // In-list KV stores (probe-1 follow-up, 2026-08-31): each (kvh, kind) staging slot's
 // engine STORE rides the qkr list as a NOWAIT descriptor right after the pack quant8
 // that fills the slot - the next head's quant8 (vec) runs under the store's stream, so
@@ -1177,9 +1178,22 @@ static void seq_build_qkr(void)
     // is dead during attention: softmax p8 lives at SP_X[0, ctx) and nothing else
     // touches SP_X until the FFN quant8 overwrites it.
     {
-        int32_t qargs[4] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
-                            (n_head*head_dim)/16};
-        seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
+#ifdef BONSAI_VEC_LOOPS2
+        if (qfix_use) {
+            // Fixed shift only (2026-09-08): PROG_QUANT8 with A1 = 0 still runs its absmax
+            // pass over all 128 beats before the fixed >>8 pass, and nothing reads the
+            // absmax it returns here. PROG_KVPACK_H with one "head" is the same LDV / VRNE 8
+            // / VCLAMP8 / STB chain without the scan - byte-identical, half the loads.
+            int32_t fargs[8] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
+                                (n_head*head_dim)/16, 0, 0, 0, 1};
+            seq_desc_vec(di++, PROG_KVPACK_H, fargs, 8, 0);
+        } else
+#endif
+        {
+            int32_t qargs[4] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
+                                (n_head*head_dim)/16};
+            seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
+        }
     }
     seq_desc_stop(di++);
     seq_qkr_count = di;
@@ -2206,6 +2220,13 @@ void infer_qkr_reorder(int on)
     seq_build_qkv();
 }
 int infer_qkr_reorder_state(void) { return qkr_reorder; }
+void infer_qfix(int on)
+{
+    qfix_use = on ? 1 : 0;
+    seq_ffn_base = -1;
+    seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
+}
+int infer_qfix_state(void) { return qfix_use; }
 
 // Console toggle (fsplit): same base shifts as the other list toggles.
 void infer_ffn_split(int on)
