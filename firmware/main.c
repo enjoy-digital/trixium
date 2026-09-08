@@ -560,6 +560,12 @@ static void console_service(void)
         printf("FSPLIT %s (gate-only SiLU under the up stream; mul+quant8 after)\n",
                infer_ffn_split_state() ? "on" : "off");
     }
+    else if (strcmp(token, "kvms") == 0) {
+        if (strncmp(str, "on", 2) == 0)  infer_kv_mstore(1);
+        if (strncmp(str, "off", 3) == 0) infer_kv_mstore(0);
+        printf("KVMS %s (one in-list multi-store for all KV slots vs 16 stores)\n",
+               infer_kv_mstore_state() ? "on" : "off");
+    }
     else if (strcmp(token, "kvq") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_kvq_redundant(1);
         if (strncmp(str, "off", 3) == 0) infer_kvq_redundant(0);

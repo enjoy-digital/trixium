@@ -1033,6 +1033,18 @@ static int kvq_redundant = 0;
 #else
 static const int kvq_redundant = 1;
 #endif
+// One in-list MULTI-STORE for all 2*n_kv_head slots instead of 16 NOWAIT store ops
+// (2026-09-08): the staging slots are 0x200 B apart and a layer's (kvh, kind) regions
+// kv_region beats apart, so the engine's rep/dstride/sstride store (F1-1) scatters them
+// all from one descriptor. 16 dispatches -> 1 on the list side, 16 per-layer address
+// patches -> 1 on the CPU side - and the qkr window is the one where both sides are the
+// long pole within ~850 cycles of each other (qtrace, v11). Needs the multi-store CSR.
+#ifdef CSR_ENGINE_CSR_REP_ADDR
+static int kv_mstore = 1;
+#else
+static const int kv_mstore = 0;
+#endif
+static int kv_mstore_active = 0; // What the built list uses.
 static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2 + kind).
 // What the store descriptors' constant words currently hold (~0 = unknown/rebuilt).
 static uint32_t kvst_rb_set = 0xFFFFFFFFu, kvst_chan_set = 0xFFFFFFFFu;
@@ -1107,7 +1119,7 @@ static void seq_build_qkr(void)
                                 head_dim/16};                       // A1 = 0: fixed >>8.
             if (kvq_redundant)
                 seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
-            if (kv_pipe && 2*n_kv_head <= 32) {
+            if (kv_pipe && !kv_mstore && 2*n_kv_head <= 32) {
                 // NOWAIT store of the slot just packed; wbase/wlen/chan patched per
                 // layer/forward (kv_rb is set after the first build).
                 struct engine_op st = {0};
@@ -1120,6 +1132,24 @@ static void seq_build_qkr(void)
                 di++;
             }
         }
+    kv_mstore_active = 0;
+    if (kv_pipe && kv_mstore && 2*n_kv_head <= 31) {
+        // ONE NOWAIT multi-store for every slot (see kv_mstore): rep packets, kv_rb beats
+        // each, from kvp_slot(0,0) stepping 0x200 B, to kv_region_addr(l,0,0) + rowoff
+        // stepping kv_region beats. Word 4 (base) is patched per layer, 5/10 on change.
+        struct engine_op st = {0};
+        st.kind    = ENGINE_KIND_STORE;
+        st.xsrc    = kvp_slot(0, 0);
+        st.rep     = (uint8_t)(2*n_kv_head);
+        st.dstride = kv_region;
+        st.sstride = 0x200/32;
+        seq_desc_engine(di, &st);
+        seq_patch(di, 0, 1u | (1u << 9)); // NOWAIT: the whole-Q quant8 below runs under it.
+        seq_kvst_di[0] = (uint8_t)di;
+        kv_pipe_active = 1;
+        kv_mstore_active = 1;
+        di++;
+    }
     // F0-5: ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB
     // post-increments 16 B, so head j lands at +j*head_dim); the attention list's
     // per-head quant8 descriptor is gone and its scores read x from there. The region
@@ -2122,6 +2152,23 @@ void infer_kvq_redundant(int on)
 #endif
 }
 int infer_kvq_redundant_state(void) { return kvq_redundant; }
+
+// Console toggle (kvms): in-list multi-store vs 16 per-slot stores. Same rebuilds as kovl.
+void infer_kv_mstore(int on)
+{
+#ifdef CSR_ENGINE_CSR_REP_ADDR
+    kv_mstore = on ? 1 : 0;
+    seq_ffn_base = -1;
+    seq_build_qkr();
+    seq_build_attn();
+    seq_build_ffn();
+    seq_build_scale8();
+    seq_build_qkv();
+#else
+    (void)on;
+#endif
+}
+int infer_kv_mstore_state(void) { return kv_mstore_active; }
 // Console toggle (fsplit): same base shifts as the other list toggles.
 void infer_ffn_split(int on)
 {
@@ -2532,12 +2579,20 @@ embed_done: ;
                     for (int hh = 0; hh < n_kv_head; hh++) {
                         kv_pack_prep_res(l, hh, 0, E_NORM);
                         kv_pack_prep_res(l, hh, 1, ev_res);
+                        if (kv_mstore_active)
+                            continue; // One descriptor for all slots, patched below.
                         for (int kind = 0; kind < 2; kind++) {
                             uint32_t sdi = seq_kvst_di[hh*2 + kind];
                             seq_patch(sdi, 4, kv_region_addr(l, hh, kind) + rowoff);
                             if (wr_rb)   seq_patch(sdi, 5, (uint32_t)kv_rb);
                             if (wr_chan) seq_patch(sdi, 10, chan);
                         }
+                    }
+                    if (kv_mstore_active) {
+                        uint32_t sdi = seq_kvst_di[0];
+                        seq_patch(sdi, 4, kv_region_addr(l, 0, 0) + rowoff);
+                        if (wr_rb)   seq_patch(sdi, 5, (uint32_t)kv_rb);
+                        if (wr_chan) seq_patch(sdi, 10, chan);
                     }
                     kvst_rb_set   = (uint32_t)kv_rb;
                     kvst_chan_set = chan;
