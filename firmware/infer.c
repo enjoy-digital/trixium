@@ -954,10 +954,13 @@ static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst);
 // decode and 1,024 uncached scratchpad stores (2026-09-08). Falls back to the decode when
 // the image predates the table. `embf` toggles it.
 static int embfetch_use = 1;
+// Both entries resolved once at init (norm16_cache_build): the lookups are HBM-backed
+// table walks, and this runs once per forward.
+static const struct bons_entry *emb16_ent, *emb16x_ent;
 static int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
-    const struct bons_entry *e16 = model_entry(ROLE_TOK_EMB16, 0);
-    const struct bons_entry *ee  = model_entry(ROLE_TOK_EMB16_EXP, 0);
+    const struct bons_entry *e16 = emb16_ent;
+    const struct bons_entry *ee  = emb16x_ent;
     if (!embfetch_use || !e16 || !ee || e16->kind != KIND_NORM16 || ee->kind != KIND_NORM16
         || (uint32_t)e16->cols != (uint32_t)e->cols || row < 0 || (uint32_t)row >= e16->rows)
         return embed_row_bfp(e, row, sp_dst);
@@ -2252,7 +2255,7 @@ void infer_qfix(int on)
 }
 int infer_qfix_state(void) { return qfix_use; }
 void infer_embfetch(int on) { embfetch_use = on ? 1 : 0; }
-int  infer_embfetch_state(void) { return embfetch_use && model_entry(ROLE_TOK_EMB16, 0) != 0; }
+int  infer_embfetch_state(void) { return embfetch_use && emb16_ent != 0; }
 
 // Console toggle (fsplit): same base shifts as the other list toggles.
 void infer_ffn_split(int on)
@@ -2455,6 +2458,8 @@ static void norm16_cache_build(void)
         nrm_ffn16[l]  = model_entry_kind(ROLE_FFN_NORM,  l, KIND_NORM16);
     }
     nrm_out16 = model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16);
+    emb16_ent  = model_entry(ROLE_TOK_EMB16, 0);
+    emb16x_ent = model_entry(ROLE_TOK_EMB16_EXP, 0);
 }
 
 // The norm16 row the layer after l opens with (attention norm), or the final norm.

@@ -36,8 +36,12 @@ static const struct bons_entry *model_table(void)
 // linked with so little stack that boot corrupted itself and hung. They live instead in the
 // unused main_ram window between the BONS header/table (~32 KB at BONSAI_HDR_ADDR) and the
 // inference heap (BONSAI_HDR_ADDR + 0x100000, see infer.c HEAP_BASE).
-#define ECACHE_ROLES  16
+// 32 roles: ROLE_TOK_EMB16_EXP is role 16 and sat just past the old bound of 16, so its
+// lookup fell to the 426-entry scan (~27 KB through the D$) once every forward - 33k
+// cycles of the embed window on the card (2026-09-08). 8 KB of the 64 KB window.
+#define ECACHE_ROLES  32
 #define ECACHE_LAYERS 64
+_Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every role");
 #define ECACHE_BASE   (BONSAI_HDR_ADDR + 0x80000)
 #define ecache_any ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE))
 #define ecache_n16 ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE + \
