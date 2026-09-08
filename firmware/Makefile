@@ -10,6 +10,13 @@ BUILD_DIR ?= ../build/sim
 
 include $(BUILD_DIR)/software/include/generated/variables.mak
 include $(SOC_DIRECTORY)/software/common.mak
+# LiteX's common.mak compiles at -Os, under which GCC declined to inline the per-head
+# helpers (attn_grp, attn_di_*, kv_scores_br, kv_region_addr) or the cross-file seq_patch:
+# attn_patch_slots ran ~14 calls and one iterative div per head, ~300 cycles of compute
+# for a dozen operations (2026-09-08 diagnostics). The firmware is ~80 KB; the per-layer
+# hot path has to stay inside the 32 KB I$, so this is measured, not assumed.
+OPT ?= -O2
+CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o
 

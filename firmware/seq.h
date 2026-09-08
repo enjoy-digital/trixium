@@ -25,7 +25,13 @@ void     seq_desc_vec_seed(uint32_t idx, uint16_t pc, const int32_t *args, int n
                            uint16_t srcs, int seed_abs); // S7 <- engine absmax.
 void     seq_desc_engine(uint32_t idx, const struct engine_op *op);
 void     seq_desc_stop(uint32_t idx);
-void     seq_patch(uint32_t idx, int word, uint32_t value); // Patch one descriptor word.
+// Patch one descriptor word. Inline: it is one posted store, and it used to be a
+// cross-file call at every one of the ~150 patches a layer (2026-09-08).
+#include <generated/soc.h>
+static inline void seq_patch(uint32_t idx, int word, uint32_t value)
+{
+    ((volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + idx*64))[word] = value;
+}
 void     seq_run(uint32_t idx0, uint32_t count);            // Run + wait (gives up if wedged).
 void     seq_list_start(uint32_t idx0, uint32_t count);     // Start only; overlap CPU work...
 int      seq_run_trace(uint32_t idx0, uint32_t count,

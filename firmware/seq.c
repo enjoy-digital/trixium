@@ -64,11 +64,6 @@ void seq_desc_stop(uint32_t idx)
     desc_w(idx)[0] = 0;
 }
 
-void seq_patch(uint32_t idx, int word, uint32_t value)
-{
-    desc_w(idx)[word] = value;
-}
-
 // Posted-write ordering mode (bitstreams carrying the sbmode CSR only). 0 = legacy: the
 // descriptor fetch stalls while any CPU patch is still in the scratchpad's posted-write
 // FIFO. 1 = the sequencer drains that FIFO once at list START instead, so a patch burst
