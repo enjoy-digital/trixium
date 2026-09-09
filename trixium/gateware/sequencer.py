@@ -299,6 +299,14 @@ class BonsaiSequencer(LiteXModule):
         lut_sum  = Signal(32)
         lut_idx  = Signal(5)
         lut_word = Signal(32)
+        # Timing: the two things this must not do on a 98%-full die are add an adder to
+        # the scratchpad address cone or a mux to its 256-bit read bus (the vec unit's
+        # ex1_r family lives there). So the address is registered in FETCHL from a
+        # comb index (lut_adr_r), the fetched beat is captured whole (lut_beat_r, like
+        # d0/d1) and the word select runs off that register a cycle later.
+        lut_adr_r  = Signal(13)
+        lut_sel_r  = Signal(3)
+        lut_beat_r = Signal(256)
         self.comb += [
             lut_mode.eq((unit == 2) & w(0, 0)[12]),
             lut_base.eq(w(1, 10)[0:13]),
@@ -307,6 +315,7 @@ class BonsaiSequencer(LiteXModule):
             # Negative or >31 both clamp to the table's ends (the firmware never asks
             # for either; a wrong index is a wrong eps, not a hang).
             lut_idx.eq(Mux(lut_sum[31], 0, Mux(lut_sum[5:31] != 0, 31, lut_sum[0:5]))),
+            lut_word.eq(Array([lut_beat_r[32*j:32*j + 32] for j in range(8)])[lut_sel_r]),
         ]
 
         for i in range(8):
@@ -425,21 +434,29 @@ class BonsaiSequencer(LiteXModule):
                 NextState("DISPATCH"),
             )
         )
-        fsm.act("FETCHL", # One more beat: the LUT entry for this descriptor's A5.
+        fsm.act("FETCHL", # Resolve the LUT index (waits for its kreg), register the address.
             self.busy.eq(1),
-            self.sp_active.eq(1),
-            self.sp_adr.eq(lut_base + lut_idx[3:5]),
             # The index reads a kreg: hold while its capture is still in flight or in the
             # done+2 pipe (the same interlock DISPATCH applies to kadd consumers).
-            If(~kadd_hazard & self.sp_gnt,
+            If(~kadd_hazard,
+                NextValue(lut_adr_r, lut_base + lut_idx[3:5]),
+                NextValue(lut_sel_r, lut_idx[0:3]),
+                NextState("FETCHL_A"),
+            )
+        )
+        fsm.act("FETCHL_A", # One more beat: the LUT entry for this descriptor's A5.
+            self.busy.eq(1),
+            self.sp_active.eq(1),
+            self.sp_adr.eq(lut_adr_r),
+            If(self.sp_gnt,
                 NextState("FETCHL_L"),
             )
         )
         fsm.act("FETCHL_L",
             self.busy.eq(1),
             self.sp_active.eq(1),
-            self.sp_adr.eq(lut_base + lut_idx[3:5]), # Hold.
-            NextValue(lut_word, Array([self.sp_dat[32*j:32*j + 32] for j in range(8)])[lut_idx[0:3]]),
+            self.sp_adr.eq(lut_adr_r), # Hold.
+            NextValue(lut_beat_r, self.sp_dat), # lut_word reads it in DISPATCH.
             NextState("DISPATCH"),
         )
         fsm.act("DISPATCH",
