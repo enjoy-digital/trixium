@@ -284,10 +284,36 @@ class BonsaiSequencer(LiteXModule):
                 | kadd_hazard),
         ]
 
+        # A5 from a scratchpad LUT (w0[12], 2026-09-09): A5 = LUT[imm5 + kreg[sel5]], the
+        # LUT's beat index in w(1,10) (an engine-only word, free on vec descriptors). The
+        # one arg the k/v chain could not derive in-sequencer was rmsnorm's eps, a
+        # power-of-two scaling of rms_eps by the source exponent - which is a per-layer
+        # constant plus the shift the sequencer already holds in a kreg. The firmware
+        # writes 32 entries per norm per layer (under the previous FFN list) and patches
+        # the per-token part of the exponent into imm5, as it patched eps itself before.
+        # The kreg comes from A5's own kadd select, so the capture-pipe interlock
+        # (kadd_hazard) covers the read; the index is clamped to the 32-entry table.
+        lut_mode = Signal()
+        lut_base = Signal(13)
+        lut_sel  = Signal(2)
+        lut_sum  = Signal(32)
+        lut_idx  = Signal(5)
+        lut_word = Signal(32)
+        self.comb += [
+            lut_mode.eq((unit == 2) & w(0, 0)[12]),
+            lut_base.eq(w(1, 10)[0:13]),
+            lut_sel.eq(w(0, 1)[26:28]),
+            lut_sum.eq(w(0, 7) + Mux(lut_sel == 0, 0, kregs[lut_sel - 1])),
+            # Negative or >31 both clamp to the table's ends (the firmware never asks
+            # for either; a wrong index is a wrong eps, not a hang).
+            lut_idx.eq(Mux(lut_sum[31], 0, Mux(lut_sum[5:31] != 0, 31, lut_sum[0:5]))),
+        ]
+
         for i in range(8):
             src  = Signal(2)
             imm  = Signal(32)
             base = Signal(32)
+            full = Signal(32)
             kadd = Signal(2)
             self.comb += [
                 src.eq(argsrc[2*i:2*i+2]),
@@ -304,9 +330,11 @@ class BonsaiSequencer(LiteXModule):
                 # descriptor's kreg terms to ADD for the direct-shift convention
                 # (A4 = eg + 6 = C_layer + kg). The '+latest k' case without a register
                 # is already covered by SEQ_SRC_KABS.
-                self.vec_args[i].eq(Mux(w(0, 0)[11],
+                full.eq(Mux(w(0, 0)[11],
                     base + Mux(kadd == 0, 0, kregs[kadd - 1]),
                     base - Mux(kadd == 0, 0, kregs[kadd - 1]))),
+                # LUT mode replaces the whole A5 formula (its kreg is the index).
+                self.vec_args[i].eq(Mux(lut_mode, lut_word, full) if i == 5 else full),
             ]
 
         # Engine fields straight from the descriptor.
@@ -389,6 +417,29 @@ class BonsaiSequencer(LiteXModule):
             self.sp_active.eq(1),
             self.sp_adr.eq(dptr + 1), # Hold.
             NextValue(d1, self.sp_dat),
+            # d1 lands this edge; lut_mode reads d0 (captured two states ago). w(1,10)
+            # is read in FETCHL from the registered d1.
+            If((unit == 2) & w(0, 0)[12],
+                NextState("FETCHL"),
+            ).Else(
+                NextState("DISPATCH"),
+            )
+        )
+        fsm.act("FETCHL", # One more beat: the LUT entry for this descriptor's A5.
+            self.busy.eq(1),
+            self.sp_active.eq(1),
+            self.sp_adr.eq(lut_base + lut_idx[3:5]),
+            # The index reads a kreg: hold while its capture is still in flight or in the
+            # done+2 pipe (the same interlock DISPATCH applies to kadd consumers).
+            If(~kadd_hazard & self.sp_gnt,
+                NextState("FETCHL_L"),
+            )
+        )
+        fsm.act("FETCHL_L",
+            self.busy.eq(1),
+            self.sp_active.eq(1),
+            self.sp_adr.eq(lut_base + lut_idx[3:5]), # Hold.
+            NextValue(lut_word, Array([self.sp_dat[32*j:32*j + 32] for j in range(8)])[lut_idx[0:3]]),
             NextState("DISPATCH"),
         )
         fsm.act("DISPATCH",

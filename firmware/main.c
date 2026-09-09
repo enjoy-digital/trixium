@@ -566,6 +566,12 @@ static void console_service(void)
         printf("EMBF %s (embedding row fetched pre-dequantized)\n",
                infer_embfetch_state() ? "on" : "off");
     }
+    else if (strcmp(token, "qkvx") == 0) {
+        if (strncmp(str, "on", 2) == 0)  infer_qkvx(1);
+        if (strncmp(str, "off", 3) == 0) infer_qkvx(0);
+        printf("QKVX %s (K chain and V pack inside the qkv list, eps via LUT)\n",
+               infer_qkvx_state() ? "on" : "off");
+    }
     else if (strcmp(token, "qfix") == 0) {
         if (strncmp(str, "on", 2) == 0)  infer_qfix(1);
         if (strncmp(str, "off", 3) == 0) infer_qfix(0);

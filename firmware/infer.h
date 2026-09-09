@@ -26,6 +26,8 @@ void infer_kv_mstore(int on);     // In-list KV multi-store vs per-slot stores (
 void infer_qkr_reorder(int on);   // qkr list: Q chain behind the store (qkro).
 void infer_qfix(int on);          // Scan-free fixed-shift Q quant8 in the qkr list (qfix).
 void infer_embfetch(int on);      // Embedding row fetched pre-dequantized from the image (embf).
+void infer_qkvx(int on);          // K chain + V pack inside the qkv list, eps from a LUT (qkvx).
+int  infer_qkvx_state(void);
 int  infer_embfetch_state(void);
 int  infer_qfix_state(void);
 int  infer_qkr_reorder_state(void);

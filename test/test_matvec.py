@@ -810,13 +810,17 @@ def _desc_engine(**f):
     w[10] = f.get("chan", 0)
     return b"".join(x.to_bytes(4, "little") for x in w)
 
-def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None, barrier=0, kadd_add=0):
+def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None, barrier=0, kadd_add=0,
+              lut_beat=None):
     w = [0]*16
     sel = 0
     for i, sv in enumerate(srcs or []):
         sel |= (sv & 3) << (2*i)
     w[0] = (2 | ((1 << 4) if seed_abs else 0) | ((1 << 10) if barrier else 0)
             | ((1 << 11) if kadd_add else 0) | (sel << 16))
+    if lut_beat is not None:                  # w0[12]: A5 = LUT[imm5 + kreg[kadds[5]-1]]
+        w[0] |= 1 << 12
+        w[10] = lut_beat
     w[1] = pc
     for i, kv in enumerate(kadds or []):     # 0 = none, n = add kreg[n-1] after the source
         w[1] |= (kv & 3) << (16 + 2*i)
@@ -1745,6 +1749,158 @@ def test_sequencer_kreg_capture_and_add():
         assert np.array_equal(nrm, nrm_exp), ("norm via kreg", nrm[:8], nrm_exp[:8], k_exp)
         assert np.array_equal(nrmA, nrm_exp), ("norm via kreg ADD (w0[11])",
                                                nrmA[:8], nrm_exp[:8], k_exp)
+
+    run_simulation(dut, [driver()])
+
+
+def test_sequencer_lut_arg():
+    # A5 from a scratchpad LUT indexed by imm5 + kreg (w0[12], 2026-09-09): the one arg
+    # the k/v chain could not derive in-sequencer was rmsnorm's eps, a per-layer table
+    # indexed by the exponent shift the sequencer already holds in a kreg. Shape: the
+    # kreg-capture test's AXPY (k -> kreg0), then rmsnorm with A5 = LUT[3 + kreg0]; the
+    # same rmsnorm with the immediate the LUT holds must match bit for bit, and an index
+    # past the table clamps to entry 31 rather than reading past it.
+    import trixium.model.asm as vasm
+    from trixium.gateware.vector import BonsaiVectorUnit
+    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.gateware.csr_front import BonsaiEngineCSR
+    n_channels, cols, T = 2, 64, 5
+    rng = np.random.default_rng(137)
+    ev     = rng.integers(-9, -4, T)
+    scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
+    v8     = rng.integers(-127, 128, (T, cols), dtype=np.int8)
+    v8[:, -1] = 127
+    p8     = rng.integers(1, 128, T, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B_ax   = 12 - int(e16.max())
+    Rpre   = bx.axpy_rpre(int(p8.astype(np.int64).sum()))
+    rows, rem = T//n_channels, T % n_channels
+    payloads, parts = [], []
+    for c in range(n_channels):
+        pos = [t for t in range(T) if t % n_channels == c]
+        spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
+                            len(pos), cols, scales=scales[pos], values=v8[pos])
+        payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
+        parts.append(bx.axpy_rows(scales[pos], v8[pos], p8[pos], B_ax, Rpre))
+    maxlen   = max(len(pp) for pp in payloads)
+    payloads = [pp.ljust(maxlen, b"\0") for pp in payloads]
+    summed   = np.sum(np.stack(parts).astype(np.int64), axis=0).astype(np.int32)
+    am       = int(np.abs(summed.astype(np.int64)).max())
+    k_exp    = max(0, am.bit_length() - 14)
+    assert 3 + k_exp <= 31
+
+    # rmsnorm input: an int16 row and a norm-weight row (E_W16 units, all ones).
+    n = 128
+    # Small source so eps (100..1247) is comparable with mean(m^2) and visibly changes
+    # the normalization; A6 is any sane (negative) final shift - the firmware's is
+    # e_w - E_NORM - 15 = -17; the test only needs the LUT and immediate runs to agree.
+    x16 = rng.integers(-40, 41, n, dtype=np.int16)
+    w16 = np.full(n, 1 << 13, dtype=np.int16)
+    ln  = 7
+    A6  = -15
+    lut = [100 + 37*i for i in range(32)]             # Distinct eps per entry.
+    words, offs = [], {}
+    for name in ("rmsnorm",):
+        offs[name] = len(words)
+        words += vasm.assemble(vasm.PROGRAMS[name]())
+    def ref(eps):
+        sp = bytearray(64*1024)
+        sp[0x1000:0x1000+2*n] = x16.tobytes()
+        sp[0x1800:0x1800+2*n] = w16.tobytes()
+        vasm.VecInterp(sp).run(vasm.assemble(vasm.PROGRAMS["rmsnorm"]()),
+                               [0x1000, 0x1800, 0x2000, n//16, -ln, eps, A6])
+        return np.frombuffer(bytes(sp[0x2000:0x2000+2*n]), dtype="<i2")
+    exp_lut   = ref(lut[3 + k_exp])
+    exp_clamp = ref(lut[31])
+    assert not np.array_equal(exp_lut, ref(lut[3]))   # The kreg term must matter.
+
+    rb = layout.row_beats(cols, layout.KIND_Q8)
+    LUT_ADDR = 0x5800
+    descs = (_desc_engine(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
+                          sbeats=layout.scale_beats(cols, layout.KIND_Q8),
+                          cbeats=layout.code_beats(cols, layout.KIND_Q8),
+                          bias=B_ax, rshift=Rpre, rem=rem, xred=1,
+                          kcap=1, kreg=0, xsrc=0x200, dst=0x4000)
+             + _desc_vec(offs["rmsnorm"], [0x1000, 0x1800, 0x2000, n//16, -ln, 3, A6],
+                         kadds=[0, 0, 0, 0, 0, 1], lut_beat=LUT_ADDR//32)   # A5 = LUT[3+k]
+             + _desc_vec(offs["rmsnorm"], [0x1000, 0x1800, 0x2400, n//16, -ln,
+                                           lut[3 + k_exp], A6])             # same eps, imm
+             + _desc_vec(offs["rmsnorm"], [0x1000, 0x1800, 0x2800, n//16, -ln, 40, A6],
+                         kadds=[0, 0, 0, 0, 0, 1], lut_beat=LUT_ADDR//32)   # clamps to 31
+             + _desc_stop())
+    sp = bytearray(64*1024)
+    sp[0x200:0x200+T]              = p8.tobytes()
+    sp[0x1000:0x1000+2*n]          = x16.tobytes()
+    sp[0x1800:0x1800+2*n]          = w16.tobytes()
+    sp[LUT_ADDR:LUT_ADDR+4*32]     = b"".join(int(v).to_bytes(4, "little") for v in lut)
+    sp[0x6000:0x6000+len(descs)]   = descs
+
+    class _DUT(Module):
+        def __init__(self):
+            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                    for _ in range(n_channels)]
+            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+                                                          init=words_from_bytes(bytes(sp)))
+            self.submodules.vu  = BonsaiVectorUnit()
+            self.submodules.seq = BonsaiSequencer()
+            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+                                                        xbuf_groups=32,
+                                                        vecunit=self.vu, seq=self.seq)
+            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.comb += [
+                self.vu.seq_en.eq(self.seq.busy),
+                self.vu.seq_start.eq(self.seq.vec_start),
+                self.vu.seq_pc.eq(self.seq.vec_pc),
+                self.seq.vec_done.eq(self.vu.done),
+                self.seq.vec_res6.eq(self.vu.res6.status),
+                self.vu.seq_seed7.eq(self.seq.vec_seed7),
+            ]
+            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
+            for i, axi in enumerate(axis):
+                setattr(self.submodules, f"model{i}", BonsaiHBMChannelModel(
+                    axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
+
+    dut = _DUT()
+
+    def driver():
+        yield dut.vu.prog_adr.storage.eq(0)
+        yield dut.vu.prog_adr.re.eq(1)
+        yield
+        yield dut.vu.prog_adr.re.eq(0)
+        for wd in words:
+            yield dut.vu.prog.storage.eq(wd)
+            yield dut.vu.prog.re.eq(1)
+            yield
+        yield dut.vu.prog.re.eq(0)
+        yield
+        yield dut.seq.base.storage.eq(0x6000)
+        yield dut.seq.count.storage.eq(5)
+        yield
+        yield dut.seq.start.storage.eq(1)
+        yield dut.seq.start.re.eq(1)
+        yield
+        yield dut.seq.start.re.eq(0)
+        yield
+        for _ in range(200000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("sequencer timeout")
+        yield
+        data = bytearray()
+        for wd in range(0x3000//32):
+            v = (yield dut.scratchpad.mem[wd])
+            data += int(v).to_bytes(32, "little")
+        kr0 = (yield dut.seq.kregs[0])
+        assert kr0 == k_exp, ("kreg0 capture", kr0, k_exp)
+        out_lut   = np.frombuffer(bytes(data[0x2000:0x2000+2*n]), dtype="<i2")
+        out_imm   = np.frombuffer(bytes(data[0x2400:0x2400+2*n]), dtype="<i2")
+        out_clamp = np.frombuffer(bytes(data[0x2800:0x2800+2*n]), dtype="<i2")
+        assert np.array_equal(out_lut, exp_lut), ("A5 via LUT[3+kreg0]", out_lut[:6], exp_lut[:6])
+        assert np.array_equal(out_imm, exp_lut), ("same eps as immediate", out_imm[:6])
+        assert np.array_equal(out_clamp, exp_clamp), ("index 40+k clamps to 31",
+                                                      out_clamp[:6], exp_clamp[:6])
 
     run_simulation(dut, [driver()])
 

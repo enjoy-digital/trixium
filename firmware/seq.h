@@ -23,6 +23,10 @@
 void     seq_desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_t srcs);
 void     seq_desc_vec_seed(uint32_t idx, uint16_t pc, const int32_t *args, int n,
                            uint16_t srcs, int seed_abs); // S7 <- engine absmax.
+// A5 = LUT[args[5] + kreg[lut_kreg]] (w0[12], BONSAI_SEQ_LUT bitstreams): lut_beat is the
+// 32-entry table's scratchpad beat index, lut_kreg 1..3 selects kreg0..2 (0 = none).
+void     seq_desc_vec_lut(uint32_t idx, uint16_t pc, const int32_t *args, int n,
+                          uint16_t srcs, uint32_t lut_beat, int lut_kreg);
 void     seq_desc_engine(uint32_t idx, const struct engine_op *op);
 void     seq_desc_stop(uint32_t idx);
 // Patch one descriptor word. Inline: it is one posted store, and it used to be a

@@ -154,6 +154,7 @@ class BonsaiSoC(SoCCore):
             seq = None
             if with_vecunit:
                 from trixium.gateware.sequencer import BonsaiSequencer
+                self.add_constant("BONSAI_SEQ_LUT")      # A5-from-LUT arg source (2026-09-09).
                 seq = self.seq = BonsaiSequencer()
                 self.comb += [
                     vecunit.seq_en.eq(seq.busy),

@@ -1066,6 +1066,20 @@ static int seq_qkr_di_qn = 0, seq_qkr_di_kn = 1;
 // Same ops, same numerics. Toggle qkro selects the old order for a same-boot A/B.
 static int qkr_reorder = 1;
 static int qfix_use = 1;     // Console toggle (qfix): scan-free fixed-shift Q quant8.
+// qkvx (2026-09-09, BONSAI_SEQ_LUT bitstreams): the K chain (rmsnorm_h, rope_h, pack) and
+// the V pack move INTO the qkv list, under the q projection's stream, in v-k-q order; the
+// qkr list keeps the multi-store and the Q chain. What kept them out was rmsnorm's eps -
+// a per-layer constant scaled by the norm shift the sequencer holds in a kreg - which
+// the sequencer now reads from a 32-entry table (seq_desc_vec_lut) the CPU fills per
+// layer under the previous FFN list. Same programs, same eps values: byte-identical.
+// Requires the resident norm rows (qres), the multi-store and the reordered Q chain.
+int        qkvx_use = 1;
+static int qkvx_ok  = 0;      // What the built lists use.
+static int qkvx_blocked = 0;  // The 14-descriptor qkv list did not fit: rebuilt without.
+static int seq_qkv_len = 10;
+static int seq_qkv_di_kn = -1;
+#define SP_LUTQ (SP_DESC + 188*64) // 32 x int32 eps for the q norm (descriptor slots
+#define SP_LUTK (SP_LUTQ + 128)    // 188-191, past every list; vbench stays below 188).
 // In-list KV stores (probe-1 follow-up, 2026-08-31): each (kvh, kind) staging slot's
 // engine STORE rides the qkr list as a NOWAIT descriptor right after the pack quant8
 // that fills the slot - the next head's quant8 (vec) runs under the store's stream, so
@@ -1098,9 +1112,24 @@ static int kv_mstore_active = 0; // What the built list uses.
 static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2 + kind).
 // What the store descriptors' constant words currently hold (~0 = unknown/rebuilt).
 static uint32_t kvst_rb_set = 0xFFFFFFFFu, kvst_chan_set = 0xFFFFFFFFu;
+extern int qres_use;
+static int qkvx_possible(void)
+{
+#if defined(BONSAI_SEQ_LUT) && defined(BONSAI_VEC_LOOPS2) && !defined(BONSAI_HAS_DUALQ)
+    return qkvx_use && !qkvx_blocked && qres_use
+        && (uint32_t)n_layer*head_dim*2 <= 0x1C00
+        && model_entry_kind(ROLE_ATTN_Q_NORM, 0, KIND_NORM16) != 0
+        && model_entry_kind(ROLE_ATTN_K_NORM, 0, KIND_NORM16) != 0
+        && kv_pipe && kv_mstore && 2*n_kv_head <= 31 && qkr_reorder && qfix_use;
+#else
+    return 0;
+#endif
+}
+
 static void seq_build_qkr(void)
 {
     kvst_rb_set = kvst_chan_set = 0xFFFFFFFFu; // The store slots below are rewritten.
+    qkvx_ok = qkvx_possible();
     int ln = 0;
     while ((1 << ln) < head_dim) ln++;
     uint32_t di = 0;
@@ -1122,20 +1151,22 @@ static void seq_build_qkr(void)
         }
         int32_t nk[8] = {(int32_t)SP_K, (int32_t)SP_FET2, (int32_t)SP_K, head_dim/16,
                          -ln, 1, E_W16 - E_NORM - 15, n_kv_head};
-        seq_qkr_di_kn = (int)di;
-        seq_desc_vec(di++, PROG_RMSNORM_H, nk, 8, 0);                  // k-norm (A5 patched)
-        if (!qkr_reorder)
-            seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                 // q-rope
         int32_t rk[8] = {(int32_t)SP_K, (int32_t)(SP_K + head_dim), (int32_t)SP_TAB,
                          (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_K,
                          head_dim, n_kv_head};
-        seq_desc_vec(di++, PROG_ROPE_H, rk, 8, 0);                     // k-rope
         int32_t pk[8] = {(int32_t)SP_K, 0, (int32_t)(kvp_slot(0, 0) + 32), head_dim/16, 0, 0,
                          0x400 - 16*(head_dim/16), n_kv_head};
-        seq_desc_vec(di++, PROG_KVPACK_H, pk, 8, 0);                   // 4: K packs
         int32_t pv[8] = {(int32_t)SP_V, 0, (int32_t)(kvp_slot(0, 1) + 32), head_dim/16, 0, 0,
                          0x400 - 16*(head_dim/16), n_kv_head};
-        seq_desc_vec(di++, PROG_KVPACK_H, pv, 8, 0);                   // 5: V packs
+        if (!qkvx_ok) { // qkvx: the K chain and both packs ride the qkv list instead.
+            seq_qkr_di_kn = (int)di;
+            seq_desc_vec(di++, PROG_RMSNORM_H, nk, 8, 0);              // k-norm (A5 patched)
+            if (!qkr_reorder)
+                seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);             // q-rope
+            seq_desc_vec(di++, PROG_ROPE_H, rk, 8, 0);                 // k-rope
+            seq_desc_vec(di++, PROG_KVPACK_H, pk, 8, 0);               // 4: K packs
+            seq_desc_vec(di++, PROG_KVPACK_H, pv, 8, 0);               // 5: V packs
+        }
     }
     if (0)
 #endif
@@ -1208,7 +1239,11 @@ static void seq_build_qkr(void)
 #ifdef BONSAI_VEC_LOOPS2
     if (qkr_reorder) { // Q chain behind the (NOWAIT) store: absorbs its write-latency tail.
         seq_qkr_di_qn = (int)di;
-        seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);                  // q-norm (A5 patched)
+        if (qkvx_ok) { // A5 = LUTQ[sx8 + kreg0], kreg0 captured by the qkv list's q matvec.
+            int32_t nql[8] = {nq[0], nq[1], nq[2], nq[3], nq[4], 0, nq[6], nq[7]};
+            seq_desc_vec_lut(di++, PROG_RMSNORM_H, nql, 8, 0, SP_LUTQ/32, 1);
+        } else
+            seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);              // q-norm (A5 patched)
         seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                     // q-rope
     }
 #endif
@@ -1239,20 +1274,24 @@ static void seq_build_qkr(void)
     seq_qkr_count = di;
 }
 
-static int16_t eps_memo[64]; // seq_eps_int cache, index es+32; 0 = not computed yet.
+static int32_t eps_memo[128]; // seq_eps_int cache, index es+64; 0 = not computed yet.
+                              // int32 and [-64, 63] since the qkvx LUT fill (2026-09-09)
+                              // asks for 32 es values per norm per layer - a miss is
+                              // ~500 cycles of soft-float, and the old int16 memo could
+                              // not hold the big-eps (very negative es) entries at all.
 
 static int seq_eps_int(int es)
 {
     // Soft-float (lroundf/ldexpf) costs hundreds of cycles on this FPU-less core and
     // es takes a handful of values - memoize (qtrace, 2026-09-02). e >= 1 always, so
     // 0 doubles as the empty marker.
-    int mi = es + 32;
-    if (mi >= 0 && mi < 64 && eps_memo[mi])
+    int mi = es + 64;
+    if (mi >= 0 && mi < 128 && eps_memo[mi])
         return eps_memo[mi];
     int e = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*es));
     if (e < 1) e = 1;
-    if (mi >= 0 && mi < 64 && e <= 0x7FFF)
-        eps_memo[mi] = (int16_t)e;
+    if (mi >= 0 && mi < 128)
+        eps_memo[mi] = e;
     return e;
 }
 
@@ -1644,15 +1683,60 @@ static void seq_build_qkv(void)
     if (seq_scale8_base < 0)
         return;
     int di = seq_scale8_base + n_head + 1;
-    if (di + 10 > 192)
+    int len = qkvx_ok ? 14 : 10;
+    if (di + len > 192) {
+        if (qkvx_ok) { // Fit without qkvx: every list rebuilds (bases shift with qkr).
+            qkvx_blocked = 1;
+            seq_ffn_base = -1;
+            seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8();
+            seq_build_qkv();
+        }
         return;
+    }
     seq_qkv_base = di;
+    seq_qkv_len  = len;
     struct engine_op z = {0};
     int32_t pq = (int32_t)(SP_QKSP + 0), pk = (int32_t)(SP_QKSP + 32), pv = (int32_t)(SP_QKSP + 64);
     int q_dim = n_head*head_dim, kv_dim = n_kv_head*head_dim;
     int32_t nq[5] = {(int32_t)SP_Y,            0, (int32_t)SP_Q, q_dim/16,  0};
     int32_t nk[5] = {(int32_t)(SP_Y + 0x4000), 0, (int32_t)SP_K, kv_dim/16, 0};
     int32_t nv[5] = {(int32_t)(SP_Y + 0x5000), 0, (int32_t)SP_V, kv_dim/16, 0};
+    if (qkvx_ok) {
+        // v-k-q order: V's pack rides under the k stream, the whole K chain under the q
+        // stream (its eps from LUTK[sx8 + kreg1], kreg1 captured by the k matvec); q's
+        // own chain stays in the qkr list behind the store, its kreg0 captured here.
+        //   0 v mv            1 spill v   2 k mv NOWAIT [cap kreg1]   3 norm_v   4 V packs
+        //   5 spill k         6 q mv NOWAIT [cap kreg0]   7 norm_k   8 k-norm [LUT]
+        //   9 k-rope         10 K packs  11 spill q   12 norm_q   13 stop
+        int ln = 0;
+        while ((1 << ln) < head_dim) ln++;
+        int32_t nkl[8] = {(int32_t)SP_K, (int32_t)SP_KNW, (int32_t)SP_K, head_dim/16,
+                          -ln, 0, E_W16 - E_NORM - 15, n_kv_head}; // A1 per layer, A5 per token.
+        int32_t rk[8]  = {(int32_t)SP_K, (int32_t)(SP_K + head_dim), (int32_t)SP_TAB,
+                          (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_K,
+                          head_dim, n_kv_head};
+        int32_t pkk[8] = {(int32_t)SP_K, 0, (int32_t)(kvp_slot(0, 0) + 32), head_dim/16, 0, 0,
+                          0x400 - 16*(head_dim/16), n_kv_head};
+        int32_t pvv[8] = {(int32_t)SP_V, 0, (int32_t)(kvp_slot(0, 1) + 32), head_dim/16, 0, 0,
+                          0x400 - 16*(head_dim/16), n_kv_head};
+        seq_desc_engine(di + 0, &z);
+        seq_desc_vec_seed(di + 1, PROG_SPILL, &pv, 1, 0, 1);
+        seq_desc_engine(di + 2, &z);
+        seq_desc_vec(di + 3, PROG_NORM_I32, nv, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
+        seq_desc_vec(di + 4, PROG_KVPACK_H, pvv, 8, 0);
+        seq_desc_vec_seed(di + 5, PROG_SPILL, &pk, 1, 0, 1);
+        seq_desc_engine(di + 6, &z);
+        seq_desc_vec(di + 7, PROG_NORM_I32, nk, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
+        seq_qkv_di_kn = di + 8;
+        seq_desc_vec_lut(di + 8, PROG_RMSNORM_H, nkl, 8, 0, SP_LUTK/32, 2);
+        seq_desc_vec(di + 9, PROG_ROPE_H, rk, 8, 0);
+        seq_desc_vec(di + 10, PROG_KVPACK_H, pkk, 8, 0);
+        seq_desc_vec_seed(di + 11, PROG_SPILL, &pq, 1, 0, 1);
+        seq_desc_vec(di + 12, PROG_NORM_I32, nq, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
+        seq_desc_stop(di + 13);
+        printf("qkvx: K chain + V pack in the qkv list (%d descriptors), eps via LUT\n", len);
+        return;
+    }
     seq_desc_engine(di + 0, &z);
     seq_desc_vec_seed(di + 1, PROG_SPILL, &pq, 1, 0, 1);
     seq_desc_engine(di + 2, &z);
@@ -1672,6 +1756,36 @@ static void qkv_prep_layer(int l)
         return;
     struct engine_op mo = {0};
     uint32_t b = (uint32_t)seq_qkv_base;
+    if (qkvx_ok) {
+        const struct bons_entry *eq = model_entry(ROLE_ATTN_Q, l);
+        const struct bons_entry *ek = model_entry(ROLE_ATTN_K, l);
+        model_matvec_op(model_entry(ROLE_ATTN_V, l), SP_X, SP_Y + 0x5000, &mo);
+        seq_desc_engine(b + 0, &mo);
+        model_matvec_op(ek, SP_X, SP_Y + 0x4000, &mo);
+        seq_desc_engine(b + 2, &mo);
+        seq_patch(b + 2, 0, 1u | (1u << 9) | (1u << 5) | (1u << 6)); // NOWAIT, k -> kreg1.
+        model_matvec_op(eq, SP_X, SP_Y, &mo);
+        seq_desc_engine(b + 6, &mo);
+        seq_patch(b + 6, 0, 1u | (1u << 9) | (1u << 5));             // NOWAIT, k -> kreg0.
+        // The layer's eps tables: LUT[s] = eps(E_NORM + s - bias + rshift), s = sx8 + k
+        // with sx8 the per-token part (patched into A5's immediate before the list) and k
+        // the norm shift the sequencer adds from the kreg. 32 entries cover sx8 <= 8 and
+        // k <= 18 (int32 sources); seq_eps_int is the same function the qkr list's A5
+        // patch used, so the values are identical by construction.
+        volatile uint32_t *lq = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_LUTQ);
+        volatile uint32_t *lk = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_LUTK);
+        int eq0 = E_NORM - (int)eq->bias + (int)eq->rshift;
+        int ek0 = E_NORM - (int)ek->bias + (int)ek->rshift;
+        for (int sidx = 0; sidx < 32; sidx++) {
+            lq[sidx] = (uint32_t)seq_eps_int(eq0 + sidx);
+            lk[sidx] = (uint32_t)seq_eps_int(ek0 + sidx);
+        }
+        // Resident norm rows (qres is a qkvx precondition): A1 of both rmsnorm_h.
+        seq_patch((uint32_t)seq_qkv_di_kn, 3, SP_KNW + (uint32_t)l*head_dim*2);
+        seq_patch((uint32_t)seq_qkr_di_qn, 3, SP_QNW + (uint32_t)l*head_dim*2);
+        qkv_prepped = l;
+        return;
+    }
     model_matvec_op(model_entry(ROLE_ATTN_Q, l), SP_X, SP_Y, &mo);
     seq_desc_engine(b + 0, &mo);
     model_matvec_op(model_entry(ROLE_ATTN_K, l), SP_X, SP_Y + 0x4000, &mo);
@@ -2267,6 +2381,14 @@ void infer_qfix(int on)
     seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
 }
 int infer_qfix_state(void) { return qfix_use; }
+void infer_qkvx(int on)
+{
+    qkvx_use = on ? 1 : 0;
+    qkvx_blocked = 0;
+    seq_ffn_base = -1;
+    seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
+}
+int infer_qkvx_state(void) { return qkvx_ok; }
 void infer_embfetch(int on) { embfetch_use = on ? 1 : 0; }
 int  infer_embfetch_state(void) { return embfetch_use && emb16_ent != 0; }
 
@@ -2561,13 +2683,39 @@ embed_done: ;
             perf_enter(OP_NORM_I32);
             int kq, kk2, kv2;
 #ifdef CSR_SEQ_BASE
+            // Resident q/k norm rows (qres): one-time fetch of every layer's row. Ahead of
+            // the qkv list since qkvx runs the k-norm INSIDE that list (2026-09-09); the
+            // fetch used to sit in the qkr section below, after the list.
+            int qres = 0;
+#ifdef BONSAI_VEC_LOOPS2
+            {
+                const struct bons_entry *qn16r = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
+                const struct bons_entry *kn16r = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
+                qres = qres_use && (uint32_t)n_layer*head_dim*2 <= 0x1C00 && qn16r && kn16r;
+            }
+            if (qres && !qkn_resident) {
+                for (int ll = 0; ll < n_layer; ll++) {
+                    const struct bons_entry *q = model_entry_kind(ROLE_ATTN_Q_NORM, ll, KIND_NORM16);
+                    const struct bons_entry *k = model_entry_kind(ROLE_ATTN_K_NORM, ll, KIND_NORM16);
+                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + q->chan_base_beats*32,
+                                 q->chan_len_beats, SP_QNW + (uint32_t)ll*head_dim*2);
+                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + k->chan_base_beats*32,
+                                 k->chan_len_beats, SP_KNW + (uint32_t)ll*head_dim*2);
+                }
+                qkn_resident = 1;
+            }
+#endif
             if (likely(qkvl_use && seq_use && seq_qkv_base >= 0 && op_on_hw(OP_NORM_I32))) {
                 // One sequencer run for q/k/v + norms (seq_build_qkv). The engine words
                 // were posted under the previous FFN list (or the LM-head stream); the
                 // call below is a no-op then. kq/kk/kv from the spilled absmaxes, the
                 // same bitlen-14 the op path derives - byte-identical.
                 qkv_prep_layer(l);
-                seq_run((uint32_t)seq_qkv_base, 10);
+                if (qkvx_ok) { // Per-token part of both norms' eps index (LUT[sx8 + k]).
+                    seq_patch((uint32_t)seq_qkv_di_kn, 7, (uint32_t)sx8);
+                    seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)sx8);
+                }
+                seq_run((uint32_t)seq_qkv_base, (uint32_t)seq_qkv_len);
                 uint32_t aq = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_QKSP);
                 uint32_t ak = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_QKSP + 32);
                 uint32_t av = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_QKSP + 64);
@@ -2623,23 +2771,11 @@ embed_done: ;
             const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
             const struct bons_entry *kn16 = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
             uint32_t dqn = 0;
-            int qres = 0;
-#ifdef BONSAI_VEC_LOOPS2
-            qres = qres_use && (uint32_t)n_layer*head_dim*2 <= 0x1C00 && qn16 && kn16;
-            if (qres && !qkn_resident) {
-                // One-time residency: every layer's q/k norm row (8 beats each).
-                for (int ll = 0; ll < n_layer; ll++) {
-                    const struct bons_entry *q = model_entry_kind(ROLE_ATTN_Q_NORM, ll, KIND_NORM16);
-                    const struct bons_entry *k = model_entry_kind(ROLE_ATTN_K_NORM, ll, KIND_NORM16);
-                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + q->chan_base_beats*32,
-                                 q->chan_len_beats, SP_QNW + (uint32_t)ll*head_dim*2);
-                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + k->chan_base_beats*32,
-                                 k->chan_len_beats, SP_KNW + (uint32_t)ll*head_dim*2);
-                }
-                qkn_resident = 1;
-            }
-#endif
-            if (qres) {
+            (void)qn16; (void)kn16; // qres and the residency fetch moved ahead of the qkv list.
+            if (qres && qkvx_ok) {
+                // Both A1s were patched with the layer's engine words (qkv_prep_layer);
+                // the K chain has already run inside the qkv list.
+            } else if (qres) {
                 seq_patch((uint32_t)seq_qkr_di_qn, 3, SP_QNW + (uint32_t)l*head_dim*2); // rmsnorm_h A1 (q).
                 seq_patch((uint32_t)seq_qkr_di_kn, 3, SP_KNW + (uint32_t)l*head_dim*2); // rmsnorm_h A1 (k).
             } else if (fovl_use) {  // fovl: the q-norm row streams under the eps/KV prep below.
@@ -2657,8 +2793,11 @@ embed_done: ;
                 if (qtr) qt[qtn++] = perf_now(); // [1] fetches + entry lookups done.
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
 #ifdef BONSAI_VEC_LOOPS2
-                seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
-                seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);   // rmsnorm_h A5 (k heads).
+                if (!qkvx_ok) { // qkvx: the sequencer reads both from the layer's LUTs.
+                    seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
+                    seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);   // rmsnorm_h A5 (k heads).
+                }
+                (void)epq; (void)epk;
 #else
                 for (int hh = 0; hh < n_head + n_kv_head; hh++)
                     seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
@@ -3673,9 +3812,9 @@ void infer_vbench(void)
 #ifdef CSR_SEQ_BASE
     { // One-descriptor sequencer list (spill): the in-list dispatch floor.
         int32_t pa = (int32_t)SP_FET;
-        seq_desc_vec(191, PROG_SPILL, &pa, 1, 0);
+        seq_desc_vec(187, PROG_SPILL, &pa, 1, 0);
         t0 = perf_now();
-        for (int i = 0; i < 16; i++) seq_run(191, 1);
+        for (int i = 0; i < 16; i++) seq_run(187, 1);
         dt = perf_now() - t0;
         printf("VB seq_1desc        %8lu\n", (unsigned long)(dt/16));
     }
@@ -3683,11 +3822,11 @@ void infer_vbench(void)
       // top of the descriptor region; nothing is running. The difference over 31 is the
       // sequencer fetch/dispatch plus the vector unit's fixed per-program cost.
         int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 1, 0, -1};
-        for (int i = 0; i < 32; i++) seq_desc_vec((uint32_t)(158 + i), PROG_RESID_ADD, a, 6, 0);
-        seq_desc_stop(190);
+        for (int i = 0; i < 32; i++) seq_desc_vec((uint32_t)(150 + i), PROG_RESID_ADD, a, 6, 0);
+        seq_desc_stop(182);
         uint32_t t1;
-        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(189, 2); t1 = perf_now() - t0;
-        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(158, 33); dt = perf_now() - t0;
+        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(181, 2); t1 = perf_now() - t0;
+        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(150, 33); dt = perf_now() - t0;
         printf("VB seq_desc_step    %8lu  (list of 32: %lu, of 1: %lu)\n",
                (unsigned long)((dt - t1)/(8*31)), (unsigned long)(dt/8), (unsigned long)(t1/8));
         seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();

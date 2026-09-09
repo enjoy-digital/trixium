@@ -38,6 +38,16 @@ void seq_desc_vec_seed(uint32_t idx, uint16_t pc, const int32_t *args, int n, ui
         d[2 + i] = (i < n) ? (uint32_t)args[i] : 0;
 }
 
+void seq_desc_vec_lut(uint32_t idx, uint16_t pc, const int32_t *args, int n,
+                      uint16_t srcs, uint32_t lut_beat, int lut_kreg)
+{
+    volatile uint32_t *d = desc_w(idx);
+    seq_desc_vec_seed(idx, pc, args, n, srcs, 0);
+    d[0] |= 1u << 12;                          // A5 from the LUT.
+    d[1] |= (uint32_t)(lut_kreg & 3) << 26;    // A5's kreg select = the table index term.
+    d[10] = lut_beat;
+}
+
 void seq_desc_engine(uint32_t idx, const struct engine_op *op)
 {
     volatile uint32_t *d = desc_w(idx);
