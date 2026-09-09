@@ -3679,6 +3679,19 @@ void infer_vbench(void)
         dt = perf_now() - t0;
         printf("VB seq_1desc        %8lu\n", (unsigned long)(dt/16));
     }
+    { // In-list per-descriptor cost: 32 one-beat resid_adds vs 1 (2026-09-09). Uses the
+      // top of the descriptor region; nothing is running. The difference over 31 is the
+      // sequencer fetch/dispatch plus the vector unit's fixed per-program cost.
+        int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 1, 0, -1};
+        for (int i = 0; i < 32; i++) seq_desc_vec((uint32_t)(158 + i), PROG_RESID_ADD, a, 6, 0);
+        seq_desc_stop(190);
+        uint32_t t1;
+        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(189, 2); t1 = perf_now() - t0;
+        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(158, 33); dt = perf_now() - t0;
+        printf("VB seq_desc_step    %8lu  (list of 32: %lu, of 1: %lu)\n",
+               (unsigned long)((dt - t1)/(8*31)), (unsigned long)(dt/8), (unsigned long)(t1/8));
+        seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
+    }
 #endif
 #if defined(BONSAI_HAS_KVSTORE)
     { // KV scale-beat prep with a forced exponent change every call.
