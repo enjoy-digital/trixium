@@ -2722,8 +2722,27 @@ embed_done: ;
                 // same bitlen-14 the op path derives - byte-identical.
                 qkv_prep_layer(l);
                 if (qkvx_ok) { // Per-token part of both norms' eps index (LUT[sx8 + k]).
-                    seq_patch((uint32_t)seq_qkv_di_kn, 7, (uint32_t)sx8);
-                    seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)sx8);
+                    // The layer's tables cover s = sx8 + k in [0, 31], i.e. sx8 in [0, 13]
+                    // with k <= 18 (an int32 source). quant8_shift can go negative for a
+                    // tiny source, so outside that window refill both tables around this
+                    // token's sx8 and index by k alone - the sequencer clamps, and a
+                    // clamped index would be a silently wrong eps. Rare: after the
+                    // attention rmsnorm the mantissas sit near 2^11..2^15 (sx8 4..8).
+                    int imm = sx8;
+                    if (sx8 < 0 || sx8 > 13) {
+                        volatile uint32_t *lq = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_LUTQ);
+                        volatile uint32_t *lk = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_LUTK);
+                        int eq0 = E_NORM + sx8 - (int)eqt->bias + (int)eqt->rshift;
+                        int ek0 = E_NORM + sx8 - (int)ekt->bias + (int)ekt->rshift;
+                        for (int j = 0; j < 32; j++) {
+                            lq[j] = (uint32_t)seq_eps_int(eq0 + j);
+                            lk[j] = (uint32_t)seq_eps_int(ek0 + j);
+                        }
+                        qkv_prepped = -1; // The next layer's prep rewrites its own tables.
+                        imm = 0;
+                    }
+                    seq_patch((uint32_t)seq_qkv_di_kn, 7, (uint32_t)imm);
+                    seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)imm);
                 }
                 seq_run((uint32_t)seq_qkv_base, (uint32_t)seq_qkv_len);
                 uint32_t aq = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_QKSP);
