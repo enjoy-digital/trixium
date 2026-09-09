@@ -268,7 +268,19 @@ COLD static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 //   ea8 = frexpf(max hm) - 7               -> e2max + 24 - 7
 //   Mh  = lroundf(ldexpf(c2, 15 - ea8))    -> qm * 2^(qe + E1 + 15 - ea8), half away from 0
 int ifold_use = 1; // Second version (2026-08-30): 32-bit hardware divides + clz.
+#ifdef BONSAI_HAS_ZBB
+// Zbb clz (v12+ bitstreams). GCC 10.1 knows no Zb*, so the encoding is spelled out:
+// .insn i 0x13, 1, rd, rs1, 0x600 == clz rd, rs1 (0x60059513 for a0, a1). Defined for 0
+// (returns 32), so no zero test is needed.
+static inline __attribute__((always_inline)) int bitlen32(uint32_t x)
+{
+    uint32_t r;
+    __asm__ (".insn i 0x13, 1, %0, %1, 0x600" : "=r"(r) : "r"(x));
+    return 32 - (int)r;
+}
+#else
 static inline __attribute__((always_inline)) int bitlen32(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
+#endif
 static void attn_f32_recip(uint32_t p8, uint32_t *qm, int *qe)
 {
     // m = 2^(23+L)/p8 in (2^23, 2^24] with an exact remainder, on the 32-bit divider:
@@ -596,9 +608,7 @@ COLD static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
 static int quant8_shift(uint32_t amax)
 {
     if (amax == 0) return 8; // VCLZN(0) == 0, i.e. pre-shift 0 - keep the paths identical.
-    int b = 0;
-    while ((amax >> b) != 0) b++; // bitlen.
-    return b - 7;
+    return bitlen32(amax) - 7;
 }
 
 // rmsnorm + measured quant8 in one program (F1-3, 2026-08-30): saves a dispatch and

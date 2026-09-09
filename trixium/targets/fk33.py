@@ -288,6 +288,12 @@ def main():
         pcie_lanes   = args.pcie_lanes,
         **parser.soc_argdict)
 
+    # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates
+    # the extension, so the firmware reaches clz through a .insn encoding behind this.
+    if "--with-rvZbb" in (getattr(args, "vexii_args", "") or "") or \
+       "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
+        soc.add_constant("BONSAI_HAS_ZBB")
+
     # Per-variant build directory (default Builder output_dir collides across variants).
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
