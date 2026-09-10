@@ -346,10 +346,17 @@ class BonsaiChannelPipe(LiteXModule):
         self.sync += is_axpy.eq(self.kind == KIND_OP_AXPY)
         q8_lanes  = []
         q8_lanesb = []
+        # The 32 signed 8x8 products go to DSP48E2s (2026-09-10, from the external review's
+        # out-of-context study, reproduced with tools/pipe_ooc_study.py): -2.6k LUT, -0.9k
+        # FF and -330 CARRY8 per channel, the CE'd product register absorbed as the DSP's
+        # P register (same cycle), and Vivado folds the first Q8 tree levels into the DSP
+        # ALUs. Exact by construction (a 27x18 signed multiplier). The 16 channels' 912
+        # DSPs are 32% of the die's; they were 3% used.
         for j in range(32):
             w_j = Signal((8, True))
             x_j = Signal((8, True))
             p   = Signal((16, True))
+            p.attr.add(("use_dsp", "yes"))
             self.comb += [
                 w_j.eq(codes_r[8*j:8*j+8]),
                 x_j.eq(Mux(is_axpy, p8_ax, xslice[8*j:8*j+8])),
@@ -362,6 +369,7 @@ class BonsaiChannelPipe(LiteXModule):
                 continue
             xb_j = Signal((8, True))
             pb   = Signal((16, True))
+            pb.attr.add(("use_dsp", "yes"))
             self.comb += [
                 xb_j.eq(Mux(is_axpy, p8_axb, xsliceb[8*j:8*j+8])),
                 pb.eq(w_j*xb_j),
