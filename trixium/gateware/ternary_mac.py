@@ -339,8 +339,11 @@ class BonsaiChannelPipe(LiteXModule):
                                             for i in range(16)})
             self.comb += Case(pidx_rb[:3], {i: p8_axb.eq(p8_grpb[8*i:8*(i+1)])
                                             for i in range(8)})
+        # Op-stable decode, registered: kind loads at START+1 and the first T1 use is at
+        # START+5 or later, so a flop copy is exact and keeps the kind compare (and the
+        # engine-side flop it would otherwise reach) out of the 32-lane operand mux.
         is_axpy = Signal()
-        self.comb += is_axpy.eq(self.kind == KIND_OP_AXPY)
+        self.sync += is_axpy.eq(self.kind == KIND_OP_AXPY)
         q8_lanes  = []
         q8_lanesb = []
         for j in range(32):
@@ -367,12 +370,15 @@ class BonsaiChannelPipe(LiteXModule):
             self.sync += If(v1b_q8[j // 16], rb.eq(pb))
             q8_lanesb.append(rb)
 
-        # Scale fp16: mux halfword out of the scale word (registered at T1 for use at T2+).
-        scale_word_r = Signal(256)
-        g_lo_r2      = Signal(4)
-        self.sync += If(v1_scale, scale_word_r.eq(scale_r.dat_r), g_lo_r2.eq(g_lo_r))
+        # Scale fp16: the beat's halfword selected at T1 straight from the scale RAM read
+        # (scale_r.dat_r and g_lo_r are both valid then) and registered as 16 bits, valid
+        # at T2+ - the same value and cycle the old 256-bit scale_word_r + T2 mux gave
+        # (2026-09-10: that mux sat in front of the AXPY shift-amount cone; -240 FF).
+        scale_f16_t1 = Signal(16)
+        self.comb += Case(g_lo_r, {i: scale_f16_t1.eq(scale_r.dat_r[16*i:16*(i+1)])
+                                   for i in range(16)})
         scale_f16 = Signal(16)
-        self.comb += Case(g_lo_r2, {i: scale_f16.eq(scale_word_r[16*i:16*(i+1)]) for i in range(16)})
+        self.sync += If(v1_scale, scale_f16.eq(scale_f16_t1))
 
         # AXPY datapath (kind 2): per-lane shift + int32 accumulators + drain. --------------------
         # Row weight is one shift (pow-2 row scales, m11 == 1024): sh = (f_exp - 15) + B - Rpre
@@ -381,55 +387,75 @@ class BonsaiChannelPipe(LiteXModule):
         # drain FSM streams code_beats*32 accumulators into the out FIFO (row = g*32 + j).
         # Signed-only arithmetic through dedicated intermediates (unsigned operands mixed
         # into signed expressions emit corrupt Verilog - see the fp16 decompose below).
+        # The shift amount used to be one combinational cone in the T2 cycle: the engine's
+        # bias/rshift flop (which Vivado merged across all 16 pipes - fanout 9,756, ~3.4 ns
+        # of route), a 16:1 scale mux, a 3-operand add, two saturations and then 32
+        # bidirectional barrel shifters - the family that owned ~8k of v11's failing
+        # endpoints. Now: the op-stable part (B - Rpre - 15) is a register, the exponent
+        # part is added at T1 from the RAM read data, and the resulting direction/amount
+        # bits are registered (replicated per 8 lanes, dont_touch) so T2 is register ->
+        # shifter -> register. Values and cycles are identical (2026-09-10).
         ax_c31n  = Signal((9, True), reset=-31)
-        ax_sh    = Signal((9, True))
-        ax_exp   = Signal(5)
-        ax_exp_s = Signal((7, True))
         ax_bias  = Signal((8, True))
         ax_rpre  = Signal((8, True))
+        ax_bmr   = Signal((9, True)) # B - Rpre - 15, registered (op-stable inputs).
+        ax_exp   = Signal(5)
+        ax_exp_s = Signal((7, True))
+        ax_sh    = Signal((9, True)) # T1: exponent + (B - Rpre - 15), same range as before.
         self.comb += [
-            ax_exp.eq(scale_f16[10:15]),
-            ax_exp_s.eq(ax_exp),          # Zero-extend into a signed signal.
             ax_bias.eq(self.bias),
             ax_rpre.eq(self.rshift),
-            ax_sh.eq(ax_exp_s - 15 + ax_bias - ax_rpre),
+            ax_exp.eq(scale_f16_t1[10:15]),
+            ax_exp_s.eq(ax_exp),          # Zero-extend into a signed signal.
+            ax_sh.eq(ax_exp_s + ax_bmr),
         ]
-        ax_shl = Signal(4)
-        ax_shr = Signal(5)
-        self.comb += [
-            ax_shl.eq(Mux(ax_sh >= 0, Mux(ax_sh > 15, 15, ax_sh[:4]), 0)),
-            ax_shr.eq(Mux(ax_sh < 0, Mux(ax_sh < ax_c31n, 31, (-ax_sh)[:5]), 0)),
-        ]
+        self.sync += ax_bmr.eq(ax_bias - ax_rpre - 15)
+        def amount_regs(sh, tag):
+            """Registered (neg, shl, shr) for `sh`, one dont_touch copy per 8 lanes."""
+            copies = []
+            for k in range(4):
+                neg = Signal(name=f"axneg_{tag}{k}")
+                shl = Signal(4, name=f"axshl_{tag}{k}")
+                shr = Signal(5, name=f"axshr_{tag}{k}")
+                for c in (neg, shl, shr):
+                    c.attr.add(("dont_touch", "true"))
+                self.sync += If(v1_scale,
+                    neg.eq(sh < 0),
+                    shl.eq(Mux(sh >= 0, Mux(sh > 15, 15, sh[:4]), 0)),
+                    shr.eq(Mux(sh < 0, Mux(sh < ax_c31n, 31, (-sh)[:5]), 0)),
+                )
+                copies.append((neg, shl, shr))
+            return copies
+        ax_amt = amount_regs(ax_sh, "a")
         # Head B (dual-Q): its own pre-shift (Rpre differs per head), same exponent path.
         if dual:
-          ax_sh2    = Signal((9, True))
           ax_rpre2  = Signal((8, True))
-          ax_shl2   = Signal(4)
-          ax_shr2   = Signal(5)
+          ax_bmr2   = Signal((9, True))
+          ax_sh2    = Signal((9, True))
           self.comb += [
             ax_rpre2.eq(self.rshift2),
-            ax_sh2.eq(ax_exp_s - 15 + ax_bias - ax_rpre2),
-            ax_shl2.eq(Mux(ax_sh2 >= 0, Mux(ax_sh2 > 15, 15, ax_sh2[:4]), 0)),
-            ax_shr2.eq(Mux(ax_sh2 < 0, Mux(ax_sh2 < ax_c31n, 31, (-ax_sh2)[:5]), 0)),
+            ax_sh2.eq(ax_exp_s + ax_bmr2),
           ]
+          self.sync += ax_bmr2.eq(ax_bias - ax_rpre2 - 15)
+          ax_amt2 = amount_regs(ax_sh2, "b")
         v2a    = _delay(self, v1, 1)              # Lane products valid (T2).
         v3a    = _delay(self, v1, 2)              # Shifted values valid (T3).
         g_ax2  = _delay(self, g_ax_r, 2)          # Beat group at T3.
         ax_shifted  = []
         ax_shifted2 = []
         for j in range(32):
+            neg, shl, shr = ax_amt[j // 8]
             sh_full = Signal((32, True))
             r       = Signal((32, True))
-            self.comb += sh_full.eq(Mux(ax_sh >= 0, q8_lanes[j] << ax_shl,
-                                                    q8_lanes[j] >> ax_shr))
+            self.comb += sh_full.eq(Mux(neg, q8_lanes[j] >> shr, q8_lanes[j] << shl))
             self.sync += If(v2a, r.eq(sh_full))
             ax_shifted.append(r)
             if not dual:
                 continue
+            neg2, shl2, shr2 = ax_amt2[j // 8]
             sh_full2 = Signal((32, True))
             r2       = Signal((32, True))
-            self.comb += sh_full2.eq(Mux(ax_sh2 >= 0, q8_lanesb[j] << ax_shl2,
-                                                      q8_lanesb[j] >> ax_shr2))
+            self.comb += sh_full2.eq(Mux(neg2, q8_lanesb[j] >> shr2, q8_lanesb[j] << shl2))
             self.sync += If(v2a & self.qn, r2.eq(sh_full2))
             ax_shifted2.append(r2)
 
@@ -493,7 +519,7 @@ class BonsaiChannelPipe(LiteXModule):
                 *[acc_ax[g][j].eq(0) for g in range(AX_GROUPS) for j in range(32)],
                 *([acc_ax2[g][j].eq(0) for g in range(AX_GROUPS) for j in range(32)]
                   if dual else []),
-            ).Elif(v3a & (self.kind == KIND_OP_AXPY),
+            ).Elif(v3a & is_axpy,
                 Case(g_ax2[:2], {g: [acc_ax[g][j].eq(acc_ax[g][j] + ax_shifted[j])
                                      for j in range(32)] for g in range(AX_GROUPS)}),
                 *([If(self.qn,
@@ -554,15 +580,20 @@ class BonsaiChannelPipe(LiteXModule):
 
         # T+1: product (DSP). ---------------------------------------------------------------------
         prod   = Signal((34, True))
-        bias_s = Signal((8, True)) # Signed copy of B: signed-only arithmetic for sh_r.
-        sh_r   = Signal((8, True)) # 12 - (e16 + B) in [0, 44].
+        bias_s = Signal((8, True)) # Signed copy of B: signed-only arithmetic for sh_c.
+        sh_c   = Signal((8, True)) # 12 - (e16 + B) in [0, 44] (comb; was the sh_r register).
+        shamt  = Signal(6)         # Saturated at T+1 (>>45 of a 46-bit value = sign only),
+                                   # so T+2 is register -> 46-bit shifter -> register.
         v3     = Signal()
         row3   = Signal(16)
         rlast3 = Signal()
-        self.comb += bias_s.eq(self.bias)
+        self.comb += [
+            bias_s.eq(self.bias),
+            sh_c.eq(12 - e16 - bias_s),
+        ]
         self.sync += [
             prod.eq(gs*m11),
-            sh_r.eq(12 - e16 - bias_s),
+            shamt.eq(Mux(sh_c > 45, 45, sh_c)),
             v3.eq(v2),
             row3.eq(row2),
             rlast3.eq(row_last2),
@@ -573,8 +604,6 @@ class BonsaiChannelPipe(LiteXModule):
         v4      = Signal()
         row4    = Signal(16)
         rlast4  = Signal()
-        shamt   = Signal(6)
-        self.comb += shamt.eq(Mux(sh_r > 45, 45, sh_r)) # >>45 of a 46-bit value = sign only.
         self.sync += [
             contrib.eq((prod << 12) >> shamt),
             v4.eq(v3),

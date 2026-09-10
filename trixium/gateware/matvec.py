@@ -323,6 +323,14 @@ class BonsaiMatVecEngine(LiteXModule):
         # cmd_r and are stable one cycle later, together with the registered start pulse
         # below - the first beat or fill write reaches a pipe later than that.
         for i, pipe in enumerate(self.pipes):
+            # The copies are logically identical, so opt_design merged them back into ONE
+            # flop (kept under pipe 0's name) with a fanout of 9,756 and ~3.4 ns of route
+            # into every pipe's AXPY shift cone - the largest failing-endpoint family on
+            # v11 (2026-09-10). dont_touch keeps each pipe's copy next to its consumers,
+            # the v1_rep / fill_*2 idiom. (rows differs per pipe and never merged.)
+            for s in (pipe.kind, pipe.scale_beats, pipe.code_beats, pipe.bias,
+                      pipe.rshift, pipe.qn, pipe.rshift2):
+                s.attr.add(("dont_touch", "true"))
             self.sync += [
                 pipe.kind.eq(Mux(axpy_mode, 2,
                              Mux(fetch_mode | store_mode, 0, cmd_r["kind"][0:2]))),
