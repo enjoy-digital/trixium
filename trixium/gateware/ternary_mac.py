@@ -439,8 +439,6 @@ class BonsaiChannelPipe(LiteXModule):
           self.sync += ax_bmr2.eq(ax_bias - ax_rpre2 - 15)
           ax_amt2 = amount_regs(ax_sh2, "b")
         v2a    = _delay(self, v1, 1)              # Lane products valid (T2).
-        v3a    = _delay(self, v1, 2)              # Shifted values valid (T3).
-        g_ax2  = _delay(self, g_ax_r, 2)          # Beat group at T3.
         ax_shifted  = []
         ax_shifted2 = []
         for j in range(32):
@@ -514,20 +512,49 @@ class BonsaiChannelPipe(LiteXModule):
             )
         )
 
-        self.sync += [
-            If(self.start,
-                *[acc_ax[g][j].eq(0) for g in range(AX_GROUPS) for j in range(32)],
-                *([acc_ax2[g][j].eq(0) for g in range(AX_GROUPS) for j in range(32)]
-                  if dual else []),
-            ).Elif(v3a & is_axpy,
-                Case(g_ax2[:2], {g: [acc_ax[g][j].eq(acc_ax[g][j] + ax_shifted[j])
-                                     for j in range(32)] for g in range(AX_GROUPS)}),
-                *([If(self.qn,
-                    Case(g_ax2[:2], {g: [acc_ax2[g][j].eq(acc_ax2[g][j] + ax_shifted2[j])
-                                         for j in range(32)] for g in range(AX_GROUPS)}),
-                )] if dual else [])
-            ),
-        ]
+        # Accumulate: ONE adder per lane, shared by the four groups (2026-09-10). The RTL
+        # used to write all 128 additions out (Case over the group, each arm its own
+        # `acc += x`), which synthesized as 128 32-bit adders per channel (512 CARRY8) of
+        # which one group's 32 ever added on a beat. Now the beat's bank is selected
+        # (4:1 per lane, select replicated per 8 lanes), added once, and written back
+        # under a registered per-bank enable. Exact: the group sequence is cyclic within a
+        # row and rows are separated by at least one scale beat, so the same bank is
+        # never updated on consecutive beats and the single-cycle read-modify-write sees
+        # its own previous write. `start` keeps priority over the enables.
+        g_ax1 = _delay(self, g_ax_r, 1)           # Beat group at T2 (decode below -> T3).
+        ax_we = [Signal(name=f"ax_we{g}") for g in range(AX_GROUPS)]
+        self.sync += [ax_we[g].eq(v2a & is_axpy & (g_ax1[:2] == g)) for g in range(AX_GROUPS)]
+        g_sel = []
+        for k in range(4):
+            c = Signal(2, name=f"ax_gsel{k}")
+            c.attr.add(("dont_touch", "true"))
+            self.sync += c.eq(g_ax1[:2])        # The beat's group at T3, one copy per 8 lanes.
+            g_sel.append(c)
+        if dual:
+            ax_we2 = [Signal(name=f"ax_we2_{g}") for g in range(AX_GROUPS)]
+            self.sync += [ax_we2[g].eq(v2a & is_axpy & self.qn & (g_ax1[:2] == g))
+                          for g in range(AX_GROUPS)]
+        for j in range(32):
+            acc_sel = Signal((32, True))
+            acc_sum = Signal((32, True))
+            self.comb += [
+                Case(g_sel[j // 8], {g: acc_sel.eq(acc_ax[g][j]) for g in range(AX_GROUPS)}),
+                acc_sum.eq(acc_sel + ax_shifted[j]),
+            ]
+            for g in range(AX_GROUPS):
+                self.sync += If(self.start, acc_ax[g][j].eq(0)
+                                ).Elif(ax_we[g], acc_ax[g][j].eq(acc_sum))
+            if not dual:
+                continue
+            acc_sel2 = Signal((32, True))
+            acc_sum2 = Signal((32, True))
+            self.comb += [
+                Case(g_sel[j // 8], {g: acc_sel2.eq(acc_ax2[g][j]) for g in range(AX_GROUPS)}),
+                acc_sum2.eq(acc_sel2 + ax_shifted2[j]),
+            ]
+            for g in range(AX_GROUPS):
+                self.sync += If(self.start, acc_ax2[g][j].eq(0)
+                                ).Elif(ax_we2[g], acc_ax2[g][j].eq(acc_sum2))
 
         # T2..: adder trees (both built; result muxed by kind). -----------------------------------
         tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
