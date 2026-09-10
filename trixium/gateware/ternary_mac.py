@@ -352,30 +352,43 @@ class BonsaiChannelPipe(LiteXModule):
         # P register (same cycle), and Vivado folds the first Q8 tree levels into the DSP
         # ALUs. Exact by construction (a 27x18 signed multiplier). The 16 channels' 912
         # DSPs are 32% of the die's; they were 3% used.
+        # Operands registered at T1 (the DSP's A/B registers), product at T2 -> valid T3,
+        # one cycle later than the ternary lanes. The single-cycle form (x-buffer BRAM read
+        # -> slice mux -> AXPY mux -> multiply -> P) was the top failing family of v13a and
+        # 17k of v14a's 21.7k endpoints at 212.5 MHz (2026-09-10). The T1 path is now the
+        # same class as the ternary lanes' (BRAM read -> mux -> FF) and the multiply sits
+        # entirely inside the DSP. Costs one cycle of Q8/AXPY op latency, not throughput.
+        v2_q8  = [_delay(self, c, 1) for c in v1_q8]
+        v2b_q8 = [_delay(self, c, 1) for c in v1b_q8] if dual else []
         for j in range(32):
             w_j = Signal((8, True))
             x_j = Signal((8, True))
+            w_r = Signal((8, True))
+            x_r = Signal((8, True))
             p   = Signal((16, True))
             p.attr.add(("use_dsp", "yes"))
             self.comb += [
                 w_j.eq(codes_r[8*j:8*j+8]),
                 x_j.eq(Mux(is_axpy, p8_ax, xslice[8*j:8*j+8])),
-                p.eq(w_j*x_j),
+                p.eq(w_r*x_r),
             ]
+            self.sync += If(v1_q8[j // 16], w_r.eq(w_j), x_r.eq(x_j))
             r = Signal((16, True))
-            self.sync += If(v1_q8[j // 16], r.eq(p))
+            self.sync += If(v2_q8[j // 16], r.eq(p))
             q8_lanes.append(r)
             if not dual:
                 continue
             xb_j = Signal((8, True))
+            xb_r = Signal((8, True))
             pb   = Signal((16, True))
             pb.attr.add(("use_dsp", "yes"))
             self.comb += [
                 xb_j.eq(Mux(is_axpy, p8_axb, xsliceb[8*j:8*j+8])),
-                pb.eq(w_j*xb_j),
+                pb.eq(w_r*xb_r),
             ]
+            self.sync += If(v1b_q8[j // 16], xb_r.eq(xb_j))
             rb = Signal((16, True))
-            self.sync += If(v1b_q8[j // 16], rb.eq(pb))
+            self.sync += If(v2b_q8[j // 16], rb.eq(pb))
             q8_lanesb.append(rb)
 
         # Scale fp16: the beat's halfword selected at T1 straight from the scale RAM read
@@ -419,19 +432,24 @@ class BonsaiChannelPipe(LiteXModule):
         ]
         self.sync += ax_bmr.eq(ax_bias - ax_rpre - 15)
         def amount_regs(sh, tag):
-            """Registered (neg, shl, shr) for `sh`, one dont_touch copy per 8 lanes."""
+            """(neg, shl, shr) for `sh`: registered at T1 (valid T2), then one more stage
+            so they meet the products at T3; one dont_touch copy per 8 lanes."""
             copies = []
             for k in range(4):
+                neg1 = Signal(name=f"axneg1_{tag}{k}")
+                shl1 = Signal(4, name=f"axshl1_{tag}{k}")
+                shr1 = Signal(5, name=f"axshr1_{tag}{k}")
+                self.sync += If(v1_scale,
+                    neg1.eq(sh < 0),
+                    shl1.eq(Mux(sh >= 0, Mux(sh > 15, 15, sh[:4]), 0)),
+                    shr1.eq(Mux(sh < 0, Mux(sh < ax_c31n, 31, (-sh)[:5]), 0)),
+                )
                 neg = Signal(name=f"axneg_{tag}{k}")
                 shl = Signal(4, name=f"axshl_{tag}{k}")
                 shr = Signal(5, name=f"axshr_{tag}{k}")
                 for c in (neg, shl, shr):
                     c.attr.add(("dont_touch", "true"))
-                self.sync += If(v1_scale,
-                    neg.eq(sh < 0),
-                    shl.eq(Mux(sh >= 0, Mux(sh > 15, 15, sh[:4]), 0)),
-                    shr.eq(Mux(sh < 0, Mux(sh < ax_c31n, 31, (-sh)[:5]), 0)),
-                )
+                self.sync += [neg.eq(neg1), shl.eq(shl1), shr.eq(shr1)]
                 copies.append((neg, shl, shr))
             return copies
         ax_amt = amount_regs(ax_sh, "a")
@@ -446,7 +464,7 @@ class BonsaiChannelPipe(LiteXModule):
           ]
           self.sync += ax_bmr2.eq(ax_bias - ax_rpre2 - 15)
           ax_amt2 = amount_regs(ax_sh2, "b")
-        v2a    = _delay(self, v1, 1)              # Lane products valid (T2).
+        v2a    = _delay(self, v1, 2)              # Lane products valid (T3).
         ax_shifted  = []
         ax_shifted2 = []
         for j in range(32):
@@ -478,7 +496,7 @@ class BonsaiChannelPipe(LiteXModule):
         # Final-beat tag: last code beat of the last row, aligned to the accumulate stage.
         fin_t0  = Signal()
         self.comb += fin_t0.eq(t0_fire & row_last & (row_cnt == self.rows - 1))
-        fin_acc = _delay(self, fin_t0, 3)         # Accumulate of the final beat done (T4).
+        fin_acc = _delay(self, fin_t0, 4)         # Accumulate of the final beat done (T5).
 
         d_cnt   = Signal(8)
         d_total = Signal(8)
@@ -529,7 +547,7 @@ class BonsaiChannelPipe(LiteXModule):
         # row and rows are separated by at least one scale beat, so the same bank is
         # never updated on consecutive beats and the single-cycle read-modify-write sees
         # its own previous write. `start` keeps priority over the enables.
-        g_ax1 = _delay(self, g_ax_r, 1)           # Beat group at T2 (decode below -> T3).
+        g_ax1 = _delay(self, g_ax_r, 2)           # Beat group at T3 (decode below -> T4).
         ax_we = [Signal(name=f"ax_we{g}") for g in range(AX_GROUPS)]
         self.sync += [ax_we[g].eq(v2a & is_axpy & (g_ax1[:2] == g)) for g in range(AX_GROUPS)]
         g_sel = []
@@ -567,15 +585,17 @@ class BonsaiChannelPipe(LiteXModule):
         # T2..: adder trees (both built; result muxed by kind). -----------------------------------
         tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
         q8_sum,   q8_regs   = _adder_tree(self, q8_lanes)   # 5 levels -> 21b, n regs.
-        n_tree = max(tern_regs, q8_regs)
+        # Q8 lanes are valid one cycle after the ternary lanes (the DSP operand stage).
+        n_tree = max(tern_regs, q8_regs + 1)
+        assert n_tree == 3 and q8_regs + 1 <= n_tree
         tern_sum  = _delay(self, tern_sum,  n_tree - tern_regs)
-        q8_sum    = _delay(self, q8_sum,    n_tree - q8_regs)
+        q8_sum    = _delay(self, q8_sum,    n_tree - q8_regs - 1)
         gs  = Signal((22, True))
         self.comb += gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum))
         if dual:
             q8_sumb,   q8_regsb   = _adder_tree(self, q8_lanesb)  # Head B (dual-Q).
             tern_sumb, tern_regsb = _adder_tree(self, tern_lanesb)
-            q8_sumb   = _delay(self, q8_sumb,   n_tree - q8_regsb)
+            q8_sumb   = _delay(self, q8_sumb,   n_tree - q8_regsb - 1)
             tern_sumb = _delay(self, tern_sumb, n_tree - tern_regsb)
             gsb = Signal((22, True))
             self.comb += gsb.eq(Mux(self.kind == KIND_OP_Q8, q8_sumb, tern_sumb))
@@ -732,9 +752,9 @@ class BonsaiChannelPipe(LiteXModule):
                 out_fifo.sink.data.eq(result[:32]),
             ),
             out_fifo_rdy_ax.eq(axw_fifo.sink.ready),
-            # 8 slots of slack cover in-flight results (<= 3 row-lasts in the T+0..T+3
-            # stages, x2 for the dual-Q staged head-B pushes).
-            out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 8)),
+            # 9 slots of slack cover in-flight results (<= 4 row-lasts in the T+0..T+4
+            # stages with the Q8 operand register, x2 for the dual-Q staged head-B pushes).
+            out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 9)),
             If(self.kind == KIND_OP_AXPY,
                 self.source.valid.eq(axw_fifo.source.valid),
                 self.source.row.eq(axw_fifo.source.row),
