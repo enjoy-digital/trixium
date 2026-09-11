@@ -319,12 +319,20 @@ static void tokclr_cmd(void)
 static void tok_cmd(char *args)
 {
     char *tok;
+    uint32_t vocab = model_header() ? model_header()->vocab : 0;
     while (1) {
         tok = get_token(&args);
         if (*tok == 0)
             break;
+        int id = parse_int(tok);
+        // A garbled line (the console drops characters from long bursts) can merge two
+        // ids into one past the vocabulary; refuse the whole line so the host resends it.
+        if (vocab && (uint32_t)id >= vocab) {
+            printf("TOK ERR bad id %d (vocab %lu)\n", id, (unsigned long)vocab);
+            return;
+        }
         if (pbuf_n < PBUF_N)
-            pbuf[pbuf_n++] = parse_int(tok);
+            pbuf[pbuf_n++] = id;
     }
     printf("TOK %d\n", pbuf_n); // Host uses this to confirm the running length.
 }
@@ -351,10 +359,10 @@ static void genb_cmd(char *args)
     printf("GEN:");
     gen_emit_to_pbuf = 1;
     infer_set_stop(stop, nstop);
-    infer_generate(pbuf, pbuf_n, n, emit_token);
+    int r = infer_generate(pbuf, pbuf_n, n, emit_token);
     infer_set_stop(stop, 0);
     gen_emit_to_pbuf = 0;
-    puts("\nGEN DONE");
+    puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
 }
 
 static void gen_cmd(char *args)
@@ -374,8 +382,8 @@ static void gen_cmd(char *args)
         return;
     }
     printf("GEN:");
-    infer_generate(prompt, np, n, emit_token);
-    puts("\nGEN DONE");
+    int r = infer_generate(prompt, np, n, emit_token);
+    puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
 }
 
 static void sptest(void)

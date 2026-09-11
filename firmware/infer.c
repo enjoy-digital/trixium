@@ -4125,6 +4125,19 @@ static int gen_is_stop(int tok)
 
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {
+    // An id past the vocabulary makes the embedding fetch read a row that does not exist -
+    // an engine stall only reconfiguring the FPGA clears. It happened: the console dropped
+    // characters from a long `tok` line and two ids merged (2026-09-11). Refuse the
+    // request instead; the console commands report it as GEN ERR.
+    if (!H || H->magic != BONS_MAGIC || n_layer == 0) {
+        printf(" [no model: hdrload first]");
+        return -1;
+    }
+    for (int i = 0; i < n_prompt; i++)
+        if (prompt[i] < 0 || (uint32_t)prompt[i] >= H->vocab) {
+            printf(" [bad token id %d at %d, vocab %lu]", prompt[i], i, (unsigned long)H->vocab);
+            return -1;
+        }
     n_pos = 0; // Reset the KV cache (fresh generation).
 #ifdef BONSAI_HAS_KVSTORE
     // ...and its exponent ratchet. kv_ekmax is the running max over every row ever

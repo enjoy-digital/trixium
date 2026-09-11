@@ -530,6 +530,32 @@ static int fastboot(const char *fw)
 /* Chat                                                                                   */
 /*---------------------------------------------------------------------------------------*/
 
+/* Console lines go out in small chunks, each acknowledged by its echo before the next.
+ *
+ * The firmware's UART RX ring is 128 bytes (libbase uart.c) and the ISR DROPS bytes when it
+ * is full; the console loop drains it one byte per iteration and echoes each through a TX
+ * ring the host driver empties on a poll timer. A long `tok` line written in one burst thus
+ * loses characters as soon as the echo stalls - two ids merge into one out-of-range id, and
+ * an id past the vocabulary sends the engine to fetch a row that does not exist: ENGSTALL,
+ * reconfigure the FPGA. Seen with 130-character lines on 2026-09-11; the 850-character
+ * lines both clients allowed were never safe. Waiting for the echo bounds the bytes in
+ * flight to one chunk, well inside the ring. */
+#define PACE_CHUNK 48
+static void tty_write_paced(const char *buf, size_t n)
+{
+    while (n) {
+        size_t k = n < PACE_CHUNK ? n : PACE_CHUNK;
+        tty_write(buf, k);
+        double t0 = now_s();
+        size_t got = 0;
+        while (got < k && now_s() - t0 < 3.0) {  /* the echo, byte for byte */
+            uint8_t c;
+            if (read(g_tty, &c, 1) == 1) got++;
+        }
+        buf += k; n -= k;
+    }
+}
+
 static void send_line(const char *fmt, ...)
 {
     char line[1200];
@@ -537,7 +563,7 @@ static void send_line(const char *fmt, ...)
     int n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
     va_end(ap);
     line[n++] = '\n'; line[n] = 0;
-    tty_write(line, n);
+    tty_write_paced(line, n);
 }
 
 /* Firmware console line buffer is 1024 B; send the prompt in comfortably-sized chunks. */

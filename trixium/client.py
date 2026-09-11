@@ -82,13 +82,34 @@ class Bonsai:
                     return bytes(buf)
         raise BonsaiError(f"timeout waiting for {needle!r}; got {bytes(buf[-200:])!r}")
 
+    # The firmware's UART RX ring is 128 bytes and its ISR drops bytes when it is full; the
+    # console loop drains one byte per iteration and echoes each through a TX ring the host
+    # driver empties on a poll timer. A long `tok` line written in one burst loses characters
+    # (two ids merge into one past the vocabulary -> the engine fetches a row that does not
+    # exist -> ENGSTALL, reconfigure the FPGA; 2026-09-11). So lines go out in chunks, each
+    # acknowledged by its echo, byte for byte, before the next.
+    PACE_CHUNK = 48
+
+    def _write_paced(self, data):
+        """Write `data`, waiting for each chunk's echo. Returns bytes read past the echo
+        (the start of the reply, when a read overshoots)."""
+        surplus = b""
+        for i in range(0, len(data), self.PACE_CHUNK):
+            chunk = data[i:i + self.PACE_CHUNK]
+            self.ser.write(chunk)
+            self.ser.flush()
+            got = surplus
+            deadline = time.time() + 3.0
+            while len(got) < len(chunk) and time.time() < deadline:
+                got += self.ser.read(len(chunk) - len(got))
+            surplus = got[len(chunk):]
+        return surplus
+
     def command(self, line, timeout=None):
         """Run one firmware console command; returns its output (without the echo/prompt)."""
-        self.ser.write(line.encode() + b"\n")
-        self.ser.flush()
-        out = self._read_until(PROMPT, timeout or self.timeout)
+        surplus = self._write_paced(line.encode() + b"\n")
+        out = surplus + self._read_until(PROMPT, timeout or self.timeout)
         text = out.decode(errors="replace")
-        text = text.split("\n", 1)[1] if "\n" in text else ""     # Drop the echoed line.
         return text.rsplit("bonsai>", 1)[0].replace("\r", "").strip("\n")
 
     def hdrload(self):
@@ -143,9 +164,7 @@ class Bonsai:
         # The firmware stops at <|im_end|> (emitted, kept in the buffer) - without it the
         # model runs on past its answer until max_tokens.
         stop = f" {self.im_end}" if self.im_end is not None else ""
-        self.ser.write(f"genb {max_tokens}{stop}\n".encode())
-        self.ser.flush()
-        pending = ""
+        pending = self._write_paced(f"genb {max_tokens}{stop}\n".encode()).decode(errors="replace")
         ids = []
         decoded_upto = 0
         deadline = time.time() + self.timeout
