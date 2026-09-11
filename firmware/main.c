@@ -742,14 +742,24 @@ int main(void)
     if (infer_init() == 0) {
         // Boot generation demo (deterministic; checked by the sim harness).
         static const int prompt[3] = {1, 2, 3};
-        // The GEN leg is the all-CPU reference the gate compares against hybrid_generate's
-        // CPU modes, so pin it here rather than inheriting whatever the default mask is.
-        hwops_set_all(0);
-        printf("GEN:");
-        perf_reset();
-        infer_generate(prompt, 3, 2, emit_token);
-        puts("\nGEN DONE");
-        perf_print();
+        // The legs that only exist for the gate are skipped on big models: on the 1.7B
+        // the all-CPU reference alone is 3.2 G cycles - 15 s of what was a 16 s boot -
+        // and the tiny sim model (2 layers) still runs every leg. GEN-HW stays: two
+        // tokens through the hardware path cost 35 ms and prove the units are alive.
+        const int big_model = model_header()->n_layer > 8;
+        if (big_model) {
+            puts("GEN skipped at boot on this model size (`hwops all cpu` + `gen` runs the CPU reference)");
+        } else {
+            // The GEN leg is the all-CPU reference the gate compares against
+            // hybrid_generate's CPU modes, so pin it here rather than inheriting
+            // whatever the default mask is.
+            hwops_set_all(0);
+            printf("GEN:");
+            perf_reset();
+            infer_generate(prompt, 3, 2, emit_token);
+            puts("\nGEN DONE");
+            perf_print();
+        }
         if (hw_caps()) {
             hwops_set_all(1);
             printf("GEN-HW:");
@@ -764,7 +774,7 @@ int main(void)
             // (It used to be skipped because the sequencer stalled here; that was the
             // interleaved-gather bug, now fixed.) `spec on` reaches it deliberately, and
             // the sim's tiny model still runs the leg so the gate keeps checking it.
-            if (model_header()->n_layer > 8) {
+            if (big_model) {
                 puts("GEN-SP skipped at boot on this model size (use `spec on` to run it)");
                 goto boot_demo_done;
             }

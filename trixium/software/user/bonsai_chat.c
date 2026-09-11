@@ -458,7 +458,7 @@ static int fastboot(const char *fw)
     printf("[boot] CPU reset, waiting for the BIOS prompt...\n");
     loader_cpu_reset();
     /* The prompt is coloured ("\e[92;1mlitex\e[0m> "), so match its uncoloured tail. It
-     * comes after the 2 MB memtest/memspeed and the serial-boot timeout, ~6 s. */
+     * comes after the 2 MB memtest/memspeed and the serial-boot timeout: 1.0 s. */
     if (!tty_expect("[0m> ", 30.0, NULL, 0, 0)) {
         tty_write("\n", 1);
         if (!tty_expect("[0m> ", 10.0, NULL, 0, 0)) {
@@ -708,10 +708,11 @@ int main(int argc, char **argv)
     if (fw_serial && serialboot(fw_serial) < 0) return 1;
 
     /* Sync with the firmware prompt. The firmware runs its power-on self-tests (scratchpad,
-     * vector-unit programs, and with a model present the engine matvec/fetch checksums)
-     * before it prints a prompt, which takes well over ten seconds on a cold boot - waiting
-     * too briefly here reports "firmware not running" for a board that is merely busy, and
-     * eats the startup log on the way out. */
+     * vector-unit programs, and with a model present the engine matvec/fetch checksums and
+     * a two-token generation) before it prints a prompt: 0.2 s on the 1.7B now that the
+     * all-CPU reference leg is skipped there, but a firmware that still runs it takes 15 s,
+     * and waiting too briefly reports "firmware not running" for a board that is merely
+     * busy, eating the startup log on the way out. */
     send_line("");
     if (!tty_expect("bonsai>", 120.0, NULL, 0, 1)) { /* echo: show the self-tests as they run */
         fprintf(stderr,
