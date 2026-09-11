@@ -85,6 +85,9 @@ static const struct merge_slot *merge_find(uint32_t a, uint32_t b)
     return NULL;
 }
 
+static uint8_t g_tok_sha[32];
+static int     g_tok_sha_ok;
+
 static int tok_load(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -98,6 +101,10 @@ static int tok_load(const char *path)
         fclose(f); return -1;
     }
 
+    if (ver >= 2) {                                  /* v2: the source tokenizer.json's hash. */
+        if (fread(g_tok_sha, 32, 1, f) != 1) { perror("fread"); fclose(f); return -1; }
+        g_tok_sha_ok = 1;
+    }
     long here = ftell(f);
     fseek(f, 0, SEEK_END);
     long rest = ftell(f) - here;
@@ -720,6 +727,23 @@ int main(int argc, char **argv)
     tty_expect("bonsai>", 30.0, cap, sizeof(cap), 0);
     if (strstr(cap, "inference ready") == NULL)
         fprintf(stderr, "[warn] hdrload did not report 'inference ready':\n%s\n", cap);
+    if (g_tok_sha_ok) {
+        /* The image header carries the converter's tokenizer hash; a mismatch means the
+         * ids sent and the ids the model was converted with do not agree. */
+        send_line("info");
+        tty_expect("bonsai>", 10.0, cap, sizeof(cap), 0);
+        char *p = strstr(cap, "tokenizer sha256 ");
+        char hex[65];
+        for (int i = 0; i < 32; i++) sprintf(hex + 2*i, "%02x", g_tok_sha[i]);
+        if (!p)
+            fprintf(stderr, "[warn] firmware did not report the image's tokenizer hash\n");
+        else if (strncmp(p + 17, hex, 64) != 0)
+            fprintf(stderr, "[warn] TOKENIZER MISMATCH: image %.16s..., %s %.16s...\n"
+                            "       (convert with --tokenizer <the json this .bin came from>)\n",
+                    p + 17, tokf, hex);
+        else
+            printf("[init] tokenizer matches the image (%.16s...)\n", hex);
+    }
 
     printf("\nTriXium chat - type a prompt, Ctrl-D to quit.\n"
            "(each turn continues the conversation on-card; /reset clears it)\n\n");

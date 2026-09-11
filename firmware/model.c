@@ -119,6 +119,10 @@ void model_info(void)
            (unsigned long)h->n_head, (unsigned long)h->n_kv_head, (unsigned long)h->ffn_dim,
            (unsigned long)h->vocab, (unsigned long)h->n_tensors, (unsigned long)h->n_channels,
            (unsigned long)h->payload_beats);
+    printf("tokenizer sha256 ");                     // The converter's --tokenizer file;
+    for (int i = 0; i < 32; i++)                     // bonsai_chat compares it with its own.
+        printf("%02x", h->tokenizer_sha256[i]);
+    printf("\n");
 }
 
 // Fill the engine op for a tensor without running it: the FFN descriptor list rebuilds its

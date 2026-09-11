@@ -10,7 +10,8 @@
 
 #include <stdint.h>
 
-#define BONS_MAGIC 0x534E4F42 // "BONS"
+#define BONS_MAGIC   0x534E4F42 // "BONS"
+#define BONS_VERSION 1          // layout.BONS_VERSION; infer_init refuses any other.
 
 // Tensor kinds.
 #define KIND_TERNARY 0

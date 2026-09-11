@@ -3648,6 +3648,11 @@ int infer_init(void)
     H = model_header();
     if (H->magic != BONS_MAGIC)
         return -1;
+    if (H->version != BONS_VERSION) { // Only the magic was checked before 2026-09-11: a
+        printf("infer: BONS version %lu, this firmware reads version %u\n", // future layout
+               (unsigned long)H->version, BONS_VERSION);                    // would be misread.
+        return -2;
+    }
 #ifdef BONSAI_N_CHANNELS
     if (H->n_channels != BONSAI_N_CHANNELS) {
         printf("infer: image channels (%lu) != engine channels (%u)\n",
@@ -3752,6 +3757,19 @@ int infer_init(void)
     kv_base   = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
     kv_rb     = 1 + head_dim/32; // One scale beat + code beats (cols = head_dim, Q8).
     kv_region = (uint32_t)((max_ctx + n_ch - 1)/n_ch)*kv_rb;
+    // Engine channel 3's window lies inside main_ram (see HEAP_HI_BASE): its payload + KV
+    // tail must stay under the high heap. 142 MB on the 1.7B with the int16 embedding
+    // table, against 144 MB - close enough to check every time the image changes.
+    for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
+        uint64_t win  = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)c*BONSAI_CHAN_STRIDE;
+        uint64_t tail = win + H->payload_beats*32
+                      + (uint64_t)n_layer*n_kv_head*2*kv_region*32;
+        if (win < 0x40000000ull + MAIN_RAM_SIZE && tail > 0x40000000ull && tail > HEAP_HI_BASE) {
+            printf("infer: channel %lu's weights+KV reach %08lx, past the high heap at %08x\n",
+                   (unsigned long)c, (unsigned long)tail, (unsigned)HEAP_HI_BASE);
+            return -4;
+        }
+    }
     kv_ekmax  = halloc(n_layer*n_kv_head*2);
     for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
 #ifdef CSR_SEQ_BASE
