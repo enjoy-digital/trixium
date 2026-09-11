@@ -17,7 +17,7 @@ VIVADO_SETTINGS ?= /opt/Xilinx/2024.1/Vivado/2024.1/settings64.sh
 venv:
 	python3 -m venv .venv
 	$(PIP) install --upgrade pip
-	$(PIP) install numpy pytest tokenizers huggingface_hub
+	$(PIP) install -e ".[dev]"   # numpy tokenizers pyserial + pytest huggingface_hub; the `bonsai` CLI
 
 .PHONY: df-check
 df-check:
@@ -34,6 +34,22 @@ models: df-check
 .PHONY: tiny
 tiny:
 	$(PYTHON) -m trixium.model.tinygen --out models/tiny
+
+# The model path: GGUF -> BONS image (~13 s, ~2 GB RAM for the 1.7B) + the C tool's tokenizer.
+GGUF     ?= models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf
+CHANNELS ?= 16
+.PHONY: convert
+convert:
+	$(PYTHON) -m trixium.cli convert $(GGUF) --channels $(CHANNELS)
+	$(PYTHON) -m trixium.cli tokenizer $(dir $(GGUF))tokenizer.json
+
+# The card: deploy a build to the lab board (tools/board.env), or chat where the card is.
+BUILD ?= n16_212_v14b
+.PHONY: deploy chat
+deploy:
+	$(PYTHON) -m trixium.cli deploy $(BUILD)
+chat: software
+	$(PYTHON) -m trixium.cli chat
 
 # Tests / Simulation -----------------------------------------------------------------------------
 
@@ -75,11 +91,11 @@ load-c:
 
 .PHONY: firmware
 firmware:
-	$(MAKE) -C firmware
+	$(MAKE) -C firmware BUILD_DIR=../build/$(BUILD)
 
 .PHONY: software
 software:
-	$(MAKE) -C trixium/software/user
+	$(MAKE) -C trixium/software/user BUILD_DIR=../../../build/$(BUILD)
 
 .PHONY: driver
 driver:
