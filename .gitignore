@@ -77,3 +77,8 @@ tools/vsim/obj_engine/
 firmware/.build_dir_stamp
 /trace.json
 firmware/progs.h
+
+# Vivado scratch files it drops in the CWD
+vivado_pid*.str
+vivado*.jou
+vivado*.log
