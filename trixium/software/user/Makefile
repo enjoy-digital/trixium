@@ -1,10 +1,12 @@
 # Point BUILD_DIR at the gateware build whose bitstream is loaded: the generated headers
 # (BONSAI_N_CHANNELS, CSR map) differ per build and a mismatch silently misconfigures the
-# card. Defaults to the N=8 200 MHz phase-2 build.
-BUILD_DIR ?= ../../../build/trixium_b_n8_200
-GEN_INC   := $(BUILD_DIR)/software/include/generated
+# card. Defaults to the shipping build (tools/build_fk33.sh).
+BUILD_DIR ?= ../../../build/n16_212_v14b
+# The driver-flavour headers (csr.h/soc.h/mem.h without the <generated/...> includes) are
+# what host code compiles against; the deploy script regenerates them next to the build.
+GEN_INC   := $(BUILD_DIR)/driver/kernel
 
-CFLAGS=-O2 -Wall -g -I$(GEN_INC) -I../kernel -Iliblitepcie -MMD -fPIC
+CFLAGS=-O2 -Wall -g -I$(GEN_INC) -I$(BUILD_DIR)/software/include -I../kernel -Iliblitepcie -MMD -fPIC
 LDFLAGS=-g
 CC=$(CROSS_COMPILE)gcc
 AR=ar
@@ -20,10 +22,10 @@ liblitepcie/liblitepcie.a: liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash
 bonsai_util: liblitepcie/liblitepcie.a bonsai_util.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
-bonsai_load: liblitepcie/liblitepcie.a bonsai_load.o
+bonsai_load: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_load.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
-bonsai_chat: liblitepcie/liblitepcie.a bonsai_chat.o
+bonsai_chat: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_chat.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
 clean:

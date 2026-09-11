@@ -37,6 +37,7 @@
 #include "liblitepcie.h"
 #include "soc.h"
 #include "mem.h"
+#include "bonsai_loader.h"
 
 /* Firmware load/jump address: the BIOS serialboot target is main_ram (HBM channel 0 on
  * hardware). ROM_BOOT_ADDRESS only exists in the simulation SoC. */
@@ -428,94 +429,41 @@ static int serialboot(const char *fw)
 }
 
 /*---------------------------------------------------------------------------------------*/
-/* Weight upload (PCIe DMA -> loader -> HBM), same sequence as bonsai_load                */
+/* Weight upload and firmware boot, through the shared loader (bonsai_loader.c)            */
 /*---------------------------------------------------------------------------------------*/
-
-struct bons_header {
-    uint32_t magic, version, n_layer, n_embd, n_head, n_kv_head, head_dim, ffn_dim, vocab;
-    uint32_t rope_theta;
-    float    rms_eps;
-    uint32_t max_ctx, n_channels, n_tensors, table_offset, payload_offset;
-    uint64_t payload_beats;
-} __attribute__((packed));
-
-static void dma_write_all(int fd, const uint8_t *buf, size_t len)
-{
-    while (len) {
-        ssize_t r = write(fd, buf, len);
-        if (r < 0) { if (errno == EAGAIN) { usleep(100); continue; } perror("write"); exit(1); }
-        if (r == 0) { fprintf(stderr, "DMA stalled, %zu left\n", len); exit(1); }
-        buf += r; len -= r;
-    }
-}
-
-static void loader_transfer(int fd, int chan, uint32_t base, const uint8_t *d, uint64_t beats)
-{
-    litepcie_writel(fd, CSR_LOADER_CHAN_ADDR,   chan);
-    litepcie_writel(fd, CSR_LOADER_BASE_ADDR,   base);
-    litepcie_writel(fd, CSR_LOADER_LENGTH_ADDR, beats);
-    litepcie_writel(fd, CSR_LOADER_START_ADDR,  1);
-    dma_write_all(fd, d, beats*32);
-    int timeout = 10000;
-    while (!(litepcie_readl(fd, CSR_LOADER_STATUS_ADDR) & 1)) {
-        usleep(1000);
-        if (--timeout == 0) { fprintf(stderr, "loader timeout\n"); exit(1); }
-    }
-}
 
 static int upload_model(int devnum, const char *path)
 {
-    char dev[64];
-    snprintf(dev, sizeof(dev), "/dev/bonsai%d", devnum);
-    int fd = open(dev, O_RDWR);
-    if (fd < 0) { perror(dev); return -1; }
+    (void)devnum; /* BAR0 is mapped once in main() for every loader use. */
+    printf("[load] %s\n", path);
+    return loader_upload_image(path, 0) ? 0 : -1;
+}
 
-    FILE *f = fopen(path, "rb");
-    if (!f) { perror(path); return -1; }
-    struct bons_header h;
-    if (fread(&h, sizeof(h), 1, f) != 1 || h.magic != 0x534E4F42) {
-        fprintf(stderr, "%s: not a BONS image\n", path); return -1;
+/* Fast boot: CPU reset -> BIOS prompt -> firmware into main_ram through the loader ->
+ * BIOS `boot`. The serial-boot protocol moved 100 KB in 64-byte frames with an ack each
+ * (23-44 s, and NAKs part-way often enough that the deploy script retries three times);
+ * the loader does it in about a millisecond. Cache coherency: the BIOS memtest/memspeed
+ * stream 2 MB through the 32 KB write-back D$ before the prompt, so no line of the
+ * firmware's first 100 KB is left in it (dirty or clean) when the loader writes past the
+ * cache, and the BIOS never executes from main_ram (no stale I$ lines). */
+static int fastboot(const char *fw)
+{
+    printf("[boot] CPU reset, waiting for the BIOS prompt...\n");
+    loader_cpu_reset();
+    /* The prompt is coloured ("\e[92;1mlitex\e[0m> "), so match its uncoloured tail. It
+     * comes after the 2 MB memtest/memspeed and the serial-boot timeout, ~6 s. */
+    if (!tty_expect("[0m> ", 30.0, NULL, 0, 0)) {
+        tty_write("\n", 1);
+        if (!tty_expect("[0m> ", 10.0, NULL, 0, 0)) {
+            fprintf(stderr, "fastboot: no BIOS prompt on the console - is the tty right?\n");
+            return -1;
+        }
     }
-    if (h.n_channels != BONSAI_N_CHANNELS) {
-        fprintf(stderr, "image has %u channels, gateware has %u - use the matching image\n",
-                h.n_channels, BONSAI_N_CHANNELS);
-        return -1;
-    }
-    printf("[load] %s: %u layers, %u channels, %.0f MB total\n", path, h.n_layer,
-           h.n_channels, (h.payload_beats*32.0*h.n_channels + h.payload_offset)/1e6);
-
-    litepcie_dma_set_loopback(fd, 0);
-    struct litepcie_ioctl_dma_reader rd = { .enable = 1 };
-    ioctl(fd, LITEPCIE_IOCTL_DMA_READER, &rd);
-
-    uint64_t chan_bytes = h.payload_beats*32;
-    uint64_t bufsz = PAD(chan_bytes > h.payload_offset ? chan_bytes : h.payload_offset);
-    uint8_t *buf = malloc(bufsz);
-    double t0 = now_s();
-
-    fseek(f, 0, SEEK_SET);
-    if (fread(buf, 1, h.payload_offset, f) != h.payload_offset) { perror("fread"); return -1; }
-    memset(buf + h.payload_offset, 0, PAD(h.payload_offset) - h.payload_offset);
-    loader_transfer(fd, 0, HDR_STAGING, buf, PAD(h.payload_offset)/32);
-
-    for (uint32_t c = 0; c < h.n_channels; c++) {
-        fseek(f, (uint64_t)h.payload_offset + (uint64_t)c*chan_bytes, SEEK_SET);
-        if (fread(buf, 1, chan_bytes, f) != chan_bytes) { perror("fread"); return -1; }
-        memset(buf + chan_bytes, 0, PAD(chan_bytes) - chan_bytes);
-        printf("\r[load] channel %u/%u", c + 1, h.n_channels); fflush(stdout);
-#ifdef BONSAI_LOADER_ADDS_CHAN_OFFSET
-        loader_transfer(fd, c, BONSAI_CHAN_WEIGHT_BASE, buf, PAD(chan_bytes)/32);
-#else
-        loader_transfer(fd, c, BONSAI_CHAN_WEIGHT_BASE + (uint32_t)c*BONSAI_CHAN_STRIDE,
-                        buf, PAD(chan_bytes)/32);
-#endif
-    }
-    rd.enable = 0;
-    ioctl(fd, LITEPCIE_IOCTL_DMA_READER, &rd);
-    double dt = now_s() - t0;
-    double mb = (h.payload_offset + (double)h.n_channels*chan_bytes)/1e6;
-    printf("\r[load] %.0f MB in %.1f s (%.2f GB/s)\n", mb, dt, mb/dt/1000);
-    free(buf); fclose(f); close(fd);
+    uint64_t n = loader_upload_firmware(fw);
+    printf("[boot] %llu KB into main_ram - jumping\n", (unsigned long long)(n/1024));
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "boot 0x%08lx\n", (unsigned long)MAIN_RAM_BASE);
+    tty_write(cmd, strlen(cmd));
     return 0;
 }
 
@@ -704,26 +652,34 @@ static void usage(void)
            "  -c N       PCIe device number (default 0)\n"
            "  -t TTY     console tty (default /dev/ttyLXU0)\n"
            "  -m IMAGE   upload a BONS weight image to HBM first\n"
-           "  -k FW      serial-boot this firmware binary first\n"
+           "  -k FW      boot this firmware first (CPU reset, loader into main_ram, BIOS boot)\n"
+           "  -K FW      boot it the old way (serial-boot frames over the console, 30-45 s)\n"
            "  -z FILE    tokeniser (default models/1.7b/tokenizer.bin)\n"
            "  -n N       tokens to generate per turn (default 64)\n"
-           "  -T [FILE]  tokeniser self-test against reference encodings, then exit\n");
+           "  -T [FILE]  tokeniser self-test against reference encodings, then exit\n"
+           "In the chat: /reset clears the conversation, /cmd <line> runs a firmware console\n"
+           "command (e.g. /cmd stats, /cmd hwops), /stats and /help are shortcuts.\n");
 }
 
 int main(int argc, char **argv)
 {
     int devnum = 0, ntok = 64, do_test = 0;
     const char *tty  = "/dev/ttyLXU0";
-    const char *img  = NULL, *fw = NULL;
+    const char *img  = NULL, *fw = NULL, *fw_serial = NULL;
     const char *tokf = "models/1.7b/tokenizer.bin";
     const char *testf = "models/1.7b/tokenizer_tests.txt";
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:m:k:z:n:T::h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::h")) != -1) {
         switch (opt) {
         case 'c': devnum = atoi(optarg); break;
         case 't': tty = optarg; break;
         case 'm': img = optarg; break;
         case 'k': fw  = optarg; break;
+        case 'K': fw_serial = optarg; break;
+        case 'U': /* Upload the firmware through the loader and exit (bring-up aid). */
+            loader_bar_map(devnum);
+            printf("%llu bytes\n", (unsigned long long)loader_upload_firmware(optarg));
+            return 0;
         case 'z': tokf = optarg; break;
         case 'n': ntok = atoi(optarg); break;
         case 'T': do_test = 1; if (optarg) testf = optarg; break;
@@ -734,12 +690,15 @@ int main(int argc, char **argv)
     if (tok_load(tokf) < 0) return 1;
     if (do_test) return self_test(testf);
 
+    if (img || fw)
+        loader_bar_map(devnum);
     if (img && upload_model(devnum, img) < 0) return 1;
 
     g_tty = tty_open(tty);
     if (g_tty < 0) return 1;
 
-    if (fw && serialboot(fw) < 0) return 1;
+    if (fw && fastboot(fw) < 0) return 1;
+    if (fw_serial && serialboot(fw_serial) < 0) return 1;
 
     /* Sync with the firmware prompt. The firmware runs its power-on self-tests (scratchpad,
      * vector-unit programs, and with a model present the engine matvec/fetch checksums)
@@ -776,6 +735,20 @@ int main(int argc, char **argv)
         if (linebuf[ln-1] == '\n') linebuf[--ln] = 0;
         if (ln == 0) continue;
         if (!strcmp(linebuf, "/reset")) { fresh = 1; printf("[context cleared]\n"); continue; }
+        if (!strcmp(linebuf, "/help"))  { strcpy(linebuf, "/cmd help"); }
+        if (!strcmp(linebuf, "/stats")) { strcpy(linebuf, "/cmd stats"); }
+        if (!strncmp(linebuf, "/cmd ", 5)) {
+            /* A firmware console command, its output echoed until the next prompt. */
+            char cap[8192];
+            send_line("%s", linebuf + 5);
+            if (tty_expect("bonsai>", 30.0, cap, sizeof(cap), 0)) {
+                char *nl = strchr(cap, '\n');            /* Drop the echoed command line. */
+                fputs(nl ? nl + 1 : cap, stdout);
+            } else
+                fprintf(stderr, "[no prompt back after 30 s]\n");
+            continue;
+        }
+        if (linebuf[0] == '/') { printf("[unknown: /reset /cmd <line> /stats /help]\n"); continue; }
 
         int n = tok_encode(linebuf, ids, 1024);
         if (n == 0) { printf("[empty after tokenising]\n"); continue; }
