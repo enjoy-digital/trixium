@@ -133,6 +133,16 @@ static void help(void)
     puts("stats [reset]   - per-op cycle profile");
     puts("bench [n]       - profiled generation benchmark (default 4 tokens)");
     puts("vbench          - stage-by-stage cycle microbenchmark");
+    puts("Experiment toggles (all `name on|off`, each printing its state; defaults ship):");
+    puts("  ffnseq fsplit     - FFN as one sequencer list; SiLU split under the up stream");
+    puts("  qkvl qkvx qkro    - QKV projections as a list; K chain inside it; Q chain last");
+    puts("  qfix kvms kvq     - fixed-shift Q quant8; one KV multi-store; redundant KV quant8");
+    puts("  aovl kovl povl lovl eovl ovl fovl - overlap windows (attention, KV, patches,");
+    puts("                      LM head, early fold, op-by-op norms, norm-row prefetch)");
+    puts("  qres ifold embf sbdrain - resident qk-norm rows; integer folds; int16 embedding");
+    puts("                      table; sideband drain-at-start (needs the sbmode CSR)");
+    puts("  fprof tprof atrace engdiag - profiling: FFN windows, token timeline, attention");
+    puts("                      list trace (atrace N arms), engine diagnostics");
 }
 
 static void hwops_cmd(char *args)
