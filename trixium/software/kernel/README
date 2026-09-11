@@ -1,9 +1,17 @@
-- Use 'make' to build the driver
+TriXium PCIe drivers
 
-- Install the driver and create the device with :
+  bonsai.ko    /dev/bonsaiN: BAR0 (CSRs, the HBM loader) and the DMA rings.
+  liteuart.ko  /dev/ttyLXUN: the firmware console over PCIe (the crossover UART).
 
-  ./init.sh
+The headers next to the sources (csr.h, soc.h, mem.h, flags.h, config.h) are generated per
+SoC build - they must come from the build whose bitstream is on the card. `bonsai deploy`
+(tools/fk33_bringup_measure.sh) regenerates them from the build's recorded command line
+and refuses on any CSR difference.
 
-- Remove driver with
+  make                 build both modules
+  sudo ./init.sh       insmod both and make the device nodes world-writable
+  make install         copy them to /lib/modules/.../extra + modules-load.d + a udev rule
+  sudo rmmod bonsai liteuart
 
-  rmmod litepcie
+Secure Boot refuses unsigned modules ("Lockdown: insmod: unsigned module loading is
+restricted"); disable it in the BIOS.
