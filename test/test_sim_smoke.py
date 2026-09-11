@@ -181,17 +181,25 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         e = int(np.frexp(f32(amax))[1]) - 15
         return np.clip(lroundf(x*f32(np.exp2(-e))), -32767, 32767), e
 
+    def w16_exp(w16_name):
+        # The .w16 entry's bias byte is the tensor's exponent (int8; BONS v2) - it was a
+        # fixed -13 that clipped the 1.7B's gammas above 4 (layout.norm16_exp).
+        b = img.by_name[w16_name]["bias"]
+        return b - 256 if b >= 128 else b
+
     def rmsnorm_sp(m, e, name):
         n = len(m)
         if modes.get("rmsnorm", "cpu") == "hw":
-            _, w16 = img.tensor(name.replace(".weight", "") + ".w16")
+            w16_name = name.replace(".weight", "") + ".w16"
+            _, w16 = img.tensor(w16_name)
             sp = bytearray(3*8192)
             sp[0:2*n]         = np.asarray(m).astype("<i2").tobytes()
             sp[8192:8192+2*n] = w16.reshape(-1).astype("<i2").tobytes()
             eps_int = max(1, int(round(float(h["rms_eps"])*2.0**(-2*e))))
             words = vasm.assemble(vasm.PROGRAMS["rmsnorm"]())
             vasm.VecInterp(sp).run(words, [0, 8192, 16384, n//16,
-                                           -int(np.log2(n)), eps_int, (-13) - E_NORM - 15])
+                                           -int(np.log2(n)), eps_int,
+                                           w16_exp(w16_name) - E_NORM - 15])
             return np.frombuffer(bytes(sp[16384:16384+2*n]), dtype="<i2").astype(np.int64)
         w  = norm_w(name)
         v  = m.astype(f32)*f32(np.exp2(e))
@@ -317,14 +325,14 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         words = vasm.assemble(vasm.PROGRAMS[name]())
         return vasm.VecInterp(sp).run(words, args)
 
-    def res_rmsnorm_head(m, es, w16):
+    def res_rmsnorm_head(m, es, w16, ew16):
         n  = len(m)
         sp = bytearray(3*4096)
         sp[0:2*n]         = np.asarray(m).astype("<i2").tobytes()
         sp[4096:4096+2*n] = np.asarray(w16).astype("<i2").tobytes()
         eps_int = max(1, int(round(float(h["rms_eps"])*2.0**(-2*es))))
         vec_prog("rmsnorm", sp, [0, 4096, 8192, n//16, -int(np.log2(n)), eps_int,
-                                 (-13) - E_NORM - 15])
+                                 ew16 - E_NORM - 15])
         return np.frombuffer(bytes(sp[8192:8192+2*n]), dtype="<i2").astype(np.int64)
 
     def res_rope_head(m, tab_row):
@@ -498,15 +506,16 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                 vm, evr = qkv_res("attn_v.weight")
                 _, qn16 = img.tensor(p + "attn_q_norm.w16")
                 _, kn16 = img.tensor(p + "attn_k_norm.w16")
+                eqn16, ekn16 = w16_exp(p + "attn_q_norm.w16"), w16_exp(p + "attn_k_norm.w16")
                 _, rtab = img.tensor("rope_tab")
                 trow = rtab[pos]
                 qh8 = []
                 for i2 in range(n_head):
-                    mh = res_rmsnorm_head(qm[i2*hd:(i2+1)*hd], eqr, qn16.reshape(-1))
+                    mh = res_rmsnorm_head(qm[i2*hd:(i2+1)*hd], eqr, qn16.reshape(-1), eqn16)
                     mh = res_rope_head(mh, trow)
                     qh8.append((quant8_fixed(mh), E_NORM + 8))
                 for i2 in range(n_kv):
-                    mh = res_rmsnorm_head(km[i2*hd:(i2+1)*hd], ekr, kn16.reshape(-1))
+                    mh = res_rmsnorm_head(km[i2*hd:(i2+1)*hd], ekr, kn16.reshape(-1), ekn16)
                     mh = res_rope_head(mh, trow)
                     hbm_kv.setdefault((l, i2, 0), []).append((E_NORM + 8, quant8_fixed(mh)))
                     hbm_kv.setdefault((l, i2, 1), []).append(

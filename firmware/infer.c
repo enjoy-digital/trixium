@@ -531,9 +531,19 @@ static inline volatile int32_t *sp32(uint32_t off) { return (volatile int32_t *)
 static inline volatile int8_t  *sp8(uint32_t off)  { return (volatile int8_t  *)(SCRATCHPAD_BASE + off); }
 
 // rmsnorm: SP int16(src,esrc) -> SP int16(dst) at fixed E_NORM. HW path: fetch the
-// image's int16 norm rows (kind norm16, exponent E_W16) into SP_FET and run the vector
-// unit's two-pass program; CPU path: soft-float with the F32 weights from RAM.
-#define E_W16 (-13) // layout.NORM16_EXP.
+// image's int16 norm rows (kind norm16) into SP_FET and run the vector unit's two-pass
+// program; CPU path: soft-float with the F32 weights from RAM.
+//
+// The int16 rows carry a per-tensor exponent in the entry's bias byte (BONS v2). It was a
+// fixed -13 - "|w| < 4 covers rmsnorm gammas" - and the 1.7B's gammas reach 153: 72 of its
+// 113 norm tensors were clipped at 4.0, whole late-layer attention norms flattened, and
+// "hello" came back in Russian while the CPU path (fp32 gammas) agreed with the fp32
+// reference (2026-09-11). The program's A6 is the combined shift; the sequencer lists get
+// theirs patched per layer next to their A5 (eps) and A1 (resident rows).
+static inline int w16_shift(const struct bons_entry *e)
+{
+    return (int)(int8_t)e->bias - E_NORM - 15;
+}
 
 // rms_eps as an exact integer mantissa/exponent, so the per-call eps does not cost soft-float.
 //
@@ -572,7 +582,7 @@ COLD static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
         int ln = 0;
         while ((1 << ln) < n) ln++;
         int32_t args[7] = {(int32_t)src, (int32_t)SP_FET, (int32_t)dst, n/16,
-                           -ln, eps_int, E_W16 - E_NORM - 15};
+                           -ln, eps_int, w16_shift(w16)};
         vec_run(PROG_RMSNORM, args, 7);
         return;
     }
@@ -663,7 +673,7 @@ static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
         int ln = 0;
         while ((1 << ln) < n) ln++;
         int32_t args[8] = {(int32_t)src, (int32_t)SP_FET, (int32_t)dst16, n/16,
-                           -ln, eps_int, E_W16 - E_NORM - 15, (int32_t)dst8};
+                           -ln, eps_int, w16_shift(w16), (int32_t)dst8};
         perf_enter(OP_RMSNORM);
         uint32_t amax = (uint32_t)vec_run(PROG_RMSNORM_Q8, args, 8);
         perf_exit(OP_RMSNORM);
@@ -860,14 +870,15 @@ static int attn_all_hw(void)
         && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV);
 }
 
-// vec rmsnorm of one head slice in place (w16 rows already staged at w_sp).
-static void vec_rmsnorm_head(uint32_t sp, int es, uint32_t w_sp, int n)
+// vec rmsnorm of one head slice in place (w16 rows already staged at w_sp; shift = the
+// rows' w16_shift).
+static void vec_rmsnorm_head(uint32_t sp, int es, uint32_t w_sp, int n, int shift)
 {
     int eps_int = eps_for(es);
     int ln = 0;
     while ((1 << ln) < n) ln++;
     int32_t args[7] = {(int32_t)sp, (int32_t)w_sp, (int32_t)sp, n/16,
-                       -ln, eps_int, E_W16 - E_NORM - 15};
+                       -ln, eps_int, shift};
     vec_run(PROG_RMSNORM, args, 7);
 }
 
@@ -1150,7 +1161,7 @@ static void seq_build_qkr(void)
     // cycles/token measured vs 87k + 44k attainable). Same instruction sequence per head,
     // so byte-identical by construction; only A5 (eps) of the two norms is patched per layer.
     int32_t nq[8] = {(int32_t)SP_Q, (int32_t)SP_FET, (int32_t)SP_Q, head_dim/16,
-                     -ln, 1, E_W16 - E_NORM - 15, n_head};
+                     -ln, 1, 0, n_head};                       // A5, A6 patched per layer
     int32_t rq[8] = {(int32_t)SP_Q, (int32_t)(SP_Q + head_dim), (int32_t)SP_TAB,
                      (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_Q,
                      head_dim, n_head};
@@ -1160,7 +1171,7 @@ static void seq_build_qkr(void)
             seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);              // q-norm (A5 patched)
         }
         int32_t nk[8] = {(int32_t)SP_K, (int32_t)SP_FET2, (int32_t)SP_K, head_dim/16,
-                         -ln, 1, E_W16 - E_NORM - 15, n_kv_head};
+                         -ln, 1, 0, n_kv_head};                // A5, A6 patched per layer
         int32_t rk[8] = {(int32_t)SP_K, (int32_t)(SP_K + head_dim), (int32_t)SP_TAB,
                          (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_K,
                          head_dim, n_kv_head};
@@ -1186,7 +1197,7 @@ static void seq_build_qkr(void)
                              : (SP_K + (hh - n_head)*head_dim*2);
         uint32_t wsp  = is_q ? SP_FET : SP_FET2;
         int32_t rargs[7] = {(int32_t)sp, (int32_t)wsp, (int32_t)sp, head_dim/16,
-                            -ln, 1, E_W16 - E_NORM - 15};
+                            -ln, 1, 0};                        // A5, A6 patched per layer
         seq_desc_vec(di++, PROG_RMSNORM, rargs, 7, 0);
         int32_t pargs[7] = {(int32_t)sp, (int32_t)(sp + head_dim), (int32_t)SP_TAB,
                             (int32_t)(SP_TAB + head_dim), (head_dim/2)/16,
@@ -1721,7 +1732,7 @@ static void seq_build_qkv(void)
         int ln = 0;
         while ((1 << ln) < head_dim) ln++;
         int32_t nkl[8] = {(int32_t)SP_K, (int32_t)SP_KNW, (int32_t)SP_K, head_dim/16,
-                          -ln, 0, E_W16 - E_NORM - 15, n_kv_head}; // A1 per layer, A5 per token.
+                          -ln, 0, 0, n_kv_head}; // A1, A6 per layer (qkv_prep_layer), A5 per token.
         int32_t rk[8]  = {(int32_t)SP_K, (int32_t)(SP_K + head_dim), (int32_t)SP_TAB,
                           (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_K,
                           head_dim, n_kv_head};
@@ -1790,9 +1801,14 @@ static void qkv_prep_layer(int l)
             lq[sidx] = (uint32_t)seq_eps_int(eq0 + sidx);
             lk[sidx] = (uint32_t)seq_eps_int(ek0 + sidx);
         }
-        // Resident norm rows (qres is a qkvx precondition): A1 of both rmsnorm_h.
+        // Resident norm rows (qres is a qkvx precondition): A1 of both rmsnorm_h, and
+        // A6 = the layer's per-tensor gamma exponent shift.
         seq_patch((uint32_t)seq_qkv_di_kn, 3, SP_KNW + (uint32_t)l*head_dim*2);
         seq_patch((uint32_t)seq_qkr_di_qn, 3, SP_QNW + (uint32_t)l*head_dim*2);
+        seq_patch((uint32_t)seq_qkv_di_kn, 8,
+                  (uint32_t)w16_shift(model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16)));
+        seq_patch((uint32_t)seq_qkr_di_qn, 8,
+                  (uint32_t)w16_shift(model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16)));
         qkv_prepped = l;
         return;
     }
@@ -2155,9 +2171,13 @@ static int forward_pair(int t0, int t1, int *am0, int *am1)
 #ifdef BONSAI_VEC_LOOPS2
             seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);
             seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);
+            seq_patch((uint32_t)seq_qkr_di_qn, 8, (uint32_t)w16_shift(qn16));
+            seq_patch((uint32_t)seq_qkr_di_kn, 8, (uint32_t)w16_shift(kn16));
 #else
-            for (int hh = 0; hh < n_head + n_kv_head; hh++)
+            for (int hh = 0; hh < n_head + n_kv_head; hh++) {
                 seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
+                seq_patch(2*hh, 8, (uint32_t)w16_shift((hh < n_head) ? qn16 : kn16));
+            }
 #endif
             seq_run(0, seq_qkr_count);
             perf_exit(OP_QKNORM);
@@ -2822,14 +2842,19 @@ embed_done: ;
                 if (qtr) qt[qtn++] = perf_now(); // [1] fetches + entry lookups done.
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
 #ifdef BONSAI_VEC_LOOPS2
-                if (!qkvx_ok) { // qkvx: the sequencer reads both from the layer's LUTs.
+                if (!qkvx_ok) { // qkvx: the sequencer reads both from the layer's LUTs,
+                                // and qkv_prep_layer patched both A6s.
                     seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
                     seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);   // rmsnorm_h A5 (k heads).
+                    seq_patch((uint32_t)seq_qkr_di_qn, 8, (uint32_t)w16_shift(qn16)); // A6 (gamma exp).
+                    seq_patch((uint32_t)seq_qkr_di_kn, 8, (uint32_t)w16_shift(kn16));
                 }
                 (void)epq; (void)epk;
 #else
-                for (int hh = 0; hh < n_head + n_kv_head; hh++)
+                for (int hh = 0; hh < n_head + n_kv_head; hh++) {
                     seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
+                    seq_patch(2*hh, 8, (uint32_t)w16_shift((hh < n_head) ? qn16 : kn16));
+                }
 #endif
                 if (kv_pipe_active) {
                     // In-list stores: the scale beats must exist before the list runs
@@ -2911,9 +2936,9 @@ embed_done: ;
                              kn16->chan_len_beats, SP_FET2);
             }
             for (int hh = 0; hh < n_head; hh++)
-                vec_rmsnorm_head(SP_Q + hh*head_dim*2, eq_r, SP_FET, head_dim);
+                vec_rmsnorm_head(SP_Q + hh*head_dim*2, eq_r, SP_FET, head_dim, w16_shift(qn16));
             for (int hh = 0; hh < n_kv_head; hh++)
-                vec_rmsnorm_head(SP_K + hh*head_dim*2, ek_r, SP_FET2, head_dim);
+                vec_rmsnorm_head(SP_K + hh*head_dim*2, ek_r, SP_FET2, head_dim, w16_shift(kn16));
             perf_exit(OP_QKNORM);
             perf_enter(OP_ROPE);
             for (int hh = 0; hh < n_head; hh++)
@@ -3942,7 +3967,7 @@ void infer_vbench(void)
             int ln = 0;
             while ((1 << ln) < n_embd) ln++;
             int32_t a[7] = {(int32_t)SP_XR, (int32_t)SP_FET, (int32_t)SP_H, n_embd/16,
-                            -ln, eps_int, E_W16 - E_NORM - 15};
+                            -ln, eps_int, w16_shift(an)};
             t0 = perf_now();
             for (int i = 0; i < 8; i++) vec_run(PROG_RMSNORM, a, 7);
             dt = perf_now() - t0;

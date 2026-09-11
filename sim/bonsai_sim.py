@@ -233,15 +233,19 @@ def main():
     parser.add_argument("--hbm-latency",    default=16, type=int)
     parser.add_argument("--hbm-stall-rate", default=0, type=int)
     parser.add_argument("--threads",        default=4, type=int)
-    parser.add_argument("--no-dual",        action="store_true",
-        help="Build the slim engine (no S3/S6 head-B datapath), matching a hardware build without --with-dual.")
+    parser.add_argument("--dual",           action="store_true",
+        help="Build the dual-Q engine (S3/S6 head-B datapath, spec decode). The default is the "
+             "slim engine the hardware builds ship (no --with-dual): the dual attention path "
+             "(attn_seq2_layer) is not what the card runs, and on 2026-09-11 it was the one "
+             "diverging from the mirror while the slim path matched at every checksum.")
+    parser.add_argument("--no-dual",        action="store_true", help=argparse.SUPPRESS)  # old default
     args = parser.parse_args()
 
     sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
 
     if args.build_software:
-        soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=not args.no_dual,
+        soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
         builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
@@ -249,7 +253,7 @@ def main():
         builder.build(sim_config=sim_config, run=False)
         return
 
-    soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=not args.no_dual,
+    soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")

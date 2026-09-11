@@ -45,9 +45,24 @@ KIND_TERNARY = 0 # 2-bit codes {0,1,2}, group=128, w = (q-1)*scale.
 KIND_Q8      = 1 # int8 quants, group=32, w = q*scale.
 KIND_F16     = 2 # Raw fp16 rows (no scales).
 KIND_F32     = 3 # Raw fp32 rows (no scales; norms etc, consumed by CPU/vector unit).
-KIND_NORM16  = 4 # int16 rows at fixed exponent NORM16_EXP (norm weights for the vector unit).
+KIND_NORM16  = 4 # int16 rows; for the ".w16" norm companions the entry's bias byte is the
+                 # tensor's exponent (int8): w = q * 2^bias. Rope/embedding NORM16 rows keep
+                 # their own fixed formats and bias 0.
 
-NORM16_EXP = -13 # w = q * 2^-13: |w| < 4 with ~1.2e-4 resolution - covers rmsnorm gammas.
+# Per-tensor: the smallest exponent whose 15-bit mantissa still holds the tensor's absmax.
+# It WAS a fixed -13 ("|w| < 4 covers rmsnorm gammas"), and it did not: Qwen3-1.7B's norm
+# gammas reach 153 (blk.27 ffn_norm), 136 (blk.26 attn_norm: 2046 of 2048 above 4), 68
+# (blk.0 k_norm) - 72 of 113 norm tensors clipped, up to 0.89 rel-rms error, and the tiny
+# model's gammas are all small so no gate saw it (found 2026-09-11 from a "hello" answered
+# in Russian; the CPU path with the fp32 gammas agreed with the fp32 reference).
+NORM16_EXP_MAX_FALLBACK = -13 # For an all-zero tensor.
+
+def norm16_exp(values):
+    import math
+    amax = float(abs(values).max()) if values.size else 0.0
+    if amax == 0.0:
+        return NORM16_EXP_MAX_FALLBACK
+    return math.ceil(math.log2(amax/32767.0))
 
 KIND_NAMES = {KIND_TERNARY: "ternary", KIND_Q8: "q8", KIND_F16: "f16", KIND_F32: "f32",
               KIND_NORM16: "norm16"}
@@ -136,7 +151,7 @@ def tensor_chan_beats(rows, cols, kind, n_channels, flags=0):
 # can walk the model without host-side sideband.
 
 BONS_MAGIC       = 0x534E4F42 # "BONS" little-endian.
-BONS_VERSION     = 1
+BONS_VERSION     = 2  # 2: NORM16 .w16 entries carry their exponent in bias (2026-09-11).
 BONS_HEADER_SIZE = 4096
 BONS_ENTRY_SIZE  = 64
 BONS_NAME_BYTES  = 24  # Entry name field; longer names are stored truncated.

@@ -11,7 +11,8 @@
 #include <stdint.h>
 
 #define BONS_MAGIC   0x534E4F42 // "BONS"
-#define BONS_VERSION 1          // layout.BONS_VERSION; infer_init refuses any other.
+#define BONS_VERSION 2          // layout.BONS_VERSION; infer_init refuses any other.
+                                // 2: NORM16 .w16 entries carry their exponent in bias.
 
 // Tensor kinds.
 #define KIND_TERNARY 0

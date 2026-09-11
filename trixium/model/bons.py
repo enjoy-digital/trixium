@@ -36,7 +36,7 @@ class TensorSpec:
     - KIND_F16/F32: values (rows, cols).
     """
     def __init__(self, name, role, layer, kind, rows, cols, scales=None, values=None, flags=0,
-                 loader=None):
+                 loader=None, bias=None):
         self.name   = name
         self.role   = role
         self.layer  = layer
@@ -61,7 +61,8 @@ class TensorSpec:
             self.bias   = bx.choose_scale_bias(e16)
             self.rshift = bx.choose_result_shift(scales, self.bias, gs_max=gs_max)
         else:
-            self.bias   = 0
+            # NORM16 norm companions: bias = the tensor's exponent (int8, two's complement).
+            self.bias   = (bias & 0xFF) if bias is not None else 0
             self.rshift = 0
         if values is not None:
             assert values.shape == (rows, cols), (name, values.shape)
@@ -253,16 +254,18 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
                                   layout.KIND_NORM16, cfg.max_ctx, cfg.head_dim,
                                   values=t14, flags=FLAG_REPLICATED))
 
-    # Every F32 tensor (norm weights) gets an int16 companion at NORM16_EXP so the vector
+    # Every F32 tensor (norm weights) gets an int16 companion at its own exponent so the vector
     # unit's rmsnorm can fetch it straight into the scratchpad (same role/layer; ".w16"
     # name - the entry name field is 24 bytes; consumers select by kind).
     for spec in [t for t in tensors if t.kind == KIND_F32]:
-        q = np.clip(np.round(spec.get_values().astype(np.float64)*2.0**(-layout.NORM16_EXP)),
-                    -32767, 32767).astype(np.int16)
+        w = spec.get_values().astype(np.float64)
+        e = layout.norm16_exp(w)               # per tensor: the gammas reach 153 in the 1.7B
+        q = np.round(w*2.0**(-e))
+        assert np.abs(q).max() <= 32767, (spec.name, e)
         n16_name = spec.name.replace(".weight", "") + ".w16"
         tensors.append(TensorSpec(n16_name, spec.role, spec.layer,
                                   layout.KIND_NORM16, spec.rows, spec.cols,
-                                  values=q, flags=spec.flags))
+                                  values=q.astype(np.int16), flags=spec.flags, bias=e))
 
     emb = [t for t in tensors if t.role == layout.ROLE_TOK_EMB and t.kind == KIND_TERNARY]
     if emb16 and emb and not any(t.role == layout.ROLE_TOK_EMB16 for t in tensors):
