@@ -127,7 +127,7 @@ static void help(void)
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
     puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
     puts("seq [on|off]    - sequencer attention lists (on by default; off: CPU-dispatched)");
-    puts("tokclr/tok/genb - chunked prompt buffer + generate (host chat tool)");
+    puts("tokclr/tok/genb - chunked prompt buffer + generate [stop ids] (host chat tools)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
@@ -330,18 +330,29 @@ static void tok_cmd(char *args)
 }
 
 // Generate from the accumulated prompt buffer; appends the emitted tokens to it so the
-// next turn continues the conversation without the host resending history.
+// next turn continues the conversation without the host resending history. Optional stop
+// ids (the chat template's <|im_end|>) end the reply early; the stop token is emitted and
+// kept in the buffer so the next turn's context stays well-formed.
 static void genb_cmd(char *args)
 {
     char *tok = get_token(&args);
     int n = parse_int(tok);
+    int stop[INFER_STOP_MAX], nstop = 0;
+    while (nstop < INFER_STOP_MAX) {
+        tok = get_token(&args);
+        if (*tok == 0)
+            break;
+        stop[nstop++] = parse_int(tok);
+    }
     if (n <= 0 || pbuf_n == 0) {
-        puts("usage: tok <ids...> ; genb <n>");
+        puts("usage: tok <ids...> ; genb <n> [stop ids...]");
         return;
     }
     printf("GEN:");
     gen_emit_to_pbuf = 1;
+    infer_set_stop(stop, nstop);
     infer_generate(pbuf, pbuf_n, n, emit_token);
+    infer_set_stop(stop, 0);
     gen_emit_to_pbuf = 0;
     puts("\nGEN DONE");
 }

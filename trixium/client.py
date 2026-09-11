@@ -47,6 +47,8 @@ class Bonsai:
         self.chat_template = chat_template
         self.timeout = timeout
         self.turns = 0                        # Tokens currently in the on-card buffer.
+        self.im_end = self.tok.token_to_id("<|im_end|>") if chat_template else None
+        self._closed = True                   # Did the last reply end with <|im_end|>?
         self._sync()
 
     # -- console -------------------------------------------------------------------------------
@@ -104,12 +106,16 @@ class Bonsai:
         """Clear the on-card conversation."""
         self.command("tokclr")
         self.turns = 0
+        self._closed = True
 
     def _encode(self, text):
         if self.chat_template:
             # Qwen3 chat turn; the empty <think> block asks for a direct answer (thinking
-            # mode otherwise spends the whole budget inside <think>...</think>).
-            text = (f"<|im_start|>user\n{text}<|im_end|>\n"
+            # mode otherwise spends the whole budget inside <think>...</think>). On a
+            # continuing conversation the previous reply is closed first: the card keeps
+            # it in the buffer, and one cut short by max_tokens has no <|im_end|>.
+            prefix = "" if self.turns == 0 else ("" if self._closed else "<|im_end|>") + "\n"
+            text = (f"{prefix}<|im_start|>user\n{text}<|im_end|>\n"
                     f"<|im_start|>assistant\n<think>\n\n</think>\n\n")
         return self.tok.encode(text).ids
 
@@ -134,7 +140,10 @@ class Bonsai:
         if self.turns == 0:
             self.command("tokclr")
         self._send_ids(self._encode(text))
-        self.ser.write(f"genb {max_tokens}\n".encode())
+        # The firmware stops at <|im_end|> (emitted, kept in the buffer) - without it the
+        # model runs on past its answer until max_tokens.
+        stop = f" {self.im_end}" if self.im_end is not None else ""
+        self.ser.write(f"genb {max_tokens}{stop}\n".encode())
         self.ser.flush()
         pending = ""
         ids = []
@@ -165,6 +174,7 @@ class Bonsai:
         if not done:
             raise BonsaiError("generation timed out")
         self.turns += len(ids)
+        self._closed = bool(ids) and ids[-1] == self.im_end
         if PROMPT.decode() not in pending.split("GEN DONE", 1)[1]:   # Usually in the same chunk.
             self._read_until(PROMPT, timeout=5.0)
 

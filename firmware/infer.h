@@ -12,6 +12,10 @@ int  infer_init(void);   // Load norms etc; returns 0 on success.
 // Feed prompt ids then generate up to max_new tokens (greedy); calls emit() per new token.
 // Returns the number of generated tokens.
 int  infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok));
+// Stop set for infer_generate: a generated token in it is emitted and ends the request
+// (the chat tools pass <|im_end|>; the tokenizer lives on the host). n = 0 clears it.
+#define INFER_STOP_MAX 4
+void infer_set_stop(const int *ids, int n);
 // Sequencer attention lists: off by default (they wedge the engine on this gateware - see
 // infer.c). The same ops run CPU-dispatched per head when off.
 extern int seq_use;

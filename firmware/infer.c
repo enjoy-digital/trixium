@@ -4083,6 +4083,21 @@ void infer_spec_stats(int *acc, int *rej)
     *rej = spec_rej;
 }
 
+static int gen_stop[INFER_STOP_MAX], gen_nstop;
+
+void infer_set_stop(const int *ids, int n)
+{
+    gen_nstop = n < INFER_STOP_MAX ? n : INFER_STOP_MAX;
+    for (int i = 0; i < gen_nstop; i++) gen_stop[i] = ids[i];
+}
+
+static int gen_is_stop(int tok)
+{
+    for (int i = 0; i < gen_nstop; i++)
+        if (gen_stop[i] == tok) return 1;
+    return 0;
+}
+
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {
     n_pos = 0; // Reset the KV cache (fresh generation).
@@ -4104,6 +4119,8 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
             break;
         emit(tok);
         count++;
+        if (gen_is_stop(tok))
+            break;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
         // Speculative decode: draft the successor seen last time this token appeared;
@@ -4125,6 +4142,8 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
                         count++; i++;
                         spec_succ[draft] = (uint16_t)am1; spec_succ_v[draft] = 1;
                         tok = am1;
+                        if (gen_is_stop(draft))
+                            break;
                         continue;
                     }
                     // Reject: keep position n_pos-2 (t0 accepted), drop the draft's.

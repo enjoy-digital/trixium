@@ -88,6 +88,21 @@ static const struct merge_slot *merge_find(uint32_t a, uint32_t b)
 static uint8_t g_tok_sha[32];
 static int     g_tok_sha_ok;
 
+/* Chat-template tokens (Qwen3: <|im_start|> 151644, <|im_end|> 151645, <think> 151667,
+ * </think> 151668), found by their literal text in the table - added tokens are stored as
+ * UTF-8, and the added-token id is the highest one carrying that text. -1 = not this
+ * tokenizer, and the tool falls back to raw completion. */
+static int g_im_start = -1, g_im_end = -1, g_think = -1, g_think_end = -1;
+
+static int tok_find(const char *lit)
+{
+    size_t n = strlen(lit);
+    for (uint32_t i = g_nvocab; i-- > 0; )
+        if (g_vocab[i].len == n && memcmp(g_vocab[i].bytes, lit, n) == 0)
+            return (int)i;
+    return -1;
+}
+
 static int tok_load(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -139,6 +154,10 @@ static int tok_load(const char *path)
         while (g_mtab[i].key != UINT64_MAX) i = (i + 1) & g_mmask;
         g_mtab[i].key = k; g_mtab[i].rank = r; g_mtab[i].result = ab;
     }
+    g_im_start  = tok_find("<|im_start|>");
+    g_im_end    = tok_find("<|im_end|>");
+    g_think     = tok_find("<think>");
+    g_think_end = tok_find("</think>");
     return 0;
 }
 
@@ -276,6 +295,39 @@ static int tok_encode(const char *text, int *out, int max)
         w += bpe_chunk(s + start, i - start, out + w, max - w);
     }
     return w;
+}
+
+static int g_chat = 1;   /* 0 = raw completion (-r): the text goes to the model as typed. */
+
+/* One user turn in the Qwen3 chat template, as the HF tokenizer would encode it (it splits
+ * at the added tokens and BPE-encodes the runs between - same ids as this, piece by piece):
+ *   [\n] <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+ * The empty think block is the template's "enable_thinking=False": without it the model
+ * spends the whole budget inside <think>. On a continuing conversation the previous reply
+ * is closed first (the card keeps it in the buffer; a reply cut by -n has no <|im_end|>). */
+static int encode_turn(const char *text, int *out, int max, int first, int prev_closed)
+{
+    int n = 0;
+    if (!g_chat || g_im_start < 0)
+        return tok_encode(text, out, max);
+    if (!first) {
+        if (!prev_closed && n < max) out[n++] = g_im_end;
+        n += tok_encode("\n", out + n, max - n);
+    }
+    if (n < max) out[n++] = g_im_start;
+    n += tok_encode("user\n", out + n, max - n);
+    n += tok_encode(text, out + n, max - n);
+    if (n < max) out[n++] = g_im_end;
+    n += tok_encode("\n", out + n, max - n);
+    if (n < max) out[n++] = g_im_start;
+    n += tok_encode("assistant\n", out + n, max - n);
+    if (g_think >= 0 && g_think_end >= 0) {
+        if (n < max) out[n++] = g_think;
+        n += tok_encode("\n\n", out + n, max - n);
+        if (n < max) out[n++] = g_think_end;
+        n += tok_encode("\n\n", out + n, max - n);
+    }
+    return n;
 }
 
 
@@ -563,7 +615,9 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
         if (n < max) ids[n] = (int)acc;
         n++;
         if (n == 1) *first_dt = now_s() - t0;
-        if (acc >= 0 && (uint32_t)acc < g_nvocab) {
+        if (acc == g_im_end || acc == g_im_start) {
+            /* Template tokens are structure, not text (the firmware stops on <|im_end|>). */
+        } else if (acc >= 0 && (uint32_t)acc < g_nvocab) {
             const struct tok_entry *t = &g_vocab[acc];
             for (size_t i = 0; i < t->len; i++) {
                 if (pendn < sizeof(pend)) pend[pendn++] = (unsigned char)t->bytes[i];
@@ -663,7 +717,9 @@ static void usage(void)
            "  -K FW      boot it the old way (serial-boot frames over the console, 30-45 s)\n"
            "  -z FILE    tokeniser (default models/1.7b/tokenizer.bin)\n"
            "  -n N       tokens to generate per turn (default 64)\n"
+           "  -r         raw completion: no chat template, the text continues as typed\n"
            "  -T [FILE]  tokeniser self-test against reference encodings, then exit\n"
+           "  -E TEXT    print the ids one chat turn of TEXT sends (template included), exit\n"
            "In the chat: /reset clears the conversation, /cmd <line> runs a firmware console\n"
            "command (e.g. /cmd stats, /cmd hwops), /stats and /help are shortcuts.\n");
 }
@@ -675,8 +731,9 @@ int main(int argc, char **argv)
     const char *img  = NULL, *fw = NULL, *fw_serial = NULL;
     const char *tokf = "models/1.7b/tokenizer.bin";
     const char *testf = "models/1.7b/tokenizer_tests.txt";
+    const char *enc_text = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:rh")) != -1) {
         switch (opt) {
         case 'c': devnum = atoi(optarg); break;
         case 't': tty = optarg; break;
@@ -689,6 +746,8 @@ int main(int argc, char **argv)
             return 0;
         case 'z': tokf = optarg; break;
         case 'n': ntok = atoi(optarg); break;
+        case 'r': g_chat = 0; break;
+        case 'E': enc_text = optarg; break;
         case 'T': do_test = 1; if (optarg) testf = optarg; break;
         default: usage(); return 0;
         }
@@ -696,6 +755,12 @@ int main(int argc, char **argv)
 
     if (tok_load(tokf) < 0) return 1;
     if (do_test) return self_test(testf);
+    if (enc_text) {
+        int ids[1024];
+        int n = encode_turn(enc_text, ids, 1024, 1, 1);
+        for (int i = 0; i < n; i++) printf("%d%c", ids[i], i + 1 < n ? ' ' : '\n');
+        return 0;
+    }
 
     if (img || fw)
         loader_bar_map(devnum);
@@ -746,12 +811,17 @@ int main(int argc, char **argv)
             printf("[init] tokenizer matches the image (%.16s...)\n", hex);
     }
 
+    if (g_chat && g_im_start < 0) {
+        fprintf(stderr, "[warn] no <|im_start|> in %s - raw completion mode\n", tokf);
+        g_chat = 0;
+    }
     printf("\nTriXium chat - type a prompt, Ctrl-D to quit.\n"
-           "(each turn continues the conversation on-card; /reset clears it)\n\n");
+           "(%s; each turn continues the conversation on-card; /reset clears it)\n\n",
+           g_chat ? "chat template, thinking off" : "raw completion, -r");
 
     char *linebuf = NULL; size_t linecap = 0;
     int   ids[1024], out[1024];
-    int   fresh = 1;
+    int   fresh = 1, prev_closed = 1;
 
     while (1) {
         printf("you> "); fflush(stdout);
@@ -759,7 +829,7 @@ int main(int argc, char **argv)
         if (ln <= 0) break;
         if (linebuf[ln-1] == '\n') linebuf[--ln] = 0;
         if (ln == 0) continue;
-        if (!strcmp(linebuf, "/reset")) { fresh = 1; printf("[context cleared]\n"); continue; }
+        if (!strcmp(linebuf, "/reset")) { fresh = 1; prev_closed = 1; printf("[context cleared]\n"); continue; }
         if (!strcmp(linebuf, "/help"))  { strcpy(linebuf, "/cmd help"); }
         if (!strcmp(linebuf, "/stats")) { strcpy(linebuf, "/cmd stats"); }
         if (!strncmp(linebuf, "/cmd ", 5)) {
@@ -775,7 +845,7 @@ int main(int argc, char **argv)
         }
         if (linebuf[0] == '/') { printf("[unknown: /reset /cmd <line> /stats /help]\n"); continue; }
 
-        int n = tok_encode(linebuf, ids, 1024);
+        int n = encode_turn(linebuf, ids, 1024, fresh, prev_closed);
         if (n == 0) { printf("[empty after tokenising]\n"); continue; }
 
         double t0 = now_s();
@@ -794,7 +864,8 @@ int main(int argc, char **argv)
             }
         }
 
-        send_line("genb %d", ntok);
+        if (g_chat) send_line("genb %d %d", ntok, g_im_end);   /* stop at <|im_end|> */
+        else        send_line("genb %d", ntok);
         printf("bot> ");
         fflush(stdout);
         double first_dt = 0;
@@ -804,8 +875,14 @@ int main(int argc, char **argv)
             continue;
         }
         double dt = now_s() - t0;
-        printf("\n     [%d tokens, %.1f s, %.1f tok/s, first token %.1f s]\n\n",
-               ng, dt, ng > 0 ? ng/dt : 0.0, first_dt);
+        prev_closed = (ng > 0 && ng <= 1024 && out[ng - 1] == g_im_end);
+        /* The rate is the decode rate: tokens after the first over the time after it. The
+         * first token's latency is the prefill of the whole buffer (the card re-runs the
+         * conversation from position 0 each turn), so folding it in halves the number on
+         * a long chat while the hardware runs no slower. */
+        double rate = (ng > 1 && dt > first_dt) ? (ng - 1)/(dt - first_dt) : 0.0;
+        printf("\n     [%d tokens in %.1f s: first after %.2f s, then %.1f tok/s%s]\n\n",
+               ng, dt, first_dt, rate, prev_closed || !g_chat ? "" : ", cut by -n");
         tty_expect("bonsai>", 5.0, NULL, 0, 0);
     }
     free(linebuf);
