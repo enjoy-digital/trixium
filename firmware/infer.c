@@ -4123,7 +4123,24 @@ static int gen_is_stop(int tok)
     return 0;
 }
 
+static uint32_t gen_serial;   // Bumped per generation: a continuation must follow its own.
+
+int infer_kv_resident(void) { return n_pos; }
+uint32_t infer_gen_serial(void) { return gen_serial; }
+
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
+{
+    return infer_generate_from(prompt, n_prompt, 0, max_new, emit);
+}
+
+// buf[0..resident) are already in the KV cache from the previous call (n_pos == resident:
+// every forwarded token, i.e. all but the last one emitted), buf[resident..n) are new.
+// resident == 0 is a fresh generation. Byte-identical to re-forwarding the whole buffer
+// from position 0: the rows and the kv_ekmax ratchet evolve in the same order either way.
+// The chat clients keep the conversation on the card (tokclr/tok/genb), so without this
+// every turn re-ran the whole history and the first token drifted out with it (0.13 s ->
+// 0.6 s -> 1.6 s over three turns, 2026-09-11).
+int infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok))
 {
     // An id past the vocabulary makes the embedding fetch read a row that does not exist -
     // an engine stall only reconfiguring the FPGA clears. It happened: the console dropped
@@ -4133,24 +4150,33 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
         printf(" [no model: hdrload first]");
         return -1;
     }
-    for (int i = 0; i < n_prompt; i++)
-        if (prompt[i] < 0 || (uint32_t)prompt[i] >= H->vocab) {
-            printf(" [bad token id %d at %d, vocab %lu]", prompt[i], i, (unsigned long)H->vocab);
+    for (int i = 0; i < n; i++)
+        if (buf[i] < 0 || (uint32_t)buf[i] >= H->vocab) {
+            printf(" [bad token id %d at %d, vocab %lu]", buf[i], i, (unsigned long)H->vocab);
             return -1;
         }
-    n_pos = 0; // Reset the KV cache (fresh generation).
+    if (resident <= 0 || resident > n || resident != n_pos)
+        resident = 0;
+    gen_serial++;
+    if (resident == 0) {
+        n_pos = 0; // Reset the KV cache (fresh generation).
 #ifdef BONSAI_HAS_KVSTORE
-    // ...and its exponent ratchet. kv_ekmax is the running max over every row ever
-    // stored in a region and picks the KV scale bias (B = 22 - ekmax), so without this
-    // a generation inherited the previous request's maxima: its arithmetic depended on
-    // request history, and only the FIRST generation after a boot matched the reference
-    // (2026-09-07, from the external review). Rows are overwritten from position 0 anyway.
-    if (kv_ekmax)
-        for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
+        // ...and its exponent ratchet. kv_ekmax is the running max over every row ever
+        // stored in a region and picks the KV scale bias (B = 22 - ekmax), so without this
+        // a generation inherited the previous request's maxima: its arithmetic depended on
+        // request history, and only the FIRST generation after a boot matched the reference
+        // (2026-09-07, from the external review). Rows are overwritten from position 0 anyway.
+        if (kv_ekmax)
+            for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
 #endif
+    }
+    if (resident == n) {
+        printf(" [nothing new to forward]");
+        return -1;
+    }
     int tok = -1;
-    for (int i = 0; i < n_prompt; i++)
-        tok = forward(prompt[i], i == n_prompt - 1);
+    for (int i = resident; i < n; i++)
+        tok = forward(buf[i], i == n - 1);
     int count = 0;
     for (int i = 0; i < max_new; i++) {
         if (n_pos >= max_ctx)

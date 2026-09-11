@@ -12,6 +12,11 @@ int  infer_init(void);   // Load norms etc; returns 0 on success.
 // Feed prompt ids then generate up to max_new tokens (greedy); calls emit() per new token.
 // Returns the number of generated tokens.
 int  infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok));
+// Same, continuing a conversation: buf[0..resident) are in the KV cache from the previous
+// call (check infer_gen_serial() has not moved), the rest is new. resident 0 = fresh.
+int  infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok));
+int  infer_kv_resident(void);       // Tokens in the KV cache after a generation (= n_pos).
+uint32_t infer_gen_serial(void);    // Bumped by every generation.
 // Stop set for infer_generate: a generated token in it is emitted and ends the request
 // (the chat tools pass <|im_end|>; the tokenizer lives on the host). n = 0 clears it.
 #define INFER_STOP_MAX 4

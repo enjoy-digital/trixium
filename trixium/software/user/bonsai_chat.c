@@ -903,9 +903,9 @@ int main(int argc, char **argv)
         double dt = now_s() - t0;
         prev_closed = (ng > 0 && ng <= 1024 && out[ng - 1] == g_im_end);
         /* The rate is the decode rate: tokens after the first over the time after it. The
-         * first token's latency is the prefill of the whole buffer (the card re-runs the
-         * conversation from position 0 each turn), so folding it in halves the number on
-         * a long chat while the hardware runs no slower. */
+         * first token's latency is this turn's prefill (the card keeps the conversation's
+         * KV cache across turns since 2026-09-11; before, it re-ran the whole history and
+         * that latency grew with the chat), so folding it in would misreport the decode. */
         double rate = (ng > 1 && dt > first_dt) ? (ng - 1)/(dt - first_dt) : 0.0;
         printf("\n     [%d tokens in %.1f s: first after %.2f s, then %.1f tok/s%s]\n\n",
                ng, dt, first_dt, rate, prev_closed || !g_chat ? "" : ", cut by -n");

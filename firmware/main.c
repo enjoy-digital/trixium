@@ -209,6 +209,8 @@ static int gen_emit_to_pbuf;
 #define PBUF_N 512
 static int *const pbuf = (int *)(BONSAI_HDR_ADDR + 0xA0000); // [PBUF_N]
 static int pbuf_n;
+static int      pbuf_kv;      // pbuf[0..pbuf_kv) are in the KV cache (from the last genb)...
+static uint32_t pbuf_serial;  // ...as long as no other generation ran since.
 
 static void emit_token(int tok)
 {
@@ -313,6 +315,7 @@ static int parse_int(const char *s)
 static void tokclr_cmd(void)
 {
     pbuf_n = 0;
+    pbuf_kv = 0;
     printf("TOKCLR %d\n", pbuf_n);
 }
 
@@ -359,7 +362,12 @@ static void genb_cmd(char *args)
     printf("GEN:");
     gen_emit_to_pbuf = 1;
     infer_set_stop(stop, nstop);
-    int r = infer_generate(pbuf, pbuf_n, n, emit_token);
+    // Continue from the KV cache when the buffer's head is still what the last genb left
+    // there (gen/bench in between reset it); otherwise the whole buffer is re-forwarded.
+    int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
+    int r = infer_generate_from(pbuf, pbuf_n, resident, n, emit_token);
+    pbuf_kv     = infer_kv_resident();
+    pbuf_serial = infer_gen_serial();
     infer_set_stop(stop, 0);
     gen_emit_to_pbuf = 0;
     puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
