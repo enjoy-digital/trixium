@@ -35,7 +35,8 @@ class TensorSpec:
     - KIND_Q8:      scales (rows, cols//32)  float16, values (rows, cols) int8.
     - KIND_F16/F32: values (rows, cols).
     """
-    def __init__(self, name, role, layer, kind, rows, cols, scales=None, values=None, flags=0):
+    def __init__(self, name, role, layer, kind, rows, cols, scales=None, values=None, flags=0,
+                 loader=None):
         self.name   = name
         self.role   = role
         self.layer  = layer
@@ -45,6 +46,10 @@ class TensorSpec:
         self.scales = scales
         self.values = values
         self.flags  = flags
+        # loader: a callable returning `values` on demand, for the streaming writer - the
+        # 1.7B's codes are 1.7 GB and the whole image another 1.1, and the old writer held
+        # both plus every temporary (14.5 GB peak); the 8B could not convert at all.
+        self.loader = loader
         if kind in (KIND_TERNARY, KIND_Q8):
             group = layout.KIND_GROUP[kind]
             assert cols % group == 0
@@ -58,12 +63,21 @@ class TensorSpec:
         else:
             self.bias   = 0
             self.rshift = 0
-        assert values.shape == (rows, cols), (name, values.shape)
+        if values is not None:
+            assert values.shape == (rows, cols), (name, values.shape)
+        else:
+            assert loader is not None, name
+
+    def get_values(self):
+        """The (rows, cols) array; loaded through `loader` when the spec is lazy (not cached:
+        the caller encodes every channel from one load and drops it)."""
+        return self.values if self.values is not None else self.loader()
 
 # Row packet encoding ------------------------------------------------------------------------------
 
-def encode_rows(spec, row0, nrows):
-    """Encode rows [row0, row0+nrows) of a tensor as row-packet bytes -> (nrows*row_beats*32,)."""
+def encode_rows(spec, row0, nrows, values=None):
+    """Encode rows [row0, row0+nrows) of a tensor as row-packet bytes -> (nrows*row_beats*32,).
+    `values` overrides spec.values (the streaming writer passes one load for all channels)."""
     sb = scale_beats(spec.cols, spec.kind)
     cb = code_beats(spec.cols, spec.kind)
     out = np.zeros((nrows, (sb + cb)*BEAT_BYTES), dtype=np.uint8)
@@ -73,7 +87,9 @@ def encode_rows(spec, row0, nrows):
         sbytes = scales.view(np.uint8).reshape(nrows, -1)
         out[:, :sbytes.shape[1]] = sbytes
 
-    v = spec.values[row0:row0+nrows]
+    if values is None:
+        values = spec.get_values()
+    v = values[row0:row0+nrows]
     if spec.kind == KIND_TERNARY:
         codes = np.ascontiguousarray(v.astype(np.uint8)).reshape(nrows, spec.cols//4, 4)
         packed = (codes[:, :, 0] | (codes[:, :, 1] << 2) |
@@ -162,11 +178,67 @@ def embed_bfp_rows(spec):
     exps = (e16min[:, 0] + k2).astype(np.int32)
     return mant, exps
 
-def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_path=None):
-    """Write a BONS image + JSON manifest. Returns the manifest dict."""
-    chan_payloads = [bytearray() for _ in range(n_channels)]
-    entries       = []
-    manifest_tensors = []
+def _tensor_beats(spec, n_channels):
+    """Per-channel payload beats of a tensor: every channel carries the same count (the
+    sharding divides rows exactly; replicated tensors carry all rows everywhere)."""
+    nrows = spec.rows if (spec.flags & FLAG_REPLICATED) else shard_rows(spec.rows, n_channels, 0)[1]
+    return nrows*(scale_beats(spec.cols, spec.kind) + code_beats(spec.cols, spec.kind))
+
+
+def _emb16_specs(emb, n_channels, block=8192):
+    """The token embedding pre-dequantized to int16 BFP rows (ROLE_TOK_EMB16) plus the per-row
+    exponent (ROLE_TOK_EMB16_EXP), bit-exact with the firmware's embed_row_bfp. Computed in
+    row blocks when loaded (the int64 intermediates of the whole table were 2.5 GB)."""
+    rows, cols = emb.rows, emb.cols
+    erows = (rows + 15)//16
+    state = {}
+
+    def compute():
+        if "mant" in state:
+            return
+        codes  = emb.get_values()
+        mant   = np.empty((rows, cols), dtype=np.int16)
+        exps   = np.empty(rows, dtype=np.int32)
+        for r0 in range(0, rows, block):
+            r1 = min(rows, r0 + block)
+            sub = type("Sub", (), {})()
+            sub.values = codes[r0:r1]
+            sub.scales = emb.scales[r0:r1]
+            m, e = embed_bfp_rows(sub)
+            mant[r0:r1] = m
+            exps[r0:r1] = e
+        state["mant"] = mant
+        etab = np.zeros((erows, 16), dtype=np.int16)
+        etab.reshape(-1)[:rows] = exps.astype(np.int16)
+        state["etab"] = etab
+
+    def load_mant():
+        compute()
+        return state.pop("mant")           # Dropped after the writer has encoded it.
+
+    def load_etab():
+        compute()
+        return state["etab"]
+
+    return [TensorSpec("token_embd.bfp16", layout.ROLE_TOK_EMB16, 0, layout.KIND_NORM16,
+                       rows, cols, loader=load_mant, flags=0),
+            # 16 exponents per beat; rows padded to a multiple of 16 tokens. Replicated: the
+            # firmware fetches one beat from channel 0 per token.
+            TensorSpec("token_embd.bfp16_exp", layout.ROLE_TOK_EMB16_EXP, 0, layout.KIND_NORM16,
+                       erows, 16, loader=load_etab, flags=FLAG_REPLICATED)]
+
+
+def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_path=None,
+                emb16=True, progress=None):
+    """Write a BONS image + JSON manifest. Returns the manifest dict.
+
+    Streams: the metadata pass sizes every tensor from rows/cols/kind (the scales are
+    already in the specs), which fixes every channel's file offset, so the data pass
+    loads one tensor (TensorSpec.loader), encodes it for all channels, writes each chunk
+    at its place and drops it. Peak memory is one tensor, not the model.
+    emb16=False leaves out the 622 MB int16 embedding table (the firmware decodes the
+    ternary row itself then: ~2.6% slower per token, 4.5 s instead of 10 to upload)."""
+    tensors = list(tensors)
 
     # Rope tables baked into the image: one NORM16 row per position, [c14 | s14] Q14
     # halves (Q14 absorbs YaRN's mscale > 1), computed with golden.rope_tables (float64
@@ -177,79 +249,73 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
         cos, sin = rope_tables(cfg, np.arange(cfg.max_ctx), dtype=np.float64)
         tab = np.concatenate([cos, sin], axis=1)
         t14 = np.clip(np.round(tab*(1 << 14)), -32767, 32767).astype(np.int16)
-        tensors = list(tensors) + [TensorSpec("rope_tab", layout.ROLE_ROPE_TAB, 0,
-                                              layout.KIND_NORM16, cfg.max_ctx, cfg.head_dim,
-                                              values=t14, flags=FLAG_REPLICATED)]
+        tensors.append(TensorSpec("rope_tab", layout.ROLE_ROPE_TAB, 0,
+                                  layout.KIND_NORM16, cfg.max_ctx, cfg.head_dim,
+                                  values=t14, flags=FLAG_REPLICATED))
 
     # Every F32 tensor (norm weights) gets an int16 companion at NORM16_EXP so the vector
     # unit's rmsnorm can fetch it straight into the scratchpad (same role/layer; ".w16"
     # name - the entry name field is 24 bytes; consumers select by kind).
-    tensors = list(tensors)
     for spec in [t for t in tensors if t.kind == KIND_F32]:
-        q = np.clip(np.round(spec.values.astype(np.float64)*2.0**(-layout.NORM16_EXP)),
+        q = np.clip(np.round(spec.get_values().astype(np.float64)*2.0**(-layout.NORM16_EXP)),
                     -32767, 32767).astype(np.int16)
         n16_name = spec.name.replace(".weight", "") + ".w16"
         tensors.append(TensorSpec(n16_name, spec.role, spec.layer,
                                   layout.KIND_NORM16, spec.rows, spec.cols,
                                   values=q, flags=spec.flags))
 
-    # The token embedding pre-dequantized to int16 BFP rows (ROLE_TOK_EMB16) plus the
-    # per-row exponent (ROLE_TOK_EMB16_EXP), bit-exact with the firmware's embed_row_bfp.
     emb = [t for t in tensors if t.role == layout.ROLE_TOK_EMB and t.kind == KIND_TERNARY]
-    if emb and not any(t.role == layout.ROLE_TOK_EMB16 for t in tensors):
-        mant, exps = embed_bfp_rows(emb[0])
-        tensors.append(TensorSpec("token_embd.bfp16", layout.ROLE_TOK_EMB16, 0,
-                                  layout.KIND_NORM16, mant.shape[0], mant.shape[1],
-                                  values=mant, flags=0))
-        # 16 exponents per beat; rows padded to a multiple of 16 tokens. Replicated: the
-        # firmware fetches one beat from channel 0 per token.
-        ne  = mant.shape[0]
-        erows = (ne + 15)//16
-        etab = np.zeros((erows, 16), dtype=np.int16)
-        etab.reshape(-1)[:ne] = exps.astype(np.int16)
-        tensors.append(TensorSpec("token_embd.bfp16_exp", layout.ROLE_TOK_EMB16_EXP, 0,
-                                  layout.KIND_NORM16, erows, 16, values=etab,
-                                  flags=FLAG_REPLICATED))
+    if emb16 and emb and not any(t.role == layout.ROLE_TOK_EMB16 for t in tensors):
+        tensors.extend(_emb16_specs(emb[0], n_channels))
 
+    # Metadata pass: offsets from shapes alone.
+    bases, base = [], 0
     for spec in tensors:
-        base_beats = len(chan_payloads[0])//BEAT_BYTES
-        replicated = bool(spec.flags & FLAG_REPLICATED)
-        crc = 0 # CRC over the channel-major concatenation of this tensor's payload.
-        for c in range(n_channels):
-            if replicated:
-                row0, nrows = 0, spec.rows
-            else:
-                row0, nrows = shard_rows(spec.rows, n_channels, c)
-            chunk = encode_rows(spec, row0, nrows)
-            crc   = zlib.crc32(chunk.tobytes(), crc) & 0xFFFFFFFF
-            chan_payloads[c].extend(chunk.tobytes())
-        len_beats = len(chan_payloads[0])//BEAT_BYTES - base_beats
-        entries.append(layout.pack_entry(
-            spec.role, spec.kind, spec.flags, spec.layer, spec.rows, spec.cols,
-            base_beats, len_beats, crc, spec.bias, spec.rshift, spec.name))
-        manifest_tensors.append({
-            "name": spec.name, "role": ROLE_NAMES[spec.role], "layer": spec.layer,
-            "kind": KIND_NAMES[spec.kind], "flags": spec.flags,
-            "rows": spec.rows, "cols": spec.cols,
-            "chan_base_beats": base_beats, "chan_len_beats": len_beats, "crc32": crc,
-            "bias": spec.bias, "rshift": spec.rshift,
-        })
-        # All channels must stay in lockstep.
-        assert all(len(p) == len(chan_payloads[0]) for p in chan_payloads), spec.name
+        n = _tensor_beats(spec, n_channels)
+        bases.append((base, n))
+        base += n
+    payload_beats  = base
+    table_bytes    = len(tensors)*layout.BONS_ENTRY_SIZE
+    table_padded_n = ceil_div(table_bytes, layout.BONS_HEADER_SIZE)*layout.BONS_HEADER_SIZE
+    payload_offset = layout.BONS_HEADER_SIZE + table_padded_n
+    chan_bytes     = payload_beats*BEAT_BYTES
 
-    payload_beats = len(chan_payloads[0])//BEAT_BYTES
-    table         = b"".join(entries)
-    table_crc     = layout.crc32(table)
-    header        = layout.pack_header(cfg, n_channels, len(tensors), payload_beats,
-                                       table_crc, tokenizer_sha256)
-    table_padded  = table.ljust(
-        ceil_div(len(table), layout.BONS_HEADER_SIZE)*layout.BONS_HEADER_SIZE, b"\x00")
-
+    entries, manifest_tensors = [], []
     with open(path, "wb") as f:
+        f.truncate(payload_offset + n_channels*chan_bytes)
+        for spec, (base_beats, len_beats) in zip(tensors, bases):
+            if progress:
+                progress(spec.name)
+            values = spec.get_values()
+            crc = 0 # CRC over the channel-major concatenation of this tensor's payload.
+            for c in range(n_channels):
+                if spec.flags & FLAG_REPLICATED:
+                    row0, nrows = 0, spec.rows
+                else:
+                    row0, nrows = shard_rows(spec.rows, n_channels, c)
+                chunk = encode_rows(spec, row0, nrows, values=values).tobytes()
+                assert len(chunk) == len_beats*BEAT_BYTES, spec.name
+                crc = zlib.crc32(chunk, crc) & 0xFFFFFFFF
+                f.seek(payload_offset + c*chan_bytes + base_beats*BEAT_BYTES)
+                f.write(chunk)
+            del values
+            entries.append(layout.pack_entry(
+                spec.role, spec.kind, spec.flags, spec.layer, spec.rows, spec.cols,
+                base_beats, len_beats, crc, spec.bias, spec.rshift, spec.name))
+            manifest_tensors.append({
+                "name": spec.name, "role": ROLE_NAMES[spec.role], "layer": spec.layer,
+                "kind": KIND_NAMES[spec.kind], "flags": spec.flags,
+                "rows": spec.rows, "cols": spec.cols,
+                "chan_base_beats": base_beats, "chan_len_beats": len_beats, "crc32": crc,
+                "bias": spec.bias, "rshift": spec.rshift,
+            })
+        table     = b"".join(entries)
+        table_crc = layout.crc32(table)
+        header    = layout.pack_header(cfg, n_channels, len(tensors), payload_beats,
+                                       table_crc, tokenizer_sha256)
+        f.seek(0)
         f.write(header)
-        f.write(table_padded)
-        for p in chan_payloads:
-            f.write(bytes(p))
+        f.write(table.ljust(table_padded_n, b"\x00"))
 
     manifest = {
         "model"          : cfg.name,

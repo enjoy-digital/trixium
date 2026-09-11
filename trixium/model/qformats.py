@@ -33,6 +33,14 @@ def q2_0_unpack(raw):
     codes  = np.stack([(qs >> (2*j)) & 3 for j in range(4)], axis=-1).reshape(-1, QK_Q2_0)
     return scales, codes
 
+def q2_0_scales(raw):
+    """Raw Q2_0 bytes -> scales float16 (nb,) only - the 2 bytes of every 34, no code
+    unpacking. The converter's metadata pass needs the scales (bias/rshift) for every
+    tensor while the codes stream one tensor at a time (2026-09-11)."""
+    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    assert raw.size % BLOCK_Q2_0 == 0, f"Q2_0 payload not a multiple of {BLOCK_Q2_0} bytes"
+    return raw.reshape(-1, BLOCK_Q2_0)[:, 0:2].copy().view(np.float16).reshape(-1)
+
 def q2_0_pack(scales, codes):
     """(scales float16 (nb,), codes uint8 (nb, 128)) -> raw Q2_0 bytes."""
     scales = np.asarray(scales, dtype=np.float16)

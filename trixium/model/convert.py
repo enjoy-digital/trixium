@@ -16,6 +16,7 @@ zero-weight rows (code 1 -> w = 0, scale 0); the top-k unit masks rows >= vocab.
 
 import argparse
 import hashlib
+import time
 import sys
 
 import numpy as np
@@ -73,22 +74,31 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
 
     if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_Q1_0):
         rows, cols = t.shape
+        raw = reader.tensor_bytes(name)
+        # Scales now (bias/rshift need them: a few MB for the whole model); the codes
+        # through a loader when the writer gets to this tensor, one tensor in memory at
+        # a time (the 1.7B's codes alone are 1.7 GB).
         if t.type_id == qformats.GGML_Q2_0:
-            scales, codes = qformats.q2_0_unpack(reader.tensor_bytes(name))
+            scales = qformats.q2_0_scales(raw)
+            unpack = lambda: qformats.q2_0_unpack(raw)[1]
         else:
             # 1-bit builds ("Bonsai" as opposed to "Ternary-Bonsai"): run on the ternary
             # engine via code expansion (see qformats.q1_0_to_ternary_codes).
-            scales, codes = qformats.q1_0_to_ternary_codes(reader.tensor_bytes(name))
+            scales = qformats.q1_0_to_ternary_codes(raw)[0]
+            unpack = lambda: qformats.q1_0_to_ternary_codes(raw)[1]
         scales = scales.reshape(rows, cols//layout.GROUP_TERNARY)
-        codes  = codes.reshape(rows, cols)
+        pad = 0
         if not repl and rows % n_channels != 0:
             assert role in (ROLE_TOK_EMB, ROLE_LM_HEAD), name
-            pad = vocab_pad - rows
+            pad    = vocab_pad - rows
             scales = np.concatenate([scales, np.zeros((pad, scales.shape[1]), np.float16)])
-            codes  = np.concatenate([codes,  np.ones((pad, cols), np.uint8)]) # code 1 -> w=0.
-            rows   = vocab_pad
-        return TensorSpec(name, role, layer, KIND_TERNARY, rows, cols,
-                          scales=scales, values=codes, flags=flags)
+        def load(unpack=unpack, rows=rows, cols=cols, pad=pad):
+            codes = unpack().reshape(rows, cols)
+            if pad:
+                codes = np.concatenate([codes, np.ones((pad, cols), np.uint8)]) # code 1 -> w=0.
+            return codes
+        return TensorSpec(name, role, layer, KIND_TERNARY, rows + pad, cols,
+                          scales=scales, loader=load, flags=flags)
 
     if t.type_name == "F32":
         cols   = t.shape[-1]
@@ -99,7 +109,7 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
     raise NotImplementedError(f"{name}: unsupported tensor type {t.type_name}")
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
-            max_layers=None, check=False):
+            max_layers=None, check=False, emb16=True):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
     if max_layers is not None:
@@ -117,17 +127,17 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     if "output.weight" in reader.tensors:
         names.append("output.weight")
 
-    specs = []
-    for name in names:
-        print(f"  {name}...", flush=True)
-        specs.append(_spec_from_gguf(reader, name, n_channels, vocab_pad))
+    specs = [_spec_from_gguf(reader, name, n_channels, vocab_pad) for name in names]
 
     sha = b""
     if tokenizer_path:
         sha = hashlib.sha256(open(tokenizer_path, "rb").read()).digest()
 
+    t0 = time.time()
     manifest = write_image(cfg, specs, n_channels, out_path,
-                           tokenizer_sha256=sha, manifest_path=manifest_path)
+                           tokenizer_sha256=sha, manifest_path=manifest_path, emb16=emb16,
+                           progress=lambda name: print(f"  {name}...", flush=True))
+    print(f"  {time.time() - t0:.1f} s")
     print(f"image: {out_path} payload {manifest['payload_bytes_per_channel']/1e6:.1f} MB/channel"
           f" x {n_channels} channels")
 
@@ -180,6 +190,9 @@ def main():
     p.add_argument("--tokenizer", default=None)
     p.add_argument("--layers",    default=None, type=int, help="Truncate to first K layers.")
     p.add_argument("--check",     action="store_true")
+    p.add_argument("--no-emb16",  action="store_true",
+                   help="Leave out the pre-dequantized int16 embedding table (622 MB on the "
+                        "1.7B; the firmware decodes rows itself, ~2.6%% slower per token).")
 
     p = sub.add_parser("verify")
     p.add_argument("--image", required=True)
@@ -190,7 +203,7 @@ def main():
     elif args.cmd == "convert":
         manifest = args.manifest or args.out.rsplit(".", 1)[0] + ".json"
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
-                args.layers, args.check)
+                args.layers, args.check, emb16=not args.no_emb16)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 
