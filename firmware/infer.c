@@ -1143,10 +1143,16 @@ static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2
 // What the store descriptors' constant words currently hold (~0 = unknown/rebuilt).
 static uint32_t kvst_rb_set = 0xFFFFFFFFu, kvst_chan_set = 0xFFFFFFFFu;
 extern int qres_use;
+extern int qkvl_use;          // Defined with the other toggles below.
+extern int seq_use;
 static int qkvx_possible(void)
 {
 #if defined(BONSAI_SEQ_LUT) && defined(BONSAI_VEC_LOOPS2) && !defined(BONSAI_HAS_DUALQ)
-    return qkvx_use && !qkvx_blocked && qres_use
+    // The K chain lives inside the qkv list, so qkvx only holds while that list runs:
+    // with `qkvl off` or `seq off` the qkr list (built without the K chain) ran alone,
+    // K was never normed and the q-norm's A6 never patched - a different token than the
+    // default path on the 1.7B (2026-09-14, card_vs_mirror: q16 saturated, k16 raw).
+    return qkvx_use && !qkvx_blocked && qres_use && qkvl_use && seq_use
         && (uint32_t)n_layer*head_dim*2 <= 0x1C00
         && model_entry_kind(ROLE_ATTN_Q_NORM, 0, KIND_NORM16) != 0
         && model_entry_kind(ROLE_ATTN_K_NORM, 0, KIND_NORM16) != 0
@@ -2428,6 +2434,9 @@ void infer_qkvx(int on)
     seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
 }
 int infer_qkvx_state(void) { return qkvx_ok; }
+// `qkvl`/`seq` change what the lists must contain (qkvx_possible): rebuild them too.
+void infer_qkvl(int on) { qkvl_use = on ? 1 : 0; infer_qkvx(qkvx_use); }
+void infer_seq(int on)  { seq_use  = on ? 1 : 0; infer_qkvx(qkvx_use); }
 void infer_embfetch(int on) { embfetch_use = on ? 1 : 0; }
 int  infer_embfetch_state(void) { return embfetch_use && emb16_ent != 0; }
 
@@ -3013,6 +3022,9 @@ embed_done: ;
                 vec_rope_head(SP_K + hh*head_dim*2, head_dim);
             perf_exit(OP_ROPE);
 #endif
+            dbg_sum("q16", l, SP_Q, 2*q_dim, E_NORM);      // q heads normed + roped
+            dbg_sum("k16", l, SP_K, 2*kv_dim, E_NORM);     // k heads normed + roped
+            dbg_sum("v16", l, SP_V, 2*kv_dim, ev_res);     // v after norm_i32
             perf_enter(OP_KVQUANT);
             for (int hh = 0; hh < n_kv_head && !kv_pipe_active; hh++) {
 #ifdef CSR_SEQ_BASE

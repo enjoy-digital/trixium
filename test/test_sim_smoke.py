@@ -523,16 +523,23 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                 _, rtab = img.tensor("rope_tab")
                 trow = rtab[pos]
                 qh8 = []
+                _q16, _k16 = [], []
                 for i2 in range(n_head):
                     mh = res_rmsnorm_head(qm[i2*hd:(i2+1)*hd], eqr, qn16.reshape(-1), eqn16)
                     mh = res_rope_head(mh, trow)
+                    _q16.append(np.asarray(mh))
                     qh8.append((quant8_fixed(mh), E_NORM + 8))
                 for i2 in range(n_kv):
                     mh = res_rmsnorm_head(km[i2*hd:(i2+1)*hd], ekr, kn16.reshape(-1), ekn16)
                     mh = res_rope_head(mh, trow)
+                    _k16.append(np.asarray(mh))
                     hbm_kv.setdefault((l, i2, 0), []).append((E_NORM + 8, quant8_fixed(mh)))
                     hbm_kv.setdefault((l, i2, 1), []).append(
                         (evr + 8, quant8_fixed(vm[i2*hd:(i2+1)*hd])))
+                if trace is not None:
+                    trace(pos, (l, "q16"), (np.concatenate(_q16), E_NORM))
+                    trace(pos, (l, "k16"), (np.concatenate(_k16), E_NORM))
+                    trace(pos, (l, "v16"), (np.asarray(vm), evr))
                 n_rep2 = n_head//n_kv
                 rms, cs = [], []
                 hmax = f32(0.0)

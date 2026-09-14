@@ -546,8 +546,8 @@ static void console_service(void)
     }
     else if (strcmp(token, "qkvl") == 0) {
         extern int qkvl_use;
-        if (strncmp(str, "on", 2) == 0)  qkvl_use = 1;
-        if (strncmp(str, "off", 3) == 0) qkvl_use = 0;
+        if (strncmp(str, "on", 2) == 0)  infer_qkvl(1);
+        if (strncmp(str, "off", 3) == 0) infer_qkvl(0);
         printf("QKVL %s (q/k/v projections + norms as one sequencer list)\n",
                qkvl_use ? "on" : "off");
     }
@@ -668,9 +668,9 @@ static void console_service(void)
     }
     else if (strcmp(token, "seq") == 0) {
         if (strncmp(str, "on", 2) == 0)
-            seq_use = 1;
+            infer_seq(1);
         else if (strncmp(str, "off", 3) == 0)
-            seq_use = 0;
+            infer_seq(0);
         printf("SEQ %s (off runs the same ops CPU-dispatched per head, ~20%% slower)\n",
                seq_use ? "on" : "off");
     }
