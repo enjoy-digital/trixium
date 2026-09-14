@@ -184,10 +184,13 @@ class Bonsai:
             pending += chunk.decode(errors="replace")
             if "GEN DONE" in pending:
                 done = True
-            # Token ids stream after "GEN:" as " %d" pieces.
-            m = re.search(r"GEN:((?:\s+\d+)*)", pending)
-            if m:
-                ids = [int(t) for t in m.group(1).split()]
+            # Token ids stream after "GEN:" as " %d" pieces. Take only digit runs that
+            # sit between separators (a stray firmware message inside the stream once
+            # contributed its "(14 descriptors)" as a token; the anchored form then
+            # dropped every id after the message).
+            if "GEN:" in pending:
+                seg = pending.split("GEN:", 1)[1].split("GEN DONE", 1)[0]
+                ids = [int(t) for t in re.findall(r"(?:^|(?<=[ \r\n]))(\d+)(?=[ \r\n]|$)", seg)]
                 # Decode incrementally; hold back the last id in case it is a partial UTF-8
                 # sequence the next id completes.
                 keep = len(ids) if done else max(0, len(ids) - 1)

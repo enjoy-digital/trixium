@@ -622,6 +622,7 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
     size_t ww = 0;
     int started = 0, n = 0;
     long acc = -1;                /* digits of the id being parsed, -1 = not in a number */
+    int  prev = ':';              /* the byte before the digits: an id follows ':' or ' ' */
     unsigned char pend[8];        /* incomplete UTF-8 tail */
     size_t pendn = 0;
 
@@ -641,11 +642,19 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
         }
         if (strstr(win, "GEN DONE")) break;
 
+        /* Ids are printed as " %d" after "GEN:". Digits reached any other way - inside
+         * a stray message ("(14 descriptors)") - are not ids: the firmware once printed
+         * such a line inside the stream and its 14 became a "/" in every reply. */
         if (isdigit(c)) {
-            acc = (acc < 0 ? 0 : acc)*10 + (c - '0');
+            if (acc >= 0 || prev == ' ' || prev == ':')
+                acc = (acc < 0 ? 0 : acc)*10 + (c - '0');
+            prev = c;
             continue;
         }
+        int delim = (c == ' ' || c == '\n' || c == '\r');
+        prev = c;
         if (acc < 0) continue;                 /* delimiter with no digits pending */
+        if (!delim) { acc = -1; continue; }    /* digits glued to text: not an id */
 
         /* One complete id: record it, then print its bytes. */
         if (n < max) ids[n] = (int)acc;

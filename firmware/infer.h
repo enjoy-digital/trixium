@@ -38,6 +38,7 @@ void infer_qkr_reorder(int on);   // qkr list: Q chain behind the store (qkro).
 void infer_qfix(int on);          // Scan-free fixed-shift Q quant8 in the qkr list (qfix).
 void infer_embfetch(int on);      // Embedding row fetched pre-dequantized from the image (embf).
 void infer_qkvx(int on);          // K chain + V pack inside the qkv list, eps from a LUT (qkvx).
+void infer_qkvx_report(void);     // Print the qkvx state (init and the toggle; never mid-generation).
 void infer_qkvl(int on);          // QKV projections + norms as one list (qkvl); rebuilds the lists.
 void infer_seq(int on);           // Sequencer lists on/off (seq); rebuilds the lists.
 int  infer_qkvx_state(void);

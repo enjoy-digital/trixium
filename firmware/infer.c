@@ -1770,7 +1770,11 @@ static void seq_build_qkv(void)
         seq_desc_vec_seed(di + 11, PROG_SPILL, &pq, 1, 0, 1);
         seq_desc_vec(di + 12, PROG_NORM_I32, nq, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
         seq_desc_stop(di + 13);
-        printf("qkvx: K chain + V pack in the qkv list (%d descriptors), eps via LUT\n", len);
+        // No print here: the lists rebuild during a generation (the deep attention layout
+        // toggles with the context), and anything printed between "GEN:" and "GEN DONE"
+        // is parsed as token ids by the chat tools - this line's "(14 descriptors)"
+        // became a stray "/" (token 14) at the start of replies (2026-09-14). The state
+        // is reported once by infer_init and by the qkvx toggle instead.
         return;
     }
     seq_desc_engine(di + 0, &z);
@@ -2432,6 +2436,11 @@ void infer_qkvx(int on)
     qkvx_blocked = 0;
     seq_ffn_base = -1;
     seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
+}
+void infer_qkvx_report(void)
+{
+    if (qkvx_ok)
+        puts("qkvx: K chain + V pack in the qkv list (14 descriptors), eps via LUT");
 }
 int infer_qkvx_state(void) { return qkvx_ok; }
 // `qkvl`/`seq` change what the lists must contain (qkvx_possible): rebuild them too.
@@ -3901,6 +3910,7 @@ int infer_init(void)
     seq_build_qkv();
     seq_build_attn2();
 #endif
+    infer_qkvx_report();
 #endif
     k_cache = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*kv_dim);
     v_cache = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*kv_dim);
