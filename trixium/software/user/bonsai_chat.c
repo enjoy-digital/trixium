@@ -32,6 +32,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/time.h>
 
 #include "liblitepcie.h"
@@ -357,6 +358,15 @@ static int tty_open(const char *path)
 {
     int fd = open(path, O_RDWR | O_NOCTTY);
     if (fd < 0) { perror(path); return -1; }
+    /* One console session at a time: the firmware reads one byte stream, and two readers
+     * split its replies between them (an idle bonsai_chat left at its prompt did exactly
+     * that, 2026-09-14). Advisory lock, shared by every console tool. */
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr, "%s is in use by another console session (bonsai_chat, pcie_console.py, "
+                        "the Python client, litex_term?) - close it first\n", path);
+        close(fd);
+        return -1;
+    }
     struct termios t;
     if (tcgetattr(fd, &t) == 0) {
         cfmakeraw(&t);

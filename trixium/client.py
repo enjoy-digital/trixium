@@ -43,6 +43,14 @@ class Bonsai:
         import serial                          # Imported here: only the client needs it.
         from tokenizers import Tokenizer
         self.ser = serial.Serial(tty, 115200, timeout=0.05)
+        # One console session at a time (see tools/pcie_console.py): advisory lock on the tty.
+        import fcntl
+        try:
+            fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.ser.close()
+            raise BonsaiError(f"{tty} is in use by another console session (bonsai_chat, "
+                              "pcie_console.py, litex_term?) - close it first")
         self.tok = Tokenizer.from_file(tokenizer)
         self.chat_template = chat_template
         self.timeout = timeout
