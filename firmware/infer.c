@@ -564,8 +564,17 @@ static void eps_init(void)
 static int eps_for(int esrc)
 {
     int s = 24 + 2*esrc - eps_e;
-    if (s <= 0)                                  // float path overflowed int here too
-        return 0x7FFFFFFF;                       // (verified bit-exact for every s > 0)
+    if (s <= 0) {
+        // eps_m < 2^24, so the value fits int32 up to a 7-bit left shift. This used to
+        // return 0x7FFFFFFF for every s <= 0 ("the float path overflowed int here too" -
+        // it did not: lroundf(1e-6 * 2^44) is 1.76e7). It fires when the residual absmax
+        // is below 2^-4, i.e. on the tiny embeddings of the chat template's special tokens
+        // (<|im_start|> at 2^-22), never on a plain-text prompt - so the tokens gate never
+        // saw it, and the first reply token after the template came out 2-4 logits off the
+        // fp32 reference (Russian for "Hello"; 2026-09-14, found by the card-vs-mirror
+        // checksums: the very first rmsnorm's quant8 exponent differed).
+        return s < -7 ? 0x7FFFFFFF : (int)(eps_m << (-s));
+    }
     if (s > 31)
         return 1;                                // rounds to 0; callers clamp to >= 1 anyway
     uint32_t v = (eps_m + (1u << (s - 1))) >> s; // round half away from zero (values > 0)
