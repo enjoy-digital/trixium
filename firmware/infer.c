@@ -4155,6 +4155,10 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
             printf(" [bad token id %d at %d, vocab %lu]", buf[i], i, (unsigned long)H->vocab);
             return -1;
         }
+    if (n > max_ctx) { // KV rows live at [0, max_ctx); the generation loop stops there too.
+        printf(" [%d tokens exceed the KV budget of %d - tokclr]", n, max_ctx);
+        return -1;
+    }
     if (resident <= 0 || resident > n || resident != n_pos)
         resident = 0;
     gen_serial++;

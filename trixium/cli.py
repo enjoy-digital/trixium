@@ -10,7 +10,7 @@
     bonsai verify    models/bons/bonsai-1p7b-n16.img
     bonsai tokenizer models/1.7b/tokenizer.json                 # -> models/1.7b/tokenizer.bin
     bonsai deploy    n16_212_v14b                               # bitstream + weights + boot
-    bonsai chat      [--tty /dev/ttyLXU0] [-n 64]               # on the machine with the card
+    bonsai chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
     bonsai console   "stats" "bench 64"                         # raw firmware commands
 
 `deploy` drives the lab board from the workstation (tools/fk33_bringup_measure.sh with
@@ -113,7 +113,7 @@ def main(argv=None):
     p = sub.add_parser("chat", help="chat REPL on the machine with the card")
     p.add_argument("--tty", default="/dev/ttyLXU0")
     p.add_argument("--tokenizer", default=os.path.join(REPO, "models", "1.7b", "tokenizer.bin"))
-    p.add_argument("-n", type=int, default=64, help="tokens per turn")
+    p.add_argument("-n", type=int, default=256, help="reply cap in tokens (replies end at <|im_end|>)")
     p.add_argument("-k", "--firmware", help="boot this firmware first (bonsai.bin)")
     p.add_argument("-m", "--image", help="upload this weight image first")
     p.set_defaults(fn=cmd_chat)

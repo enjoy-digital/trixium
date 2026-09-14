@@ -14,7 +14,7 @@ continues on-card without resending history.
     from trixium.client import Bonsai
     with Bonsai() as b:
         b.hdrload()
-        print(b.generate("The capital of France is", max_tokens=32))
+        print(b.generate("The capital of France is", max_tokens=32))   # cap; ends at <|im_end|>
         for piece in b.stream("and Germany's?"):      # continues the conversation
             print(piece, end="", flush=True)
         print(b.command("stats"))
@@ -28,7 +28,7 @@ import time
 DEFAULT_TTY       = "/dev/ttyLXU0"
 DEFAULT_TOKENIZER = "models/1.7b/tokenizer.json"
 PROMPT            = b"bonsai> "
-PBUF_TOKENS       = 512        # firmware/main.c PBUF_N: the on-card conversation buffer.
+PBUF_TOKENS       = 2048       # firmware/main.c PBUF_N: the on-card conversation buffer (= max_ctx).
 LINE_MAX          = 850        # Firmware console line buffer is 1024 B; leave slack.
 
 
@@ -164,7 +164,7 @@ class Bonsai:
                 raise BonsaiError(f"tok not acknowledged: {out!r}")
         self.turns = int(m.group(1))
 
-    def stream(self, text, max_tokens=64):
+    def stream(self, text, max_tokens=256):
         """Append `text` to the conversation and yield decoded pieces as tokens arrive."""
         if self.turns == 0:
             self.command("tokclr")
@@ -205,6 +205,6 @@ class Bonsai:
         if PROMPT.decode() not in pending.split("GEN DONE", 1)[1]:   # Usually in the same chunk.
             self._read_until(PROMPT, timeout=5.0)
 
-    def generate(self, text, max_tokens=64):
+    def generate(self, text, max_tokens=256):
         """Append `text` to the conversation; return the generated text."""
         return "".join(self.stream(text, max_tokens))

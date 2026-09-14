@@ -752,7 +752,8 @@ static void usage(void)
            "  -k FW      boot this firmware first (CPU reset, loader into main_ram, BIOS boot)\n"
            "  -K FW      boot it the old way (serial-boot frames over the console, 30-45 s)\n"
            "  -z FILE    tokeniser (default models/1.7b/tokenizer.bin)\n"
-           "  -n N       tokens to generate per turn (default 64)\n"
+           "  -n N       reply cap in tokens (default 256; the reply ends at <|im_end|> anyway,\n"
+           "             the cap is for runaways; the card holds 2048 tokens of conversation)\n"
            "  -r         raw completion: no chat template, the text continues as typed\n"
            "  -T [FILE]  tokeniser self-test against reference encodings, then exit\n"
            "  -E TEXT    print the ids one chat turn of TEXT sends (template included), exit\n"
@@ -762,7 +763,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-    int devnum = 0, ntok = 64, do_test = 0;
+    int devnum = 0, ntok = 256, do_test = 0;
     const char *tty  = "/dev/ttyLXU0";
     const char *img  = NULL, *fw = NULL, *fw_serial = NULL;
     const char *tokf = "models/1.7b/tokenizer.bin";
@@ -792,8 +793,8 @@ int main(int argc, char **argv)
     if (tok_load(tokf) < 0) return 1;
     if (do_test) return self_test(testf);
     if (enc_text) {
-        int ids[1024];
-        int n = encode_turn(enc_text, ids, 1024, 1, 1);
+        int ids[2048];
+        int n = encode_turn(enc_text, ids, 2048, 1, 1);
         for (int i = 0; i < n; i++) printf("%d%c", ids[i], i + 1 < n ? ' ' : '\n');
         return 0;
     }
@@ -856,7 +857,7 @@ int main(int argc, char **argv)
            g_chat ? "chat template, thinking off" : "raw completion, -r");
 
     char *linebuf = NULL; size_t linecap = 0;
-    int   ids[1024], out[1024];
+    int   ids[2048], out[2048];         /* PBUF_N in firmware/main.c: the on-card buffer. */
     int   fresh = 1, prev_closed = 1;
 
     while (1) {
@@ -881,7 +882,7 @@ int main(int argc, char **argv)
         }
         if (linebuf[0] == '/') { printf("[unknown: /reset /cmd <line> /stats /help]\n"); continue; }
 
-        int n = encode_turn(linebuf, ids, 1024, fresh, prev_closed);
+        int n = encode_turn(linebuf, ids, 2048, fresh, prev_closed);
         if (n == 0) { printf("[empty after tokenising]\n"); continue; }
 
         double t0 = now_s();
@@ -905,13 +906,13 @@ int main(int argc, char **argv)
         printf("bot> ");
         fflush(stdout);
         double first_dt = 0;
-        int ng = stream_generate(600.0, out, 1024, &first_dt);
+        int ng = stream_generate(600.0, out, 2048, &first_dt);
         if (ng < 0) {
             fprintf(stderr, "\n[timeout waiting for generation]\n");
             continue;
         }
         double dt = now_s() - t0;
-        prev_closed = (ng > 0 && ng <= 1024 && out[ng - 1] == g_im_end);
+        prev_closed = (ng > 0 && ng <= 2048 && out[ng - 1] == g_im_end);
         /* The rate is the decode rate: tokens after the first over the time after it. The
          * first token's latency is this turn's prefill (the card keeps the conversation's
          * KV cache across turns since 2026-09-11; before, it re-ran the whole history and

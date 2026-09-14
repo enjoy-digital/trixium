@@ -205,8 +205,9 @@ static void bench_cmd(char *args)
 static int gen_emit_to_pbuf;
 // Chunked prompt buffer (tok/genb) - main_ram static window, not .bss (sram is tight;
 // see firmware/linker.ld). BONSAI_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000)
-// and ek_undo (+0x90000).
-#define PBUF_N 512
+// and ek_undo (+0x90000); the heap starts at +0x100000. Sized to the KV budget (the image's
+// max_ctx, 2048 for the 1.7B): a conversation can use the whole context.
+#define PBUF_N 2048
 static int *const pbuf = (int *)(BONSAI_HDR_ADDR + 0xA0000); // [PBUF_N]
 static int pbuf_n;
 static int      pbuf_kv;      // pbuf[0..pbuf_kv) are in the KV cache (from the last genb)...
