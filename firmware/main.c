@@ -132,6 +132,7 @@ static void help(void)
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
     puts("bench [n]       - profiled generation benchmark (default 4 tokens)");
+    puts("sample T P R [S] - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
     puts("dbg [n]         - checksum the next n forwards' intermediates (vs the Python mirror)");
     puts("vbench          - stage-by-stage cycle microbenchmark");
     puts("Experiment toggles (all `name on|off`, each printing its state; defaults ship):");
@@ -364,6 +365,7 @@ static void genb_cmd(char *args)
     printf("GEN:");
     gen_emit_to_pbuf = 1;
     infer_set_stop(stop, nstop);
+    infer_set_recent(pbuf, &pbuf_n);      // the repetition penalty's window
     // Continue from the KV cache when the buffer's head is still what the last genb left
     // there (gen/bench in between reset it); otherwise the whole buffer is re-forwarded.
     int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
@@ -483,6 +485,16 @@ static void console_service(void)
         genb_cmd(str);
     else if (strcmp(token, "hwops") == 0)
         hwops_cmd(str);
+    else if (strcmp(token, "sample") == 0) { // sample <temp> <top_p> <rep> [seed], all x1000
+        char *a = get_token(&str), *b = get_token(&str), *c = get_token(&str), *d = get_token(&str);
+        if (*a) // Integers scaled by 1000: the console parser has no floats.
+            infer_set_sampling(parse_int(a)/1000.0f, *b ? parse_int(b)/1000.0f : 1.0f,
+                               *c ? parse_int(c)/1000.0f : 1.0f, *d ? (uint32_t)parse_int(d) : 0);
+        float t, p, r;
+        infer_get_sampling(&t, &p, &r);
+        printf("SAMPLE temp=%d.%03d top_p=%d.%03d rep=%d.%03d (x1000: sample 700 900 1100 [seed])\n",
+               (int)t, (int)(t*1000) % 1000, (int)p, (int)(p*1000) % 1000, (int)r, (int)(r*1000) % 1000);
+    }
     else if (strcmp(token, "dbg") == 0) {
         int n = (*str) ? parse_int(str) : 1;
         infer_dbg(n);

@@ -66,6 +66,10 @@ def cmd_chat(a):
     if not os.path.exists(exe):
         sys.exit(f"{exe} not built: make -C trixium/software/user BUILD_DIR=../../../build/<build>")
     cmd = [exe, "-t", a.tty, "-z", a.tokenizer, "-n", str(a.n)]
+    if a.temp or a.top_p != 1.0 or a.repeat != 1.0:
+        cmd += ["-S", f"{a.temp},{a.top_p},{a.repeat}"]
+    if a.seed:
+        cmd += ["-s", str(a.seed)]
     if a.firmware:
         cmd += ["-k", a.firmware]
     if a.image:
@@ -114,6 +118,10 @@ def main(argv=None):
     p.add_argument("--tty", default="/dev/ttyLXU0")
     p.add_argument("--tokenizer", default=os.path.join(REPO, "models", "1.7b", "tokenizer.bin"))
     p.add_argument("-n", type=int, default=256, help="reply cap in tokens (replies end at <|im_end|>)")
+    p.add_argument("--temp", type=float, default=0.0, help="sampling temperature (0 = greedy)")
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--repeat", type=float, default=1.0, help="repetition penalty (1.1 breaks greedy loops)")
+    p.add_argument("--seed", type=int, default=0)
     p.add_argument("-k", "--firmware", help="boot this firmware first (bonsai.bin)")
     p.add_argument("-m", "--image", help="upload this weight image first")
     p.set_defaults(fn=cmd_chat)

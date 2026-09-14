@@ -21,6 +21,11 @@ uint32_t infer_gen_serial(void);    // Bumped by every generation.
 // (the chat tools pass <|im_end|>; the tokenizer lives on the host). n = 0 clears it.
 #define INFER_STOP_MAX 4
 void infer_set_stop(const int *ids, int n);
+// Sampling: temperature (0 = greedy), top-p, repetition penalty (1 = none), PRNG seed
+// (0 = keep). infer_set_recent names the token buffer the penalty looks back into.
+void infer_set_sampling(float temp, float top_p, float rep, uint32_t seed);
+void infer_get_sampling(float *temp, float *top_p, float *rep);
+void infer_set_recent(const int *buf, const int *n_ptr);
 // Sequencer attention lists: off by default (they wedge the engine on this gateware - see
 // infer.c). The same ops run CPU-dispatched per head when off.
 extern int seq_use;

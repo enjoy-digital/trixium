@@ -38,8 +38,10 @@ class BonsaiError(RuntimeError):
 
 class Bonsai:
     def __init__(self, tty=DEFAULT_TTY, tokenizer=DEFAULT_TOKENIZER, chat_template=True,
-                 timeout=600.0):
-        """chat_template=False sends the text raw (completion style, like bonsai_chat)."""
+                 timeout=600.0, temperature=0.0, top_p=1.0, repeat_penalty=1.0, seed=None):
+        """chat_template=False sends the text raw (completion style, like bonsai_chat).
+        temperature 0 = greedy (bit-exact, the default); repeat_penalty 1.1 alone already
+        stops the list loops greedy decoding falls into."""
         import serial                          # Imported here: only the client needs it.
         from tokenizers import Tokenizer
         self.ser = serial.Serial(tty, 115200, timeout=0.05)
@@ -58,6 +60,8 @@ class Bonsai:
         self.im_end = self.tok.token_to_id("<|im_end|>") if chat_template else None
         self._closed = True                   # Did the last reply end with <|im_end|>?
         self._sync()
+        if temperature or top_p != 1.0 or repeat_penalty != 1.0 or seed:
+            self.set_sampling(temperature, top_p, repeat_penalty, seed)
 
     # -- console -------------------------------------------------------------------------------
 
@@ -125,6 +129,11 @@ class Bonsai:
         if "inference ready" not in out:
             raise BonsaiError(f"hdrload did not report 'inference ready':\n{out}")
         return out
+
+    def set_sampling(self, temperature=0.0, top_p=1.0, repeat_penalty=1.0, seed=None):
+        """Firmware `sample` (values x1000): temperature 0 = greedy."""
+        return self.command(f"sample {int(temperature*1000 + 0.5)} {int(top_p*1000 + 0.5)} "
+                            f"{int(repeat_penalty*1000 + 0.5)} {seed or 0}")
 
     def stats(self, reset=False):
         return self.command("stats reset" if reset else "stats")

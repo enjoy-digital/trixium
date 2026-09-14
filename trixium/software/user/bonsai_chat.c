@@ -764,9 +764,13 @@ static void usage(void)
            "  -n N       reply cap in tokens (default 256; the reply ends at <|im_end|> anyway,\n"
            "             the cap is for runaways; the card holds 2048 tokens of conversation)\n"
            "  -r         raw completion: no chat template, the text continues as typed\n"
+           "  -S T,P,R   sampling: temperature (0 = greedy), top-p, repetition penalty, e.g.\n"
+           "             -S 0.7,0.9,1.1 (greedy loops on lists; 1.1 alone already breaks them)\n"
+           "  -s SEED    sampling PRNG seed (reproducible runs)\n"
            "  -T [FILE]  tokeniser self-test against reference encodings, then exit\n"
            "  -E TEXT    print the ids one chat turn of TEXT sends (template included), exit\n"
-           "In the chat: /reset clears the conversation, /cmd <line> runs a firmware console\n"
+           "In the chat: /reset clears the conversation, /sample T,P,R changes the sampling,\n"
+           "/cmd <line> runs a firmware console\n"
            "command (e.g. /cmd stats, /cmd hwops), /stats and /help are shortcuts.\n");
 }
 
@@ -778,8 +782,10 @@ int main(int argc, char **argv)
     const char *tokf = "models/1.7b/tokenizer.bin";
     const char *testf = "models/1.7b/tokenizer_tests.txt";
     const char *enc_text = NULL;
+    const char *sampling = NULL;
+    unsigned    seed = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:rh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:S:s:rh")) != -1) {
         switch (opt) {
         case 'c': devnum = atoi(optarg); break;
         case 't': tty = optarg; break;
@@ -793,6 +799,8 @@ int main(int argc, char **argv)
         case 'z': tokf = optarg; break;
         case 'n': ntok = atoi(optarg); break;
         case 'r': g_chat = 0; break;
+        case 'S': sampling = optarg; break;
+        case 's': seed = (unsigned)strtoul(optarg, NULL, 0); break;
         case 'E': enc_text = optarg; break;
         case 'T': do_test = 1; if (optarg) testf = optarg; break;
         default: usage(); return 0;
@@ -861,6 +869,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "[warn] no <|im_start|> in %s - raw completion mode\n", tokf);
         g_chat = 0;
     }
+    if (sampling || seed) {
+        double t = 0, pp = 1, r = 1;
+        if (sampling) sscanf(sampling, "%lf,%lf,%lf", &t, &pp, &r);
+        send_line("sample %d %d %d %u", (int)(t*1000 + 0.5), (int)(pp*1000 + 0.5),
+                  (int)(r*1000 + 0.5), seed);
+        tty_expect("bonsai>", 5.0, cap, sizeof(cap), 0);
+        char *nl = strchr(cap, '\n');
+        printf("[init] %s", nl ? nl + 1 : cap);
+    }
     printf("\nTriXium chat - type a prompt, Ctrl-D to quit.\n"
            "(%s; each turn continues the conversation on-card; /reset clears it)\n\n",
            g_chat ? "chat template, thinking off" : "raw completion, -r");
@@ -889,7 +906,19 @@ int main(int argc, char **argv)
                 fprintf(stderr, "[no prompt back after 30 s]\n");
             continue;
         }
-        if (linebuf[0] == '/') { printf("[unknown: /reset /cmd <line> /stats /help]\n"); continue; }
+        if (!strncmp(linebuf, "/sample", 7)) {           /* /sample T,P,R  or  /sample T P R */
+            double t = 0, pp = 1, r = 1;
+            if (sscanf(linebuf + 7, "%lf%*[ ,]%lf%*[ ,]%lf", &t, &pp, &r) < 1) {
+                printf("[usage: /sample temp,top_p,rep  e.g. /sample 0.7,0.9,1.1]\n"); continue;
+            }
+            send_line("sample %d %d %d 0", (int)(t*1000 + 0.5), (int)(pp*1000 + 0.5), (int)(r*1000 + 0.5));
+            if (tty_expect("bonsai>", 5.0, cap, sizeof(cap), 0)) {
+                char *nl = strchr(cap, '\n');
+                fputs(nl ? nl + 1 : cap, stdout);
+            }
+            continue;
+        }
+        if (linebuf[0] == '/') { printf("[unknown: /reset /sample /cmd <line> /stats /help]\n"); continue; }
 
         int n = encode_turn(linebuf, ids, 2048, fresh, prev_closed);
         if (n == 0) { printf("[empty after tokenising]\n"); continue; }

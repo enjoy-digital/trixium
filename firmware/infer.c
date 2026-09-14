@@ -2661,6 +2661,93 @@ static const struct bons_entry *next_norm16(int l)
 }
 
 uint32_t infer_forwards; // Forwards run since boot (bench reports cycles per forward too).
+// Sampling (`sample <temp> <top_p> <rep> [seed]`; temp 0 = greedy, the default).
+//
+// The LM head's argmax tap returns one (value, index); sampling needs a candidate set. The
+// head runs as SMP_SLICES row-range ops instead of one, and each tap returns the best of
+// its slice: 32 candidates that always include the global best (so temperature 0 stays
+// bit-exact greedy) and approximate the top-32 (the true second best sits in the best's
+// own slice with probability 1/32). One op's dispatch is ~0.5k cycles, so the cost is
+// ~16k cycles a token (<1%); the stream itself is the same 151k rows. No RTL, no logits
+// in the scratchpad. The repetition penalty (llama.cpp's form: logit/rep above zero,
+// logit*rep below) applies to candidates seen in the last smp_window tokens of the
+// buffer the caller registers (infer_set_recent); then temperature, top-p, one draw from
+// an xorshift32 stream seeded by `sample`'s seed (reproducible).
+#define SMP_SLICES 32
+static float    smp_temp = 0.0f, smp_top_p = 1.0f, smp_rep = 1.0f;
+static uint32_t smp_rng = 0x9E3779B9u;
+static int      smp_window = 64;
+static const int *smp_recent; static const int *smp_recent_np;
+
+void infer_set_sampling(float temp, float top_p, float rep, uint32_t seed)
+{
+    smp_temp = temp < 0 ? 0 : temp;
+    smp_top_p = (top_p <= 0 || top_p > 1) ? 1.0f : top_p;
+    smp_rep = rep < 1.0f ? 1.0f : rep;
+    if (seed) smp_rng = seed;
+}
+void infer_get_sampling(float *temp, float *top_p, float *rep)
+{
+    *temp = smp_temp; *top_p = smp_top_p; *rep = smp_rep;
+}
+void infer_set_recent(const int *buf, const int *n_ptr) { smp_recent = buf; smp_recent_np = n_ptr; }
+static int smp_on(void) { return smp_temp > 0.0f || smp_rep > 1.0f; }
+
+static uint32_t smp_rand(void)
+{
+    uint32_t x = smp_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return smp_rng = x;
+}
+
+// Pick a token among the slice maxima. val[i] are the engine's int32 logits (one scale
+// for every row: the same B/R), lscale their float scale; tok[i] < vocab.
+static int smp_pick(const int32_t *val, const int *tok, int n, float lscale)
+{
+    float lg[SMP_SLICES];
+    int   best = 0;
+    for (int i = 0; i < n; i++) {
+        float v = (float)val[i]*lscale;
+        if (smp_rep > 1.0f) {
+            int seen = 0, rn = smp_recent_np ? *smp_recent_np : 0;
+            for (int j = rn - smp_window; j < rn; j++)
+                if (j >= 0 && smp_recent[j] == tok[i]) { seen = 1; break; }
+            if (seen) v = (v > 0) ? v/smp_rep : v*smp_rep;
+        }
+        lg[i] = v;
+        if (v > lg[best]) best = i;
+    }
+    if (smp_temp <= 0.0f)
+        return tok[best];                        // greedy (with the penalty applied)
+    // softmax(lg / temp) over the candidates, sorted descending for top-p.
+    int   ord[SMP_SLICES];
+    for (int i = 0; i < n; i++) ord[i] = i;
+    for (int i = 1; i < n; i++) {                // insertion sort, n <= 32
+        int o = ord[i], j = i;
+        while (j > 0 && lg[ord[j - 1]] < lg[o]) { ord[j] = ord[j - 1]; j--; }
+        ord[j] = o;
+    }
+    float p[SMP_SLICES], sum = 0;
+    for (int i = 0; i < n; i++) {
+        p[i] = expf((lg[ord[i]] - lg[ord[0]])/smp_temp);
+        sum += p[i];
+    }
+    float acc = 0, cut = smp_top_p*sum;
+    int keep = n;
+    for (int i = 0; i < n; i++) {                // smallest prefix with mass >= top_p
+        acc += p[i];
+        if (acc >= cut) { keep = i + 1; break; }
+    }
+    float r = (float)(smp_rand() >> 8)*(1.0f/16777216.0f)*acc;
+    float c = 0;
+    for (int i = 0; i < keep; i++) {
+        c += p[i];
+        if (r < c) return tok[ord[i]];
+    }
+    return tok[ord[keep - 1]];
+}
+
+
 // `dbg N`: checksum the resident intermediates of the next N forwards, the same regions at
 // the same points as the Python mirror's raw trace (test_sim_smoke.hybrid_generate, tag
 // names shared) - tools/card_vs_mirror.py lines the two up and names the first divergence.
@@ -3669,8 +3756,8 @@ attn_heads_done: ;
         return -1;
 
     // Final norm + LM head (tied or separate), chunked over rows to fit the scratchpad.
-    (void)op_rmsnorm_q8_sp(SP_XR, ex_state, out_norm,
-                           nrm_out16, n_embd, SP_H, SP_X);
+    int lm_sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, out_norm,
+                                  nrm_out16, n_embd, SP_H, SP_X);
     perf_enter(OP_LMHEAD);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head)
@@ -3681,6 +3768,53 @@ attn_heads_done: ;
     if (chunk_rpc > rpc) chunk_rpc = rpc;
 
 #ifdef BONSAI_HAS_TOPK
+    if (op_on_hw(OP_LMHEAD) && smp_on()) {
+        // Sampling: SMP_SLICES row-range ops, one candidate per slice from the tap.
+        uint32_t rb = bons_row_beats(head->cols, head->kind, head->group);
+        uint32_t srows = (rpc + SMP_SLICES - 1)/SMP_SLICES;
+        int32_t  cval[SMP_SLICES]; int ctok[SMP_SLICES]; int nc = 0;
+        for (uint32_t r0 = 0; r0 < rpc; r0 += srows) {
+            uint32_t rows = (r0 + srows <= rpc) ? srows : (rpc - r0);
+            struct engine_op op = {0};
+            op.kind   = ENGINE_KIND_TERNARY;
+            op.rows   = rows;
+            op.cols   = head->cols;
+            op.wbase  = BONSAI_CHAN_WEIGHT_BASE + (head->chan_base_beats + (uint64_t)r0*rb)*32;
+            op.wlen   = rows*rb;
+            op.sbeats = bons_scale_beats(head->cols, head->group);
+            op.cbeats = bons_code_beats(head->cols, head->kind);
+            op.bias   = head->bias;
+            op.rshift = head->rshift;
+            op.xsrc   = SP_X;
+            op.dst    = SP_Y;
+            op.supw   = 1;
+            engine_run(&op);
+            uint32_t idx = engine_csr_argmax_idx_read();   // grant*rows + row
+            uint32_t tok = (idx/rows)*rpc + r0 + idx % rows;
+            if (idx != 0xFFFFFF && tok < H->vocab) {
+                cval[nc] = (int32_t)engine_csr_argmax_val_read();
+                ctok[nc] = (int)tok;
+                nc++;
+            }
+        }
+#ifdef CSR_SEQ_BASE
+        if (likely(lovl_use && seq_use)) {   // the same next-token prep the greedy path posts
+            attn_list_prep_token(n_pos);
+            if (likely(qkvl_use))
+                qkv_prep_layer(0);
+        }
+#endif
+        perf_exit(OP_LMHEAD);
+        if (unlikely(tprof_active))
+            tprof_end();
+        float lscale = ldexpf(1.0f, E_NORM + lm_sx8 - (int)head->bias + (int)head->rshift);
+        int pick = nc ? smp_pick(cval, ctok, nc, lscale) : 0;
+        if (dbg_armed) {
+            printf("DBG pos=%d l=-1 argmax e=0 %08lx\n", n_pos - 1, (unsigned long)pick);
+            dbg_armed--;
+        }
+        return pick;
+    }
     if (likely(op_on_hw(OP_LMHEAD))) {
         // One suppressed-write op over every row; the argmax tap returns value+index
         // (global row order, ties to smallest - same as the CPU scan). Padding rows
