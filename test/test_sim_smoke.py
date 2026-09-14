@@ -192,15 +192,16 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         if modes.get("rmsnorm", "cpu") == "hw":
             w16_name = name.replace(".weight", "") + ".w16"
             _, w16 = img.tensor(w16_name)
-            sp = bytearray(3*8192)
+            slot = max(8192, ((2*n + 2047)//2048)*2048)
+            sp = bytearray(3*slot)
             sp[0:2*n]         = np.asarray(m).astype("<i2").tobytes()
-            sp[8192:8192+2*n] = w16.reshape(-1).astype("<i2").tobytes()
+            sp[slot:slot+2*n] = w16.reshape(-1).astype("<i2").tobytes()
             eps_int = max(1, int(round(float(h["rms_eps"])*2.0**(-2*e))))
             words = vasm.assemble(vasm.PROGRAMS["rmsnorm"]())
-            vasm.VecInterp(sp).run(words, [0, 8192, 16384, n//16,
+            vasm.VecInterp(sp).run(words, [0, slot, 2*slot, n//16,
                                            -int(np.log2(n)), eps_int,
                                            w16_exp(w16_name) - E_NORM - 15])
-            return np.frombuffer(bytes(sp[16384:16384+2*n]), dtype="<i2").astype(np.int64)
+            return np.frombuffer(bytes(sp[2*slot:2*slot+2*n]), dtype="<i2").astype(np.int64)
         w  = norm_w(name)
         v  = m.astype(f32)*f32(np.exp2(e))
         ss = fsum32(v*v)
@@ -240,12 +241,18 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
     def silu_sp(gm, eg, um, eu):
         if modes.get("silu_mul", "cpu") == "hw":
             n  = len(gm)
-            sp = bytearray(4*((2*n + 2048)//2048 + 2)*2048)
+            # Regions sized to the vector: the 8 KB slots were fine for the tiny model
+            # (ffn 512) and silently overlapped on the 1.7B (ffn 6144: the up vector
+            # overwrote the last third of the gate vector, so the mirror's silu was wrong
+            # for elements 4096.. of every layer - found 2026-09-14 by the card-vs-mirror
+            # dump, where the CARD was right).
+            slot = ((2*n + 2047)//2048)*2048
+            sp = bytearray(3*slot)
             sp[0:2*n]         = gm.astype("<i2").tobytes()
-            sp[8192:8192+2*n] = um.astype("<i2").tobytes()
+            sp[slot:slot+2*n] = um.astype("<i2").tobytes()
             words = vasm.assemble(vasm.PROGRAMS["silu_mul"]())
-            vasm.VecInterp(sp).run(words, [0, 8192, 16384, n//16, eg + 6, 0, -15])
-            return np.frombuffer(bytes(sp[16384:16384+2*n]), dtype="<i2").astype(np.int64)
+            vasm.VecInterp(sp).run(words, [0, slot, 2*slot, n//16, eg + 6, 0, -15])
+            return np.frombuffer(bytes(sp[2*slot:2*slot+2*n]), dtype="<i2").astype(np.int64)
         g = gm.astype(f32)*f32(np.exp2(eg))
         u = um.astype(f32)*f32(np.exp2(eu))
         o = (g/(f32(1.0) + np.exp(-g, dtype=f32))*u).astype(f32)*f32(np.exp2(-(eg + eu + 15)))
@@ -358,16 +365,17 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         cnt = len(res)
         padn = (16 - cnt % 16) % 16
         buf = np.concatenate([res, np.full(padn, -2**31, dtype=np.int64)])
-        spb = bytearray(8192)
+        pslot = max(4096, ((4*len(buf) + 2047)//2048)*2048)   # scores, then p8 (any context)
+        spb = bytearray(2*pslot)
         spb[0:4*len(buf)] = buf.astype("<i4").tobytes()
         lg = int(np.log2(hd))
         Ceff  = 523 if (lg & 1) else 739
         sigma = eq - Bk + Rk - (lg >> 1)
         s1v = 11
         words = vasm.assemble(vasm.PROGRAMS["softmax8"]())
-        S, _ = vasm.VecInterp(spb).run(words, [0, Ceff, 4096, len(buf)//16,
+        S, _ = vasm.VecInterp(spb).run(words, [0, Ceff, pslot, len(buf)//16,
                                                -s1v, sigma + 6 + s1v, 6144])
-        p8 = np.frombuffer(bytes(spb[4096:4096+len(buf)]), dtype=np.int8).astype(np.int64)
+        p8 = np.frombuffer(bytes(spb[pslot:pslot+len(buf)]), dtype=np.int8).astype(np.int64)
         P8 = int(S[6]) if S[6] else 1
         rowsv = hbm_kv[(l, kvh, 1)]
         ekv = max(e for e, _ in rowsv)
@@ -404,16 +412,17 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         cnt  = len(res)
         padn = (16 - cnt % 16) % 16
         buf  = np.concatenate([res, np.full(padn, -2**31, dtype=np.int64)])
-        spb  = bytearray(8192)
+        pslot = max(4096, ((4*len(buf) + 2047)//2048)*2048)
+        spb  = bytearray(2*pslot)
         spb[0:4*len(buf)] = buf.astype("<i4").tobytes()
         lg = int(np.log2(hd))
         Ceff  = 523 if (lg & 1) else 739
         sigma = eq - Bk + Rk - (lg >> 1)
         s1v   = 11
         words = vasm.assemble(vasm.PROGRAMS["softmax8"]())
-        S, _  = vasm.VecInterp(spb).run(words, [0, Ceff, 4096, len(buf)//16,
+        S, _  = vasm.VecInterp(spb).run(words, [0, Ceff, pslot, len(buf)//16,
                                                 -s1v, sigma + 6 + s1v, 6144])
-        p8 = np.frombuffer(bytes(spb[4096:4096+len(buf)]), dtype=np.int8).astype(np.int64)
+        p8 = np.frombuffer(bytes(spb[pslot:pslot+len(buf)]), dtype=np.int8).astype(np.int64)
         P8 = int(S[6]) if S[6] else 1
         rowsv = hbm_kv[(l, kvh, 1)]
         ekv   = max(e for e, _ in rowsv)
@@ -483,12 +492,16 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
             xf = ((emb_c[tok].astype(np.int32) - 1)
                   .reshape(-1, 128)*emb_s[tok].astype(f32)[:, None]).reshape(-1).astype(f32)
             xm, ex = to_bfp16(xf)
+        if trace is not None:
+            trace(pos, (-1, "emb"), (xm.copy(), ex))
         for l in range(n_layer):
             p = f"blk.{l}."
             # Attention block.
             hm = rmsnorm_sp(xm, ex, p + "attn_norm.weight")
             x8, sh8 = quant8_sp(hm)
             e8 = E_NORM + sh8
+            if trace is not None:
+                trace(pos, (l, "attn_in_x8"), (x8.copy(), e8))
             def qkv(name):
                 res, er = matvec_i8(p + name, x8, e8)
                 return (res.astype(np.float64)*np.exp2(er)).astype(f32)
@@ -542,21 +555,34 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                     Mh = int(np.clip(lroundf(np.ldexp(cs[i2], 15 - ea8)), 0, 32767))
                     a8[i2*hd:(i2+1)*hd] = np.clip(
                         bx.rne_shift(rms[i2]*Mh, 15), -127, 127).astype(np.int8)
+                # Raw (mantissa, exponent) trace points: the firmware's `dbg` checksums the
+                # same scratchpad regions at the same points (tools/card_vs_mirror.py).
+                if trace is not None:
+                    trace(pos, (l, "attn_x8"), (a8.copy(), ea8))
                 res, er = matvec_i8(p + "attn_output.weight", a8, ea8)
                 dm, kk  = norm_i32_sp(res)
                 xm, ex  = resid_sp(xm, ex, dm, er + kk)
+                if trace is not None:
+                    trace(pos, (l, "attn_res"), (xm.copy(), ex))
                 hm = rmsnorm_sp(xm, ex, p + "ffn_norm.weight")
                 x8, sh8 = quant8_sp(hm)
+                if trace is not None:
+                    trace(pos, (l, "ffn_x8"), (x8.copy(), E_NORM + sh8))
                 gres, ger = matvec_i8(p + "ffn_gate.weight", x8, E_NORM + sh8)
                 gm, kg = norm_i32_sp(gres)
                 ures, uer = matvec_i8(p + "ffn_up.weight", x8, E_NORM + sh8)
                 um, ku = norm_i32_sp(ures)
                 sm = silu_sp(gm, ger + kg, um, uer + ku)
                 s8, shs = quant8_sp(sm)
+                if trace is not None:
+                    trace(pos, (l, "ffn_g16"), (sm.copy(), ger + kg))
+                    trace(pos, (l, "silu_x8"), (s8.copy(), (ger + kg) + (uer + ku) + 15 + shs))
                 dres, der = matvec_i8(p + "ffn_down.weight", s8,
                                       (ger + kg) + (uer + ku) + 15 + shs)
                 dm, kd = norm_i32_sp(dres)
                 xm, ex = resid_sp(xm, ex, dm, der + kd)
+                if trace is not None:
+                    trace(pos, (l, "ffn_res"), (xm.copy(), ex))
                 continue
             if trace is not None:
                 trace(pos, (l, "h_attn"), hm.astype(np.float64)*2.0**E_NORM)

@@ -2634,6 +2634,61 @@ static const struct bons_entry *next_norm16(int l)
 }
 
 uint32_t infer_forwards; // Forwards run since boot (bench reports cycles per forward too).
+// `dbg N`: checksum the resident intermediates of the next N forwards, the same regions at
+// the same points as the Python mirror's raw trace (test_sim_smoke.hybrid_generate, tag
+// names shared) - tools/card_vs_mirror.py lines the two up and names the first divergence.
+// The only bit-exact reference the 1.7B has: the tiny sim model answers token 0 to
+// everything, so its token gate cannot see a numerics deviation (2026-09-14).
+static int dbg_armed;
+static char dbg_dump_tag[16];  // `dbgdump <tag> <layer> <pos>`: print that region whole.
+static int  dbg_dump_l, dbg_dump_pos = -1;
+void infer_dbg(int n) { dbg_armed = n; }
+void infer_dbg_dump(const char *tag, int l, int pos)
+{
+    int i = 0;
+    while (tag[i] && i < 15) { dbg_dump_tag[i] = tag[i]; i++; }
+    dbg_dump_tag[i] = 0;
+    dbg_dump_l = l; dbg_dump_pos = pos;
+}
+
+static void dbg_sum(const char *tag, int l, uint32_t off, uint32_t bytes, int e)
+{
+    if (!dbg_armed)
+        return;
+    const volatile uint8_t *p = (const volatile uint8_t *)(SCRATCHPAD_BASE + off);
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < bytes; i++)
+        h = (h ^ p[i])*16777619u;
+    // The first four elements and the absmax, so a divergence shows its magnitude at once
+    // (int8 regions carry "x8" in the tag).
+    int is8 = 0;                                  // libbase has no strstr: "x8" by hand.
+    for (const char *q = tag; q[0] && q[1]; q++)
+        if (q[0] == 'x' && q[1] == '8') is8 = 1;
+    int32_t v[4], amax = 0;
+    uint32_t n = is8 ? bytes : bytes/2;
+    for (uint32_t i = 0; i < n; i++) {
+        int32_t x = is8 ? (int32_t)((const volatile int8_t *)p)[i]
+                        : (int32_t)((const volatile int16_t *)p)[i];
+        if (i < 4) v[i] = x;
+        if (x < 0) x = -x;
+        if (x > amax) amax = x;
+    }
+    printf("DBG pos=%d l=%d %s e=%d %08lx  amax=%ld v0..3=%ld,%ld,%ld,%ld\n", n_pos, l, tag, e,
+           (unsigned long)h, (long)amax, (long)v[0], (long)v[1], (long)v[2], (long)v[3]);
+    if (dbg_dump_pos == n_pos && dbg_dump_l == l) {
+        int same = 1;
+        for (int i = 0; dbg_dump_tag[i] || tag[i]; i++)
+            if (dbg_dump_tag[i] != tag[i]) { same = 0; break; }
+        if (same) {
+            printf("DUMP %s", tag);
+            for (uint32_t i = 0; i < n; i++)
+                printf("%s%ld", (i & 15) ? "," : "\n", is8 ? (long)((const volatile int8_t *)p)[i]
+                                                        : (long)((const volatile int16_t *)p)[i]);
+            printf("\nDUMP END\n");
+        }
+    }
+}
+
 static int forward(int token, int want_logits)
 {
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
@@ -2671,6 +2726,7 @@ static int forward(int token, int want_logits)
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
 embed_done: ;
 #endif
+    dbg_sum("emb", -1, SP_XR, 2*n_embd, ex_state);
 
     int   kv_dim = n_kv_head*head_dim;
     int   q_dim  = n_head*head_dim;
@@ -2702,6 +2758,7 @@ embed_done: ;
         int sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, attn_norm[l],
                                    nrm_attn16[l],
                                    n_embd, SP_H, SP_X);
+        dbg_sum("attn_in_x8", l, SP_X, n_embd, E_NORM + sx8);
         int eq_res = 0, ev_res = 0;
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
         if (likely(attn_hw)) {
@@ -3428,6 +3485,7 @@ attn_heads_done: ;
             } else
 #endif
             ea8 = quantize_f_pow2(attn, q_dim, SP_X);
+            dbg_sum("attn_x8", l, SP_X, q_dim, ea8);
             model_matvec(eo, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);
             uint32_t dmax = 0;
@@ -3436,6 +3494,7 @@ attn_heads_done: ;
             int ed = ea8 - (int)eo->bias + (int)eo->rshift + kk;
             ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
                                     nrm_ffn16[l]);
+            dbg_sum("attn_res", l, SP_XR, 2*n_embd, ex_state);
         }
 
         // FFN (fully resident: no float round-trips).
@@ -3446,6 +3505,7 @@ attn_heads_done: ;
             int ex8 = E_NORM + op_rmsnorm_q8_sp(SP_XR, ex_state, ffn_norm[l],
                                                 nrm_ffn16[l],
                                                 n_embd, SP_H, SP_X);
+            dbg_sum("ffn_x8", l, SP_X, n_embd, ex8);
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && !defined(BONSAI_HAS_DUALQ)
@@ -3493,6 +3553,8 @@ attn_heads_done: ;
                 int eu  = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
                 int es8 = (eg + eu + 15)
                         + quant8_shift((uint32_t)vecunit_res6_read());
+                dbg_sum("ffn_g16", l, SP_G, 2*ffn_dim, eg);      // silu(gate)*up, int16
+                dbg_sum("silu_x8", l, SP_X, ffn_dim, es8);
                 perf_enter(OP_NORM_I32);
                 uint32_t dmax = 0;
                 int kd = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
@@ -3500,6 +3562,7 @@ attn_heads_done: ;
                 int ed = es8 - (int)ed_t->bias + (int)ed_t->rshift + kd;
                 ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
                                         next_norm16(l));
+                dbg_sum("ffn_res", l, SP_XR, 2*n_embd, ex_state);
                 goto ffn_done;
             }
 #endif
@@ -3546,6 +3609,7 @@ attn_heads_done: ;
 
             int es = eg + eu + 15;
             int es8 = es + op_silu_q8_sp(SP_G, eg, SP_U, eu, ffn_dim, SP_X);
+            dbg_sum("silu_x8", l, SP_X, ffn_dim, es8);
             if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
 
             model_matvec(ed_t, SP_X, SP_Y);
@@ -3560,12 +3624,15 @@ attn_heads_done: ;
             int ed = es8 - (int)ed_t->bias + (int)ed_t->rshift + kd;
             ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
                                     next_norm16(l));
+            dbg_sum("ffn_res", l, SP_XR, 2*n_embd, ex_state);
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
     && !defined(BONSAI_HAS_DUALQ)
             ffn_done: ;
 #endif
         }
     }
+    if (dbg_armed && !want_logits)
+        dbg_armed--;
     n_pos++;
 
     if (!want_logits)
@@ -3622,6 +3689,10 @@ attn_heads_done: ;
             perf_exit(OP_LMHEAD);
             if (unlikely(tprof_active))
                 tprof_end();
+            if (dbg_armed) {
+                printf("DBG pos=%d l=-1 argmax e=0 %08lx\n", n_pos - 1, (unsigned long)idx);
+                dbg_armed--;
+            }
             return (int)idx;
         }
     }
@@ -3661,6 +3732,10 @@ attn_heads_done: ;
     perf_exit(OP_LMHEAD);
     if (unlikely(tprof_active))
         tprof_end();
+    if (dbg_armed) {
+        printf("DBG pos=%d l=-1 argmax e=0 %08lx\n", n_pos - 1, (unsigned long)best_tok);
+        dbg_armed--;
+    }
     return best_tok;
 }
 

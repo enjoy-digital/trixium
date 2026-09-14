@@ -132,6 +132,7 @@ static void help(void)
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
     puts("bench [n]       - profiled generation benchmark (default 4 tokens)");
+    puts("dbg [n]         - checksum the next n forwards' intermediates (vs the Python mirror)");
     puts("vbench          - stage-by-stage cycle microbenchmark");
     puts("Experiment toggles (all `name on|off`, each printing its state; defaults ship):");
     puts("  ffnseq fsplit     - FFN as one sequencer list; SiLU split under the up stream");
@@ -482,6 +483,18 @@ static void console_service(void)
         genb_cmd(str);
     else if (strcmp(token, "hwops") == 0)
         hwops_cmd(str);
+    else if (strcmp(token, "dbg") == 0) {
+        int n = (*str) ? parse_int(str) : 1;
+        infer_dbg(n);
+        printf("DBG armed for %d forwards\n", n);
+    }
+    else if (strcmp(token, "dbgdump") == 0) { // dbgdump <tag> <layer> <pos>
+        char *tag = get_token(&str);
+        char *ls  = get_token(&str);
+        char *ps  = get_token(&str);
+        infer_dbg_dump(tag, parse_int(ls), parse_int(ps));
+        printf("DBG dump %s l=%d pos=%d\n", tag, parse_int(ls), parse_int(ps));
+    }
     else if (strcmp(token, "stats") == 0) {
         if (strncmp(str, "reset", 5) == 0)
             perf_reset();

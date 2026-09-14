@@ -26,6 +26,8 @@ void infer_set_stop(const int *ids, int n);
 extern int seq_use;
 
 void infer_vbench(void);  // Stage-by-stage cycle microbenchmark (run after hdrload).
+void infer_dbg(int n);    // Checksum the resident intermediates of the next n forwards (dbg).
+void infer_dbg_dump(const char *tag, int l, int pos); // ...and print one of them whole.
 void infer_attn_pipe(int on);   // Pipelined attention list on/off (aovl; rebuilds lists).
 void infer_kv_pipe(int on);     // In-list NOWAIT KV stores on/off (kovl; rebuilds lists).
 int  infer_kv_pipe_state(void);
