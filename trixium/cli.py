@@ -9,7 +9,7 @@
     bonsai convert   models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf   # -> models/bons/...-n16.img
     bonsai verify    models/bons/bonsai-1p7b-n16.img
     bonsai tokenizer models/1.7b/tokenizer.json                 # -> models/1.7b/tokenizer.bin
-    bonsai deploy    n16_212_v14b                               # bitstream + weights + boot
+    bonsai deploy    n16_212_v15b                               # bitstream + weights + boot
     bonsai chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
     bonsai console   "stats" "bench 64"                         # raw firmware commands
 
@@ -131,7 +131,7 @@ def main(argv=None):
     p.set_defaults(fn=cmd_tokenizer)
 
     p = sub.add_parser("deploy", help="configure the lab board with a build and boot it (tools/board.env)")
-    p.add_argument("build", nargs="?", default="n16_212_v14b", help="build/<name> (default n16_212_v14b)")
+    p.add_argument("build", nargs="?", default="n16_212_v15b", help="build/<name> (default n16_212_v15b)")
     p.set_defaults(fn=cmd_deploy)
 
     p = sub.add_parser("chat", help="chat REPL on the machine with the card")

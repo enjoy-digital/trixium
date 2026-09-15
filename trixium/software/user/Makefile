@@ -1,7 +1,7 @@
 # Point BUILD_DIR at the gateware build whose bitstream is loaded: the generated headers
 # (BONSAI_N_CHANNELS, CSR map) differ per build and a mismatch silently misconfigures the
 # card. Defaults to the shipping build (tools/build_fk33.sh).
-BUILD_DIR ?= ../../../build/n16_212_v14b
+BUILD_DIR ?= ../../../build/n16_212_v15b
 # The driver-flavour headers (csr.h/soc.h/mem.h without the <generated/...> includes) are
 # what host code compiles against; the deploy script regenerates them next to the build.
 GEN_INC   := $(BUILD_DIR)/driver/kernel
