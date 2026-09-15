@@ -133,6 +133,8 @@ static void help(void)
     puts("stats [reset]   - per-op cycle profile");
     puts("bench [n]       - profiled generation benchmark (default 4 tokens)");
     puts("sample T P R [S] - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
+    puts("engreset        - soft reset of the engine cluster (automatic after a stall)");
+    puts("wedge           - stall the engine on purpose, recover, rerun the self-test");
     puts("dbg [n]         - checksum the next n forwards' intermediates (vs the Python mirror)");
     puts("vbench          - stage-by-stage cycle microbenchmark");
     puts("Experiment toggles (all `name on|off`, each printing its state; defaults ship):");
@@ -375,6 +377,10 @@ static void genb_cmd(char *args)
     infer_set_stop(stop, 0);
     gen_emit_to_pbuf = 0;
     puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
+    if (engine_wedged) {          // Recover here, after the stream: the client reads GEN ERR.
+        engine_recover();
+        pbuf_kv = 0;              // The KV cache is not trustworthy: the next genb re-forwards.
+    }
 }
 
 static void gen_cmd(char *args)
@@ -396,6 +402,8 @@ static void gen_cmd(char *args)
     printf("GEN:");
     int r = infer_generate(prompt, np, n, emit_token);
     puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
+    if (engine_wedged)
+        engine_recover();
 }
 
 static void sptest(void)
@@ -494,6 +502,23 @@ static void console_service(void)
         infer_get_sampling(&t, &p, &r);
         printf("SAMPLE temp=%d.%03d top_p=%d.%03d rep=%d.%03d (x1000: sample 700 900 1100 [seed])\n",
                (int)t, (int)(t*1000) % 1000, (int)p, (int)(p*1000) % 1000, (int)r, (int)(r*1000) % 1000);
+    }
+    else if (strcmp(token, "engreset") == 0)
+        engine_recover();
+    else if (strcmp(token, "wedge") == 0) {
+        // Deliberately wedge the engine (an op whose stream is 2 beats short of its rows),
+        // let the stall reporter give up, recover, and rerun the self-test: the checksums
+        // must match the boot's. The recovery path's own test, on the sim and the card.
+        struct engine_op op = {0};
+        op.kind = ENGINE_KIND_TERNARY; op.rows = 8; op.cols = 256; op.wbase = 0;
+        op.wlen = 2; op.sbeats = 1; op.cbeats = 2; op.xsrc = 0; op.dst = 0x4000;
+        puts("WEDGE: submitting an op that cannot complete");
+        engine_run(&op);
+        if (!engine_wedged) { puts("WEDGE: the op completed?!"); return; }
+        if (engine_recover() == 0) {
+            puts("WEDGE: recovered - self-test follows");
+            selftest();
+        }
     }
     else if (strcmp(token, "dbg") == 0) {
         int n = (*str) ? parse_int(str) : 1;

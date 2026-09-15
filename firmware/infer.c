@@ -4419,12 +4419,15 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
         return -1;
     }
     int tok = -1;
-    for (int i = resident; i < n; i++)
+    for (int i = resident; i < n; i++) {
         tok = forward(buf[i], i == n - 1);
+        if (engine_wedged) { printf(" [engine wedged during the prompt]"); return -1; }
+    }
     int count = 0;
     for (int i = 0; i < max_new; i++) {
         if (n_pos >= max_ctx)
             break;
+        if (engine_wedged) { printf(" [engine wedged]"); return -1; } // the token is garbage
         emit(tok);
         count++;
         if (gen_is_stop(tok))

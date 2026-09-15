@@ -9,6 +9,7 @@
 #include <generated/soc.h>
 
 #include "seq.h"
+#include "engine.h"
 #include "perf.h"
 
 #ifdef CSR_SEQ_BASE
@@ -130,9 +131,15 @@ void seq_join(void)
                (unsigned long)engine_csr_status_read());
         if (++reports == 8) {
             seq_wedged = 1;
+            engine_wedged = 1;
+#ifdef BONSAI_HAS_ENGRESET
+            puts("SEQSTALL: giving up - the generation aborts and the engine cluster is "
+                 "soft-reset (engreset); the weights stay.");
+#else
             puts("SEQSTALL: giving up. The engine is stuck mid-op and holds the scratchpad;\n"
                  "results from here are garbage. Reconfigure the FPGA to recover (a CPU\n"
                  "reset will not do it) - and note this wipes HBM, so reupload the weights.");
+#endif
             return;
         }
     }
@@ -162,6 +169,7 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
             break;
         if (++spins > 4000000u) { // Wedge guard (diagnostic path: just stop).
             seq_wedged = 1;
+            engine_wedged = 1;
             puts("SEQSTALL (trace): giving up - reconfigure to recover.");
             break;
         }
@@ -207,9 +215,15 @@ void seq_run(uint32_t idx0, uint32_t count)
                (unsigned long)engine_csr_status_read());
         if (++reports == 8) {
             seq_wedged = 1;
+            engine_wedged = 1;
+#ifdef BONSAI_HAS_ENGRESET
+            puts("SEQSTALL: giving up - the generation aborts and the engine cluster is "
+                 "soft-reset (engreset); the weights stay.");
+#else
             puts("SEQSTALL: giving up. The engine is stuck mid-op and holds the scratchpad;\n"
                  "results from here are garbage. Reconfigure the FPGA to recover (a CPU\n"
                  "reset will not do it) - and note this wipes HBM, so reupload the weights.");
+#endif
             return;
         }
     }

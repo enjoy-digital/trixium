@@ -147,8 +147,13 @@ class BonsaiSimSoC(SoCCore):
                 latency=hbm_latency, stall_rate=hbm_stall_rate)
             self.add_module(f"hbm_model{c}", model)
             axis.append(axi)
-        self.vecunit    = BonsaiVectorUnit()
-        self.seq = BonsaiSequencer()
+        # Same soft-resettable domain + AXI shims as trixium.py (engreset.py).
+        from trixium.gateware.engreset import BonsaiEngineResetDomain
+        self.engrst = BonsaiEngineResetDomain(axis)
+        axis = self.engrst.masters
+        self.add_constant("BONSAI_HAS_ENGRESET")
+        self.vecunit    = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
+        self.seq = ClockDomainsRenamer("eng")(BonsaiSequencer())
         self.comb += [
             self.vecunit.seq_en.eq(self.seq.busy),
             self.vecunit.seq_start.eq(self.seq.vec_start),
@@ -162,9 +167,14 @@ class BonsaiSimSoC(SoCCore):
             self.vecunit.seq_seed7.eq(self.seq.vec_seed7),
         ]
         self.comb += [self.vecunit.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-        self.engine     = BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit,
-                                              seq=self.seq, dual=dual)
+        self.engine     = ClockDomainsRenamer("eng")(
+            BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit, seq=self.seq, dual=dual))
         self.engine_csr = BonsaiEngineCSR(self.engine, seq=self.seq)
+        self.comb += [
+            self.engrst.trigger.eq(self.engine_csr.rst_trigger),
+            self.engine_csr.rst_busy.eq(self.engrst.busy),
+            self.engine_csr.rst_stuck.eq(self.engrst.stuck),
+        ]
         self.add_constant("BONSAI_HAS_SEQ")
         self.comb += [
             self._prof_pads.eng_busy.eq(self.engine.busy),
@@ -173,7 +183,7 @@ class BonsaiSimSoC(SoCCore):
         ]
         # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
         # kind-3 STORE ops (KV append).
-        self.loader = BonsaiHBMLoader(axis)
+        self.loader = ClockDomainsRenamer("eng")(BonsaiHBMLoader(axis))
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
             self.engine.store_data.connect(self.loader.store_data),

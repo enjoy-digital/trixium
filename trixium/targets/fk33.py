@@ -144,10 +144,17 @@ class BonsaiSoC(SoCCore):
             from litex.soc.integration.soc import SoCRegion
 
             self.scratchpad = BonsaiScratchpad(size=256*1024)
+            # The engine cluster lives in the soft-resettable `eng` domain (engreset.py):
+            # a wedged op is a CSR write away from recovery instead of a reconfigure. Its
+            # HBM ports go through the AXI shims, which keep the protocol whole meanwhile.
+            from trixium.gateware.engreset import BonsaiEngineResetDomain
+            self.engrst = BonsaiEngineResetDomain(engine_axis)
+            engine_axis = self.engrst.masters
+            self.add_constant("BONSAI_HAS_ENGRESET")
             vecunit = None
             if with_vecunit:
                 from trixium.gateware.vector import BonsaiVectorUnit
-                vecunit = self.vecunit = BonsaiVectorUnit()
+                vecunit = self.vecunit = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
                 self.add_constant("BONSAI_HAS_VECUNIT")
                 self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set.
                 self.add_constant("BONSAI_VEC_LOOPS2")   # Second loop level (2026-08-30).
@@ -155,7 +162,7 @@ class BonsaiSoC(SoCCore):
             if with_vecunit:
                 from trixium.gateware.sequencer import BonsaiSequencer
                 self.add_constant("BONSAI_SEQ_LUT")      # A5-from-LUT arg source (2026-09-09).
-                seq = self.seq = BonsaiSequencer()
+                seq = self.seq = ClockDomainsRenamer("eng")(BonsaiSequencer())
                 self.comb += [
                     vecunit.seq_en.eq(seq.busy),
                     vecunit.seq_start.eq(seq.vec_start),
@@ -179,19 +186,24 @@ class BonsaiSoC(SoCCore):
                 # RAMB18 output stage, so the regexes matched nothing.)
             from trixium.layout import HBM_CHAN_STRIDE
             self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
-            self.engine     = BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
-                                                 seq=seq, dual=with_dual,
-                                                 chan_stride=HBM_CHAN_STRIDE)
+            self.engine     = ClockDomainsRenamer("eng")(
+                BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
+                                   seq=seq, dual=with_dual, chan_stride=HBM_CHAN_STRIDE))
             if with_dual:
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
                 self.add_constant("BONSAI_HAS_DUALQ")
             self.engine_csr = BonsaiEngineCSR(self.engine, seq=seq)
+            self.comb += [
+                self.engrst.trigger.eq(self.engine_csr.rst_trigger),
+                self.engine_csr.rst_busy.eq(self.engrst.busy),
+                self.engine_csr.rst_stuck.eq(self.engrst.stuck),
+            ]
             from trixium.layout import HBM_CHAN_STRIDE as _LOADER_STRIDE
             # Channel offsets added in hardware on the upload path too (33-bit windows,
             # N=16 puts channel 15 above 4 GB); the host tools read
             # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
-            self.loader     = BonsaiHBMLoader(engine_axis, data_width=128,
-                                              chan_stride=_LOADER_STRIDE)
+            self.loader     = ClockDomainsRenamer("eng")(
+                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=_LOADER_STRIDE))
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),

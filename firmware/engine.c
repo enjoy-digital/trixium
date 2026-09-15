@@ -15,6 +15,41 @@
 #include "perf.h"
 
 int engine_wedged; // Sticky: an op never completed, so engine results are not trustworthy.
+
+// Soft reset of the engine cluster (engine, loader, sequencer, vector unit) - the `eng`
+// clock domain, gateware/engreset.py. The HBM ports stay whole behind their AXI shims;
+// the scratchpad, the vector programs and the descriptor lists survive. Returns 0 when
+// the ports drained, -1 when a port never answers (the shim's `stuck`: the FPGA needs a
+// reconfigure after all) or the drain timed out. Bitstreams before 2026-09-15 have no
+// soft reset: -2.
+int engine_recover(void)
+{
+#ifdef BONSAI_HAS_ENGRESET
+    engine_csr_soft_reset_write(1);
+    engine_csr_soft_reset_write(0);
+    uint32_t spins = 0;
+    while (engine_csr_rst_status_read() & 1) {  // busy: hold + drain
+        if (engine_csr_rst_status_read() & 2) { // stuck: a burst that never returns
+            puts("ENGRESET: a port did not drain (a burst the HBM never answered) - "
+                 "reconfigure the FPGA");
+            return -1;
+        }
+        if (++spins > 2000000u) {
+            puts("ENGRESET: drain timeout - reconfigure the FPGA");
+            return -1;
+        }
+    }
+    engine_wedged = 0;
+    extern int seq_wedged;
+    seq_wedged = 0;
+    // The op CSRs live in the never-reset CSR front, so the shadow stays valid.
+    puts("ENGRESET ok");
+    return 0;
+#else
+    puts("ENGRESET: this bitstream has no soft reset - reconfigure the FPGA");
+    return -2;
+#endif
+}
 // Per-op stall diagnostics (pre-op beat snapshots, result-slot markers) cost ~2k cycles of
 // CSR/scratchpad traffic per engine op - ~1.3M cycles per forward at ~760 ops. They were
 // indispensable while the gather wedge was live; now they are opt-in (`engdiag on`). The
@@ -166,8 +201,13 @@ void engine_join(uint32_t done)
         // and only reconfiguring the FPGA recovers either way.
         if (++reports == 8) {
             engine_wedged = 1;
+#ifdef BONSAI_HAS_ENGRESET
+            puts("ENGSTALL: giving up - the generation aborts and the engine is soft-reset "
+                 "(engreset); the weights stay.");
+#else
             puts("ENGSTALL: giving up. Reconfigure the FPGA to recover (a CPU reset will "
                  "not do it), and reupload the weights - HBM is wiped with it.");
+#endif
             break;
         }
     }

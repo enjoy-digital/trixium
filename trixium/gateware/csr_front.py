@@ -47,6 +47,16 @@ class BonsaiEngineCSR(LiteXModule):
         self.dstride = CSRStorage(24, description="STORE: HBM beats between packets.")
         self.sstride = CSRStorage(8,  description="STORE: scratchpad beats between source slots.")
         self.submit  = CSRStorage(1,  description="Write 1 to submit the op.")
+        self.soft_reset = CSRStorage(1, description="Write 1: reset the engine, loader, sequencer "
+                                        "and vector unit (their HBM ports drain cleanly).")
+        self.rst_status = CSRStatus(fields=[
+            CSRField("busy",  size=1, description="Reset or port drain in progress: wait."),
+            CSRField("stuck", size=1, description="A port did not drain (burst never answered): "
+                                                  "reconfigure the FPGA."),
+        ])
+        self.rst_trigger = Signal()   # -> the reset domain
+        self.rst_busy    = Signal()   # <- the reset domain
+        self.rst_stuck   = Signal()
         self.status  = CSRStatus(fields=[
             CSRField("busy",     size=1),
             CSRField("error",    size=1, description="Sticky reserved-code error."),
@@ -93,8 +103,15 @@ class BonsaiEngineCSR(LiteXModule):
         # returns to idle (results are rewritten identically, but the replay's command
         # accept resets the absmax tracker under the firmware's feet - and doubles the
         # HBM stream time of every op).
+        self.comb += [
+            self.rst_trigger.eq(self.soft_reset.re & self.soft_reset.storage),
+            self.rst_status.fields.busy.eq(self.rst_busy),
+            self.rst_status.fields.stuck.eq(self.rst_stuck),
+        ]
         self.sync += [
-            If(engine.cmd.valid & engine.cmd.ready,
+            If(self.rst_trigger | self.rst_busy,
+                pending.eq(0),                  # never replay the wedged op after the reset
+            ).Elif(engine.cmd.valid & engine.cmd.ready,
                 pending.eq(0),
             ).Elif(self.submit.re & self.submit.storage,
                 pending.eq(1),

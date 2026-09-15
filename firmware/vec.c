@@ -7,6 +7,7 @@
 #include <generated/soc.h>
 
 #include "vec.h"
+#include "engine.h"
 #include "perf.h"
 
 #ifdef CSR_VECUNIT_BASE
@@ -57,6 +58,7 @@ uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
                pc, (unsigned long)vecunit_status_read());
         if (++reports == 8) {
             puts("VECSTALL: giving up (results from here are garbage).");
+            engine_wedged = 1;   // one flag: the generation aborts and engine_recover runs
             break;
         }
     }

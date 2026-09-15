@@ -58,6 +58,10 @@ class BonsaiHBMChannelModel(LiteXModule):
         if axi is None:
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
         self.axi = axi
+        # Test control: while `freeze` is up the read server delivers nothing (a port that
+        # stops answering - the wedge the engine soft reset exists for); released later, the
+        # beats of the bursts it still owes come out, which is what the AXI shim must absorb.
+        self.freeze = Signal()
         depth    = size//BEAT_BYTES
         self.autocsr_exclude = {"mem"} # Keep the model memory off the CSR bus (AutoCSR scan).
 
@@ -136,7 +140,7 @@ class BonsaiHBMChannelModel(LiteXModule):
             )
         )
         fsm.act("STREAM",
-            axi.r.valid.eq(~stall),
+            axi.r.valid.eq(~stall & ~self.freeze),
             If(axi.r.valid & axi.r.ready,
                 NextValue(r_beat, r_beat + 1),
                 NextValue(r_left, r_left - 1),
@@ -195,7 +199,7 @@ class BonsaiHBMChannelModel(LiteXModule):
             axi.r.id.eq(cur_id),
             axi.r.resp.eq(0),
             axi.r.last.eq(cur_left == 1),
-            axi.r.valid.eq(cur_valid & ~stall),
+            axi.r.valid.eq(cur_valid & ~stall & ~self.freeze),
             rr_fire.eq(axi.r.valid & axi.r.ready),
             cur_done.eq(rr_fire & (cur_left == 1)),
         ]

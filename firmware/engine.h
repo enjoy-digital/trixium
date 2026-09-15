@@ -54,6 +54,7 @@ void engine_join(uint32_t done);
 void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst);
 
 extern int engine_wedged; // Set once an op stalled (see ENGSTALL in engine.c).
+int engine_recover(void);   // Soft reset of the engine cluster; 0 = recovered, <0 = reconfigure.
 extern int engine_diag;   // Opt-in per-op stall diagnostics (cost ~2k cycles/op).
 
 #endif
