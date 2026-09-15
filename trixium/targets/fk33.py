@@ -151,6 +151,17 @@ class BonsaiSoC(SoCCore):
             self.engrst = BonsaiEngineResetDomain(engine_axis)
             engine_axis = self.engrst.masters
             self.add_constant("BONSAI_HAS_ENGRESET")
+            # The eng reset is held for 64 cycles, so its net may take several to arrive:
+            # without this Vivado puts the 90k-fanout net on a BUFG and 16k flop R pins
+            # miss by 0.4 ns (n16_212_v15a: 22,046 failing endpoints, 16,286 of them R).
+            # Setup 4 / hold 3 cycles: every flop is in reset well inside the hold, and the
+            # CPU's first submit after the release is hundreds of cycles away.
+            platform.add_platform_command(
+                "set_multicycle_path -setup 4 -from "
+                "[get_cells -hierarchical -filter {{NAME =~ *eng_rst_reg*}}]")
+            platform.add_platform_command(
+                "set_multicycle_path -hold 3 -from "
+                "[get_cells -hierarchical -filter {{NAME =~ *eng_rst_reg*}}]")
             vecunit = None
             if with_vecunit:
                 from trixium.gateware.vector import BonsaiVectorUnit
