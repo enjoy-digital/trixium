@@ -299,6 +299,7 @@ static int tok_encode(const char *text, int *out, int max)
 }
 
 static int g_chat = 1;   /* 0 = raw completion (-r): the text goes to the model as typed. */
+static const char *g_system = NULL;   /* -y: a system turn ahead of the first user turn. */
 
 /* One user turn in the Qwen3 chat template, as the HF tokenizer would encode it (it splits
  * at the added tokens and BPE-encodes the runs between - same ids as this, piece by piece):
@@ -313,6 +314,13 @@ static int encode_turn(const char *text, int *out, int max, int first, int prev_
         return tok_encode(text, out, max);
     if (!first) {
         if (!prev_closed && n < max) out[n++] = g_im_end;
+        n += tok_encode("\n", out + n, max - n);
+    }
+    if (first && g_system && *g_system) {         /* <|im_start|>system\n...<|im_end|>\n */
+        if (n < max) out[n++] = g_im_start;
+        n += tok_encode("system\n", out + n, max - n);
+        n += tok_encode(g_system, out + n, max - n);
+        if (n < max) out[n++] = g_im_end;
         n += tok_encode("\n", out + n, max - n);
     }
     if (n < max) out[n++] = g_im_start;
@@ -767,6 +775,8 @@ static void usage(void)
            "  -S T,P,R   sampling: temperature (0 = greedy), top-p, repetition penalty, e.g.\n"
            "             -S 0.7,0.9,1.1 (greedy loops on lists; 1.1 alone already breaks them)\n"
            "  -s SEED    sampling PRNG seed (reproducible runs)\n"
+           "  -y TEXT    system prompt (a system turn ahead of the conversation)\n"
+           "In the chat a line ending in a backslash continues on the next line.\n"
            "  -T [FILE]  tokeniser self-test against reference encodings, then exit\n"
            "  -E TEXT    print the ids one chat turn of TEXT sends (template included), exit\n"
            "In the chat: /reset clears the conversation, /sample T,P,R changes the sampling,\n"
@@ -785,7 +795,7 @@ int main(int argc, char **argv)
     const char *sampling = NULL;
     unsigned    seed = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:S:s:rh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:S:s:y:rh")) != -1) {
         switch (opt) {
         case 'c': devnum = atoi(optarg); break;
         case 't': tty = optarg; break;
@@ -801,6 +811,7 @@ int main(int argc, char **argv)
         case 'r': g_chat = 0; break;
         case 'S': sampling = optarg; break;
         case 's': seed = (unsigned)strtoul(optarg, NULL, 0); break;
+        case 'y': g_system = optarg; break;
         case 'E': enc_text = optarg; break;
         case 'T': do_test = 1; if (optarg) testf = optarg; break;
         default: usage(); return 0;
@@ -891,6 +902,22 @@ int main(int argc, char **argv)
         ssize_t ln = getline(&linebuf, &linecap, stdin);
         if (ln <= 0) break;
         if (linebuf[ln-1] == '\n') linebuf[--ln] = 0;
+        /* Multi-line input: a trailing backslash continues the prompt on the next line. */
+        while (ln > 0 && linebuf[ln-1] == '\\') {
+            linebuf[ln-1] = '\n';
+            printf("...> "); fflush(stdout);
+            char *more = NULL; size_t morecap = 0;
+            ssize_t lm = getline(&more, &morecap, stdin);
+            if (lm <= 0) { free(more); break; }
+            if (more[lm-1] == '\n') more[--lm] = 0;
+            if ((size_t)(ln + lm + 1) > linecap) {
+                linecap = ln + lm + 1024;
+                linebuf = realloc(linebuf, linecap);
+            }
+            memcpy(linebuf + ln, more, lm + 1);
+            ln += lm;
+            free(more);
+        }
         if (ln == 0) continue;
         if (!strcmp(linebuf, "/reset")) { fresh = 1; prev_closed = 1; printf("[context cleared]\n"); continue; }
         if (!strcmp(linebuf, "/help"))  { strcpy(linebuf, "/cmd help"); }

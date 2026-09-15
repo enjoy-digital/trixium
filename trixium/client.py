@@ -38,7 +38,8 @@ class BonsaiError(RuntimeError):
 
 class Bonsai:
     def __init__(self, tty=DEFAULT_TTY, tokenizer=DEFAULT_TOKENIZER, chat_template=True,
-                 timeout=600.0, temperature=0.0, top_p=1.0, repeat_penalty=1.0, seed=None):
+                 timeout=600.0, temperature=0.0, top_p=1.0, repeat_penalty=1.0, seed=None,
+                 system=None):
         """chat_template=False sends the text raw (completion style, like bonsai_chat).
         temperature 0 = greedy (bit-exact, the default); repeat_penalty 1.1 alone already
         stops the list loops greedy decoding falls into."""
@@ -55,6 +56,7 @@ class Bonsai:
                               "pcie_console.py, litex_term?) - close it first")
         self.tok = Tokenizer.from_file(tokenizer)
         self.chat_template = chat_template
+        self.system = system                  # A system turn ahead of the first user turn.
         self.timeout = timeout
         self.turns = 0                        # Tokens currently in the on-card buffer.
         self.im_end = self.tok.token_to_id("<|im_end|>") if chat_template else None
@@ -153,6 +155,8 @@ class Bonsai:
             # continuing conversation the previous reply is closed first: the card keeps
             # it in the buffer, and one cut short by max_tokens has no <|im_end|>.
             prefix = "" if self.turns == 0 else ("" if self._closed else "<|im_end|>") + "\n"
+            if self.turns == 0 and self.system:
+                prefix += f"<|im_start|>system\n{self.system}<|im_end|>\n"
             text = (f"{prefix}<|im_start|>user\n{text}<|im_end|>\n"
                     f"<|im_start|>assistant\n<think>\n\n</think>\n\n")
         return self.tok.encode(text).ids

@@ -62,19 +62,39 @@ def cmd_deploy(a):
 
 
 def cmd_chat(a):
+    flags = ["-n", str(a.n)]
+    if a.temp or a.top_p != 1.0 or a.repeat != 1.0:
+        flags += ["-S", f"{a.temp},{a.top_p},{a.repeat}"]
+    if a.seed:
+        flags += ["-s", str(a.seed)]
+    if a.system:
+        flags += ["-y", a.system]
+    if a.firmware:
+        flags += ["-k", a.firmware]
+    if a.image:
+        flags += ["-m", a.image]
+    if a.remote:
+        # From the workstation: the chat runs on the board host over ssh (tools/board.env),
+        # in the tree the deploy script maintains there.
+        env = _board_env()
+        import shlex
+        remote = (f"cd {shlex.quote(env['BOARD_DIR'])} && ./user/bonsai_chat -t {shlex.quote(a.tty)} "
+                  + " ".join(shlex.quote(f) for f in flags))
+        os.execvp("ssh", ["ssh", "-t", f"{env['BOARD_USER']}@{env['BOARD_HOST']}", remote])
     exe = os.path.join(REPO, "trixium", "software", "user", "bonsai_chat")
     if not os.path.exists(exe):
         sys.exit(f"{exe} not built: make -C trixium/software/user BUILD_DIR=../../../build/<build>")
-    cmd = [exe, "-t", a.tty, "-z", a.tokenizer, "-n", str(a.n)]
-    if a.temp or a.top_p != 1.0 or a.repeat != 1.0:
-        cmd += ["-S", f"{a.temp},{a.top_p},{a.repeat}"]
-    if a.seed:
-        cmd += ["-s", str(a.seed)]
-    if a.firmware:
-        cmd += ["-k", a.firmware]
-    if a.image:
-        cmd += ["-m", a.image]
-    os.execv(exe, cmd)
+    os.execv(exe, [exe, "-t", a.tty, "-z", a.tokenizer] + flags)
+
+
+def _board_env():
+    env = {}
+    for line in open(os.path.join(REPO, "tools", "board.env")):
+        line = line.split("#", 1)[0].strip()
+        if "=" in line and not line.startswith(("H=", "REPO=")):
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"')
+    return env
 
 
 def cmd_console(a):
@@ -122,6 +142,9 @@ def main(argv=None):
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--repeat", type=float, default=1.0, help="repetition penalty (1.1 breaks greedy loops)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--system", help="system prompt (a system turn ahead of the conversation)")
+    p.add_argument("--remote", action="store_true",
+                   help="run the chat on the board host over ssh (tools/board.env)")
     p.add_argument("-k", "--firmware", help="boot this firmware first (bonsai.bin)")
     p.add_argument("-m", "--image", help="upload this weight image first")
     p.set_defaults(fn=cmd_chat)
