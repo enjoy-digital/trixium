@@ -45,7 +45,7 @@ convert:
 	$(PYTHON) -m trixium.cli tokenizer $(dir $(GGUF))tokenizer.json
 
 # The card: deploy a build to the lab board (tools/board.env), or chat where the card is.
-BUILD ?= n16_212_v15b
+BUILD ?= n16_212_v16b
 .PHONY: deploy chat
 deploy:
 	$(PYTHON) -m trixium.cli deploy $(BUILD)
