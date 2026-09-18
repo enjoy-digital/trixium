@@ -65,7 +65,19 @@ def load_gguf_f32(path):
         raw = reader.tensor_bytes(name)
         if t.type_id == qformats.GGML_Q2_0 and qformats.q2_0_group(raw, int(np.prod(t.shape))) != 128:
             raise NotImplementedError(f"{name}: a group-64 Q2_0 file - use the PQ2_0 (g128) file")
-        tensors[name] = dequant(raw).reshape(t.shape)
+        if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_PQ2_0, qformats.GGML_PTQ1_0):
+            # In place: the generic dequant's float temporaries (codes - 1, times the
+            # broadcast scales) doubled the 8B's 2.5 GB embedding table three times over
+            # and the whole 33 GB model was OOM-killed at 57 GB (2026-09-18).
+            unpack = qformats.ptq1_0_unpack if t.type_id == qformats.GGML_PTQ1_0 else qformats.q2_0_unpack
+            scales, codes = unpack(raw)
+            w = codes.astype(np.float32).reshape(-1, 128)
+            del codes
+            w -= 1.0
+            w *= scales.astype(np.float32)[:, None]
+            tensors[name] = w.reshape(t.shape)
+        else:
+            tensors[name] = dequant(raw).reshape(t.shape)
     return cfg, tensors
 
 # RoPE with YaRN (exact transliteration of ggml's rope_yarn) ---------------------------------------
