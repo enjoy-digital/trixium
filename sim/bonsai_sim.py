@@ -61,9 +61,24 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 
 # BonsaiSimSoC -------------------------------------------------------------------------------------
 
+# The DDR4 flavour of the sim (--mem ddr4): the XCU1525's memory plumbing on LiteDRAM's PHY
+# model - main_ram on controller 0 through the BIOS's own sdram_init(), the engine channels
+# on 256-bit crossbar ports behind LiteDRAMAXI2Native bridges, chan_mod channels per
+# controller at these window constants, and the firmware's ddr_init_all()/ddr_test() for
+# controllers 1..N-1 (firmware/ddr.c) - all on the tiny model, tokens against the same
+# reference as the HBM-model sim. Sizes: main_ram is 8 MB (0..8 MB of controller 0), the
+# windows start at 12 MB so the header staging area (window - 1 MB) and the round-trip test
+# (window - 2 MB) stay above main_ram; 2 MB per window holds the tiny payload and its KV.
+DDR4_SIM_WEIGHT_BASE = 0x00C0_0000  # 12 MB.
+DDR4_SIM_CHAN_STRIDE = 0x0020_0000  # 2 MB.
+DDR4_SIM_CSR_PAGE0   = 8            # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
+DDR4_SIM_CSR_STRIDE  = 0x1000
+
 class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
-                 dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra=""):
+                 dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra="",
+                 mem="hbm", n_memctrl=4):
+        assert mem in ("hbm", "ddr4")
         platform = Platform()
         self.comb += platform.trace.eq(1)
 
@@ -109,11 +124,11 @@ class BonsaiSimSoC(SoCCore):
 
         SoCCore.__init__(self, platform,
             clk_freq                 = int(1e6),
-            ident                    = "TriXium Sim",
+            ident                    = "TriXium Sim" + (" DDR4" if mem == "ddr4" else ""),
             cpu_type                 = cpu_type,
             integrated_rom_size      = 0x20000,
-            integrated_main_ram_size = MAIN_RAM_SIZE,
-            integrated_main_ram_init = ram_words,
+            integrated_main_ram_size = MAIN_RAM_SIZE if mem == "hbm" else 0,
+            integrated_main_ram_init = ram_words if mem == "hbm" else [],
             uart_name                = "sim")
         self.crg = CRG(platform.request("sys_clk"))
 
@@ -129,24 +144,28 @@ class BonsaiSimSoC(SoCCore):
             Subsignal("seq_busy", Pins(1)))])
         self._prof_pads = platform.request("prof")
 
-        # Scratchpad + engine + HBM channel models.
+        # Scratchpad + engine + the memory system.
         self.scratchpad = BonsaiScratchpad(size=256*1024)
         axis = []
         n_channels = img.header["n_channels"] if img is not None else 2
-        for c in range(n_channels):
-            axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-            init = None
-            size = 256*1024
-            if img is not None:
-                payload = bytes(img.channel_payload(c))
-                # Reserve headroom above the weights for the KV region (kind-3 stores).
-                while size < len(payload) + 128*1024:
-                    size *= 2
-                init = words_from_bytes(payload)
-            model = BonsaiHBMChannelModel(axi, size=size, init=init,
-                latency=hbm_latency, stall_rate=hbm_stall_rate)
-            self.add_module(f"hbm_model{c}", model)
-            axis.append(axi)
+        chan_mod = 0
+        if mem == "hbm":
+            for c in range(n_channels):
+                axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+                init = None
+                size = 256*1024
+                if img is not None:
+                    payload = bytes(img.channel_payload(c))
+                    # Reserve headroom above the weights for the KV region (kind-3 stores).
+                    while size < len(payload) + 128*1024:
+                        size *= 2
+                    init = words_from_bytes(payload)
+                model = BonsaiHBMChannelModel(axi, size=size, init=init,
+                    latency=hbm_latency, stall_rate=hbm_stall_rate)
+                self.add_module(f"hbm_model{c}", model)
+                axis.append(axi)
+        else:
+            chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
         # Same soft-resettable domain + AXI shims as trixium.py (engreset.py).
         from trixium.gateware.engreset import BonsaiEngineResetDomain
         self.engrst = BonsaiEngineResetDomain(axis)
@@ -168,7 +187,9 @@ class BonsaiSimSoC(SoCCore):
         ]
         self.comb += [self.vecunit.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
         self.engine     = ClockDomainsRenamer("eng")(
-            BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit, seq=self.seq, dual=dual))
+            BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit, seq=self.seq, dual=dual,
+                               chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
+                               chan_mod=chan_mod))
         self.engine_csr = BonsaiEngineCSR(self.engine, seq=self.seq)
         self.comb += [
             self.engrst.trigger.eq(self.engine_csr.rst_trigger),
@@ -183,7 +204,8 @@ class BonsaiSimSoC(SoCCore):
         ]
         # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
         # kind-3 STORE ops (KV append).
-        self.loader = ClockDomainsRenamer("eng")(BonsaiHBMLoader(axis))
+        self.loader = ClockDomainsRenamer("eng")(BonsaiHBMLoader(axis,
+            chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0, chan_mod=chan_mod))
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
             self.engine.store_data.connect(self.loader.store_data),
@@ -210,14 +232,86 @@ class BonsaiSimSoC(SoCCore):
 
         # Firmware-visible contract.
         self.add_constant("BONSAI_HDR_ADDR",         MAIN_RAM_BASE + HDR_OFFSET)
-        self.add_constant("BONSAI_CHAN_WEIGHT_BASE", 0)
-        # Sim keeps stride 0: each channel has its own independent HBM model, so the models
-        # already give every channel a private address space. On hardware the AXI switch makes
-        # the address select the pseudo-channel, hence the non-zero stride there.
-        self.add_constant("BONSAI_CHAN_STRIDE",      0)
+        if mem == "hbm":
+            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", 0)
+            # Sim keeps stride 0: each channel has its own independent HBM model, so the models
+            # already give every channel a private address space. On hardware the AXI switch makes
+            # the address select the pseudo-channel, hence the non-zero stride there.
+            self.add_constant("BONSAI_CHAN_STRIDE",      0)
+        else:
+            # The XCU1525's geometry, scaled to the tiny model: the same constants the
+            # firmware reads on the board (BONSAI_CHAN_MOD, BONSAI_MEM_CPU_OFFSET,
+            # BONSAI_N_MEMCTRL, BONSAI_DDR_CSR_STRIDE) with 2 MB windows from 12 MB.
+            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", DDR4_SIM_WEIGHT_BASE)
+            self.add_constant("BONSAI_CHAN_STRIDE",      DDR4_SIM_CHAN_STRIDE)
+            self.add_constant("BONSAI_CHAN_MOD",         chan_mod)
+            self.add_constant("BONSAI_MEM_CPU_OFFSET",   0)
+            self.add_constant("BONSAI_N_MEMCTRL",        n_memctrl)
+            self.add_constant("BONSAI_DDR_CSR_STRIDE",   DDR4_SIM_CSR_STRIDE)
+            self.add_constant("SDRAM_TEST_DISABLE") # The BIOS's memtest would erase the init.
         self.add_constant("BONSAI_N_CHANNELS",       n_channels)
         if firmware is not None:
             self.add_constant("ROM_BOOT_ADDRESS", MAIN_RAM_BASE)
+
+    def _add_ddr4(self, n_channels, n_memctrl, ram, img, axis):
+        """The XCU1525's memory system on LiteDRAM's PHY model; returns chan_mod."""
+        from litedram.modules import MT40A512M8
+        from litedram.phy.model import SDRAMPHYModel
+        from litedram.frontend.axi import LiteDRAMAXI2Native
+
+        assert n_channels % n_memctrl == 0, "channels shard evenly over the controllers"
+        chan_mod = n_channels//n_memctrl
+        assert chan_mod & (chan_mod - 1) == 0
+
+        class _SimDDR4(MT40A512M8):
+            # The board's part with 2048 rows x 128 columns: 32 MB per x64 controller, enough
+            # for main_ram (8 MB) and up to four 2 MB windows from 12 MB, small enough to
+            # initialise from Python and hold in the verilated memory. (The PHY model needs
+            # at least 11 address bits for the A10 precharge-all decode: rows, not columns.)
+            nrows = 2048
+            ncols = 128
+
+        # Controller k's contents: controller 0 carries main_ram (firmware + header) at 0
+        # and, like the others, its channels' payloads at their windows.
+        span = DDR4_SIM_WEIGHT_BASE + chan_mod*DDR4_SIM_CHAN_STRIDE
+        for k in range(n_memctrl):
+            content = bytearray(span)
+            if k == 0:
+                content[:len(ram)] = ram
+            if img is not None:
+                for j in range(chan_mod):
+                    c = k*chan_mod + j
+                    payload = bytes(img.channel_payload(c))
+                    base = DDR4_SIM_WEIGHT_BASE + j*DDR4_SIM_CHAN_STRIDE
+                    assert len(payload) + 512*1024 <= DDR4_SIM_CHAN_STRIDE, \
+                        f"channel {c}: {len(payload)} B does not fit a sim window"
+                    content[base:base + len(payload)] = payload
+            words = [int.from_bytes(content[i:i+4], "little") for i in range(0, len(content), 4)]
+            sfx = "" if k == 0 else str(k)
+            self.csr.add(f"sdram{sfx}",  DDR4_SIM_CSR_PAGE0 + 2*k)
+            self.csr.add(f"ddrphy{sfx}", DDR4_SIM_CSR_PAGE0 + 2*k + 1)
+            module = _SimDDR4(int(100e6), "1:4") # 100 MHz timings, as litex_sim does.
+            phy = SDRAMPHYModel(module=module, data_width=64, clk_freq=int(100e6), init=words)
+            setattr(self, f"ddrphy{sfx}", phy)
+            if k == 0:
+                self.add_sdram("sdram", phy=phy, module=module, size=MAIN_RAM_SIZE,
+                               l2_cache_size=8192)
+            else:
+                self.add_sdram(f"sdram{sfx}", phy=phy, module=module,
+                               with_soc_interconnect=False)
+            core = getattr(self, f"sdram{sfx}")
+            for j in range(chan_mod):
+                c = k*chan_mod + j
+                port = core.crossbar.get_port(data_width=256)
+                axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
+                setattr(self, f"engbridge{c}",
+                        LiteDRAMAXI2Native(axi, port, w_buffer_depth=64, r_buffer_depth=256))
+                axis.append(axi)
+        # VexiiRiscv enforces execute permission from region.mode (the FK33 target's lesson).
+        for _rn, _r in self.bus.regions.items():
+            if _r.origin == MAIN_RAM_BASE and not _r.linker:
+                _r.mode = "rwx"
+        return chan_mod
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -249,7 +343,14 @@ def main():
              "(attn_seq2_layer) is not what the card runs, and on 2026-09-11 it was the one "
              "diverging from the mirror while the slim path matched at every checksum.")
     parser.add_argument("--no-dual",        action="store_true", help=argparse.SUPPRESS)  # old default
+    parser.add_argument("--mem",            default="hbm", choices=["hbm", "ddr4"],
+        help="hbm: one independent channel model per engine channel (the FK33's shape, the "
+             "default). ddr4: the XCU1525's memory system on LiteDRAM's PHY model - N "
+             "controllers, main_ram on controller 0, chan_mod channels per controller; "
+             "builds in build/sim_ddr4 (the firmware must be built against that tree).")
+    parser.add_argument("--n-memctrl",      default=4, type=int, help="--mem ddr4: controllers.")
     args = parser.parse_args()
+    out_dir = "build/sim" if args.mem == "hbm" else "build/sim_ddr4"
 
     sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
@@ -257,16 +358,18 @@ def main():
     if args.build_software:
         soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
-            hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
-        builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
+            hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
+            mem=args.mem, n_memctrl=args.n_memctrl)
+        builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
         return
 
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
-        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
-    builder = Builder(soc, output_dir="build/sim", csr_csv="build/sim/csr.csv")
+        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
+        mem=args.mem, n_memctrl=args.n_memctrl)
+    builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the
     # VexRiscv retired PC every cycle. That is the only way to attribute the ~69% of a token
