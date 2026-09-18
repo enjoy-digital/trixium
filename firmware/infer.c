@@ -19,6 +19,7 @@
 
 #include "bons.h"
 #include "engine.h"
+#include "hybrid.h"
 #include "model.h"
 #include "infer.h"
 
@@ -429,11 +430,73 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
 }
 
 // Full matvec (all rows), output in original row order (block shard: chan-major == row order).
-static void matvec_f(const struct bons_entry *e, const float *src, float *dst)
+// The float matvec the hybrid CPU path runs (hybrid.c): quantize the input to int8 with a
+// power-of-two scale, engine, float results in row order - chunked so the int32 results
+// stay inside SP_Y..SP_H (96 KB) whatever the row count (the 27B's LM head is 15,520 rows
+// per channel).
+static float *rot_scratch;   // (SP_H - SP_Y)/4 floats, allocated on first use.
+void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
 {
-    float s = quantize_to_sp(src, e->cols, SP_X);
-    matvec_rows_f(e, 0, e->rows/n_ch, s, dst);
+    if (!rot_scratch) rot_scratch = halloc((SP_H - SP_Y));
+    int e8 = quantize_f_pow2(src, e->cols, SP_X);
+    float xs = ldexpf(1.0f, e8);
+    uint32_t rpc   = e->rows/n_ch;
+    uint32_t chunk = (SP_H - SP_Y)/(4*n_ch);
+    if (chunk > rpc) chunk = rpc;
+    for (uint32_t r0 = 0; r0 < rpc; r0 += chunk) {
+        uint32_t n = (rpc - r0 < chunk) ? rpc - r0 : chunk;
+        // matvec_rows_f gathers chan*n + row: unshuffle into row order per channel.
+        if (n == rpc) {
+            matvec_rows_f(e, r0, n, xs, dst);
+        } else {
+            // Results arrive as [chan][n] at the scratchpad; scatter them into the
+            // caller's [chan][rpc] row order straight from there.
+            matvec_rows_f(e, r0, n, xs, rot_scratch);
+            for (int c = 0; c < n_ch; c++)
+                for (uint32_t i = 0; i < n; i++)
+                    dst[(uint32_t)c*rpc + r0 + i] = rot_scratch[(uint32_t)c*n + i];
+        }
+    }
 }
+
+void *infer_halloc(uint64_t n, int big)
+{
+    uint8_t *lim = big && heap_hi ? (uint8_t *)(0x40000000ull + MAIN_RAM_SIZE - (2u << 20))
+                                  : (uint8_t *)(0x40000000ull + MAIN_RAM_SIZE - (1u << 20));
+    uint8_t *p = big && heap_hi ? heap_hi : heap;
+    if ((uint64_t)(lim - p) < n) return NULL;
+    return big && heap_hi ? halloc_hi((uint32_t)n) : halloc((uint32_t)n);
+}
+
+uint64_t infer_heap_room(int big)
+{
+    uint8_t *lim = (uint8_t *)(0x40000000ull + MAIN_RAM_SIZE - (1u << 20));
+#if !defined(BONSAI_CHAN_MOD) || BONSAI_CHAN_MOD == 0
+    // One flat memory (the FK33): the low heap ends where the first engine window inside
+    // main_ram starts (channel 3's, at +64 MB) - hybrid models are not this board's.
+    if (MAIN_RAM_SIZE > (64u << 20)) lim = (uint8_t *)(0x40000000u + (64u << 20));
+#endif
+    uint8_t *p = big && heap_hi ? heap_hi : heap;
+    if (big && heap_hi) lim = (uint8_t *)(0x40000000ull + MAIN_RAM_SIZE - (2u << 20));
+    return p < lim ? (uint64_t)(lim - p) : 0;
+}
+
+void infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n)
+{
+    // Through the fetch staging region, 8 KB at a time.
+    int done = 0;
+    while (done < n) {
+        uint32_t b = beats - (uint32_t)done/8;
+        if (b > 256) b = 256;
+        engine_fetch(0, addr + (uint32_t)done*4, b, SP_FET);
+        volatile float *p = (volatile float *)(SCRATCHPAD_BASE + SP_FET);
+        int m = (int)b*8;
+        if (m > n - done) m = n - done;
+        for (int i = 0; i < m; i++) dst[done + i] = p[i];
+        done += m;
+    }
+}
+
 
 // Embedding row: fetch the row packet from HBM and dequantize (ternary).
 COLD static void embed_row_f(const struct bons_entry *e, int row, float *dst)
@@ -1111,6 +1174,17 @@ COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_d
         }
     }
     return e16min + k2;
+}
+
+int infer_embed_f(int token, float *dst)
+{
+    const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
+    if (!emb) return -1;
+    int e = embed_row_fetch(emb, token, SP_XR);
+    volatile int16_t *p = sp16(SP_XR);
+    float s = ldexpf(1.0f, e);
+    for (int i = 0; i < n_embd; i++) dst[i] = (float)p[i]*s;
+    return 0;
 }
 
 #if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
@@ -2858,6 +2932,12 @@ static void dbg_sum(const char *tag, int l, uint32_t off, uint32_t bytes, int e)
 
 static int forward(int token, int want_logits)
 {
+    if (hybrid_present()) {          // The 27B's layers: hybrid.c, the CPU path.
+        infer_forwards++;
+        int t = hybrid_forward(token, want_logits);
+        n_pos = hybrid_pos();
+        return t;
+    }
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
     infer_forwards++;
     if (tprof_armed && want_logits && --tprof_armed == 0)
@@ -4035,6 +4115,19 @@ int infer_init(void)
     int kv_dim = n_kv_head*head_dim;
     int q_dim  = n_head*head_dim;
 
+    if (hybrid_present()) {
+        // The hybrid models run on their own CPU path (hybrid.c) - none of the Qwen3
+        // lists, caches or resident regions below apply. The embedding must come from the
+        // restored emb16 rows, so the fetch path is forced on.
+        embfetch_use = 1;
+        emb16_ent  = model_entry(ROLE_TOK_EMB16, 0);
+        emb16x_ent = model_entry(ROLE_TOK_EMB16_EXP, 0);
+        max_ctx = H->max_ctx;
+        n_pos = 0;
+        heap_hi = 0;
+        return hybrid_init();
+    }
+
     // Norms: fetch each F32 tensor (replicated; channel 0 copy) to the CPU.
     attn_norm = halloc(n_layer*sizeof(float *));
     ffn_norm  = halloc(n_layer*sizeof(float *));
@@ -4505,6 +4598,7 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
     gen_serial++;
     if (resident == 0) {
         n_pos = 0; // Reset the KV cache (fresh generation).
+        if (hybrid_present()) hybrid_reset();
 #ifdef BONSAI_HAS_KVSTORE
         // ...and its exponent ratchet. kv_ekmax is the running max over every row ever
         // stored in a region and picks the KV scale bias (B = 22 - ekmax), so without this

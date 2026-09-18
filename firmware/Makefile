@@ -21,7 +21,7 @@ include $(SOC_DIRECTORY)/software/common.mak
 OPT ?= -O2 -flto -freorder-blocks-and-partition
 CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
 
-OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o
+OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o hybrid.o
 
 
 # Objects are tree-specific: the generated CSR map differs between BUILD_DIRs, so an object
