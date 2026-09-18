@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
+# TriXium on the SQRL XCU1525: XCVU9P, four DDR4 x64 channels, PCIe. The same engine
+# cluster as the FK33 (one marked block, identical in both targets) over LiteDRAM: engine channel c
+# streams from DDR4 controller c // 4 through a 256-bit crossbar port, at the FK33's
+# per-channel window constants inside that controller (chan_mod = 4), so the images and the
+# firmware constants are the same on both boards. Design decisions, projection and status:
+# docs/xcu1525.md.
+#
+# Build (from the repo root):
+#   tools/build_xcu1525.sh <name>          # the recipe that ships; or by hand:
+#   ./trixium_xcu1525.py --engine-channels 16 --with-vecunit --build
+#
+# The whole SoC - CPU, engine cluster, the four controllers - runs in one `sys` domain at
+# the DDR4 controller clock (125 MHz with the USPDDRPHY: 4:1, DDR4-1000). No clock-domain
+# crossing anywhere; the accelerator has 4.8 ns of margin from its 212.5 MHz closure on the
+# FK33. --sys-clk-freq raises the DDR rate (150-166 MHz = DDR4-1200/1333) once the board
+# can calibrate it.
+
+import os
+
+from migen import *
+
+from litex.gen import *
+
+from litex_boards.platforms import sqrl_xcu1525
+
+from litex.soc.cores.clock import *
+from litex.soc.cores.led import LedChaser
+from litex.soc.integration.soc import *
+from litex.soc.integration.builder import *
+from litex.soc.interconnect.axi import AXIInterface
+
+import litedram.modules
+from litedram.phy import usddrphy
+from litedram.frontend.axi import LiteDRAMAXI2Native
+
+from litepcie.phy.usppciephy import USPPCIEPHY
+from litepcie.software import generate_litepcie_software
+
+# CRG ----------------------------------------------------------------------------------------------
+
+class _CRG(LiteXModule):
+    def __init__(self, platform, sys_clk_freq, clk_channel=0):
+        self.rst       = Signal()
+        self.cd_sys    = ClockDomain()
+        self.cd_sys4x  = ClockDomain()
+        self.cd_pll4x  = ClockDomain()
+        self.cd_idelay = ClockDomain()
+
+        # # #
+
+        # One MMCM (on DDR channel 0's 300 MHz reference) for the whole SoC: sys and sys4x
+        # come from the same VCO through the BUFGCE_DIV / BUFGCE pair the PHY needs for a
+        # known phase relation. The four PHYs share them; the USPDDRPHY captures on sys4x
+        # through calibrated IDELAYs, so per-bank skew is absorbed by the read leveling.
+        self.pll = pll = USPMMCM(speedgrade=-2)
+        self.comb += pll.reset.eq(self.rst)
+        pll.register_clkin(platform.request("clk300", clk_channel), 300e6)
+        pll.create_clkout(self.cd_pll4x, sys_clk_freq*4, buf=None, with_reset=False)
+        pll.create_clkout(self.cd_idelay, 500e6)
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
+
+        self.specials += [
+            Instance("BUFGCE_DIV",
+                p_BUFGCE_DIVIDE=4,
+                i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys.clk),
+            Instance("BUFGCE",
+                i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk),
+        ]
+
+        self.idelayctrl = USPIDELAYCTRL(cd_ref=self.cd_idelay, cd_sys=self.cd_sys)
+
+# BonsaiXCU1525SoC ---------------------------------------------------------------------------------
+
+# The (sdram, ddrphy) CSR pairs sit on pages 8/9, 10/11, 12/13, 14/15: controller k's
+# registers are controller 0's shifted by k*DDR_CSR_STRIDE, which is how the firmware
+# initialises 1-3 with the BIOS's own liblitedram (firmware/ddr.c).
+DDR_CSR_PAGE0  = 8
+DDR_CSR_STRIDE = 0x1000
+
+class BonsaiXCU1525SoC(SoCCore):
+    def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
+                 with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
+                 ddram_channels=4, main_ram_size=0x1000_0000, **kwargs):
+        assert 1 <= ddram_channels <= 4
+        assert engine_channels % ddram_channels == 0, \
+            "engine channels shard evenly over the DDR4 controllers"
+        chan_mod = engine_channels//ddram_channels
+        assert chan_mod & (chan_mod - 1) == 0, "channels per controller must be a power of two"
+        platform = sqrl_xcu1525.Platform()
+
+        # CRG --------------------------------------------------------------------------------------
+        self.crg = _CRG(platform, sys_clk_freq)
+
+        # SoCCore ----------------------------------------------------------------------------------
+        if kwargs.get("uart_name", "serial") == "serial":
+            kwargs["uart_name"] = "crossover" # Console over PCIe/JTAGBone, as on the FK33.
+        kwargs["with_jtagbone"] = True
+        SoCCore.__init__(self, platform, sys_clk_freq,
+            ident = "TriXium on XCU1525", **kwargs)
+        self.add_constant("BONSAI_VARIANT", ord("b"))
+
+        # DDR4 x4 ----------------------------------------------------------------------------------
+        # Controller 0 is the BIOS's: main_ram (256 MB of it: the FK33's size, so the
+        # firmware's memory map is the same) through the L2 cache. Controllers 1-3 have
+        # crossbar ports only. All four on pinned CSR pages (see DDR_CSR_PAGE0).
+        module_cls = getattr(litedram.modules, ddram_module)
+        for i in range(ddram_channels):
+            sfx = "" if i == 0 else str(i)
+            self.csr.add(f"sdram{sfx}",  DDR_CSR_PAGE0 + 2*i)
+            self.csr.add(f"ddrphy{sfx}", DDR_CSR_PAGE0 + 2*i + 1)
+        self.sdrams = []
+        for i in range(ddram_channels):
+            sfx = "" if i == 0 else str(i)
+            phy = usddrphy.USPDDRPHY(
+                pads             = platform.request("ddram", i),
+                memtype          = "DDR4",
+                sys_clk_freq     = sys_clk_freq,
+                iodelay_clk_freq = 500e6)
+            setattr(self, f"ddrphy{sfx}", phy)
+            module = module_cls(sys_clk_freq, "1:4")
+            if i == 0:
+                self.add_sdram("sdram",
+                    phy           = phy,
+                    module        = module,
+                    size          = main_ram_size,
+                    l2_cache_size = kwargs.get("l2_size", 8192))
+            else:
+                self.add_sdram(f"sdram{sfx}",
+                    phy                   = phy,
+                    module                = module,
+                    with_soc_interconnect = False)
+            self.sdrams.append(getattr(self, f"sdram{sfx}"))
+        # VexiiRiscv builds its memory map from region.mode and enforces execute
+        # permission: mark main_ram executable (the FK33 target's lesson).
+        for _rn, _r in self.bus.regions.items():
+            if _r.origin == 0x4000_0000 and not _r.linker:
+                _r.mode = "rwx"
+        # Workaround for a Vivado DRC on the PHY's clocking (upstream target).
+        platform.add_platform_command("set_property SEVERITY {{Warning}} [get_drc_checks PDCN-2736]")
+        # Engine ports: engine channel c = controller c // chan_mod, a 256-bit crossbar port
+        # (the controller is 512 bits wide at 4:1; four ports share its 8 GB/s at 125 MHz)
+        # behind an AXI bridge. The read buffer holds the readers' 8 outstanding 16-beat
+        # bursts (128 beats), so a channel is never throttled by the bridge.
+        engine_axis = []
+        for c in range(engine_channels):
+            core = self.sdrams[c//chan_mod]
+            port = core.crossbar.get_port(data_width=256)
+            axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
+            bridge = LiteDRAMAXI2Native(axi, port, w_buffer_depth=64, r_buffer_depth=256)
+            setattr(self, f"engbridge{c}", bridge)
+            engine_axis.append(axi)
+
+        # PCIe -------------------------------------------------------------------------------------
+        self.pcie_phy = USPPCIEPHY(platform, platform.request(f"pcie_x{pcie_lanes}"),
+            data_width = {2: 64, 4: 128, 8: 256, 16: 512}[pcie_lanes],
+            bar0_size  = 0x20000)
+        self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
+
+        # Leds -------------------------------------------------------------------------------------
+        self.leds = LedChaser(
+            pads         = platform.request_all("user_led"),
+            sys_clk_freq = sys_clk_freq)
+
+        # Bonsai -----------------------------------------------------------------------------------
+        # The FK33's constants per controller: channel c's window is controller c // chan_mod's
+        # local HBM_WEIGHT_BASE + (c % chan_mod)*HBM_CHAN_STRIDE (320 MB .. 1.3 GB of each
+        # 4 GB channel), above main_ram (controller 0's local 0 .. 256 MB); the BONS header
+        # staging area (1 MB below channel 0's window) and the header copy at main_ram + 4 MB
+        # as on the FK33. BONSAI_MEM_CPU_OFFSET = 0: main_ram's origin is controller 0's
+        # local address 0 (the FK33's CPU window passes through 1:1 at 0x4000_0000).
+        with_bonsai            = True
+        cluster_chan_mod       = chan_mod
+        cluster_mem_cpu_offset = 0
+        cluster_n_memctrl      = ddram_channels
+        # Bonsai cluster: begin. This block is byte-identical in every board target
+        # (test_layout_contract.py diffs the marked regions): the per-board knobs are
+        # the cluster_* variables set just above it. Migen names every signal by the
+        # frame it was created in, so a shared function would rename the FK33 netlist
+        # wholesale (2026-09-18) - hence inline, and checked.
+        if with_bonsai:
+            from trixium.gateware.scratchpad import BonsaiScratchpad
+            from trixium.gateware.matvec import BonsaiMatVecEngine
+            from trixium.gateware.csr_front import BonsaiEngineCSR
+            from trixium.gateware.loader import BonsaiHBMLoader
+            from litex.soc.integration.soc import SoCRegion
+
+            self.scratchpad = BonsaiScratchpad(size=256*1024)
+            # The engine cluster lives in the soft-resettable `eng` domain (engreset.py):
+            # a wedged op is a CSR write away from recovery instead of a reconfigure. Its
+            # memory ports go through the AXI shims, which keep the protocol whole meanwhile.
+            from trixium.gateware.engreset import BonsaiEngineResetDomain
+            self.engrst = BonsaiEngineResetDomain(engine_axis)
+            engine_axis = self.engrst.masters
+            self.add_constant("BONSAI_HAS_ENGRESET")
+            # The eng reset is held for 64 cycles, so its net may take several to arrive:
+            # without this Vivado puts the 90k-fanout net on a BUFG and 16k flop R pins
+            # miss by 0.4 ns (n16_212_v15a: 22,046 failing endpoints, 16,286 of them R).
+            # Setup 4 / hold 3 cycles: every flop is in reset well inside the hold, and the
+            # CPU's first submit after the release is hundreds of cycles away.
+            platform.add_platform_command(
+                "set_multicycle_path -setup 4 -from "
+                "[get_cells -hierarchical -filter {{NAME =~ *eng_rst_reg*}}]")
+            platform.add_platform_command(
+                "set_multicycle_path -hold 3 -from "
+                "[get_cells -hierarchical -filter {{NAME =~ *eng_rst_reg*}}]")
+            vecunit = None
+            if with_vecunit:
+                from trixium.gateware.vector import BonsaiVectorUnit
+                vecunit = self.vecunit = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
+                self.add_constant("BONSAI_HAS_VECUNIT")
+                self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set.
+                self.add_constant("BONSAI_VEC_LOOPS2")   # Second loop level (2026-08-30).
+            seq = None
+            if with_vecunit:
+                from trixium.gateware.sequencer import BonsaiSequencer
+                self.add_constant("BONSAI_SEQ_LUT")      # A5-from-LUT arg source (2026-09-09).
+                seq = self.seq = ClockDomainsRenamer("eng")(BonsaiSequencer())
+                self.comb += [
+                    vecunit.seq_en.eq(seq.busy),
+                    vecunit.seq_start.eq(seq.vec_start),
+                    vecunit.seq_pc.eq(seq.vec_pc),
+                    seq.vec_done.eq(vecunit.done),
+                    seq.vec_res6.eq(vecunit.res6.status),
+                    vecunit.seq_seed7.eq(seq.vec_seed7), # res6 chaining, or engine absmax (w0[4]).
+                ]
+                self.comb += [vecunit.seq_args[i].eq(seq.vec_args[i]) for i in range(8)]
+                self.add_constant("BONSAI_HAS_SEQ")
+                # The 4KB vec imem must stay in distributed RAM: as BRAM, Vivado packs the
+                # FETCHR register into the BRAM output stage, re-anchoring the decode
+                # launch to the BRAM's clock-to-out + placement (the overnight worst path).
+                platform.add_platform_command(
+                    "set_property RAM_STYLE distributed "
+                    "[get_cells -hierarchical -filter {{NAME =~ *imem_reg*}}]")
+                # (The vecunit multicycle constraints were removed with the V1 pipeline,
+                # 2026-08-29: every stage is a true single-cycle path. They had been dead
+                # in the netlist anyway - the operand register was emitted under a
+                # namer-collided name and the ROM output cells are absorbed into the
+                # RAMB18 output stage, so the regexes matched nothing.)
+            from trixium.layout import HBM_CHAN_STRIDE
+            self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
+            self.engine     = ClockDomainsRenamer("eng")(
+                BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
+                                   seq=seq, dual=with_dual, chan_stride=HBM_CHAN_STRIDE,
+                                   chan_mod=cluster_chan_mod))
+            if with_dual:
+                # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
+                self.add_constant("BONSAI_HAS_DUALQ")
+            self.engine_csr = BonsaiEngineCSR(self.engine, seq=seq)
+            self.comb += [
+                self.engrst.trigger.eq(self.engine_csr.rst_trigger),
+                self.engine_csr.rst_busy.eq(self.engrst.busy),
+                self.engine_csr.rst_stuck.eq(self.engrst.stuck),
+            ]
+            from trixium.layout import HBM_CHAN_STRIDE as _LOADER_STRIDE
+            # Channel offsets added in hardware on the upload path too (33-bit windows,
+            # N=16 puts channel 15 above 4 GB); the host tools read
+            # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
+            self.loader     = ClockDomainsRenamer("eng")(
+                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=_LOADER_STRIDE,
+                                chan_mod=cluster_chan_mod))
+            # Engine kind-3 STORE (KV append) rides the loader's writers.
+            self.comb += [
+                self.engine.store_cmd.connect(self.loader.store_cmd),
+                self.engine.store_data.connect(self.loader.store_data),
+                self.engine.store_busy.eq(self.loader.store_busy),
+            ]
+            self.add_constant("BONSAI_HAS_KVSTORE")
+            self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
+            # Sideband (wishbone/CSR) scratchpad access only while all units are idle.
+            units_idle = ~self.engine.sp_busy
+            if vecunit is not None:
+                units_idle = units_idle & ~vecunit.busy
+            if seq is not None:
+                units_idle = units_idle & ~seq.busy
+            self.comb += self.scratchpad.units_idle.eq(units_idle)
+            self.add_constant("BONSAI_SP_SB_SLOT", 1) # Per-cycle sideband slot present.
+            self.add_constant("BONSAI_SP_SB_RSLOT", 1) # Read slot: reads grant mid-list.
+            # Vector ISA encoding (model.asm): the firmware Makefile reads this to emit a
+            # progs.h that matches the bitstream. Absent = the original 8-register encoding.
+            if vecunit is not None: # A build without --with-vecunit has no encoding to name.
+                self.add_constant("BONSAI_VEC_VREGS", vecunit.vregs)
+            self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
+
+            # Scratchpad on the SoC bus (uncached: shared with the engine).
+            self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
+                SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
+
+            # Weight upload: PCIe DMA0 host->device stream feeds the loader.
+            self.comb += [
+                self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"}),
+            ]
+
+            # Firmware contract: the BONS header+table are staged 1 MB below engine channel
+            # 0's window and copied to main_ram + HDR_CPU_OFFSET; engine-channel payloads one
+            # HBM_CHAN_STRIDE apart from HBM_WEIGHT_BASE, each in its own channel's window
+            # (the offset is added in hardware; layout.py has the geometry of each board).
+            from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
+            self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
+            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
+            self.add_constant("BONSAI_CHAN_STRIDE",      HBM_CHAN_STRIDE)
+            self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
+            # Several memory controllers (the XCU1525): the firmware's overlap check and
+            # its controller init read these; absent, the FK33's flat HBM geometry.
+            if cluster_chan_mod:
+                self.add_constant("BONSAI_CHAN_MOD", cluster_chan_mod)
+            if cluster_mem_cpu_offset is not None:
+                self.add_constant("BONSAI_MEM_CPU_OFFSET", cluster_mem_cpu_offset)
+            if cluster_n_memctrl is not None:
+                self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
+
+        # Bonsai cluster: end.
+
+
+        self.add_constant("BONSAI_DDR_CSR_STRIDE", DDR_CSR_STRIDE)
+
+# Build --------------------------------------------------------------------------------------------
+
+def main():
+    from litex.build.parser import LiteXArgumentParser
+    parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform,
+                                 description="TriXium SoC on the SQRL XCU1525.")
+    parser.add_target_argument("--sys-clk-freq",    default=125e6, type=float, help="System clock = DDR4 controller clock (4:1).")
+    parser.add_target_argument("--pcie-lanes",      default=4, type=int,       choices=[2, 4, 8, 16], help="PCIe lane count.")
+    parser.add_target_argument("--driver",          action="store_true",       help="Generate LitePCIe driver headers.")
+    parser.add_target_argument("--engine-channels", default=16, type=int,      help="Engine channel count (a multiple of the DDR4 channel count).")
+    parser.add_target_argument("--ddram-channels",  default=4, type=int,       help="DDR4 channels to instantiate (1-4).")
+    parser.add_target_argument("--ddram-module",    default="MT40A512M8",      help="LiteDRAM module class of the DDR4 (upstream target: MT40A512M8).")
+    parser.add_target_argument("--main-ram-size",   default=0x1000_0000, type=lambda x: int(x, 0), help="CPU main_ram size on controller 0 (default 256 MB, the FK33's).")
+    parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
+    parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
+    args = parser.parse_args()
+
+    soc = BonsaiXCU1525SoC(
+        sys_clk_freq    = args.sys_clk_freq,
+        pcie_lanes      = args.pcie_lanes,
+        engine_channels = args.engine_channels,
+        with_vecunit    = not args.no_vecunit,
+        with_dual       = args.with_dual,
+        ddram_module    = args.ddram_module,
+        ddram_channels  = args.ddram_channels,
+        main_ram_size   = args.main_ram_size,
+        **parser.soc_argdict)
+
+    # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates
+    # the extension, so the firmware reaches clz through a .insn encoding behind this.
+    if "--with-rvZbb" in (getattr(args, "vexii_args", "") or "") or \
+       "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
+        soc.add_constant("BONSAI_HAS_ZBB")
+
+    builder_argd = parser.builder_argdict
+    if builder_argd.get("output_dir") is None:
+        builder_argd["output_dir"] = os.path.join("build", f"xcu1525_n{args.engine_channels}")
+    if builder_argd.get("csr_csv") is None:
+        builder_argd["csr_csv"] = os.path.join(builder_argd["output_dir"], "csr.csv")
+
+    builder = Builder(soc, **builder_argd)
+    if args.build or args.driver:
+        if not args.build:
+            builder.compile_software = False
+            builder.compile_gateware = False
+        builder.build(**parser.toolchain_argdict)
+
+    if args.driver:
+        generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
+
+    if args.load:
+        prog = soc.platform.create_programmer()
+        prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
+
+if __name__ == "__main__":
+    main()
