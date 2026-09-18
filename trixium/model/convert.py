@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""bonsai_convert: GGUF (PrismML Q2_0 g128) -> BONS hardware weight image.
+"""bonsai_convert: GGUF (PrismML PQ2_0 / legacy Q2_0 g128 / PTQ1_0) -> BONS hardware weight image.
 
 Subcommands:
   inspect  <gguf>                    - dump metadata + tensor table.
@@ -72,15 +72,25 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
     layer, role, repl = _name_role(name)
     flags = FLAG_REPLICATED if repl else 0
 
-    if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_Q1_0):
+    if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_PQ2_0, qformats.GGML_PTQ1_0,
+                     qformats.GGML_Q1_0):
         rows, cols = t.shape
         raw = reader.tensor_bytes(name)
         # Scales now (bias/rshift need them: a few MB for the whole model); the codes
         # through a loader when the writer gets to this tensor, one tensor in memory at
         # a time (the 1.7B's codes alone are 1.7 GB).
-        if t.type_id == qformats.GGML_Q2_0:
+        if t.type_id == qformats.GGML_Q2_0 and qformats.q2_0_group(raw, rows*cols) != 128:
+            # PrismML gave type 42 to upstream's group-64 Q2_0 in 2026-06 (the *_Q2_0_g64
+            # files); two scales per 128 weights do not fit the engine's g128 rows.
+            raise NotImplementedError(f"{name}: group-64 Q2_0 - convert the PQ2_0 (g128) "
+                                      "file of the same model instead")
+        if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_PQ2_0):
             scales = qformats.q2_0_scales(raw)
             unpack = lambda: qformats.q2_0_unpack(raw)[1]
+        elif t.type_id == qformats.GGML_PTQ1_0:
+            # Dense trits (5 per byte): same weights as PQ2_0, decoded to the same codes.
+            scales = qformats.ptq1_0_scales(raw)
+            unpack = lambda: qformats.ptq1_0_unpack(raw)[1]
         else:
             # 1-bit builds ("Bonsai" as opposed to "Ternary-Bonsai"): run on the ternary
             # engine via code expansion (see qformats.q1_0_to_ternary_codes).
@@ -128,6 +138,35 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
         names.append("output.weight")
 
     specs = [_spec_from_gguf(reader, name, n_channels, vocab_pad) for name in names]
+
+    # Does it fit the card? Each engine channel owns HBM_CHAN_STRIDE (256 MB) from
+    # HBM_WEIGHT_BASE's offset into its pseudo-channel (64 MB), and the KV cache sits above
+    # the weights (kv rows of 1 + head_dim/32 beats, max_ctx/n_channels per (layer, kv
+    # head, K|V)). The 8B (136 MB/channel of ternary) fits; its int16 embedding table
+    # (1.2 GB) does not, so that is dropped with a note rather than refused; a model whose
+    # weights alone overflow is refused here instead of by the loader (2026-09-18).
+    from trixium.model.bons import _tensor_beats
+    from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
+    window   = HBM_CHAN_STRIDE - (HBM_WEIGHT_BASE % HBM_CHAN_STRIDE)
+    kv_rb    = 1 + cfg.head_dim//32
+    kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
+    weights  = sum(_tensor_beats(t, n_channels) for t in specs)*32
+    emb16_b  = 0
+    if emb16:
+        erows   = (vocab_pad + 15)//16
+        emb16_b = (vocab_pad*cfg.n_embd*2 + erows*32)//n_channels   # int16 rows + exponents
+    def mb(b): return f"{b/1e6:.0f} MB"
+    if weights + kv_bytes > window:
+        raise SystemExit(f"{cfg.name}: {mb(weights)} of weights + {mb(kv_bytes)} of KV per "
+                         f"channel exceed the {mb(window)} channel window at {n_channels} "
+                         f"channels - this model does not fit the card")
+    if emb16 and weights + kv_bytes + emb16_b > window:
+        print(f"  int16 embedding table ({mb(emb16_b)}/channel) would overflow the channel "
+              f"window ({mb(weights + kv_bytes)} used of {mb(window)}): left out, the firmware "
+              f"decodes the ternary embedding rows itself (~2.6% per token)")
+        emb16 = False
+    print(f"  per channel: weights {mb(weights)} + KV {mb(kv_bytes)}"
+          f"{' + emb16 ' + mb(emb16_b) if emb16 else ''} of {mb(window)}")
 
     sha = b""
     if tokenizer_path:

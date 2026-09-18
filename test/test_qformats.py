@@ -96,3 +96,66 @@ def test_q1_0_roundtrip_and_semantics():
     s3, codes = q1_0_to_ternary_codes(raw)
     assert np.array_equal(s3, scales)
     assert np.array_equal(codes, bits*2)
+
+
+# PrismML's 2026-06 formats: PQ2_0 (type 142) is the g128 block under its current name;
+# PTQ1_0 (type 143) packs the same trits 5 per byte; type 42 became upstream's g64 block.
+
+def _ptq1_0_decode_reference(raw):
+    """Straight port of dequantize_row_ptq1_0 (ggml-quants.c, prism branch), scalar."""
+    from trixium.model.qformats import BLOCK_PTQ1_0
+    raw = np.frombuffer(raw, dtype=np.uint8)
+    pow3 = [1, 3, 9, 27, 81, 243]
+    out = []
+    for i in range(raw.size//BLOCK_PTQ1_0):
+        b  = raw[i*BLOCK_PTQ1_0:(i + 1)*BLOCK_PTQ1_0]
+        qs, qh = b[0:24], b[24:26]
+        j = 0
+        for c in (32, 16, 8):
+            while j + c <= 24:
+                for n in range(5):
+                    for m in range(c):
+                        q  = (int(qs[j + m])*pow3[n]) & 0xFF
+                        out.append(((q*3) >> 8) - 1)
+                j += c
+        for n in range(4):
+            for h in range(2):
+                q = (int(qh[h])*pow3[n]) & 0xFF
+                out.append(((q*3) >> 8) - 1)
+    return np.array(out, dtype=np.int64)
+
+
+def test_ptq1_0_pack_unpack_matches_c_reference():
+    from trixium.model.qformats import ptq1_0_pack, ptq1_0_unpack, ptq1_0_dequant, BLOCK_PTQ1_0
+    rng    = np.random.default_rng(7)
+    codes  = rng.integers(0, 3, (37, 128), dtype=np.uint8)
+    scales = rng.uniform(0.01, 0.1, 37).astype(np.float16)
+    raw    = ptq1_0_pack(scales, codes)
+    assert raw.size == 37*BLOCK_PTQ1_0
+    s2, c2 = ptq1_0_unpack(raw)
+    assert np.array_equal(c2, codes) and np.array_equal(s2, scales)
+    # The vectorized decoder against the scalar port of the C loop, element order included.
+    ref = _ptq1_0_decode_reference(raw)
+    assert np.array_equal(ref, codes.astype(np.int64).reshape(-1) - 1)
+    w = ptq1_0_dequant(raw)
+    assert np.allclose(w, ((codes.astype(np.float32) - 1)*scales.astype(np.float32)[:, None]).reshape(-1))
+
+
+def test_ptq1_0_and_pq2_0_agree_on_the_same_weights():
+    from trixium.model.qformats import (ptq1_0_pack, ptq1_0_dequant, q2_0_pack, q2_0_dequant,
+                                             DEQUANT, GGML_PQ2_0, GGML_PTQ1_0, GGML_Q2_0)
+    rng    = np.random.default_rng(8)
+    codes  = rng.integers(0, 3, (16, 128), dtype=np.uint8)
+    scales = rng.uniform(0.01, 0.1, 16).astype(np.float16)
+    assert np.array_equal(ptq1_0_dequant(ptq1_0_pack(scales, codes)),
+                          q2_0_dequant(q2_0_pack(scales, codes)))
+    assert DEQUANT[GGML_PQ2_0] is DEQUANT[GGML_Q2_0] and DEQUANT[GGML_PTQ1_0] is ptq1_0_dequant
+
+
+def test_q2_0_group_detection():
+    from trixium.model.qformats import q2_0_group
+    assert q2_0_group(np.zeros(34*10, np.uint8), 1280) == 128
+    assert q2_0_group(np.zeros(18*20, np.uint8), 1280) == 64
+    import pytest
+    with pytest.raises(ValueError):
+        q2_0_group(np.zeros(100, np.uint8), 1280)

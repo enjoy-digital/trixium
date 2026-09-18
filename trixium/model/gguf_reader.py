@@ -40,6 +40,9 @@ GGML_TYPE_NAMES = {
      8: "Q8_0",    9: "Q8_1",   10: "Q2_K",  11: "Q3_K",  12: "Q4_K", 13: "Q5_K",
     14: "Q6_K",   15: "Q8_K",   24: "I8",    25: "I16",   26: "I32",  27: "I64",
     28: "F64",    30: "BF16",   34: "TQ1_0", 35: "TQ2_0",
+    # PrismML fork (prism branch): 41/42 the original 1-bit/2-bit g128 blocks (42 became
+    # upstream's g64 Q2_0 in 2026-06), 142/143 the g128 2-bit and dense-trit blocks.
+    41: "Q1_0",   42: "Q2_0",    142: "PQ2_0", 143: "PTQ1_0",
 }
 
 # GGUFTensor ---------------------------------------------------------------------------------------

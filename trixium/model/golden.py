@@ -62,7 +62,10 @@ def load_gguf_f32(path):
     for name, t in reader.tensors.items():
         dequant = qformats.DEQUANT.get(t.type_id)
         assert dequant is not None, f"no dequant for {name} type {t.type_id}"
-        tensors[name] = dequant(reader.tensor_bytes(name)).reshape(t.shape)
+        raw = reader.tensor_bytes(name)
+        if t.type_id == qformats.GGML_Q2_0 and qformats.q2_0_group(raw, int(np.prod(t.shape))) != 128:
+            raise NotImplementedError(f"{name}: a group-64 Q2_0 file - use the PQ2_0 (g128) file")
+        tensors[name] = dequant(raw).reshape(t.shape)
     return cfg, tensors
 
 # RoPE with YaRN (exact transliteration of ggml's rope_yarn) ---------------------------------------
