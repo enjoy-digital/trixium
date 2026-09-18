@@ -1371,6 +1371,7 @@ static int attn_pipe_req = 1;    // Requested (aovl console toggle). attn_list_p
                                  // would leave aovl off for every generation after it.
 static int attn_prep_pos = -1;   // Position attn_list_prep_token last ran for (lovl dedup).
 static int attn_pipe_active = 0; // What the built list uses.
+static int attn_chunk_cap = 0;   // Debug: cap the heads per list (0 = as many as fit).
 // The second scores buffer (odd heads, deep layout) sits at SP_SC + 0x3800 and resident K
 // starts at SP_K: 0x800 bytes = 512 int32 entries, NOT the 14 KB the "halves" comment
 // used to claim. Its INT32_MIN padding is written once per token, and every layer's QKV
@@ -1378,7 +1379,19 @@ static int attn_pipe_active = 0; // What the built list uses.
 // time softmax read it (and V data from 1537). Bench runs at ctx~67 and the tokens gate
 // is short, so it never showed. Buffer A is safe: ceil32(cnt) <= 2048 = max_ctx ends it
 // exactly at SP_Q. (Found by the 2026-09-07 external review.)
-#define SC_B_CAP_BYTES ((uint32_t)SP_K - ((uint32_t)SP_SC + 0x3800u))
+// 2026-09-18: the second buffer's address follows the model. At SP_SC + 0x3800 it sat in
+// the tail of the resident-q region - free on the 1.7B (q 4 KB), INSIDE SP_Q on the 8B
+// (q 8 KB): every layer's QKV list rewrote its padding, odd heads softmaxed over q values
+// and their AXPY returned zero (card_vs_mirror: even heads exact, odd heads all-zero).
+// The padding is written once per token, so the buffer must be untouched for the whole
+// forward: the 8B gets the free half of SP_D (the resident k-norm rows that live there on
+// the 1.7B are impossible at 36 layers, see qres), 8 KB = the full 2048-position budget.
+// (SP_YU was tried first: dead through attention, but the FFN's up results overwrote the
+// padding every layer - layer 1 diverged.) Neither fits: the deep layout stays off.
+static uint32_t sp_scb2;          // Second scores buffer (0 = no deep layout possible).
+static uint32_t sc_b_cap_bytes;   // Its capacity.
+#define SP_SCB2        sp_scb2
+#define SC_B_CAP_BYTES sc_b_cap_bytes
 static inline uint32_t attn_grp(int j) {
     return (uint32_t)seq_attn_base + (attn_pipe_active ? 1u : 0u)
            + (uint32_t)j*(uint32_t)seq_attn_dph;
@@ -1403,9 +1416,7 @@ static inline uint32_t attn_sc_dst(int j) {
     // unconditionally left aovl-off reading an unpadded second buffer for odd heads
     // (latent since the aovl commit: every sim gate ran the pipelined default and the
     // card's aovl-off benches never token-checked; the pipe-off bisect exposed it).
-    return (uint32_t)SP_SC
-           + ((attn_pipe_active && (j & 1)) ? 0x3800u : 0u); // B holds 512 entries, not 14 KB
-                                                             // (SC_B_CAP_BYTES): K is at SP_K.
+    return (attn_pipe_active && (j & 1)) ? (uint32_t)SP_SCB2 : (uint32_t)SP_SC;
 }
 static inline int attn_list_len(int nh) {
     return nh*seq_attn_dph + (attn_pipe_active ? 3 : 0); // Prologue + 2-slot epilogue.
@@ -1423,6 +1434,8 @@ static void seq_build_attn(void)
     // channels. 16*5 + 66 = 146 of 192, so the FFN and scale8 lists fit behind it.
     int dph = 5;
     int cap = (192 - seq_qkr_count - (attn_pipe ? 3 : 0))/dph;
+    if (attn_chunk_cap > 0 && cap > attn_chunk_cap)
+        cap = attn_chunk_cap;                    // `attnchunk N`: force a chunked list
     if (cap <= 0)
         return;
     int chunk = (cap < n_head) ? cap : n_head;
@@ -2467,6 +2480,14 @@ void infer_ffn_split(int on)
 int infer_ffn_split_state(void) { return ffn_split; }
 
 // Console toggle (aovl): rebuild the three dependent lists in either layout.
+void infer_attn_chunk(int cap)
+{
+    attn_chunk_cap = cap;
+    seq_ffn_base = -1;
+    seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
+    printf("ATTNCHUNK cap %d: list holds %d of %d heads, pipelined %d\n", cap, seq_attn_heads,
+           n_head, attn_pipe_active);
+}
 void infer_attn_pipe(int on)
 {
     attn_pipe_req = on ? 1 : 0;
@@ -2572,7 +2593,7 @@ static void attn_list_prep_token(int pos)
     // capacity (SC_B_CAP_BYTES, see above). Beyond it fall back to the plain list, and
     // come back to the deep one as soon as a new generation fits again - both directions
     // shift the FFN/scale8/qkv bases with the prologue, so all four lists rebuild.
-    int want_pipe = attn_pipe_req && ((uint32_t)(cnt + padn)*4u <= SC_B_CAP_BYTES);
+    int want_pipe = attn_pipe_req && SP_SCB2 != 0 && ((uint32_t)(cnt + padn)*4u <= SC_B_CAP_BYTES);
     if (want_pipe != attn_pipe) {
         attn_pipe = want_pipe;
         seq_ffn_base = -1;
@@ -2582,7 +2603,7 @@ static void attn_list_prep_token(int pos)
     for (int i2 = 0; i2 < padn; i2++)
         sc32[cnt + i2] = (int32_t)0x80000000;
     if (attn_pipe_active) {
-        volatile int32_t *sc32b = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SC + 0x3800);
+        volatile int32_t *sc32b = (volatile int32_t *)(SCRATCHPAD_BASE + SP_SCB2);
         for (int i2 = 0; i2 < padn; i2++)
             sc32b[cnt + i2] = (int32_t)0x80000000;
     }
@@ -3609,6 +3630,11 @@ attn_heads_done: ;
 #endif
             ea8 = quantize_f_pow2(attn, q_dim, SP_X);
             dbg_sum("attn_x8", l, SP_X, q_dim, ea8);
+            // The attention list's per-head spills (int32 as int16 pairs: the low half of
+            // each 32 B beat's first word is what the fold reads) and scores buffer B.
+            dbg_sum("awp8", l, SP_AWP8, n_head*32, 0);
+            dbg_sum("awam", l, SP_AWAM, n_head*32, 0);
+            dbg_sum("scb",  l, SP_SCB2, 64, 0);
             model_matvec(eo, SP_X, SP_Y);
             perf_enter(OP_NORM_I32);
             uint32_t dmax = 0;
@@ -3957,6 +3983,19 @@ int infer_init(void)
         fold_nrep_sh = sh;
     }
     qkn_resident = 0; // New image / re-init: the resident qk-norm rows must be refetched.
+    {
+        int q_bytes = 2*n_head*head_dim, kn_bytes = 2*n_layer*head_dim;
+        if (q_bytes <= 0x1800) {                       // 1.7B: the tail of the q region
+            sp_scb2 = (uint32_t)SP_SC + 0x3800u;
+            sc_b_cap_bytes = (uint32_t)SP_K - sp_scb2;
+        } else if (2*n_embd <= 0x2000 && kn_bytes > 0x1C00) { // 8B: SP_D's free half
+            sp_scb2 = (uint32_t)SP_D + 0x2000u;
+            sc_b_cap_bytes = (uint32_t)SP_FET - sp_scb2;
+        } else {
+            sp_scb2 = 0;
+            sc_b_cap_bytes = 0;
+        }
+    }
     norm16_cache_build();
     tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
     {

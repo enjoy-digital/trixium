@@ -227,17 +227,30 @@ static void emit_token(int tok)
 // Copy the BONS header+table from the HBM staging area (engine channel 0, uploaded there by
 // bonsai_load) into the CPU-visible header location, then re-init inference.
 #define HDR_STAGING (BONSAI_CHAN_WEIGHT_BASE - 0x100000)
-static void hdrload(void)
+// The staged copy (channel 0, uploaded with every image by bonsai_load) is the truth about
+// what is in HBM; the main_ram copy is derived from it. The boot used to trust main_ram: a
+// CPU reset after `bonsai_load` of a DIFFERENT model then ran the boot demo with the
+// previous model's tables - the 1.7B's KV addresses, which on the 8B point into layer 18's
+// weights - and the two demo tokens overwrote them (2026-09-18: mvtest of blk.18.attn_v
+// wrong until re-uploaded, the corruption starting exactly at the 1.7B's kv_base). Now the
+// boot refreshes main_ram from the staged header when the two differ.
+static int hdrload_staged(int quiet)
 {
     // First fetch just the header to learn the table size.
     engine_fetch(0, HDR_STAGING, 128, 0xC000);
     volatile struct bons_header *sh =
         (volatile struct bons_header *)(SCRATCHPAD_BASE + 0xC000);
     if (sh->magic != BONS_MAGIC) {
-        printf("hdrload: no BONS header at staging (magic %08lx)\n",
-               (unsigned long)sh->magic);
-        return;
+        if (!quiet)
+            printf("hdrload: no BONS header at staging (magic %08lx)\n",
+                   (unsigned long)sh->magic);
+        return -1;
     }
+    const struct bons_header *mh = model_header();
+    if (quiet && mh->magic == BONS_MAGIC && mh->version == sh->version
+        && mh->n_tensors == sh->n_tensors && mh->payload_beats == sh->payload_beats
+        && mh->n_layer == sh->n_layer && mh->table_crc32 == sh->table_crc32)
+        return 0;                              // main_ram already holds this image's header
     uint32_t bytes = sh->payload_offset;
     uint8_t *dst   = (uint8_t *)BONSAI_HDR_ADDR;
     uint32_t off   = 0;
@@ -250,7 +263,15 @@ static void hdrload(void)
         off += chunk;
     }
     model_cache_reset(); // Header changed: rebuild the (role, layer) lookup cache.
-    printf("hdrload: %lu KB copied\n", (unsigned long)(bytes/1024));
+    printf("hdrload: %lu KB copied%s\n", (unsigned long)(bytes/1024),
+           quiet ? " (staged header differed from main_ram's)" : "");
+    return 1;
+}
+
+static void hdrload(void)
+{
+    if (hdrload_staged(0) < 0)
+        return;
     model_info();
     if (infer_init() == 0)
         puts("hdrload: inference ready");
@@ -503,6 +524,8 @@ static void console_service(void)
         printf("SAMPLE temp=%d.%03d top_p=%d.%03d rep=%d.%03d (x1000: sample 700 900 1100 [seed])\n",
                (int)t, (int)(t*1000) % 1000, (int)p, (int)(p*1000) % 1000, (int)r, (int)(r*1000) % 1000);
     }
+    else if (strcmp(token, "attnchunk") == 0)
+        infer_attn_chunk(parse_int(str));
     else if (strcmp(token, "engreset") == 0)
         engine_recover();
     else if (strcmp(token, "wedge") == 0) {
@@ -739,6 +762,7 @@ int main(void)
 #endif
 
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
+    hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
     model_info();
     sptest();
 #ifdef CSR_VECUNIT_BASE
