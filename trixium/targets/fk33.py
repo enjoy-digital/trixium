@@ -140,6 +140,9 @@ class BonsaiSoC(SoCCore):
         cluster_chan_mod       = 0     # One flat HBM address space.
         cluster_mem_cpu_offset = None  # The CPU window passes through 1:1 (the default).
         cluster_n_memctrl      = None  # The BIOS owns the one memory system.
+        from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE
+        cluster_chan_stride    = HBM_CHAN_STRIDE  # 256 MB: one pseudo-channel per engine channel.
+        cluster_weight_base    = HBM_WEIGHT_BASE  # +64 MB into it (port-matched, CPU-safe).
         # Bonsai cluster: begin. This block is byte-identical in every board target
         # (test_layout_contract.py diffs the marked regions): the per-board knobs are
         # the cluster_* variables set just above it. Migen names every signal by the
@@ -204,11 +207,10 @@ class BonsaiSoC(SoCCore):
                 # in the netlist anyway - the operand register was emitted under a
                 # namer-collided name and the ROM output cells are absorbed into the
                 # RAMB18 output stage, so the regexes matched nothing.)
-            from trixium.layout import HBM_CHAN_STRIDE
             self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
             self.engine     = ClockDomainsRenamer("eng")(
                 BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
-                                   seq=seq, dual=with_dual, chan_stride=HBM_CHAN_STRIDE,
+                                   seq=seq, dual=with_dual, chan_stride=cluster_chan_stride,
                                    chan_mod=cluster_chan_mod))
             if with_dual:
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
@@ -219,12 +221,11 @@ class BonsaiSoC(SoCCore):
                 self.engine_csr.rst_busy.eq(self.engrst.busy),
                 self.engine_csr.rst_stuck.eq(self.engrst.stuck),
             ]
-            from trixium.layout import HBM_CHAN_STRIDE as _LOADER_STRIDE
             # Channel offsets added in hardware on the upload path too (33-bit windows,
             # N=16 puts channel 15 above 4 GB); the host tools read
             # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
             self.loader     = ClockDomainsRenamer("eng")(
-                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=_LOADER_STRIDE,
+                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=cluster_chan_stride,
                                 chan_mod=cluster_chan_mod))
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [
@@ -260,12 +261,12 @@ class BonsaiSoC(SoCCore):
 
             # Firmware contract: the BONS header+table are staged 1 MB below engine channel
             # 0's window and copied to main_ram + HDR_CPU_OFFSET; engine-channel payloads one
-            # HBM_CHAN_STRIDE apart from HBM_WEIGHT_BASE, each in its own channel's window
+            # cluster_chan_stride apart from cluster_weight_base, each in its own window
             # (the offset is added in hardware; layout.py has the geometry of each board).
-            from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
+            from trixium.layout import HDR_CPU_OFFSET
             self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
-            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
-            self.add_constant("BONSAI_CHAN_STRIDE",      HBM_CHAN_STRIDE)
+            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", cluster_weight_base)
+            self.add_constant("BONSAI_CHAN_STRIDE",      cluster_chan_stride)
             self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
             # Several memory controllers (the XCU1525): the firmware's overlap check and
             # its controller init read these; absent, the FK33's flat HBM geometry.

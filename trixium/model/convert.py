@@ -23,7 +23,9 @@ import numpy as np
 
 from trixium import layout
 from trixium.layout import (
-    KIND_TERNARY, KIND_F32, FLAG_REPLICATED,
+    ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
+    ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM, ROLE_HADAMARD,
+    KIND_TERNARY, KIND_Q8, KIND_F32, FLAG_REPLICATED,
     ROLE_TOK_EMB, ROLE_OUT_NORM, ROLE_LM_HEAD,
     ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
     ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
@@ -53,19 +55,56 @@ _BLK_ROLES = {
     "ffn_gate"    : (ROLE_FFN_GATE,    False),
     "ffn_up"      : (ROLE_FFN_UP,      False),
     "ffn_down"    : (ROLE_FFN_DOWN,    False),
+    # The 27B's hybrid layers (Qwen3.5 names in the GGUF).
+    "post_attention_norm" : (ROLE_FFN_NORM,   True),   # the FFN's input norm, renamed
+    "attn_qkv"    : (ROLE_ATTN_QKV,    False),
+    "attn_gate"   : (ROLE_ATTN_ZGATE,  False),
+    "ssm_out"     : (ROLE_SSM_OUT,     False),
+    "ssm_beta"    : (ROLE_SSM_BETA,    False),
+    "ssm_alpha"   : (ROLE_SSM_ALPHA,   False),
+    "ssm_conv1d"  : (ROLE_SSM_CONV,    True),
+    "ssm_a"       : (ROLE_SSM_A,       True),
+    "ssm_dt"      : (ROLE_SSM_DT,      True),
+    "ssm_norm"    : (ROLE_SSM_NORM,    True),
 }
+
+_DN_LAYER_TENSORS = ("attn_norm", "attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha", "ssm_conv1d",
+                     "ssm_a", "ssm_dt", "ssm_norm", "ssm_out", "post_attention_norm",
+                     "ffn_gate", "ffn_up", "ffn_down")
+_ATTN_LAYER_TENSORS_Q35 = ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
+                           "attn_output", "post_attention_norm", "ffn_gate", "ffn_up", "ffn_down")
 
 def _name_role(name):
     if name in _GLOBAL_ROLES:
         return 0, *_GLOBAL_ROLES[name]
     if name.startswith("blk."):
         _, l, base = name.split(".", 2)
-        base = base.removesuffix(".weight")
+        base = base.removesuffix(".weight").removesuffix(".bias")
         role, repl = _BLK_ROLES[base]
         return int(l), role, repl
     raise KeyError(name)
 
 # Conversion ---------------------------------------------------------------------------------------
+
+def _hadamard_specs(cfg):
+    """PrismML's rotation as ternary tensors, one per (input width, block): rows = cols =
+    block, row i = R[i] * s[b*block + i], scale 1/sqrt(block) (exact in fp16 for a power-of-
+    two block). The runtime computes x' blockwise: block b of x' = tensor (w, b) against
+    x[b*block : (b+1)*block] - one engine matvec per block with the x slice as its input,
+    the tensor sharded over the channels like any other. Entry layer = width index * 256 +
+    block index (layout.hadamard_layer); the widths are listed in the header."""
+    from trixium.model.golden import hadamard_matrix
+    block = cfg.hadamard_block
+    R = hadamard_matrix(block)*np.sqrt(float(block))          # +-1
+    specs = []
+    for wi, width in enumerate(sorted(cfg.hadamard_signs)):
+        s = np.asarray(cfg.hadamard_signs[width], dtype=np.float32)
+        for b in range(width//block):
+            codes  = (R*s[b*block:(b + 1)*block][None, :] + 1).astype(np.uint8)
+            scales = np.full((block, block//layout.GROUP_TERNARY), 1.0/np.sqrt(float(block)), np.float16)
+            specs.append(TensorSpec(f"had.{width}.{b}", ROLE_HADAMARD, layout.hadamard_layer(wi, b),
+                                    KIND_TERNARY, block, block, scales=scales, values=codes, flags=0))
+    return specs
 
 def _spec_from_gguf(reader, name, n_channels, vocab_pad):
     t     = reader.tensors[name]
@@ -111,10 +150,31 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
                           scales=scales, loader=load, flags=flags)
 
     if t.type_name == "F32":
-        cols   = t.shape[-1]
-        values = qformats.f32_dequant(reader.tensor_bytes(name)).reshape(1, cols)
-        return TensorSpec(name, role, layer, KIND_F32, 1, cols, values=values,
+        values = qformats.f32_dequant(reader.tensor_bytes(name)).reshape(t.shape)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if role == ROLE_SSM_CONV:
+            # (channels, taps): stored as rows of 1024 floats, tap i of channel c at flat
+            # index c*taps + i, so the firmware indexes a beat-aligned table.
+            values = values.reshape(-1, 1024)
+        rows, cols = values.shape
+        return TensorSpec(name, role, layer, KIND_F32, rows, cols, values=values,
                           flags=FLAG_REPLICATED)
+
+    if t.type_name == "BF16":
+        # The DeltaNet head projections (beta/alpha: value heads x n_embd): Q8 rows for the
+        # engine, one fp16 scale per 32 weights, rounded to nearest.
+        assert role in (ROLE_SSM_BETA, ROLE_SSM_ALPHA), name
+        rows, cols = t.shape
+        raw = np.frombuffer(reader.tensor_bytes(name), dtype=np.uint16).astype(np.uint32) << 16
+        w = raw.view(np.float32).reshape(rows, cols)
+        g = w.reshape(rows, cols//layout.GROUP_Q8, layout.GROUP_Q8)
+        amax = np.abs(g).max(axis=2)
+        scales = (amax/127.0).astype(np.float16)
+        sc = scales.astype(np.float32)[:, :, None]
+        q = np.where(sc > 0, np.round(g/np.where(sc > 0, sc, 1.0)), 0).clip(-127, 127)
+        return TensorSpec(name, role, layer, KIND_Q8, rows, cols, scales=scales,
+                          values=q.reshape(rows, cols).astype(np.int8), flags=0)
 
     raise NotImplementedError(f"{name}: unsupported tensor type {t.type_name}")
 
@@ -122,7 +182,12 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
             max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
-    check_engine_support(cfg)
+    try:
+        check_engine_support(cfg)
+    except SystemExit as e:
+        # The image is still built: the firmware refuses at boot what it cannot run, and
+        # the tools (the mirrors, the golden) read the image meanwhile.
+        print(f"  NOTE: {e}")
     if max_layers is not None:
         cfg.n_layer = min(cfg.n_layer, max_layers)
         cfg.name    = f"{cfg.name}-l{cfg.n_layer}"
@@ -131,14 +196,23 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     # Canonical tensor order: embeddings, per-layer blocks, final norm, head.
     names = ["token_embd.weight"]
     for l in range(cfg.n_layer):
-        for base in ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
-                     "attn_output", "ffn_norm", "ffn_gate", "ffn_up", "ffn_down"):
-            names.append(f"blk.{l}.{base}.weight")
+        if cfg.layer_type(l) == "deltanet":
+            bases = _DN_LAYER_TENSORS
+        elif f"blk.{l}.post_attention_norm.weight" in reader.tensors:
+            bases = _ATTN_LAYER_TENSORS_Q35
+        else:
+            bases = ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
+                     "attn_output", "ffn_norm", "ffn_gate", "ffn_up", "ffn_down")
+        for base in bases:
+            suffix = ".bias" if base == "ssm_dt" else ("" if base == "ssm_a" else ".weight")
+            names.append(f"blk.{l}.{base}{suffix}")
     names.append("output_norm.weight")
     if "output.weight" in reader.tensors:
         names.append("output.weight")
 
     specs = [_spec_from_gguf(reader, name, n_channels, vocab_pad) for name in names]
+    if cfg.hadamard_block:
+        specs += _hadamard_specs(cfg)
 
     # Does it fit the card? Each engine channel owns HBM_CHAN_STRIDE (256 MB) from
     # HBM_WEIGHT_BASE's offset into its pseudo-channel (64 MB), and the KV cache sits above
@@ -154,7 +228,8 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
     if chan_stride is None: chan_stride = HBM_CHAN_STRIDE
     if weight_base is None: weight_base = HBM_WEIGHT_BASE
-    window   = chan_stride - (weight_base % chan_stride)
+    window   = chan_stride - (weight_base % chan_stride) - 0x1000  # The last 4 KB: the
+    # firmware's DDR round-trip test (ddr.c) writes them on boards with several controllers.
     kv_rb    = 1 + cfg.head_dim//32
     kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
     weights  = sum(_tensor_beats(t, n_channels) for t in specs)*32

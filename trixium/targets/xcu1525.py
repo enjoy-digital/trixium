@@ -139,7 +139,8 @@ DDR_CSR_STRIDE = 0x1000
 class BonsaiXCU1525SoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
-                 ddram_channels=4, main_ram_size=0x1000_0000, **kwargs):
+                 ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000,
+                 **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
             "engine channels shard evenly over the DDR4 controllers"
@@ -221,16 +222,29 @@ class BonsaiXCU1525SoC(SoCCore):
             sys_clk_freq = sys_clk_freq)
 
         # Bonsai -----------------------------------------------------------------------------------
-        # The FK33's constants per controller: channel c's window is controller c // chan_mod's
-        # local HBM_WEIGHT_BASE + (c % chan_mod)*HBM_CHAN_STRIDE (320 MB .. 1.3 GB of each
-        # 4 GB channel), above main_ram (controller 0's local 0 .. 256 MB); the BONS header
-        # staging area (1 MB below channel 0's window) and the header copy at main_ram + 4 MB
-        # as on the FK33. BONSAI_MEM_CPU_OFFSET = 0: main_ram's origin is controller 0's
-        # local address 0 (the FK33's CPU window passes through 1:1 at 0x4000_0000).
+        # The window per engine channel: the FK33's base (320 MB) with a 1 GB stride, so
+        # channel c's window is controller c // chan_mod's local 320 MB + (c % chan_mod) GB,
+        # 704 MB usable (the stride minus the base's offset into it), the last of the four
+        # ending exactly at the channel's 4 GB. 704 MB holds the 27B (370 MB of ternary
+        # weights + its 159 MB int16 embedding table + KV and recurrent state per channel
+        # at N=16), where the FK33's 192 MB window holds only the 8B without its table. The
+        # 1.7B image is byte-identical to the FK33's; the 8B's gains its embedding table
+        # (convert with --chan-stride 0x40000000). main_ram is controller 0's local
+        # 0..256 MB, below every window; the BONS staging area is the megabyte below
+        # channel 0's window (319 MB) as on the FK33. BONSAI_MEM_CPU_OFFSET = 0: main_ram's
+        # origin is controller 0's local address 0 (the FK33's CPU window passes through
+        # 1:1 at 0x4000_0000).
+        from trixium.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
+        assert chan_stride & (chan_stride - 1) == 0 and HBM_WEIGHT_BASE < chan_stride
+        assert HBM_WEIGHT_BASE + chan_stride*chan_mod - (HBM_WEIGHT_BASE % chan_stride) \
+            <= 4 << 30, "the last window must end inside the channel's 4 GB"
+        assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000, "main_ram must end below the staging area"
         with_bonsai            = True
         cluster_chan_mod       = chan_mod
         cluster_mem_cpu_offset = 0
         cluster_n_memctrl      = ddram_channels
+        cluster_chan_stride    = chan_stride
+        cluster_weight_base    = HBM_WEIGHT_BASE
         # Bonsai cluster: begin. This block is byte-identical in every board target
         # (test_layout_contract.py diffs the marked regions): the per-board knobs are
         # the cluster_* variables set just above it. Migen names every signal by the
@@ -295,11 +309,10 @@ class BonsaiXCU1525SoC(SoCCore):
                 # in the netlist anyway - the operand register was emitted under a
                 # namer-collided name and the ROM output cells are absorbed into the
                 # RAMB18 output stage, so the regexes matched nothing.)
-            from trixium.layout import HBM_CHAN_STRIDE
             self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
             self.engine     = ClockDomainsRenamer("eng")(
                 BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
-                                   seq=seq, dual=with_dual, chan_stride=HBM_CHAN_STRIDE,
+                                   seq=seq, dual=with_dual, chan_stride=cluster_chan_stride,
                                    chan_mod=cluster_chan_mod))
             if with_dual:
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
@@ -310,12 +323,11 @@ class BonsaiXCU1525SoC(SoCCore):
                 self.engine_csr.rst_busy.eq(self.engrst.busy),
                 self.engine_csr.rst_stuck.eq(self.engrst.stuck),
             ]
-            from trixium.layout import HBM_CHAN_STRIDE as _LOADER_STRIDE
             # Channel offsets added in hardware on the upload path too (33-bit windows,
             # N=16 puts channel 15 above 4 GB); the host tools read
             # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
             self.loader     = ClockDomainsRenamer("eng")(
-                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=_LOADER_STRIDE,
+                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=cluster_chan_stride,
                                 chan_mod=cluster_chan_mod))
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [
@@ -351,12 +363,12 @@ class BonsaiXCU1525SoC(SoCCore):
 
             # Firmware contract: the BONS header+table are staged 1 MB below engine channel
             # 0's window and copied to main_ram + HDR_CPU_OFFSET; engine-channel payloads one
-            # HBM_CHAN_STRIDE apart from HBM_WEIGHT_BASE, each in its own channel's window
+            # cluster_chan_stride apart from cluster_weight_base, each in its own window
             # (the offset is added in hardware; layout.py has the geometry of each board).
-            from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
+            from trixium.layout import HDR_CPU_OFFSET
             self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
-            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
-            self.add_constant("BONSAI_CHAN_STRIDE",      HBM_CHAN_STRIDE)
+            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", cluster_weight_base)
+            self.add_constant("BONSAI_CHAN_STRIDE",      cluster_chan_stride)
             self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
             # Several memory controllers (the XCU1525): the firmware's overlap check and
             # its controller init read these; absent, the FK33's flat HBM geometry.
@@ -385,6 +397,7 @@ def main():
     parser.add_target_argument("--ddram-channels",  default=4, type=int,       help="DDR4 channels to instantiate (1-4).")
     parser.add_target_argument("--ddram-module",    default="MT40A512M8",      help="LiteDRAM module class of the DDR4 (upstream target: MT40A512M8).")
     parser.add_target_argument("--main-ram-size",   default=0x1000_0000, type=lambda x: int(x, 0), help="CPU main_ram size on controller 0 (default 256 MB, the FK33's).")
+    parser.add_target_argument("--chan-stride",     default=0x4000_0000, type=lambda x: int(x, 0), help="Per-engine-channel stride inside a controller (default 1 GB: 704 MB windows, the 27B fits; 0x10000000 = the FK33's 256 MB).")
     parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
@@ -398,6 +411,7 @@ def main():
         ddram_module    = args.ddram_module,
         ddram_channels  = args.ddram_channels,
         main_ram_size   = args.main_ram_size,
+        chan_stride     = args.chan_stride,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates

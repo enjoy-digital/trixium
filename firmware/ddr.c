@@ -70,14 +70,16 @@ int ddr_init_all(void)
 // channel: all stores first, then every fetch, so a channel aliased onto another's memory
 // (the FK33's 2026-08-03 bug, and the failure a wrong chan_mod would give) reads back its
 // neighbour's pattern instead of its own. 64 beats in the last 4 KB of the channel's own
-// stride: the converter caps a model at the window (stride minus the base's offset into
-// it, 192 MB on the FK33/XCU1525 constants), so the top of the stride is free on every
-// board and for every model. NOT "below the window": the hardware adds the channel's
-// offset, so an address below channel c's window is inside channel c-1's - and with the
-// sim's 2 MB stride the first version of this test overwrote the neighbour's embedding
-// table and cost the tokens on all three boot legs (2026-09-18).
-#define DDR_TEST_BEATS 64
-#define DDR_TEST_ADDR  (BONSAI_CHAN_WEIGHT_BASE + BONSAI_CHAN_STRIDE - 0x1000u)
+// window - base + (stride - base % stride) - 4 KB, which the converter reserves (a model
+// is capped at the window minus these 4 KB), so it is free on every board and for every
+// model. NOT "below the window": the hardware adds the channel's offset, so an address
+// below channel c's window is inside channel c-1's - and with the sim's 2 MB stride the
+// first version of this test overwrote the neighbour's embedding table and cost the
+// tokens on all three boot legs (2026-09-18). And not "base + stride": with the XCU1525's
+// 1 GB stride and 320 MB base that is past the channel's 4 GB for the last window.
+#define DDR_TEST_BEATS  64
+#define DDR_TEST_WINDOW (BONSAI_CHAN_STRIDE - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE))
+#define DDR_TEST_ADDR   (BONSAI_CHAN_WEIGHT_BASE + DDR_TEST_WINDOW - 0x1000u)
 #define DDR_TEST_SRC   0x0000u   // Scratchpad: the pattern (2 KB).
 #define DDR_TEST_DST   0x4000u   // Scratchpad: the readback.
 
