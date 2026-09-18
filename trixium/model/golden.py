@@ -133,6 +133,7 @@ class LazyTernary:
         return out if np.ndim(idx) else out[0]
 
 class _LazyT:
+    __array_ufunc__ = None            # so ndarray @ this defers to __rmatmul__
     def __init__(self, m):
         self.m = m
     def __rmatmul__(self, x):          # x @ W.T  ->  (.., rows)
