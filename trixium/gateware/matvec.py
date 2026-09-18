@@ -143,7 +143,7 @@ class _ResultPacker(Module):
 
 class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
-                 dual=True, chan_stride=0):
+                 dual=True, chan_stride=0, chan_mod=0):
         # chan_stride: byte distance between consecutive channels' weight regions. The HBM IP
         # is configured with the AXI switch enabled (USER_SWITCH_ENABLE_00/01), so the address
         # - not the port it arrives on - selects the pseudo-channel: with stride 0 every
@@ -158,6 +158,18 @@ class BonsaiMatVecEngine(LiteXModule):
         assert chan_stride == 0 or (chan_stride & (chan_stride - 1)) == 0, \
             "chan_stride must be 0 or a power of two (the STORE path shifts by it)"
         chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
+        # chan_mod: channels per memory controller, a power of two (0 = one flat address
+        # space, the FK33's HBM). On a board with several controllers (the XCU1525's four
+        # DDR4 channels) engine channel c sits on controller c // chan_mod and its window
+        # is that controller's local HBM_WEIGHT_BASE + (c % chan_mod)*stride: the FK33's
+        # constants and images, per controller. The mask is applied on the read, fetch and
+        # STORE paths alike (the loader masks the upload path the same way).
+        assert chan_mod == 0 or (chan_mod & (chan_mod - 1)) == 0, \
+            "chan_mod must be 0 or a power of two (the STORE path masks by it)"
+        def _chan_off(i): # Python int: per-reader constant.
+            return ((i % chan_mod) if chan_mod else i)*chan_stride
+        def _chan_sel(c): # Signal: the STORE path's per-op channel.
+            return (c & (chan_mod - 1)) if chan_mod else c
 
         # Keep the vector unit's busy signal, not the module: assigning a Module to an
         # attribute registers it as a submodule, and it is already one of the SoC's. The
@@ -936,7 +948,7 @@ class BonsaiMatVecEngine(LiteXModule):
             # STORE targets the one channel in cmd.chan, so it needs the same per-channel
             # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
             self.store_cmd.addr.eq(st_addr_r +
-                (cmd_r["chan"] << chan_shift if chan_stride else 0)),
+                (_chan_sel(cmd_r["chan"]) << chan_shift if chan_stride else 0)),
             self.store_cmd.len.eq(cmd_r["wlen"]),
             If(self.store_cmd.ready,
                 NextState("ST_RUN"),
@@ -980,7 +992,7 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             *[r.sink.valid.eq(~fetch_mode | (fetch_chan == i))
               for i, r in enumerate(self.readers)],
-            *[r.sink.addr.eq(cmd_r["wbase"] + i*chan_stride)
+            *[r.sink.addr.eq(cmd_r["wbase"] + _chan_off(i))
               for i, r in enumerate(self.readers)],
             *[r.sink.len.eq(cmd_r["wlen"]
                 + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))

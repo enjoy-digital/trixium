@@ -100,6 +100,32 @@ int *__errno(void) { return &__errno_storage; }
 // fixed main_ram + 144 MB, which the 8B's 136 MB/channel of weights overran (2026-09-18).
 static uint32_t heap_hi_base;
 
+// Engine-side addresses vs the CPU's. On the FK33 the CPU window passes through 1:1 (main_ram
+// at 0x4000_0000 IS HBM address 0x4000_0000 on port 0, inside pseudo-channel 4 = engine
+// channel 3's window). On a board with several memory controllers (the XCU1525's four DDR4
+// channels) engine channel c lives on controller c / CHAN_MOD at that controller's local
+// BASE + (c % CHAN_MOD)*STRIDE, and main_ram is controller 0's local [MEM_CPU_OFFSET, +size).
+// Two SoC constants describe both; absent, the FK33's geometry.
+#ifndef BONSAI_CHAN_MOD
+#define BONSAI_CHAN_MOD 0                       // 0: one flat engine address space.
+#endif
+#ifndef BONSAI_MEM_CPU_OFFSET
+#define BONSAI_MEM_CPU_OFFSET 0x40000000ull      // Engine-side address of main_ram's origin.
+#endif
+static inline uint64_t chan_window(uint32_t c)  // Engine-side start of channel c's window.
+{
+    uint32_t local = BONSAI_CHAN_MOD ? (c % BONSAI_CHAN_MOD) : c;
+    return (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)local*BONSAI_CHAN_STRIDE;
+}
+static inline int chan_on_cpu_memory(uint32_t c) // Same controller as main_ram?
+{
+    return BONSAI_CHAN_MOD ? (c / BONSAI_CHAN_MOD) == 0 : 1;
+}
+static inline uint32_t cpu_addr_of(uint64_t eng) // Engine-side -> CPU address (main_ram).
+{
+    return (uint32_t)(0x40000000ull + (eng - BONSAI_MEM_CPU_OFFSET));
+}
+
 static uint8_t *heap;
 static void *halloc(uint32_t n)
 {
@@ -4067,25 +4093,29 @@ int infer_init(void)
     kv_base   = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
     kv_rb     = 1 + head_dim/32; // One scale beat + code beats (cols = head_dim, Q8).
     kv_region = (uint32_t)((max_ctx + n_ch - 1)/n_ch)*kv_rb;
-    // Engine channel 3's window lies inside main_ram (PC 4): its payload + KV tail decides
-    // where the high heap can start (142 MB on the 1.7B with the int16 embedding table,
-    // 212 MB on the 8B), and the image is refused only when that tail leaves main_ram.
+    // A channel window that lies inside main_ram (the FK33's channel 3, in PC 4): its
+    // payload + KV tail decides where the high heap can start (142 MB on the 1.7B with the
+    // int16 embedding table, 212 MB on the 8B), and the image is refused only when that
+    // tail leaves main_ram. On a board whose windows sit above main_ram (the XCU1525) no
+    // channel qualifies and the high heap keeps its fixed base.
     {
-        uint64_t top = 0;
+        uint64_t top = 0;   // Engine-side.
+        const uint64_t ram_lo = BONSAI_MEM_CPU_OFFSET, ram_hi = ram_lo + MAIN_RAM_SIZE;
         for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
-            uint64_t win  = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)c*BONSAI_CHAN_STRIDE;
+            if (!chan_on_cpu_memory(c)) continue;
+            uint64_t win  = chan_window(c);
             uint64_t tail = win + H->payload_beats*32
                           + (uint64_t)n_layer*n_kv_head*2*kv_region*32;
-            if (win < 0x40000000ull + MAIN_RAM_SIZE && tail > 0x40000000ull) {
-                if (tail > 0x40000000ull + MAIN_RAM_SIZE) {
+            if (win < ram_hi && tail > ram_lo) {
+                if (tail > ram_hi) {
                     printf("infer: channel %lu's weights+KV reach %08lx, past the end of "
-                           "main_ram\n", (unsigned long)c, (unsigned long)tail);
+                           "main_ram\n", (unsigned long)c, (unsigned long)cpu_addr_of(tail));
                     return -4;
                 }
                 if (tail > top) top = tail;
             }
         }
-        heap_hi_base = (uint32_t)((top + 0xFFFFF) & ~0xFFFFFull);
+        heap_hi_base = top ? (uint32_t)((cpu_addr_of(top) + 0xFFFFFu) & ~0xFFFFFu) : 0;
         if (heap_hi_base < 0x40000000u + 0x09000000u)
             heap_hi_base = 0x40000000u + 0x09000000u;   // never below the old fixed base
         heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)heap_hi_base : 0;
@@ -4134,26 +4164,32 @@ int infer_init(void)
         return -1;
     }
 
-    // The low heap now lives BELOW engine channel 3's weight window (see layout.py:
-    // HBM_WEIGHT_BASE is port-matched, so channel 3 lands inside main_ram at +64 MB).
-    // Overrunning it would scribble on that channel's weights and show up as wrong tokens
-    // with everything else looking healthy - which is exactly the failure mode that cost a
-    // day. Check it, loudly, once per init; the numbers are cheap to print and worth having
-    // in every boot log.
+    // The low heap lives BELOW the lowest engine window inside main_ram (on the FK33
+    // channel 3's, at +64 MB: HBM_WEIGHT_BASE is port-matched, see layout.py). Overrunning
+    // it would scribble on that channel's weights and show up as wrong tokens with
+    // everything else looking healthy - which is exactly the failure mode that cost a day.
+    // Check it, loudly, once per init; the numbers are cheap to print and worth having in
+    // every boot log. A board whose windows sit above main_ram has no such limit.
     {
         uint32_t lo_used = (uint32_t)(heap - (uint8_t *)HEAP_BASE);
-        uint32_t lo_room = (uint32_t)(BONSAI_CHAN_WEIGHT_BASE + 3*BONSAI_CHAN_STRIDE
-                                      - (uint32_t)HEAP_BASE);
+        uint64_t lo_win  = 0;   // Engine-side start of the lowest window inside main_ram.
+        for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
+            uint64_t win = chan_window(c);
+            if (chan_on_cpu_memory(c) && win >= BONSAI_MEM_CPU_OFFSET
+                && win < BONSAI_MEM_CPU_OFFSET + MAIN_RAM_SIZE && (!lo_win || win < lo_win))
+                lo_win = win;
+        }
+        uint32_t lo_room = lo_win ? cpu_addr_of(lo_win) - (uint32_t)HEAP_BASE : 0xFFFFFFFFu;
         printf("infer: low heap %lu KB", (unsigned long)(lo_used >> 10));
         if (heap_hi)
             printf(", high heap %lu KB @%08lx (CPU KV fallback %d positions)",
                    (unsigned long)((uint32_t)(heap_hi - (uint8_t *)heap_hi_base) >> 10),
                    (unsigned long)heap_hi_base, cpu_kv_ctx);
         printf("\n");
-        if ((uint32_t)MAIN_RAM_BASE + MAIN_RAM_SIZE > BONSAI_CHAN_WEIGHT_BASE + 3*BONSAI_CHAN_STRIDE
-            && lo_used > lo_room) {
-            printf("infer: LOW HEAP OVERRUNS engine channel 3's weights "
+        if (lo_win && lo_used > lo_room) {
+            printf("infer: LOW HEAP OVERRUNS the engine window at %08lx "
                    "(%lu KB used, %lu KB available) - tokens will be wrong\n",
+                   (unsigned long)cpu_addr_of(lo_win),
                    (unsigned long)(lo_used >> 10), (unsigned long)(lo_room >> 10));
             return -1;
         }
