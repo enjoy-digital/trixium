@@ -256,10 +256,17 @@ GGML_Q1_0   = 41  # PrismML fork type id (1-bit builds).
 GGML_PQ2_0  = 142 # PrismML fork: the g128 2-bit block, its current name.
 GGML_PTQ1_0 = 143 # PrismML fork: g128 dense trits (5 per byte).
 
+def bf16_dequant(raw):
+    """GGML type 30: bfloat16 = the top 16 bits of an fp32."""
+    return (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+GGML_BF16 = 30
+
 DEQUANT = {
     0:           f32_dequant,
     1:           f16_dequant,
     8:           q8_0_dequant,
+    GGML_BF16:   bf16_dequant,
     GGML_Q1_0:   q1_0_dequant,
     GGML_Q2_0:   q2_0_dequant,   # g128 only - load_gguf_f32 checks q2_0_group() first
     GGML_PQ2_0:  q2_0_dequant,

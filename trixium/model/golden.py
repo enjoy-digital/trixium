@@ -115,8 +115,42 @@ def check_engine_support(cfg):
             f"runtime has to rotate every projection's input activation and un-rotate the "
             f"embedding rows, which the engine does not do yet (docs/xcu1525.md, the 27B).")
 
-def load_gguf_f32(path):
-    """Load a GGUF file -> (config, dict name -> fp32 ndarray with GGUF logical shape)."""
+class LazyTernary:
+    """A ternary matrix kept as its int8 codes and fp16 scales (1 byte per weight instead of
+    4): the 27B's 27 GB fits where 108 GB of fp32 do not. `@` and `.T` are what FloatModel
+    uses; the product is exact fp32 math per group (codes - 1) * scale, row by row in
+    chunks."""
+    def __init__(self, scales, codes, shape):
+        self.shape  = tuple(shape)
+        self.scales = scales.astype(np.float32).reshape(shape[0], -1)     # (rows, G)
+        self.codes  = codes.reshape(shape[0], shape[1])                     # uint8 {0,1,2}
+        self.T      = _LazyT(self)
+
+    def __getitem__(self, idx):        # embedding lookup: rows -> fp32
+        rows = np.atleast_1d(np.asarray(idx))
+        c = self.codes[rows].astype(np.float32).reshape(len(rows), -1, 128) - 1.0
+        out = (c*self.scales[rows][:, :, None]).reshape(len(rows), self.shape[1])
+        return out if np.ndim(idx) else out[0]
+
+class _LazyT:
+    def __init__(self, m):
+        self.m = m
+    def __rmatmul__(self, x):          # x @ W.T  ->  (.., rows)
+        m = self.m
+        x = np.asarray(x, dtype=np.float32)
+        xs = x.reshape(-1, m.shape[1])                                     # (P, cols)
+        out = np.empty((xs.shape[0], m.shape[0]), dtype=np.float32)
+        step = max(1, (64 << 20)//(m.shape[1]*4))                          # 64 MB of fp32 rows
+        for r0 in range(0, m.shape[0], step):
+            r1 = min(m.shape[0], r0 + step)
+            w = (m.codes[r0:r1].astype(np.float32).reshape(r1 - r0, -1, 128) - 1.0) \
+                * m.scales[r0:r1][:, :, None]
+            out[:, r0:r1] = xs @ w.reshape(r1 - r0, m.shape[1]).T
+        return out.reshape(*x.shape[:-1], m.shape[0])
+
+def load_gguf_f32(path, lazy=False):
+    """Load a GGUF file -> (config, dict name -> fp32 ndarray with GGUF logical shape).
+    lazy=True keeps the ternary matrices as LazyTernary (codes + scales, 1 byte/weight)."""
     reader  = GGUFReader(path)
     cfg     = config_from_gguf(reader)
     tensors = {}
@@ -132,6 +166,9 @@ def load_gguf_f32(path):
             # and the whole 33 GB model was OOM-killed at 57 GB (2026-09-18).
             unpack = qformats.ptq1_0_unpack if t.type_id == qformats.GGML_PTQ1_0 else qformats.q2_0_unpack
             scales, codes = unpack(raw)
+            if lazy:
+                tensors[name] = LazyTernary(scales, codes, t.shape)
+                continue
             w = codes.astype(np.float32).reshape(-1, 128)
             del codes
             w -= 1.0
@@ -238,6 +275,7 @@ class FloatModel:
         self.cfg = cfg
         self.t   = tensors
         self.head_out = tensors.get("output.weight", tensors["token_embd.weight"])
+        # A lazy (codes + scales) embedding table: rows are dequantized on lookup.
         self.reset()
 
     def reset(self):
@@ -286,7 +324,7 @@ class FloatModel:
         return self._rot(x, perm_gdn) @ self.t[name].T
 
     def _embed(self, tokens):
-        e = self.t["token_embd.weight"][np.asarray(tokens)]
+        e = np.asarray(self.t["token_embd.weight"][np.asarray(tokens)], dtype=np.float32)
         if self.cfg.hadamard_block:
             e = hadamard_restore(e, self.cfg.hadamard_signs[e.shape[-1]], self.cfg.hadamard_block)
         return e
@@ -410,10 +448,11 @@ def main():
     parser.add_argument("--prompt",    default="The capital of France is")
     parser.add_argument("--raw",       action="store_true", help="No chat template.")
     parser.add_argument("-n",          default=8, type=int)
+    parser.add_argument("--lazy",      action="store_true", help="Keep ternary matrices as codes (the 27B).")
     args = parser.parse_args()
 
     print(f"loading {args.gguf}...")
-    cfg, tensors = load_gguf_f32(args.gguf)
+    cfg, tensors = load_gguf_f32(args.gguf, lazy=args.lazy)
     print(f"config: {cfg}")
     model = FloatModel(cfg, tensors)
 

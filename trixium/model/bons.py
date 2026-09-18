@@ -198,8 +198,9 @@ def restored_bfp_rows(scales, codes, signs, hblock):
     e = hadamard_restore(z.reshape(rows, cols), signs, hblock).astype(np.float64)
     amax = np.abs(e).max(axis=1)
     exps = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30))).astype(np.int64) - 14, 0)
-    mant = np.round(e*2.0**(-exps[:, None]))
-    assert np.abs(mant).max() < 32768
+    # A row's absmax lands in [2^14, 2^15) before rounding; rounding can push it to 2^15
+    # exactly (one LSB of 2^15 = 3e-5 relative), which the int16 cannot hold: clip.
+    mant = np.clip(np.round(e*2.0**(-exps[:, None])), -32767, 32767)
     return mant.astype(np.int16), exps.astype(np.int32)
 
 
