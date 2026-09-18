@@ -59,4 +59,13 @@ int  infer_attn_pipe_state(void);
 void infer_spec(int on);                    // Speculative decode on/off (lossless, greedy).
 void infer_spec_stats(int *acc, int *rej);  // Accepted / rejected draft counts.
 
+// The hybrid CPU path's primitives (hybrid.c): the engine matvec on a float vector (row
+// order out), main_ram allocation (big = the high heap when there is one), the room left,
+// an F32 tensor fetch, the embedding row as floats.
+struct bons_entry;
+void     infer_matvec_f(const struct bons_entry *e, const float *src, float *dst);
+void    *infer_halloc(uint64_t n, int big);
+uint64_t infer_heap_room(int big);
+void     infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n);
+int      infer_embed_f(int token, float *dst);
 #endif
