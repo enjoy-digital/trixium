@@ -107,7 +107,7 @@ def test_tiny_image_roundtrip(tmp_path):
     assert np.array_equal(reader.tensor_channel_bytes("blk.0.attn_norm.weight", 0),
                           reader.tensor_channel_bytes("blk.0.attn_norm.weight", 1))
 def test_soc_definitions_wire_the_sequencer_alike():
-    """trixium.py and sim/bonsai_sim.py must wire the vecunit/sequencer identically.
+    """The board targets and sim/bonsai_sim.py must wire the vecunit/sequencer identically.
 
     There are two SoC definitions - hardware and Verilator sim - and every integration
     signal has to be spelled out in both. When they drift, the sim silently stops testing
@@ -128,8 +128,9 @@ def test_soc_definitions_wire_the_sequencer_alike():
 
     root = Path(__file__).resolve().parent.parent
     srcs = {
-        "trixium.py":    (root/"trixium.py").read_text(),
-        "sim/bonsai_sim.py":  (root/"sim/bonsai_sim.py").read_text(),
+        "trixium.py":         (root/"trixium.py").read_text(),
+        "trixium_xcu1525.py": (root/"trixium_xcu1525.py").read_text(),
+        "sim/bonsai_sim.py":       (root/"sim/bonsai_sim.py").read_text(),
     }
     # (signal, expected right-hand side) for the vecunit<->sequencer seam.
     seam = [
@@ -145,3 +146,31 @@ def test_soc_definitions_wire_the_sequencer_alike():
                 f"{fname}: vecunit.{sig} is wired from seq.{m.group(1)}, expected "
                 f"seq.{want}. The two SoC definitions have drifted - see this test's "
                 f"docstring for what that costs.")
+
+
+def test_board_targets_share_the_cluster_block():
+    """trixium.py (FK33) and trixium_xcu1525.py instantiate the engine cluster
+    from one byte-identical block, marked `# Bonsai cluster: begin` / `end`.
+
+    A shared function would be the obvious way to keep two board targets from drifting,
+    and it is exactly what cannot be done here: Migen names every signal by the frame it
+    was created in, so moving the block into a function renamed every cluster signal in the
+    FK33 netlist (`add_bonsai_cluster_engine_csr_bias_storage`, 11k lines of diff for a
+    pure move, 2026-09-18). The operating board's netlist stays as it is; the two copies
+    are checked instead. The per-board knobs live in the cluster_* variables set just
+    before the block, so the block itself never mentions a board.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    blocks = {}
+    for fname in ("trixium.py", "trixium_xcu1525.py"):
+        text  = (root/fname).read_text()
+        begin = text.index("        # Bonsai cluster: begin")
+        end   = text.index("        # Bonsai cluster: end")
+        blocks[fname] = text[begin:end]
+        for knob in ("with_bonsai", "cluster_chan_mod", "cluster_mem_cpu_offset",
+                     "cluster_n_memctrl"):
+            assert f"{knob} " in text[:begin], f"{fname}: {knob} must be set before the block"
+    a, b = blocks.values()
+    assert a == b, "the two board targets' cluster blocks differ"

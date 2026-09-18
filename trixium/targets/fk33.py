@@ -136,7 +136,16 @@ class BonsaiSoC(SoCCore):
         engine_axis   = [hbm.axi[1 + i] for i in range(engine_channels)]
         bist_channels = list(range(1 + engine_channels, 32))
 
-        if variant in ["b", "c"]:
+        with_bonsai            = variant in ["b", "c"]
+        cluster_chan_mod       = 0     # One flat HBM address space.
+        cluster_mem_cpu_offset = None  # The CPU window passes through 1:1 (the default).
+        cluster_n_memctrl      = None  # The BIOS owns the one memory system.
+        # Bonsai cluster: begin. This block is byte-identical in every board target
+        # (test_layout_contract.py diffs the marked regions): the per-board knobs are
+        # the cluster_* variables set just above it. Migen names every signal by the
+        # frame it was created in, so a shared function would rename the FK33 netlist
+        # wholesale (2026-09-18) - hence inline, and checked.
+        if with_bonsai:
             from trixium.gateware.scratchpad import BonsaiScratchpad
             from trixium.gateware.matvec import BonsaiMatVecEngine
             from trixium.gateware.csr_front import BonsaiEngineCSR
@@ -146,7 +155,7 @@ class BonsaiSoC(SoCCore):
             self.scratchpad = BonsaiScratchpad(size=256*1024)
             # The engine cluster lives in the soft-resettable `eng` domain (engreset.py):
             # a wedged op is a CSR write away from recovery instead of a reconfigure. Its
-            # HBM ports go through the AXI shims, which keep the protocol whole meanwhile.
+            # memory ports go through the AXI shims, which keep the protocol whole meanwhile.
             from trixium.gateware.engreset import BonsaiEngineResetDomain
             self.engrst = BonsaiEngineResetDomain(engine_axis)
             engine_axis = self.engrst.masters
@@ -199,7 +208,8 @@ class BonsaiSoC(SoCCore):
             self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
             self.engine     = ClockDomainsRenamer("eng")(
                 BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
-                                   seq=seq, dual=with_dual, chan_stride=HBM_CHAN_STRIDE))
+                                   seq=seq, dual=with_dual, chan_stride=HBM_CHAN_STRIDE,
+                                   chan_mod=cluster_chan_mod))
             if with_dual:
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
                 self.add_constant("BONSAI_HAS_DUALQ")
@@ -214,7 +224,8 @@ class BonsaiSoC(SoCCore):
             # N=16 puts channel 15 above 4 GB); the host tools read
             # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
             self.loader     = ClockDomainsRenamer("eng")(
-                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=_LOADER_STRIDE))
+                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=_LOADER_STRIDE,
+                                chan_mod=cluster_chan_mod))
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
@@ -247,15 +258,26 @@ class BonsaiSoC(SoCCore):
                 self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"}),
             ]
 
-            # Firmware contract: BONS header+table live in HBM channel 0 (the CPU window) at
-            # HBM_WEIGHT_BASE; engine-channel payloads one HBM_CHAN_STRIDE apart (the AXI
-            # switch makes the address, not the port, select the pseudo-channel).
-            # Variant c == b gateware: the token loop is firmware + these constants.
+            # Firmware contract: the BONS header+table are staged 1 MB below engine channel
+            # 0's window and copied to main_ram + HDR_CPU_OFFSET; engine-channel payloads one
+            # HBM_CHAN_STRIDE apart from HBM_WEIGHT_BASE, each in its own channel's window
+            # (the offset is added in hardware; layout.py has the geometry of each board).
             from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
             self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
             self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
             self.add_constant("BONSAI_CHAN_STRIDE",      HBM_CHAN_STRIDE)
             self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
+            # Several memory controllers (the XCU1525): the firmware's overlap check and
+            # its controller init read these; absent, the FK33's flat HBM geometry.
+            if cluster_chan_mod:
+                self.add_constant("BONSAI_CHAN_MOD", cluster_chan_mod)
+            if cluster_mem_cpu_offset is not None:
+                self.add_constant("BONSAI_MEM_CPU_OFFSET", cluster_mem_cpu_offset)
+            if cluster_n_memctrl is not None:
+                self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
+
+        # Bonsai cluster: end.
+
 
         # Per-channel HBM bandwidth BIST (channels not owned by the engine). Skipped on
         # phase-2 inference builds (--with-vecunit): its 20+ channels of unsliced macro-
