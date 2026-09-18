@@ -31,7 +31,8 @@ the protocol:
 
 Between drains the shim is transparent on R, W and B (no added registers on the streaming
 paths); AR/AW gain one register, which the readers already amortize with 8 outstanding
-bursts.
+bursts. W beats of a burst are held until its AW has fired at the port (the shim's WLAST
+comes from the accepted AWs' lengths), which the writers' own issue order already respects.
 """
 
 from migen import *
@@ -152,25 +153,35 @@ class AXIResetShim(LiteXModule):
         # while draining, beats still owed go out with wstrb = 0. WLAST comes from the
         # shim's own count against the accepted AWs' lengths (a queue in issue order), so
         # padded bursts end where the port expects them to - one B per AW.
+        #
+        # That count is only right if a burst's AW has fired at the port before any of its
+        # W beats does, so W is held (w_ok) until the queue holds its length. The HBM IP
+        # happened to guarantee the order by not taking W ahead of AW; LiteDRAM's AXI
+        # bridge takes W into a FIFO while it still holds the previous AW, and without the
+        # gate the second burst of every store went out with WLAST on every beat - one B
+        # per beat, the writer's outstanding count underflowed, and the engine sat in
+        # ST_DRAIN forever (the XCU1525 sim, 2026-09-18; test_ddr_port_path.py).
         w_v    = Signal()
         w_data = Signal(port.data_width)
         w_strb = Signal(port.data_width//8)
         w_fire = Signal()
+        w_ok   = Signal()
         pad    = Signal()
         w_cnt  = Signal(8)
         w_lastc = Signal()
         self.comb += [
             wq.sink.valid.eq(aw_fire),
             wq.sink.len.eq(aw_len),
+            w_ok.eq(wq.source.valid),                   # This burst's AW has fired.
             w_lastc.eq(w_cnt == wq.source.len),        # len = beats - 1
-            pad.eq(drain_w & ~w_v & (w_due != 0) & wq.source.valid),
-            port.w.valid.eq(w_v | pad),
+            pad.eq(drain_w & ~w_v & (w_due != 0) & w_ok),
+            port.w.valid.eq((w_v | pad) & w_ok),
             port.w.data.eq(Mux(w_v, w_data, 0)),
             port.w.strb.eq(Mux(w_v, w_strb, 0)),
             port.w.last.eq(w_lastc),
             w_fire.eq(port.w.valid & port.w.ready),
             wq.source.ready.eq(w_fire & w_lastc),
-            master.w.ready.eq((~w_v | port.w.ready) & ~drain_w & ~self.hold),
+            master.w.ready.eq((~w_v | (port.w.ready & w_ok)) & ~drain_w & ~self.hold),
         ]
         self.sync += [
             If(master.w.valid & master.w.ready,
