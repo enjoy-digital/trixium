@@ -80,6 +80,22 @@ FLAG_REPLICATED = 0x01 # Tensor payload identical in every channel (not row-shar
  ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
  ROLE_ROPE_TAB,
  ROLE_TOK_EMB16, ROLE_TOK_EMB16_EXP) = range(17)
+# The 27B's hybrid layers (BONS v3, 2026-09-18). Gated DeltaNet: the fused [q|k|v]
+# projection, the z gate projection, the out projection (its input in grouped head order),
+# the beta and alpha head projections (Q8), the conv taps (F32, kernel rows), A = -exp(A_log)
+# and the dt bias (F32, one row of value heads), the per-head norm (F32, one row of head dim).
+# The attention layers' q projection carries [q | gate] per head when the header says
+# attn_gated. Hadamard: the block matrices R diag(s) per input width as ternary tensors
+# (rows = width, cols = block), layer = the width's index in the header's list.
+(ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
+ ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM,
+ ROLE_HADAMARD) = range(17, 27)
+
+def hadamard_layer(width_index, block_index):
+    """The entry `layer` of a ROLE_HADAMARD block tensor (u16: width index in the header's
+    list, then the block)."""
+    assert 0 <= width_index < 4 and 0 <= block_index < 256
+    return width_index*256 + block_index
 # ROLE_TOK_EMB16: the token embedding rows pre-dequantized to the firmware's int16 BFP form
 # (bit-exact with embed_row_bfp / the sim's embed_bfp_int), one NORM16 row per token, so a
 # forward starts with a 128-beat engine fetch instead of ~47k cycles of CPU decode and
@@ -94,6 +110,10 @@ ROLE_NAMES = {
     ROLE_FFN_UP      : "ffn_up",      ROLE_FFN_DOWN  : "ffn_down",
     ROLE_ROPE_TAB    : "rope_tab",
     ROLE_TOK_EMB16   : "tok_emb16",   ROLE_TOK_EMB16_EXP: "tok_emb16_exp",
+    ROLE_ATTN_QKV    : "attn_qkv",    ROLE_ATTN_ZGATE: "attn_zgate", ROLE_SSM_OUT : "ssm_out",
+    ROLE_SSM_BETA    : "ssm_beta",    ROLE_SSM_ALPHA : "ssm_alpha",  ROLE_SSM_CONV: "ssm_conv",
+    ROLE_SSM_A       : "ssm_a",       ROLE_SSM_DT    : "ssm_dt",     ROLE_SSM_NORM: "ssm_norm",
+    ROLE_HADAMARD    : "hadamard",
 }
 
 # Row packet math ----------------------------------------------------------------------------------
@@ -151,7 +171,10 @@ def tensor_chan_beats(rows, cols, kind, n_channels, flags=0):
 # can walk the model without host-side sideband.
 
 BONS_MAGIC       = 0x534E4F42 # "BONS" little-endian.
-BONS_VERSION     = 2  # 2: NORM16 .w16 entries carry their exponent in bias (2026-09-11).
+BONS_VERSION     = 3  # 2: NORM16 .w16 entries carry their exponent in bias (2026-09-11).
+                      # 3: the hybrid fields at 112 (2026-09-18); a v2 image reads as v3
+                      #    with every one of them zero (a plain Qwen3 model).
+BONS_VERSIONS_OK = (2, 3)
 BONS_HEADER_SIZE = 4096
 BONS_ENTRY_SIZE  = 64
 BONS_NAME_BYTES  = 24  # Entry name field; longer names are stored truncated.
@@ -162,8 +185,17 @@ BONS_NAME_BYTES  = 24  # Entry name field; longer names are stored truncated.
 # 32: u32 vocab         36: u32 rope_theta   40: f32 rms_eps      44: u32 max_ctx
 # 48: u32 n_channels    52: u32 n_tensors    56: u32 table_offset 60: u32 payload_offset
 # 64: u64 payload_beats (per channel)        72: u32 mode (0=host-owned, 1=fw-owned)
-# 76: u32 table_crc32   80: 32B tokenizer sha256                 112: pad to 4096.
+# 76: u32 table_crc32   80: 32B tokenizer sha256
+# v3 (all zero on a Qwen3 model):
+# 112: 2 x u64 layer_types  (bit l set = layer l is Gated DeltaNet; 128 layers)
+# 128: u16 dn_v_heads 130: u16 dn_k_heads 132: u16 dn_k_dim 134: u16 dn_v_dim 136: u16 dn_conv
+# 138: u16 rope_dims (0 = whole head)     140: u16 hadamard_block (0 = plain basis)
+# 142: u8 attn_gated  143: u8 hyb_flags (bit 0: the emb16 rows are un-rotated)
+# 144: 4 x u32 hadamard_widths (the ROLE_HADAMARD tensors, by layer index)   160: pad to 4096.
 _HEADER_FMT = "<IIIIIIIIIIfIIIIIQII32s"
+_HEADER_V3_FMT = "<QQHHHHHHHBBIIII"
+_HEADER_V3_OFF = 112
+HYB_EMB16_RESTORED = 0x01
 
 MODE_HOST_OWNED = 0
 MODE_FW_OWNED   = 1
@@ -177,6 +209,19 @@ def pack_header(cfg, n_channels, n_tensors, payload_beats, table_crc32, tokenize
         int(cfg.rope_theta), cfg.rms_eps, cfg.max_ctx,
         n_channels, n_tensors, table_offset, payload_offset, payload_beats,
         MODE_HOST_OWNED, table_crc32, tokenizer_sha256[:32].ljust(32, b"\x00"))
+    hdr = hdr.ljust(_HEADER_V3_OFF, b"\x00")
+    lt = 0
+    for l in range(cfg.n_layer):
+        if cfg.layer_type(l) == "deltanet":
+            lt |= 1 << l
+    widths = sorted(cfg.hadamard_signs) if getattr(cfg, "hadamard_signs", None) else []
+    assert len(widths) <= 4
+    hdr += struct.pack(_HEADER_V3_FMT,
+        lt & ((1 << 64) - 1), lt >> 64,
+        cfg.dn_num_v_heads, cfg.dn_num_k_heads, cfg.dn_k_head_dim, cfg.dn_v_head_dim,
+        cfg.dn_conv_kernel, cfg.rope_dims, cfg.hadamard_block,
+        1 if cfg.attn_gated else 0, HYB_EMB16_RESTORED if cfg.hadamard_block else 0,
+        *(widths + [0]*(4 - len(widths))))
     return hdr.ljust(BONS_HEADER_SIZE, b"\x00")
 
 def unpack_header(data):
@@ -187,7 +232,15 @@ def unpack_header(data):
             "tokenizer_sha256")
     hdr = dict(zip(keys, fields))
     assert hdr["magic"] == BONS_MAGIC, "not a BONS image"
-    assert hdr["version"] == BONS_VERSION
+    assert hdr["version"] in BONS_VERSIONS_OK, hdr["version"]
+    v3 = struct.unpack_from(_HEADER_V3_FMT, data, _HEADER_V3_OFF) if hdr["version"] >= 3 \
+         else (0,)*15
+    lt = v3[0] | (v3[1] << 64)
+    hdr["layer_types"]     = tuple("deltanet" if (lt >> l) & 1 else "attn" for l in range(hdr["n_layer"]))
+    hdr["dn_num_v_heads"], hdr["dn_num_k_heads"], hdr["dn_k_head_dim"], hdr["dn_v_head_dim"], \
+        hdr["dn_conv_kernel"], hdr["rope_dims"], hdr["hadamard_block"] = v3[2:9]
+    hdr["attn_gated"], hdr["hyb_flags"] = v3[9], v3[10]
+    hdr["hadamard_widths"] = tuple(w for w in v3[11:15] if w)
     return hdr
 
 # Tensor table entry (64 B):

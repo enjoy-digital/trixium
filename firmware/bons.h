@@ -11,8 +11,10 @@
 #include <stdint.h>
 
 #define BONS_MAGIC   0x534E4F42 // "BONS"
-#define BONS_VERSION 2          // layout.BONS_VERSION; infer_init refuses any other.
+#define BONS_VERSION 3          // layout.BONS_VERSION; infer_init accepts 2 and 3.
                                 // 2: NORM16 .w16 entries carry their exponent in bias.
+                                // 3: the hybrid fields (a v2 image reads as all-zero ones).
+#define BONS_VERSION_MIN 2
 
 // Tensor kinds.
 #define KIND_TERNARY 0
@@ -31,7 +33,13 @@ enum {
     ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
     ROLE_ROPE_TAB,
     ROLE_TOK_EMB16, ROLE_TOK_EMB16_EXP, // Pre-dequantized int16 embedding rows + exponents.
+    // The 27B's hybrid layers (BONS v3): see layout.py.
+    ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
+    ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM,
+    ROLE_HADAMARD,
 };
+
+#define HYB_EMB16_RESTORED 0x01   // hyb_flags: the emb16 rows are in the plain basis.
 
 struct __attribute__((packed)) bons_header {
     uint32_t magic;
@@ -54,7 +62,29 @@ struct __attribute__((packed)) bons_header {
     uint32_t mode;
     uint32_t table_crc32;
     uint8_t  tokenizer_sha256[32];
+    // v3 (offset 112): zero on a v2 image and on a plain Qwen3 model.
+    uint64_t layer_types[2];      // bit l set = layer l is Gated DeltaNet.
+    uint16_t dn_num_v_heads;
+    uint16_t dn_num_k_heads;
+    uint16_t dn_k_head_dim;
+    uint16_t dn_v_head_dim;
+    uint16_t dn_conv_kernel;
+    uint16_t rope_dims;           // 0 = the whole head is rotated.
+    uint16_t hadamard_block;      // 0 = plain basis.
+    uint8_t  attn_gated;
+    uint8_t  hyb_flags;
+    uint32_t hadamard_widths[4];  // ROLE_HADAMARD tensors by layer index.
 };
+
+_Static_assert(__builtin_offsetof(struct bons_header, layer_types) == 112, "BONS v3 fields at 112");
+_Static_assert(__builtin_offsetof(struct bons_header, hadamard_widths) == 144, "BONS v3 widths at 144");
+
+// ROLE_HADAMARD block tensors: entry layer = width index (header list) * 256 + block.
+#define HADAMARD_LAYER(wi, b) ((int)((wi)*256 + (b)))
+
+static inline int bons_layer_is_deltanet(const struct bons_header *h, unsigned l) {
+    return (int)((h->layer_types[l >> 6] >> (l & 63)) & 1);
+}
 
 struct __attribute__((packed)) bons_entry {
     uint8_t  role;

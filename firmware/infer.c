@@ -3970,7 +3970,7 @@ int infer_init(void)
     H = model_header();
     if (H->magic != BONS_MAGIC)
         return -1;
-    if (H->version != BONS_VERSION) { // Only the magic was checked before 2026-09-11: a
+    if (H->version < BONS_VERSION_MIN || H->version > BONS_VERSION) { // Only the magic was checked before 2026-09-11: a
         printf("infer: BONS version %lu, this firmware reads version %u\n", // future layout
                (unsigned long)H->version, BONS_VERSION);                    // would be misread.
         return -2;
