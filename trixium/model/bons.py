@@ -406,7 +406,11 @@ class BONSReader:
         return self.data[start:start + h["payload_beats"]*BEAT_BYTES]
 
     def tensor_channel_bytes(self, name, channel):
-        e  = self._lookup(name)
+        return self.entry_channel_bytes(self._lookup(name), channel)
+
+    def entry_channel_bytes(self, e, channel):
+        """By entry, not by name: the 24-byte entry names collide (`post_attention_norm.
+        weight` and its `.w16` companion truncate to the same string, 2026-09-18)."""
         ch = self.channel_payload(channel)
         return ch[e["chan_base_beats"]*BEAT_BYTES:
                   (e["chan_base_beats"] + e["chan_len_beats"])*BEAT_BYTES]

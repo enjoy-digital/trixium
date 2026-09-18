@@ -285,7 +285,7 @@ def verify(image_path):
     for e in img.entries:
         crc = 0
         for c in range(h["n_channels"]):
-            data = img.tensor_channel_bytes(e["name"], c)
+            data = img.entry_channel_bytes(e, c)
             crc  = zlib.crc32(bytes(data), crc) & 0xFFFFFFFF
         ok = crc == e["crc32"]
         bad += not ok
