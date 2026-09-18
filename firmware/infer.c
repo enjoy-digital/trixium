@@ -71,8 +71,11 @@ int *__errno(void) { return &__errno_storage; }
 #define SP_K    0x3A000 // Resident k int16 (kv_dim <= 1024: 2 KB).
 #define SP_V    0x3B000 // Resident v int16.
 #define SP_TAB  0x3B800 // Rope table row for the current position ([c14 | s14]).
-#define SP_FFSP 0x1D000 // FFN seq spill beats (gate absmax, up absmax): the 0x1D000..0x1E000
-                        // gap between SP_H (ends 0x1C000 + 2*n_embd <= 0x1D000) and SP_XR.
+#define SP_FFSP (SP_TAB + 0x400) // FFN/QKV seq spill beats (5 x 32 B): the tail of the rope
+                        // table slot (the row is 2*head_dim bytes, 256 on these models). It
+                        // used to sit at 0x1D000, "the gap between SP_H (ends 0x1C000 +
+                        // 2*n_embd) and SP_XR" - a gap only while n_embd <= 2048; the 8B's
+                        // SP_H (4096 int16 = 8 KB) runs right up to SP_XR (2026-09-18).
 #define SP_FET2 0x3C000 // Second norm16 staging slot (k_norm while q_norm sits in SP_FET).
 // Resident qk-norm weight rows (qres, 2026-09-03): head_dim int16 = 256 B per layer per
 // kind, 28 layers = 7 KB each, in the tails of the SP_FET and SP_D regions (their live
@@ -91,8 +94,11 @@ int *__errno(void) { return &__errno_storage; }
 // consumer is the CPU-side KV cache, which is a debug fallback (HW attention keeps its own
 // KV in HBM at full context) and is capped at CPU_KV_CTX positions to fit.
 #define HEAP_BASE    (BONSAI_HDR_ADDR + 0x100000)
-#define HEAP_HI_BASE (0x40000000u + 0x09000000u) // Main_ram + 144 MB: above ch3's tail.
 #define CPU_KV_CTX   512
+// The high heap starts above the highest weights+KV tail any engine channel puts inside
+// main_ram (channel 3, PC 4): computed per image at infer_init, 1 MB aligned. It was a
+// fixed main_ram + 144 MB, which the 8B's 136 MB/channel of weights overran (2026-09-18).
+static uint32_t heap_hi_base;
 
 static uint8_t *heap;
 static void *halloc(uint32_t n)
@@ -3961,7 +3967,6 @@ int infer_init(void)
         kv_br_r = r;
         for (int i = 0; i < 64; i++) eps_memo[i] = 0; // New image: new rms_eps.
     }
-    heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)HEAP_HI_BASE : 0;
     int kv_dim = n_kv_head*head_dim;
     int q_dim  = n_head*head_dim;
 
@@ -4015,23 +4020,44 @@ int infer_init(void)
     cpu_kv_ctx = (max_ctx < CPU_KV_CTX) ? max_ctx : CPU_KV_CTX;
 #else
     cpu_kv_ctx = max_ctx;
+    heap_hi_base = 0x40000000u + 0x09000000u;           // no engine windows to dodge
+    heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)heap_hi_base : 0;
 #endif
 #ifdef BONSAI_HAS_KVSTORE
     // KV region: above the per-channel weight payload, 4 KB aligned.
     kv_base   = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
     kv_rb     = 1 + head_dim/32; // One scale beat + code beats (cols = head_dim, Q8).
     kv_region = (uint32_t)((max_ctx + n_ch - 1)/n_ch)*kv_rb;
-    // Engine channel 3's window lies inside main_ram (see HEAP_HI_BASE): its payload + KV
-    // tail must stay under the high heap. 142 MB on the 1.7B with the int16 embedding
-    // table, against 144 MB - close enough to check every time the image changes.
-    for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
-        uint64_t win  = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)c*BONSAI_CHAN_STRIDE;
-        uint64_t tail = win + H->payload_beats*32
-                      + (uint64_t)n_layer*n_kv_head*2*kv_region*32;
-        if (win < 0x40000000ull + MAIN_RAM_SIZE && tail > 0x40000000ull && tail > HEAP_HI_BASE) {
-            printf("infer: channel %lu's weights+KV reach %08lx, past the high heap at %08x\n",
-                   (unsigned long)c, (unsigned long)tail, (unsigned)HEAP_HI_BASE);
-            return -4;
+    // Engine channel 3's window lies inside main_ram (PC 4): its payload + KV tail decides
+    // where the high heap can start (142 MB on the 1.7B with the int16 embedding table,
+    // 212 MB on the 8B), and the image is refused only when that tail leaves main_ram.
+    {
+        uint64_t top = 0;
+        for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
+            uint64_t win  = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)c*BONSAI_CHAN_STRIDE;
+            uint64_t tail = win + H->payload_beats*32
+                          + (uint64_t)n_layer*n_kv_head*2*kv_region*32;
+            if (win < 0x40000000ull + MAIN_RAM_SIZE && tail > 0x40000000ull) {
+                if (tail > 0x40000000ull + MAIN_RAM_SIZE) {
+                    printf("infer: channel %lu's weights+KV reach %08lx, past the end of "
+                           "main_ram\n", (unsigned long)c, (unsigned long)tail);
+                    return -4;
+                }
+                if (tail > top) top = tail;
+            }
+        }
+        heap_hi_base = (uint32_t)((top + 0xFFFFF) & ~0xFFFFFull);
+        if (heap_hi_base < 0x40000000u + 0x09000000u)
+            heap_hi_base = 0x40000000u + 0x09000000u;   // never below the old fixed base
+        heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)heap_hi_base : 0;
+        // The CPU-side KV cache (the debug fallback) must fit between the high heap's
+        // base and the end of main_ram: halve its depth until it does (37 MB at 512
+        // positions on the 8B, against the 44 MB left above its 212 MB tail).
+        if (heap_hi) {
+            uint64_t room = 0x40000000ull + MAIN_RAM_SIZE - heap_hi_base - (2u << 20);
+            while (cpu_kv_ctx > 64
+                   && (uint64_t)n_layer*cpu_kv_ctx*(2ull*kv_dim + 2ull*n_kv_head*4) > room)
+                cpu_kv_ctx /= 2;
         }
     }
     kv_ekmax  = halloc(n_layer*n_kv_head*2);
@@ -4081,9 +4107,9 @@ int infer_init(void)
                                       - (uint32_t)HEAP_BASE);
         printf("infer: low heap %lu KB", (unsigned long)(lo_used >> 10));
         if (heap_hi)
-            printf(", high heap %lu KB @%08lx",
-                   (unsigned long)((uint32_t)(heap_hi - (uint8_t *)HEAP_HI_BASE) >> 10),
-                   (unsigned long)HEAP_HI_BASE);
+            printf(", high heap %lu KB @%08lx (CPU KV fallback %d positions)",
+                   (unsigned long)((uint32_t)(heap_hi - (uint8_t *)heap_hi_base) >> 10),
+                   (unsigned long)heap_hi_base, cpu_kv_ctx);
         printf("\n");
         if ((uint32_t)MAIN_RAM_BASE + MAIN_RAM_SIZE > BONSAI_CHAN_WEIGHT_BASE + 3*BONSAI_CHAN_STRIDE
             && lo_used > lo_room) {
