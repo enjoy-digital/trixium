@@ -186,10 +186,30 @@ def _tensor_beats(spec, n_channels):
     return nrows*(scale_beats(spec.cols, spec.kind) + code_beats(spec.cols, spec.kind))
 
 
-def _emb16_specs(emb, n_channels, block=8192):
+def restored_bfp_rows(scales, codes, signs, hblock):
+    """A rotated embedding block (PrismML's basis) dequantized, restored to the plain basis
+    (e = s * (R z), golden.hadamard_restore) and quantized to the firmware's int16 BFP rows:
+    per row the exponent puts the absmax in [2^14, 2^15), mantissas rounded to nearest."""
+    from trixium.model.golden import hadamard_restore
+    rows, cols = codes.shape
+    G = cols//layout.GROUP_TERNARY
+    z = (codes.astype(np.float32).reshape(rows, G, layout.GROUP_TERNARY) - 1.0) \
+        * scales.astype(np.float32)[:, :, None]
+    e = hadamard_restore(z.reshape(rows, cols), signs, hblock).astype(np.float64)
+    amax = np.abs(e).max(axis=1)
+    exps = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30))).astype(np.int64) - 14, 0)
+    mant = np.round(e*2.0**(-exps[:, None]))
+    assert np.abs(mant).max() < 32768
+    return mant.astype(np.int16), exps.astype(np.int32)
+
+
+def _emb16_specs(emb, n_channels, block=8192, restore=None):
     """The token embedding pre-dequantized to int16 BFP rows (ROLE_TOK_EMB16) plus the per-row
     exponent (ROLE_TOK_EMB16_EXP), bit-exact with the firmware's embed_row_bfp. Computed in
-    row blocks when loaded (the int64 intermediates of the whole table were 2.5 GB)."""
+    row blocks when loaded (the int64 intermediates of the whole table were 2.5 GB).
+    restore = (signs, hadamard_block): the table is in PrismML's rotated basis and the rows
+    are restored to the plain one here (restored_bfp_rows) - the firmware cannot decode
+    the ternary rows itself for such a model (header flag HYB_EMB16_RESTORED)."""
     rows, cols = emb.rows, emb.cols
     erows = (rows + 15)//16
     state = {}
@@ -202,10 +222,13 @@ def _emb16_specs(emb, n_channels, block=8192):
         exps   = np.empty(rows, dtype=np.int32)
         for r0 in range(0, rows, block):
             r1 = min(rows, r0 + block)
-            sub = type("Sub", (), {})()
-            sub.values = codes[r0:r1]
-            sub.scales = emb.scales[r0:r1]
-            m, e = embed_bfp_rows(sub)
+            if restore is not None:
+                m, e = restored_bfp_rows(emb.scales[r0:r1], codes[r0:r1], *restore)
+            else:
+                sub = type("Sub", (), {})()
+                sub.values = codes[r0:r1]
+                sub.scales = emb.scales[r0:r1]
+                m, e = embed_bfp_rows(sub)
             mant[r0:r1] = m
             exps[r0:r1] = e
         state["mant"] = mant
@@ -251,7 +274,7 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
         tab = np.concatenate([cos, sin], axis=1)
         t14 = np.clip(np.round(tab*(1 << 14)), -32767, 32767).astype(np.int16)
         tensors.append(TensorSpec("rope_tab", layout.ROLE_ROPE_TAB, 0,
-                                  layout.KIND_NORM16, cfg.max_ctx, cfg.head_dim,
+                                  layout.KIND_NORM16, cfg.max_ctx, tab.shape[1],   # = rope_dims when partial
                                   values=t14, flags=FLAG_REPLICATED))
 
     # Every F32 tensor (norm weights) gets an int16 companion at its own exponent so the vector
@@ -269,7 +292,11 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
 
     emb = [t for t in tensors if t.role == layout.ROLE_TOK_EMB and t.kind == KIND_TERNARY]
     if emb16 and emb and not any(t.role == layout.ROLE_TOK_EMB16 for t in tensors):
-        tensors.extend(_emb16_specs(emb[0], n_channels))
+        restore = None
+        if getattr(cfg, "hadamard_block", 0):
+            # The rotated table is restored offline: the firmware never sees the rotation.
+            restore = (cfg.hadamard_signs[emb[0].cols], cfg.hadamard_block)
+        tensors.extend(_emb16_specs(emb[0], n_channels, restore=restore))
 
     # Metadata pass: offsets from shapes alone.
     bases, base = [], 0

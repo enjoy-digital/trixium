@@ -37,6 +37,13 @@ class ModelConfig:
     dn_v_head_dim  : int   = 0            # Value head dim (ssm.inner_size / v heads).
     dn_conv_kernel : int   = 0            # Short causal conv kernel (ssm.conv_kernel).
     rope_dims      : int   = 0            # Partial RoPE: rotated dims per head (0 = all).
+    attn_gated     : bool  = False        # attn_q also emits a per-head sigmoid output gate.
+    # PrismML's rotated weight basis (the 27B): every ternary matrix W is stored as
+    # W·H_s, a blockwise signed Walsh-Hadamard rotation of its input dimension (block
+    # hadamard_block, one fixed ±1 sign vector per input width), and the runtime applies
+    # H_s to the activation before the matvec; token_embd is stored with the inverse.
+    hadamard_block : int   = 0            # 0 = no rotation (the 1.7B/8B files).
+    hadamard_signs : dict  = None         # {input width: tuple of ±1}, from the GGUF.
 
     def layer_type(self, l):
         return self.layer_types[l] if self.layer_types else "attn"
@@ -110,4 +117,31 @@ BONSAI_8B = ModelConfig(
     yarn_orig_ctx = 16384,
 )
 
-CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B)}
+# bonsai-tiny-hybrid: the 27B's shape at sim size - Gated DeltaNet layers with an attention
+# layer every 3rd (layer 2), gated attention with partial RoPE, PrismML's rotated basis with
+# a 128-block. Random weights; the golden defines the semantics (the "folded" weights are
+# simply what the golden multiplies the rotated activations by).
+BONSAI_TINY_HYBRID = ModelConfig(
+    name           = "bonsai-tiny-hybrid",
+    n_layer        = 3,
+    n_embd         = 256,
+    n_head         = 4,
+    n_kv_head      = 2,
+    head_dim       = 64,
+    ffn_dim        = 512,
+    vocab          = 512,
+    max_ctx        = 64,
+    rope_theta     = 10000000.0,
+    layer_types    = ("deltanet", "deltanet", "attn"),
+    dn_num_v_heads = 4,
+    dn_num_k_heads = 2,
+    dn_k_head_dim  = 64,
+    dn_v_head_dim  = 64,
+    dn_conv_kernel = 4,
+    rope_dims      = 16,
+    attn_gated     = True,
+    hadamard_block = 128,
+    hadamard_signs = None,   # filled by tinygen (deterministic from the seed)
+)
+
+CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B, BONSAI_TINY_HYBRID)}
