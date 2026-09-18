@@ -31,7 +31,7 @@ from trixium.layout import (
 )
 from trixium.model import qformats
 from trixium.model.gguf_reader import GGUFReader, inspect as gguf_inspect
-from trixium.model.golden import config_from_gguf
+from trixium.model.golden import config_from_gguf, check_engine_support
 from trixium.model.bons import TensorSpec, write_image, BONSReader, decode_rows
 
 # GGUF name -> (role, replicated) ------------------------------------------------------------------
@@ -119,9 +119,10 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
     raise NotImplementedError(f"{name}: unsupported tensor type {t.type_name}")
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
-            max_layers=None, check=False, emb16=True):
+            max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
+    check_engine_support(cfg)
     if max_layers is not None:
         cfg.n_layer = min(cfg.n_layer, max_layers)
         cfg.name    = f"{cfg.name}-l{cfg.n_layer}"
@@ -145,9 +146,15 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     # head, K|V)). The 8B (136 MB/channel of ternary) fits; its int16 embedding table
     # (1.2 GB) does not, so that is dropped with a note rather than refused; a model whose
     # weights alone overflow is refused here instead of by the loader (2026-09-18).
+    # The window is a property of the board target (chan_stride / weight_base are what its
+    # SoC exports as BONSAI_CHAN_STRIDE / BONSAI_CHAN_WEIGHT_BASE); the FK33's constants are
+    # the default and the XCU1525 uses the same ones per controller, so the images are
+    # shared. A target with a bigger stride passes it (--chan-stride / --weight-base).
     from trixium.model.bons import _tensor_beats
     from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
-    window   = HBM_CHAN_STRIDE - (HBM_WEIGHT_BASE % HBM_CHAN_STRIDE)
+    if chan_stride is None: chan_stride = HBM_CHAN_STRIDE
+    if weight_base is None: weight_base = HBM_WEIGHT_BASE
+    window   = chan_stride - (weight_base % chan_stride)
     kv_rb    = 1 + cfg.head_dim//32
     kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
     weights  = sum(_tensor_beats(t, n_channels) for t in specs)*32
@@ -232,6 +239,10 @@ def main():
     p.add_argument("--no-emb16",  action="store_true",
                    help="Leave out the pre-dequantized int16 embedding table (622 MB on the "
                         "1.7B; the firmware decodes rows itself, ~2.6%% slower per token).")
+    p.add_argument("--chan-stride", default=None, type=lambda x: int(x, 0),
+                   help="The target's per-channel stride (BONSAI_CHAN_STRIDE; default: the FK33's 256 MB).")
+    p.add_argument("--weight-base", default=None, type=lambda x: int(x, 0),
+                   help="The target's weight base (BONSAI_CHAN_WEIGHT_BASE; default: the FK33's).")
 
     p = sub.add_parser("verify")
     p.add_argument("--image", required=True)
@@ -242,7 +253,8 @@ def main():
     elif args.cmd == "convert":
         manifest = args.manifest or args.out.rsplit(".", 1)[0] + ".json"
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
-                args.layers, args.check, emb16=not args.no_emb16)
+                args.layers, args.check, emb16=not args.no_emb16,
+                chan_stride=args.chan_stride, weight_base=args.weight_base)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 

@@ -31,14 +31,21 @@ from trixium.model import qformats
 
 # GGUF loading -------------------------------------------------------------------------------------
 
+# The GGUF architectures the geometry reader understands. qwen3: the Ternary-Bonsai 1.7B and
+# 8B. qwen3next: Bonsai 2 (the 27B), whose DeltaNet keys follow llama.cpp's convention for
+# the architecture (ssm.* for the linear-attention geometry, full_attention_interval,
+# rope.dimension_count for the partial RoPE); its DeltaNet layers are read here and refused
+# by the converter until the engine has a recurrent unit (docs/xcu1525.md).
+GGUF_ARCHS = ("qwen3", "qwen3next")
+
 def config_from_gguf(reader):
     """Build a ModelConfig from GGUF metadata."""
     md   = reader.metadata
     arch = md["general.architecture"]
-    assert arch == "qwen3", f"unsupported architecture {arch}"
+    assert arch in GGUF_ARCHS, f"unsupported architecture {arch} (known: {GGUF_ARCHS})"
     g = lambda k, default=None: md.get(f"{arch}.{k}", default)
     vocab = reader.tensors["token_embd.weight"].shape[0]
-    return ModelConfig(
+    cfg = ModelConfig(
         name           = md.get("general.basename", arch).lower(),
         n_layer        = g("block_count"),
         n_embd         = g("embedding_length"),
@@ -53,6 +60,31 @@ def config_from_gguf(reader):
         yarn_factor    = g("rope.scaling.factor", 1.0) if g("rope.scaling.type") == "yarn" else 1.0,
         yarn_orig_ctx  = g("rope.scaling.original_context_length", 0),
     )
+    if arch == "qwen3next":
+        interval = g("full_attention_interval", 4)
+        cfg.layer_types    = tuple("attn" if (l + 1) % interval == 0 else "deltanet"
+                                   for l in range(cfg.n_layer))
+        cfg.dn_num_v_heads = g("ssm.time_step_rank", 0)
+        cfg.dn_num_k_heads = g("ssm.group_count", 0)
+        cfg.dn_k_head_dim  = g("ssm.state_size", 0)
+        cfg.dn_v_head_dim  = g("ssm.inner_size", 0)//max(1, cfg.dn_num_v_heads)
+        cfg.dn_conv_kernel = g("ssm.conv_kernel", 0)
+        cfg.rope_dims      = g("rope.dimension_count", 0)
+    return cfg
+
+def check_engine_support(cfg):
+    """What the engine can run today. Raises SystemExit with the reason otherwise."""
+    if cfg.n_dn_layers:
+        raise SystemExit(
+            f"{cfg.name}: {cfg.n_dn_layers} of {cfg.n_layer} layers are Gated DeltaNet "
+            f"({cfg.dn_num_v_heads} value heads x {cfg.dn_v_head_dim}, {cfg.dn_num_k_heads} "
+            f"key heads x {cfg.dn_k_head_dim}, conv kernel {cfg.dn_conv_kernel}); the engine "
+            f"has no recurrent unit for them yet - the projections are ordinary matvecs, the "
+            f"state update is not. See docs/xcu1525.md (the 27B).")
+    for name, dim in (("n_embd", cfg.n_embd), ("ffn_dim", cfg.ffn_dim), ("head_dim", cfg.head_dim)):
+        if dim % 128:
+            raise SystemExit(f"{cfg.name}: {name} = {dim} is not a multiple of the 128-wide "
+                             f"ternary group")
 
 def load_gguf_f32(path):
     """Load a GGUF file -> (config, dict name -> fp32 ndarray with GGUF logical shape)."""

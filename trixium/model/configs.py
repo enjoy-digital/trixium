@@ -26,6 +26,28 @@ class ModelConfig:
     # host/firmware fold it into the precomputed sin/cos tables, no hardware impact.
     yarn_factor    : float = 1.0
     yarn_orig_ctx  : int   = 0
+    # Bonsai 2 / Qwen3.8 (the 27B): a hybrid of Gated DeltaNet layers with full attention
+    # every full_attention_interval-th layer. () = every layer is attention (the Qwen3
+    # models). The DeltaNet geometry is carried so the converter and the firmware can say
+    # exactly what the missing recurrent unit has to compute (docs/xcu1525.md).
+    layer_types    : tuple = ()           # "attn" / "deltanet" per layer, or ().
+    dn_num_v_heads : int   = 0            # DeltaNet value heads (GGUF ssm.time_step_rank).
+    dn_num_k_heads : int   = 0            # DeltaNet key heads (ssm.group_count).
+    dn_k_head_dim  : int   = 0            # Key/query head dim (ssm.state_size).
+    dn_v_head_dim  : int   = 0            # Value head dim (ssm.inner_size / v heads).
+    dn_conv_kernel : int   = 0            # Short causal conv kernel (ssm.conv_kernel).
+    rope_dims      : int   = 0            # Partial RoPE: rotated dims per head (0 = all).
+
+    def layer_type(self, l):
+        return self.layer_types[l] if self.layer_types else "attn"
+
+    @property
+    def n_dn_layers(self):
+        return sum(1 for t in self.layer_types if t == "deltanet")
+
+    @property
+    def n_attn_layers(self):
+        return self.n_layer - self.n_dn_layers
 
     @property
     def q_dim(self):
