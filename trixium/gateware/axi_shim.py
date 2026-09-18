@@ -31,8 +31,8 @@ the protocol:
 
 Between drains the shim is transparent on R, W and B (no added registers on the streaming
 paths); AR/AW gain one register, which the readers already amortize with 8 outstanding
-bursts. W beats of a burst are held until its AW has fired at the port (the shim's WLAST
-comes from the accepted AWs' lengths), which the writers' own issue order already respects.
+bursts. No W handshake depends on the AW one (AXI's rule for masters): WLAST is the
+master's on the normal path, and the accepted-AW length queue only pads during a drain.
 """
 
 from migen import *
@@ -149,54 +149,65 @@ class AXIResetShim(LiteXModule):
             ),
         ]
 
-        # W skid: a beat the master presented is delivered whatever happens to the master;
-        # while draining, beats still owed go out with wstrb = 0. WLAST comes from the
-        # shim's own count against the accepted AWs' lengths (a queue in issue order), so
-        # padded bursts end where the port expects them to - one B per AW.
-        #
-        # That count is only right if a burst's AW has fired at the port before any of its
-        # W beats does, so W is held (w_ok) until the queue holds its length. The HBM IP
-        # happened to guarantee the order by not taking W ahead of AW; LiteDRAM's AXI
-        # bridge takes W into a FIFO while it still holds the previous AW, and without the
-        # gate the second burst of every store went out with WLAST on every beat - one B
-        # per beat, the writer's outstanding count underflowed, and the engine sat in
-        # ST_DRAIN forever (the XCU1525 sim, 2026-09-18; test_ddr_port_path.py).
+        # W skid: a beat the master presented is delivered whatever happens to the master.
+        # On the normal path WLAST is the master's own (the writers set it right), and no W
+        # handshake depends on the AW one: AXI forbids a master to wait for AWREADY before
+        # WVALID, and a slave may wait for WVALID before AWREADY - the HBM IP does something
+        # of the kind (2026-09-18: a W gated on the accepted-AW queue cost ~3k cycles per
+        # KV-store packet on the card, 7% of the token), while LiteDRAM's bridge takes W
+        # into a FIFO ahead of its one-deep AW buffer, so W beats may fire before their AW
+        # and whole bursts may complete before it. The queue of accepted AW lengths serves
+        # only the drain: padding the rest of a burst the master abandoned, and whole
+        # bursts whose AW fired without any W - one B per AW either way. Bursts that
+        # completed ahead of their AW (`ahead`) skip the queue when the AW fires.
         w_v    = Signal()
         w_data = Signal(port.data_width)
         w_strb = Signal(port.data_width//8)
+        w_last = Signal()
         w_fire = Signal()
-        w_ok   = Signal()
         pad    = Signal()
         w_cnt  = Signal(8)
         w_lastc = Signal()
+        last_fire = Signal()
+        lf_nq     = Signal()   # A last beat fired with no AW entry for it (yet).
+        ahead     = Signal(4)  # Bursts complete before their AW fired at the port.
+        aw_match  = Signal()   # This AW's burst already completed: no queue entry.
         self.comb += [
-            wq.sink.valid.eq(aw_fire),
-            wq.sink.len.eq(aw_len),
-            w_ok.eq(wq.source.valid),                   # This burst's AW has fired.
-            w_lastc.eq(w_cnt == wq.source.len),        # len = beats - 1
-            pad.eq(drain_w & ~w_v & (w_due != 0) & w_ok),
-            port.w.valid.eq((w_v | pad) & w_ok),
+            w_lastc.eq(w_cnt == wq.source.len),        # len = beats - 1 (pad beats only)
+            pad.eq(drain_w & ~w_v & (w_due != 0) & wq.source.valid),
+            port.w.valid.eq(w_v | pad),
             port.w.data.eq(Mux(w_v, w_data, 0)),
             port.w.strb.eq(Mux(w_v, w_strb, 0)),
-            port.w.last.eq(w_lastc),
+            port.w.last.eq(Mux(w_v, w_last, w_lastc)),
             w_fire.eq(port.w.valid & port.w.ready),
-            wq.source.ready.eq(w_fire & w_lastc),
-            master.w.ready.eq((~w_v | (port.w.ready & w_ok)) & ~drain_w & ~self.hold),
+            last_fire.eq(w_fire & port.w.last),
+            lf_nq.eq(last_fire & ~wq.source.valid),
+            aw_match.eq(aw_fire & ((ahead != 0) | lf_nq)),
+            wq.sink.valid.eq(aw_fire & ~aw_match),
+            wq.sink.len.eq(aw_len),
+            wq.source.ready.eq(last_fire & wq.source.valid),
+            master.w.ready.eq((~w_v | port.w.ready) & ~drain_w & ~self.hold),
         ]
         self.sync += [
             If(master.w.valid & master.w.ready,
                 w_v.eq(1),
                 w_data.eq(master.w.data),
                 w_strb.eq(master.w.strb),
+                w_last.eq(master.w.last),
             ).Elif(w_fire,
                 w_v.eq(0),
             ),
             If(w_fire,
-                If(w_lastc,
+                If(port.w.last,
                     w_cnt.eq(0),
                 ).Else(
                     w_cnt.eq(w_cnt + 1),
                 )
+            ),
+            If(lf_nq & ~aw_match,
+                ahead.eq(ahead + 1),
+            ).Elif(aw_match & ~lf_nq,
+                ahead.eq(ahead - 1),
             ),
         ]
 

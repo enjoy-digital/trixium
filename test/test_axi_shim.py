@@ -202,3 +202,86 @@ def test_shim_stuck_when_port_never_answers():
 
     run_simulation(dut, gen())
     assert not out["drained"] and out["stuck"]
+
+
+import pytest
+
+@pytest.mark.parametrize("order", ["aw_first", "w_first", "aw_after_w"])
+def test_shim_writes_under_every_slave_handshake_order(order):
+    """The shim in front of a slave that takes AW first (the legacy model), W first
+    (LiteDRAM's bridge: W into a FIFO ahead of a one-deep AW buffer) or AW only after
+    WVALID (a slave that waits for data - what the HBM IP's behaviour on the card implied,
+    2026-09-18). Three multi-burst stores back to back, then a read-back: exact bytes, one
+    B per AW (the writer goes idle), no dependence of any W handshake on the AW one
+    (the aw_after_w slave would deadlock a master that had one)."""
+    import numpy as np
+    from litex.soc.interconnect.axi import AXIInterface
+    rng = np.random.default_rng(int(sum(map(ord, order))))
+
+    class _D(Module):
+        def __init__(self):
+            port = AXIInterface(data_width=256, address_width=33, id_width=6)
+            self.submodules.model = BonsaiHBMChannelModel(port, size=16*1024, latency=3,
+                                                          write_order=order)
+            self.submodules.shim  = AXIResetShim(port, stuck_cycles=4000)
+            self.submodules.writer = BonsaiAXIWriter(self.shim.master)
+            self.submodules.reader = BonsaiAXIReader(self.shim.master)
+            self.comb += self.reader.source.ready.eq(1)
+            self.port = port
+            self.bcount = Signal(8)
+            self.sync += If(port.b.valid & port.b.ready, self.bcount.eq(self.bcount + 1))
+
+    dut = _D()
+    stores = [(0x1000*i, rng.integers(0, 2**32, 8*n, dtype=np.uint32)) for i, n in
+              enumerate((3, 40, 5))]   # 1, 3 and 1 bursts.
+    got = []
+
+    def driver():
+        for addr, words in stores:
+            beats = len(words)//8
+            yield dut.writer.sink_cmd.addr.eq(addr)
+            yield dut.writer.sink_cmd.len.eq(beats)
+            yield dut.writer.sink_cmd.valid.eq(1)
+            yield
+            while not (yield dut.writer.sink_cmd.ready):
+                yield
+            yield dut.writer.sink_cmd.valid.eq(0)
+            for b in range(beats):
+                w = int.from_bytes(words[8*b:8*b + 8].tobytes(), "little")
+                yield dut.writer.sink_data.data.eq(w)
+                yield dut.writer.sink_data.valid.eq(1)
+                yield
+                while not (yield dut.writer.sink_data.ready):
+                    yield
+            yield dut.writer.sink_data.valid.eq(0)
+            for _ in range(3000):
+                if (yield dut.writer.idle):
+                    break
+                yield
+            else:
+                raise AssertionError(f"{order}: the writer never went idle")
+        assert (yield dut.bcount) == 5, f"{order}: {(yield dut.bcount)} B responses for 5 bursts"
+        for addr, words in stores:
+            beats = len(words)//8
+            yield dut.reader.sink.addr.eq(addr)
+            yield dut.reader.sink.len.eq(beats)
+            yield dut.reader.sink.valid.eq(1)
+            yield
+            while not (yield dut.reader.sink.ready):
+                yield
+            yield dut.reader.sink.valid.eq(0)
+            n = 0
+            for _ in range(4000):
+                if (yield dut.reader.source.valid):
+                    got.append((yield dut.reader.source.data)); n += 1
+                if n == beats:
+                    break
+                yield
+            assert n == beats, order
+        want = []
+        for _, words in stores:
+            for b in range(len(words)//8):
+                want.append(int.from_bytes(words[8*b:8*b + 8].tobytes(), "little"))
+        assert got == want, f"{order}: read-back differs"
+
+    run_simulation(dut, [driver()], clocks={"sys": 10, "eng": 10})

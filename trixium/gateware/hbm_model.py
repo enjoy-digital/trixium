@@ -36,7 +36,7 @@ def words_from_bytes(data):
 
 class BonsaiHBMChannelModel(LiteXModule):
     def __init__(self, axi=None, size=64*1024, init=None, latency=16, stall_rate=0,
-                 reorder_ids=0):
+                 reorder_ids=0, write_order="aw_first"):
         """
         axi        : AXIInterface slave (created if None).
         size       : modeled memory bytes (power of two).
@@ -54,6 +54,14 @@ class BonsaiHBMChannelModel(LiteXModule):
                      per round trip. A single-ID reader against this model reproduces the
                      pathology; the multi-ID reader must erase it. Response order across IDs
                      follows service order (rotating scan), not request order.
+        write_order: the slave's AW/W handshake discipline - every one is legal AXI and a
+                     master must work with all three (the shim's lesson, 2026-09-18):
+                     "aw_first"   : AW into a FIFO whenever presented; W taken only after
+                                    its AW (the legacy model).
+                     "w_first"    : W beats taken into a FIFO ahead of their AW (LiteDRAM's
+                                    bridge: a W FIFO independent of its one-deep AW buffer).
+                     "aw_after_w" : AWREADY only once WVALID is seen (a slave that waits for
+                                    data before the address - the HBM IP behaves like this).
         """
         if axi is None:
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
@@ -62,6 +70,8 @@ class BonsaiHBMChannelModel(LiteXModule):
         # stops answering - the wedge the engine soft reset exists for); released later, the
         # beats of the bursts it still owes come out, which is what the AXI shim must absorb.
         self.freeze = Signal()
+        assert write_order in ("aw_first", "w_first", "aw_after_w")
+        self.write_order = write_order
         depth    = size//BEAT_BYTES
         self.autocsr_exclude = {"mem"} # Keep the model memory off the CSR bus (AutoCSR scan).
 
@@ -269,19 +279,50 @@ class BonsaiHBMChannelModel(LiteXModule):
         aw_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
         self.submodules += aw_fifo
         self.comb += [
-            aw_fifo.sink.valid.eq(axi.aw.valid),
-            axi.aw.ready.eq(aw_fifo.sink.ready),
             aw_fifo.sink.addr.eq(axi.aw.addr),
             aw_fifo.sink.len.eq(axi.aw.len[:4]),
             aw_fifo.sink.id.eq(axi.aw.id),
         ]
+        if self.write_order == "aw_after_w":
+            # The address is taken only once the data has started to show.
+            self.comb += [
+                aw_fifo.sink.valid.eq(axi.aw.valid & axi.w.valid),
+                axi.aw.ready.eq(aw_fifo.sink.ready & axi.w.valid),
+            ]
+        else:
+            self.comb += [
+                aw_fifo.sink.valid.eq(axi.aw.valid),
+                axi.aw.ready.eq(aw_fifo.sink.ready),
+            ]
+
+        # The data source of the write server: the bus, or a FIFO fed ahead of the AW.
+        w = stream.Endpoint([("data", 256), ("strb", 32)])   # `last` is the stream's own.
+        if self.write_order == "w_first":
+            w_fifo = stream.SyncFIFO([("data", 256), ("strb", 32)], 64)
+            self.submodules += w_fifo
+            self.comb += [
+                w_fifo.sink.valid.eq(axi.w.valid),
+                axi.w.ready.eq(w_fifo.sink.ready),
+                w_fifo.sink.data.eq(axi.w.data),
+                w_fifo.sink.strb.eq(axi.w.strb),
+                w_fifo.sink.last.eq(axi.w.last),
+                w_fifo.source.connect(w),
+            ]
+        else:
+            self.comb += [
+                w.valid.eq(axi.w.valid),
+                axi.w.ready.eq(w.ready),
+                w.data.eq(axi.w.data),
+                w.strb.eq(axi.w.strb),
+                w.last.eq(axi.w.last),
+            ]
 
         w_beat = Signal(30)
         w_id   = Signal(6)
 
         self.comb += [
             wr_port.adr.eq(w_beat),
-            wr_port.dat_w.eq(axi.w.data),
+            wr_port.dat_w.eq(w.data),
         ]
 
         self.wr_fsm = fsm = FSM(reset_state="IDLE")
@@ -294,11 +335,11 @@ class BonsaiHBMChannelModel(LiteXModule):
             )
         )
         fsm.act("STREAM",
-            axi.w.ready.eq(1),
-            If(axi.w.valid,
-                wr_port.we.eq(axi.w.strb),
+            w.ready.eq(1),
+            If(w.valid,
+                wr_port.we.eq(w.strb),
                 NextValue(w_beat, w_beat + 1),
-                If(axi.w.last,
+                If(w.last,
                     NextState("RESP"),
                 )
             )
