@@ -26,6 +26,7 @@
 import os
 
 from migen import *
+from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
 
@@ -75,7 +76,57 @@ class _CRG(LiteXModule):
                 i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk),
         ]
 
-        self.idelayctrl = USPIDELAYCTRL(cd_ref=self.cd_idelay, cd_sys=self.cd_sys)
+        self.idelayctrl = _IDELAYCTRL(platform, cd_ref=self.cd_idelay, cd_sys=self.cd_sys)
+
+# _IDELAYCTRL --------------------------------------------------------------------------------------
+
+class _IDELAYCTRL(LiteXModule):
+    """LiteX's USPIDELAYCTRL with the reset counter in the sys domain and a false path to
+    the IDELAYCTRL RST pins.
+
+    LiteX clocks its 64-cycle reset counter with the 500 MHz IDELAY reference and Vivado
+    replicates the IDELAYCTRL once per I/O bank: with four DDR4 channels the replicas sit in
+    all three SLRs, the reset net is 2.1 ns of route against a 2 ns period, and every one of
+    the first build's 82 failing endpoints was this net (xcu1525_n16_125_v1: WNS -0.809, the
+    engine and controllers at 125 MHz all met). The RST pin is asynchronous on UltraScale+
+    (UG571: a 52 ns minimum pulse, no clock relation), so the counter runs at sys (64 cycles
+    = 512 ns of reset) and the RST paths are false paths. The RDY handling is LiteX's.
+    """
+    def __init__(self, platform, cd_ref, cd_sys, reset_cycles=64, ready_cycles=64):
+        self.cd_ic = ClockDomain()
+        ic_reset_counter = Signal(max=reset_cycles, reset=reset_cycles-1)
+        ic_reset         = Signal(reset=1)
+        cd_sys_sync      = getattr(self.sync, cd_sys.name)
+        cd_sys_sync += [
+            If(ic_reset_counter != 0,
+                ic_reset_counter.eq(ic_reset_counter - 1)
+            ).Else(
+                ic_reset.eq(0)
+            )
+        ]
+        ic_ready_counter = Signal(max=ready_cycles, reset=ready_cycles-1)
+        ic_ready         = Signal()
+        self.comb += self.cd_ic.clk.eq(cd_sys.clk)
+        self.sync.ic += [
+            cd_sys.rst.eq(1),
+            If(ic_ready,
+                If(ic_ready_counter != 0,
+                    ic_ready_counter.eq(ic_ready_counter - 1)
+                ).Else(
+                    cd_sys.rst.eq(0)
+                )
+            )
+        ]
+        self.specials += [
+            Instance("IDELAYCTRL",
+                p_SIM_DEVICE = "ULTRASCALE",
+                i_REFCLK     = cd_ref.clk,
+                i_RST        = ic_reset,
+                o_RDY        = ic_ready),
+            AsyncResetSynchronizer(self.cd_ic, ic_reset)
+        ]
+        platform.add_platform_command(
+            "set_false_path -to [get_pins -hierarchical -filter {{REF_NAME == IDELAYCTRL && NAME =~ *RST}}]")
 
 # BonsaiXCU1525SoC ---------------------------------------------------------------------------------
 
