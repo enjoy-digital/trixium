@@ -18,6 +18,29 @@
 #include <generated/soc.h>
 
 #include "bons.h"
+#include "ddr.h"
+
+#ifdef BONSAI_N_MEMCTRL
+// ddr.c reaches controller k's registers as controller 0's shifted by k*STRIDE: the target
+// pins the (sdram, ddrphy) CSR pairs to consecutive pages, and this is where that is checked.
+// (The PHY model of the Verilator sim has no CSRs, hence the ddrphy guards.)
+_Static_assert(CSR_SDRAM1_BASE - CSR_SDRAM_BASE == BONSAI_DDR_CSR_STRIDE, "sdram1 CSR page");
+#ifdef CSR_DDRPHY_BASE
+_Static_assert(CSR_DDRPHY1_BASE - CSR_DDRPHY_BASE == BONSAI_DDR_CSR_STRIDE, "ddrphy1 CSR page");
+#endif
+#if BONSAI_N_MEMCTRL > 2
+_Static_assert(CSR_SDRAM2_BASE - CSR_SDRAM_BASE == 2*BONSAI_DDR_CSR_STRIDE, "sdram2 CSR page");
+#ifdef CSR_DDRPHY_BASE
+_Static_assert(CSR_DDRPHY2_BASE - CSR_DDRPHY_BASE == 2*BONSAI_DDR_CSR_STRIDE, "ddrphy2 CSR page");
+#endif
+#endif
+#if BONSAI_N_MEMCTRL > 3
+_Static_assert(CSR_SDRAM3_BASE - CSR_SDRAM_BASE == 3*BONSAI_DDR_CSR_STRIDE, "sdram3 CSR page");
+#ifdef CSR_DDRPHY_BASE
+_Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "ddrphy3 CSR page");
+#endif
+#endif
+#endif
 #include "engine.h"
 #include "model.h"
 #include "infer.h"
@@ -122,6 +145,10 @@ static void help(void)
     puts("info            - model info (BONS header)");
     puts("hdrload         - copy BONS header+table staged by bonsai_load to CPU memory");
     puts("sptest          - scratchpad bus read/write test");
+#ifdef BONSAI_N_MEMCTRL
+    puts("ddrinit [k]     - re-init DDR4 controller k (default: 1..N-1, as at boot)");
+    puts("ddrtest [c]     - engine store/fetch round trip through channel c's window (all)");
+#endif
     puts("peek c addr     - dump one HBM beat via the engine (hex addr)");
     puts("mvtest idx      - matvec tensor <idx> with the test pattern, print checksum");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
@@ -528,6 +555,16 @@ static void console_service(void)
         infer_attn_chunk(parse_int(str));
     else if (strcmp(token, "engreset") == 0)
         engine_recover();
+#ifdef BONSAI_N_MEMCTRL
+    else if (strcmp(token, "ddrinit") == 0) {
+        char *arg = get_token(&str);
+        if (arg && *arg) ddr_init(parse_int(arg)); else ddr_init_all();
+    }
+    else if (strcmp(token, "ddrtest") == 0) {
+        char *arg = get_token(&str);
+        ddr_test((arg && *arg) ? parse_int(arg) : -1);
+    }
+#endif
     else if (strcmp(token, "wedge") == 0) {
         // Deliberately wedge the engine (an op whose stream is 2 beats short of its rows),
         // let the stall reporter give up, recover, and rerun the self-test: the checksums
@@ -762,6 +799,13 @@ int main(void)
 #endif
 
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
+#ifdef BONSAI_N_MEMCTRL
+    // The BIOS brought up controller 0 (main_ram); the other DDR4 controllers carry
+    // the engine channels' weights and have no BIOS support: init them here, then prove
+    // every channel's window with the path the weights take (ddr.c).
+    ddr_init_all();
+    ddr_test(-1);
+#endif
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
     model_info();
     sptest();
