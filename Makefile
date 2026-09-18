@@ -35,8 +35,9 @@ models: df-check
 tiny:
 	$(PYTHON) -m trixium.model.tinygen --out models/tiny
 
-# The model path: GGUF -> BONS image (~13 s, ~2 GB RAM for the 1.7B) + the C tool's tokenizer.
-GGUF     ?= models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf
+# The model path: GGUF -> BONS image (~13 s, ~2 GB RAM for the 1.7B; ~60 s for the 8B) + the
+# C tool's tokenizer. `make convert GGUF=models/8b/Ternary-Bonsai-8B-PQ2_0.gguf` for the 8B.
+GGUF     ?= models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf
 CHANNELS ?= 16
 .PHONY: convert
 convert:

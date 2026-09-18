@@ -6,7 +6,8 @@
 
 """`bonsai`: the one entry point for the model path.
 
-    bonsai convert   models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf   # -> models/bons/...-n16.img
+    bonsai convert   models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf  # -> models/bons/bonsai-1p7b-n16.img
+    bonsai convert   models/8b/Ternary-Bonsai-8B-PQ2_0.gguf      # -> models/bons/bonsai-8b-n16.img
     bonsai verify    models/bons/bonsai-1p7b-n16.img
     bonsai tokenizer models/1.7b/tokenizer.json                 # -> models/1.7b/tokenizer.bin
     bonsai deploy    n16_212_v15b                               # bitstream + weights + boot
