@@ -162,11 +162,18 @@ void engine_join(uint32_t done)
 
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
     // hanging the boot silently.
+    // The report threshold scales with the op: 200k spins (~4 M cycles) covers every op at
+    // the HBM's rate, but the 8B's LM head streams 322k beats per channel and at the
+    // XCU1525 v3's 23 cycles/beat that is 7.4 M cycles of legitimate work (2026-09-19: a
+    // stall report per token, the tokens right).
+    uint32_t spin_limit = 200000u;
+    if (op->wlen > 100000u)
+        spin_limit = op->wlen*2u;
     uint32_t spins = 0, reports = 0;
     eng_poll_waits++;
     while (engine_csr_done_count_read() == done) {
         eng_poll_spins++;
-        if (++spins < 200000u)
+        if (++spins < spin_limit)
             continue;
         spins = 0;
         // The op's own parameters, because a stall is nearly always a parameter the
