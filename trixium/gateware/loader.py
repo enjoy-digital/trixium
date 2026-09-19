@@ -29,7 +29,7 @@ SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 # BonsaiHBMLoader ----------------------------------------------------------------------------------
 
 class BonsaiHBMLoader(LiteXModule):
-    def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0):
+    def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0):
         # chan_stride: byte distance between channel windows, added IN HARDWARE to host
         # uploads (base + chan*stride, 33 bits) exactly as the engine adds it for reads
         # and stores - so the host writes the channel-relative base and channel 15's
@@ -41,6 +41,9 @@ class BonsaiHBMLoader(LiteXModule):
         # (chan % chan_mod)*stride, the window's offset inside the channel's own controller.
         assert chan_mod == 0 or (chan_mod & (chan_mod - 1)) == 0
         chan_sel = (lambda c: c & (chan_mod - 1)) if chan_mod else (lambda c: c)
+        # chan_skew: the per-channel bank skew the engine adds (matvec.py), added here too.
+        assert chan_skew == 0 or chan_mod
+        chan_skew_of = lambda sel: Array([k*chan_skew for k in range(chan_mod)])[sel]
         self.sink = stream.Endpoint([("data", data_width)]) # From PCIe DMA (host->device).
 
         self.chan   = CSRStorage(5,  description="Destination channel.")
@@ -218,11 +221,13 @@ class BonsaiHBMLoader(LiteXModule):
         )
         self.comb += self.store_busy.eq(fsm.ongoing("EST_CMD") | fsm.ongoing("EST_DATA")
                                         | fsm.ongoing("EST_DRAIN"))
+        # Built term by term so that chan_skew=0 emits exactly the expression it always did.
+        _upload_addr = self.base.storage + ((chan_sel(chan) << chan_shift) if chan_stride else 0)
+        if chan_skew:
+            _upload_addr = _upload_addr + chan_skew_of(chan_sel(chan))
         fsm.act("CMD",
             *[w.sink_cmd.valid.eq(chan == i) for i, w in enumerate(self.writers)],
-            *[w.sink_cmd.addr.eq(self.base.storage
-                                 + ((chan_sel(chan) << chan_shift) if chan_stride else 0))
-              for w in self.writers],
+            *[w.sink_cmd.addr.eq(_upload_addr) for w in self.writers],
             *[w.sink_cmd.len.eq(self.length.storage) for w in self.writers],
             If(Array([w.sink_cmd.ready for w in self.writers])[chan],
                 If(sync_hunt,

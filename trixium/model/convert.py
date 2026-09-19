@@ -179,7 +179,8 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
     raise NotImplementedError(f"{name}: unsupported tensor type {t.type_name}")
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
-            max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None):
+            max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None,
+            window_reserve=0):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
     try:
@@ -228,7 +229,7 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
     if chan_stride is None: chan_stride = HBM_CHAN_STRIDE
     if weight_base is None: weight_base = HBM_WEIGHT_BASE
-    window   = chan_stride - (weight_base % chan_stride) - 0x1000  # The last 4 KB: the
+    window   = chan_stride - (weight_base % chan_stride) - 0x1000 - window_reserve  # The last 4 KB: the
     # firmware's DDR round-trip test (ddr.c) writes them on boards with several controllers.
     kv_rb    = 1 + cfg.head_dim//32
     kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
@@ -316,6 +317,9 @@ def main():
                         "1.7B; the firmware decodes rows itself, ~2.6%% slower per token).")
     p.add_argument("--chan-stride", default=None, type=lambda x: int(x, 0),
                    help="The target's per-channel stride (BONSAI_CHAN_STRIDE; default: the FK33's 256 MB).")
+    p.add_argument("--window-reserve", default=0, type=lambda x: int(x, 0),
+                   help="Bytes the last window of a controller loses to the per-channel bank skew "
+                        "((chan_mod-1)*BONSAI_CHAN_SKEW: 96 KB on the XCU1525).")
     p.add_argument("--weight-base", default=None, type=lambda x: int(x, 0),
                    help="The target's weight base (BONSAI_CHAN_WEIGHT_BASE; default: the FK33's).")
 
@@ -329,7 +333,8 @@ def main():
         manifest = args.manifest or args.out.rsplit(".", 1)[0] + ".json"
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
                 args.layers, args.check, emb16=not args.no_emb16,
-                chan_stride=args.chan_stride, weight_base=args.weight_base)
+                chan_stride=args.chan_stride, weight_base=args.weight_base,
+                window_reserve=args.window_reserve)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 

@@ -166,7 +166,7 @@ DDR_CSR_STRIDE = 0x1000
 class BonsaiXCU1525SoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
-                 ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000,
+                 ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -274,12 +274,22 @@ class BonsaiXCU1525SoC(SoCCore):
         assert chan_stride & (chan_stride - 1) == 0 and HBM_WEIGHT_BASE < chan_stride
         assert HBM_WEIGHT_BASE + chan_stride*chan_mod - (HBM_WEIGHT_BASE % chan_stride) \
             <= 4 << 30, "the last window must end inside the channel's 4 GB"
+        assert chan_skew % 0x1000 == 0 and (chan_mod - 1)*chan_skew < chan_stride // 64
         assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000, "main_ram must end below the staging area"
         with_bonsai            = True
         cluster_chan_mod       = chan_mod
         cluster_mem_cpu_offset = 0
         cluster_n_memctrl      = ddram_channels
         cluster_chan_stride    = chan_stride
+        # The four windows of a controller start in four different DDR4 banks: a
+        # power-of-two stride is a multiple of the bank period, so without this the four
+        # streams sharing a controller thrash one bank's row (the LiteDRAM sim: 6-7.6
+        # cycles/beat per port same-bank, 4.3 with a bank skew, 2026-09-19). In LiteDRAM's
+        # ROW_BANK_COL mapping the bank index is byte address bits 13..16 (colbits 10, 64 B
+        # words), DFI bank[1:0] = BA and bank[3:2] = BG: a 32 KB skew steps the bank GROUP,
+        # so the four streams also never meet DDR4's tCCD_L. The last window loses
+        # (chan_mod-1)*skew = 96 KB (the converter's --window-reserve).
+        cluster_chan_skew      = chan_skew
         cluster_weight_base    = HBM_WEIGHT_BASE
         # Bonsai cluster: begin. This block is byte-identical in every board target
         # (test_layout_contract.py diffs the marked regions): the per-board knobs are
@@ -349,7 +359,7 @@ class BonsaiXCU1525SoC(SoCCore):
             self.engine     = ClockDomainsRenamer("eng")(
                 BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
                                    seq=seq, dual=with_dual, chan_stride=cluster_chan_stride,
-                                   chan_mod=cluster_chan_mod))
+                                   chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew))
             if with_dual:
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
                 self.add_constant("BONSAI_HAS_DUALQ")
@@ -364,7 +374,7 @@ class BonsaiXCU1525SoC(SoCCore):
             # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
             self.loader     = ClockDomainsRenamer("eng")(
                 BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=cluster_chan_stride,
-                                chan_mod=cluster_chan_mod))
+                                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew))
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
@@ -410,6 +420,8 @@ class BonsaiXCU1525SoC(SoCCore):
             # its controller init read these; absent, the FK33's flat HBM geometry.
             if cluster_chan_mod:
                 self.add_constant("BONSAI_CHAN_MOD", cluster_chan_mod)
+            if cluster_chan_skew:
+                self.add_constant("BONSAI_CHAN_SKEW", cluster_chan_skew)
             if cluster_mem_cpu_offset is not None:
                 self.add_constant("BONSAI_MEM_CPU_OFFSET", cluster_mem_cpu_offset)
             if cluster_n_memctrl is not None:
@@ -434,6 +446,7 @@ def main():
     parser.add_target_argument("--ddram-module",    default="MT40A512M8",      help="LiteDRAM module class of the DDR4 (upstream target: MT40A512M8).")
     parser.add_target_argument("--main-ram-size",   default=0x1000_0000, type=lambda x: int(x, 0), help="CPU main_ram size on controller 0 (default 256 MB, the FK33's).")
     parser.add_target_argument("--chan-stride",     default=0x4000_0000, type=lambda x: int(x, 0), help="Per-engine-channel stride inside a controller (default 1 GB: 704 MB windows, the 27B fits; 0x10000000 = the FK33's 256 MB).")
+    parser.add_target_argument("--chan-skew",       default=0x8000, type=lambda x: int(x, 0), help="Extra per-channel offset inside a controller so the windows start in different DDR4 bank groups (default 32 KB; 0 = none).")
     parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
@@ -448,6 +461,7 @@ def main():
         ddram_channels  = args.ddram_channels,
         main_ram_size   = args.main_ram_size,
         chan_stride     = args.chan_stride,
+        chan_skew       = args.chan_skew,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates

@@ -142,6 +142,7 @@ class BonsaiSoC(SoCCore):
         cluster_n_memctrl      = None  # The BIOS owns the one memory system.
         from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE
         cluster_chan_stride    = HBM_CHAN_STRIDE  # 256 MB: one pseudo-channel per engine channel.
+        cluster_chan_skew      = 0     # No shared controller, no bank skew.
         cluster_weight_base    = HBM_WEIGHT_BASE  # +64 MB into it (port-matched, CPU-safe).
         # Bonsai cluster: begin. This block is byte-identical in every board target
         # (test_layout_contract.py diffs the marked regions): the per-board knobs are
@@ -211,7 +212,7 @@ class BonsaiSoC(SoCCore):
             self.engine     = ClockDomainsRenamer("eng")(
                 BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
                                    seq=seq, dual=with_dual, chan_stride=cluster_chan_stride,
-                                   chan_mod=cluster_chan_mod))
+                                   chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew))
             if with_dual:
                 # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
                 self.add_constant("BONSAI_HAS_DUALQ")
@@ -226,7 +227,7 @@ class BonsaiSoC(SoCCore):
             # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
             self.loader     = ClockDomainsRenamer("eng")(
                 BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=cluster_chan_stride,
-                                chan_mod=cluster_chan_mod))
+                                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew))
             # Engine kind-3 STORE (KV append) rides the loader's writers.
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
@@ -272,6 +273,8 @@ class BonsaiSoC(SoCCore):
             # its controller init read these; absent, the FK33's flat HBM geometry.
             if cluster_chan_mod:
                 self.add_constant("BONSAI_CHAN_MOD", cluster_chan_mod)
+            if cluster_chan_skew:
+                self.add_constant("BONSAI_CHAN_SKEW", cluster_chan_skew)
             if cluster_mem_cpu_offset is not None:
                 self.add_constant("BONSAI_MEM_CPU_OFFSET", cluster_mem_cpu_offset)
             if cluster_n_memctrl is not None:

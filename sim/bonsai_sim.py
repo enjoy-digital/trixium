@@ -71,6 +71,7 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 # (window - 2 MB) stay above main_ram; 2 MB per window holds the tiny payload and its KV.
 DDR4_SIM_WEIGHT_BASE = 0x00C0_0000  # 12 MB.
 DDR4_SIM_CHAN_STRIDE = 0x0020_0000  # 2 MB.
+DDR4_SIM_CHAN_SKEW   = 0x8000       # 32 KB: the XCU1525's bank-group skew, exercised on every path.
 DDR4_SIM_CSR_PAGE0   = 8            # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
 
@@ -192,7 +193,8 @@ class BonsaiSimSoC(SoCCore):
         self.engine     = ClockDomainsRenamer("eng")(
             BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit, seq=self.seq, dual=dual,
                                chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
-                               chan_mod=chan_mod))
+                               chan_mod=chan_mod,
+                               chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0))
         self.engine_csr = BonsaiEngineCSR(self.engine, seq=self.seq)
         self.comb += [
             self.engrst.trigger.eq(self.engine_csr.rst_trigger),
@@ -208,7 +210,8 @@ class BonsaiSimSoC(SoCCore):
         # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
         # kind-3 STORE ops (KV append).
         self.loader = ClockDomainsRenamer("eng")(BonsaiHBMLoader(axis,
-            chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0, chan_mod=chan_mod))
+            chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0, chan_mod=chan_mod,
+            chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0))
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
             self.engine.store_data.connect(self.loader.store_data),
@@ -248,6 +251,7 @@ class BonsaiSimSoC(SoCCore):
             self.add_constant("BONSAI_CHAN_WEIGHT_BASE", DDR4_SIM_WEIGHT_BASE)
             self.add_constant("BONSAI_CHAN_STRIDE",      DDR4_SIM_CHAN_STRIDE)
             self.add_constant("BONSAI_CHAN_MOD",         chan_mod)
+            self.add_constant("BONSAI_CHAN_SKEW",        DDR4_SIM_CHAN_SKEW)
             self.add_constant("BONSAI_MEM_CPU_OFFSET",   0)
             self.add_constant("BONSAI_N_MEMCTRL",        n_memctrl)
             self.add_constant("BONSAI_DDR_CSR_STRIDE",   DDR4_SIM_CSR_STRIDE)
@@ -285,8 +289,8 @@ class BonsaiSimSoC(SoCCore):
                 for j in range(chan_mod):
                     c = k*chan_mod + j
                     payload = bytes(img.channel_payload(c))
-                    base = DDR4_SIM_WEIGHT_BASE + j*DDR4_SIM_CHAN_STRIDE
-                    assert len(payload) + 512*1024 <= DDR4_SIM_CHAN_STRIDE, \
+                    base = DDR4_SIM_WEIGHT_BASE + j*DDR4_SIM_CHAN_STRIDE + j*DDR4_SIM_CHAN_SKEW
+                    assert len(payload) + 512*1024 + (chan_mod - 1)*DDR4_SIM_CHAN_SKEW <= DDR4_SIM_CHAN_STRIDE, \
                         f"channel {c}: {len(payload)} B does not fit a sim window"
                     content[base:base + len(payload)] = payload
             words = [int.from_bytes(content[i:i+4], "little") for i in range(0, len(content), 4)]

@@ -78,7 +78,12 @@ int ddr_init_all(void)
 // tokens on all three boot legs (2026-09-18). And not "base + stride": with the XCU1525's
 // 1 GB stride and 320 MB base that is past the channel's 4 GB for the last window.
 #define DDR_TEST_BEATS  64
-#define DDR_TEST_WINDOW (BONSAI_CHAN_STRIDE - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE))
+#ifndef BONSAI_CHAN_SKEW
+#define BONSAI_CHAN_SKEW 0
+#endif
+// The smallest window of a controller: the last one, which the bank skew shortens.
+#define DDR_TEST_WINDOW (BONSAI_CHAN_STRIDE - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE) \
+                         - (BONSAI_CHAN_MOD ? (BONSAI_CHAN_MOD - 1)*BONSAI_CHAN_SKEW : 0))
 #define DDR_TEST_ADDR   (BONSAI_CHAN_WEIGHT_BASE + DDR_TEST_WINDOW - 0x1000u)
 #define DDR_TEST_SRC   0x0000u   // Scratchpad: the pattern (2 KB).
 #define DDR_TEST_DST   0x4000u   // Scratchpad: the readback.

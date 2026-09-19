@@ -29,7 +29,7 @@ from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
 
 class _DUT(Module):
-    def __init__(self, n_channels, chan_mod):
+    def __init__(self, n_channels, chan_mod, chan_skew=0):
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
         self.axis = axis
@@ -38,10 +38,10 @@ class _DUT(Module):
                                                       init=words_from_bytes(src.tobytes()))
         self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
                                                     chan_stride=HBM_CHAN_STRIDE,
-                                                    chan_mod=chan_mod)
+                                                    chan_mod=chan_mod, chan_skew=chan_skew)
         self.submodules.loader = BonsaiHBMLoader(axis, data_width=256,
                                                  chan_stride=HBM_CHAN_STRIDE,
-                                                 chan_mod=chan_mod)
+                                                 chan_mod=chan_mod, chan_skew=chan_skew)
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
             self.engine.store_data.connect(self.loader.store_data),
@@ -83,15 +83,20 @@ def _probe(axi, chan, out, key):
         yield
 
 
-@pytest.mark.parametrize("chan_mod", [0, 4])
-def test_chan_mod_addresses_every_path(chan_mod):
+@pytest.mark.parametrize("chan_mod, chan_skew", [(0, 0), (4, 0), (4, 0x2000)])
+def test_chan_mod_addresses_every_path(chan_mod, chan_skew):
+    """Read (FETCH), STORE and host upload each add (c % chan_mod)*stride + (c % chan_mod)*skew
+    in hardware - the bank skew (XCU1525: 8 KB) on top of the window stride."""
     n_channels = 8
-    dut = _DUT(n_channels, chan_mod)
+    dut = _DUT(n_channels, chan_mod, chan_skew)
     out = {}
     wbase = HBM_WEIGHT_BASE + 0x8000
 
     def local(c):
         return (c % chan_mod) if chan_mod else c
+
+    def off(c):
+        return local(c)*HBM_CHAN_STRIDE + local(c)*chan_skew
 
     def driver():
         # FETCH from channel 6: one reader's AR carries wbase + local(6)*stride.
@@ -125,11 +130,11 @@ def test_chan_mod_addresses_every_path(chan_mod):
             yield
         out["done"] = True
 
-        assert out[("ar", 6)][0] == wbase + local(6)*HBM_CHAN_STRIDE, \
+        assert out[("ar", 6)][0] == wbase + off(6), \
             [hex(a) for a in out[("ar", 6)][:2]]
-        assert out[("aw", 5)][0] == wbase + local(5)*HBM_CHAN_STRIDE, \
+        assert out[("aw", 5)][0] == wbase + off(5), \
             [hex(a) for a in out[("aw", 5)][:2]]
-        assert out[("aw", 7)][0] == wbase + local(7)*HBM_CHAN_STRIDE, \
+        assert out[("aw", 7)][0] == wbase + off(7), \
             [hex(a) for a in out[("aw", 7)][:2]]
         # Nothing else was addressed on the probed channels' write side.
         assert ("aw", 6) not in out

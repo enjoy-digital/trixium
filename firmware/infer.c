@@ -113,10 +113,14 @@ static uint32_t heap_hi_base;
 #ifndef BONSAI_MEM_CPU_OFFSET
 #define BONSAI_MEM_CPU_OFFSET 0x40000000ull      // Engine-side address of main_ram's origin.
 #endif
+#ifndef BONSAI_CHAN_SKEW
+#define BONSAI_CHAN_SKEW 0                       // Per-channel bank skew inside a controller.
+#endif
 static inline uint64_t chan_window(uint32_t c)  // Engine-side start of channel c's window.
 {
     uint32_t local = BONSAI_CHAN_MOD ? (c % BONSAI_CHAN_MOD) : c;
-    return (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)local*BONSAI_CHAN_STRIDE;
+    return (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)local*BONSAI_CHAN_STRIDE
+           + (uint64_t)local*BONSAI_CHAN_SKEW;
 }
 static inline int chan_on_cpu_memory(uint32_t c) // Same controller as main_ram?
 {

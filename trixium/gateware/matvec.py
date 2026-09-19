@@ -143,7 +143,7 @@ class _ResultPacker(Module):
 
 class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
-                 dual=True, chan_stride=0, chan_mod=0):
+                 dual=True, chan_stride=0, chan_mod=0, chan_skew=0):
         # chan_stride: byte distance between consecutive channels' weight regions. The HBM IP
         # is configured with the AXI switch enabled (USER_SWITCH_ENABLE_00/01), so the address
         # - not the port it arrives on - selects the pseudo-channel: with stride 0 every
@@ -166,10 +166,21 @@ class BonsaiMatVecEngine(LiteXModule):
         # STORE paths alike (the loader masks the upload path the same way).
         assert chan_mod == 0 or (chan_mod & (chan_mod - 1)) == 0, \
             "chan_mod must be 0 or a power of two (the STORE path masks by it)"
+        # chan_skew: an extra per-channel offset of (c % chan_mod)*chan_skew bytes on top of
+        # the stride, so that the channels sharing a DDR4 controller start in different
+        # banks. With power-of-two strides the four windows of a controller sit in the same
+        # bank (the stride is a multiple of the bank period) and four sequential streams
+        # thrash that bank's row: 6-7.6 cycles/beat per port in the LiteDRAM sim against
+        # 4.3 with a bank skew (2026-09-19; the XCU1525 uses 32 KB = a bank group step).
+        # 0 keeps the FK33's netlist exactly.
+        assert chan_skew == 0 or chan_mod, "chan_skew needs chan_mod"
         def _chan_off(i): # Python int: per-reader constant.
-            return ((i % chan_mod) if chan_mod else i)*chan_stride
+            local = (i % chan_mod) if chan_mod else i
+            return local*chan_stride + local*chan_skew
         def _chan_sel(c): # Signal: the STORE path's per-op channel.
             return (c & (chan_mod - 1)) if chan_mod else c
+        def _chan_skew_of(sel): # Signal: the STORE path's skew, a mux of constants.
+            return Array([k*chan_skew for k in range(chan_mod)])[sel]
 
         # Keep the vector unit's busy signal, not the module: assigning a Module to an
         # attribute registers it as a submodule, and it is already one of the SoC's. The
@@ -941,14 +952,17 @@ class BonsaiMatVecEngine(LiteXModule):
                 NextState("FILL"),
             )
         )
+        # STORE targets the one channel in cmd.chan, so it needs the same per-channel
+        # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
+        # Built term by term so that chan_skew=0 emits exactly the expression it always did.
+        _store_addr = st_addr_r + (_chan_sel(cmd_r["chan"]) << chan_shift if chan_stride else 0)
+        if chan_skew:
+            _store_addr = _store_addr + _chan_skew_of(_chan_sel(cmd_r["chan"]))
         fsm.act("ST_CMD",
             self.busy.eq(1),
             self.store_cmd.valid.eq(1),
             self.store_cmd.chan.eq(cmd_r["chan"]),
-            # STORE targets the one channel in cmd.chan, so it needs the same per-channel
-            # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
-            self.store_cmd.addr.eq(st_addr_r +
-                (_chan_sel(cmd_r["chan"]) << chan_shift if chan_stride else 0)),
+            self.store_cmd.addr.eq(_store_addr),
             self.store_cmd.len.eq(cmd_r["wlen"]),
             If(self.store_cmd.ready,
                 NextState("ST_RUN"),
