@@ -81,23 +81,31 @@ class _CRG(LiteXModule):
 # _IDELAYCTRL --------------------------------------------------------------------------------------
 
 class _IDELAYCTRL(LiteXModule):
-    """LiteX's USPIDELAYCTRL with the reset counter in the sys domain and a false path to
-    the IDELAYCTRL RST pins.
+    """LiteX's USPIDELAYCTRL with the reset counter on the sys clock in a reset-less domain,
+    and a false path to the IDELAYCTRL RST pins.
 
     LiteX clocks its 64-cycle reset counter with the 500 MHz IDELAY reference and Vivado
     replicates the IDELAYCTRL once per I/O bank: with four DDR4 channels the replicas sit in
     all three SLRs, the reset net is 2.1 ns of route against a 2 ns period, and every one of
     the first build's 82 failing endpoints was this net (xcu1525_n16_125_v1: WNS -0.809, the
     engine and controllers at 125 MHz all met). The RST pin is asynchronous on UltraScale+
-    (UG571: a 52 ns minimum pulse, no clock relation), so the counter runs at sys (64 cycles
-    = 512 ns of reset) and the RST paths are false paths. The RDY handling is LiteX's.
+    (UG571: a 52 ns minimum pulse, no clock relation), so the counter runs at the sys clock
+    (512 ns of reset) and the RST paths are false paths. The RDY handling is LiteX's.
+
+    The counter's domain must NOT be `sys`: sys is held in reset until the IDELAYCTRL is
+    ready, and the IDELAYCTRL is not ready until this counter releases RST - a counter in
+    sys never counts and the SoC never leaves reset (v2 on the board, 2026-09-19: PCIe up,
+    every CSR read 0xffffffff). LiteX's original avoided it by counting in the reference
+    domain; this one counts in a reset-less domain on the sys clock (test_xcu1525_crg.py).
     """
     def __init__(self, platform, cd_ref, cd_sys, reset_cycles=64, ready_cycles=64):
-        self.cd_ic = ClockDomain()
+        self.cd_ic       = ClockDomain()
+        self.cd_idelayrst = ClockDomain("idelayrst", reset_less=True)
+        self.ic_reset    = ic_reset = Signal(reset=1)
+        self.ic_ready    = ic_ready = Signal()
         ic_reset_counter = Signal(max=reset_cycles, reset=reset_cycles-1)
-        ic_reset         = Signal(reset=1)
-        cd_sys_sync      = getattr(self.sync, cd_sys.name)
-        cd_sys_sync += [
+        self.comb += self.cd_idelayrst.clk.eq(cd_sys.clk)
+        self.sync.idelayrst += [
             If(ic_reset_counter != 0,
                 ic_reset_counter.eq(ic_reset_counter - 1)
             ).Else(
@@ -105,7 +113,6 @@ class _IDELAYCTRL(LiteXModule):
             )
         ]
         ic_ready_counter = Signal(max=ready_cycles, reset=ready_cycles-1)
-        ic_ready         = Signal()
         self.comb += self.cd_ic.clk.eq(cd_sys.clk)
         self.sync.ic += [
             cd_sys.rst.eq(1),
@@ -117,16 +124,20 @@ class _IDELAYCTRL(LiteXModule):
                 )
             )
         ]
-        self.specials += [
-            Instance("IDELAYCTRL",
-                p_SIM_DEVICE = "ULTRASCALE",
-                i_REFCLK     = cd_ref.clk,
-                i_RST        = ic_reset,
-                o_RDY        = ic_ready),
-            AsyncResetSynchronizer(self.cd_ic, ic_reset)
-        ]
-        platform.add_platform_command(
-            "set_false_path -to [get_pins -hierarchical -filter {{REF_NAME == IDELAYCTRL && NAME =~ *RST}}]")
+        if platform is not None:
+            self.specials += [
+                Instance("IDELAYCTRL",
+                    p_SIM_DEVICE = "ULTRASCALE",
+                    i_REFCLK     = cd_ref.clk,
+                    i_RST        = ic_reset,
+                    o_RDY        = ic_ready),
+                AsyncResetSynchronizer(self.cd_ic, ic_reset)
+            ]
+            platform.add_platform_command(
+                "set_false_path -to [get_pins -hierarchical -filter {{REF_NAME == IDELAYCTRL && NAME =~ *RST}}]")
+        else:
+            # Test: no primitive; the test drives ic_ready and resets cd_ic itself.
+            self.specials += AsyncResetSynchronizer(self.cd_ic, ic_reset)
 
 # BonsaiXCU1525SoC ---------------------------------------------------------------------------------
 
