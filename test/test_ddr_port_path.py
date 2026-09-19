@@ -192,6 +192,83 @@ def test_engine_port_path_through_the_controller():
     run_simulation(dut, [control(), port_driver(0), port_driver(1)])
 
 
+def test_engine_port_path_streams_at_rate():
+    """A sequential read stream through the whole chain on the real LiteDRAM core must run
+    near one beat per cycle. LiteDRAM's native up-converter (the 256-bit port on the 512-bit
+    controller) used to hold one controller word in flight - a read had to return before the
+    next was accepted - and the XCU1525 streamed weights at 23 cycles/beat (5.6 tok/s on the
+    1.7B, 2026-09-19). The patched converter keeps 8 reads in flight; this pins the rate."""
+    from litedram.core import LiteDRAMCore
+    from litedram.modules import MT40A512M8
+    from litedram.phy.model import SDRAMPHYModel
+
+    class _SimDDR4(MT40A512M8):
+        nrows = 2048
+        ncols = 128
+
+    class _CtrlDUT(Module):
+        def __init__(self):
+            module = _SimDDR4(int(100e6), "1:4")
+            self.submodules.phy  = SDRAMPHYModel(module=module, data_width=64,
+                                                 clk_freq=int(100e6), init=[])
+            self.submodules.core = LiteDRAMCore(phy=self.phy, geom_settings=module.geom_settings,
+                                                timing_settings=module.timing_settings,
+                                                clk_freq=int(100e6))
+            port = self.core.crossbar.get_port(data_width=256)
+            self.axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+            self.submodules.bridge = LiteDRAMAXI2Native(self.axi, port, w_buffer_depth=64, r_buffer_depth=256)
+            self.submodules.reader = BonsaiAXIReader(self.axi)
+            self.submodules.writer = BonsaiAXIWriter(self.axi)
+            self.comb += self.reader.source.ready.eq(1)
+
+    dut = _CtrlDUT()
+    n_beats = 512          # 16 KB: 32 AXI bursts of 16 beats.
+    base = 0x0A0_0000
+    stats = {}
+
+    def driver():
+        yield dut.core.dfii._control.storage.eq(0b1111)
+        yield
+        wr = dut.writer
+        yield wr.sink_cmd.addr.eq(base); yield wr.sink_cmd.len.eq(n_beats); yield wr.sink_cmd.valid.eq(1)
+        yield
+        while not (yield wr.sink_cmd.ready):
+            yield
+        yield wr.sink_cmd.valid.eq(0)
+        for w in range(n_beats):
+            yield wr.sink_data.data.eq(w); yield wr.sink_data.valid.eq(1)
+            yield
+            while not (yield wr.sink_data.ready):
+                yield
+        yield wr.sink_data.valid.eq(0)
+        for _ in range(50000):
+            if (yield wr.idle):
+                break
+            yield
+        rd = dut.reader
+        yield rd.sink.addr.eq(base); yield rd.sink.len.eq(n_beats); yield rd.sink.valid.eq(1)
+        yield
+        while not (yield rd.sink.ready):
+            yield
+        yield rd.sink.valid.eq(0)
+        got, t0, t = [], None, 0
+        for _ in range(50000):
+            if (yield rd.source.valid):
+                if t0 is None:
+                    t0 = t
+                got.append((yield rd.source.data))
+                if len(got) == n_beats:
+                    break
+            yield
+            t += 1
+        assert got == list(range(n_beats)), "stream data differs"
+        stats["cyc_per_beat"] = (t - t0)/n_beats
+
+    run_simulation(dut, [driver()])
+    print(f"stream: {stats['cyc_per_beat']:.2f} cycles/beat")
+    assert stats["cyc_per_beat"] < 2.0, f"the read stream runs at {stats['cyc_per_beat']:.1f} cycles/beat"
+
+
 def test_engine_port_path_through_the_reset_shim():
     """The chain as the SoC wires it: the engine's reader/writer behind the AXI reset shim
     (engreset.py), the shim's port side into LiteDRAMAXI2Native. The shim derives WLAST from
