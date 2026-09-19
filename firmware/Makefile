@@ -20,6 +20,10 @@ include $(SOC_DIRECTORY)/software/common.mak
 # smaller -O2 stays. Text: -Os 83.6 KB, -O2 90.9, -O2 -flto 100.8.
 OPT ?= -O2 -flto -freorder-blocks-and-partition
 CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
+# No fused multiply-add: a build with the hardware FPU (VexiiRiscv --with-rvf, the XCU1525's
+# 27B CPU path) must produce the same float32 bits as the soft-float sim that gated it, and
+# GCC contracts a*b+c into fmadd by default once the F extension is in -march.
+CFLAGS += -ffp-contract=off
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o hybrid.o
 
@@ -61,6 +65,12 @@ infer.o main.o vec.o: progs.h
 
 vpath %.a $(PACKAGES:%=../%)
 
+# The toolchain's libm for the CPU's ABI (soft float today; ilp32f with a VexiiRiscv FPU).
+# LiteX's -march carries an ISA version (rv32i2p0_m) that GCC 10's multilib matcher does not
+# resolve - it silently returns the rv64 default - so the version is stripped here.
+LIBM_ARCH := $(subst i2p0_,i,$(patsubst -march=%,%,$(filter -march=%,$(CPUFLAGS))))
+LIBM_ABI  := $(patsubst -mabi=%,%,$(filter -mabi=%,$(CPUFLAGS)))
+
 bonsai.elf: $(OBJECTS)
 	$(CC) $(LDFLAGS) -T linker.ld -N -o $@ \
 		$(OBJECTS) \
@@ -68,7 +78,7 @@ bonsai.elf: $(OBJECTS)
 		-Wl,--start-group \
 		$(REGULAR_LIBS:lib%=-l%) \
 		$(ALWAYS_LINK_LIBFLAGS) \
-		$$($(TARGET_PREFIX)gcc -march=rv32im -mabi=ilp32 -print-file-name=libm.a) \
+		$$($(TARGET_PREFIX)gcc -march=$(LIBM_ARCH) -mabi=$(LIBM_ABI) -print-file-name=libm.a) \
 		-Wl,--end-group \
 		-Wl,--gc-sections \
 		-Wl,-Map,$@.map
