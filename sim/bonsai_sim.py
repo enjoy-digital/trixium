@@ -112,14 +112,17 @@ class BonsaiSimSoC(SoCCore):
             VexiiRiscv.args_fill(_p)
             _va = _p.parse_args([])
             _va.cpu_variant = "standard"
+            # The extra args go through the real API: args_read runs the generator's
+            # PythonArgsGen on them and the ISA map (hence the software's -march) follows,
+            # so "--with-rvf" gives an FPU the firmware actually uses.
+            _va.vexii_args  = vexii_extra
             VexiiRiscv.args_read(_va)
             # Now override just the fetch cache. 64 sets x 4 ways x 64 B = 16 KB, against a
             # 12 KB forward() that a 4 KB VexRiscv cache cannot hold.
             sets = max(16, (icache_kb*1024)//(4*64)) if icache_kb else 64
             VexiiRiscv.vexii_args = (VexiiRiscv.vexii_args
                                      .replace("--fetch-l1-ways=2", "--fetch-l1-ways=4")
-                                     + f" --fetch-l1-sets={sets}"
-                                     + (" " + vexii_extra if vexii_extra else ""))
+                                     + f" --fetch-l1-sets={sets}")
             print(f"[bonsai] VexiiRiscv args: {VexiiRiscv.vexii_args}")
 
         SoCCore.__init__(self, platform,

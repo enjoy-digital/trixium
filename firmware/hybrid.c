@@ -297,15 +297,17 @@ static void deltanet_layer(int l, const float *h, float *out)
         const float *qh = qb + kh*hk, *kk = kb + kh*hk, *vh = vb + hh*hv;
         float *M = S + (uint64_t)hh*hv*hk;
         float decay = expf(gb[hh]);
+        float *oh = ob + hh*hv;
+        // One pass over the state: row j's delta depends on row j alone, so the decay,
+        // the k dot, the update and the q dot happen while the row (512 B) is in the
+        // D$ - the two-loop form streamed the 64 KB head twice through a 32 KB cache.
+        // Same operations in the same order per element: bit-identical results.
         for (int j = 0; j < hv; j++) {
             float *Mj = M + j*hk, dot = 0;
             for (int i = 0; i < hk; i++) { Mj[i] *= decay; dot += Mj[i]*kk[i]; }
-            delta[j] = (vh[j] - dot)*betab[hh];
-        }
-        float *oh = ob + hh*hv;
-        for (int j = 0; j < hv; j++) {
-            float *Mj = M + j*hk, dot = 0;
-            for (int i = 0; i < hk; i++) { Mj[i] += delta[j]*kk[i]; dot += Mj[i]*qh[i]; }
+            float dj = (vh[j] - dot)*betab[hh];
+            dot = 0;
+            for (int i = 0; i < hk; i++) { Mj[i] += dj*kk[i]; dot += Mj[i]*qh[i]; }
             oh[j] = dot*scale;
         }
         // Gated RMSNorm over the head with the shared head norm, times SiLU(z); written in
