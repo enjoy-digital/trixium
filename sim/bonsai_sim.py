@@ -309,12 +309,12 @@ class BonsaiSimSoC(SoCCore):
                 self.add_sdram(f"sdram{sfx}", phy=phy, module=module,
                                with_soc_interconnect=False)
             core = getattr(self, f"sdram{sfx}")
+            from trixium.gateware.ddr_port import engine_ddr_port
             for j in range(chan_mod):
                 c = k*chan_mod + j
-                port = core.crossbar.get_port(data_width=256)
                 axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
-                setattr(self, f"engbridge{c}",
-                        LiteDRAMAXI2Native(axi, port, w_buffer_depth=64, r_buffer_depth=256))
+                for jj, m in enumerate(engine_ddr_port(core, axi)):   # the target's default port
+                    setattr(self, f"engport{c}_{jj}", m)
                 axis.append(axi)
         # VexiiRiscv enforces execute permission from region.mode (the FK33 target's lesson).
         for _rn, _r in self.bus.regions.items():

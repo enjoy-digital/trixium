@@ -167,6 +167,7 @@ class BonsaiXCU1525SoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
                  ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
+                 port_width=512,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -237,13 +238,15 @@ class BonsaiXCU1525SoC(SoCCore):
         # (the controller is 512 bits wide at 4:1; four ports share its 8 GB/s at 125 MHz)
         # behind an AXI bridge. The read buffer holds the readers' 8 outstanding 16-beat
         # bursts (128 beats), so a channel is never throttled by the bridge.
+        # The port itself: trixium/gateware/ddr_port.py (512-bit ports by default since
+        # v6 - the 256-bit port's native up-converter costs ~5 cycles per controller word).
+        from trixium.gateware.ddr_port import engine_ddr_port
         engine_axis = []
         for c in range(engine_channels):
             core = self.sdrams[c//chan_mod]
-            port = core.crossbar.get_port(data_width=256)
             axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
-            bridge = LiteDRAMAXI2Native(axi, port, w_buffer_depth=64, r_buffer_depth=256)
-            setattr(self, f"engbridge{c}", bridge)
+            for j, m in enumerate(engine_ddr_port(core, axi, port_width=port_width)):
+                setattr(self, f"engport{c}_{j}", m)
             engine_axis.append(axi)
 
         # PCIe -------------------------------------------------------------------------------------
@@ -447,6 +450,7 @@ def main():
     parser.add_target_argument("--main-ram-size",   default=0x1000_0000, type=lambda x: int(x, 0), help="CPU main_ram size on controller 0 (default 256 MB, the FK33's).")
     parser.add_target_argument("--chan-stride",     default=0x4000_0000, type=lambda x: int(x, 0), help="Per-engine-channel stride inside a controller (default 1 GB: 704 MB windows, the 27B fits; 0x10000000 = the FK33's 256 MB).")
     parser.add_target_argument("--chan-skew",       default=0x8000, type=lambda x: int(x, 0), help="Extra per-channel offset inside a controller so the windows start in different DDR4 bank groups (default 32 KB; 0 = none).")
+    parser.add_target_argument("--port-width",      default=512, type=int, help="Crossbar port width per engine channel: 512 (LiteX AXIUpConverter, default) or 256 (LiteDRAM's native up-converter).")
     parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
@@ -462,6 +466,7 @@ def main():
         main_ram_size   = args.main_ram_size,
         chan_stride     = args.chan_stride,
         chan_skew       = args.chan_skew,
+        port_width      = args.port_width,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates

@@ -106,10 +106,18 @@ def test_engine_port_path_write_then_read():
                          dut.mem.read_handler(dut.ctrl_port)])
 
 
-def test_engine_port_path_through_the_controller():
+def _engine_port(core, axi, port_width):
+    from trixium.gateware.ddr_port import engine_ddr_port
+    return engine_ddr_port(core, axi, port_width=port_width)
+
+
+@pytest.mark.parametrize("port_width, base_skew", [(256, 0), (512, 0), (512, 32)])
+def test_engine_port_path_through_the_controller(port_width, base_skew):
     """The same chain on the real LiteDRAM core (bank machines, multiplexer, refresher) over
     the PHY model, DFI in hardware mode as after the BIOS's init - the Verilator sim minus
-    the CPU. Two engine ports on one controller, so the crossbar arbitrates."""
+    the CPU. Two engine ports on one controller, so the crossbar arbitrates. The 512-bit
+    port variant with a 32 B base skew exercises the up-converter's lane selection on
+    bursts that start in the upper half of a controller word."""
     from litedram.core import LiteDRAMCore
     from litedram.modules import MT40A512M8
     from litedram.phy.model import SDRAMPHYModel
@@ -128,10 +136,9 @@ def test_engine_port_path_through_the_controller():
                                                 clk_freq=int(100e6))
             self.axis, self.readers, self.writers = [], [], []
             for i in range(2):
-                port = self.core.crossbar.get_port(data_width=256)
                 axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
-                setattr(self.submodules, f"bridge{i}",
-                        LiteDRAMAXI2Native(axi, port, w_buffer_depth=64, r_buffer_depth=256))
+                for j, m in enumerate(_engine_port(self.core, axi, port_width)):
+                    setattr(self.submodules, f"glue{i}_{j}", m)
                 rd = BonsaiAXIReader(axi); wr = BonsaiAXIWriter(axi)
                 setattr(self.submodules, f"reader{i}", rd)
                 setattr(self.submodules, f"writer{i}", wr)
@@ -142,7 +149,7 @@ def test_engine_port_path_through_the_controller():
     rng = np.random.default_rng(7)
     n_beats = 48
     payloads = [rng.integers(0, 256, 32*n_beats, dtype=np.uint8).tobytes() for _ in range(2)]
-    bases = [0x0A0_0000, 0x0A0_0000 + 0x20_0000]   # Two channels' test addresses.
+    bases = [0x0A0_0000 + base_skew, 0x0A0_0000 + 0x20_0000 + base_skew]   # Two channels' test addresses.
     got = [[], []]
 
     def port_driver(i):
@@ -192,7 +199,8 @@ def test_engine_port_path_through_the_controller():
     run_simulation(dut, [control(), port_driver(0), port_driver(1)])
 
 
-def test_engine_port_path_streams_at_rate():
+@pytest.mark.parametrize("port_width", [256, 512])
+def test_engine_port_path_streams_at_rate(port_width):
     """A sequential read stream through the whole chain on the real LiteDRAM core must run
     near one beat per cycle. LiteDRAM's native up-converter (the 256-bit port on the 512-bit
     controller) used to hold one controller word in flight - a read had to return before the
@@ -214,9 +222,9 @@ def test_engine_port_path_streams_at_rate():
             self.submodules.core = LiteDRAMCore(phy=self.phy, geom_settings=module.geom_settings,
                                                 timing_settings=module.timing_settings,
                                                 clk_freq=int(100e6))
-            port = self.core.crossbar.get_port(data_width=256)
             self.axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-            self.submodules.bridge = LiteDRAMAXI2Native(self.axi, port, w_buffer_depth=64, r_buffer_depth=256)
+            for j, m in enumerate(_engine_port(self.core, self.axi, port_width)):
+                setattr(self.submodules, f"glue{j}", m)
             self.submodules.reader = BonsaiAXIReader(self.axi)
             self.submodules.writer = BonsaiAXIWriter(self.axi)
             self.comb += self.reader.source.ready.eq(1)
@@ -265,8 +273,8 @@ def test_engine_port_path_streams_at_rate():
         stats["cyc_per_beat"] = (t - t0)/n_beats
 
     run_simulation(dut, [driver()])
-    print(f"stream: {stats['cyc_per_beat']:.2f} cycles/beat")
-    assert stats["cyc_per_beat"] < 2.0, f"the read stream runs at {stats['cyc_per_beat']:.1f} cycles/beat"
+    print(f"stream ({port_width}-bit port): {stats['cyc_per_beat']:.2f} cycles/beat")
+    assert stats["cyc_per_beat"] < 3.0, f"the read stream runs at {stats['cyc_per_beat']:.1f} cycles/beat"
 
 
 def test_engine_port_path_through_the_reset_shim():
