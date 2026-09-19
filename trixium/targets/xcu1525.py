@@ -203,6 +203,15 @@ class BonsaiXCU1525SoC(SoCCore):
                 memtype          = "DDR4",
                 sys_clk_freq     = sys_clk_freq,
                 iodelay_clk_freq = 500e6)
+            # liblitedram's write DQ-DQS training (per-module centring of the DQ output delay
+            # against the DQS), which the US+ PHY does not declare by default. On this board
+            # controller 0's byte lane 7 came out of write leveling at the edge of its write
+            # eye (three DQ bits lost written 1s, read leveling then found no window at any
+            # bitslip, memtest KO); the same scan run from the host (tools/xcu1525_rdlevel.py)
+            # moved lane 7's DQ by ~50 taps and the 16 MB memtest passed (2026-09-19). The
+            # flag only adds the C define to sdram_phy.h: the BIOS in the ROM and the
+            # firmware's ddr.c both run the training, no gateware changes.
+            phy.settings.write_dq_dqs_training = True
             setattr(self, f"ddrphy{sfx}", phy)
             module = module_cls(sys_clk_freq, "1:4")
             if i == 0:

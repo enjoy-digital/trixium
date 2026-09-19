@@ -25,7 +25,16 @@
  * MAIN_RAM_BASE = 0x4000_0000 (pseudo-channel 4), and the loader's own port reaches it
  * because the HBM AXI switch routes by address, not by port (layout.py, "port-matched
  * addressing"). Read back through the BIOS to confirm on 2026-09-11: address 0 was not it. */
+/* Where the firmware goes: the ENGINE-side address of main_ram's origin. On the FK33 the CPU
+ * window passes through 1:1 (HBM address = CPU address); on the XCU1525 main_ram is
+ * controller 0's local address 0 and the SoC exports it (BONSAI_MEM_CPU_OFFSET = 0) - the
+ * first XCU1525 boot put the firmware at DRAM 0x40000000, in channel 1's window, and the BIOS
+ * jumped into the memtest's leftovers (2026-09-19). */
+#ifdef BONSAI_MEM_CPU_OFFSET
+#define FW_HBM_ADDR ((uint32_t)BONSAI_MEM_CPU_OFFSET)
+#else
 #define FW_HBM_ADDR ((uint32_t)MAIN_RAM_BASE)
+#endif
 
 struct bons_header {
     uint32_t magic, version, n_layer, n_embd, n_head, n_kv_head, head_dim, ffn_dim, vocab;

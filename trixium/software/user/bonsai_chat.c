@@ -523,10 +523,21 @@ static int upload_model(int devnum, const char *path)
  * stream 2 MB through the 32 KB write-back D$ before the prompt, so no line of the
  * firmware's first 100 KB is left in it (dirty or clean) when the loader writes past the
  * cache, and the BIOS never executes from main_ram (no stale I$ lines). */
+static double g_prompt_wait = 120.0;   /* -W: seconds to wait for the firmware prompt (the
+                                          XCU1525's firmware calibrates three DDR4 controllers
+                                          before it prints one: minutes). */
+static int g_no_cpu_reset;   /* -R: the BIOS is already at its prompt (a host-side DDR
+                                training between its calibration and the boot - the
+                                XCU1525's controller 0 with the v3 bitstream). */
+
 static int fastboot(const char *fw)
 {
-    printf("[boot] CPU reset, waiting for the BIOS prompt...\n");
-    loader_cpu_reset();
+    if (g_no_cpu_reset)
+        printf("[boot] no CPU reset (-R), expecting the BIOS prompt...\n");
+    else {
+        printf("[boot] CPU reset, waiting for the BIOS prompt...\n");
+        loader_cpu_reset();
+    }
     /* The prompt is coloured ("\e[92;1mlitex\e[0m> "), so match its uncoloured tail. It
      * comes after the 2 MB memtest/memspeed and the serial-boot timeout: 1.0 s. */
     if (!tty_expect("[0m> ", 30.0, NULL, 0, 0)) {
@@ -767,6 +778,10 @@ static void usage(void)
            "  -t TTY     console tty (default /dev/ttyLXU0)\n"
            "  -m IMAGE   upload a BONS weight image to HBM first\n"
            "  -k FW      boot this firmware first (CPU reset, loader into main_ram, BIOS boot)\n"
+           "  -R         with -k: no CPU reset - the BIOS is at its prompt already (a host-side\n"
+           "             DDR training ran after its calibration; tools/xcu1525_rdlevel.py)\n"
+           "  -W SECS    wait this long for the firmware prompt (default 120; the XCU1525's\n"
+           "             firmware calibrates three DDR4 controllers first)\n"
            "  -K FW      boot it the old way (serial-boot frames over the console, 30-45 s)\n"
            "  -z FILE    tokeniser (default models/1.7b/tokenizer.bin)\n"
            "  -n N       reply cap in tokens (default 256; the reply ends at <|im_end|> anyway,\n"
@@ -795,7 +810,7 @@ int main(int argc, char **argv)
     const char *sampling = NULL;
     unsigned    seed = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:S:s:y:rh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:S:s:y:W:rRh")) != -1) {
         switch (opt) {
         case 'c': devnum = atoi(optarg); break;
         case 't': tty = optarg; break;
@@ -809,6 +824,8 @@ int main(int argc, char **argv)
         case 'z': tokf = optarg; break;
         case 'n': ntok = atoi(optarg); break;
         case 'r': g_chat = 0; break;
+        case 'R': g_no_cpu_reset = 1; break;
+        case 'W': g_prompt_wait = atof(optarg); break;
         case 'S': sampling = optarg; break;
         case 's': seed = (unsigned)strtoul(optarg, NULL, 0); break;
         case 'y': g_system = optarg; break;
@@ -844,12 +861,12 @@ int main(int argc, char **argv)
      * and waiting too briefly reports "firmware not running" for a board that is merely
      * busy, eating the startup log on the way out. */
     send_line("");
-    if (!tty_expect("bonsai>", 120.0, NULL, 0, 1)) { /* echo: show the self-tests as they run */
+    if (!tty_expect("bonsai>", g_prompt_wait, NULL, 0, 1)) { /* echo: show the self-tests as they run */
         fprintf(stderr,
-            "no 'bonsai>' prompt on %s after 120 s.\n"
+            "no 'bonsai>' prompt on %s after %.0f s (-W to wait longer).\n"
             "  - firmware not running? re-run with -k firmware/bonsai.bin\n"
             "  - self-test wedged? watch the console directly and look for ENGSTALL\n"
-            "  - wrong console? try -t /dev/ttyLXU0 (PCIe) or use litex_term crossover\n", tty);
+            "  - wrong console? try -t /dev/ttyLXU0 (PCIe) or use litex_term crossover\n", tty, g_prompt_wait);
         return 1;
     }
     printf("[init] firmware is up; loading the model header\n");
