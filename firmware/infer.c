@@ -4082,7 +4082,8 @@ int infer_init(void)
     ffn_dim  = H->ffn_dim;
 
     heap    = (uint8_t *)HEAP_BASE;
-    {
+    if (!hybrid_present()) {   // The integer attention's per-head fold shifts by log2(n_rep);
+                               // the hybrid CPU path takes any ratio (the 27B: 24/4 = 6).
         int nrep = n_head/n_kv_head, sh = 0;
         while ((1 << sh) < nrep) sh++;
         if ((1 << sh) != nrep) { printf("infer: n_head/n_kv_head must be a power of two\n"); return -5; }

@@ -108,7 +108,24 @@ static void loader_wait(int chan, uint32_t base, uint64_t beats)
     }
 }
 
+static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, uint64_t beats);
+
+/* The gateware loader counts a transfer in 24 bits of beats (512 MB); the 27B's 641 MB
+ * channel payloads wrapped it and the host spun forever on a full FIFO (2026-09-19).
+ * Chunk at 128 MB; each chunk is its own armed transfer at the advanced base. */
 void loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t beats)
+{
+    const uint64_t chunk = 4u << 20;   /* beats: 128 MB */
+    while (beats > chunk) {
+        loader_transfer_one(chan, base, data, chunk);
+        base  += (uint32_t)(chunk*32);
+        data  += chunk*32;
+        beats -= chunk;
+    }
+    loader_transfer_one(chan, base, data, beats);
+}
+
+static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, uint64_t beats)
 {
     BAR_W(CSR_LOADER_SRC_SEL_ADDR, 1);
     BAR_W(CSR_LOADER_CHAN_ADDR,     chan);
