@@ -36,11 +36,14 @@ OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o 
 #
 # The %.o rule below depends only on the .c, so nothing forces a rebuild when BUILD_DIR moves.
 # This stamp does: it records the tree the objects were built for and wipes them on a change.
+# The CPU flags are part of the stamp too: the same tree regenerated for another CPU (the
+# FPU sim, ilp32f) leaves objects the linker refuses to mix ("can't link single-float
+# modules with soft-float modules") unless everything is rebuilt.
 BUILD_STAMP := .build_dir_stamp
 -include $(BUILD_STAMP)
-ifneq ($(LAST_BUILD_DIR),$(BUILD_DIR))
+ifneq ($(LAST_BUILD_KEY),$(BUILD_DIR) $(CPUFLAGS))
 $(shell rm -f *.o *.d bonsai.bin bonsai.elf)
-$(shell echo "LAST_BUILD_DIR := $(BUILD_DIR)" > $(BUILD_STAMP))
+$(shell echo "LAST_BUILD_KEY := $(BUILD_DIR) $(CPUFLAGS)" > $(BUILD_STAMP))
 endif
 
 COMMA = ,
