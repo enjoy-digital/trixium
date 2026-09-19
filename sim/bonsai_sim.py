@@ -71,7 +71,9 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 # (window - 2 MB) stay above main_ram; 2 MB per window holds the tiny payload and its KV.
 DDR4_SIM_WEIGHT_BASE = 0x00C0_0000  # 12 MB.
 DDR4_SIM_CHAN_STRIDE = 0x0020_0000  # 2 MB.
-DDR4_SIM_CHAN_SKEW   = 0x8000       # 32 KB: the XCU1525's bank-group skew, exercised on every path.
+DDR4_SIM_CHAN_SKEW   = 0xA000       # 40 KB: a bank skew IN THE SIM'S GEOMETRY (ncols 128 puts the
+                                    # bank bits at byte bits 10..13, so the board's 32 KB would be
+                                    # a row bit here); the address arithmetic is what the gate checks.
 DDR4_SIM_CSR_PAGE0   = 8            # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
 
