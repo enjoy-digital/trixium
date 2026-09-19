@@ -58,3 +58,44 @@ def test_idelayctrl_reset_releases_sys():
         assert seen["sys_released"] > seen["rst_dropped"], seen
 
     run_simulation(dut, [gen()], clocks={"sys": 10, "idelay": 4, "idelayrst": 10, "ic": 10})
+
+
+def test_idelayctrl_reset_waits_for_mmcm_lock():
+    """RST stays asserted while the MMCM is unlocked, drops reset_cycles after lock, and
+    comes back (counter reloaded) if lock is lost - UG571's "reset after REFCLK is stable"."""
+    from trixium_xcu1525 import _IDELAYCTRL
+
+    class _DUT(Module):
+        def __init__(self):
+            self.cd_sys = ClockDomain("sys")
+            self.cd_ref = ClockDomain("idelay")
+            self.locked = Signal()
+            self.submodules.ic = _IDELAYCTRL(None, self.cd_ref, self.cd_sys, reset_cycles=8,
+                                             ready_cycles=4, locked=self.locked)
+            since = Signal(4)
+            self.sync.idelayrst += If(self.ic.ic_reset, since.eq(0)).Elif(since != 15, since.eq(since + 1))
+            self.comb += self.ic.ic_ready.eq(since >= 5)
+
+    dut = _DUT()
+    trace = []
+
+    def gen():
+        # 30 cycles unlocked: RST must not drop. Then lock: RST drops ~8 (+2 sync) cycles
+        # later and sys.rst follows. Then a lock loss re-asserts RST at once.
+        for t in range(30):
+            assert (yield dut.ic.ic_reset) == 1, f"RST released at {t} before MMCM lock"
+            yield
+        yield dut.locked.eq(1)
+        for t in range(30):
+            trace.append(((yield dut.ic.ic_reset), (yield dut.cd_sys.rst)))
+            yield
+        drops = [i for i, (r, _) in enumerate(trace) if r == 0]
+        assert drops, "RST never released after lock"
+        assert 8 <= drops[0] <= 12, f"RST released {drops[0]} cycles after lock (want ~8+sync)"
+        assert any(s == 0 for r, s in trace[drops[0]:]), "sys.rst never released"
+        yield dut.locked.eq(0)
+        for t in range(6):
+            yield
+        assert (yield dut.ic.ic_reset) == 1, "RST not re-asserted on lock loss"
+
+    run_simulation(dut, [gen()], clocks={"sys": 10, "idelay": 4, "idelayrst": 10, "ic": 10})

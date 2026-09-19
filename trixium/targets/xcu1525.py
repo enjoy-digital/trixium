@@ -27,6 +27,7 @@ import os
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
+from migen.genlib.cdc import MultiReg
 
 from litex.gen import *
 
@@ -76,7 +77,7 @@ class _CRG(LiteXModule):
                 i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk),
         ]
 
-        self.idelayctrl = _IDELAYCTRL(platform, cd_ref=self.cd_idelay, cd_sys=self.cd_sys)
+        self.idelayctrl = _IDELAYCTRL(platform, cd_ref=self.cd_idelay, cd_sys=self.cd_sys, locked=pll.locked)
 
 # _IDELAYCTRL --------------------------------------------------------------------------------------
 
@@ -97,16 +98,31 @@ class _IDELAYCTRL(LiteXModule):
     sys never counts and the SoC never leaves reset (v2 on the board, 2026-09-19: PCIe up,
     every CSR read 0xffffffff). LiteX's original avoided it by counting in the reference
     domain; this one counts in a reset-less domain on the sys clock (test_xcu1525_crg.py).
+
+    The count starts at MMCM lock, not at configuration: UG571 wants the IDELAYCTRL reset
+    applied after REFCLK is stable, and LiteX gets that for free because its reference
+    domain is reset by ~locked. Here `locked` is synchronised into the counter's domain and
+    holds RST asserted (counter reloaded) while it is low - the MMCM outputs toggle for the
+    ~100 us of lock acquisition, 64 sys cycles would have released RST into an unstable
+    REFCLK, and a RDY that never rises is the v2 symptom again.
     """
-    def __init__(self, platform, cd_ref, cd_sys, reset_cycles=64, ready_cycles=64):
+    def __init__(self, platform, cd_ref, cd_sys, reset_cycles=64, ready_cycles=64, locked=None):
         self.cd_ic       = ClockDomain()
         self.cd_idelayrst = ClockDomain("idelayrst", reset_less=True)
         self.ic_reset    = ic_reset = Signal(reset=1)
         self.ic_ready    = ic_ready = Signal()
         ic_reset_counter = Signal(max=reset_cycles, reset=reset_cycles-1)
         self.comb += self.cd_idelayrst.clk.eq(cd_sys.clk)
+        locked_s = Signal()
+        if locked is None:
+            self.comb += locked_s.eq(1)
+        else:
+            self.specials += MultiReg(locked, locked_s, "idelayrst")
         self.sync.idelayrst += [
-            If(ic_reset_counter != 0,
+            If(~locked_s,
+                ic_reset_counter.eq(ic_reset_counter.reset),
+                ic_reset.eq(1)
+            ).Elif(ic_reset_counter != 0,
                 ic_reset_counter.eq(ic_reset_counter - 1)
             ).Else(
                 ic_reset.eq(0)
