@@ -216,6 +216,12 @@ uint64_t loader_upload_image(const char *path, int verbose)
     return (uint64_t)hdr.n_channels*chan_bytes;
 }
 
+void loader_clear_staging(void)
+{
+    static uint8_t zeros[4096];
+    loader_transfer(0, HDR_STAGING, zeros, BEATS(sizeof(zeros)));
+}
+
 uint64_t loader_upload_firmware(const char *path)
 {
     FILE *f = fopen(path, "rb");

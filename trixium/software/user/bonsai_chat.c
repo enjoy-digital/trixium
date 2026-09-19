@@ -778,6 +778,7 @@ static void usage(void)
            "  -t TTY     console tty (default /dev/ttyLXU0)\n"
            "  -m IMAGE   upload a BONS weight image to HBM first\n"
            "  -k FW      boot this firmware first (CPU reset, loader into main_ram, BIOS boot)\n"
+           "  -C         clear the staged BONS header (before a boot on a new memory layout)\n"
            "  -R         with -k: no CPU reset - the BIOS is at its prompt already (a host-side\n"
            "             DDR training ran after its calibration; tools/xcu1525_rdlevel.py)\n"
            "  -W SECS    wait this long for the firmware prompt (default 120; the XCU1525's\n"
@@ -810,7 +811,7 @@ int main(int argc, char **argv)
     const char *sampling = NULL;
     unsigned    seed = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:S:s:y:W:rRh")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:m:k:K:U:z:n:T::E:S:s:y:W:rRCh")) != -1) {
         switch (opt) {
         case 'c': devnum = atoi(optarg); break;
         case 't': tty = optarg; break;
@@ -820,6 +821,14 @@ int main(int argc, char **argv)
         case 'U': /* Upload the firmware through the loader and exit (bring-up aid). */
             loader_bar_map(devnum);
             printf("%llu bytes\n", (unsigned long long)loader_upload_firmware(optarg));
+            return 0;
+        case 'C': /* Clear the staged BONS header and exit: a firmware that finds one runs its
+                   * self-test on the weights it describes, and after a bitstream whose
+                   * memory layout moved (the XCU1525's bank skew, v5) those are stale -
+                   * the boot wedged in the self-test (2026-09-19). */
+            loader_bar_map(devnum);
+            loader_clear_staging();
+            puts("staged header cleared");
             return 0;
         case 'z': tokf = optarg; break;
         case 'n': ntok = atoi(optarg); break;

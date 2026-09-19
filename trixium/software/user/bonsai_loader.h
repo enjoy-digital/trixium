@@ -38,5 +38,6 @@ uint64_t loader_upload_image(const char *path, int verbose);
  * switch routes by address. ~1 ms for 100 KB against 30-45 s of 64-byte serial-boot frames.
  * The caller then asks the BIOS to `boot 0x40000000`. Returns the byte count. */
 uint64_t loader_upload_firmware(const char *path);
+void     loader_clear_staging(void);   /* Zero the staged BONS header (no model at boot). */
 
 #endif
