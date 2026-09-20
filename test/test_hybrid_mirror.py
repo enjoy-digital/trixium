@@ -38,9 +38,15 @@ def _lroundf(x):
     return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
 
 
-def hybrid27_generate(img, prompt, n_new, exact=False):
+def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None):
     """exact=True: fp32 weights and no activation quantization (the golden's arithmetic),
-    which tests the mirror's structure against the golden independently of the int8 noise."""
+    which tests the mirror's structure against the golden independently of the int8 noise.
+    fast=True: the DeltaNet recurrence in the fast path's arithmetic (docs/xcu1525.md) -
+    q and k as int8 per head (unit vectors, exponent -7), v as int8 per head, the state as
+    int16 with one exponent per head that ratchets up when a row would overflow, the decay
+    as Q15, the dots as exact int32 sums (the engine's Q8 matvec on the two int8 planes),
+    the rank-1 update in the state's fixed point (the vector unit). Everything else stays
+    as in the CPU path. fast_stats (a dict) collects the state exponents seen."""
     h = img.header
     assert h["version"] >= 3 and (any(t == "deltanet" for t in h["layer_types"]) or h["hadamard_block"])
     n_layer, n_embd, ffn_dim = h["n_layer"], h["n_embd"], h["ffn_dim"]
@@ -173,6 +179,46 @@ def hybrid27_generate(img, prompt, n_new, exact=False):
     scale_dn = f32(1.0/np.sqrt(hk))
     scale_at = f32(1.0/np.sqrt(hd))
 
+    def q8_head(x):
+        """int8 with the head's own power-of-two exponent (mantissas in [64, 128))."""
+        amax = np.abs(x).max()
+        if amax == 0:
+            return np.zeros(len(x), dtype=np.int32), 0
+        e = int(np.frexp(f32(amax))[1]) - 7
+        return np.clip(_lroundf(x*f32(np.exp2(-e))), -127, 127).astype(np.int32), e
+
+    state16 = {l: np.zeros((nv, hv, hk), dtype=np.int32) for l in range(n_layer) if dn[l]}
+    state_e = {l: np.full(nv, -20, dtype=np.int64) for l in range(n_layer) if dn[l]}
+
+    def recurrence_fast(l, hh, qh, kk, vh, decay, beta_h):
+        """One head, the fast path's arithmetic. Returns o (float, hv)."""
+        k8, ek = q8_head(kk)
+        q8, eq = q8_head(qh)
+        M = state16[l][hh]
+        eM = int(state_e[l][hh])
+        # decay as Q15: M <- (M * d15 + 2^14) >> 15 (the vector unit's multiply-shift).
+        d15 = int(np.clip(_lroundf(f32(decay)*f32(32768.0)), 0, 32767))
+        M[:] = (M*d15 + (1 << 14)) >> 15
+        # dot_j = M_j . k  (int32 sums; units 2^(eM+ek))
+        dot = (M @ k8).astype(np.int64)
+        dotf = (dot.astype(np.float64)*float(np.exp2(eM + ek))).astype(f32)
+        delta = ((vh - dotf)*beta_h).astype(f32)
+        # rank-1 update: M_ji += wq_j * k8_i with wq_j = round(delta_j * 2^(ek - eM)) - and the
+        # exponent ratchet: if a row would overflow int16, halve the state (eM += 1) first.
+        while True:
+            wq = _lroundf(delta.astype(np.float64)*float(np.exp2(ek - eM)))
+            newM = M + np.outer(wq.astype(np.int64), k8.astype(np.int64))
+            if np.abs(newM).max() < 32768 and np.abs(wq).max() < (1 << 24):
+                break
+            M[:] = (M + 1) >> 1
+            eM += 1
+        M[:] = newM.astype(np.int32)
+        state_e[l][hh] = eM
+        if fast_stats is not None:
+            fast_stats.setdefault("eM", []).append(eM)
+        o = (M @ q8).astype(np.float64)*float(np.exp2(eM + eq))
+        return (o.astype(f32)*scale_dn).astype(f32)
+
     def deltanet(l, hn):
         C = 2*nq + nvh
         qkv = proj(layout.ROLE_ATTN_QKV, l, hn)
@@ -200,24 +246,27 @@ def hybrid27_generate(img, prompt, n_new, exact=False):
         for hh in range(nv):
             kh = hh % nk
             qh, kk, vh = q[kh*hk:(kh + 1)*hk], k[kh*hk:(kh + 1)*hk], v[hh*hv:(hh + 1)*hv]
-            M = state[l][hh]
             decay = f32(np.exp(g[hh], dtype=f32))
-            delta = np.empty(hv, dtype=f32)
-            for j in range(hv):
-                Mj = M[j]
-                dot = f32(0.0)
-                for i in range(hk):
-                    Mj[i] = f32(Mj[i]*decay)
-                    dot = f32(dot + f32(Mj[i]*kk[i]))
-                delta[j] = f32(f32(vh[j] - dot)*beta[hh])
-            oh = np.empty(hv, dtype=f32)
-            for j in range(hv):
-                Mj = M[j]
-                dot = f32(0.0)
-                for i in range(hk):
-                    Mj[i] = f32(Mj[i] + f32(delta[j]*kk[i]))
-                    dot = f32(dot + f32(Mj[i]*qh[i]))
-                oh[j] = f32(dot*scale_dn)
+            if fast:
+                oh = recurrence_fast(l, hh, qh, kk, vh, decay, beta[hh])
+            else:
+                M = state[l][hh]
+                delta = np.empty(hv, dtype=f32)
+                for j in range(hv):
+                    Mj = M[j]
+                    dot = f32(0.0)
+                    for i in range(hk):
+                        Mj[i] = f32(Mj[i]*decay)
+                        dot = f32(dot + f32(Mj[i]*kk[i]))
+                    delta[j] = f32(f32(vh[j] - dot)*beta[hh])
+                oh = np.empty(hv, dtype=f32)
+                for j in range(hv):
+                    Mj = M[j]
+                    dot = f32(0.0)
+                    for i in range(hk):
+                        Mj[i] = f32(Mj[i] + f32(delta[j]*kk[i]))
+                        dot = f32(dot + f32(Mj[i]*qh[i]))
+                    oh[j] = f32(dot*scale_dn)
             nrm = rmsnorm(oh, norm_ssm[l])
             gpos = kh*rep + hh//nk
             og[gpos*hv:(gpos + 1)*hv] = (nrm*silu(z[hh*hv:(hh + 1)*hv])).astype(f32)
