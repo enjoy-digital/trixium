@@ -127,6 +127,19 @@ ROLE_NAMES = {
 def ceil_div(a, b):
     return (a + b - 1)//b
 
+def deltanet_state_bytes_per_channel(cfg, n_channels):
+    """FP32 recurrent-matrix storage needed by the hardware DeltaNet path.
+
+    Whole value-head matrices are striped over the engine channels.  Return the largest
+    channel's allocation so the converter's fit check covers a non-even final stripe too.
+    The short convolution history remains CPU-resident and is not part of this region.
+    """
+    if not cfg.n_dn_layers:
+        return 0
+    heads = cfg.n_dn_layers*cfg.dn_num_v_heads
+    head_bytes = cfg.dn_v_head_dim*cfg.dn_k_head_dim*4
+    return ceil_div(heads, n_channels)*head_bytes
+
 def row_groups(cols, kind):
     group = KIND_GROUP[kind]
     assert cols % group == 0, f"cols {cols} not a multiple of group {group}"

@@ -237,3 +237,14 @@ void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst)
     op.dst   = dst;
     engine_run(&op);
 }
+
+void engine_store(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t src)
+{
+    struct engine_op op = {0};
+    op.kind  = ENGINE_KIND_STORE;
+    op.chan  = chan;
+    op.wbase = addr;
+    op.wlen  = beats;
+    op.xsrc  = src;
+    engine_run(&op);
+}

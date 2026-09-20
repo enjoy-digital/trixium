@@ -240,22 +240,26 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     # firmware's DDR round-trip test (ddr.c) writes them on boards with several controllers.
     kv_rb    = 1 + cfg.head_dim//32
     kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
+    dn_bytes = layout.deltanet_state_bytes_per_channel(cfg, n_channels)
     weights  = sum(_tensor_beats(t, n_channels) for t in specs)*32
     emb16_b  = 0
     if emb16:
         erows   = (vocab_pad + 15)//16
         emb16_b = (vocab_pad*cfg.n_embd*2 + erows*32)//n_channels   # int16 rows + exponents
     def mb(b): return f"{b/1e6:.0f} MB"
-    if weights + kv_bytes > window:
-        raise SystemExit(f"{cfg.name}: {mb(weights)} of weights + {mb(kv_bytes)} of KV per "
+    reserved = weights + kv_bytes + dn_bytes
+    if reserved > window:
+        raise SystemExit(f"{cfg.name}: {mb(weights)} of weights + {mb(kv_bytes)} of KV"
+                         f"{' + ' + mb(dn_bytes) + ' of DeltaNet state' if dn_bytes else ''} per "
                          f"channel exceed the {mb(window)} channel window at {n_channels} "
                          f"channels - this model does not fit the card")
-    if emb16 and weights + kv_bytes + emb16_b > window:
+    if emb16 and reserved + emb16_b > window:
         print(f"  int16 embedding table ({mb(emb16_b)}/channel) would overflow the channel "
-              f"window ({mb(weights + kv_bytes)} used of {mb(window)}): left out, the firmware "
+              f"window ({mb(reserved)} used of {mb(window)}): left out, the firmware "
               f"decodes the ternary embedding rows itself (~2.6% per token)")
         emb16 = False
     print(f"  per channel: weights {mb(weights)} + KV {mb(kv_bytes)}"
+          f"{' + DeltaNet state ' + mb(dn_bytes) if dn_bytes else ''}"
           f"{' + emb16 ' + mb(emb16_b) if emb16 else ''} of {mb(window)}")
 
     sha = b""

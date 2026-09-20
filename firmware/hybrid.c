@@ -50,6 +50,94 @@ static float *kc, *vc;               // [n_attn][ctx_cap][kv_dim]
 static float *rope_c, *rope_s, *rope_freq;
 static int    rope_pos_cached;
 
+// Exact-FP32 recurrence accelerator. The fixed gateware geometry is the 27B's 128x128
+// matrix; other hybrid test models keep using the scalar CPU implementation below.
+static int      dn_hw;
+static uint32_t dn_hbm_base;
+
+#ifdef BONSAI_HAS_DNREC
+#define DN_SP_STATE 0x00000u
+#define DN_SP_Q     0x10000u
+#define DN_SP_K     0x10200u
+#define DN_SP_V     0x10400u
+#define DN_SP_OUT   0x10600u
+#define DN_HW_ROWS  128u
+#define DN_HW_COLS  128u
+#define DN_HEAD_BYTES (DN_HW_ROWS*DN_HW_COLS*4u)
+#define DN_HEAD_BEATS (DN_HEAD_BYTES/32u)
+
+static uint32_t f32_bits(float x)
+{
+    union { float f; uint32_t u; } v = { .f = x };
+    return v.u;
+}
+
+static uint32_t dn_head_addr(uint32_t global_head)
+{
+    return dn_hbm_base + (global_head/(uint32_t)n_ch)*DN_HEAD_BYTES;
+}
+
+static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
+                       const float *vh, float decay, float beta, float scale, float *oh)
+{
+    uint8_t chan = global_head % (uint32_t)n_ch;
+    engine_fetch(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+
+    volatile float *sq = (volatile float *)(SCRATCHPAD_BASE + DN_SP_Q);
+    volatile float *sk = (volatile float *)(SCRATCHPAD_BASE + DN_SP_K);
+    volatile float *sv = (volatile float *)(SCRATCHPAD_BASE + DN_SP_V);
+    for (uint32_t i = 0; i < DN_HW_COLS; i++) { sq[i] = qh[i]; sk[i] = kh[i]; }
+    for (uint32_t i = 0; i < DN_HW_ROWS; i++) sv[i] = vh[i];
+
+    dnunit_decay_write(f32_bits(decay));
+    dnunit_beta_write(f32_bits(beta));
+    dnunit_scale_write(f32_bits(scale));
+    uint32_t done = dnunit_done_count_read();
+    dnunit_submit_write(1);
+    uint32_t spins = 0;
+    while (dnunit_done_count_read() == done && ++spins < 100000u) {}
+    if (dnunit_done_count_read() == done) {
+        puts("DNSTALL: recurrence command did not complete");
+        engine_wedged = 1;
+        return;
+    }
+
+    engine_store(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+    volatile float *so = (volatile float *)(SCRATCHPAD_BASE + DN_SP_OUT);
+    for (uint32_t i = 0; i < DN_HW_ROWS; i++) oh[i] = so[i];
+}
+
+static void dn_hw_reset(void)
+{
+    // Fill one matrix once, then let the engine's multi-store repeat it across consecutive
+    // per-channel slots (up to 31 packets per command). This clears the full 144 MiB 27B
+    // state without walking it over the CPU/main-RAM path.
+    volatile uint32_t *z = (volatile uint32_t *)(SCRATCHPAD_BASE + DN_SP_STATE);
+    for (uint32_t i = 0; i < DN_HEAD_BYTES/4; i++) z[i] = 0;
+    uint32_t total = (uint32_t)n_dn*(uint32_t)nv;
+    for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
+        uint32_t count = (total + (uint32_t)n_ch - 1u - c)/(uint32_t)n_ch;
+        uint32_t slot = 0;
+        while (slot < count) {
+            uint32_t batch = count - slot;
+            if (batch > 31) batch = 31;
+            struct engine_op op = {0};
+            op.kind    = ENGINE_KIND_STORE;
+            op.chan    = c;
+            op.wbase   = dn_hbm_base + slot*DN_HEAD_BYTES;
+            op.wlen    = DN_HEAD_BEATS;
+            op.xsrc    = DN_SP_STATE;
+            op.rep     = batch;
+            op.dstride = DN_HEAD_BEATS;
+            op.sstride = 0;
+            engine_run(&op);
+            if (engine_wedged) return;
+            slot += batch;
+        }
+    }
+}
+#endif
+
 int hybrid_present(void)
 {
     const struct bons_header *h = model_header();
@@ -167,8 +255,45 @@ int hybrid_init(void)
         if (bons_layer_is_deltanet(H, l)) { dn_slot[l] = n_dn++; attn_slot[l] = -1; }
         else                              { attn_slot[l] = n_attn++; dn_slot[l] = -1; }
     }
-    // The CPU state: fp32 everything. main_ram decides how deep the KV cache goes.
-    uint64_t state_b = (uint64_t)n_dn*nv*hv*hk*4 + (uint64_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4;
+    dn_hw = 0;
+#ifdef BONSAI_HAS_DNREC
+    dn_hw = n_dn && hv == DN_HW_ROWS && hk == DN_HW_COLS;
+    if (dn_hw) {
+        // Keep the same conservative KV reservation as the image converter, then place
+        // whole recurrent matrices immediately above it. Hybrid attention currently keeps
+        // its KV cache in main RAM, but reserving the range makes this layout future-proof.
+        uint32_t kv_base = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32
+                                      + 0xFFFu) & ~0xFFFu);
+        uint32_t kv_rb = 1u + (uint32_t)head_dim/32u;
+        uint32_t kv_region = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)
+                           /(uint32_t)n_ch*kv_rb;
+        uint64_t base = (uint64_t)kv_base
+                      + (uint64_t)n_layer*n_kv_head*2u*kv_region*32u;
+        dn_hbm_base = (uint32_t)((base + 0xFFFu) & ~0xFFFull);
+        uint64_t state_per_channel = ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
+        uint32_t skew_count = BONSAI_CHAN_MOD ? BONSAI_CHAN_MOD - 1u : 0u;
+        uint64_t limit = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + BONSAI_CHAN_STRIDE
+                       - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE) - 0x1000u
+                       - (uint64_t)skew_count*BONSAI_CHAN_SKEW;
+        if ((uint64_t)dn_hbm_base + state_per_channel > limit) {
+            printf("hybrid: DeltaNet state reaches %08lx, past channel limit %08lx - "
+                   "reconvert for this board\n",
+                   (unsigned long)((uint64_t)dn_hbm_base + state_per_channel),
+                   (unsigned long)limit);
+            return -1;
+        }
+        dnunit_state_base_write(DN_SP_STATE);
+        dnunit_q_base_write(DN_SP_Q);
+        dnunit_k_base_write(DN_SP_K);
+        dnunit_v_base_write(DN_SP_V);
+        dnunit_out_base_write(DN_SP_OUT);
+    }
+#endif
+    // FP32 state. The matrix lives in engine DDR when the recurrence accelerator is
+    // available; the short causal-convolution history remains in main RAM either way.
+    uint64_t matrix_b = (uint64_t)n_dn*nv*hv*hk*4;
+    uint64_t conv_b = (uint64_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4;
+    uint64_t state_b = (dn_hw ? 0 : matrix_b) + conv_b;
     ctx_cap = H->max_ctx;
     uint64_t kv_b = (uint64_t)n_attn*ctx_cap*kv_dim*4*2;
     uint64_t room = infer_heap_room(1);
@@ -184,7 +309,7 @@ int hybrid_init(void)
                (unsigned long)(kv_b >> 10), (unsigned long)(work_b >> 10), (unsigned long)(room >> 10));
         return -1;
     }
-    dn_state = n_dn ? infer_halloc((uint64_t)n_dn*nv*hv*hk*4, 1) : NULL;
+    dn_state = (n_dn && !dn_hw) ? infer_halloc(matrix_b, 1) : NULL;
     dn_conv  = n_dn ? infer_halloc((uint64_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4, 1) : NULL;
     kc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
@@ -243,14 +368,26 @@ int hybrid_init(void)
            "rope %d/%d, gate %d, hadamard %d (widths", n_dn, n_attn, nv, nk, hv, hk, conv_k,
            rope_n, head_dim, H->attn_gated, H->hadamard_block);
     for (int i = 0; i < 4; i++) if (H->hadamard_widths[i]) printf(" %lu", (unsigned long)H->hadamard_widths[i]);
-    printf("), ctx %d, state %lu KB - CPU path\n", ctx_cap, (unsigned long)(state_b >> 10));
+    if (dn_hw)
+        printf("), ctx %d, state %lu KB + %lu KB engine DDR at %08lx - HW recurrence\n",
+               ctx_cap, (unsigned long)(conv_b >> 10), (unsigned long)(matrix_b >> 10),
+               (unsigned long)dn_hbm_base);
+    else
+        printf("), ctx %d, state %lu KB - CPU path\n", ctx_cap,
+               (unsigned long)(state_b >> 10));
     return 0;
 }
 
 void hybrid_reset(void)
 {
     pos = 0;
-    if (dn_state) memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
+    if (dn_hw) {
+#ifdef BONSAI_HAS_DNREC
+        dn_hw_reset();
+#endif
+    } else if (dn_state) {
+        memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
+    }
     if (dn_conv)  memset(dn_conv, 0, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);
 }
 
@@ -294,7 +431,7 @@ static void deltanet_layer(int l, const float *h, float *out)
 {
     int   s = dn_slot[l];
     int   C = 2*nq + nvh;
-    float *S    = dn_state + (uint64_t)s*nv*hv*hk;
+    float *S    = dn_hw ? NULL : dn_state + (uint64_t)s*nv*hv*hk;
     float *win  = dn_conv + (uint64_t)s*(conv_k - 1)*C;
 
     proj_f(model_entry(ROLE_ATTN_QKV, l), h, qkv);
@@ -327,23 +464,30 @@ static void deltanet_layer(int l, const float *h, float *out)
     for (int hh = 0; hh < nv; hh++) {
         int kh = hh % nk;
         const float *qh = qb + kh*hk, *kk = kb + kh*hk, *vh = vb + hh*hv;
-        float *M = S + (uint64_t)hh*hv*hk;
+        float *M = dn_hw ? NULL : S + (uint64_t)hh*hv*hk;
         float decay = expf(gb[hh]);
         float *oh = ob + hh*hv;
-        // One pass over the state: row j's delta depends on row j alone, so the decay,
-        // the k dot, the update and the q dot happen while the row (512 B) is in the
-        // D$ - the two-loop form streamed the 64 KB head twice through a 32 KB cache.
-        // Same operations in the same order per element: bit-identical results.
-        int j = 0;
-        for (; j + 3 < hv; j += 4)
-            deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
-        for (; j < hv; j++) {
-            float *Mj = M + j*hk, dot = 0;
-            for (int i = 0; i < hk; i++) { Mj[i] *= decay; dot += Mj[i]*kk[i]; }
-            float dj = (vh[j] - dot)*betab[hh];
-            dot = 0;
-            for (int i = 0; i < hk; i++) { Mj[i] += dj*kk[i]; dot += Mj[i]*qh[i]; }
-            oh[j] = dot*scale;
+        if (dn_hw) {
+#ifdef BONSAI_HAS_DNREC
+            dn_hw_head((uint32_t)s*nv + (uint32_t)hh, qh, kk, vh, decay,
+                       betab[hh], scale, oh);
+#endif
+        } else {
+            // One pass over the state: row j's delta depends on row j alone, so the decay,
+            // the k dot, the update and the q dot happen while the row (512 B) is in the
+            // D$ - the two-loop form streamed the 64 KB head twice through a 32 KB cache.
+            // Same operations in the same order per element: bit-identical results.
+            int j = 0;
+            for (; j + 3 < hv; j += 4)
+                deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
+            for (; j < hv; j++) {
+                float *Mj = M + j*hk, dot = 0;
+                for (int i = 0; i < hk; i++) { Mj[i] *= decay; dot += Mj[i]*kk[i]; }
+                float dj = (vh[j] - dot)*betab[hh];
+                dot = 0;
+                for (int i = 0; i < hk; i++) { Mj[i] += dj*kk[i]; dot += Mj[i]*qh[i]; }
+                oh[j] = dot*scale;
+            }
         }
         // Gated RMSNorm over the head with the shared head norm, times SiLU(z); written in
         // grouped head order (key head major) - the order the folded out projection expects.

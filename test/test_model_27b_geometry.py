@@ -89,6 +89,10 @@ def test_27b_layer_pattern_and_dimensions():
     for cols in (cfg.n_embd, cfg.ffn_dim, cfg.head_dim):
         assert cols % 128 == 0
     assert cfg.vocab_padded(16) == 248320
+    # 48 DeltaNet layers x 48 value heads = 2304 whole 128x128 FP32 matrices;
+    # striped evenly over 16 channels, that is 144 x 64 KiB per channel.
+    from trixium import layout
+    assert layout.deltanet_state_bytes_per_channel(cfg, 16) == 144*128*128*4
 
 
 def test_27b_is_refused_with_the_reason_and_the_8b_is_not():

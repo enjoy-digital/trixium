@@ -52,6 +52,7 @@ void engine_run(const struct engine_op *op);
 uint32_t engine_submit(const struct engine_op *op);
 void engine_join(uint32_t done);
 void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst);
+void engine_store(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t src);
 
 extern int engine_wedged; // Set once an op stalled (see ENGSTALL in engine.c).
 int engine_recover(void);   // Soft reset of the engine cluster; 0 = recovered, <0 = reconfigure.
