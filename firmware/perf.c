@@ -62,6 +62,20 @@ uint32_t perf_now(void)
     return ~timer0_value_read(); // Down-counter -> up-counting cycles.
 }
 
+uint64_t perf_now64(void)
+{
+    // A 27B forward is over a billion cycles and even bench 1 can cross the 32-bit timer
+    // wrap.  RV32 exposes the architectural counter as two CSRs; sample high/low/high so
+    // a low-word rollover between reads cannot create a torn timestamp.
+    uint32_t hi0, lo, hi1;
+    do {
+        __asm__ volatile("rdcycleh %0" : "=r"(hi0));
+        __asm__ volatile("rdcycle %0"  : "=r"(lo));
+        __asm__ volatile("rdcycleh %0" : "=r"(hi1));
+    } while (hi0 != hi1);
+    return ((uint64_t)hi0 << 32) | lo;
+}
+
 void perf_enter(enum perf_op op)
 {
     perf_t0[op] = perf_now();

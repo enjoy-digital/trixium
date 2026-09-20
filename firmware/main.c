@@ -205,6 +205,19 @@ static void hwops_cmd(char *args)
     hwops_print();
 }
 
+static void print_u64_dec(uint64_t v)
+{
+    // LiteX's minimal printf treats %llu as %lu.  Long 27B benchmarks exceed 32 bits,
+    // so format the few 64-bit values here without pulling a larger printf into firmware.
+    char buf[20];
+    int n = 0;
+    do {
+        buf[n++] = '0' + (char)(v % 10);
+        v /= 10;
+    } while (v);
+    while (n) putchar(buf[--n]);
+}
+
 static void bench_cmd(char *args)
 {
     char *tok = get_token(&args);
@@ -212,24 +225,31 @@ static void bench_cmd(char *args)
     static const int prompt[3] = {1, 2, 3};
     perf_reset();
     uint32_t f0 = infer_forwards;
-    uint32_t t0 = perf_now();
+    uint64_t t0 = perf_now64();
     printf("GEN:");
     int count = infer_generate(prompt, 3, n, emit_token);
-    uint32_t dt = perf_now() - t0;
+    uint64_t dt = perf_now64() - t0;
     uint32_t fwd = infer_forwards - f0;
     puts("");
     perf_print();
-    printf("BENCH: %d tokens, %lu cycles total", count, (unsigned long)dt);
-    if (count > 0)
-        printf(", %lu cycles/token (%lu.%03lu tok/s @%luMHz)",
-               (unsigned long)(dt/count),
+    printf("BENCH: %d tokens, ", count);
+    print_u64_dec(dt);
+    printf(" cycles total");
+    if (count > 0) {
+        printf(", ");
+        print_u64_dec(dt/count);
+        printf(" cycles/token (%lu.%03lu tok/s @%luMHz)",
                (unsigned long)(((uint64_t)CONFIG_CLOCK_FREQUENCY*count)/dt),
                (unsigned long)((((uint64_t)CONFIG_CLOCK_FREQUENCY*count*1000)/dt) % 1000),
                (unsigned long)(CONFIG_CLOCK_FREQUENCY/1000000));
+    }
     // Per FORWARD: the comparable figure across the 2026-09-07 change that stopped
     // running the unused final forward (bench 64 = 3 prompt + 63 = 66 forwards, was 67).
-    if (fwd > 0)
-        printf(", %lu forwards, %lu cycles/fwd", (unsigned long)fwd, (unsigned long)(dt/fwd));
+    if (fwd > 0) {
+        printf(", %lu forwards, ", (unsigned long)fwd);
+        print_u64_dec(dt/fwd);
+        printf(" cycles/fwd");
+    }
     puts("");
 }
 

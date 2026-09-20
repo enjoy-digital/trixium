@@ -33,6 +33,7 @@ enum perf_op {
 void     perf_init(void);
 void     perf_reset(void);
 uint32_t perf_now(void); // Free-running cycle counter (wraps; deltas are valid).
+uint64_t perf_now64(void); // Architectural cycle/cycleh counter for long benchmarks.
 void     perf_enter(enum perf_op op);
 void     perf_exit(enum perf_op op);
 void     perf_print(void); // Dump per-op {calls, cycles} table + engine counters.
