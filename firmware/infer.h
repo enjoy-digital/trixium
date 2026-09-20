@@ -63,6 +63,7 @@ void infer_spec_stats(int *acc, int *rej);  // Accepted / rejected draft counts.
 // order out), main_ram allocation (big = the high heap when there is one), the room left,
 // an F32 tensor fetch, the embedding row as floats.
 struct bons_entry;
+uint32_t infer_matvec_cols(const struct bons_entry *e);   // K of the whole matvec (K-segments summed).
 void     infer_matvec_f(const struct bons_entry *e, const float *src, float *dst);
 void    *infer_halloc(uint64_t n, int big);
 uint64_t infer_heap_room(int big);

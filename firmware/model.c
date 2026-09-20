@@ -106,6 +106,34 @@ const struct bons_entry *model_entry_kind(int role, int layer, int kind)
     return 0;
 }
 
+const struct bons_entry *model_entry_at(uint32_t i)
+{
+    return &model_table()[i];
+}
+
+const struct bons_entry *model_entry_kseg(const struct bons_entry *e0, int k)
+{
+    const struct bons_header *h = model_header();
+    const struct bons_entry  *t = model_table();
+    if (!(e0->flags & FLAG_KSEG))
+        return k == 0 ? e0 : 0;
+    for (uint32_t i = 0; i < h->n_tensors; i++)
+        if (t[i].role == e0->role && t[i].layer == e0->layer && t[i].kind == e0->kind
+            && (t[i].flags & FLAG_KSEG) && t[i].kseg == k)
+            return &t[i];
+    return 0;
+}
+
+int model_entry_nkseg(const struct bons_entry *e0)
+{
+    if (!(e0->flags & FLAG_KSEG))
+        return 1;
+    int n = 0;
+    while (model_entry_kseg(e0, n))
+        n++;
+    return n;
+}
+
 void model_info(void)
 {
     const struct bons_header *h = model_header();

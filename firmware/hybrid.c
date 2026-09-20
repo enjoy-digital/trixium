@@ -112,7 +112,7 @@ static void rotate_f(const float *src, float *dst, int width)
 static void proj_f(const struct bons_entry *e, const float *src, float *dst)
 {
     if (H->hadamard_block) {
-        rotate_f(src, rot, e->cols);
+        rotate_f(src, rot, infer_matvec_cols(e));   // The whole width, K-segments included.
         infer_matvec_f(e, rot, dst);
     } else {
         infer_matvec_f(e, src, dst);

@@ -16,6 +16,11 @@
 const struct bons_header *model_header(void);
 const struct bons_entry  *model_entry(int role, int layer);
 const struct bons_entry  *model_entry_kind(int role, int layer, int kind);
+// K-segment k of a wide matvec (FLAG_KSEG); k = 0 is what model_entry returns.
+const struct bons_entry *model_entry_kseg(const struct bons_entry *e0, int k);
+int                      model_entry_nkseg(const struct bons_entry *e0);
+const struct bons_entry *model_entry_at(uint32_t i);   // The table itself, entry i.
+
 void model_info(void);
 void model_cache_reset(void); // Invalidate the (role, layer) lookup cache (call on hdrload).
 

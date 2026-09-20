@@ -36,7 +36,7 @@ class TensorSpec:
     - KIND_F16/F32: values (rows, cols).
     """
     def __init__(self, name, role, layer, kind, rows, cols, scales=None, values=None, flags=0,
-                 loader=None, bias=None):
+                 loader=None, bias=None, kseg=0, fixed_point=None):
         self.name   = name
         self.role   = role
         self.layer  = layer
@@ -46,6 +46,7 @@ class TensorSpec:
         self.scales = scales
         self.values = values
         self.flags  = flags
+        self.kseg   = kseg          # K-segment index (with FLAG_KSEG), see layout.FLAG_KSEG.
         # loader: a callable returning `values` on demand, for the streaming writer - the
         # 1.7B's codes are 1.7 GB and the whole image another 1.1, and the old writer held
         # both plus every temporary (14.5 GB peak); the 8B could not convert at all.
@@ -60,6 +61,8 @@ class TensorSpec:
             gs_max      = bx.GS_MAX if kind == KIND_TERNARY else bx.GS_MAX_Q8
             self.bias   = bx.choose_scale_bias(e16)
             self.rshift = bx.choose_result_shift(scales, self.bias, gs_max=gs_max)
+            if fixed_point is not None:   # A K-segment: the whole tensor's contract.
+                self.bias, self.rshift = fixed_point
         else:
             # NORM16 norm companions: bias = the tensor's exponent (int8, two's complement).
             self.bias   = (bias & 0xFF) if bias is not None else 0
@@ -75,6 +78,31 @@ class TensorSpec:
         return self.values if self.values is not None else self.loader()
 
 # Row packet encoding ------------------------------------------------------------------------------
+
+def split_wide(spec, kseg_max=layout.KSEG_MAX):
+    """A matvec spec wider than kseg_max as K-segments: equal column ranges (a multiple of the
+    scale group each), the tensor's own bias/rshift for every segment so their int32 results
+    add up, FLAG_KSEG with the segment index. Anything narrower comes back as [spec]."""
+    if spec.kind not in (layout.KIND_TERNARY, layout.KIND_Q8) or spec.cols <= kseg_max:
+        return [spec]
+    group = layout.KIND_GROUP[spec.kind]
+    nseg  = -(-spec.cols // kseg_max)
+    ngrp  = spec.cols // group
+    bounds = [(ngrp*k // nseg)*group for k in range(nseg + 1)]
+    segs = []
+    for k in range(nseg):
+        c0, c1 = bounds[k], bounds[k + 1]
+        scales = np.ascontiguousarray(spec.scales[:, c0//group:c1//group])
+        values = None if spec.values is None else np.ascontiguousarray(spec.values[:, c0:c1])
+        loader = None
+        if spec.loader is not None:
+            loader = (lambda c0=c0, c1=c1, src=spec.loader: np.ascontiguousarray(src()[:, c0:c1]))
+        segs.append(TensorSpec(f"{spec.name}.k{k}", spec.role, spec.layer, spec.kind, spec.rows,
+                               c1 - c0, scales=scales, values=values, loader=loader,
+                               flags=spec.flags | layout.FLAG_KSEG, kseg=k,
+                               fixed_point=(spec.bias, spec.rshift)))
+    return segs
+
 
 def encode_rows(spec, row0, nrows, values=None):
     """Encode rows [row0, row0+nrows) of a tensor as row-packet bytes -> (nrows*row_beats*32,).
@@ -332,7 +360,7 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
             del values
             entries.append(layout.pack_entry(
                 spec.role, spec.kind, spec.flags, spec.layer, spec.rows, spec.cols,
-                base_beats, len_beats, crc, spec.bias, spec.rshift, spec.name))
+                base_beats, len_beats, crc, spec.bias, spec.rshift, spec.name, kseg=spec.kseg))
             manifest_tensors.append({
                 "name": spec.name, "role": ROLE_NAMES[spec.role], "layer": spec.layer,
                 "kind": KIND_NAMES[spec.kind], "flags": spec.flags,

@@ -116,14 +116,21 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
     t += _hadamard_specs(cfg)
     return t
 
-def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY):
+def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
+    """kseg_max: split matvecs wider than this into K-segments (the 27B's FFN down projection
+    path, exercised on the tiny model with e.g. 256); the image is named `-kseg`."""
     os.makedirs(out_dir, exist_ok=True)
     if cfg.layer_types:
         tensors = make_tiny_hybrid_tensors(cfg, seed)
     else:
         tensors = make_tiny_tensors(cfg, seed)
-    img_path = os.path.join(out_dir, f"{cfg.name}-n{n_channels}.img")
-    man_path = os.path.join(out_dir, f"{cfg.name}-n{n_channels}.json")
+    suffix = ""
+    if kseg_max is not None:
+        from trixium.model.bons import split_wide
+        tensors = [seg for t in tensors for seg in split_wide(t, kseg_max)]
+        suffix = "-kseg"
+    img_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.img")
+    man_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.json")
     manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path)
     return img_path, man_path, manifest
 
@@ -133,10 +140,12 @@ def main():
     parser.add_argument("--channels", default=2, type=int,   help="Channel shard count.")
     parser.add_argument("--seed",     default=1234, type=int)
     parser.add_argument("--hybrid",   action="store_true", help="bonsai-tiny-hybrid (the 27B's shape).")
+    parser.add_argument("--kseg-max", default=None, type=int, help="Split matvecs wider than this (K-segments).")
     args = parser.parse_args()
     from trixium.model.configs import BONSAI_TINY_HYBRID
     img, man, manifest = generate(args.out, args.channels, args.seed,
-                                  cfg=BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY)
+                                  cfg=BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY,
+                                  kseg_max=args.kseg_max)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")
     print(f"manifest : {man}")
     print(f"payload  : {manifest['payload_beats']} beats/channel "

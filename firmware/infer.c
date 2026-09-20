@@ -406,9 +406,10 @@ static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
 #endif
 
 // Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
-// scaled by xscale) into dst[gathered global order: chan*rows + row].
+// scaled by xscale) into dst[gathered global order: chan*rows + row]. With `acc` the int32
+// results are added into acc[] instead (a K-segment of a wide matvec; the caller scales).
 COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t rows,
-                          float xscale, float *dst)
+                          float xscale, float *dst, int32_t *acc)
 {
     uint32_t rb = bons_row_beats(e->cols, e->kind, e->group);
     struct engine_op op = {0};
@@ -426,10 +427,15 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
     engine_run(&op);
 
     perf_enter(OP_NORM_I32);
-    float sc = ldexpf(xscale, (int)e->rshift - (int)e->bias);
     volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
-    for (uint32_t i = 0; i < rows*n_ch; i++)
-        dst[i] = (float)y[i]*sc;
+    if (acc) {
+        for (uint32_t i = 0; i < rows*n_ch; i++)
+            acc[i] += y[i];
+    } else {
+        float sc = ldexpf(xscale, (int)e->rshift - (int)e->bias);
+        for (uint32_t i = 0; i < rows*n_ch; i++)
+            dst[i] = (float)y[i]*sc;
+    }
     perf_exit(OP_NORM_I32);
 }
 
@@ -439,11 +445,8 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
 // stay inside SP_Y..SP_H (96 KB) whatever the row count (the 27B's LM head is 15,520 rows
 // per channel).
 static float *rot_scratch;   // (SP_H - SP_Y)/4 floats, allocated on first use.
-void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
+static void matvec_f_one(const struct bons_entry *e, float xs, float *dst, int32_t *acc)
 {
-    if (!rot_scratch) rot_scratch = halloc((SP_H - SP_Y));
-    int e8 = quantize_f_pow2(src, e->cols, SP_X);
-    float xs = ldexpf(1.0f, e8);
     uint32_t rpc   = e->rows/n_ch;
     uint32_t chunk = (SP_H - SP_Y)/(4*n_ch);
     if (chunk > rpc) chunk = rpc;
@@ -451,16 +454,96 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
         uint32_t n = (rpc - r0 < chunk) ? rpc - r0 : chunk;
         // matvec_rows_f gathers chan*n + row: unshuffle into row order per channel.
         if (n == rpc) {
-            matvec_rows_f(e, r0, n, xs, dst);
+            matvec_rows_f(e, r0, n, xs, dst, acc);
+        } else if (acc) {
+            // K-segment: the int32 results arrive as [chan][n]; add them at [chan][rpc].
+            matvec_rows_f(e, r0, n, xs, 0, (int32_t *)rot_scratch);
+            volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
+            (void)y;
+            for (int c = 0; c < n_ch; c++)
+                for (uint32_t i = 0; i < n; i++)
+                    acc[(uint32_t)c*rpc + r0 + i] += ((int32_t *)rot_scratch)[(uint32_t)c*n + i];
         } else {
             // Results arrive as [chan][n] at the scratchpad; scatter them into the
             // caller's [chan][rpc] row order straight from there.
-            matvec_rows_f(e, r0, n, xs, rot_scratch);
+            matvec_rows_f(e, r0, n, xs, rot_scratch, 0);
             for (int c = 0; c < n_ch; c++)
                 for (uint32_t i = 0; i < n; i++)
                     dst[(uint32_t)c*rpc + r0 + i] = rot_scratch[(uint32_t)c*n + i];
         }
     }
+}
+
+// K-segments (FLAG_KSEG, the 27B's FFN down projection): the whole input is quantised once
+// with one exponent, each segment's int8 slice goes to SP_X, the engine's int32 results add
+// up in acc[] (every segment carries the tensor's bias/rshift, so they are in one fixed
+// point) and are scaled once - the unsplit result up to one LSB of the per-segment shift.
+uint32_t infer_matvec_cols(const struct bons_entry *e)   // K of the whole matvec.
+{
+    if (!(e->flags & FLAG_KSEG))
+        return e->cols;
+    uint32_t cols = 0;
+    for (int k = 0; k < model_entry_nkseg(e); k++)
+        cols += model_entry_kseg(e, k)->cols;
+    return cols;
+}
+
+static int32_t *kseg_acc;    // rows int32, sized on first use to the widest such tensor.
+static int8_t  *kseg_x8;     // The whole quantised input.
+void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
+{
+    if (!rot_scratch) rot_scratch = halloc((SP_H - SP_Y));
+    if (!(e->flags & FLAG_KSEG)) {
+        int e8 = quantize_f_pow2(src, e->cols, SP_X);
+        matvec_f_one(e, ldexpf(1.0f, e8), dst, 0);
+        return;
+    }
+    int nseg = model_entry_nkseg(e);
+    uint32_t cols = infer_matvec_cols(e);
+    if (!kseg_acc) {
+        // The widest K-split tensor decides both buffers (the table is small; once).
+        uint32_t max_rows = 0, max_cols = 0;
+        const struct bons_entry *tab = model_entry_at(0);
+        for (uint32_t i = 0; i < H->n_tensors; i++) {
+            const struct bons_entry *t = &tab[i];
+            if (!(t->flags & FLAG_KSEG) || t->kseg != 0) continue;
+            uint32_t c = 0;
+            for (int k = 0; k < model_entry_nkseg(t); k++) c += model_entry_kseg(t, k)->cols;
+            if (t->rows > max_rows) max_rows = t->rows;
+            if (c > max_cols) max_cols = c;
+        }
+        kseg_acc = halloc(max_rows*4);
+        kseg_x8  = halloc(max_cols);
+    }
+    // One exponent for the whole vector (quantize_f_pow2's rule: amax's exponent - 7).
+    float amax = 0;
+    for (uint32_t i = 0; i < cols; i++) {
+        float a = fabsf(src[i]);
+        if (a > amax) amax = a;
+    }
+    int e8 = 0;
+    if (amax > 0) { frexpf(amax, &e8); e8 -= 7; }
+    float is = ldexpf(1.0f, -e8);
+    for (uint32_t i = 0; i < cols; i++) {
+        long q = lroundf(src[i]*is);
+        kseg_x8[i] = (int8_t)(q > 127 ? 127 : q < -127 ? -127 : q);
+    }
+    memset(kseg_acc, 0, e->rows*4);
+    uint32_t c0 = 0;
+    for (int k = 0; k < nseg; k++) {
+        const struct bons_entry *seg = model_entry_kseg(e, k);
+        volatile uint32_t *x = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_X);
+        for (uint32_t i = 0; i < seg->cols; i += 4)   // 32-bit words: the scratchpad bus.
+            x[i/4] = (uint32_t)(uint8_t)kseg_x8[c0 + i]
+                   | ((uint32_t)(uint8_t)kseg_x8[c0 + i + 1] << 8)
+                   | ((uint32_t)(uint8_t)kseg_x8[c0 + i + 2] << 16)
+                   | ((uint32_t)(uint8_t)kseg_x8[c0 + i + 3] << 24);
+        matvec_f_one(seg, 1.0f, 0, kseg_acc);
+        c0 += seg->cols;
+    }
+    float sc = ldexpf(1.0f, e8 + (int)e->rshift - (int)e->bias);
+    for (uint32_t i = 0; i < e->rows; i++)
+        dst[i] = (float)kseg_acc[i]*sc;
 }
 
 void *infer_halloc(uint64_t n, int big)
@@ -3305,9 +3388,9 @@ embed_done: ;
 #endif
         {
         float sx = ldexpf(1.0f, E_NORM + sx8);
-        matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q);
-        matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k);
-        matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v);
+        matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q, 0);
+        matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k, 0);
+        matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v, 0);
         }
 
         perf_enter(OP_QKNORM);

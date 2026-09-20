@@ -180,7 +180,7 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
             max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None,
-            window_reserve=0):
+            window_reserve=0, kseg_max=layout.KSEG_MAX):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
     try:
@@ -214,6 +214,13 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     specs = [_spec_from_gguf(reader, name, n_channels, vocab_pad) for name in names]
     if cfg.hadamard_block:
         specs += _hadamard_specs(cfg)
+    # Matvecs wider than one engine op (the 27B's FFN down projection, K = 17408) become
+    # K-segments the firmware sums (layout.FLAG_KSEG).
+    from trixium.model.bons import split_wide
+    specs = [seg for spec in specs for seg in split_wide(spec, kseg_max)]
+    nseg = sum(1 for sp in specs if sp.flags & layout.FLAG_KSEG)
+    if nseg:
+        print(f"  {nseg} K-segments (matvecs wider than {kseg_max})")
 
     # Does it fit the card? Each engine channel owns HBM_CHAN_STRIDE (256 MB) from
     # HBM_WEIGHT_BASE's offset into its pseudo-channel (64 MB), and the KV cache sits above
@@ -317,6 +324,9 @@ def main():
                         "1.7B; the firmware decodes rows itself, ~2.6%% slower per token).")
     p.add_argument("--chan-stride", default=None, type=lambda x: int(x, 0),
                    help="The target's per-channel stride (BONSAI_CHAN_STRIDE; default: the FK33's 256 MB).")
+    p.add_argument("--kseg-max", default=layout.KSEG_MAX, type=int,
+                   help="Split matvecs wider than this into K-segments (default: the engine op's "
+                        "limit; small values exercise the path on tiny models).")
     p.add_argument("--window-reserve", default=0, type=lambda x: int(x, 0),
                    help="Bytes the last window of a controller loses to the per-channel bank skew "
                         "((chan_mod-1)*BONSAI_CHAN_SKEW: 96 KB on the XCU1525).")
@@ -334,7 +344,7 @@ def main():
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
                 args.layers, args.check, emb16=not args.no_emb16,
                 chan_stride=args.chan_stride, weight_base=args.weight_base,
-                window_reserve=args.window_reserve)
+                window_reserve=args.window_reserve, kseg_max=args.kseg_max)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 

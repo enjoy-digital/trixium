@@ -75,23 +75,42 @@ def hybrid27_generate(img, prompt, n_new, exact=False):
 
     wcache = {}
 
+    def ksegs(e):
+        """The K-segments of a wide matvec (layout.FLAG_KSEG), in order; [e] otherwise."""
+        if not (e["flags"] & layout.FLAG_KSEG):
+            return [e]
+        segs = [t for t in img.entries if t["role"] == e["role"] and t["layer"] == e["layer"]
+                and t["kind"] == e["kind"] and (t["flags"] & layout.FLAG_KSEG)]
+        return sorted(segs, key=lambda t: t["kseg"])
+
     def matvec_f(e, x):
+        segs = ksegs(e)
         if exact:
             if e["name"] not in wcache:
-                scales, codes = img.tensor(e["name"])
-                g = 128 if e["kind"] == layout.KIND_TERNARY else 32
-                off = 1.0 if e["kind"] == layout.KIND_TERNARY else 0.0
-                w = (codes.astype(f32).reshape(e["rows"], -1, g) - f32(off))*scales.astype(f32)[:, :, None]
-                wcache[e["name"]] = w.reshape(e["rows"], e["cols"])
+                ws = []
+                for t in segs:
+                    scales, codes = img.tensor(t["name"])
+                    g = 128 if t["kind"] == layout.KIND_TERNARY else 32
+                    off = 1.0 if t["kind"] == layout.KIND_TERNARY else 0.0
+                    w = (codes.astype(f32).reshape(t["rows"], -1, g) - f32(off))*scales.astype(f32)[:, :, None]
+                    ws.append(w.reshape(t["rows"], t["cols"]))
+                wcache[e["name"]] = np.concatenate(ws, axis=1)
             return (wcache[e["name"]] @ np.asarray(x, dtype=f32)).astype(f32)
+        # As infer_matvec_f: one exponent for the whole input; per segment the engine's
+        # int32 result (each segment carries the tensor's bias/rshift); the sum, scaled once.
         x8, e8 = quantize_f_pow2(np.asarray(x, dtype=f32))
-        scales, codes = img.tensor(e["name"])
-        if e["kind"] == layout.KIND_TERNARY:
-            res = bx.matvec_ternary(scales, codes, x8, e["bias"], e["rshift"])
-        else:
-            res = bx.matvec_q8(scales, codes, x8, e["bias"], e["rshift"])
+        res, c0 = None, 0
+        for t in segs:
+            scales, codes = img.tensor(t["name"])
+            xs = x8[c0:c0 + t["cols"]]
+            if t["kind"] == layout.KIND_TERNARY:
+                r = bx.matvec_ternary(scales, codes, xs, t["bias"], t["rshift"])
+            else:
+                r = bx.matvec_q8(scales, codes, xs, t["bias"], t["rshift"])
+            res = r.astype(np.int64) if res is None else res + r.astype(np.int64)
+            c0 += t["cols"]
         sc = f32(np.exp2(f32(e8 + e["rshift"] - e["bias"])))
-        return (res.astype(f32)*sc).astype(f32)
+        return (res.astype(np.int32).astype(f32)*sc).astype(f32)
 
     def rotate(x, width):
         if not B:
@@ -103,9 +122,12 @@ def hybrid27_generate(img, prompt, n_new, exact=False):
             out[b*B:(b + 1)*B] = matvec_f(e, x[b*B:(b + 1)*B])
         return out
 
+    def total_cols(e):
+        return sum(t["cols"] for t in ksegs(e))
+
     def proj(role, l, x):
         e = entry(role, l)
-        return matvec_f(e, rotate(x, e["cols"]) if B else x)
+        return matvec_f(e, rotate(x, total_cols(e)) if B else x)
 
     def rmsnorm(x, w):
         ss = _fsum32(x*x)

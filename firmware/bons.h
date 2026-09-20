@@ -24,6 +24,8 @@
 #define KIND_NORM16  4 // int16 rows at 2^-13 (layout.NORM16_EXP) for the vector unit.
 
 #define FLAG_REPLICATED 0x01
+#define FLAG_KSEG       0x02   // One K-segment of a wide matvec (layout.FLAG_KSEG): siblings
+                               // share role/layer/kind/bias/rshift; sum their int32 results.
 
 // Tensor roles.
 enum {
@@ -90,7 +92,7 @@ struct __attribute__((packed)) bons_entry {
     uint8_t  role;
     uint8_t  kind;
     uint8_t  flags;
-    uint8_t  pad0;
+    uint8_t  kseg;     // K-segment index with FLAG_KSEG (0 otherwise).
     uint16_t layer;
     uint16_t group;
     uint32_t rows;
