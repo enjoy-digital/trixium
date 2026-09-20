@@ -25,6 +25,8 @@ from migen.genlib.fifo import SyncFIFO
 from litex.gen import *
 from litex.soc.interconnect import stream
 
+from trixium.gateware.fp32 import BonsaiFP32Add, BonsaiFP32Mul
+
 
 class BonsaiDeltaNetState(LiteXModule):
     """Banked row-major state buffer with an eight-row compute port."""
@@ -47,6 +49,7 @@ class BonsaiDeltaNetState(LiteXModule):
         self.groups = groups
         self.rows_per_lane = rows_per_lane
         self.beats = beats
+        self.read_latency = 2
 
         # Sequential row-major load stream. load_start restarts at row 0, column 0.
         self.load_start = Signal()
@@ -279,3 +282,318 @@ class BonsaiDeltaNetState(LiteXModule):
                 dump_return.eq(0),
             ),
         ]
+
+
+class BonsaiDeltaNetRecurrence(LiteXModule):
+    """Eight-lane, operation-order-exact DeltaNet recurrence pipeline.
+
+    The matrix state lives in :attr:`state`; software/integration logic loads and dumps it
+    through that object's row-major stream. Parameters are written a scalar at a time before
+    ``start``. The datapath computes, for every row, exactly::
+
+        m = round(m * decay)
+        d = round(d + round(m * k[i]))
+        delta = round(round(v - d) * beta)
+        m = round(m + round(delta * k[i]))
+        o = round(o + round(m * q[i]))
+        out = round(o * scale)
+
+    No FMA or tree reduction is used. Rows are interleaved, so the feedback distance is
+    ``rows/lanes`` cycles; the 27B's 16 phases exceed the FP adder's 11-cycle latency.
+
+    ``add_factory``/``mul_factory`` are test hooks. Hardware uses the Xilinx binary32
+    operators; a small integer pipeline can exercise the scheduler in the Migen simulator.
+    """
+
+    def __init__(self, rows=128, cols=128, lanes=8,
+                 add_factory=BonsaiFP32Add, mul_factory=BonsaiFP32Mul,
+                 negate=lambda x: x ^ 0x80000000):
+        assert rows % lanes == 0
+        phases = rows // lanes
+        assert phases >= add_factory.latency, \
+            "row interleave must cover the accumulator feedback latency"
+        issue_cycles = phases * cols
+
+        self.start = Signal()
+        self.busy = Signal()
+        self.done = Signal()
+        self.decay = Signal(32)
+        self.beta  = Signal(32)
+        self.scale = Signal(32)
+
+        # Parameter write port: kind 0=q, 1=k, 2=v; index is the scalar index.
+        self.param_we    = Signal()
+        self.param_kind  = Signal(2)
+        self.param_index = Signal(max=max(rows, cols))
+        self.param_data  = Signal(32)
+
+        self.state = BonsaiDeltaNetState(rows=rows, cols=cols, lanes=lanes)
+        self.submodules.state = self.state
+
+        self.out_row_phase = Signal(max=phases)
+        self.out_data = Signal(32*lanes)
+
+        # # #
+
+        q = [Signal(32, name=f"dn_q{i}") for i in range(cols)]
+        k = [Signal(32, name=f"dn_k{i}") for i in range(cols)]
+        v = [[Signal(32, name=f"dn_v{lane}_{p}") for p in range(phases)]
+             for lane in range(lanes)]
+        acc = [[Signal(32, name=f"dn_acc{lane}_{p}") for p in range(phases)]
+               for lane in range(lanes)]
+        delta = [[Signal(32, name=f"dn_delta{lane}_{p}") for p in range(phases)]
+                 for lane in range(lanes)]
+        out = [[Signal(32, name=f"dn_out{lane}_{p}") for p in range(phases)]
+               for lane in range(lanes)]
+        qa, ka = Array(q), Array(k)
+        va = [Array(x) for x in v]
+        acca = [Array(x) for x in acc]
+        deltaa = [Array(x) for x in delta]
+        outa = [Array(x) for x in out]
+
+        self.sync += If(self.param_we,
+            If(self.param_kind == 0,
+                qa[self.param_index].eq(self.param_data),
+            ).Elif(self.param_kind == 1,
+                ka[self.param_index].eq(self.param_data),
+            ).Else(
+                *[If(self.param_index[0:(lanes - 1).bit_length()] == lane,
+                    va[lane][self.param_index >> (lanes - 1).bit_length()].eq(
+                        self.param_data)) for lane in range(lanes)]
+            )
+        )
+        self.comb += self.out_data.eq(Cat(*[outa[l][self.out_row_phase]
+                                            for l in range(lanes)]))
+
+        add0, add1, mul0, mul1 = [], [], [], []
+        for lane in range(lanes):
+            for group, factory, name in (
+                    (add0, add_factory, f"add0_{lane}"),
+                    (add1, add_factory, f"add1_{lane}"),
+                    (mul0, mul_factory, f"mul0_{lane}"),
+                    (mul1, mul_factory, f"mul1_{lane}")):
+                op = factory()
+                setattr(self.submodules, name, op)
+                group.append(op)
+        add_latency = add0[0].latency
+        mul_latency = mul0[0].latency
+
+        def delayed(value, latency, name):
+            """A metadata delay matching a non-stalling arithmetic pipeline."""
+            regs = [Signal.like(value, name=f"{name}_{i}") for i in range(latency)]
+            if regs:
+                self.sync += regs[0].eq(value)
+                for a, b in zip(regs[1:], regs[:-1]):
+                    self.sync += a.eq(b)
+                return regs[-1]
+            return value
+
+        fsm = FSM(reset_state="IDLE")
+        self.submodules.fsm = fsm
+        p1_mode = Signal()
+        delta_mode = Signal()
+        p2_mode = Signal()
+        scale_mode = Signal()
+        self.comb += [
+            p1_mode.eq(fsm.ongoing("P1_ISSUE") | fsm.ongoing("P1_DRAIN")),
+            delta_mode.eq(fsm.ongoing("DELTA_ISSUE") | fsm.ongoing("DELTA_DRAIN")),
+            p2_mode.eq(fsm.ongoing("P2_ISSUE") | fsm.ongoing("P2_DRAIN")),
+            scale_mode.eq(fsm.ongoing("SCALE_ISSUE") | fsm.ongoing("SCALE_DRAIN")),
+            self.busy.eq(~fsm.ongoing("IDLE")),
+        ]
+
+        phase = Signal(max=phases)
+        col = Signal(max=cols)
+        phase_bits = (phases - 1).bit_length()
+        self.comb += [
+            self.state.rd_row_phase.eq(phase),
+            self.state.rd_col.eq(col),
+        ]
+        rd_phase = delayed(self.state.rd_row_phase, self.state.read_latency, "rd_phase")
+        rd_col   = delayed(self.state.rd_col,       self.state.read_latency, "rd_col")
+
+        # First pass: decay the state, then the sequential k dot.
+        p1_m_phase = delayed(rd_phase, mul_latency, "p1_m_phase")
+        p1_m_col   = delayed(rd_col,   mul_latency, "p1_m_col")
+        p1_m_k     = delayed(ka[rd_col], mul_latency, "p1_m_k")
+        p1_k_phase = delayed(p1_m_phase, mul_latency, "p1_k_phase")
+        p1_a_phase = delayed(p1_k_phase, add_latency, "p1_a_phase")
+
+        # Delta stage tags.
+        delta_add_phase = delayed(phase, add_latency, "delta_add_phase")
+        delta_mul_phase = delayed(delta_add_phase, mul_latency, "delta_mul_phase")
+
+        # Second pass: rank-1 update, then the sequential q dot.
+        p2_m_phase = delayed(rd_phase, mul_latency, "p2_m_phase")
+        p2_m_col   = delayed(rd_col,   mul_latency, "p2_m_col")
+        p2_m_state = [delayed(self.state.rd_data[l], mul_latency, f"p2_m_state{l}")
+                      for l in range(lanes)]
+        p2_m_q     = delayed(qa[rd_col], mul_latency, "p2_m_q")
+        p2_u_phase = delayed(p2_m_phase, add_latency, "p2_u_phase")
+        p2_u_col   = delayed(p2_m_col,   add_latency, "p2_u_col")
+        p2_u_q     = delayed(p2_m_q,     add_latency, "p2_u_q")
+        p2_q_phase = delayed(p2_u_phase, mul_latency, "p2_q_phase")
+        p2_a_phase = delayed(p2_q_phase, add_latency, "p2_a_phase")
+
+        scale_phase = delayed(phase, mul_latency, "scale_phase")
+
+        # Operator routing. A phase fully drains before the next phase reuses a pipe.
+        p1_rd = self.state.rd_valid & p1_mode
+        p2_rd = self.state.rd_valid & p2_mode
+        for lane in range(lanes):
+            self.comb += [
+                # mul0: state decay (P1), delta*k (P2), or (v-dot)*beta (DELTA).
+                mul0[lane].valid.eq(Mux(delta_mode, add0[lane].result_valid,
+                                    Mux(p1_mode, p1_rd, p2_rd))),
+                mul0[lane].a.eq(Mux(delta_mode, add0[lane].result,
+                                Mux(p1_mode, self.state.rd_data[lane],
+                                    deltaa[lane][rd_phase]))),
+                mul0[lane].b.eq(Mux(delta_mode, self.beta,
+                                Mux(p1_mode, self.decay, ka[rd_col]))),
+
+                # mul1: decayed-state*k (P1), or updated-state*q (P2).
+                mul1[lane].valid.eq(Mux(p1_mode, mul0[lane].result_valid,
+                                                   add0[lane].result_valid & p2_mode)),
+                mul1[lane].a.eq(Mux(p1_mode, mul0[lane].result, add0[lane].result)),
+                mul1[lane].b.eq(Mux(p1_mode, p1_m_k, p2_u_q)),
+
+                # add0: k-dot accumulator, v-dot subtraction, or state update.
+                add0[lane].valid.eq(Mux(delta_mode,
+                    fsm.ongoing("DELTA_ISSUE"),
+                    Mux(p1_mode, mul1[lane].result_valid, mul0[lane].result_valid & p2_mode))),
+                add0[lane].a.eq(Mux(delta_mode, va[lane][phase],
+                    Mux(p1_mode, acca[lane][p1_k_phase], p2_m_state[lane]))),
+                add0[lane].b.eq(Mux(delta_mode, negate(acca[lane][phase]),
+                    Mux(p1_mode, mul1[lane].result, mul0[lane].result))),
+
+                # add1: q-dot accumulator (P2 only).
+                add1[lane].valid.eq(mul1[lane].result_valid & p2_mode),
+                add1[lane].a.eq(acca[lane][p2_q_phase]),
+                add1[lane].b.eq(mul1[lane].result),
+            ]
+
+        # State updates from the two passes.
+        self.comb += [
+            self.state.wr_en.eq((p1_mode & mul0[0].result_valid) |
+                                (p2_mode & add0[0].result_valid)),
+            self.state.wr_row_phase.eq(Mux(p1_mode, p1_m_phase, p2_u_phase)),
+            self.state.wr_col.eq(Mux(p1_mode, p1_m_col, p2_u_col)),
+        ]
+        for lane in range(lanes):
+            self.comb += self.state.wr_data[lane].eq(
+                Mux(p1_mode, mul0[lane].result, add0[lane].result))
+
+        # Group retirement counters (one result_valid represents all eight lanes).
+        p1_ret = Signal(max=issue_cycles + 1)
+        delta_ret = Signal(max=phases + 1)
+        p2_ret = Signal(max=issue_cycles + 1)
+        scale_ret = Signal(max=phases + 1)
+        delta_done = Signal()
+        self.comb += delta_done.eq(delta_mode & mul0[0].result_valid &
+                                   (delta_ret == phases - 1))
+
+        # Accumulator/delta/output register writes. Dynamic phase compares infer compact
+        # one-hot enables; each lane owns a separate small register bank.
+        for lane in range(lanes):
+            for p in range(phases):
+                self.sync += If(self.start,
+                    acc[lane][p].eq(0),
+                ).Elif(p1_mode & add0[lane].result_valid & (p1_a_phase == p),
+                    acc[lane][p].eq(add0[lane].result),
+                ).Elif(delta_done,
+                    acc[lane][p].eq(0),
+                ).Elif(p2_mode & add1[lane].result_valid & (p2_a_phase == p),
+                    acc[lane][p].eq(add1[lane].result),
+                )
+                self.sync += If(delta_mode & mul0[lane].result_valid &
+                                (delta_mul_phase == p),
+                    delta[lane][p].eq(mul0[lane].result),
+                )
+                self.sync += If(scale_mode & mul0[lane].result_valid &
+                                (scale_phase == p),
+                    out[lane][p].eq(mul0[lane].result),
+                )
+
+        self.sync += [
+            self.done.eq(0),
+            If(self.start,
+                p1_ret.eq(0), delta_ret.eq(0), p2_ret.eq(0), scale_ret.eq(0),
+            ).Else(
+                If(p1_mode & add0[0].result_valid, p1_ret.eq(p1_ret + 1)),
+                If(delta_mode & mul0[0].result_valid, delta_ret.eq(delta_ret + 1)),
+                If(p2_mode & add1[0].result_valid, p2_ret.eq(p2_ret + 1)),
+                If(scale_mode & mul0[0].result_valid, scale_ret.eq(scale_ret + 1)),
+            )
+        ]
+
+        def advance_issue(next_state):
+            return If(phase == phases - 1,
+                NextValue(phase, 0),
+                If(col == cols - 1,
+                    NextState(next_state),
+                ).Else(
+                    NextValue(col, col + 1),
+                )
+            ).Else(
+                NextValue(phase, phase + 1),
+            )
+
+        fsm.act("IDLE",
+            If(self.start,
+                NextValue(phase, 0), NextValue(col, 0),
+                NextState("P1_ISSUE"),
+            )
+        )
+        fsm.act("P1_ISSUE",
+            self.state.rd_en.eq(1),
+            advance_issue("P1_DRAIN"),
+        )
+        fsm.act("P1_DRAIN",
+            If(add0[0].result_valid & (p1_ret == issue_cycles - 1),
+                NextValue(phase, 0),
+                NextState("DELTA_ISSUE"),
+            )
+        )
+        fsm.act("DELTA_ISSUE",
+            If(phase == phases - 1,
+                NextState("DELTA_DRAIN"),
+            ).Else(
+                NextValue(phase, phase + 1),
+            )
+        )
+        fsm.act("DELTA_DRAIN",
+            If(mul0[0].result_valid & (delta_ret == phases - 1),
+                NextValue(phase, 0), NextValue(col, 0),
+                NextState("P2_ISSUE"),
+            )
+        )
+        fsm.act("P2_ISSUE",
+            self.state.rd_en.eq(1),
+            advance_issue("P2_DRAIN"),
+        )
+        fsm.act("P2_DRAIN",
+            If(add1[0].result_valid & (p2_ret == issue_cycles - 1),
+                NextValue(phase, 0),
+                NextState("SCALE_ISSUE"),
+            )
+        )
+        # Reuse mul0 after P2 has completely drained.
+        for lane in range(lanes):
+            self.comb += If(scale_mode,
+                mul0[lane].valid.eq(fsm.ongoing("SCALE_ISSUE")),
+                mul0[lane].a.eq(acca[lane][phase]),
+                mul0[lane].b.eq(self.scale),
+            )
+        fsm.act("SCALE_ISSUE",
+            If(phase == phases - 1,
+                NextState("SCALE_DRAIN"),
+            ).Else(
+                NextValue(phase, phase + 1),
+            )
+        )
+        fsm.act("SCALE_DRAIN",
+            If(mul0[0].result_valid & (scale_ret == phases - 1),
+                self.done.eq(1),
+                NextState("IDLE"),
+            )
+        )
