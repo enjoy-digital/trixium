@@ -291,3 +291,35 @@ def test_rtl_silu_gate_and_mul_q8():
         # equal to the RTL's by the line above).
         asm.VecInterp(sp).run(asm.assemble(gate), [0, 0, 0, n//16, -12])
         _compare_words(mul, sp, [0, 0x1000, 0, n//16, 0, 0, -15, 0x3000])
+
+
+def _dn_case(seed, hv, hk):
+    """A DeltaNet head mid-life: a state at its exponent, unit k/q, a value row - the
+    scratchpad and both passes' arguments from deltanet.head_step's trace."""
+    from trixium.model import deltanet as dn
+    from test_asm import _dn_scratchpad
+    rng = np.random.default_rng(seed)
+    M = rng.integers(-30000, 30000, (hv, hk)).astype(np.int64)
+    kk = rng.standard_normal(hk).astype(np.float32); kk /= np.linalg.norm(kk)
+    qh = rng.standard_normal(hk).astype(np.float32); qh /= np.linalg.norm(qh)
+    vh = (rng.standard_normal(hv)*2.0).astype(np.float32)
+    tr = {}
+    dn.head_step(M.copy(), -14, kk, qh, vh, np.float32(0.9), np.float32(0.7), trace=tr)
+    sp, K, KQ, NV, DL = _dn_scratchpad(M, tr["k16"], tr["q16"], tr["nv"], hv, hk//16,
+                                       base=0x1000, size=SP_SIZE)
+    return sp, K, KQ, NV, DL, tr, hv | ((hk//16) << 16)
+
+
+def test_rtl_dn_a():
+    sp, K, KQ, NV, DL, tr, geom = _dn_case(45, 32, 64)
+    shift_a, d15, nbq = tr["a_args"]
+    _compare_words(asm.prog_dn_a(), sp, [0, K, NV, DL, shift_a, d15, nbq, geom])
+
+
+def test_rtl_dn_b():
+    sp, K, KQ, NV, DL, tr, geom = _dn_case(46, 32, 64)
+    # Pass A's delta beats as pass B finds them.
+    for j in range(32):
+        sp[DL + 32*j:DL + 32*j + 32] = np.full(8, tr["delta"][j], dtype="<i4").tobytes()
+    shift_b, d15n, rnd = tr["b_args"]
+    _compare_words(asm.prog_dn_b(), sp, [0, KQ, 0, DL, shift_b, d15n, rnd, geom])

@@ -1546,6 +1546,100 @@ UNROLL16 = {"silu_q8": prog_silu_q8_x2, "softmax8": prog_softmax8_x2,
             "rope_h": prog_rope_h_x2, "kvpack_h": prog_kvpack_h_x2,
             "silu_gate": prog_silu_gate_x2, "mul_q8": prog_mul_q8_x2}
 
+def prog_dn_a():
+    """Gated DeltaNet, pass A of a value head (trixium/model/deltanet.py): per row the
+    k dot exact into S1, the per-row delta in units of 2^-19, its abs-max into S6.
+      A0 = state (int16 rows), A1 = k16 (beats per row, contiguous), A2 = -v (one int32
+      per 32-byte beat, the other seven words ZERO - the row's value is the beat's REDSUM),
+      A3 = delta out (8 copies per beat), A4 = dot shift (SSHLV amount: negative = right),
+      A5 = decay Q15, A6 = -beta Q15, A7 = rows | beats_per_row << 16.
+    Returns S6 = max |delta| (res6). The beats loop is a real loop (k re-read per beat)
+    so one program serves every head geometry; s5 walks k, rewound per row."""
+    return [
+        ("ARG",   "s0", 0),                  # M
+        ("ARG",   "s3", 2),                  # -v
+        ("ARG",   "s7", 3),                  # delta out
+        ("ARG",   "s4", 4),                  # dot shift
+        ("ARG",   "s2", 5), ("BCAST", "v9", "s2"),    # decay
+        ("ARG",   "s2", 6), ("BCAST", "v13", "s2"),   # -beta
+        ("MOVSI", "s6", 0),                  # max |delta|
+        ("ARG",   "s5", 7), ("MOVSI", "s2", 32), ("SSHLV", "s5", "s2"),
+        ("MOVSI", "s2", -32), ("SSHLV", "s5", "s2"),                        # rows (A7 & 0xFFFF)
+        ("ARG",   "s1", 7), ("MOVSI", "s2", -16), ("SSHLV", "s1", "s2"),   # beats (A7 >> 16)
+        ("LOOPS2", "s5"),
+        ("ARG",   "s5", 1),                  # k, rewound per row
+        ("SMOV",  "s2", "s1"),               # beats (S1 becomes the dot accumulator)
+        ("MOVSI", "s1", 0),
+        ("LOOPS", "s2"),
+        ("LDV",   "v8", "s0"),               # M beat
+        ("LDV",   "v1", "s5"),               # k beat
+        ("VMUL",  "v10", "v8", "v1"),        # int16 x int16: no wrap
+        ("REDSUM", "s1", "v10"),             # 48-bit exact
+        ("LOOPE",),
+        ("SSHLV", "s1", "s4"),               # dot -> units 2^-19 (fits int32: the CPU's algebra)
+        ("BCAST", "v11", "s1"),
+        ("VMULH15", "v11", "v11", "v9"),     # * decay (floor)
+        ("MOVSI", "s2", 0),
+        ("LDW",   "v12", "s3"),
+        ("REDSUM", "s2", "v12"),             # -v_j
+        ("BCAST", "v12", "s2"),
+        ("VADD",  "v11", "v11", "v12"),      # decay * dot - v
+        ("VMULH15", "v11", "v11", "v13"),    # * -beta (floor) = (v - decay * dot) * beta
+        ("REDMAX", "s6", "v11"),
+        ("STW",   "v11", "s7"),              # 8 copies
+        ("ARG",   "s1", 7), ("MOVSI", "s2", -16), ("SSHLV", "s1", "s2"),   # beats again
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
+def prog_dn_b():
+    """Gated DeltaNet, pass B of a value head: per row the state update in place and the
+    q dot. A0 = state (int16, in place), A1 = k16 and q16 INTERLEAVED per beat (k beat 0,
+    q beat 0, k beat 1, ...: one pointer walks both), A3 = delta in / o out (the 8-copy
+    beats of pass A; o_j = (M'_j . q16) >> 8 overwrites them, 8 copies), A4 = delta shift
+    (VSHLS amount, negative = right; applied to 8 delta_j + A6), A5 = decay Q15 carrying
+    the ratchet (alpha 2^(15-n)), A6 = rounding constant, A7 = rows | beats << 16.
+    Returns S5 = max |M'| (res5) for the next token's ratchet."""
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s6", 0),         # M read / write pointers
+        ("ARG",   "s3", 3),                  # delta / o
+        ("ARG",   "s4", 4),                  # delta shift
+        ("ARG",   "s2", 5), ("BCAST", "v9", "s2"),    # decay (ratchet folded in)
+        ("ARG",   "s2", 6), ("BCAST", "v14", "s2"),   # rounding constant
+        ("MOVSI", "s5", 0),                  # max |M'|
+        ("ARG",   "s1", 7), ("MOVSI", "s2", 32), ("SSHLV", "s1", "s2"),
+        ("MOVSI", "s2", -32), ("SSHLV", "s1", "s2"),                        # rows
+        ("LOOPS2", "s1"),
+        ("MOVSI", "s2", 0),
+        ("LDW",   "v12", "s3"),
+        ("REDSUM", "s2", "v12"),             # 8 delta_j
+        ("BCAST", "v11", "s2"),
+        ("VADD",  "v11", "v11", "v14"),      # + rounding
+        ("VSHLS", "v11", "v11", "s4"),       # delta_s (16 bits by the ratchet)
+        ("ARG",   "s2", 7), ("MOVSI", "s7", -16), ("SSHLV", "s2", "s7"),   # beats
+        ("ARG",   "s1", 1),                  # k/q, rewound per row
+        ("MOVSI", "s7", 0),                  # o accumulator
+        ("LOOPS", "s2"),
+        ("LDV",   "v8", "s0"),               # M beat
+        ("LDV",   "v1", "s1"),               # k beat
+        ("LDV",   "v12", "s1"),              # q beat
+        ("VMUL",  "v8", "v8", "v9"),         # M * decay (< 2^30: no wrap)
+        ("VMUL",  "v10", "v11", "v1"),       # delta_s * k16 (< 2^31)
+        ("VADD",  "v8", "v8", "v10"),        # wraps only where the result would not fit int16
+        ("VRNE",  "v8", "v8", 15),
+        ("STV",   "v8", "s6"),
+        ("REDMAX", "s5", "v8"),
+        ("VMUL",  "v13", "v8", "v12"),
+        ("REDSUM", "s7", "v13"),
+        ("LOOPE",),
+        ("MOVSI", "s2", -8), ("SSHLV", "s7", "s2"),   # o >> 8
+        ("BCAST", "v13", "s7"),
+        ("SADDI", "s3", -32),
+        ("STW",   "v13", "s3"),              # in place of the delta beat
+        ("LOOPE2",),
+        ("DONE",),
+    ]
+
 PROGRAMS = {
     "resid_add":  prog_resid_add,
     "quant8":     prog_quant8,
@@ -1565,6 +1659,8 @@ PROGRAMS = {
     "silu_gate":  prog_silu_gate,   # FFN split: gate half, runs under the up stream.
     "mul_q8":     prog_mul_q8,      # FFN split: up-dependent tail (was silu_q8's tail).
     "nopd": prog_nopd,
+    "dn_a": prog_dn_a,              # Gated DeltaNet recurrence, pass A (deltanet.py).
+    "dn_b": prog_dn_b,              # pass B.
 }
 
 def emit_c(out):

@@ -9,6 +9,7 @@
 # (semantics + accuracy), before any RTL exists.
 
 import numpy as np
+import pytest
 
 from trixium.model import asm
 from trixium.model import bitexact as bx
@@ -437,3 +438,57 @@ def test_silu_split_matches_fused():
                     assert Sg[6] == Sr[6], (trial, a4, a6, Sg[6], Sr[6])
                     cases += 1
     assert cases == 6*6*3*2
+
+
+def _dn_scratchpad(M, k16, q16, nv, rows, beats, base=0x10000, size=0x14000):
+    """The two passes' scratchpad: state at 0, k at K, k/q interleaved at KQ, -v beats at
+    NV (word 0 of each, the rest zero), delta/o beats at DL."""
+    K, KQ, NV, DL = base, base + 0x400, base + 0x1000, base + 0x2000
+    sp = bytearray(size)
+    sp[0:rows*beats*32] = np.asarray(M, dtype="<i2").tobytes()
+    sp[K:K + beats*32] = np.asarray(k16, dtype="<i2").tobytes()
+    kq = np.empty((beats, 2, 16), dtype="<i2")
+    kq[:, 0, :] = np.asarray(k16).reshape(beats, 16)
+    kq[:, 1, :] = np.asarray(q16).reshape(beats, 16)
+    sp[KQ:KQ + 2*beats*32] = kq.tobytes()
+    for j in range(rows):
+        sp[NV + 32*j:NV + 32*j + 4] = np.asarray([nv[j]], dtype="<i4").tobytes()
+    return sp, K, KQ, NV, DL
+
+@pytest.mark.parametrize("hv,hk,seed", [(64, 64, 1), (128, 128, 2), (128, 128, 3), (32, 64, 4)])
+def test_dn_passes_match_head_step(hv, hk, seed):
+    """prog_dn_a / prog_dn_b executed by the interpreter equal deltanet.head_step to the
+    bit: the delta beats and max |delta| out of pass A, the updated state, max |M'| and
+    the o beats out of pass B - over a few tokens so the ratchet fires (the state starts
+    at a small exponent and the first updates overflow it) and a token where it does not."""
+    from trixium.model import deltanet as dn
+    rng = np.random.default_rng(seed)
+    beats = hk//16
+    M = np.zeros((hv, hk), dtype=np.int64)
+    eM, maxM = -20, 0
+    for tok in range(4):
+        kk = rng.standard_normal(hk).astype(np.float32); kk /= np.linalg.norm(kk)
+        qh = rng.standard_normal(hk).astype(np.float32); qh /= np.linalg.norm(qh)
+        vh = (rng.standard_normal(hv)*(3.0 if tok < 2 else 0.05)).astype(np.float32)
+        decay, beta = np.float32(rng.uniform(0.3, 1.0)), np.float32(rng.uniform(0.2, 1.0))
+        tr = {}
+        Mref = M.copy()
+        o_ref, eM2, maxM2 = dn.head_step(Mref, eM, kk, qh, vh, decay, beta, maxM=maxM, trace=tr)
+        sp, K, KQ, NV, DL = _dn_scratchpad(M, tr["k16"], tr["q16"], tr["nv"], hv, beats)
+        geom = hv | (beats << 16)
+        shift_a, d15, nbq = tr["a_args"]
+        S, _ = _run_words(asm.assemble(asm.prog_dn_a()), sp, [0, K, NV, DL, shift_a, d15, nbq, geom])
+        assert S[6] == tr["maxD"], (S[6], tr["maxD"])
+        got_delta = np.frombuffer(bytes(sp[DL:DL + hv*32]), dtype="<i4").reshape(hv, 8)
+        assert (got_delta == tr["delta"][:, None]).all()
+        shift_b, d15n, rnd = tr["b_args"]
+        S, _ = _run_words(asm.assemble(asm.prog_dn_b()), sp, [0, KQ, 0, DL, shift_b, d15n, rnd, geom])
+        assert S[5] == tr["maxM2"], (S[5], tr["maxM2"])
+        got_M = np.frombuffer(bytes(sp[0:hv*hk*2]), dtype="<i2").reshape(hv, hk).astype(np.int64)
+        assert (got_M == Mref).all(), np.argwhere(got_M != Mref)[:4]
+        got_o = np.frombuffer(bytes(sp[DL:DL + hv*32]), dtype="<i4").reshape(hv, 8)
+        assert (got_o == tr["o_r"][:, None]).all()
+        M, eM, maxM = Mref, eM2, maxM2
+        if tok == 0:
+            assert tr["n"] > 0, "the first token must ratchet from the -20 start"
+    assert tr["n"] == 0, "the small last update must not ratchet"

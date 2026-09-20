@@ -38,7 +38,7 @@ def _lroundf(x):
     return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
 
 
-def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None):
+def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None, fast_cfg=None):
     """exact=True: fp32 weights and no activation quantization (the golden's arithmetic),
     which tests the mirror's structure against the golden independently of the int8 noise.
     fast=True: the DeltaNet recurrence in the fast path's arithmetic (docs/xcu1525.md) -
@@ -46,7 +46,10 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     int16 with one exponent per head that ratchets up when a row would overflow, the decay
     as Q15, the dots as exact int32 sums (the engine's Q8 matvec on the two int8 planes),
     the rank-1 update in the state's fixed point (the vector unit). Everything else stays
-    as in the CPU path. fast_stats (a dict) collects the state exponents seen."""
+    as in the CPU path. fast_stats (a dict) collects the state exponents seen. fast_cfg
+    picks the precisions: qk_bits (8 = one int8 plane, 16 = two), wq_extra (extra fraction
+    bits on the rank-1 weight, applied as a shift after the product), state_bits (the
+    ratchet's limit), decay_q (the decay's fixed point, None = fp32)."""
     h = img.header
     assert h["version"] >= 3 and (any(t == "deltanet" for t in h["layer_types"]) or h["hadamard_block"])
     n_layer, n_embd, ffn_dim = h["n_layer"], h["n_embd"], h["ffn_dim"]
@@ -179,44 +182,132 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     scale_dn = f32(1.0/np.sqrt(hk))
     scale_at = f32(1.0/np.sqrt(hd))
 
-    def q8_head(x):
-        """int8 with the head's own power-of-two exponent (mantissas in [64, 128))."""
+    cfg = dict(qk_bits=8, wq_extra=0, state_bits=16, decay_q=15, mode="planes")
+    cfg.update(fast_cfg or {})
+    qk_bits, wq_extra, state_bits, decay_q = (cfg[k] for k in ("qk_bits", "wq_extra", "state_bits", "decay_q"))
+    vec_qk_bits = cfg.get("vec_qk_bits", 16)
+    state_lim = 1 << (state_bits - 1)
+    vecunit = cfg["mode"] == "vecunit"
+
+    def q8_head(x, bits=8):
+        """int8 with the head's own power-of-two exponent (mantissas in [64, 128));
+        bits=16 is the two-plane form (mantissas in [16384, 32768))."""
         amax = np.abs(x).max()
         if amax == 0:
             return np.zeros(len(x), dtype=np.int32), 0
-        e = int(np.frexp(f32(amax))[1]) - 7
-        return np.clip(_lroundf(x*f32(np.exp2(-e))), -127, 127).astype(np.int32), e
+        e = int(np.frexp(f32(amax))[1]) - (bits - 1)
+        lim = (1 << (bits - 1)) - 1
+        return np.clip(_lroundf(x*f32(np.exp2(-e))), -lim, lim).astype(np.int32), e
 
-    state16 = {l: np.zeros((nv, hv, hk), dtype=np.int32) for l in range(n_layer) if dn[l]}
+    state16 = {l: np.zeros((nv, hv, hk), dtype=np.int64) for l in range(n_layer) if dn[l]}
     state_e = {l: np.full(nv, -20, dtype=np.int64) for l in range(n_layer) if dn[l]}
+
+    def _shr(x, n):
+        """Arithmetic shift by n: right (floor) for n > 0, left for n < 0 - SSHLV/VSHLS."""
+        x = np.asarray(x, dtype=np.int64)
+        return x >> n if n >= 0 else x << (-n)
+
+    def _rne(x, n):
+        """Round-nearest-even right shift by n >= 0 (VRNE)."""
+        x = np.asarray(x, dtype=np.int64)
+        if n == 0:
+            return x
+        q, rem = x >> n, x & ((1 << n) - 1)
+        half = 1 << (n - 1)
+        return q + ((rem > half) | ((rem == half) & (q & 1 == 1)))
+
+    def recurrence_vecunit(l, hh, qh, kk, vh, decay, beta_h):
+        """One head in the two-pass vector-unit arithmetic (docs/xcu1525.md): the state
+        int16 in the scratchpad at one exponent per head, k and q as int16 with their own
+        exponents, the dots exact into the 48-bit scalar registers, the per-row delta in
+        units of 2^-19 (a scalar SSHLV, VMULH15 by the Q15 decay and by -beta, both
+        floors), the exponent ratchet decided by the CPU between the passes from the
+        head's max |state| and max |delta| (REDMAX), the update as one VMUL/VMUL/VADD/VRNE
+        per beat with the decay's Q15 constant carrying the ratchet shift. Returns o."""
+        k16, ek = q8_head(kk, vec_qk_bits)
+        q16, eq = q8_head(qh, vec_qk_bits)
+        M = state16[l][hh]
+        eM = int(state_e[l][hh])
+        d15 = int(np.clip(_lroundf(f32(decay)*f32(32768.0)), 0, 32767))
+        bq = int(np.clip(_lroundf(f32(beta_h)*f32(32768.0)), 0, 32767))
+        # Pass A: the k dots (exact), max |M|, the per-row delta.
+        dot = M.astype(np.int64) @ k16.astype(np.int64)                 # units 2^(eM+ek)
+        assert np.abs(dot).max() < (1 << 47), (l, hh, vec_qk_bits, np.abs(dot).max())
+        maxM = int(np.abs(M).max())
+        r = -19 - (eM + ek)
+        dot_r = _shr(dot, r)                                            # units 2^-19
+        assert np.abs(dot_r).max() < (1 << 31), (l, hh, eM, ek, np.abs(dot_r).max())
+        ddr = (dot_r*d15) >> 15                                         # VMULH15 (floor)
+        nv_ = -_lroundf(vh.astype(np.float64)*float(1 << 19))
+        assert np.abs(nv_).max() < (1 << 31)
+        s3 = ddr + nv_                                                  # decay*dot - v
+        delta_int = (s3*(-bq)) >> 15                                    # (v - decay*dot)*beta
+        maxD = int(np.abs(delta_int).max())
+        # The CPU: the ratchet from the two maxima (a bound, not the exact new max).
+        kmax = float(np.abs(k16).max())*float(np.exp2(ek))
+        t = (maxM*float(decay) + maxD*float(np.exp2(-19))*kmax*float(np.exp2(-eM)))/float((1 << 15) - 4)
+        n = 0 if t <= 1.0 else int(np.ceil(np.log2(t)))
+        eM2 = eM + n
+        d15n = int(np.clip(_lroundf(f32(decay)*f32(np.exp2(15 - n))), 0, 32767))
+        sh = eM2 + 4 - ek
+        # Pass B: the row update and the q dots.
+        rnd = (1 << (sh - 1)) if sh > 0 else 0
+        delta_s = _shr(delta_int + rnd, sh)
+        assert np.abs(delta_s).max() < (1 << 16), (l, hh, np.abs(delta_s).max(), sh, n)
+        prod = M.astype(np.int64)*d15n + np.outer(delta_s, k16.astype(np.int64))
+        newM = _rne(prod, 15)
+        assert np.abs(newM).max() <= 32767, (l, hh, np.abs(newM).max(), n, t)
+        M[:] = newM
+        state_e[l][hh] = eM2
+        if fast_stats is not None:
+            fast_stats.setdefault("eM", []).append(eM2)
+            fast_stats.setdefault("n", []).append(n)
+        o = M.astype(np.int64) @ q16.astype(np.int64)                   # units 2^(eM2+eq)
+        # Keep the scalar result in int32.  For the hardware q16 form this is 8; a q24
+        # precision probe models the same 48-bit REDSUM with two mantissa planes and uses 16.
+        o_shift = vec_qk_bits - 8
+        o_r = o >> o_shift
+        assert np.abs(o_r).max() < (1 << 31)
+        of = (o_r.astype(np.float64)*float(np.exp2(eM2 + eq + o_shift))).astype(f32)
+        return (of*scale_dn).astype(f32)
 
     def recurrence_fast(l, hh, qh, kk, vh, decay, beta_h):
         """One head, the fast path's arithmetic. Returns o (float, hv)."""
-        k8, ek = q8_head(kk)
-        q8, eq = q8_head(qh)
+        if vecunit:
+            return recurrence_vecunit(l, hh, qh, kk, vh, decay, beta_h)
+        k8, ek = q8_head(kk, qk_bits)
+        q8, eq = q8_head(qh, qk_bits)
         M = state16[l][hh]
         eM = int(state_e[l][hh])
-        # decay as Q15: M <- (M * d15 + 2^14) >> 15 (the vector unit's multiply-shift).
-        d15 = int(np.clip(_lroundf(f32(decay)*f32(32768.0)), 0, 32767))
-        M[:] = (M*d15 + (1 << 14)) >> 15
+        if decay_q is None:
+            M[:] = _lroundf(M.astype(np.float64)*float(decay)).astype(np.int64)
+        else:
+            # decay as Q15: M <- (M * d15 + 2^14) >> 15 (the vector unit's multiply-shift).
+            one = 1 << decay_q
+            dq = int(np.clip(_lroundf(f32(decay)*f32(one)), 0, one - 1))
+            M[:] = (M.astype(np.int64)*dq + (one >> 1)) >> decay_q
         # dot_j = M_j . k  (int32 sums; units 2^(eM+ek))
-        dot = (M @ k8).astype(np.int64)
+        dot = (M.astype(np.int64) @ k8.astype(np.int64))
         dotf = (dot.astype(np.float64)*float(np.exp2(eM + ek))).astype(f32)
         delta = ((vh - dotf)*beta_h).astype(f32)
-        # rank-1 update: M_ji += wq_j * k8_i with wq_j = round(delta_j * 2^(ek - eM)) - and the
-        # exponent ratchet: if a row would overflow int16, halve the state (eM += 1) first.
+        # rank-1 update: M_ji += (wq_j * k8_i) >> wq_extra with wq_j = round(delta_j *
+        # 2^(ek - eM + wq_extra)) - and the exponent ratchet: if a row would overflow the
+        # state's width, halve the state (eM += 1) first.
         while True:
-            wq = _lroundf(delta.astype(np.float64)*float(np.exp2(ek - eM)))
-            newM = M + np.outer(wq.astype(np.int64), k8.astype(np.int64))
-            if np.abs(newM).max() < 32768 and np.abs(wq).max() < (1 << 24):
+            wq = _lroundf(delta.astype(np.float64)*float(np.exp2(ek - eM + wq_extra)))
+            prod = np.outer(wq.astype(np.int64), k8.astype(np.int64))
+            if wq_extra:
+                prod = (prod + (1 << (wq_extra - 1))) >> wq_extra
+            newM = M + prod
+            if np.abs(newM).max() < state_lim and np.abs(wq).max() < (1 << 30):
                 break
             M[:] = (M + 1) >> 1
             eM += 1
-        M[:] = newM.astype(np.int32)
+        M[:] = newM.astype(np.int64)
         state_e[l][hh] = eM
         if fast_stats is not None:
             fast_stats.setdefault("eM", []).append(eM)
-        o = (M @ q8).astype(np.float64)*float(np.exp2(eM + eq))
+        o = (M.astype(np.int64) @ q8.astype(np.int64)).astype(np.float64)*float(np.exp2(eM + eq))
         return (o.astype(f32)*scale_dn).astype(f32)
 
     def deltanet(l, hn):
