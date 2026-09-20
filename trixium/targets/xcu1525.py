@@ -366,8 +366,11 @@ class BonsaiXCU1525SoC(SoCCore):
                 self.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit())
                 self.spmux = BonsaiScratchpadClientMux(vecunit, self.dnunit)
                 sp_client = self.spmux
-                platform.add_source(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
-                platform.add_source(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
+                # Register packaged Vivado cores as IPs, rather than ordinary sources.
+                # LiteX then emits read_ip/generate_target/synth_ip before top-level
+                # synthesis; add_source() leaves the modules unresolved on a clean build.
+                platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
+                platform.add_ip(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
                 self.add_constant("BONSAI_HAS_DNREC")
             self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
             self.engine     = ClockDomainsRenamer("eng")(

@@ -23,6 +23,11 @@ def _ip_config(name):
     return xci["ip_inst"]["parameters"]["component_parameters"]
 
 
+def _ip_document(name):
+    with (ROOT / "ip" / "fp32" / name / f"{name}.xci").open() as f:
+        return json.load(f)
+
+
 def _value(params, key):
     return params[key][0]["value"]
 
@@ -40,6 +45,17 @@ def test_fp32_xci_contract():
         assert _value(cfg, "Has_RESULT_TREADY") == "false"
         assert int(_value(cfg, "C_Rate")) == 1
         assert int(_value(cfg, "C_Latency")) == latency
+
+
+def test_fp32_xci_matches_xcu1525_ip_build_flow():
+    for name in ("fp32_add", "fp32_mul"):
+        inst = _ip_document(name)["ip_inst"]
+        model = inst["parameters"]["model_parameters"]
+        project = inst["parameters"]["project_parameters"]
+        runtime = inst["parameters"]["runtime_parameters"]
+        assert _value(model, "C_PART").lower() == "xcvu9p-fsgd2104-2l-e"
+        assert _value(project, "PACKAGE") == "fsgd2104"
+        assert _value(runtime, "SYNTHESISFLOW") == "OUT_OF_CONTEXT"
 
 
 def test_fp32_wrappers_have_paired_valid_and_no_backpressure():
