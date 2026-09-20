@@ -23,15 +23,21 @@ from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter
 from litedram.frontend.axi import LiteDRAMAXI2Native
 
 
-def engine_ddr_port(core, axi, port_width=512, w_buffer_depth=64, r_buffer_depth=256):
+def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64, r_buffer_depth=256):
     """Returns the list of modules (to register as submodules) that connect `axi` (the
-    engine channel's 256-bit AXI) to a crossbar port of `core` of `port_width` bits."""
+    engine channel's 256-bit AXI) to a crossbar port of `core` of `port_width` bits.
+    merge: on a wider port, merge the read bursts two beats per word (axi_merge.AXIWide)
+    instead of one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic)."""
     port = core.crossbar.get_port(data_width=port_width)
     if port_width == len(axi.r.data):
         return [LiteDRAMAXI2Native(axi, port, w_buffer_depth=w_buffer_depth,
                                    r_buffer_depth=r_buffer_depth)]
     wide = AXIInterface(data_width=port_width, address_width=axi.address_width,
                         id_width=axi.id_width)
-    return [AXIUpConverter(axi, wide),
-            LiteDRAMAXI2Native(wide, port, w_buffer_depth=w_buffer_depth,
-                               r_buffer_depth=r_buffer_depth)]
+    if merge:
+        from trixium.gateware.axi_merge import AXIWide
+        conv = AXIWide(axi, wide)
+    else:
+        conv = AXIUpConverter(axi, wide)
+    return [conv, LiteDRAMAXI2Native(wide, port, w_buffer_depth=w_buffer_depth,
+                                     r_buffer_depth=r_buffer_depth)]

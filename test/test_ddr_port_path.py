@@ -107,11 +107,15 @@ def test_engine_port_path_write_then_read():
 
 
 def _engine_port(core, axi, port_width):
+    """256: the native up-converter; 512: LiteX's beat-wise AXIUpConverter; "512m": the
+    merged read bursts (axi_merge.AXIWide)."""
     from trixium.gateware.ddr_port import engine_ddr_port
-    return engine_ddr_port(core, axi, port_width=port_width)
+    if port_width == "512m":
+        return engine_ddr_port(core, axi, port_width=512, merge=True)
+    return engine_ddr_port(core, axi, port_width=port_width, merge=False)
 
 
-@pytest.mark.parametrize("port_width, base_skew", [(256, 0), (512, 0), (512, 32)])
+@pytest.mark.parametrize("port_width, base_skew", [(256, 0), (512, 0), (512, 32), ("512m", 0), ("512m", 32)])
 def test_engine_port_path_through_the_controller(port_width, base_skew):
     """The same chain on the real LiteDRAM core (bank machines, multiplexer, refresher) over
     the PHY model, DFI in hardware mode as after the BIOS's init - the Verilator sim minus
@@ -199,7 +203,7 @@ def test_engine_port_path_through_the_controller(port_width, base_skew):
     run_simulation(dut, [control(), port_driver(0), port_driver(1)])
 
 
-@pytest.mark.parametrize("port_width", [256, 512])
+@pytest.mark.parametrize("port_width", [256, 512, "512m"])
 def test_engine_port_path_streams_at_rate(port_width):
     """A sequential read stream through the whole chain on the real LiteDRAM core must run
     near one beat per cycle. LiteDRAM's native up-converter (the 256-bit port on the 512-bit
