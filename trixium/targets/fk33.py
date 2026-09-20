@@ -144,6 +144,7 @@ class BonsaiSoC(SoCCore):
         cluster_chan_stride    = HBM_CHAN_STRIDE  # 256 MB: one pseudo-channel per engine channel.
         cluster_chan_skew      = 0     # No shared controller, no bank skew.
         cluster_weight_base    = HBM_WEIGHT_BASE  # +64 MB into it (port-matched, CPU-safe).
+        cluster_with_dnrec     = False # The XCU1525-only exact-FP32 recurrence engine.
         # Bonsai cluster: begin. This block is byte-identical in every board target
         # (test_layout_contract.py diffs the marked regions): the per-board knobs are
         # the cluster_* variables set just above it. Migen names every signal by the
@@ -208,9 +209,19 @@ class BonsaiSoC(SoCCore):
                 # in the netlist anyway - the operand register was emitted under a
                 # namer-collided name and the ROM output cells are absorbed into the
                 # RAMB18 output stage, so the regexes matched nothing.)
+            sp_client = vecunit
+            if cluster_with_dnrec:
+                assert vecunit is not None, "DeltaNet recurrence needs the scratchpad arbiter"
+                from trixium.gateware.deltanet import BonsaiDeltaNetUnit, BonsaiScratchpadClientMux
+                self.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit())
+                self.spmux = BonsaiScratchpadClientMux(vecunit, self.dnunit)
+                sp_client = self.spmux
+                platform.add_source(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
+                platform.add_source(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
+                self.add_constant("BONSAI_HAS_DNREC")
             self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
             self.engine     = ClockDomainsRenamer("eng")(
-                BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=vecunit,
+                BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=sp_client,
                                    seq=seq, dual=with_dual, chan_stride=cluster_chan_stride,
                                    chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew))
             if with_dual:
@@ -238,8 +249,8 @@ class BonsaiSoC(SoCCore):
             self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
             # Sideband (wishbone/CSR) scratchpad access only while all units are idle.
             units_idle = ~self.engine.sp_busy
-            if vecunit is not None:
-                units_idle = units_idle & ~vecunit.busy
+            if sp_client is not None:
+                units_idle = units_idle & ~sp_client.busy
             if seq is not None:
                 units_idle = units_idle & ~seq.busy
             self.comb += self.scratchpad.units_idle.eq(units_idle)
