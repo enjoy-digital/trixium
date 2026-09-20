@@ -86,7 +86,8 @@ static uint32_t dn_head_addr(uint32_t global_head)
 }
 
 static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
-                       const float *vh, float decay, float beta, float scale, float *oh)
+                       const float *vh, float decay, float beta, float scale, float *oh,
+                       int load_qk)
 {
     uint8_t chan = global_head % (uint32_t)n_ch;
     uint64_t t0 = perf_now64();
@@ -97,7 +98,8 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
     volatile float *sq = (volatile float *)(SCRATCHPAD_BASE + DN_SP_Q);
     volatile float *sk = (volatile float *)(SCRATCHPAD_BASE + DN_SP_K);
     volatile float *sv = (volatile float *)(SCRATCHPAD_BASE + DN_SP_V);
-    for (uint32_t i = 0; i < DN_HW_COLS; i++) { sq[i] = qh[i]; sk[i] = kh[i]; }
+    if (load_qk)
+        for (uint32_t i = 0; i < DN_HW_COLS; i++) { sq[i] = qh[i]; sk[i] = kh[i]; }
     for (uint32_t i = 0; i < DN_HW_ROWS; i++) sv[i] = vh[i];
 
     dnunit_decay_write(f32_bits(decay));
@@ -511,8 +513,21 @@ static void deltanet_layer(int l, const float *h, float *out)
     // The recurrence per value head (llama.cpp's autoregressive kernel): M = S[hh] rows j.
     float scale = 1.0f/sqrtf((float)hk);
     int rep = nv/nk;
-    for (int hh = 0; hh < nv; hh++) {
-        int kh = hh % nk;
+    for (int hi = 0; hi < nv; hi++) {
+        int hh = hi, kh, gpos, load_qk = 1;
+        if (dn_hw) {
+            // Heads r*nk+kh share q/k for each kh. Visit those `rep` heads together so
+            // q/k remain in the scratchpad, while their striped state matrices are also
+            // consecutive slots in one DDR channel. `og`'s grouped order is exactly hi.
+            kh = hi/rep;
+            int r = hi - kh*rep;
+            hh = r*nk + kh;
+            gpos = hi;
+            load_qk = (r == 0);
+        } else {
+            kh = hh % nk;
+            gpos = kh*rep + hh/nk;
+        }
         const float *qh = qb + kh*hk, *kk = kb + kh*hk, *vh = vb + hh*hv;
         float *M = dn_hw ? NULL : S + (uint64_t)hh*hv*hk;
         float decay = expf(gb[hh]);
@@ -520,7 +535,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         if (dn_hw) {
 #ifdef BONSAI_HAS_DNREC
             dn_hw_head((uint32_t)s*nv + (uint32_t)hh, qh, kk, vh, decay,
-                       betab[hh], scale, oh);
+                       betab[hh], scale, oh, load_qk);
 #endif
         } else {
             // One pass over the state: row j's delta depends on row j alone, so the decay,
@@ -542,7 +557,6 @@ static void deltanet_layer(int l, const float *h, float *out)
         // Gated RMSNorm over the head with the shared head norm, times SiLU(z); written in
         // grouped head order (key head major) - the order the folded out projection expects.
         rmsnorm_fv(delta, oh, norm_ssm[l], hv);
-        int gpos = kh*rep + hh/nk;
         float *dst = og + gpos*hv;
         const float *z = zb + hh*hv;
         for (int j = 0; j < hv; j++) dst[j] = delta[j]*siluf(z[j]);
