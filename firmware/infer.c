@@ -45,6 +45,28 @@ static COLD void cold_path(void) { __asm__ volatile("" ::: "memory"); }
 static int __errno_storage;
 int *__errno(void) { return &__errno_storage; }
 
+// The LiteX firmware is built with -fno-builtin, so even an RV32F build used to call
+// libm for every fabsf/lroundf in float->int8 quantisation. That is thousands of calls
+// per 27B token. RISC-V's static RMM rounding mode is exactly lroundf's finite-input
+// rule (nearest, ties away from zero); keep libm as the bit-identical soft-float fallback.
+static inline float f32_abs(float x)
+{
+    union { float f; uint32_t u; } v = { .f = x };
+    v.u &= 0x7fffffff;
+    return v.f;
+}
+
+static inline int32_t f32_lround_i32(float x)
+{
+#if defined(__riscv_flen) && __riscv_flen >= 32
+    int32_t r;
+    __asm__ volatile("fcvt.w.s %0, %1, rmm" : "=r"(r) : "f"(x));
+    return r;
+#else
+    return (int32_t)lroundf(x);
+#endif
+}
+
 // Scratchpad layout (byte offsets) - resident-BFP regions (int16 mantissas + firmware-
 // tracked exponents; sized for the 8B: E=4096, F=12288).
 #define SP_X    0x00000 // int8 matvec input (<= 12 KB).
@@ -209,7 +231,7 @@ COLD static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
     perf_enter(OP_QUANT8);
     float amax = 0;
     for (int i = 0; i < n; i++) {
-        float a = fabsf(src[i]);
+        float a = f32_abs(src[i]);
         if (a > amax) amax = a;
     }
     int e8 = 0;
@@ -222,7 +244,7 @@ COLD static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
     for (int i = 0; i < n; i += 4) {
         uint32_t w = 0;
         for (int b = 0; b < 4; b++) {
-            int q8 = (int)lroundf(src[i+b]*is);
+            int q8 = f32_lround_i32(src[i+b]*is);
             if (q8 >  127) q8 =  127;
             if (q8 < -127) q8 = -127;
             w |= ((uint32_t)(uint8_t)(int8_t)q8) << (8*b);
@@ -258,7 +280,7 @@ COLD static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 {
     float amax = 0;
     for (int i = 0; i < head_dim; i++) {
-        float a = fabsf(vec[i]);
+        float a = f32_abs(vec[i]);
         if (a > amax) amax = a;
     }
     int ek = 0;
@@ -275,7 +297,7 @@ COLD static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
     for (int i = 0; i < head_dim; i += 4) {
         uint32_t w = 0;
         for (int b = 0; b < 4; b++) {
-            int q8 = (int)lroundf(vec[i+b]*is);
+            int q8 = f32_lround_i32(vec[i+b]*is);
             if (q8 >  127) q8 =  127;
             if (q8 < -127) q8 = -127;
             w |= ((uint32_t)(uint8_t)(int8_t)q8) << (8*b);
@@ -518,14 +540,14 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
     // One exponent for the whole vector (quantize_f_pow2's rule: amax's exponent - 7).
     float amax = 0;
     for (uint32_t i = 0; i < cols; i++) {
-        float a = fabsf(src[i]);
+        float a = f32_abs(src[i]);
         if (a > amax) amax = a;
     }
     int e8 = 0;
     if (amax > 0) { frexpf(amax, &e8); e8 -= 7; }
     float is = ldexpf(1.0f, -e8);
     for (uint32_t i = 0; i < cols; i++) {
-        long q = lroundf(src[i]*is);
+        int32_t q = f32_lround_i32(src[i]*is);
         kseg_x8[i] = (int8_t)(q > 127 ? 127 : q < -127 ? -127 : q);
     }
     memset(kseg_acc, 0, e->rows*4);
