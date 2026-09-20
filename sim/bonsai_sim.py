@@ -80,7 +80,7 @@ DDR4_SIM_CSR_STRIDE  = 0x1000
 class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
                  dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra="",
-                 mem="hbm", n_memctrl=4):
+                 mem="hbm", n_memctrl=4, update_repo="no"):
         assert mem in ("hbm", "ddr4")
         platform = Platform()
         self.comb += platform.trace.eq(1)
@@ -115,11 +115,22 @@ class BonsaiSimSoC(SoCCore):
             VexiiRiscv.args_fill(_p)
             _va = _p.parse_args([])
             _va.cpu_variant = "standard"
+            _va.update_repo = update_repo
             # The extra args go through the real API: args_read runs the generator's
             # PythonArgsGen on them and the ISA map (hence the software's -march) follows,
             # so "--with-rvf" gives an FPU the firmware actually uses.
             _va.vexii_args  = vexii_extra
             VexiiRiscv.args_read(_va)
+            # LiteX builds --with-isa from a set, whose process-random iteration order used
+            # to give the same CPU a different netlist hash on successive runs and needlessly
+            # invoke SBT again.  Canonicalise only that comma list; the option order remains
+            # otherwise untouched.
+            _canon = []
+            for _arg in VexiiRiscv.vexii_args.split():
+                if _arg.startswith("--with-isa="):
+                    _arg = "--with-isa=" + ",".join(sorted(_arg.split("=", 1)[1].split(",")))
+                _canon.append(_arg)
+            VexiiRiscv.vexii_args = " ".join(_canon)
             # Now override just the fetch cache. 64 sets x 4 ways x 64 B = 16 KB, against a
             # 12 KB forward() that a 4 KB VexRiscv cache cannot hold.
             sets = max(16, (icache_kb*1024)//(4*64)) if icache_kb else 64
@@ -339,6 +350,8 @@ def main():
     parser.add_argument("--vexii-extra", default="",
                         help="vexiiriscv only: extra SocGen args, e.g. "
                              "'--with-btb --with-ras --with-gshare'")
+    parser.add_argument("--update-repo", default="no", choices=["no", "recommended", "latest"],
+                        help="VexiiRiscv source update policy (default: no, for reproducible runs)")
     parser.add_argument("--pc-profile",     action="store_true",
                         help="compile the VexRiscv PC profiler in (sim/pc_profiler.cpp); "
                              "writes pcprof-*.txt into build/sim/gateware")
@@ -368,7 +381,7 @@ def main():
         soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
-            mem=args.mem, n_memctrl=args.n_memctrl)
+            mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -377,7 +390,7 @@ def main():
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
-        mem=args.mem, n_memctrl=args.n_memctrl)
+        mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the

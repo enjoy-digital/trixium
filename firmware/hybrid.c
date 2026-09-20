@@ -258,6 +258,38 @@ int hybrid_pos(void) { return pos; }
 
 // Layers ----------------------------------------------------------------------------------------
 
+// Four rows have no data dependency between them.  Keep their FP32 operation and accumulation
+// order exactly the same as the scalar reference, but expose four independent chains to the
+// Vexii FPU.  A single row's dot += term chain otherwise serialises on the adder latency.  Do
+// not replace these loops with a tree reduction or an FMA: both change the 27B's arithmetic.
+static inline void deltanet_rows4(float *M, int stride, const float *kk, const float *qh,
+                                  const float *vh, float decay, float beta, float scale,
+                                  float *oh)
+{
+    float *m0 = M, *m1 = M + stride, *m2 = M + 2*stride, *m3 = M + 3*stride;
+    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    for (int i = 0; i < stride; i++) {
+        float k = kk[i];
+        m0[i] *= decay; d0 += m0[i]*k;
+        m1[i] *= decay; d1 += m1[i]*k;
+        m2[i] *= decay; d2 += m2[i]*k;
+        m3[i] *= decay; d3 += m3[i]*k;
+    }
+    d0 = (vh[0] - d0)*beta;
+    d1 = (vh[1] - d1)*beta;
+    d2 = (vh[2] - d2)*beta;
+    d3 = (vh[3] - d3)*beta;
+    float o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+    for (int i = 0; i < stride; i++) {
+        float k = kk[i], q = qh[i];
+        m0[i] += d0*k; o0 += m0[i]*q;
+        m1[i] += d1*k; o1 += m1[i]*q;
+        m2[i] += d2*k; o2 += m2[i]*q;
+        m3[i] += d3*k; o3 += m3[i]*q;
+    }
+    oh[0] = o0*scale; oh[1] = o1*scale; oh[2] = o2*scale; oh[3] = o3*scale;
+}
+
 static void deltanet_layer(int l, const float *h, float *out)
 {
     int   s = dn_slot[l];
@@ -302,7 +334,10 @@ static void deltanet_layer(int l, const float *h, float *out)
         // the k dot, the update and the q dot happen while the row (512 B) is in the
         // D$ - the two-loop form streamed the 64 KB head twice through a 32 KB cache.
         // Same operations in the same order per element: bit-identical results.
-        for (int j = 0; j < hv; j++) {
+        int j = 0;
+        for (; j + 3 < hv; j += 4)
+            deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
+        for (; j < hv; j++) {
             float *Mj = M + j*hk, dot = 0;
             for (int i = 0; i < hk; i++) { Mj[i] *= decay; dot += Mj[i]*kk[i]; }
             float dj = (vh[j] - dot)*betab[hh];
