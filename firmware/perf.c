@@ -9,6 +9,7 @@
 #include <generated/soc.h>
 
 #include "perf.h"
+#include "hybrid.h"
 
 uint32_t perf_cycles[OP_COUNT];
 uint32_t perf_calls[OP_COUNT];
@@ -33,6 +34,7 @@ static uint32_t ovl0_tot, ovl0_eng, ovl0_vec, ovl0_both;
 
 void perf_reset(void)
 {
+    hybrid_stats_reset();
     {
         extern uint32_t eng_poll_spins, eng_poll_waits, vec_poll_spins, vec_poll_waits,
                         seq_poll_spins, seq_poll_waits;
@@ -181,6 +183,7 @@ void perf_print(void)
                (unsigned long)vec_poll_spins, (unsigned long)vec_poll_waits,
                (unsigned long)seq_poll_spins, (unsigned long)seq_poll_waits);
     }
+    hybrid_stats_print();
     perf_print_overlap();
 }
 

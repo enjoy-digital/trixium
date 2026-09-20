@@ -31,6 +31,7 @@
 #include "engine.h"
 #include "infer.h"
 #include "hybrid.h"
+#include "perf.h"
 
 static const struct bons_header *H;
 static int n_ch, n_embd, n_head, n_kv_head, head_dim, ffn_dim, n_layer, q_dim, kv_dim, n_rep;
@@ -54,6 +55,13 @@ static int    rope_pos_cached;
 // matrix; other hybrid test models keep using the scalar CPU implementation below.
 static int      dn_hw;
 static uint32_t dn_hbm_base;
+
+// The first board run needs to distinguish a compute limit from a DDR/scratchpad/dispatch
+// limit. rdcycle is cheap enough to bracket every head without perturbing the datapath;
+// report per-head and per-forward averages so the 32-bit minimal printf remains sufficient
+// even for a long 27B benchmark.
+static uint64_t dn_cyc_fetch, dn_cyc_params, dn_cyc_core, dn_cyc_store, dn_cyc_output;
+static uint32_t dn_heads_profiled;
 
 #ifdef BONSAI_HAS_DNREC
 #define DN_SP_STATE 0x00000u
@@ -81,8 +89,11 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
                        const float *vh, float decay, float beta, float scale, float *oh)
 {
     uint8_t chan = global_head % (uint32_t)n_ch;
+    uint64_t t0 = perf_now64();
     engine_fetch(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+    dn_cyc_fetch += perf_now64() - t0;
 
+    t0 = perf_now64();
     volatile float *sq = (volatile float *)(SCRATCHPAD_BASE + DN_SP_Q);
     volatile float *sk = (volatile float *)(SCRATCHPAD_BASE + DN_SP_K);
     volatile float *sv = (volatile float *)(SCRATCHPAD_BASE + DN_SP_V);
@@ -92,6 +103,9 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
     dnunit_decay_write(f32_bits(decay));
     dnunit_beta_write(f32_bits(beta));
     dnunit_scale_write(f32_bits(scale));
+    dn_cyc_params += perf_now64() - t0;
+
+    t0 = perf_now64();
     uint32_t done = dnunit_done_count_read();
     dnunit_submit_write(1);
     uint32_t spins = 0;
@@ -101,10 +115,17 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
         engine_wedged = 1;
         return;
     }
+    dn_cyc_core += perf_now64() - t0;
 
+    t0 = perf_now64();
     engine_store(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+    dn_cyc_store += perf_now64() - t0;
+
+    t0 = perf_now64();
     volatile float *so = (volatile float *)(SCRATCHPAD_BASE + DN_SP_OUT);
     for (uint32_t i = 0; i < DN_HW_ROWS; i++) oh[i] = so[i];
+    dn_cyc_output += perf_now64() - t0;
+    dn_heads_profiled++;
 }
 
 static void dn_hw_reset(void)
@@ -389,6 +410,35 @@ void hybrid_reset(void)
         memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
     }
     if (dn_conv)  memset(dn_conv, 0, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);
+    hybrid_stats_reset();
+}
+
+void hybrid_stats_reset(void)
+{
+    dn_cyc_fetch = dn_cyc_params = dn_cyc_core = dn_cyc_store = dn_cyc_output = 0;
+    dn_heads_profiled = 0;
+}
+
+void hybrid_stats_print(void)
+{
+    if (!dn_hw || !dn_heads_profiled)
+        return;
+    uint32_t heads_per_forward = (uint32_t)n_dn*(uint32_t)nv;
+    uint32_t forwards = heads_per_forward ? dn_heads_profiled/heads_per_forward : 0;
+    uint64_t total = dn_cyc_fetch + dn_cyc_params + dn_cyc_core
+                   + dn_cyc_store + dn_cyc_output;
+    printf("dnhw: %lu heads/%lu forwards, avg cycles/head fetch %lu params %lu "
+           "core %lu store %lu output %lu total %lu",
+           (unsigned long)dn_heads_profiled, (unsigned long)forwards,
+           (unsigned long)(dn_cyc_fetch/dn_heads_profiled),
+           (unsigned long)(dn_cyc_params/dn_heads_profiled),
+           (unsigned long)(dn_cyc_core/dn_heads_profiled),
+           (unsigned long)(dn_cyc_store/dn_heads_profiled),
+           (unsigned long)(dn_cyc_output/dn_heads_profiled),
+           (unsigned long)(total/dn_heads_profiled));
+    if (forwards)
+        printf(", %lu cycles/forward", (unsigned long)(total/forwards));
+    puts("");
 }
 
 int hybrid_pos(void) { return pos; }
