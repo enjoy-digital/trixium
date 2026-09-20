@@ -191,11 +191,9 @@ class BonsaiDeltaNetState(LiteXModule):
         dump_issue   = Signal()
         dump_data    = Signal(256)
         self.comb += [
-            # Keep one read in flight for now: the selected bank/address remains stable
-            # through the synchronous BRAM read and FIFO capture, which makes the transpose
-            # boundary unambiguous under backpressure. The recurrence pipeline can later
-            # overlap a tagged sequence of these reads without changing this interface.
-            dump_issue.eq(dump_active & ~dump_request & ~dump_return & dump_fifo.writable),
+            # Two reads may be in the registered BRAM/return pipeline. Keep two FIFO slots
+            # free for them; with a draining consumer this launches one state beat/cycle.
+            dump_issue.eq(dump_active & (dump_fifo.level < 2)),
             dump_data.eq(Array([p.dat_r for p in read_ports])[dump_bank_d]),
             dump_fifo.we.eq(dump_return),
             dump_fifo.din.eq(Cat(dump_data, dump_last_d)),
