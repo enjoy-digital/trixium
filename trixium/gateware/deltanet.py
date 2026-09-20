@@ -538,7 +538,6 @@ class BonsaiDeltaNetRecurrence(LiteXModule):
                 )
 
         self.sync += [
-            self.done.eq(0),
             If(self.start,
                 p1_ret.eq(0), delta_ret.eq(0), p2_ret.eq(0), scale_ret.eq(0),
             ).Else(

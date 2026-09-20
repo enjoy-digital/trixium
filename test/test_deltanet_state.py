@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 from migen import *
+from migen.fhdl.tools import list_targets
 from migen.sim import run_simulation
 
 from litex.gen import *
@@ -47,6 +48,19 @@ class _IntMul(LiteXModule):
         for i in range(1, self.latency):
             self.sync += [data[i].eq(data[i - 1]), valid[i].eq(valid[i - 1])]
         self.comb += [self.result.eq(data[-1]), self.result_valid.eq(valid[-1])]
+
+
+def test_deltanet_done_has_one_driver_domain():
+    """Vivado must not discard the completion pulse as a multi-driven net."""
+    dut = BonsaiDeltaNetRecurrence(
+        rows=96, cols=16, lanes=8,
+        add_factory=_IntAdd, mul_factory=_IntMul,
+        negate=lambda x: -x,
+    )
+    fragment = dut.get_fragment()
+    assert dut.done in list_targets(fragment.comb)
+    assert all(dut.done not in list_targets(statements)
+               for statements in fragment.sync.values())
 
 
 def test_deltanet_state_transpose_update_and_dump_backpressure():
