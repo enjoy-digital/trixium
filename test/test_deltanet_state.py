@@ -9,7 +9,9 @@ from migen.sim import run_simulation
 
 from litex.gen import *
 
-from trixium.gateware.deltanet import BonsaiDeltaNetState, BonsaiDeltaNetRecurrence
+from trixium.gateware.deltanet import (
+    BonsaiDeltaNetState, BonsaiDeltaNetRecurrence, BonsaiDeltaNetUnit,
+)
 
 
 class _IntAdd(LiteXModule):
@@ -255,3 +257,87 @@ def test_deltanet_recurrence_scheduler_preserves_row_order():
     assert result["state"] == expected
     assert result["out"] == expected_out
     assert result["cycles"] < 2000
+
+
+def test_deltanet_scratchpad_unit_moves_a_complete_head():
+    rows, cols, lanes = 96, 16, 8
+    core = BonsaiDeltaNetRecurrence(
+        rows=rows, cols=cols, lanes=lanes,
+        add_factory=_IntAdd, mul_factory=_IntMul,
+        negate=lambda x: -x,
+    )
+    dut = BonsaiDeltaNetUnit(core=core)
+    state = [[1 + (r % 3) + (c % 2) for c in range(cols)] for r in range(rows)]
+    kval = [1, 1] + [0]*(cols - 2)
+    qval = [1, 1] + [0]*(cols - 2)
+    vval = [100 + r for r in range(rows)]
+    expected = [row[:] for row in state]
+    expected_out = []
+    for r, row in enumerate(expected):
+        d = vval[r] - row[0] - row[1]
+        row[0] += d
+        row[1] += d
+        expected_out.append(row[0] + row[1])
+
+    qbase, kbase, vbase, sbase, obase = 0x000, 0x040, 0x080, 0x400, 0x2000
+    depth = 512
+    init = [0]*depth
+
+    def put_words(base, values):
+        for g in range((len(values) + 7)//8):
+            xs = values[8*g:8*g + 8] + [0]*8
+            init[base//32 + g] = sum((xs[i] & 0xffffffff) << (32*i) for i in range(8))
+
+    put_words(qbase, qval)
+    put_words(kbase, kval)
+    put_words(vbase, vval)
+    flat_state = [x for row in state for x in row]
+    put_words(sbase, flat_state)
+
+    mem = Memory(256, depth, init=init)
+    rp = mem.get_port(has_re=True)
+    wp = mem.get_port(write_capable=True, we_granularity=32)
+    dut.specials += mem, rp, wp
+    dut.comb += [
+        rp.adr.eq(dut.sp_rd_adr),
+        rp.re.eq(dut.sp_rd_req),
+        dut.sp_rd_dat.eq(rp.dat_r),
+        dut.sp_wr_gnt.eq(1),
+        wp.adr.eq(dut.sp_wr_adr),
+        wp.we.eq(dut.sp_wr_we),
+        wp.dat_w.eq(dut.sp_wr_dat),
+    ]
+    result = {}
+
+    def gen():
+        for csr, value in ((dut.q_base, qbase), (dut.k_base, kbase),
+                           (dut.v_base, vbase), (dut.state_base, sbase),
+                           (dut.out_base, obase), (dut.decay, 1),
+                           (dut.beta, 1), (dut.scale, 1)):
+            yield csr.storage.eq(value)
+        yield dut.submit.re.eq(1)
+        yield
+        yield dut.submit.re.eq(0)
+        for cycles in range(6000):
+            if (yield dut.done_count.status) == 1:
+                result["cycles"] = cycles
+                break
+            yield
+        else:
+            raise AssertionError("scratchpad recurrence timeout")
+        yield
+        got = []
+        for i in range(rows*cols):
+            word = (yield mem[sbase//32 + i//8])
+            got.append((word >> (32*(i % 8))) & 0xffffffff)
+        result["state"] = [got[r*cols:(r + 1)*cols] for r in range(rows)]
+        outs = []
+        for i in range(rows):
+            word = (yield mem[obase//32 + i//8])
+            outs.append((word >> (32*(i % 8))) & 0xffffffff)
+        result["out"] = outs
+
+    run_simulation(dut, gen())
+    assert result["state"] == expected
+    assert result["out"] == expected_out
+    assert result["cycles"] < 3000

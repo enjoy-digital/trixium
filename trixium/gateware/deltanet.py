@@ -24,6 +24,7 @@ from migen.genlib.fifo import SyncFIFO
 
 from litex.gen import *
 from litex.soc.interconnect import stream
+from litex.soc.interconnect.csr import *
 
 from trixium.gateware.fp32 import BonsaiFP32Add, BonsaiFP32Mul
 
@@ -324,6 +325,11 @@ class BonsaiDeltaNetRecurrence(LiteXModule):
         self.param_kind  = Signal(2)
         self.param_index = Signal(max=max(rows, cols))
         self.param_data  = Signal(32)
+        # Wide loader used by the scratchpad wrapper: eight adjacent scalars per beat.
+        self.param_word_we    = Signal()
+        self.param_word_kind  = Signal(2)
+        self.param_word_group = Signal(max=max(rows, cols)//8)
+        self.param_word_data  = Signal(256)
 
         self.state = BonsaiDeltaNetState(rows=rows, cols=cols, lanes=lanes)
         self.submodules.state = self.state
@@ -360,6 +366,25 @@ class BonsaiDeltaNetRecurrence(LiteXModule):
                         self.param_data)) for lane in range(lanes)]
             )
         )
+        for i in range(8):
+            qi = Signal(max=cols)
+            vi = Signal(max=rows)
+            self.comb += [
+                qi.eq((self.param_word_group << 3) + i),
+                vi.eq((self.param_word_group << 3) + i),
+            ]
+            self.sync += If(self.param_word_we,
+                If(self.param_word_kind == 0,
+                    qa[qi].eq(self.param_word_data[32*i:32*(i + 1)]),
+                ).Elif(self.param_word_kind == 1,
+                    ka[qi].eq(self.param_word_data[32*i:32*(i + 1)]),
+                ).Else(
+                    *[If(vi[0:(lanes - 1).bit_length()] == lane,
+                        va[lane][vi >> (lanes - 1).bit_length()].eq(
+                            self.param_word_data[32*i:32*(i + 1)]))
+                      for lane in range(lanes)]
+                )
+            )
         self.comb += self.out_data.eq(Cat(*[outa[l][self.out_row_phase]
                                             for l in range(lanes)]))
 
@@ -595,3 +620,199 @@ class BonsaiDeltaNetRecurrence(LiteXModule):
                 NextState("IDLE"),
             )
         )
+
+
+class BonsaiDeltaNetUnit(LiteXModule):
+    """CSR/scratchpad front-end for :class:`BonsaiDeltaNetRecurrence`.
+
+    One command consumes q, k, v and the row-major state from scratchpad, runs the exact
+    recurrence, then overwrites the state and writes the 128-row result. The interface is
+    intentionally the same read/write client shape as ``BonsaiVectorUnit`` so the SoC can
+    give this unit priority while it is busy without adding scratchpad ports.
+    """
+
+    def __init__(self, core=None, rows=128, cols=128, lanes=8):
+        if core is None:
+            core = BonsaiDeltaNetRecurrence(rows=rows, cols=cols, lanes=lanes)
+        self.core = core
+        self.submodules.core = core
+        rows, cols, lanes = core.state.rows, core.state.cols, core.state.lanes
+        qgroups, vgroups = cols//8, rows//8
+        phases = rows//lanes
+        state_beats = core.state.beats
+
+        self.state_base = CSRStorage(24, description="Scratchpad byte base of row-major M.")
+        self.q_base = CSRStorage(24, description="Scratchpad byte base of q[cols].")
+        self.k_base = CSRStorage(24, description="Scratchpad byte base of k[cols].")
+        self.v_base = CSRStorage(24, description="Scratchpad byte base of v[rows].")
+        self.out_base = CSRStorage(24, description="Scratchpad byte base of output[rows].")
+        self.decay = CSRStorage(32, description="FP32 decay bits.")
+        self.beta  = CSRStorage(32, description="FP32 beta bits.")
+        self.scale = CSRStorage(32, description="FP32 1/sqrt(cols) bits.")
+        self.submit = CSRStorage(1, description="Write 1 to run one head recurrence.")
+        self.status = CSRStatus(fields=[CSRField("busy", size=1)])
+        self.done_count = CSRStatus(32)
+
+        self.busy = Signal()
+        self.sp_rd_req = Signal()
+        self.sp_rd_adr = Signal(13)
+        self.sp_rd_dat = Signal(256)
+        self.sp_wr_req = Signal()
+        self.sp_wr_adr = Signal(13)
+        self.sp_wr_we  = Signal(8)
+        self.sp_wr_dat = Signal(256)
+        self.sp_wr_gnt = Signal()
+
+        fsm = FSM(reset_state="IDLE")
+        self.submodules.fsm = fsm
+        self.comb += [
+            self.busy.eq(~fsm.ongoing("IDLE")),
+            self.status.fields.busy.eq(self.busy),
+            core.decay.eq(self.decay.storage),
+            core.beta.eq(self.beta.storage),
+            core.scale.eq(self.scale.storage),
+        ]
+
+        issue = Signal(12)
+        response = Signal(12)
+        rd_pending = Signal()
+        rd_kind = Signal(2)
+        rd_index = Signal(12)
+        load_kind = Signal(2)
+        load_limit = Signal(12)
+        load_base = Signal(13)
+        loading = Signal()
+        self.comb += [
+            loading.eq(fsm.ongoing("LOAD_Q") | fsm.ongoing("LOAD_K") |
+                       fsm.ongoing("LOAD_V") | fsm.ongoing("LOAD_STATE")),
+            load_kind.eq(Mux(fsm.ongoing("LOAD_Q"), 0,
+                         Mux(fsm.ongoing("LOAD_K"), 1,
+                         Mux(fsm.ongoing("LOAD_V"), 2, 3)))),
+            load_limit.eq(Mux(fsm.ongoing("LOAD_Q") | fsm.ongoing("LOAD_K"), qgroups,
+                          Mux(fsm.ongoing("LOAD_V"), vgroups, state_beats))),
+            load_base.eq(Mux(fsm.ongoing("LOAD_Q"), self.q_base.storage >> 5,
+                         Mux(fsm.ongoing("LOAD_K"), self.k_base.storage >> 5,
+                         Mux(fsm.ongoing("LOAD_V"), self.v_base.storage >> 5,
+                             self.state_base.storage >> 5)))),
+            self.sp_rd_req.eq(loading & (issue < load_limit) &
+                              (~fsm.ongoing("LOAD_STATE") | core.state.load_ready)),
+            self.sp_rd_adr.eq(load_base + issue),
+            core.param_word_we.eq(rd_pending & (rd_kind != 3)),
+            core.param_word_kind.eq(rd_kind),
+            core.param_word_group.eq(rd_index),
+            core.param_word_data.eq(self.sp_rd_dat),
+            core.state.load_valid.eq(rd_pending & (rd_kind == 3)),
+            core.state.load_beat.eq(rd_index),
+            core.state.load_data.eq(self.sp_rd_dat),
+        ]
+        rd_return = Signal()
+        self.comb += rd_return.eq(rd_pending)
+        self.sync += [
+            rd_pending.eq(self.sp_rd_req),
+            If(self.sp_rd_req,
+                rd_kind.eq(load_kind),
+                rd_index.eq(issue),
+                issue.eq(issue + 1),
+            ),
+            If(rd_return, response.eq(response + 1)),
+        ]
+
+        wr_count = Signal(12)
+        state_fire = Signal()
+        out_fire = Signal()
+        self.comb += [
+            state_fire.eq(fsm.ongoing("WRITE_STATE") & core.state.source.valid &
+                          self.sp_wr_gnt),
+            out_fire.eq(fsm.ongoing("WRITE_OUT") & self.sp_wr_gnt),
+            core.state.source.ready.eq(fsm.ongoing("WRITE_STATE") & self.sp_wr_gnt),
+            core.out_row_phase.eq(wr_count[:max(1, (phases - 1).bit_length())]),
+            If(fsm.ongoing("WRITE_STATE"),
+                self.sp_wr_req.eq(core.state.source.valid),
+                self.sp_wr_adr.eq((self.state_base.storage >> 5) + wr_count),
+                self.sp_wr_we.eq(0xff),
+                self.sp_wr_dat.eq(core.state.source.data),
+            ).Elif(fsm.ongoing("WRITE_OUT"),
+                self.sp_wr_req.eq(1),
+                self.sp_wr_adr.eq((self.out_base.storage >> 5) + wr_count),
+                self.sp_wr_we.eq(0xff),
+                self.sp_wr_dat.eq(core.out_data),
+            )
+        ]
+        self.sync += If(state_fire | out_fire, wr_count.eq(wr_count + 1))
+
+        def begin_load(state):
+            return [NextValue(issue, 0), NextValue(response, 0), NextState(state)]
+
+        fsm.act("IDLE",
+            If(self.submit.re, *begin_load("LOAD_Q"))
+        )
+        for name, next_name in (("LOAD_Q", "LOAD_K"), ("LOAD_K", "LOAD_V"),
+                                ("LOAD_V", "STATE_INIT")):
+            fsm.act(name,
+                If(rd_return & (response == load_limit - 1), *begin_load(next_name))
+            )
+        fsm.act("STATE_INIT",
+            core.state.load_start.eq(1),
+            *begin_load("LOAD_STATE"),
+        )
+        fsm.act("LOAD_STATE",
+            If(rd_return & (response == state_beats - 1),
+                NextState("STATE_DRAIN"),
+            )
+        )
+        fsm.act("STATE_DRAIN",
+            If(core.state.load_done, NextState("CORE_START"))
+        )
+        fsm.act("CORE_START",
+            core.start.eq(1),
+            NextState("RUN"),
+        )
+        fsm.act("RUN",
+            If(core.done, NextState("DUMP_INIT"))
+        )
+        fsm.act("DUMP_INIT",
+            core.state.dump_start.eq(1),
+            NextValue(wr_count, 0),
+            NextState("WRITE_STATE"),
+        )
+        fsm.act("WRITE_STATE",
+            If(state_fire & (wr_count == state_beats - 1),
+                NextValue(wr_count, 0),
+                NextState("WRITE_OUT"),
+            )
+        )
+        fsm.act("WRITE_OUT",
+            If(out_fire & (wr_count == phases - 1),
+                NextValue(self.done_count.status, self.done_count.status + 1),
+                NextState("IDLE"),
+            )
+        )
+
+
+class BonsaiScratchpadClientMux(LiteXModule):
+    """Give an auxiliary unit priority over the vector-unit scratchpad client."""
+
+    def __init__(self, vector, auxiliary):
+        self.busy = Signal()
+        self.sp_rd_req = Signal()
+        self.sp_rd_adr = Signal.like(vector.sp_rd_adr)
+        self.sp_rd_dat = Signal.like(vector.sp_rd_dat)
+        self.sp_wr_req = Signal()
+        self.sp_wr_adr = Signal.like(vector.sp_wr_adr)
+        self.sp_wr_we  = Signal.like(vector.sp_wr_we)
+        self.sp_wr_dat = Signal.like(vector.sp_wr_dat)
+        self.sp_wr_gnt = Signal()
+        sel = auxiliary.busy
+        self.comb += [
+            self.busy.eq(vector.busy | auxiliary.busy),
+            self.sp_rd_req.eq(Mux(sel, auxiliary.sp_rd_req, vector.sp_rd_req)),
+            self.sp_rd_adr.eq(Mux(sel, auxiliary.sp_rd_adr, vector.sp_rd_adr)),
+            vector.sp_rd_dat.eq(self.sp_rd_dat),
+            auxiliary.sp_rd_dat.eq(self.sp_rd_dat),
+            self.sp_wr_req.eq(Mux(sel, auxiliary.sp_wr_req, vector.sp_wr_req)),
+            self.sp_wr_adr.eq(Mux(sel, auxiliary.sp_wr_adr, vector.sp_wr_adr)),
+            self.sp_wr_we.eq(Mux(sel, auxiliary.sp_wr_we, vector.sp_wr_we)),
+            self.sp_wr_dat.eq(Mux(sel, auxiliary.sp_wr_dat, vector.sp_wr_dat)),
+            vector.sp_wr_gnt.eq(self.sp_wr_gnt & ~sel),
+            auxiliary.sp_wr_gnt.eq(self.sp_wr_gnt & sel),
+        ]
