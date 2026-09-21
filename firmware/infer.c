@@ -56,6 +56,12 @@ static inline float f32_abs(float x)
     return v.f;
 }
 
+static inline uint32_t f32_abs_bits(float x)
+{
+    union { float f; uint32_t u; } v = { .f = x };
+    return v.u & 0x7fffffff;
+}
+
 static inline int32_t f32_lround_i32(float x)
 {
 #if defined(__riscv_flen) && __riscv_flen >= 32
@@ -65,6 +71,44 @@ static inline int32_t f32_lround_i32(float x)
 #else
     return (int32_t)lroundf(x);
 #endif
+}
+
+static inline int32_t f32_q8(float x, float is)
+{
+    int32_t q = f32_lround_i32(x*is);
+    if (q >  127) q =  127;
+    if (q < -127) q = -127;
+    return q;
+}
+
+static inline uint32_t f32_pack_q8x4(const float *src, float is)
+{
+    // Spell out four independent lanes.  GCC 10 otherwise retains an inner b=0..3 loop
+    // with a variable shift, serialising the RV32F conversions and adding four branches
+    // to every scratchpad word.
+    uint32_t q0 = (uint8_t)(int8_t)f32_q8(src[0], is);
+    uint32_t q1 = (uint8_t)(int8_t)f32_q8(src[1], is);
+    uint32_t q2 = (uint8_t)(int8_t)f32_q8(src[2], is);
+    uint32_t q3 = (uint8_t)(int8_t)f32_q8(src[3], is);
+    return q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+}
+
+static int f32_quant_e8(const float *src, uint32_t n)
+{
+    uint32_t amax = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t a = f32_abs_bits(src[i]);
+        // Positive finite IEEE-754 bit patterns have the same order as their values.
+        // Ignore NaNs as the old FP compare did; retain infinity for equivalent overflow.
+        if (a <= 0x7f800000u && a > amax) amax = a;
+    }
+    if (!amax) return 0;
+    uint32_t exp = amax >> 23;
+    if (exp) return (int)exp - 133; // unbiased exponent + 1 (frexpf), then -7.
+    union { uint32_t u; float f; } v = { .u = amax };
+    int e8;
+    frexpf(v.f, &e8);               // Subnormal activations are not expected; stay exact.
+    return e8 - 7;
 }
 
 // Scratchpad layout (byte offsets) - resident-BFP regions (int16 mantissas + firmware-
@@ -229,28 +273,10 @@ COLD static void rmsnorm_f(float *dst, const float *src, const float *w, int n, 
 COLD static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
 {
     perf_enter(OP_QUANT8);
-    float amax = 0;
-    for (int i = 0; i < n; i++) {
-        float a = f32_abs(src[i]);
-        if (a > amax) amax = a;
-    }
-    int e8 = 0;
-    if (amax > 0) {
-        frexpf(amax, &e8);
-        e8 -= 7; // mantissas in [2^6, 2^7).
-    }
+    int e8 = f32_quant_e8(src, n);
     float is = ldexpf(1.0f, -e8);
     volatile uint32_t *sp = (volatile uint32_t *)(SCRATCHPAD_BASE + sp_off);
-    for (int i = 0; i < n; i += 4) {
-        uint32_t w = 0;
-        for (int b = 0; b < 4; b++) {
-            int q8 = f32_lround_i32(src[i+b]*is);
-            if (q8 >  127) q8 =  127;
-            if (q8 < -127) q8 = -127;
-            w |= ((uint32_t)(uint8_t)(int8_t)q8) << (8*b);
-        }
-        sp[i/4] = w;
-    }
+    for (int i = 0; i < n; i += 4) sp[i/4] = f32_pack_q8x4(src + i, is);
     perf_exit(OP_QUANT8);
     return e8;
 }
@@ -458,8 +484,16 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
         }
     } else {
         float sc = ldexpf(xscale, (int)e->rshift - (int)e->bias);
-        for (uint32_t i = 0; i < rows*n_ch; i++)
-            dst[i] = (float)y[i]*sc;
+        uint32_t count = rows*n_ch, i = 0;
+        // Four independent conversions let the in-order RV32F core overlap fcvt/fmul
+        // latency and remove three quarters of the loop-control instructions.
+        for (; i + 3 < count; i += 4) {
+            float f0 = (float)y[i + 0], f1 = (float)y[i + 1];
+            float f2 = (float)y[i + 2], f3 = (float)y[i + 3];
+            dst[i + 0] = f0*sc; dst[i + 1] = f1*sc;
+            dst[i + 2] = f2*sc; dst[i + 3] = f3*sc;
+        }
+        for (; i < count; i++) dst[i] = (float)y[i]*sc;
     }
     perf_exit(OP_NORM_I32);
 }
@@ -543,13 +577,7 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
         kseg_acc = halloc(max_rows*4);
     }
     // One exponent for the whole vector (quantize_f_pow2's rule: amax's exponent - 7).
-    float amax = 0;
-    for (uint32_t i = 0; i < cols; i++) {
-        float a = f32_abs(src[i]);
-        if (a > amax) amax = a;
-    }
-    int e8 = 0;
-    if (amax > 0) { frexpf(amax, &e8); e8 -= 7; }
+    int e8 = f32_quant_e8(src, cols);
     float is = ldexpf(1.0f, -e8);
     uint32_t c0 = 0;
     for (int k = 0; k < nseg; k++) {
@@ -560,16 +588,8 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
         // to SP_X produces the same bytes and removes those three redundant memory passes.
         perf_enter(OP_QUANT8);
         volatile uint32_t *x = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_X);
-        for (uint32_t i = 0; i < seg->cols; i += 4) {
-            uint32_t w = 0;
-            for (int b = 0; b < 4; b++) {
-                int32_t q = f32_lround_i32(src[c0 + i + b]*is);
-                if (q >  127) q =  127;
-                if (q < -127) q = -127;
-                w |= ((uint32_t)(uint8_t)(int8_t)q) << (8*b);
-            }
-            x[i/4] = w;
-        }
+        for (uint32_t i = 0; i < seg->cols; i += 4)
+            x[i/4] = f32_pack_q8x4(src + c0 + i, is);
         perf_exit(OP_QUANT8);
         matvec_f_one(seg, 1.0f, 0, kseg_acc, k != 0);
         c0 += seg->cols;
