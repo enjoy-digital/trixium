@@ -206,7 +206,7 @@ class BonsaiSimSoC(SoCCore):
                    list(range(n_channels)) if mem == 'hbm' else [c//chan_mod for c in range(n_channels)], write=True)
                   if with_native else {})
         config = BonsaiClusterConfig(
-            with_vecunit=True, with_dual=dual, with_sp_csr=False,
+            with_vecunit=True, with_dual=dual, with_sp_csr=with_native, append_sp_csr=with_native,
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
             chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0, **native)
         add_bonsai_cluster(self, axis, config)

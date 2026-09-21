@@ -12,6 +12,7 @@
 
 #include "bonsai_loader.h"
 #include "bonsai_region_upload.h"
+#include "bonsai_region_read.h"
 
 /* Keep in sync with trixium/layout.py and the generated soc.h / csr.h. */
 #include "soc.h"
@@ -127,6 +128,8 @@ static void region_write(void *context, uint32_t offset, uint32_t value)
     (void)context;
     BAR_W(CSR_ZZREGION_BASE+offset, value);
 }
+#endif
+#if defined(CSR_ZZREGION_BASE) || defined(CSR_ZZVERIFY_SP_COMPLETED_ADDR)
 static uint64_t region_now(void *context)
 {
     (void)context;
@@ -153,6 +156,57 @@ void loader_transfer_region(uint32_t region, uint64_t offset, const uint8_t *dat
     fprintf(stderr, "region upload unavailable in these legacy build headers\n");
 #endif
     exit(1);
+}
+
+#if defined(CSR_ZZVERIFY_SP_COMPLETED_ADDR) && defined(CSR_SP_CSR_BASE)
+_Static_assert(CSR_ZZVERIFY_DST_ADDR-CSR_ZZVERIFY_BASE == BNS_RB_DST, "readback destination CSR layout");
+_Static_assert(CSR_ZZVERIFY_SP_COMPLETED_ADDR-CSR_ZZVERIFY_BASE == BNS_RB_SP_COMPLETED, "scratch completion CSR layout");
+_Static_assert(CSR_SP_CSR_ADR_ADDR-CSR_SP_CSR_BASE == BNS_RB_SP_ADR, "scratch address CSR layout");
+_Static_assert(CSR_SP_CSR_DATA_R_ADDR-CSR_SP_CSR_BASE == BNS_RB_SP_DATA, "scratch data CSR layout");
+static uint32_t readback_read(void *context, uint32_t bank, uint32_t offset)
+{
+    (void)context;
+    return BAR_R((bank==BNS_RB_VERIFY_BANK ? CSR_ZZVERIFY_BASE : CSR_SP_CSR_BASE)+offset);
+}
+static void readback_write(void *context, uint32_t bank, uint32_t offset, uint32_t value)
+{
+    (void)context;
+    BAR_W((bank==BNS_RB_VERIFY_BANK ? CSR_ZZVERIFY_BASE : CSR_SP_CSR_BASE)+offset, value);
+}
+#endif
+
+static void loader_region_read_operation(uint32_t region, uint64_t offset, uint8_t *data,
+    const uint8_t *reference, uint64_t bytes, uint32_t scratch_dst, uint32_t scratch_bytes)
+{
+#if defined(CSR_ZZVERIFY_SP_COMPLETED_ADDR) && defined(CSR_SP_CSR_BASE)
+    if (!bar) { fprintf(stderr, "region readback requires mapped BAR0\n"); exit(1); }
+    const struct bns_read_io io = {NULL, readback_read, readback_write, region_now, region_wait};
+    struct bns_read_progress progress;
+    int rc = reference ? bns_region_verify(&io, region, offset, reference, bytes, scratch_dst,
+                                           scratch_bytes, UINT64_C(60000000), &progress)
+                       : bns_region_readback(&io, region, offset, data, bytes, scratch_dst,
+                                             scratch_bytes, UINT64_C(60000000), &progress);
+    if (!rc) return;
+    fprintf(stderr, "region readback failed rc=%d region=%u offset=%016llx completed=%llu/%llu "
+            "error=%04x mismatch=%016llx; discard the result/allocation; transport failure needs reset/drain\n",
+            rc, region, (unsigned long long)offset, (unsigned long long)progress.completed_bytes,
+            (unsigned long long)bytes, progress.hardware_error, (unsigned long long)progress.mismatch_offset);
+#else
+    (void)region; (void)offset; (void)data; (void)reference; (void)bytes; (void)scratch_dst; (void)scratch_bytes;
+    fprintf(stderr, "completion-aware region readback unavailable in these build headers\n");
+#endif
+    exit(1);
+}
+
+void loader_read_region(uint32_t region, uint64_t offset, uint8_t *data, uint64_t bytes,
+                        uint32_t scratch_dst, uint32_t scratch_bytes)
+{
+    loader_region_read_operation(region, offset, data, NULL, bytes, scratch_dst, scratch_bytes);
+}
+void loader_verify_region(uint32_t region, uint64_t offset, const uint8_t *reference, uint64_t bytes,
+                          uint32_t scratch_dst, uint32_t scratch_bytes)
+{
+    loader_region_read_operation(region, offset, NULL, reference, bytes, scratch_dst, scratch_bytes);
 }
 
 /* The gateware loader counts a transfer in 24 bits of beats (512 MB); the 27B's 641 MB

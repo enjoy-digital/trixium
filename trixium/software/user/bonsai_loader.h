@@ -33,6 +33,16 @@ void     loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t 
  */
 void     loader_transfer_region(uint32_t region, uint64_t offset, const uint8_t *data, uint64_t bytes);
 
+/* Completion-aware readback / exact comparison (zzverify ABI 1.1). Caller owns
+ * the device and a reserved scratchpad workspace exclusively. All byte spans
+ * are 32-byte aligned; data/reference pointers need not be. No implicit reset,
+ * placement, inference or model-validity state change. Fails on older headers.
+ */
+void loader_read_region(uint32_t region, uint64_t offset, uint8_t *data, uint64_t bytes,
+                        uint32_t scratch_dst, uint32_t scratch_bytes);
+void loader_verify_region(uint32_t region, uint64_t offset, const uint8_t *reference, uint64_t bytes,
+                          uint32_t scratch_dst, uint32_t scratch_bytes);
+
 /* Upload a BONS image: header+table to the channel-0 staging area (the firmware's
  * `hdrload` copies it into CPU memory), then every channel's payload to its own window.
  * Returns the number of payload bytes written, 0 on a refused image (channel-count

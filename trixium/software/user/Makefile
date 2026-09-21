@@ -22,10 +22,10 @@ liblitepcie/liblitepcie.a: liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash
 bonsai_util: liblitepcie/liblitepcie.a bonsai_util.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
-bonsai_load: liblitepcie/liblitepcie.a bonsai_loader.o region_upload.o bonsai_load.o
+bonsai_load: liblitepcie/liblitepcie.a bonsai_loader.o region_upload.o region_read.o bonsai_load.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
-bonsai_chat: liblitepcie/liblitepcie.a bonsai_loader.o region_upload.o bonsai_chat.o
+bonsai_chat: liblitepcie/liblitepcie.a bonsai_loader.o region_upload.o region_read.o bonsai_chat.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
 bonsai_caps: liblitepcie/liblitepcie.a bonsai_caps.o caps_parser.o
@@ -35,6 +35,9 @@ caps_parser.o: ../lib/bonsai_caps.c ../lib/bonsai_caps.h
 	$(CC) -c $(CFLAGS) -o $@ $<
 
 region_upload.o: ../lib/bonsai_region_upload.c ../lib/bonsai_region_upload.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+
+region_read.o: ../lib/bonsai_region_read.c ../lib/bonsai_region_read.h
 	$(CC) -c $(CFLAGS) -o $@ $<
 
 clean:
@@ -57,5 +60,5 @@ BUILD_KEY := $(abspath $(BUILD_DIR))|$(CC)|$(CFLAGS)|$(LDFLAGS)
 ifneq ($(strip $(file <$(BUILD_STAMP))),$(strip $(BUILD_KEY)))
 $(file >$(BUILD_STAMP),$(BUILD_KEY))
 endif
-$(PROGS:%=%.o) bonsai_loader.o caps_parser.o region_upload.o \
+$(PROGS:%=%.o) bonsai_loader.o caps_parser.o region_upload.o region_read.o \
 liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash.o liblitepcie/litepcie_helpers.o: $(BUILD_STAMP)

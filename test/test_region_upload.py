@@ -404,8 +404,10 @@ def test_compiled_region_csr_credit_batches_and_inflight_reset(tmp_path):
             ports[name+'_'+field] = getattr(getattr(dut.zzregion, name), field)
     ports.update(reset_re=dut.engine_csr.soft_reset.re, reset_storage=dut.engine_csr.soft_reset.storage,
                  reset_busy=dut.engrst.busy, reset_stuck=dut.engrst.stuck, freeze=dut.model.freeze)
-    for name in ('error', 'beats', 'accepted', 'completed'):
+    for name in ('error', 'beats', 'accepted', 'completed', 'sp_pending', 'sp_completed'):
         ports['v_'+name] = getattr(dut.zzverify, name).status
+    ports['v_abi'] = Signal(32)
+    dut.comb += ports['v_abi'].eq(dut.zzverify.abi.status)
     ports['v_status'] = Signal(3)
     dut.comb += ports['v_status'].eq(Cat(dut.zzverify.status.fields.busy,
         dut.zzverify.status.fields.pending, dut.zzverify.status.fields.failed))
@@ -415,9 +417,15 @@ def test_compiled_region_csr_credit_batches_and_inflight_reset(tmp_path):
     spdebug = dut.scratchpad.mem.get_port(async_read=True)
     dut.specials += spdebug
     ports.update(sp_addr=spdebug.adr, sp_data=spdebug.dat_r)
-    debug = dut.model.mem.get_port(async_read=True)
+    ports.update(sp_adr_storage=dut.sp_csr.adr.storage, sp_adr_re=dut.sp_csr.adr.re,
+                 sp_csr_data=dut.sp_csr.data_r.status)
+    # Test a higher-priority CPU read retaining the sideband port. Do not
+    # invent a fixed peek latency in either the driver or production hardware.
+    ports['hold_peek'] = Signal()
+    dut.comb += dut.scratchpad._sb_req[0].eq(ports['hold_peek'])
+    debug = dut.model.mem.get_port(async_read=True, write_capable=True)
     dut.specials += debug
-    ports.update(debug_addr=debug.adr, debug_data=debug.dat_r)
+    ports.update(debug_addr=debug.adr, debug_data=debug.dat_r, debug_we=debug.we, debug_write=debug.dat_w)
     for name, signal in ports.items():
         signal.name_override = name
     rtl = tmp_path / 'region_csr.v'
@@ -427,6 +435,7 @@ def test_compiled_region_csr_credit_batches_and_inflight_reset(tmp_path):
     built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
             '--Mdir', str(obj), '--top-module', 'region_csr', str(rtl),
             '-CFLAGS', '-I'+str(library), str(library / 'bonsai_region_upload.c'),
+            str(library / 'bonsai_region_read.c'),
             str(Path(__file__).parent.resolve() / 'rtl/region_csr.cpp')], capture_output=True, text=True, timeout=180)
     assert built.returncode == 0, built.stdout[-4000:]+built.stderr[-4000:]
     result = subprocess.run([str(obj / 'Vregion_csr')], capture_output=True, text=True, timeout=20)

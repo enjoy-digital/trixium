@@ -153,11 +153,13 @@ class BonsaiScratchpad(LiteXModule):
             )
         ]
 
-    def add_csr_port(self):
+    def add_csr_port(self, *, with_read_status=False):
         """CSR-based peek/poke (host access over the PCIe BAR0/JTAG CSR window). Write
         `adr` to trigger a read; poll `data_r` (valid once the sideband was granted -
-        debug path, host pollers naturally retry). Write `data_w` to store 32 bits."""
-        return _ScratchpadCSR(self)
+        debug path, host pollers naturally retry). Write `data_w` to store 32 bits.
+        with_read_status adds pending/completed/reset signals for an external
+        completion-aware control bank; it does not move this legacy CSR map."""
+        return _ScratchpadCSR(self, with_read_status=with_read_status)
 
     def add_wishbone_port(self):
         """32-bit Wishbone slave onto the 256-bit memory (CPU/host/JTAG access) via the
@@ -229,7 +231,7 @@ class BonsaiScratchpad(LiteXModule):
 # _ScratchpadCSR -----------------------------------------------------------------------------------
 
 class _ScratchpadCSR(LiteXModule):
-    def __init__(self, scratchpad):
+    def __init__(self, scratchpad, *, with_read_status=False):
         self.adr    = CSRStorage(24, description="Byte address (4-aligned). Writing triggers a read.")
         self.data_r = CSRStatus(32,  description="Read data for the last triggered read.")
         self.data_w = CSRStorage(32, description="Writing stores 32 bits at adr.")
@@ -241,11 +243,22 @@ class _ScratchpadCSR(LiteXModule):
         rd_p  = Signal() # Read pending (adr written, not yet granted).
         wr_p  = Signal() # Write pending.
         cap   = Signal() # Capture read data this cycle.
+        reset_read = C(0, 1)
+        if with_read_status:
+            # Observed by the append-only region-readback CSR bank. Keep this
+            # bank's legacy map intact and add no third memory port. Software
+            # issues one read at a time and waits for this completion sequence,
+            # never assumes a PCIe round trip is enough scratchpad latency.
+            self.read_reset = reset_read = Signal()
+            self.read_pending = Signal()
+            self.read_completed = Signal(32)
+            self.comb += self.read_pending.eq(rd_p | cap)
+            self.sync += If(cap & ~reset_read, self.read_completed.eq(self.read_completed + 1))
         self.comb += [
             sp._sb_adr[1].eq(self.adr.storage[5:]),
             sp._sb_sel[1].eq(self.adr.storage[2:5]),
             sp._sb_bsel[1].eq(0xF),
-            sp._sb_req[1].eq(rd_p),
+            sp._sb_req[1].eq(rd_p & ~reset_read),
             sp._sbw_adr[1].eq(self.adr.storage[5:]),
             sp._sbw_sel[1].eq(self.adr.storage[2:5]),
             sp._sbw_bsel[1].eq(0xF),
@@ -253,7 +266,9 @@ class _ScratchpadCSR(LiteXModule):
             sp._sbw_req[1].eq(wr_p),
         ]
         self.sync += [
-            If(self.adr.re,
+            If(reset_read,
+                rd_p.eq(0),
+            ).Elif(self.adr.re,
                 rd_p.eq(1),
             ).Elif(sp._sb_gnt[1] & ~wr_p,
                 rd_p.eq(0),
@@ -263,9 +278,9 @@ class _ScratchpadCSR(LiteXModule):
             ).Elif(sp._sbw_ok[1],
                 wr_p.eq(0),
             ),
-            cap.eq(sp._sb_gnt[1] & ~wr_p),
+            cap.eq(sp._sb_gnt[1] & ~wr_p & ~reset_read),
             sel_r.eq(sp._sb_sel[1]),
-            If(cap,
+            If(cap & ~reset_read,
                 Case(sel_r, {i: self.data_r.status.eq(sp._sb_rdat[32*i:32*(i+1)])
                              for i in range(8)}),
             ),

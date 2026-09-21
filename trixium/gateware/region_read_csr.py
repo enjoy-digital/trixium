@@ -6,14 +6,14 @@ from litex.soc.interconnect.csr import CSRField, CSRStatus, CSRStorage
 
 
 class BonsaiRegionReadCSR(LiteXModule):
-    """Install as zzverify (after zzregion), ABI 1.0. Exclusive device ownership.
+    """Install as zzverify (after zzregion); optional peek status adds ABI 1.1.
 
     Completion makes a scratchpad span readable, not an uploaded model valid.
     Software must compare/hash it before publishing the allocation. Failure or
     timeout requires the common full-cluster reset/drain, never a local flush.
     """
-    def __init__(self, engine, engine_csr):
-        self.abi = CSRStatus(32, reset=0x00010000)
+    def __init__(self, engine, engine_csr, *, scratchpad_csr=None):
+        self.abi = CSRStatus(32, reset=0x00010001 if scratchpad_csr is not None else 0x00010000)
         self.region = CSRStorage(32)
         self.offset = CSRStorage(64)
         self.length = CSRStorage(24, description='Nonzero number of full 32-byte beats.')
@@ -27,6 +27,12 @@ class BonsaiRegionReadCSR(LiteXModule):
         self.completed = CSRStatus(32, description='Successful readbacks only; wraps at 32 bits.')
         active, pending, local_error, failed, fire = (Signal() for _ in range(5))
         resetting = engine_csr.rst_trigger | engine_csr.rst_busy
+        if scratchpad_csr is not None:
+            self.sp_pending = CSRStatus(1, description='Scratchpad CSR read pending/capturing; serialize peek requests.')
+            self.sp_completed = CSRStatus(32, description='Scratchpad CSR reads captured; persists across engine reset.')
+            self.comb += [self.sp_pending.status.eq(scratchpad_csr.read_pending),
+                          self.sp_completed.status.eq(scratchpad_csr.read_completed),
+                          scratchpad_csr.read_reset.eq(resetting)]
         captured = {name: Signal.like(getattr(engine.region_read_cmd, name))
                     for name in ('region', 'offset', 'length', 'dst')}
         start = self.start.re & self.start.storage

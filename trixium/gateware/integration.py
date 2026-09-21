@@ -57,6 +57,7 @@ class BonsaiClusterConfig:
     native_regions: tuple = ()
     native_reservations: tuple = ()
     native_endpoints: tuple = ()
+    append_sp_csr: bool = False  # New peek bank after existing banks (targets that had no sp_csr).
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -65,6 +66,8 @@ class BonsaiClusterConfig:
             raise ValueError('native reservations/endpoints require a native region table')
         if self.with_dnrec and not self.with_vecunit:
             raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
+        if self.append_sp_csr and not self.with_sp_csr:
+            raise ValueError('append_sp_csr requires a scratchpad CSR port')
         for name in ("chan_stride", "chan_mod"):
             value = getattr(self, name)
             if value < 0 or value & (value - 1):
@@ -101,11 +104,15 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative", "zzregion", "zzverify"):
+    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative", "zzregion", "zzverify"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
     soc.scratchpad = BonsaiScratchpad(size=config.scratchpad_size)
+    sp_csr = None
+    if config.with_sp_csr:
+        sp_csr = soc.scratchpad.add_csr_port(with_read_status=bool(config.native_regions))
+        setattr(soc, 'zzxsp' if config.append_sp_csr else 'sp_csr', sp_csr)
     soc.engrst = BonsaiEngineResetDomain(ports)
     axis = soc.engrst.masters
     soc.add_constant("BONSAI_HAS_ENGRESET")
@@ -150,7 +157,8 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         soc.zznative = BonsaiNativeCSR(soc.engine, soc.engine_csr)
         soc.add_constant('BONSAI_HAS_NATIVE_ENGINE')
         from trixium.gateware.region_read_csr import BonsaiRegionReadCSR
-        soc.zzverify = BonsaiRegionReadCSR(soc.engine, soc.engine_csr)
+        soc.zzverify = BonsaiRegionReadCSR(soc.engine, soc.engine_csr,
+                                         scratchpad_csr=sp_csr)
         soc.add_constant('BONSAI_HAS_REGION_READ')
     soc.comb += [
         soc.engrst.trigger.eq(soc.engine_csr.rst_trigger),
@@ -185,5 +193,3 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         soc.add_constant(name)
     soc.add_constant("BONSAI_SP_SB_SLOT", 1)
     soc.add_constant("BONSAI_SP_SB_RSLOT", 1)
-    if config.with_sp_csr:
-        soc.sp_csr = soc.scratchpad.add_csr_port()
