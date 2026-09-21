@@ -58,16 +58,18 @@ def test_activation_probe_cli(tmp_path, adapter):
         assert not (tmp_path / 'bad').exists()
 
 
-def test_projection_restore_probe_cli(tmp_path):
+@pytest.mark.parametrize('adapter', [False, True])
+def test_projection_restore_probe_cli(tmp_path, adapter):
     tool = Path(__file__).resolve().parents[1] / 'tools/synth_projection_restore.py'
     output = tmp_path / 'out'
-    result = subprocess.run([sys.executable, str(tool), '--output-dir', str(output)],
+    result = subprocess.run([sys.executable, str(tool), '--output-dir', str(output)] +
+                            (['--scratchpad-adapter'] if adapter else []),
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert {p.name for p in output.iterdir()} == {'projection_restore.v', 'synth.xdc', 'synth.tcl'}
     assert 'PROJECTION_RESTORE_SYNTH_COMPLETE' in (output / 'synth.tcl').read_text()
     assert 'false_path' not in (output / 'synth.xdc').read_text()
-    for flags in (['--part', 'part; exit'], ['--lanes', '3']):
+    for flags in (['--part', 'part; exit'], ['--lanes', '3'], ['--scratchpad-adapter', '--lanes', '16']):
         rejected = subprocess.run([sys.executable, str(tool), '--output-dir', str(tmp_path / 'bad'), *flags],
                                    capture_output=True, text=True, timeout=30)
         assert rejected.returncode != 0
