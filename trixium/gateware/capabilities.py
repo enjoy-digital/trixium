@@ -28,9 +28,10 @@ class BonsaiCapabilitiesCSR(LiteXModule):
 def add_capabilities(soc, config, memory_ports, regions, reservations=(), *, sys_hz):
     """Install after cluster and optional traffic monitors; never infer a board.
 
-    Current shared cluster has only legacy command/weight interfaces. Future
-    REGION_IO/native decoder bits must come from their real implementations,
-    not from physical memory capacity or an optimistic target flag.
+    The experimental native projection CSR path is not a complete region-I/O
+    runtime: uploader and execution lowering are still missing. Keep the public
+    contract conservative until those interfaces are implemented and qualified;
+    physical capacity or an opt-in target flag alone must not advertise them.
     """
     if hasattr(soc, 'zzcaps'):
         raise ValueError('capabilities already installed')

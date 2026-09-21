@@ -75,7 +75,7 @@ class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
                  dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra="",
                  mem="hbm", n_memctrl=4, update_repo="no", with_memory_traffic=False,
-                 with_capabilities=True):
+                 with_capabilities=True, with_native=False):
         assert mem in ("hbm", "ddr4")
         platform = Platform()
         self.comb += platform.trace.eq(1)
@@ -180,20 +180,9 @@ class BonsaiSimSoC(SoCCore):
         else:
             chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
         # Same integration as both hardware targets; only memory/physical policy differs.
-        from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
-        config = BonsaiClusterConfig(
-            with_vecunit=True, with_dual=dual, with_sp_csr=False,
-            chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
-            chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0)
-        add_bonsai_cluster(self, axis, config)
-        if with_memory_traffic:
-            from trixium.gateware.traffic import add_memory_traffic
-            controllers = [getattr(self, 'sdram' + (str(i) if i else '')).controller.interface
-                           for i in range(n_memctrl)] if mem == 'ddr4' else []
-            add_memory_traffic(self, axis, controllers)
-        if with_capabilities:
+        from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
+        def memory_description():
             from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
-            from trixium.gateware.capabilities import add_capabilities
             if mem == 'hbm':
                 regions = [MemoryRegion(i, MemoryKind.SIMULATION, i, 0, size, locality=i)
                            for i, size in enumerate(memory_sizes)]
@@ -212,6 +201,23 @@ class BonsaiSimSoC(SoCCore):
                 reservations += [Reservation(c//chan_mod, ReservationKind.DIAGNOSTIC,
                     test_base + (c % chan_mod)*(DDR4_SIM_CHAN_STRIDE + DDR4_SIM_CHAN_SKEW), 0x1000)
                     for c in range(n_channels)]
+            return regions, reservations
+        native = (native_read_options(*memory_description(),
+                   list(range(n_channels)) if mem == 'hbm' else [c//chan_mod for c in range(n_channels)])
+                  if with_native else {})
+        config = BonsaiClusterConfig(
+            with_vecunit=True, with_dual=dual, with_sp_csr=False,
+            chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
+            chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0, **native)
+        add_bonsai_cluster(self, axis, config)
+        if with_memory_traffic:
+            from trixium.gateware.traffic import add_memory_traffic
+            controllers = [getattr(self, 'sdram' + (str(i) if i else '')).controller.interface
+                           for i in range(n_memctrl)] if mem == 'ddr4' else []
+            add_memory_traffic(self, axis, controllers)
+        if with_capabilities:
+            from trixium.gateware.capabilities import add_capabilities
+            regions, reservations = memory_description()
             self.bonsai_capabilities = add_capabilities(self, config, axis, regions, reservations,
                                                        sys_hz=int(self.sys_clk_freq))
         self.comb += [
@@ -346,6 +352,7 @@ def main():
              "builds in build/sim_ddr4 (the firmware must be built against that tree).")
     parser.add_argument("--n-memctrl",      default=4, type=int, help="--mem ddr4: controllers.")
     parser.add_argument("--with-memory-traffic", action="store_true", help="Enable coherent memory traffic counters.")
+    parser.add_argument("--with-native", action="store_true", help="Enable the experimental shared native projection engine.")
     parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
     out_dir = "build/sim" if args.mem == "hbm" else "build/sim_ddr4"
@@ -358,7 +365,8 @@ def main():
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
             mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
-            with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities)
+            with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
+            with_native=args.with_native)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -370,7 +378,8 @@ def main():
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
         mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
-        with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities)
+        with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
+        with_native=args.with_native)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the

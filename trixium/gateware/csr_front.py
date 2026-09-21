@@ -137,6 +137,16 @@ class BonsaiEngineCSR(LiteXModule):
         # `submit.re` fires on CSR write; latch as cmd.valid until accepted. While the
         # sequencer runs it owns the command interface (firmware never mixes the two).
         seq_own = Signal()
+        native_cols = self.cols.storage
+        native_blocked = C(0, 1)
+        if hasattr(engine.cmd, 'native'):
+            # Optional extension bank supplies these; no existing CSR moves.
+            self.native_enable = Signal()
+            self.native_config_pending = native_blocked = Signal()
+            self.comb += engine.cmd.native.eq(self.native_enable & ~seq_own)
+            native_cols = Mux(self.native_enable,
+                              Mux(self.kind.storage == 0, self.cbeats.storage << 7,
+                                  self.cbeats.storage << 5), self.cols.storage)
         if seq is not None:
             self.comb += [
                 seq_own.eq(seq.busy),
@@ -170,10 +180,10 @@ class BonsaiEngineCSR(LiteXModule):
                 engine.cmd.dstride.eq(0 if seq is None else seq.eng_dstride),
                 engine.cmd.sstride.eq(0 if seq is None else seq.eng_sstride),
             ).Else(
-            engine.cmd.valid.eq(pending | (self.submit.re & self.submit.storage)),
+            engine.cmd.valid.eq((pending | (self.submit.re & self.submit.storage)) & ~native_blocked),
             engine.cmd.kind.eq(self.kind.storage),
             engine.cmd.rows.eq(self.rows.storage),
-            engine.cmd.cols.eq(self.cols.storage),
+            engine.cmd.cols.eq(native_cols),
             engine.cmd.wbase.eq(self.wbase.storage),
             engine.cmd.wlen.eq(self.wlen.storage),
             engine.cmd.sbeats.eq(self.sbeats.storage),

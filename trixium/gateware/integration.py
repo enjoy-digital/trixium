@@ -28,6 +28,19 @@ from trixium.gateware.csr_front import BonsaiEngineCSR
 from trixium.gateware.loader import BonsaiHBMLoader
 
 
+def native_read_options(regions, reservations, endpoints):
+    """Opt-in read policy for the experimental native engine, not capability bits.
+
+    The target supplies physical facts/reservations once. Grant READ to the
+    bounded native path without mutating its conservative public capability
+    records; the region-aware uploader/runtime ABI still needs integration.
+    """
+    from dataclasses import replace
+    from trixium.capabilities import Access
+    return dict(native_regions=tuple(replace(r, access=Access.READ) for r in regions),
+                native_reservations=tuple(reservations), native_endpoints=tuple(endpoints))
+
+
 @dataclass(frozen=True)
 class BonsaiClusterConfig:
     with_vecunit: bool = True
@@ -39,8 +52,15 @@ class BonsaiClusterConfig:
     scratchpad_size: int = 256*1024
     loader_data_width: int = 128
     with_sp_csr: bool = True
+    native_regions: tuple = ()
+    native_reservations: tuple = ()
+    native_endpoints: tuple = ()
 
     def __post_init__(self):
+        for name in ('native_regions', 'native_reservations', 'native_endpoints'):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        if not self.native_regions and (self.native_reservations or self.native_endpoints):
+            raise ValueError('native reservations/endpoints require a native region table')
         if self.with_dnrec and not self.with_vecunit:
             raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
         for name in ("chan_stride", "chan_mod"):
@@ -60,22 +80,25 @@ class BonsaiClusterConfig:
 def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     """Install one cluster on ``soc``; leave memory adapters/SoC bus/DMA to target.
 
-    All memory ports are 256-bit AXI in sys. Channel placement is currently the
-    legacy stride/mod/skew mapping, shared by the reader and upload/store paths.
-    Ports are storage endpoints, not an assertion about board capacity. A later
-    region-addressed interface will decouple these endpoints from compute pipes.
+    All memory ports are 256-bit AXI in sys. Legacy commands and upload/store
+    retain stride/mod/skew placement. Optional native projections use explicit
+    region/offset/stride descriptors on the same reader and MAC per pipe; upload
+    and sequencer lowering for that layout are not yet implemented. Ports are
+    storage endpoints, not an assertion about board capacity.
     """
     ports = list(memory_ports)
     if not 1 <= len(ports) <= 31:
         raise ValueError("legacy cluster requires 1..31 memory ports")
     if config.chan_mod and len(ports) % config.chan_mod:
         raise ValueError("memory ports must divide evenly over controllers")
+    if config.native_regions and len(config.native_endpoints) != len(ports):
+        raise ValueError('native endpoint mapping must name every compute port')
     for port in ports:
         if port.data_width != 256 or port.address_width < 32:
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit"):
+    for name in ("scratchpad", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
@@ -113,10 +136,16 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
 
     placement = dict(chan_stride=config.chan_stride, chan_mod=config.chan_mod,
                      chan_skew=config.chan_skew)
+    native = (dict(native_regions=config.native_regions, native_reservations=config.native_reservations,
+                   native_endpoints=config.native_endpoints) if config.native_regions else {})
     soc.engine = ClockDomainsRenamer("eng")(
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
-                          seq=seq, dual=config.with_dual, **placement))
+                          seq=seq, dual=config.with_dual, **placement, **native))
     soc.engine_csr = BonsaiEngineCSR(soc.engine, seq=seq)
+    if config.native_regions:
+        from trixium.gateware.native_csr import BonsaiNativeCSR
+        soc.zznative = BonsaiNativeCSR(soc.engine, soc.engine_csr)
+        soc.add_constant('BONSAI_HAS_NATIVE_ENGINE')
     soc.comb += [
         soc.engrst.trigger.eq(soc.engine_csr.rst_trigger),
         soc.engine_csr.rst_busy.eq(soc.engrst.busy),

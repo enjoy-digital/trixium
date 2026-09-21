@@ -177,7 +177,7 @@ class BonsaiXCU1525SoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
                  ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
-                 port_width=512, with_memory_traffic=False, with_capabilities=True,
+                 port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -310,13 +310,28 @@ class BonsaiXCU1525SoC(SoCCore):
         cluster_with_dnrec     = True  # Exact FP32 recurrence for the 27B fast path.
         # One portable wiring implementation; board policy stays here.
         if with_bonsai:
-            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
+            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
             from trixium.gateware.xilinx_constraints import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
+            def memory_description():
+                from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
+                regions = [MemoryRegion(i, MemoryKind.DDR4, i, 0, size, locality=i)
+                           for i, size in enumerate(memory_sizes)]
+                reservations = [Reservation(0, ReservationKind.CPU, 0, self.bus.regions['main_ram'].size),
+                                Reservation(0, ReservationKind.UPLOAD_STAGING,
+                                            cluster_weight_base - 0x100000, 0x100000)]
+                test_base = cluster_weight_base + chan_stride - (cluster_weight_base % chan_stride)
+                test_base -= (chan_mod - 1)*chan_skew + 0x1000
+                reservations += [Reservation(c//chan_mod, ReservationKind.DIAGNOSTIC,
+                    test_base + (c % chan_mod)*(chan_stride + chan_skew), 0x1000)
+                    for c in range(engine_channels)]
+                return regions, reservations
+            native = (native_read_options(*memory_description(),
+                       [c//chan_mod for c in range(engine_channels)]) if with_native else {})
             config = BonsaiClusterConfig(
                 with_vecunit=with_vecunit, with_dual=with_dual,
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
-                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew)
+                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, **native)
             add_bonsai_cluster(self, engine_axis, config)
             if with_memory_traffic:
                 from trixium.gateware.traffic import add_memory_traffic
@@ -349,19 +364,8 @@ class BonsaiXCU1525SoC(SoCCore):
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
 
             if with_capabilities:
-                from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
                 from trixium.gateware.capabilities import add_capabilities
-                regions = [MemoryRegion(i, MemoryKind.DDR4, i, 0, size, locality=i)
-                           for i, size in enumerate(memory_sizes)]
-                reservations = [Reservation(0, ReservationKind.CPU, 0, self.bus.regions['main_ram'].size),
-                                Reservation(0, ReservationKind.UPLOAD_STAGING,
-                                            cluster_weight_base - 0x100000, 0x100000)]
-                # Same reserved page as firmware/ddr.c; include every skewed window.
-                test_base = cluster_weight_base + chan_stride - (cluster_weight_base % chan_stride)
-                test_base -= (chan_mod - 1)*chan_skew + 0x1000
-                reservations += [Reservation(c//chan_mod, ReservationKind.DIAGNOSTIC,
-                    test_base + (c % chan_mod)*(chan_stride + chan_skew), 0x1000)
-                    for c in range(engine_channels)]
+                regions, reservations = memory_description()
                 configured_sys_hz = round(self.crg.pll.compute_config()['clkout0_freq']/4)
                 self.bonsai_capabilities = add_capabilities(self, config, engine_axis, regions, reservations,
                                                            sys_hz=configured_sys_hz)
@@ -387,6 +391,7 @@ def main():
     parser.add_target_argument("--port-width",      default=512, type=int, help="Crossbar port width per engine channel: 512 (LiteX AXIUpConverter, default) or 256 (LiteDRAM's native up-converter).")
     parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
     parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent AXI/controller traffic counters (new CSR bank).")
+    parser.add_target_argument("--with-native", action="store_true", help="Experimental shared native PTQ/Q8 engine and append-only controls; not resident runtime qualification.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
@@ -405,6 +410,7 @@ def main():
         port_width      = args.port_width,
         with_memory_traffic = args.with_memory_traffic,
         with_capabilities = not args.no_capabilities,
+        with_native       = args.with_native,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates

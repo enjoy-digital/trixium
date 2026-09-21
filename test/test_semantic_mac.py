@@ -18,12 +18,13 @@ from trixium.model import bitexact as bx, qformats
 
 
 class NativeMAC(Module):
-    def __init__(self, xgroups, dual=False, channel=0, channels=1, out_fifo_depth=24):
+    def __init__(self, xgroups, dual=False, channel=0, channels=1, out_fifo_depth=24, mixed=False):
         self.submodules.decoder = NativeWeightStream()
-        self.submodules.pipe = BonsaiChannelPipe(xbuf_groups=xgroups, dual=dual, semantic=True,
+        self.submodules.pipe = BonsaiChannelPipe(xbuf_groups=xgroups, dual=dual, semantic=not mixed,
+                                                  with_native=mixed,
                                                   chan_id=channel, n_channels=channels,
                                                   out_fifo_depth=out_fifo_depth)
-        self.comb += self.decoder.source.connect(self.pipe.sink)
+        self.comb += self.decoder.source.connect(self.pipe.native_sink if mixed else self.pipe.sink)
 
 
 def make_case(kind, rows, groups, qn=False, seed=1, channel=0, channels=1):
@@ -110,9 +111,25 @@ def overflow_case(kind, qn=False, negative=False):
                 xb=bytes(xb), payload=payload, expected=[])
 
 
-def drive(dut, case, *, gaps=True, output_stall=0, seed=3):
+def drive(dut, case, *, gaps=True, output_stall=0, seed=3, legacy=False):
     pipe, decoder = dut.pipe, dut.decoder
     rng = random.Random(seed)
+    if hasattr(pipe, 'native_mode'):
+        yield pipe.native_mode.eq(not legacy)
+    payload = case['payload']
+    if legacy:
+        from trixium import layout
+        from trixium.model.bons import TensorSpec, encode_rows
+        kind, rows, groups = case['kind'], case['rows'], case['groups']
+        ternary = kind == KIND_OP_TERNARY
+        scales, codes = (qformats.ptq1_0_unpack if ternary else qformats.q8_0_unpack)(
+            payload[:rows*groups*(28 if ternary else 34)])
+        cols = groups*(128 if ternary else 32)
+        spec = TensorSpec('w', layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY if ternary else layout.KIND_Q8,
+                          rows, cols, scales=scales.reshape(rows, groups), values=codes.reshape(rows, cols))
+        payload = encode_rows(spec, 0, rows).tobytes()
+        yield pipe.scale_beats.eq((groups+15)//16)
+    weights_in = pipe.sink if legacy else decoder.sink
     x = case['xb']
     for offset in range(0, len(x), 32):
         yield pipe.xw_group.eq(offset // 128)
@@ -126,7 +143,7 @@ def drive(dut, case, *, gaps=True, output_stall=0, seed=3):
                         ('qn', case['qn'])]:
         yield getattr(pipe, name).eq(value)
     yield pipe.start.eq(1)
-    yield decoder.start.eq(1)
+    yield decoder.start.eq(not legacy)
     yield decoder.rows.eq(case['rows'])
     yield decoder.groups.eq(case['groups'])
     yield decoder.encoding.eq(PTQ1_0 if case['kind'] == KIND_OP_TERNARY else Q8_0)
@@ -134,7 +151,6 @@ def drive(dut, case, *, gaps=True, output_stall=0, seed=3):
     yield pipe.start.eq(0)
     yield decoder.start.eq(0)
     yield
-    payload = case['payload']
     beats = [int.from_bytes(payload[i:i+32], 'little') for i in range(0, len(payload), 32)]
     sent, offered, done, held = 0, False, False, None
     result = {}
@@ -142,17 +158,19 @@ def drive(dut, case, *, gaps=True, output_stall=0, seed=3):
     for cycle in range(15000):
         if sent < len(beats):
             offered = offered or not gaps or rng.randrange(3) != 0
-            yield decoder.sink.valid.eq(offered)
-            yield decoder.sink.data.eq(beats[sent])
-            yield decoder.sink.last.eq(sent == len(beats)-1)
+            yield weights_in.valid.eq(offered)
+            yield weights_in.data.eq(beats[sent])
+            yield weights_in.last.eq(sent == len(beats)-1)
         else:
-            yield decoder.sink.valid.eq(0)
+            yield weights_in.valid.eq(0)
         yield pipe.source.ready.eq(cycle >= output_stall and (not gaps or rng.randrange(3) != 0))
         yield
-        if (yield decoder.sink.valid) and (yield decoder.sink.ready):
+        if (yield weights_in.valid) and (yield weights_in.ready):
             sent += 1
             offered = False
-        done |= bool((yield decoder.done))
+        done |= sent == len(beats) if legacy else bool((yield decoder.done))
+        if hasattr(pipe, 'native_mode'):
+            assert not (yield (pipe.native_sink.ready if legacy else pipe.sink.ready))
         assert not (yield decoder.error)
         assert not (yield pipe.error), f'pipe error at cycle {cycle}, sent {sent}'
         assert not (yield pipe.overflow), f'FIFO overflow at cycle {cycle}'
@@ -175,7 +193,7 @@ def drive(dut, case, *, gaps=True, output_stall=0, seed=3):
             for head, expected in enumerate(case['expected']):
                 got = np.array([result[head, r] for r in range(len(expected))], dtype=np.int32)
                 assert np.array_equal(got, expected), (case['kind'], case['rows'], case['groups'], head, got, expected)
-            yield decoder.sink.valid.eq(0)
+            yield weights_in.valid.eq(0)
             for _ in range(16):
                 yield
                 assert not (yield pipe.source.valid)
@@ -224,6 +242,16 @@ def test_reuse_modes_without_stale_scales():
         for i, kind in enumerate([KIND_OP_TERNARY, KIND_OP_Q8, KIND_OP_AXPY, KIND_OP_TERNARY]):
             case = make_case(kind, 7, 2, qn=bool(i & 1), seed=87+i)
             yield from drive(dut, case)
+    run_simulation(dut, run())
+
+
+def test_selectable_legacy_native_ingress_reuses_one_mac():
+    dut = NativeMAC(16, dual=True, mixed=True)
+    def run():
+        for i, (kind, legacy, qn) in enumerate([(0, True, False), (1, False, True), (2, True, True),
+                                               (0, False, True), (1, True, False), (2, False, False)]):
+            yield from drive(dut, make_case(kind, 9, 1 if i % 2 else 2, qn=qn, seed=176+i),
+                             legacy=legacy, output_stall=70)
     run_simulation(dut, run())
 
 
@@ -454,14 +482,14 @@ def test_semantic_configuration_bounds_and_empty_axpy(dual):
         run_simulation(dut, run())
 
 
-@pytest.fixture(scope='module')
-def compiled_native_mac(tmp_path_factory):
+@pytest.fixture(scope='module', params=[False, True], ids=['semantic', 'selectable'])
+def compiled_native_mac(tmp_path_factory, request):
     verilator = shutil.which('verilator')
     if not verilator:
         pytest.skip('Verilator required for independent compiled MAC check')
     tmp_path = tmp_path_factory.mktemp('compiled-native-mac')
     from migen.fhdl import verilog
-    dut = NativeMAC(160, dual=True, channel=2, channels=4)
+    dut = NativeMAC(160, dual=True, channel=2, channels=4, mixed=request.param)
     pipe, decoder = dut.pipe, dut.decoder
     ports = {}
     for prefix, unit, fields in [('p', pipe, ('start', 'kind', 'rows', 'code_beats', 'bias', 'rshift', 'rshift2', 'qn',
@@ -473,6 +501,8 @@ def compiled_native_mac(tmp_path_factory):
         ports['sink_' + name] = getattr(decoder.sink, name)
     for name in ('valid', 'ready', 'row', 'head', 'wide', 'data'):
         ports['source_' + name] = getattr(pipe.source, name)
+    if request.param:
+        ports['p_native_mode'] = pipe.native_mode
     for name, signal in ports.items():
         signal.name_override = name
     rtl = tmp_path / 'semantic_mac.v'
@@ -480,6 +510,7 @@ def compiled_native_mac(tmp_path_factory):
     obj = tmp_path / 'obj'
     harness = Path(__file__).parent / 'rtl/semantic_mac.cpp'
     built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
+                            *(['-CFLAGS', '-DMIXED_INGRESS'] if request.param else []),
                             '--Mdir', str(obj), '--top-module', 'semantic_mac', str(rtl),
                             str(harness.resolve())], capture_output=True, text=True, timeout=180)
     assert built.returncode == 0, built.stdout[-6000:] + built.stderr[-6000:]

@@ -35,6 +35,9 @@ int main(int argc, char **argv) {
     }
     dut.p_xw_we=0;
     dut.p_kind=kind; dut.p_rows=rows; dut.p_code_beats=groups; dut.p_qn=qn;
+#ifdef MIXED_INGRESS
+    dut.p_native_mode=1;
+#endif
     dut.p_bias=h[4]; dut.p_rshift=h[5]; dut.p_rshift2=h[6];
     dut.d_rows=rows; dut.d_groups=groups; dut.d_encoding=kind == 0 ? 5 : 6;
     dut.p_start=1; dut.d_start=1; clock(); dut.p_start=0; dut.d_start=0;

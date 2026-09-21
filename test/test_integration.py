@@ -6,7 +6,7 @@ from migen import run_simulation
 from litex.gen import LiteXModule
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
+from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel
 from trixium.model import asm
 
@@ -152,6 +152,7 @@ def test_shared_sequencer_seed_mux_and_arguments():
     {'with_vecunit': False, 'with_dnrec': True}, {'chan_stride': 96},
     {'chan_stride': -32}, {'chan_mod': 3}, {'chan_skew': 4096},
     {'chan_mod': 2, 'chan_skew': 1}, {'scratchpad_size': 33}, {'loader_data_width': 96},
+    {'native_endpoints': [0]}, {'native_reservations': [object()]},
 ])
 def test_invalid_configuration(kwargs):
     with pytest.raises(ValueError):
@@ -166,3 +167,25 @@ def test_rejects_overwrite_and_invalid_ports():
                   [AXIInterface(data_width=256, clock_domain='other')]):
         with pytest.raises(ValueError):
             add_bonsai_cluster(LiteXModule(), ports)
+
+
+def test_native_configuration_is_explicit_frozen_and_separate_from_public_caps():
+    from trixium.capabilities import Access
+    from test_native_reader import region
+    regions, reservations, endpoints = [region(access=Access(0))], [], [0]
+    opts = native_read_options(regions, reservations, endpoints)
+    config = BonsaiClusterConfig(with_vecunit=False, **opts)
+    regions.clear()
+    endpoints[0] = 9
+    assert config.native_regions[0].access == Access.READ
+    assert config.native_endpoints == (0,)
+    assert opts['native_regions'][0].access == Access.READ
+    original = region(access=Access(0))
+    native_read_options([original], [], [0])
+    assert original.access == Access(0)
+    with pytest.raises(ValueError, match='every compute port'):
+        add_bonsai_cluster(LiteXModule(), [AXIInterface(data_width=256)]*2, config)
+    default = SoC(BonsaiClusterConfig(with_vecunit=False), n=1)
+    assert not hasattr(default.engine.cmd, 'native')
+    assert not hasattr(default, 'zznative')
+    assert 'BONSAI_HAS_NATIVE_ENGINE' not in default.constants

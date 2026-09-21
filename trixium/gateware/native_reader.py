@@ -25,6 +25,20 @@ ERROR_DECODER = 16
 ERROR_PACKER = 32
 
 
+class NativeReadTransport:
+    """Port bundle for sharing an existing burst reader, not another RTL module.
+
+    The integrator arbitrates sink/source and supplies idle. AXI responses on
+    NativeRegionReader's axi argument must belong to that same transport; ID and
+    response validation still observes that bus while a native command is busy.
+    """
+    def __init__(self, address_width):
+        self.address_width = address_width
+        self.sink = stream.Endpoint([('addr', address_width), ('len', 24)])
+        self.source = stream.Endpoint([('data', 256)])
+        self.idle = Signal()
+
+
 class NativeRegionReader(LiteXModule):
     """Read rows of native blocks at region offset + row * stride.
 
@@ -40,7 +54,7 @@ class NativeRegionReader(LiteXModule):
     no timeout is invented here. done requires reader idle, including on failure.
     """
     def __init__(self, axi, regions, reservations=(), *, endpoint=0,
-                 fifo_depth=128, n_ids=4, max_bursts=8, row_queue_depth=8):
+                 fifo_depth=128, n_ids=4, max_bursts=8, row_queue_depth=8, transport=None):
         regions, reservations = tuple(regions), tuple(reservations)
         if not regions or len({r.id for r in regions}) != len(regions):
             raise ValueError('unique physical regions are required')
@@ -66,8 +80,13 @@ class NativeRegionReader(LiteXModule):
         self.cancel = Signal()
         self.busy, self.done, self.cancelled = Signal(), Signal(), Signal()
         self.error = Signal(6)
-        self.reader = reader = BonsaiAXIReader(axi, fifo_depth=fifo_depth, n_ids=n_ids,
-                                              max_bursts=max_bursts)
+        if transport is not None and (not isinstance(transport, NativeReadTransport)
+                                      or transport.address_width != axi.address_width):
+            raise ValueError('shared transport must match the AXI address width')
+        # A port bundle is not a Module: do not register an external AXI reader
+        # a second time (which changes hierarchy and can duplicate its drivers).
+        self.reader = reader = (transport if transport is not None else
+            BonsaiAXIReader(axi, fifo_depth=fifo_depth, n_ids=n_ids, max_bursts=max_bursts))
         self.packer = packer = ByteSpanPacker()
         self.decoder = decoder = NativeWeightStream()
         self.row_queue = meta = ResetInserter()(stream.SyncFIFO(
