@@ -266,6 +266,16 @@ static void silu_mul_fv(float *dst, const float *mul, const float *gate, int n)
     for (; i < n; i++) dst[i] = mul[i]*siluf(gate[i]);
 }
 
+static void add_fv(float *dst, const float *src, int n)
+{
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        dst[i + 0] += src[i + 0]; dst[i + 1] += src[i + 1];
+        dst[i + 2] += src[i + 2]; dst[i + 3] += src[i + 3];
+    }
+    for (; i < n; i++) dst[i] += src[i];
+}
+
 // A replicated F32 tensor's rows into a float array (chunked through the fetch region).
 static float *fetch_f32(const struct bons_entry *e)
 {
@@ -826,7 +836,7 @@ int hybrid_forward(int token, int want_logits)
             hyb_cyc_attn += perf_now64() - t0;
         }
         t0 = perf_now64();
-        for (int i = 0; i < n_embd; i++) xb[i] += tmp_h[i];
+        add_fv(xb, tmp_h, n_embd);
         hyb_cyc_resid += perf_now64() - t0;
         t0 = perf_now64();
         rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
@@ -844,7 +854,7 @@ int hybrid_forward(int token, int want_logits)
         proj_f(model_entry(ROLE_FFN_DOWN, l), gateb, tmp_h);
         hyb_cyc_fdown += perf_now64() - t0;
         t0 = perf_now64();
-        for (int i = 0; i < n_embd; i++) xb[i] += tmp_h[i];
+        add_fv(xb, tmp_h, n_embd);
         hyb_cyc_resid += perf_now64() - t0;
     }
     pos++;
