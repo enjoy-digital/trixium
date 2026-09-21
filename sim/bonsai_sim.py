@@ -76,7 +76,7 @@ class BonsaiSimSoC(SoCCore):
                  dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra="",
                  mem="hbm", n_memctrl=4, update_repo="no", with_memory_traffic=False,
                  with_capabilities=True, with_native=False, with_hadamard=False, with_activation_quantize=False,
-                 with_projection_restore=False):
+                 with_projection_restore=False, with_embedding_restore=False):
         assert mem in ("hbm", "ddr4")
         platform = Platform()
         self.comb += platform.trace.eq(1)
@@ -211,7 +211,7 @@ class BonsaiSimSoC(SoCCore):
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
             chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0,
             with_hadamard=with_hadamard, with_activation_quantize=with_activation_quantize,
-            with_projection_restore=with_projection_restore, **native)
+            with_projection_restore=with_projection_restore, with_embedding_restore=with_embedding_restore, **native)
         add_bonsai_cluster(self, axis, config)
         if with_memory_traffic:
             from trixium.gateware.traffic import add_memory_traffic
@@ -359,6 +359,7 @@ def main():
     parser.add_argument("--with-hadamard", action="store_true", help="Enable experimental sequenced scratchpad integer rotations.")
     parser.add_argument("--with-activation-quantize", action="store_true", help="Enable experimental resident FP32 and post-rotation Q8 quantization.")
     parser.add_argument("--with-projection-restore", action="store_true", help="Enable experimental resident int32 projection to FP32 restoration.")
+    parser.add_argument("--with-embedding-restore", action="store_true", help="Enable experimental compact PTQ embedding restoration.")
     parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
     out_dir = "build/sim" if args.mem == "hbm" else "build/sim_ddr4"
@@ -373,7 +374,8 @@ def main():
             mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
             with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
             with_native=args.with_native, with_hadamard=args.with_hadamard,
-            with_activation_quantize=args.with_activation_quantize, with_projection_restore=args.with_projection_restore)
+            with_activation_quantize=args.with_activation_quantize, with_projection_restore=args.with_projection_restore,
+            with_embedding_restore=args.with_embedding_restore)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -387,7 +389,8 @@ def main():
         mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
         with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
         with_native=args.with_native, with_hadamard=args.with_hadamard,
-        with_activation_quantize=args.with_activation_quantize, with_projection_restore=args.with_projection_restore)
+        with_activation_quantize=args.with_activation_quantize, with_projection_restore=args.with_projection_restore,
+        with_embedding_restore=args.with_embedding_restore)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the

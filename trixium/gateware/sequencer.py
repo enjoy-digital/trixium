@@ -64,6 +64,9 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   restore: Optional unit 8, serialized; w0 exactly 8, w1 int32 src, w2 FP32 dst,
            w3 resident exponent beat, w4 elements, w5 signed adjustment (R-B),
            w6..w15 zero. See docs/projection-restoration.md.
+  embedding: Optional unit 9, serialized; w0 exactly 9, w1 compact PTQ src,
+             w2 inverse signs, w3 FP32 dst, w4 groups, w5..w15 zero.
+             See docs/native-embedding-restoration.md.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -86,10 +89,10 @@ from litex.soc.interconnect import stream
 
 class BonsaiSequencer(LiteXModule):
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0,
-                 with_projection_restore=False, scratchpad_size=256*1024):
+                 with_projection_restore=False, with_embedding_restore=False, scratchpad_size=256*1024):
         if not isinstance(native_pipes, int) or not 0 <= native_pipes <= 31:
             raise ValueError('native_pipes must be in [0, 31]')
-        extended = with_hadamard or with_activation_quantize or native_pipes or with_projection_restore
+        extended = with_hadamard or with_activation_quantize or native_pipes or with_projection_restore or with_embedding_restore
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
@@ -152,6 +155,21 @@ class BonsaiSequencer(LiteXModule):
                 'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
                 'bits8..15 restoration-client error (bit14 protects the full descriptor list).')
             extension_errors.append(self.projection_restore_error)
+        if with_embedding_restore:
+            # Append-only optional ABI. The shared-cluster profile is currently
+            # max_groups=64/input_width=16; reject unsupported model spans before
+            # execution rather than silently falling back to lossy arithmetic.
+            from trixium.gateware.embedding_restore_sp import EMBEDDING_COMMAND
+            self.embedding_restore_cmd = stream.Endpoint(EMBEDDING_COMMAND)
+            self.embedding_restore_done = Signal()
+            self.embedding_restore_failed = Signal(16)
+            self.embedding_restore_abi = CSRStatus(32, reset=0x00010000)
+            self.embedding_restore_limits = CSRStatus(32, reset=64 | (16 << 16), description=
+                'Bits0..15 maximum PTQ groups; bits16..23 exact aligned integer input width.')
+            self.embedding_restore_error = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
+                'bits8..23 embedding-client error (bit10 protects the full descriptor list).')
+            extension_errors.append(self.embedding_restore_error)
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
@@ -232,7 +250,7 @@ class BonsaiSequencer(LiteXModule):
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
 
         list_ok = C(1, 1)
-        had_dispatch, quant_dispatch, restore_dispatch, bad_list = [], [], [], []
+        had_dispatch, quant_dispatch, restore_dispatch, embedding_dispatch, bad_list = [], [], [], [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24)
@@ -298,6 +316,20 @@ class BonsaiSequencer(LiteXModule):
             restore_dispatch = [If(malformed,
                 NextValue(self.projection_restore_error.status, 2), NextState('EXT_FAILED'),
             ).Else(NextState('DISPATCH_RESTORE'))]
+        if with_embedding_restore:
+            malformed = Signal()
+            command = self.embedding_restore_cmd
+            self.comb += [
+                malformed.eq((w(0, 0) != 9) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                    (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
+                    (w(0, 5) != 0) | (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                command.src.eq(w(0, 1)[:24]), command.signs.eq(w(0, 2)[:24]),
+                command.dst.eq(w(0, 3)[:24]), command.groups.eq(w(0, 4)[:16]),
+                command.protect_start.eq(list_base), command.protect_end.eq(list_end),
+            ]
+            embedding_dispatch = [If(malformed,
+                NextValue(self.embedding_restore_error.status, 2), NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_EMBEDDING'))]
         if native_pipes:
             cfg_malformed, cfg_channel_bad = Signal(), Signal()
             projection_malformed, projection_overlap = Signal(), Signal()
@@ -664,6 +696,7 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 6, *(cfg_dispatch if native_pipes else unknown_unit)
             ).Elif(unit == 7, *(native_dispatch if native_pipes else unknown_unit)
             ).Elif(unit == 8, *(restore_dispatch if with_projection_restore else unknown_unit)
+            ).Elif(unit == 9, *(embedding_dispatch if with_embedding_restore else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -702,6 +735,15 @@ class BonsaiSequencer(LiteXModule):
                     NextValue(self.projection_restore_error.status, self.projection_restore_failed << 8),
                     NextState('EXT_FAILED'),
                 ).Elif(self.projection_restore_done, NextState('NEXT')))
+        if with_embedding_restore:
+            fsm.act('DISPATCH_EMBEDDING', self.busy.eq(1),
+                If(~eng_inflight, self.embedding_restore_cmd.valid.eq(1),
+                    If(self.embedding_restore_cmd.ready, NextState('WAIT_EMBEDDING'))))
+            fsm.act('WAIT_EMBEDDING', self.busy.eq(1),
+                If(self.embedding_restore_failed != 0,
+                    NextValue(self.embedding_restore_error.status, self.embedding_restore_failed << 8),
+                    NextState('EXT_FAILED'),
+                ).Elif(self.embedding_restore_done, NextState('NEXT')))
         if native_pipes:
             fsm.act('DISPATCH_NATIVE_CFG', self.busy.eq(1),
                 If(self.native_failed,

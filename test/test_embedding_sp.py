@@ -4,10 +4,11 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import warnings
 
 import numpy as np
 import pytest
-from migen import Mux, Signal
+from migen import ClockDomain, Mux, Signal
 from migen.fhdl import verilog
 from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
@@ -132,6 +133,7 @@ def test_compiled_embedding_shared_scratchpad(tmp_path, width):
         str((Path(__file__).parent / 'rtl/embedding_sp.cpp').resolve())],
         capture_output=True, text=True, timeout=240)
     assert built.returncode == 0, built.stdout[-7000:]+built.stderr[-7000:]
+    assert 'UNOPTFLAT' not in built.stderr, built.stderr
     run = subprocess.run([str(obj / 'Vembedding_sp')], cwd=tmp_path,
                          capture_output=True, text=True, timeout=120)
     assert run.returncode == 0, run.stdout+run.stderr
@@ -143,3 +145,16 @@ def test_embedding_scratchpad_configuration_bounds():
     for size in (0, 31, 255, SIZE+32):
         with pytest.raises(ValueError):
             BonsaiEmbeddingScratchpad(size)
+
+
+@pytest.mark.parametrize('width', [16, 32])
+def test_embedding_scratchpad_combinational_graph_is_acyclic(width):
+    # The basic Migen converter and functional Verilator tests can miss a
+    # feedback loop that's dormant for valid inputs. Use the board's LiteX
+    # dependency analysis too; no implicit timing-loop exception is acceptable.
+    from litex.gen.fhdl import verilog as board_verilog
+    dut = EmbeddingScratchpadTop(width)
+    dut.clock_domains.cd_sys = ClockDomain('sys')
+    with warnings.catch_warnings():
+        warnings.filterwarnings('error', message='Combinatorial cycle detected.*')
+        board_verilog.convert(dut, ios={dut.write_allow, dut.cd_sys.clk, dut.cd_sys.rst}, name='embedding_sp')

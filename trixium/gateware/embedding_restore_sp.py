@@ -5,7 +5,7 @@ from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
 from trixium.gateware.embedding_restore import EmbeddingRestore
-from trixium.gateware.native_weights import NativeWeightStream, PTQ1_0
+from trixium.gateware.native_weights import GROUP_LAYOUT, NativeWeightStream, PTQ1_0
 
 EMBEDDING_COMMAND = [('src', 24), ('signs', 24), ('dst', 24), ('groups', 16),
                      ('protect_start', 24), ('protect_end', 24)]
@@ -48,6 +48,12 @@ class BonsaiEmbeddingScratchpad(LiteXModule):
         self.sp_wr_we = Signal(8)
         self.kernel = kernel = EmbeddingRestore(max_groups, input_width)
         self.decoder = decoder = NativeWeightStream()
+        # The byte decoder suppresses source.valid combinationally on bad
+        # incoming framing; its sink.ready also depends on source.ready. Do not
+        # feed that valid through metadata/failure/sign arbitration back into
+        # either input valid or output ready. An elastic registered group makes
+        # the client's decisions independent of this upstream clear path.
+        group = stream.Endpoint(GROUP_LAYOUT)
 
         IDLE, VALIDATE, START, RUN, FINISH, FAILED = range(6)
         state = Signal(3, reset=IDLE)
@@ -89,9 +95,9 @@ class BonsaiEmbeddingScratchpad(LiteXModule):
             kernel.cmd.valid.eq((state == START) & ~self.cancel), kernel.cmd.groups.eq(captured['groups']),
             decoder.start.eq(kernel.cmd.valid & kernel.cmd.ready), decoder.rows.eq(1),
             decoder.groups.eq(captured['groups']), decoder.encoding.eq(PTQ1_0),
-            sign_pair.eq(decoder.source.group >> 1), sign_match.eq(sign_valid & (sign_tag == sign_pair)),
-            metadata_bad.eq(decoder.source.valid & ((decoder.source.row != 0) |
-                decoder.source.kind | decoder.source.error | (decoder.source.group >= captured['groups']))),
+            sign_pair.eq(group.group >> 1), sign_match.eq(sign_valid & (sign_tag == sign_pair)),
+            metadata_bad.eq(group.valid & ((group.row != 0) |
+                group.kind | group.error | (group.group >= captured['groups']))),
             accounting_bad.eq((pending & ~pending_sign & raw_valid) |
                 (kernel.source.valid & (~input_done | (kernel.source.first != (self.output_beats == 0)) |
                     (kernel.source.last != (self.output_beats == output_count-1)))) |
@@ -99,12 +105,13 @@ class BonsaiEmbeddingScratchpad(LiteXModule):
             failed.eq(active & (decoder.error | (kernel.error != 0) | metadata_bad | accounting_bad)),
             decoder.sink.valid.eq(raw_valid & active & ~failed & ~self.cancel), decoder.sink.data.eq(raw_data),
             decoder.sink.last.eq(raw_last), raw_pop.eq(decoder.sink.valid & decoder.sink.ready),
-            kernel.sink.valid.eq(decoder.source.valid & sign_match & active & ~failed & ~self.cancel),
-            decoder.source.ready.eq(kernel.sink.ready & sign_match & active & ~failed & ~self.cancel),
-            kernel.sink.codes.eq(decoder.source.codes), kernel.sink.scale.eq(decoder.source.scale),
-            kernel.sink.negate.eq(Mux(decoder.source.group[0], sign_data[128:], sign_data[:128])),
-            kernel.sink.first.eq(decoder.source.first), kernel.sink.last.eq(decoder.source.last),
-            read_sign.eq(active & ~pending & decoder.source.valid & ~sign_match & ~metadata_bad),
+            kernel.sink.valid.eq(group.valid & sign_match & active & ~failed & ~self.cancel),
+            group.ready.eq(kernel.sink.ready & sign_match & active & ~failed & ~self.cancel),
+            decoder.source.ready.eq((~group.valid | group.ready) & active & ~failed & ~self.cancel),
+            kernel.sink.codes.eq(group.codes), kernel.sink.scale.eq(group.scale),
+            kernel.sink.negate.eq(Mux(group.group[0], sign_data[128:], sign_data[:128])),
+            kernel.sink.first.eq(group.first), kernel.sink.last.eq(group.last),
+            read_sign.eq(active & ~pending & group.valid & ~sign_match & ~metadata_bad),
             read_raw.eq(active & ~pending & ~read_sign & (issued < raw_count) & (~raw_valid | raw_pop)),
             self.sp_rd_req.eq((read_sign | read_raw) & ~failed & ~self.cancel),
             self.sp_rd_adr.eq(Mux(read_sign, (captured['signs'] >> 5) + sign_pair,
@@ -116,8 +123,12 @@ class BonsaiEmbeddingScratchpad(LiteXModule):
             written.eq(self.sp_wr_req & self.sp_wr_gnt),
         ]
         self.sync += If(clear,
-            pending.eq(0), raw_valid.eq(0), sign_valid.eq(0), input_done.eq(0), last_written.eq(0),
+            group.valid.eq(0), pending.eq(0), raw_valid.eq(0), sign_valid.eq(0), input_done.eq(0), last_written.eq(0),
         ).Else(
+            If(decoder.source.ready,
+                group.valid.eq(decoder.source.valid),
+                If(decoder.source.valid, group.payload.eq(decoder.source.payload),
+                    group.first.eq(decoder.source.first), group.last.eq(decoder.source.last))),
             pending.eq(self.sp_rd_req),
             If(self.sp_rd_req, pending_sign.eq(read_sign), pending_tag.eq(sign_pair), pending_last.eq(issued == raw_count-1)),
             If(raw_pop, raw_valid.eq(0)),

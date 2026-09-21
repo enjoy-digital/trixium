@@ -13,6 +13,24 @@ from trixium import layout
 from trixium.model import bitexact as bx, bons4
 
 
+def scratchpad_embedding_descriptor(*, src, signs, dst, groups):
+    """Encode optional unit 9; check embedding_restore ABI/profile before use.
+
+    Input is groups compact 28-byte PTQ records plus groups*16 inverse-sign
+    bytes, all resident in scratchpad. Output is groups*128 FP32 elements.
+    Hardware validates its configured capacity, full spans and list protection.
+    Entire inputs are cached first, so output may overwrite either input; reload
+    overwritten compact/sign data before reusing it. This does not fetch a model
+    row from a device-memory region or authorize a model's numerical profile.
+    """
+    for name, value in (('src', src), ('signs', signs), ('dst', dst)):
+        if type(value) is not int or not 0 <= value < 1 << 24 or value % 32:
+            raise ValueError(name + ' must be a 32-byte-aligned unsigned 24-bit address')
+    if type(groups) is not int or not 8 <= groups <= 512 or groups % 8:
+        raise ValueError('groups must be a multiple of eight in [8,512]')
+    return [9, src, signs, dst, groups] + [0]*11
+
+
 def _parameters(input_width, max_groups):
     if type(input_width) is not int or not 12 <= input_width <= 32:
         raise ValueError('embedding input width must be in [12,32]')
