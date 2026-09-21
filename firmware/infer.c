@@ -498,10 +498,19 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
 #endif
     if (acc) {
         if (acc != (const int32_t *)y || acc_add) {
+            uint32_t i = 0;
             if (acc_add) {
-                for (uint32_t i = 0; i < count; i++) acc[i] += y[i];
+                for (; i + 3 < count; i += 4) {
+                    acc[i + 0] += y[i + 0]; acc[i + 1] += y[i + 1];
+                    acc[i + 2] += y[i + 2]; acc[i + 3] += y[i + 3];
+                }
+                for (; i < count; i++) acc[i] += y[i];
             } else {
-                for (uint32_t i = 0; i < count; i++) acc[i] = y[i];
+                for (; i + 3 < count; i += 4) {
+                    acc[i + 0] = y[i + 0]; acc[i + 1] = y[i + 1];
+                    acc[i + 2] = y[i + 2]; acc[i + 3] = y[i + 3];
+                }
+                for (; i < count; i++) acc[i] = y[i];
             }
         }
     } else {
@@ -634,8 +643,14 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
         c0 += seg->cols;
     }
     float sc = ldexpf(1.0f, e8 + (int)e->rshift - (int)e->bias);
-    for (uint32_t i = 0; i < e->rows; i++)
-        dst[i] = (float)kseg_acc[i]*sc;
+    uint32_t i = 0;
+    for (; i + 3 < e->rows; i += 4) {
+        float f0 = (float)kseg_acc[i + 0], f1 = (float)kseg_acc[i + 1];
+        float f2 = (float)kseg_acc[i + 2], f3 = (float)kseg_acc[i + 3];
+        dst[i + 0] = f0*sc; dst[i + 1] = f1*sc;
+        dst[i + 2] = f2*sc; dst[i + 3] = f3*sc;
+    }
+    for (; i < e->rows; i++) dst[i] = (float)kseg_acc[i]*sc;
 }
 
 void *infer_halloc(uint64_t n, int big)
