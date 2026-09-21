@@ -34,14 +34,29 @@ static std::array<uint32_t, 16> requant(unsigned blocks) {
     return {5, 0x22000, 0xa000, 0x800, 0x900, 0xa00, blocks, 0,0,0,0,0,0,0,0,0};
 }
 static void start(Vactivation_cluster &d, const std::array<uint32_t, 16> &words, bool rotate=false) {
+    unsigned count=rotate ? 3 : 1;
     for (unsigned i=0; i<16; i++) access(d, i*4, true, words[i]);
     if (rotate) {
         const std::array<uint32_t, 16> had={3,0x4000,0x1000,0x22000,words[4]*words[5]/1024,0x900,0,0,0,0,0,0,0,0,0,0};
         for (unsigned i=0; i<16; i++) access(d, 64+i*4, true, had[i]);
         auto post=requant(words[4]*words[5]/1024);
         for (unsigned i=0; i<16; i++) access(d, 128+i*4, true, post[i]);
+#ifdef NATIVE_CHAIN
+        unsigned groups=words[4]*words[5]/128;
+        unsigned segments=groups>96 ? 2 : 1;
+        unsigned per_segment=groups/segments;
+        for (unsigned segment=0; segment<segments; segment++) {
+            const std::array<uint32_t,16> cfg={6,0,7,0x10000+segment*per_segment*28,0,136*28,0,0,0,0,0,0,0,0,0,0};
+            const std::array<uint32_t,16> project={7,0,3,0,0,0,per_segment<<8,0,
+                0xa000+segment*per_segment*128,0xe800+segment*32,0,0,0,0,0,0};
+            for (unsigned i=0; i<16; i++) access(d,64*count+i*4,true,cfg[i]);
+            count++;
+            for (unsigned i=0; i<16; i++) access(d,64*count+i*4,true,project[i]);
+            count++;
+        }
+#endif
     }
-    d.seq_base=0; d.seq_count=rotate ? 3 : 1; d.seq_start=1; d.seq_start_re=1; tick(d); d.seq_start_re=0;
+    d.seq_base=0; d.seq_count=count; d.seq_start=1; d.seq_start_re=1; tick(d); d.seq_start_re=0;
     require(d.seq_status & 1, "list not started");
 }
 static void reset_cluster(Vactivation_cluster &d) {
@@ -49,6 +64,9 @@ static void reset_cluster(Vactivation_cluster &d) {
     for (unsigned i=0; i<100; i++) tick(d);
     require(!d.reset_busy && !d.reset_stuck && !(d.seq_status & 1) && !d.seq_error && !d.had_error,
             "cluster reset did not recover");
+#ifdef NATIVE_CHAIN
+    require(!d.native_error,"native sequencer did not reset");
+#endif
 }
 static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks, bool rotate=false, bool wide_scales=true) {
     const unsigned length=elements*blocks;
@@ -89,10 +107,18 @@ static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks,
     unsigned cycles=0;
     for (; cycles<100000; cycles++) {
         require(!d.seq_error && !d.had_error, "resident conversion/rotation failed");
+#ifdef NATIVE_CHAIN
+        if (d.native_error) std::fprintf(stderr,"native error=%x dcount=%u\n",d.native_error,d.seq_status>>8);
+        require(!d.native_error,"resident native projection failed");
+#endif
         if (!(d.seq_status & 1)) break;
         tick(d);
     }
-    require(cycles<100000 && ((d.seq_status >> 8) & 0xffff)==unsigned(rotate ? 3 : 1), "list did not retire exactly");
+    unsigned descriptors=rotate ? 3 : 1;
+#ifdef NATIVE_CHAIN
+    if (rotate) descriptors += length>96*128 ? 4 : 2;
+#endif
+    require(cycles<100000 && ((d.seq_status >> 8) & 0xffff)==descriptors, "list did not retire exactly");
     require(d.quant_blocks==blocks && d.quant_reads==(rotate ? blocks*130 : length/4) && d.quant_writes==length/32,
             "incorrect conversion counters");
     for (unsigned i=0; i<length; i+=4) {
@@ -129,6 +155,7 @@ static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks,
         // this is the full FFN. The split crosses the ninth Hadamard block.
         unsigned segment=length==17408 ? 8704 : length;
         unsigned nonzero[2]={0,0};
+        int projections[2][3]={{0,0,0},{0,0,0}};
         for (unsigned begin=0; begin<length; begin+=segment) for (unsigned i=begin; i<begin+segment; i+=4) {
             uint32_t word=0;
             for (unsigned lane=0; lane<4; lane++) {
@@ -136,12 +163,21 @@ static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks,
                 int q=std::clamp(int(std::lround(scaled)),-127,127);
                 nonzero[begin/segment] += q!=0;
                 word |= uint32_t(uint8_t(q)) << (lane*8);
+                for (unsigned row=0; row<3; row++) {
+                    unsigned k=i+lane;
+                    projections[begin/segment][row] += q*(int((k*7+k/13+row)%3)-1);
+                }
             }
             require(access(d,0xa000+i,false)==word,"wrong whole-vector requantization/FFN split bytes");
         }
         if (!wide_scales && length==17408)
             require(nonzero[0]>segment/2 && nonzero[1]>segment/2,"both FFN K segments must exercise nonzero data");
         require(access(d,0x9ffc,false)==0xdeadbeef && access(d,0xa000+length,false)==0xdeadbeef,"requant output guard clobbered");
+#ifdef NATIVE_CHAIN
+        for (unsigned part=0; part<length/segment; part++) for (unsigned row=0; row<3; row++)
+            require(int32_t(access(d,0xe800+part*32+row*4,false))==projections[part][row],
+                    "resident Q8 to compact native projection mismatch");
+#endif
     }
     std::printf("resident_quant elements=%u blocks=%u rotate=%u wide_scales=%u sequence_cycles=%u\n",elements,blocks,rotate,wide_scales,cycles);
 }
@@ -157,6 +193,15 @@ int main() {
         require(d.seq_status&1,"list completed before reset case");
         reset_cluster(d); complete(d,1024,1,true);
     }
+#ifdef NATIVE_CHAIN
+    start(d,quant(1024,17),true);
+    unsigned native_wait=0;
+    while (native_wait++<50000 && !(((d.seq_status>>8)&0xffff)==4 && d.engine_busy)) tick(d);
+    require(native_wait<50000,"native reset case never entered projection");
+    for (unsigned i=0; i<100; i++) tick(d);
+    reset_cluster(d); complete(d,1024,17,true,false);
+    std::puts("NATIVE_CHAIN_PASS full_ffn_segments=68+68 rows=3 native_reset_reuse=1");
+#endif
     for (unsigned mode=0; mode<15; mode++) {
         auto words=quant(1024,1);
         for (unsigned i=0; i<1024; i++) access(d,0x10000+i*4,true,bits(1.0f));

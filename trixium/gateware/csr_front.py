@@ -112,6 +112,14 @@ class BonsaiEngineCSR(LiteXModule):
         # # #
 
         pending = Signal()
+        manual_request = self.submit.re & self.submit.storage
+        if seq is not None and hasattr(seq, 'eng_native'):
+            # A native list drains older queued manual work before fetching,
+            # but must never replay a NEW manual submit after list ownership.
+            self.native_manual_conflict = Signal()
+            self.comb += self.native_manual_conflict.eq(manual_request &
+                (seq.busy | (seq.start.re & seq.start.storage)))
+            manual_request = manual_request & ~self.native_manual_conflict
         # Accept beats submit: when the engine is idle it accepts the command on the submit
         # cycle itself, and latching pending anyway would replay the op once the engine
         # returns to idle (results are rewritten identically, but the replay's command
@@ -127,7 +135,7 @@ class BonsaiEngineCSR(LiteXModule):
                 pending.eq(0),                  # never replay the wedged op after the reset
             ).Elif(engine.cmd.valid & engine.cmd.ready,
                 pending.eq(0),
-            ).Elif(self.submit.re & self.submit.storage,
+            ).Elif(manual_request,
                 pending.eq(1),
             ),
             If(engine.done,
@@ -143,13 +151,13 @@ class BonsaiEngineCSR(LiteXModule):
             # Optional extension bank supplies these; no existing CSR moves.
             self.native_enable = Signal()
             self.native_config_pending = native_blocked = Signal()
-            self.comb += engine.cmd.native.eq(self.native_enable & ~seq_own)
+            self.comb += engine.cmd.native.eq(Mux(seq_own, getattr(seq, 'eng_native', 0), self.native_enable))
             native_cols = Mux(self.native_enable,
                               Mux(self.kind.storage == 0, self.cbeats.storage << 7,
                                   self.cbeats.storage << 5), self.cols.storage)
         if seq is not None:
             self.comb += [
-                seq_own.eq(seq.busy),
+                seq_own.eq(seq.busy & ~getattr(seq, 'native_manual_drain', 0)),
                 seq.eng_ready.eq(engine.cmd.ready & seq_own),
                 seq.eng_done.eq(engine.done),
                 seq.absmax.eq(engine.absmax),
@@ -180,7 +188,7 @@ class BonsaiEngineCSR(LiteXModule):
                 engine.cmd.dstride.eq(0 if seq is None else seq.eng_dstride),
                 engine.cmd.sstride.eq(0 if seq is None else seq.eng_sstride),
             ).Else(
-            engine.cmd.valid.eq((pending | (self.submit.re & self.submit.storage)) & ~native_blocked),
+            engine.cmd.valid.eq((pending | manual_request) & ~native_blocked),
             engine.cmd.kind.eq(self.kind.storage),
             engine.cmd.rows.eq(self.rows.storage),
             engine.cmd.cols.eq(native_cols),

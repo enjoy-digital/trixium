@@ -137,11 +137,28 @@ def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
 
 
-def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path):
+@pytest.mark.parametrize('native', [False, True])
+def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path, native):
     verilator = shutil.which('verilator')
     if not verilator:
         pytest.skip('Verilator required for full resident conversion/rotation check')
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, with_activation_quantize=True), n=1)
+    options = {}
+    if native:
+        from test_native_reader import region
+        options = dict(native_regions=(region(7, size=256*1024),), native_endpoints=(0,))
+    dut = SoC(BonsaiClusterConfig(with_hadamard=True, with_activation_quantize=True, **options), n=1)
+    if native:
+        import numpy as np
+        from trixium.model.qformats import ptq1_0_pack
+        # Three complete compact rows. The two 68-group segments retain a
+        # whole-row stride, and consume the resident Q8 slices without host IO.
+        raw = bytearray(256*1024)
+        for row in range(3):
+            codes = np.array([(i*7 + i//13 + row) % 3 for i in range(17408)], dtype=np.uint8)
+            payload = ptq1_0_pack(np.ones(136, dtype=np.float16), codes.reshape(136, 128)).tobytes()
+            base = 0x10000 + row*136*28
+            raw[base:base + len(payload)] = payload
+        dut.models[0].mem.init = [int.from_bytes(raw[i:i+32], 'little') for i in range(0, len(raw), 32)]
     bus = dut.scratchpad.add_wishbone_port()
     status = Signal(24)
     dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
@@ -153,6 +170,9 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path):
         reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
         quant_blocks=dut.activation_quantize.blocks_done, quant_reads=dut.activation_quantize.read_beats,
         quant_writes=dut.activation_quantize.output_beats)
+    if native:
+        signals.update(native_error=dut.seq.native_error.status, engine_done=dut.engine_csr.done_count.status,
+                       engine_busy=dut.engine.busy)
     for name, signal in signals.items():
         signal.name_override = name
     rtl = tmp_path / 'activation_cluster.v'
@@ -164,7 +184,8 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path):
     harness = Path(__file__).parent / 'rtl/activation_cluster.cpp'
     built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
                             '--Mdir', str(obj), '--top-module', 'activation_cluster',
-                            str(rtl), str(harness.resolve())], capture_output=True, text=True, timeout=180)
+                            str(rtl), str(harness.resolve())] + (['-CFLAGS', '-DNATIVE_CHAIN'] if native else []),
+                           capture_output=True, text=True, timeout=240)
     assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
     result = subprocess.run([str(obj / 'Vactivation_cluster')], cwd=tmp_path,
                             capture_output=True, text=True, timeout=120)

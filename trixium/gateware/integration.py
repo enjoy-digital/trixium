@@ -70,6 +70,8 @@ class BonsaiClusterConfig:
             raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
         if (self.with_hadamard or self.with_activation_quantize) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
             raise ValueError("Resident clients need the vector/sequencer arbiter and at most 256 KiB scratchpad")
+        if self.native_regions and self.with_vecunit and self.scratchpad_size > 256*1024:
+            raise ValueError('Native sequencer needs at most 256 KiB scratchpad')
         if self.append_sp_csr and not self.with_sp_csr:
             raise ValueError('append_sp_csr requires a scratchpad CSR port')
         for name in ("chan_stride", "chan_mod"):
@@ -92,8 +94,9 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     All memory ports are 256-bit AXI in sys. Legacy commands and upload/store
     retain stride/mod/skew placement. Optional native projections use explicit
     region/offset/stride descriptors on the same reader and MAC per pipe; optional
-    checked region uploads share the existing writers. Sequencer lowering for
-    that layout is not yet implemented. Ports are
+    checked region uploads share the existing writers. The optional native
+    sequencer consumes explicit pipe descriptors; full model lowering is still
+    separate unfinished work. Ports are
     storage endpoints, not an assertion about board capacity.
     """
     ports = list(memory_ports)
@@ -126,7 +129,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         vecunit = soc.vecunit = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
         seq = soc.seq = ClockDomainsRenamer("eng")(BonsaiSequencer(
             with_hadamard=config.with_hadamard, with_activation_quantize=config.with_activation_quantize,
-            scratchpad_size=config.scratchpad_size))
+            native_pipes=len(ports) if config.native_regions else 0, scratchpad_size=config.scratchpad_size))
         soc.comb += [
             vecunit.seq_en.eq(seq.busy),
             vecunit.seq_start.eq(seq.vec_start),
@@ -146,14 +149,14 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     if config.with_dnrec:
         from trixium.gateware.deltanet import BonsaiDeltaNetUnit, BonsaiScratchpadClientMux
         soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(
-            with_dispatch_guard=config.with_hadamard or config.with_activation_quantize))
+            with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.native_regions)))
         soc.spmux = BonsaiScratchpadClientMux(vecunit, soc.dnunit)
         sp_client = soc.spmux
         soc.add_constant("BONSAI_HAS_DNREC")
 
     previous_sp_client = sp_client
     extensions = []
-    if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize):
+    if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize or config.native_regions):
         # Manual vector starts are already masked by seq_en. Apply the same
         # ownership rule to manual recurrence starts; never steal a read port.
         soc.comb += soc.dnunit.dispatch_allowed.eq(~seq.busy)
@@ -202,8 +205,10 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         ]
     if config.native_regions:
         from trixium.gateware.native_csr import BonsaiNativeCSR
-        soc.zznative = BonsaiNativeCSR(soc.engine, soc.engine_csr)
+        soc.zznative = BonsaiNativeCSR(soc.engine, soc.engine_csr, seq=seq)
         soc.add_constant('BONSAI_HAS_NATIVE_ENGINE')
+        if seq is not None:
+            soc.add_constant('BONSAI_HAS_NATIVE_SEQ')
         from trixium.gateware.region_read_csr import BonsaiRegionReadCSR
         soc.zzverify = BonsaiRegionReadCSR(soc.engine, soc.engine_csr,
                                          scratchpad_csr=sp_csr)

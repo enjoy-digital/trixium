@@ -59,6 +59,8 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   requant: Unit 5 (quant ABI >=1.1), serialized; w0 exactly 5, w1 raw int32 src,
            w2 Q8 dst, w3 input exponent array, w4 raw absmax array, w5 result
            exponent, w6 blocks of 1024, w7..w15 zero. See docs/rotation-requantization.md.
+  native: Optional units 6 (pipe region/offset/stride setup) and 7 (projection),
+          always serialized. See docs/native-sequencer.md for their strict ABI.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -80,8 +82,10 @@ from litex.soc.interconnect import stream
 # BonsaiSequencer ----------------------------------------------------------------------------------
 
 class BonsaiSequencer(LiteXModule):
-    def __init__(self, *, with_hadamard=False, with_activation_quantize=False, scratchpad_size=256*1024):
-        extended = with_hadamard or with_activation_quantize
+    def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0, scratchpad_size=256*1024):
+        if not isinstance(native_pipes, int) or not 0 <= native_pipes <= 31:
+            raise ValueError('native_pipes must be in [0, 31]')
+        extended = with_hadamard or with_activation_quantize or native_pipes
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
@@ -119,13 +123,26 @@ class BonsaiSequencer(LiteXModule):
                 "bits8..15 conversion-unit error (bit14 protects descriptor list; "
                 "bit15 rejects invalid rotation metadata/raw values).")
             extension_errors.append(self.activation_quantize_error)
+        if native_pipes:
+            self.native_abi = CSRStatus(32, reset=0x00010000)
+            self.native_error = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
+                'bit2 output overlaps descriptor list, bit3 config channel, bit8 engine failure.')
+            extension_errors.append(self.native_error)
+            self.native_cfg = stream.Endpoint([('chan', 5), ('region', 32), ('offset', 64), ('stride', 64)])
+            self.native_cfg_error = Signal()
+            self.native_failed = Signal()
+            self.native_manual_pending = Signal()
+            self.native_engine_busy = Signal()
+            self.native_manual_drain = Signal()
+            self.eng_native = Signal()
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
         self.eng_ready  = Signal()
         self.eng_kind   = Signal(3)
         self.eng_rows   = Signal(16)
-        self.eng_cols   = Signal(14)
+        self.eng_cols   = Signal(17 if native_pipes else 14)
         self.eng_wbase  = Signal(32)
         self.eng_wlen   = Signal(24)
         self.eng_sbeats = Signal(4)
@@ -250,6 +267,38 @@ class BonsaiSequencer(LiteXModule):
             quant_dispatch = [If(malformed,
                 NextValue(self.activation_quantize_error.status, 2), NextState("EXT_FAILED"),
             ).Else(NextState("DISPATCH_QUANT"))]
+        if native_pipes:
+            cfg_malformed, cfg_channel_bad = Signal(), Signal()
+            projection_malformed, projection_overlap = Signal(), Signal()
+            projection_rows = Signal(32)
+            projection_end, head_b_start, head_b_end = Signal(64), Signal(64), Signal(64)
+            self.comb += [
+                cfg_malformed.eq((w(0, 0) != 6) | (w(0, 7) != 0) | (d1 != 0)),
+                cfg_channel_bad.eq(w(0, 1) >= native_pipes),
+                self.native_cfg.chan.eq(w(0, 1)[:5]), self.native_cfg.region.eq(w(0, 2)),
+                self.native_cfg.offset.eq(Cat(w(0, 3), w(0, 4))),
+                self.native_cfg.stride.eq(Cat(w(0, 5), w(0, 6))),
+                self.eng_native.eq(w(0, 0) == 7),
+                projection_malformed.eq((w(0, 0) != 7) | ((w(0, 1) & 0xfffff4fe) != 0) |
+                    (w(0, 2)[21:] != 0) | (w(0, 3) != 0) | (w(0, 4) != 0) | (w(0, 5) != 0) |
+                    (w(0, 6)[:8] != 0) | ((w(0, 7) & 0xffc0ff80) != 0) |
+                    (w(1, 8)[24:] != 0) | (w(1, 9)[24:] != 0) | (d1[64:] != 0)),
+                projection_rows.eq(w(0, 2)[:16]*native_pipes + w(0, 2)[16:21]),
+                projection_end.eq(w(1, 9) + (projection_rows << 2)),
+                head_b_start.eq(w(1, 9) + (w(0, 6)[16:] << 2)),
+                head_b_end.eq(head_b_start + (projection_rows << 2)),
+                projection_overlap.eq(~w(0, 1)[9] &
+                    (((w(1, 9) < list_end) & (list_base < projection_end)) |
+                     (w(0, 1)[11] & (head_b_start < list_end) & (list_base < head_b_end)))),
+            ]
+            cfg_dispatch = [If(cfg_malformed | cfg_channel_bad,
+                NextValue(self.native_error.status, Cat(C(0, 1), cfg_malformed, C(0, 1), cfg_channel_bad)),
+                NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_NATIVE_CFG'))]
+            native_dispatch = [If(projection_malformed | projection_overlap,
+                NextValue(self.native_error.status, Cat(C(0, 1), projection_malformed, projection_overlap)),
+                NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_NATIVE'))]
 
         unit    = Signal(4)
         argsrc  = Signal(16)
@@ -441,7 +490,9 @@ class BonsaiSequencer(LiteXModule):
             self.eng_supw.eq(w(0, 1)[9]),
             self.eng_rows.eq(w(0, 2)[0:16]),
             self.eng_rem.eq(w(0, 2)[16:21]),
-            self.eng_cols.eq(w(0, 3)[0:14]),
+            self.eng_cols.eq(Mux(self.eng_native,
+                Mux(w(0, 1)[0], w(0, 6)[8:16] << 5, w(0, 6)[8:16] << 7),
+                w(0, 3)[0:14]) if native_pipes else w(0, 3)[0:14]),
             self.eng_wbase.eq(w(0, 4)),
             self.eng_wlen.eq(w(0, 5)[0:24]),
             self.eng_sbeats.eq(w(0, 6)[0:4]),
@@ -477,9 +528,13 @@ class BonsaiSequencer(LiteXModule):
         )
         fsm.act("SBDRAIN", # Let every patch posted for this list land before fetching it.
             self.busy.eq(1),
-            If(~self.sbw_pending,
+            *([self.native_manual_drain.eq(1)] if native_pipes else []),
+            If(~self.sbw_pending &
+               (~(self.native_manual_pending | self.native_engine_busy) if native_pipes else C(1, 1)),
                 NextState("FETCH0"),
-            )
+            ),
+            *([If(self.native_failed, NextValue(self.native_error.status, 256), NextState('EXT_FAILED'))]
+              if native_pipes else []),
         )
         fsm.act("FETCH0",
             self.busy.eq(1),
@@ -575,6 +630,8 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 3, *(had_dispatch if with_hadamard else unknown_unit)
             ).Elif(unit == 4, *(quant_dispatch if with_activation_quantize else unknown_unit)
             ).Elif(unit == 5, *(quant_dispatch if with_activation_quantize else unknown_unit)
+            ).Elif(unit == 6, *(cfg_dispatch if native_pipes else unknown_unit)
+            ).Elif(unit == 7, *(native_dispatch if native_pipes else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -604,6 +661,27 @@ class BonsaiSequencer(LiteXModule):
                 ).Elif(self.activation_quantize_done, NextState("NEXT")))
         if extended:
             fsm.act("EXT_FAILED", self.busy.eq(1))
+        if native_pipes:
+            fsm.act('DISPATCH_NATIVE_CFG', self.busy.eq(1),
+                If(self.native_failed,
+                    NextValue(self.native_error.status, 256), NextState('EXT_FAILED'),
+                ).Elif(~eng_inflight,
+                    self.native_cfg.valid.eq(1),
+                    If(self.native_cfg.ready, NextState('WAIT_NATIVE_CFG'))))
+            fsm.act('WAIT_NATIVE_CFG', self.busy.eq(1),
+                If(self.native_cfg_error,
+                    NextValue(self.native_error.status, 8), NextState('EXT_FAILED'),
+                ).Else(NextState('NEXT')))
+            fsm.act('DISPATCH_NATIVE', self.busy.eq(1),
+                If(self.native_failed,
+                    NextValue(self.native_error.status, 256), NextState('EXT_FAILED'),
+                ).Elif(~eng_inflight,
+                    self.eng_valid.eq(1),
+                    If(self.eng_ready, eng_disp.eq(1), NextState('WAIT_NATIVE'))))
+            fsm.act('WAIT_NATIVE', self.busy.eq(1),
+                If(self.native_failed,
+                    NextValue(self.native_error.status, 256), NextState('EXT_FAILED'),
+                ).Elif(self.eng_done, NextState('NEXT')))
         fsm.act("WAIT_ENG",
             self.busy.eq(1),
             If(self.eng_done,
