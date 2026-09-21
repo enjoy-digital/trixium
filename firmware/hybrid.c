@@ -211,18 +211,59 @@ static inline float siluf(float x)
 static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
 {
     float ss = 0;
-    for (int i = 0; i < n; i++) ss += src[i]*src[i];
+    int i = 0;
+    // Keep the exact sequential sum, but remove three quarters of its loop control.
+    for (; i + 3 < n; i += 4) {
+        ss += src[i + 0]*src[i + 0];
+        ss += src[i + 1]*src[i + 1];
+        ss += src[i + 2]*src[i + 2];
+        ss += src[i + 3]*src[i + 3];
+    }
+    for (; i < n; i++) ss += src[i]*src[i];
     float r = 1.0f/sqrtf(ss/n + rms_eps);
-    for (int i = 0; i < n; i++) dst[i] = src[i]*r*w[i];
+    i = 0;
+    for (; i + 3 < n; i += 4) {
+        dst[i + 0] = src[i + 0]*r*w[i + 0];
+        dst[i + 1] = src[i + 1]*r*w[i + 1];
+        dst[i + 2] = src[i + 2]*r*w[i + 2];
+        dst[i + 3] = src[i + 3]*r*w[i + 3];
+    }
+    for (; i < n; i++) dst[i] = src[i]*r*w[i];
 }
 
 static void l2norm_fv(float *v, int n)   // ggml_l2_norm: v / max(|v|, eps)
 {
     float ss = 0;
-    for (int i = 0; i < n; i++) ss += v[i]*v[i];
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        ss += v[i + 0]*v[i + 0];
+        ss += v[i + 1]*v[i + 1];
+        ss += v[i + 2]*v[i + 2];
+        ss += v[i + 3]*v[i + 3];
+    }
+    for (; i < n; i++) ss += v[i]*v[i];
     float nrm = sqrtf(ss);
     if (nrm < rms_eps) nrm = rms_eps;
-    for (int i = 0; i < n; i++) v[i] /= nrm;
+    i = 0;
+    for (; i + 3 < n; i += 4) {
+        v[i + 0] /= nrm; v[i + 1] /= nrm;
+        v[i + 2] /= nrm; v[i + 3] /= nrm;
+    }
+    for (; i < n; i++) v[i] /= nrm;
+}
+
+static void silu_mul_fv(float *dst, const float *mul, const float *gate, int n)
+{
+    int i = 0;
+    // Independent lanes hide LUT-load and FMA latency on the in-order RV32F core.  dst may
+    // alias gate (the FFN case); no element reads another element, so this remains exact.
+    for (; i + 3 < n; i += 4) {
+        float s0 = siluf(gate[i + 0]), s1 = siluf(gate[i + 1]);
+        float s2 = siluf(gate[i + 2]), s3 = siluf(gate[i + 3]);
+        dst[i + 0] = mul[i + 0]*s0; dst[i + 1] = mul[i + 1]*s1;
+        dst[i + 2] = mul[i + 2]*s2; dst[i + 3] = mul[i + 3]*s3;
+    }
+    for (; i < n; i++) dst[i] = mul[i]*siluf(gate[i]);
 }
 
 // A replicated F32 tensor's rows into a float array (chunked through the fetch region).
@@ -680,7 +721,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         rmsnorm_fv(delta, oh, norm_ssm[l], hv);
         float *dst = og + gpos*hv;
         const float *z = zb + hh*hv;
-        for (int j = 0; j < hv; j++) dst[j] = delta[j]*siluf(z[j]);
+        silu_mul_fv(dst, delta, z, hv);
         dn_cyc_gate += perf_now64() - t0;
     }
     t0 = perf_now64();
@@ -779,7 +820,7 @@ int hybrid_forward(int token, int want_logits)
         infer_matvec_f_quantized(model_entry(ROLE_FFN_UP, l), e8, upb);
         hyb_cyc_fproj += perf_now64() - t0;
         t0 = perf_now64();
-        for (int i = 0; i < ffn_dim; i++) gateb[i] = siluf(gateb[i])*upb[i];
+        silu_mul_fv(gateb, upb, gateb, ffn_dim);
         hyb_cyc_fact += perf_now64() - t0;
         t0 = perf_now64();
         proj_f(model_entry(ROLE_FFN_DOWN, l), gateb, tmp_h);
