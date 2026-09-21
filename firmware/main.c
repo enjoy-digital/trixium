@@ -319,6 +319,11 @@ static int hdrload_staged(int quiet)
                    (unsigned long)sh->magic);
         return -1;
     }
+    if (sh->version < BONS_VERSION_MIN || sh->version > BONS_VERSION) {
+        if (!quiet)
+            printf("hdrload: unsupported BONS version %lu\n", (unsigned long)sh->version);
+        return -1; // Reject before interpreting layout-specific offsets/copy sizes.
+    }
     const struct bons_header *mh = model_header();
     if (quiet && mh->magic == BONS_MAGIC && mh->version == sh->version
         && mh->n_tensors == sh->n_tensors && mh->payload_beats == sh->payload_beats

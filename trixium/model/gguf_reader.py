@@ -140,6 +140,8 @@ class GGUFReader:
         for _ in range(n_kv):
             key   = self._string()
             vtype = self._u32()
+            if key in self.metadata:
+                raise ValueError(f'duplicate GGUF metadata key: {key}')
             self.metadata[key] = self._value(vtype)
 
         # Tensor infos.
@@ -166,6 +168,8 @@ class GGUFReader:
             else:
                 end = file_size
             nbytes = end - (self.data_start + offset)
+            if name in self.tensors:
+                raise ValueError(f'duplicate GGUF tensor name: {name}')
             self.tensors[name] = GGUFTensor(name, shape, type_id, self.data_start + offset, nbytes)
 
     def tensor_bytes(self, name):

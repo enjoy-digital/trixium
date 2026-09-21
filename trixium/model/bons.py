@@ -411,6 +411,11 @@ class _TruncTolerantNames(dict):
 class BONSReader:
     def __init__(self, path):
         self.data   = np.memmap(path, dtype=np.uint8, mode="r")
+        # Explicit even under python -O: v4 is a logical container, never a legacy
+        # channel-major upload image. Do not reinterpret its unrelated offsets.
+        import struct
+        if len(self.data) < 8 or struct.unpack_from('<I', self.data, 4)[0] not in layout.BONS_VERSIONS_OK:
+            raise ValueError('legacy BONSReader accepts v2/v3 only; use bons4.Reader for v4')
         self.header = layout.unpack_header(bytes(self.data[:layout.BONS_HEADER_SIZE]))
         self.entries = []
         table_off = self.header["table_offset"]
