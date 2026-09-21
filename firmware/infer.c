@@ -97,7 +97,18 @@ static inline uint32_t f32_pack_q8x4(const float *src, float is)
 static int f32_quant_e8(const float *src, uint32_t n)
 {
     uint32_t amax = 0;
-    for (uint32_t i = 0; i < n; i++) {
+    uint32_t i = 0;
+    // The reduction is over ordered positive IEEE-754 bit patterns, so four independent
+    // loads/comparisons are bit-identical and remove three quarters of the loop control.
+    for (; i + 3 < n; i += 4) {
+        uint32_t a0 = f32_abs_bits(src[i + 0]), a1 = f32_abs_bits(src[i + 1]);
+        uint32_t a2 = f32_abs_bits(src[i + 2]), a3 = f32_abs_bits(src[i + 3]);
+        if (a0 <= 0x7f800000u && a0 > amax) amax = a0;
+        if (a1 <= 0x7f800000u && a1 > amax) amax = a1;
+        if (a2 <= 0x7f800000u && a2 > amax) amax = a2;
+        if (a3 <= 0x7f800000u && a3 > amax) amax = a3;
+    }
+    for (; i < n; i++) {
         uint32_t a = f32_abs_bits(src[i]);
         // Positive finite IEEE-754 bit patterns have the same order as their values.
         // Ignore NaNs as the old FP compare did; retain infinity for equivalent overflow.
