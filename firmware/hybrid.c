@@ -48,6 +48,7 @@ static float **norm_attn, **norm_ffn, **norm_q, **norm_k, **norm_ssm, **ssm_a, *
 static int   *dn_slot, *attn_slot;   // layer -> DeltaNet / attention index, -1 otherwise.
 static float *dn_state;              // [n_dn][nv][hv][hk]  (row j = value index, as llama.cpp)
 static float *dn_conv;               // [n_dn][conv_k - 1][C]
+static uint8_t *dn_conv_pos;         // Oldest causal-convolution plane per DeltaNet layer.
 static float *kc, *vc;               // [n_attn][ctx_cap][kv_dim]
 static float *rope_c, *rope_s, *rope_freq;
 static int    rope_pos_cached;
@@ -368,6 +369,7 @@ int hybrid_init(void)
     }
     dn_state = (n_dn && !dn_hw) ? infer_halloc(matrix_b, 1) : NULL;
     dn_conv  = n_dn ? infer_halloc((uint64_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4, 1) : NULL;
+    dn_conv_pos = n_dn ? infer_halloc(n_dn, 0) : NULL;
     kc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     silu_lut = infer_halloc(sizeof(float)*(SILU_LUT_N + 1), 0);
@@ -448,6 +450,7 @@ void hybrid_reset(void)
         memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
     }
     if (dn_conv)  memset(dn_conv, 0, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);
+    if (dn_conv_pos) memset(dn_conv_pos, 0, (size_t)n_dn);
     hybrid_stats_reset();
 }
 
@@ -585,15 +588,35 @@ static void deltanet_layer(int l, const float *h, float *out)
     // Causal conv over the last conv_k inputs of every channel, then SiLU.
     t0 = perf_now64();
     const float *w = conv_w[l];   // tap i of channel c at c*conv_k + i
-    for (int c = 0; c < C; c++) {
-        float acc = 0;
-        for (int i = 0; i < conv_k - 1; i++) acc += w[c*conv_k + i]*win[i*C + c];
-        acc += w[c*conv_k + conv_k - 1]*qkv[c];
-        convb[c] = siluf(acc);
+    if (conv_k == 4) {
+        // The 27B's fixed four-tap kernel.  A circular history removes three 40 KiB
+        // memcpys per layer, and spelling out the taps removes the runtime inner loop.
+        // The oldest-to-newest accumulation order is unchanged, so FP32 results are exact.
+        int p0 = dn_conv_pos[s], p1 = p0 == 2 ? 0 : p0 + 1;
+        int p2 = p1 == 2 ? 0 : p1 + 1;
+        const float *x0 = win + p0*C, *x1 = win + p1*C, *x2 = win + p2*C;
+        for (int c = 0; c < C; c++) {
+            const float *cw = w + 4*c;
+            float acc = 0;
+            acc += cw[0]*x0[c];
+            acc += cw[1]*x1[c];
+            acc += cw[2]*x2[c];
+            acc += cw[3]*qkv[c];
+            convb[c] = siluf(acc);
+        }
+        memcpy(win + p0*C, qkv, (size_t)C*4);
+        dn_conv_pos[s] = p1;
+    } else {
+        for (int c = 0; c < C; c++) {
+            float acc = 0;
+            for (int i = 0; i < conv_k - 1; i++) acc += w[c*conv_k + i]*win[i*C + c];
+            acc += w[c*conv_k + conv_k - 1]*qkv[c];
+            convb[c] = siluf(acc);
+        }
+        for (int i = 0; i < conv_k - 2; i++)
+            memcpy(win + i*C, win + (i + 1)*C, (size_t)C*4);
+        memcpy(win + (conv_k - 2)*C, qkv, (size_t)C*4);
     }
-    for (int i = 0; i < conv_k - 2; i++)
-        memcpy(win + i*C, win + (i + 1)*C, (size_t)C*4);
-    memcpy(win + (conv_k - 2)*C, qkv, (size_t)C*4);
     dn_cyc_conv += perf_now64() - t0;
     // q, k (per key head, L2-normalised), v.
     t0 = perf_now64();
