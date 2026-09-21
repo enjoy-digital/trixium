@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: BSD-2-Clause
+from pathlib import Path
+
 import pytest
 
 from tools.benchmark_report import parse_record, read_records, summarize
@@ -66,3 +68,14 @@ def test_missing_and_duplicate_fields():
         parse_record("BENCH_PHASE v=1")
     with pytest.raises(ValueError, match="duplicate"):
         parse_record(RECORD + " v=1")
+
+
+def test_recorded_vcu_baseline():
+    path = Path(__file__).resolve().parents[1] / "docs/measurements/v0-2026-09-21.md"
+    records = read_records(path)
+    assert len(records) == 3
+    assert all(r["decode_wall_cycles"] > 2**32 and r["request_complete"] for r in records)
+    group, = summarize(records)
+    assert group["context_capacity"] == 1024
+    assert group["median_decode_wall_tok_s"] == pytest.approx(0.21707303411234344)
+    assert group["median_ttft_s"] == pytest.approx(13.62823282)
