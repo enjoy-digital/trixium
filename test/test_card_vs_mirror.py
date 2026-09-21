@@ -2,6 +2,7 @@
 """Trace validation must fail closed, including absent/malformed board output."""
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +23,7 @@ def compare(tmp_path, mirror, card):
 def test_matching_trace_with_chatter(tmp_path):
     assert compare(tmp_path, EMBED + ARGMAX, "boot chatter\n" + EMBED + ARGMAX) == 0
     assert compare(tmp_path, EMBED + ARGMAX, "GEN:" + EMBED + " 11751" + ARGMAX) == 0
+    assert compare(tmp_path, EMBED, "DBG armed for 1 forwards\nGEN:" + EMBED) == 0
 
 
 @pytest.mark.parametrize("mirror,card", [
@@ -78,3 +80,14 @@ def test_typed_argmax_hash():
 def test_ids_do_not_require_tokenizer():
     from tools.card_vs_mirror import prompt_ids
     assert prompt_ids(SimpleNamespace(ids="1 2 3", tokenizer="missing")) == [1, 2, 3]
+
+
+def test_pinned_fpu_trace_contract():
+    path = Path(__file__).parent / "data/v0-tiny-hybrid-fpu-trace.txt"
+    points, order = parse(path)
+    assert len(order) == len(points) == 87
+    assert points[(0, 0, "ffn_act")].checksum == "15069f09"
+    assert points[(0, 0, "ffn_act")].dtype == "f32"
+    assert points[(0, 0, "ffn_act")].count == 512
+    assert [(p, l) for p, l, tag in order if tag == "argmax"] == [(2, -1)]
+    assert points[(2, -1, "argmax")].checksum == "c653a7ea"  # FNV-1a of uint32 token 143.

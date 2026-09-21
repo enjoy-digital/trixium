@@ -4,11 +4,15 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""The Python mirror of firmware/hybrid.c - the hybrid models' CPU path.
+"""Structural Python reference for firmware/hybrid.c - the hybrid models' CPU path.
 
-hybrid27_generate walks a BONS v3 image exactly as hybrid.c does: every matvec through the
+hybrid27_generate walks a BONS v3 image: every matvec through the
 engine's bit-exact model (int8 input with a power-of-two scale, int32 results, float
-scaling), everything else in float32 in the firmware's operation order (sequential sums).
+scaling), with sequential float32 sums for the other operations. IMPORTANT: its SiLU is
+the direct exponential, not the firmware's subsequently added LUT/FMA interpolation and
+polynomial tails. Token gates still agree on the tiny hybrid; typed FP32 traces expose
+the difference (docs/measurements/v0-2026-09-21.md). Do not call it a bit-exact reference
+for all current hybrid activations until those math paths are aligned.
 It is what tools/check_sim_tokens.py compares the sim's GEN legs against when the image is
 a hybrid, and the test below pins it to the fp32 golden on the tiny hybrid model.
 """
