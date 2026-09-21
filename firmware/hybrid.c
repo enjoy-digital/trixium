@@ -62,6 +62,12 @@ static uint32_t dn_hbm_base;
 // even for a long 27B benchmark.
 static uint64_t dn_cyc_fetch, dn_cyc_params, dn_cyc_core, dn_cyc_store, dn_cyc_output;
 static uint32_t dn_heads_profiled;
+static uint64_t dn_cyc_inproj, dn_cyc_act, dn_cyc_conv, dn_cyc_prep;
+static uint64_t dn_cyc_heads, dn_cyc_gate, dn_cyc_outproj;
+static uint64_t hyb_cyc_embed, hyb_cyc_anorm, hyb_cyc_dn, hyb_cyc_attn;
+static uint64_t hyb_cyc_resid, hyb_cyc_fprep, hyb_cyc_fproj, hyb_cyc_fact;
+static uint64_t hyb_cyc_fdown, hyb_cyc_logits;
+static uint32_t hyb_forwards_profiled;
 
 #ifdef BONSAI_HAS_DNREC
 #define DN_SP_STATE 0x00000u
@@ -419,6 +425,12 @@ void hybrid_stats_reset(void)
 {
     dn_cyc_fetch = dn_cyc_params = dn_cyc_core = dn_cyc_store = dn_cyc_output = 0;
     dn_heads_profiled = 0;
+    dn_cyc_inproj = dn_cyc_act = dn_cyc_conv = dn_cyc_prep = 0;
+    dn_cyc_heads = dn_cyc_gate = dn_cyc_outproj = 0;
+    hyb_cyc_embed = hyb_cyc_anorm = hyb_cyc_dn = hyb_cyc_attn = 0;
+    hyb_cyc_resid = hyb_cyc_fprep = hyb_cyc_fproj = hyb_cyc_fact = 0;
+    hyb_cyc_fdown = hyb_cyc_logits = 0;
+    hyb_forwards_profiled = 0;
 }
 
 void hybrid_stats_print(void)
@@ -441,6 +453,38 @@ void hybrid_stats_print(void)
     if (forwards)
         printf(", %lu cycles/forward", (unsigned long)(total/forwards));
     puts("");
+    if (hyb_forwards_profiled) {
+        uint64_t ht = hyb_cyc_embed + hyb_cyc_anorm + hyb_cyc_dn + hyb_cyc_attn
+                    + hyb_cyc_resid + hyb_cyc_fprep + hyb_cyc_fproj + hyb_cyc_fact
+                    + hyb_cyc_fdown + hyb_cyc_logits;
+        printf("hybprof: %lu forwards, avg cycles/fwd embed %lu anorm %lu dn %lu "
+               "attn %lu resid %lu fprep %lu fproj %lu fact %lu fdown %lu "
+               "logits %lu total %lu\n",
+               (unsigned long)hyb_forwards_profiled,
+               (unsigned long)(hyb_cyc_embed/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_anorm/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_dn/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_attn/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_resid/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_fprep/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_fproj/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_fact/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_fdown/hyb_forwards_profiled),
+               (unsigned long)(hyb_cyc_logits/hyb_forwards_profiled),
+               (unsigned long)(ht/hyb_forwards_profiled));
+        uint64_t dt = dn_cyc_inproj + dn_cyc_act + dn_cyc_conv + dn_cyc_prep
+                    + dn_cyc_heads + dn_cyc_gate + dn_cyc_outproj;
+        printf("dnprof: avg cycles/fwd inproj %lu act %lu conv %lu prep %lu "
+               "heads %lu gate %lu outproj %lu total %lu\n",
+               (unsigned long)(dn_cyc_inproj/hyb_forwards_profiled),
+               (unsigned long)(dn_cyc_act/hyb_forwards_profiled),
+               (unsigned long)(dn_cyc_conv/hyb_forwards_profiled),
+               (unsigned long)(dn_cyc_prep/hyb_forwards_profiled),
+               (unsigned long)(dn_cyc_heads/hyb_forwards_profiled),
+               (unsigned long)(dn_cyc_gate/hyb_forwards_profiled),
+               (unsigned long)(dn_cyc_outproj/hyb_forwards_profiled),
+               (unsigned long)(dt/hyb_forwards_profiled));
+    }
 }
 
 int hybrid_pos(void) { return pos; }
@@ -486,15 +530,20 @@ static void deltanet_layer(int l, const float *h, float *out)
     float *S    = dn_hw ? NULL : dn_state + (uint64_t)s*nv*hv*hk;
     float *win  = dn_conv + (uint64_t)s*(conv_k - 1)*C;
 
+    uint64_t t0 = perf_now64();
     proj_f(model_entry(ROLE_ATTN_QKV, l), h, qkv);
     proj_f(model_entry(ROLE_ATTN_ZGATE, l), h, zb);
     infer_matvec_f(model_entry(ROLE_SSM_BETA, l), h, betab);    // not folded
     infer_matvec_f(model_entry(ROLE_SSM_ALPHA, l), h, alphab);
+    dn_cyc_inproj += perf_now64() - t0;
+    t0 = perf_now64();
     for (int hh = 0; hh < nv; hh++) {
         betab[hh] = sigmoidf(betab[hh]);
         gb[hh]    = softplusf(alphab[hh] + ssm_dt[l][hh])*ssm_a[l][hh];   // ssm_a = -exp(A_log)
     }
+    dn_cyc_act += perf_now64() - t0;
     // Causal conv over the last conv_k inputs of every channel, then SiLU.
+    t0 = perf_now64();
     const float *w = conv_w[l];   // tap i of channel c at c*conv_k + i
     for (int c = 0; c < C; c++) {
         float acc = 0;
@@ -505,11 +554,14 @@ static void deltanet_layer(int l, const float *h, float *out)
     for (int i = 0; i < conv_k - 2; i++)
         memcpy(win + i*C, win + (i + 1)*C, (size_t)C*4);
     memcpy(win + (conv_k - 2)*C, qkv, (size_t)C*4);
+    dn_cyc_conv += perf_now64() - t0;
     // q, k (per key head, L2-normalised), v.
+    t0 = perf_now64();
     memcpy(qb, convb, (size_t)nq*4);
     memcpy(kb, convb + nq, (size_t)nq*4);
     memcpy(vb, convb + 2*nq, (size_t)nvh*4);
     for (int hh = 0; hh < nk; hh++) { l2norm_fv(qb + hh*hk, hk); l2norm_fv(kb + hh*hk, hk); }
+    dn_cyc_prep += perf_now64() - t0;
     // The recurrence per value head (llama.cpp's autoregressive kernel): M = S[hh] rows j.
     float scale = 1.0f/sqrtf((float)hk);
     int rep = nv/nk;
@@ -530,6 +582,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         }
         const float *qh = qb + kh*hk, *kk = kb + kh*hk, *vh = vb + hh*hv;
         float *M = dn_hw ? NULL : S + (uint64_t)hh*hv*hk;
+        t0 = perf_now64();
         float decay = expf(gb[hh]);
         float *oh = ob + hh*hv;
         if (dn_hw) {
@@ -554,14 +607,19 @@ static void deltanet_layer(int l, const float *h, float *out)
                 oh[j] = dot*scale;
             }
         }
+        dn_cyc_heads += perf_now64() - t0;
         // Gated RMSNorm over the head with the shared head norm, times SiLU(z); written in
         // grouped head order (key head major) - the order the folded out projection expects.
+        t0 = perf_now64();
         rmsnorm_fv(delta, oh, norm_ssm[l], hv);
         float *dst = og + gpos*hv;
         const float *z = zb + hh*hv;
         for (int j = 0; j < hv; j++) dst[j] = delta[j]*siluf(z[j]);
+        dn_cyc_gate += perf_now64() - t0;
     }
+    t0 = perf_now64();
     proj_f(model_entry(ROLE_SSM_OUT, l), og, out);
+    dn_cyc_outproj += perf_now64() - t0;
 }
 
 static void attention_layer(int l, const float *h, float *out)
@@ -619,22 +677,46 @@ static void attention_layer(int l, const float *h, float *out)
 int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
+    uint64_t t0 = perf_now64();
     if (infer_embed_f(token, xb) < 0) return -1;
+    hyb_cyc_embed += perf_now64() - t0;
     for (int l = 0; l < n_layer; l++) {
+        t0 = perf_now64();
         rmsnorm_fv(hb, xb, norm_attn[l], n_embd);
-        if (dn_slot[l] >= 0) deltanet_layer(l, hb, tmp_h);
-        else                 attention_layer(l, hb, tmp_h);
+        hyb_cyc_anorm += perf_now64() - t0;
+        t0 = perf_now64();
+        if (dn_slot[l] >= 0) {
+            deltanet_layer(l, hb, tmp_h);
+            hyb_cyc_dn += perf_now64() - t0;
+        } else {
+            attention_layer(l, hb, tmp_h);
+            hyb_cyc_attn += perf_now64() - t0;
+        }
+        t0 = perf_now64();
         for (int i = 0; i < n_embd; i++) xb[i] += tmp_h[i];
+        hyb_cyc_resid += perf_now64() - t0;
+        t0 = perf_now64();
         rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
         if (H->hadamard_block) rotate_f(hb, rot, n_embd); else memcpy(rot, hb, (size_t)n_embd*4);
+        hyb_cyc_fprep += perf_now64() - t0;
+        t0 = perf_now64();
         infer_matvec_f(model_entry(ROLE_FFN_GATE, l), rot, gateb);
         infer_matvec_f(model_entry(ROLE_FFN_UP, l), rot, upb);
+        hyb_cyc_fproj += perf_now64() - t0;
+        t0 = perf_now64();
         for (int i = 0; i < ffn_dim; i++) gateb[i] = siluf(gateb[i])*upb[i];
+        hyb_cyc_fact += perf_now64() - t0;
+        t0 = perf_now64();
         proj_f(model_entry(ROLE_FFN_DOWN, l), gateb, tmp_h);
+        hyb_cyc_fdown += perf_now64() - t0;
+        t0 = perf_now64();
         for (int i = 0; i < n_embd; i++) xb[i] += tmp_h[i];
+        hyb_cyc_resid += perf_now64() - t0;
     }
     pos++;
+    hyb_forwards_profiled++;
     if (!want_logits) return -1;
+    t0 = perf_now64();
     const struct bons_entry *on = model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32);
     static float *out_norm; if (!out_norm) out_norm = fetch_f32(on);
     rmsnorm_fv(hb, xb, out_norm, n_embd);
@@ -643,5 +725,6 @@ int hybrid_forward(int token, int want_logits)
     proj_f(head, hb, logits);
     int best = 0; float bv = logits[0];
     for (uint32_t i = 1; i < H->vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = (int)i; }
+    hyb_cyc_logits += perf_now64() - t0;
     return best;
 }
