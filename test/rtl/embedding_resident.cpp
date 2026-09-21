@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause
 #include "Vembedding_resident.h"
+#include "bonsai_sequence.h"
 #include "verilated.h"
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +44,27 @@ int main() {
         std::map<uint32_t,uint32_t> writes, checks;
         for (unsigned i=0; i<nw; i++) { unsigned a=word(f), v=word(f); writes[a]=v; }
         for (unsigned i=0; i<nc; i++) { unsigned a=word(f), v=word(f); checks[a]=v; }
+        // Execute descriptors built by the portable C firmware library. The
+        // Python vector file independently supplies the exact encoding oracle.
+        unsigned c_descriptors=0;
+        for (unsigned index=0; index<nd; index++) {
+            unsigned base=index*64;
+            auto w=[&](unsigned i) { return writes.at(base+4*i); };
+            bns_seq_descriptor desc;
+            int result;
+            if (w(0)==4) result=bns_seq_desc_quantize(&desc,w(1),w(2),w(3),w(4),w(5));
+            else if (w(0)==9) result=bns_seq_desc_embedding(&desc,w(1),w(2),w(3),w(4));
+            else if (w(0)==10) result=bns_seq_desc_region_fetch(&desc,w(1),
+                uint64_t(w(2)) | (uint64_t(w(3))<<32),w(4),w(5));
+            else continue; // Unchanged legacy physical fetch/store descriptors.
+            require(result==BNS_SEQ_DESC_OK,"C descriptor encoder rejected valid command");
+            for (unsigned i=0;i<BNS_SEQ_DESC_WORDS;i++) {
+                require(desc.word[i]==w(i),"C/Python descriptor mismatch");
+                writes[base+4*i]=desc.word[i];
+            }
+            c_descriptors++;
+        }
+        require(c_descriptors==(region_fetch ? 6u : 2u),"missing C descriptor coverage");
         auto install=[&]() { for (auto [a,v]:writes) access(d,a,true,v); };
         // A malformed sequencer descriptor never reaches the client, whose
         // counters otherwise retain the previous successful operation.
@@ -115,7 +137,8 @@ int main() {
             if (got!=v) std::fprintf(stderr,"profile=%u addr=%x got=%08x expected=%08x\n",profile,a,got,v);
             require(got==v,"resident memory mismatch");
         }
-        std::printf("EMBEDDING_RESIDENT profile=%u descriptors=%u cycles=%u\n",profile,nd,cycle);
+        std::printf("EMBEDDING_RESIDENT profile=%u descriptors=%u cycles=%u c_descriptors=%u\n",
+                    profile,nd,cycle,c_descriptors);
     }
     require(f.peek()==std::char_traits<char>::eof(),"trailing vector bytes");
     std::printf("EMBEDDING_RESIDENT_PASS profiles=%u rejected=3 common_reset_reuse=3 region_fetch=%u\n",profiles,region_fetch);

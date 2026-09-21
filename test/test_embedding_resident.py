@@ -27,8 +27,9 @@ from test_native_reader import region
 @pytest.mark.parametrize('companions,region_fetch', [(False, False), (True, False), (True, True)])
 def test_compiled_embedding_resident_chain(tmp_path, companions, region_fetch):
     verilator = shutil.which('verilator')
-    if not verilator:
-        pytest.skip('Verilator required for resident embedding chain')
+    compiler = shutil.which('gcc')
+    if not verilator or not compiler:
+        pytest.skip('Verilator and a C compiler required for resident embedding chain')
     profiles = [example(40, span=2), example(40, seed=412, span=2)]
     profiles[1][1].fill(1)  # Zero row still traverses every resident stage.
     source = Path(__file__).resolve().parents[1] / 'models/27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf'
@@ -109,8 +110,14 @@ def test_compiled_embedding_resident_chain(tmp_path, companions, region_fetch):
     rtl.write_text(converted.main_source)
     for name, content in converted.data_files.items():
         (tmp_path / name).write_text(content)
+    library = Path(__file__).resolve().parents[1] / 'trixium/software/lib'
+    sequence_object = tmp_path / 'sequence.o'
+    compiled = subprocess.run([compiler, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+        '-c', str(library / 'bonsai_sequence.c'), '-o', str(sequence_object)], capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stdout+compiled.stderr
     obj = tmp_path / 'obj'
     built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
+        '-CFLAGS', '-I'+str(library), '-LDFLAGS', str(sequence_object),
         '--Mdir', str(obj), '--top-module', 'embedding_resident', str(rtl),
         str((Path(__file__).parent / 'rtl/embedding_resident.cpp').resolve())],
         capture_output=True, text=True, timeout=240)

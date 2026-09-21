@@ -1,0 +1,69 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+#ifndef BONSAI_SEQUENCE_H
+#define BONSAI_SEQUENCE_H
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define BNS_SEQ_DESC_WORDS 16u
+#define BNS_SEQ_DESC_BYTES 64u
+struct bns_seq_descriptor { uint32_t word[BNS_SEQ_DESC_WORDS]; };
+enum bns_seq_desc_result { BNS_SEQ_DESC_OK=0, BNS_SEQ_DESC_INVALID=-1 };
+
+/* Pure descriptor encoders: no MMIO, allocation, board names or model policy.
+ * Words are host-native uint32_t values. Use bns_seq_desc_encode_le for a byte
+ * stream, or ordered 32-bit MMIO stores on the target. All reserved words are
+ * zero. Failure leaves the output unchanged; NULL output is invalid.
+ *
+ * Before submission the caller must check each optional unit's hardware ABI,
+ * physical capacity/profile, placement, numerical admission and full-list
+ * ownership. These functions check field encoding, not execution validity.
+ * Addresses are scratchpad-relative bytes except region-relative uint64_t
+ * offsets/strides. Hardware checks full spans/list protection. Live descriptors
+ * and input buffers must remain immutable; failure invalidates output prefixes
+ * and requires common reset/drain. There is no implicit quantization fallback.
+ */
+int bns_seq_desc_stop(struct bns_seq_descriptor *out);
+/* Unit 3, hadamard ABI 1: 1024-element int8 blocks -> raw int32 + absmax. */
+int bns_seq_desc_hadamard(struct bns_seq_descriptor *out, uint32_t src, uint32_t signs,
+                         uint32_t dst, uint32_t stats, uint32_t blocks, uint32_t inverse);
+/* Unit 4, activation_quantize ABI 1: one exponent per independent FP32 block. */
+int bns_seq_desc_quantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t dst,
+                         uint32_t exponents, uint32_t elements, uint32_t blocks);
+/* Unit 5 needs activation_quantize ABI 1, minor >= 1. Whole-vector post-Hadamard
+ * exponent over ALL 1024-element blocks, before any projection K segmentation. */
+int bns_seq_desc_requantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t dst,
+                           uint32_t exponents, uint32_t maxima, uint32_t result_exponent,
+                           uint32_t blocks);
+/* Unit 6, native ABI 1: full 64-bit row offset/stride; no byte-alignment narrowing. */
+int bns_seq_desc_native_pipe(struct bns_seq_descriptor *out, uint32_t pipe, uint32_t region,
+                            uint64_t offset, uint64_t stride);
+struct bns_seq_projection {
+    uint32_t kind, rows, rem, groups, bias, rshift, xsrc, dst;
+    uint32_t interleaved, suppress_writes, dual, qstride;
+};
+/* Unit 7, native ABI 1: kind 0 PTQ1_0 or 1 Q8_0; flags exactly 0/1.
+ * Keep whole-matrix B/R and one whole-activation exponent across K segments;
+ * reduce wrapping int32 segment outputs before restoring FP32 scale. */
+int bns_seq_desc_native_projection(struct bns_seq_descriptor *out,
+                                  const struct bns_seq_projection *projection);
+/* Unit 8, projection_restore ABI 1: int32 -> FP32 using resident e8 + (R-B). */
+int bns_seq_desc_restore(struct bns_seq_descriptor *out, uint32_t src, uint32_t dst,
+                        uint32_t exponents, uint32_t elements, int32_t adjustment);
+/* Unit 9, embedding_restore ABI 1 and admitted limits/profile. Groups 8..512
+ * encode the generic kernel range; the shared hardware currently allows <=64. */
+int bns_seq_desc_embedding(struct bns_seq_descriptor *out, uint32_t src, uint32_t signs,
+                          uint32_t dst, uint32_t groups);
+/* Unit 10, region_fetch ABI 1: positive full 32-byte beats, aligned offset/dst.
+ * Region READ access, reservations and endpoint/address width are checked in
+ * hardware. Read success alone does not publish a valid model allocation. */
+int bns_seq_desc_region_fetch(struct bns_seq_descriptor *out, uint32_t region,
+                             uint64_t offset, uint32_t length, uint32_t dst);
+/* Exactly 64 little-endian bytes; bytes may be unaligned. The two objects must
+ * not overlap. NULL input/output is rejected without modifying the output. */
+int bns_seq_desc_encode_le(void *bytes, const struct bns_seq_descriptor *descriptor);
+#ifdef __cplusplus
+}
+#endif
+#endif
