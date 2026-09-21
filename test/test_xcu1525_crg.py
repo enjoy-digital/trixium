@@ -99,3 +99,19 @@ def test_idelayctrl_reset_waits_for_mmcm_lock():
         assert (yield dut.ic.ic_reset) == 1, "RST not re-asserted on lock loss"
 
     run_simulation(dut, [gen()], clocks={"sys": 10, "idelay": 4, "idelayrst": 10, "ic": 10})
+
+
+def test_serializer_clock_group_uses_related_buffer_outputs():
+    from litex_boards.platforms.sqrl_xcu1525 import Platform
+    from trixium_xcu1525 import _CRG
+    platform = Platform()
+    crg = _CRG(platform, 150e6)
+    groups = [(command, signals) for command, signals in platform.constraint_manager.platform_commands
+              if 'CLOCK_DELAY_GROUP' in command]
+    assert len(groups) == 1
+    command, signals = groups[0]
+    assert signals['slow'] is crg.cd_sys.clk
+    assert signals['fast'] is crg.cd_sys4x.clk
+    assert command.format(slow='sys_clk', fast='sys4x_clk') == (
+        'set_property CLOCK_DELAY_GROUP bonsai_ddr4 [get_nets {sys_clk sys4x_clk}]')
+    assert 'false_path' not in command and 'uncertainty' not in command

@@ -77,6 +77,16 @@ class _CRG(LiteXModule):
                 i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk),
         ]
 
+        # These parallel buffers share one MMCM output, but their distribution trees
+        # have very different loads (sys fabric vs four PHYs across three SLRs).
+        # Ask the placer/router to balance them; do NOT waive OSERDESE3 CLK/CLKDIV
+        # checks. v8 missed the 0.270 ns maximum skew by 0.003 ns at 16 endpoints.
+        # AMD UG912 CLOCK_DELAY_GROUP: apply to the clock-buffer OUTPUT net segments.
+        platform.add_platform_command(
+            "set_property CLOCK_DELAY_GROUP bonsai_ddr4 "
+            "[get_nets {{{slow} {fast}}}]",
+            slow=self.cd_sys.clk, fast=self.cd_sys4x.clk)
+
         self.idelayctrl = _IDELAYCTRL(platform, cd_ref=self.cd_idelay, cd_sys=self.cd_sys, locked=pll.locked)
 
 # _IDELAYCTRL --------------------------------------------------------------------------------------
