@@ -67,6 +67,12 @@ uint32_t infer_matvec_cols(const struct bons_entry *e);   // K of the whole matv
 void     infer_matvec_f(const struct bons_entry *e, const float *src, float *dst);
 int      infer_quantize_f(const float *src, uint32_t n);  // Put Q8 input in SP_X; return exponent.
 void     infer_matvec_f_quantized(const struct bons_entry *e, int e8, float *dst);
+// Prism folded-basis fast path: rotate blockwise into retained int32+exponent form, pack
+// the exact downstream Q8 bytes without materialising FP32, then run a possibly K-split
+// projection.  Widths that fit SP_X use infer_matvec_f_quantized after the first call.
+#define INFER_ROTATE_UNSUPPORTED 0x40000000
+int      infer_rotate_quantize_f(const float *src, uint32_t width);
+void     infer_matvec_f_rotated_quantized(const struct bons_entry *e, int e8, float *dst);
 void    *infer_halloc(uint64_t n, int big);
 uint64_t infer_heap_room(int big);
 void     infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n);

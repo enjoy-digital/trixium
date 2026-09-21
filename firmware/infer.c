@@ -95,6 +95,30 @@ static inline uint32_t f32_pack_q8x4(const float *src, float is)
     return q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
 }
 
+static inline uint32_t i32_pack_q8x4(const int32_t *src, float is)
+{
+    // This is the fused form of the old Hadamard boundary: int32 -> FP32*2^e was
+    // materialised in main RAM, then loaded again and multiplied by 2^-e8.  Both scales
+    // are powers of two, so applying their combined exponent after the same int32->FP32
+    // conversion is bit-identical for the normal finite values produced by the engine.
+    uint32_t q0 = (uint8_t)(int8_t)f32_q8((float)src[0], is);
+    uint32_t q1 = (uint8_t)(int8_t)f32_q8((float)src[1], is);
+    uint32_t q2 = (uint8_t)(int8_t)f32_q8((float)src[2], is);
+    uint32_t q3 = (uint8_t)(int8_t)f32_q8((float)src[3], is);
+    return q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+}
+
+static int f32_e8_from_amax_bits(uint32_t amax)
+{
+    if (!amax) return 0;
+    uint32_t exp = amax >> 23;
+    if (exp) return (int)exp - 133; // unbiased exponent + 1 (frexpf), then -7.
+    union { uint32_t u; float f; } v = { .u = amax };
+    int e8;
+    frexpf(v.f, &e8);               // Subnormal activations are not expected; stay exact.
+    return e8 - 7;
+}
+
 static int f32_quant_e8(const float *src, uint32_t n)
 {
     uint32_t amax = 0;
@@ -115,13 +139,7 @@ static int f32_quant_e8(const float *src, uint32_t n)
         // Ignore NaNs as the old FP compare did; retain infinity for equivalent overflow.
         if (a <= 0x7f800000u && a > amax) amax = a;
     }
-    if (!amax) return 0;
-    uint32_t exp = amax >> 23;
-    if (exp) return (int)exp - 133; // unbiased exponent + 1 (frexpf), then -7.
-    union { uint32_t u; float f; } v = { .u = amax };
-    int e8;
-    frexpf(v.f, &e8);               // Subnormal activations are not expected; stay exact.
-    return e8 - 7;
+    return f32_e8_from_amax_bits(amax);
 }
 
 // Scratchpad layout (byte offsets) - resident-BFP regions (int16 mantissas + firmware-
@@ -492,22 +510,29 @@ static void matvec_engine_rows(const struct bons_entry *e, uint32_t row0, uint32
     engine_run(&op);
 }
 
-static const volatile int32_t *stage_i32_results(uint32_t sp_src, uint32_t count,
-                                                  int dma_result)
+static const volatile int32_t *stage_i32_results_to(uint32_t sp_src, uint32_t count,
+                                                     int dma_result, int32_t *stage)
 {
     const volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + sp_src);
 #if defined(BONSAI_HAS_KVSTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE)
     if (dma_result) {
-        uint32_t eng_addr = (uint32_t)((uintptr_t)i32_stage - MAIN_RAM_BASE
+        uint32_t eng_addr = (uint32_t)((uintptr_t)stage - MAIN_RAM_BASE
                                       + BONSAI_MEM_CPU_OFFSET);
         engine_store(0, eng_addr, (count*4 + 31)/32, sp_src);
-        invd_cpu_dcache_range(i32_stage, count*4);
-        y = i32_stage;
+        invd_cpu_dcache_range(stage, count*4);
+        y = stage;
     }
 #else
     (void)dma_result;
+    (void)stage;
 #endif
     return y;
+}
+
+static const volatile int32_t *stage_i32_results(uint32_t sp_src, uint32_t count,
+                                                  int dma_result)
+{
+    return stage_i32_results_to(sp_src, count, dma_result, i32_stage);
 }
 
 // Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
@@ -559,7 +584,14 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
 // power-of-two scale, engine, float results in row order - chunked so the int32 results
 // stay inside SP_Y..SP_H (96 KB) whatever the row count (the 27B's LM head is 15,520 rows
 // per channel).
-static float *rot_scratch;   // (SP_H - SP_Y)/4 floats, allocated on first use.
+static float *rot_scratch;   // (SP_H - SP_Y)/4 floats/ints, allocated on first use.
+static void ensure_float_matvec_scratch(void)
+{
+    if (!rot_scratch) {
+        rot_scratch = halloc((SP_H - SP_Y));
+        i32_stage   = halloc((SP_H - SP_Y));
+    }
+}
 static void matvec_f_one(const struct bons_entry *e, float xs, float *dst, int32_t *acc,
                          int acc_add)
 {
@@ -614,23 +646,150 @@ int infer_quantize_f(const float *src, uint32_t n)
     return quantize_f_pow2(src, n, SP_X);
 }
 
+// Fused Prism rotation boundary ---------------------------------------------------------------
+//
+// The hybrid path used to materialise every Hadamard block as FP32 in main RAM, scan the
+// concatenated vector for its Q8 exponent, then read it all again to feed the immediately
+// following projection.  A rotation result is an int32 engine value times a power of two;
+// retain those integers in the cacheable DMA buffer and remember the exponent per block.
+// The global exponent comes from the engine's exact absmax, and packing combines the two
+// power-of-two scales around the same RV32F conversion.  Thus the Q8 bytes are identical,
+// while the intermediate float write, float scan and float reload disappear.
+#define ROT_BLOCK_MAX 64
+static int rot_block_e[ROT_BLOCK_MAX];
+static int rot_stage_width, rot_stage_block, rot_stage_e8;
+
+static void pack_rotated_range(uint32_t c0, uint32_t n, uint32_t sp_dst)
+{
+    const int32_t *raw = (const int32_t *)rot_scratch;
+    volatile uint32_t *x = (volatile uint32_t *)(SCRATCHPAD_BASE + sp_dst);
+    uint32_t end = c0 + n, out = 0;
+    for (uint32_t i = c0; i < end;) {
+        uint32_t b = i/(uint32_t)rot_stage_block;
+        uint32_t bend = (b + 1u)*(uint32_t)rot_stage_block;
+        if (bend > end) bend = end;
+        float is = ldexpf(1.0f, rot_block_e[b] - rot_stage_e8);
+        for (; i < bend; i += 4)
+            x[out++] = i32_pack_q8x4(raw + i, is);
+    }
+}
+
+int infer_rotate_quantize_f(const float *src, uint32_t width)
+{
+#if !defined(BONSAI_HAS_KVSTORE) || !defined(HAS_INVD_CPU_DCACHE_RANGE)
+    (void)src;
+    (void)width;
+    return INFER_ROTATE_UNSUPPORTED;
+#else
+    ensure_float_matvec_scratch();
+    int B = H->hadamard_block, wi = -1;
+    for (int i = 0; i < 4; i++)
+        if (H->hadamard_widths[i] == width) wi = i;
+    if (!B || wi < 0 || width % (uint32_t)B || B % n_ch ||
+        width/(uint32_t)B > ROT_BLOCK_MAX || width*4u > (SP_H - SP_Y)) {
+        printf("hybrid: unsupported fused rotation width %lu block %d\n",
+               (unsigned long)width, B);
+        return INFER_ROTATE_UNSUPPORTED;
+    }
+
+    rot_stage_width = (int)width;
+    rot_stage_block = B;
+    uint32_t max_bits = 0;
+    int32_t *raw = (int32_t *)rot_scratch;
+    for (uint32_t b = 0; b < width/(uint32_t)B; b++) {
+        const struct bons_entry *re = model_entry(ROLE_HADAMARD, HADAMARD_LAYER(wi, b));
+        int xe = quantize_f_pow2(src + b*(uint32_t)B, B, SP_X);
+        matvec_engine_rows(re, 0, B/n_ch, SP_Y);
+#ifdef CSR_ENGINE_CSR_ABSMAX_ADDR
+        uint32_t amax = engine_csr_absmax_read();
+#else
+        uint32_t amax = 0;
+#endif
+        perf_enter(OP_NORM_I32);
+        const volatile int32_t *y = stage_i32_results_to(
+            SP_Y, B, 1, raw + b*(uint32_t)B);
+#ifndef CSR_ENGINE_CSR_ABSMAX_ADDR
+        for (int i = 0; i < B; i++) {
+            int64_t v = y[i];
+            uint32_t a = (uint32_t)(v < 0 ? -v : v);
+            if (a > amax) amax = a;
+        }
+#else
+        (void)y;
+#endif
+        perf_exit(OP_NORM_I32);
+        int oe = xe + (int)re->rshift - (int)re->bias;
+        rot_block_e[b] = oe;
+        float mf = (float)amax*ldexpf(1.0f, oe);
+        uint32_t bits = f32_abs_bits(mf);
+        if (bits <= 0x7f800000u && bits > max_bits) max_bits = bits;
+    }
+    rot_stage_e8 = f32_e8_from_amax_bits(max_bits);
+    if (width <= SP_Y - SP_X) {
+        perf_enter(OP_QUANT8);
+        pack_rotated_range(0, width, SP_X);
+        perf_exit(OP_QUANT8);
+    }
+    return rot_stage_e8;
+#endif
+}
+
+void infer_matvec_f_rotated_quantized(const struct bons_entry *e, int e8, float *dst)
+{
+    ensure_float_matvec_scratch();
+    uint32_t cols = infer_matvec_cols(e);
+    if (cols <= SP_Y - SP_X) {
+        infer_matvec_f_quantized(e, e8, dst);
+        return;
+    }
+    if (!(e->flags & FLAG_KSEG) || cols != (uint32_t)rot_stage_width ||
+        e8 != rot_stage_e8 || (uint64_t)e->rows*4 > (SP_H - SP_YU)) {
+        printf("hybrid: unsupported fused wide projection K%lu R%lu\n",
+               (unsigned long)cols, (unsigned long)e->rows);
+        return;
+    }
+
+    int nseg = model_entry_nkseg(e);
+    uint32_t c0 = 0;
+    for (int k = 0; k < nseg; k++) {
+        const struct bons_entry *seg = model_entry_kseg(e, k);
+        perf_enter(OP_QUANT8);
+        pack_rotated_range(c0, seg->cols, SP_X);
+        perf_exit(OP_QUANT8);
+        matvec_engine_rows(seg, 0, seg->rows/n_ch, k ? SP_YU : SP_Y);
+        if (k) {
+            perf_enter(OP_NORM_I32);
+            int32_t a[4] = {SP_Y, SP_YU, SP_Y, (int32_t)((e->rows + 7)/8)};
+            vec_run(PROG_REDUCE_ACC, a, 4);
+            perf_exit(OP_NORM_I32);
+        }
+        c0 += seg->cols;
+    }
+    perf_enter(OP_NORM_I32);
+    const volatile int32_t *y = stage_i32_results(SP_Y, e->rows, 1);
+    float sc = ldexpf(1.0f, e8 + (int)e->rshift - (int)e->bias);
+    uint32_t i = 0;
+    for (; i + 3 < e->rows; i += 4) {
+        float f0 = (float)y[i + 0], f1 = (float)y[i + 1];
+        float f2 = (float)y[i + 2], f3 = (float)y[i + 3];
+        dst[i + 0] = f0*sc; dst[i + 1] = f1*sc;
+        dst[i + 2] = f2*sc; dst[i + 3] = f3*sc;
+    }
+    for (; i < e->rows; i++) dst[i] = (float)y[i]*sc;
+    perf_exit(OP_NORM_I32);
+}
+
 void infer_matvec_f_quantized(const struct bons_entry *e, int e8, float *dst)
 {
     // SP_X is read-only to the engine, so consecutive non-K-segment projections with the
     // same input can reuse its exact bytes and exponent.  hybrid.c is the only caller.
-    if (!rot_scratch) {
-        rot_scratch = halloc((SP_H - SP_Y));
-        i32_stage   = halloc((SP_H - SP_Y));
-    }
+    ensure_float_matvec_scratch();
     matvec_f_one(e, ldexpf(1.0f, e8), dst, 0, 0);
 }
 
 void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
 {
-    if (!rot_scratch) {
-        rot_scratch = halloc((SP_H - SP_Y));
-        i32_stage   = halloc((SP_H - SP_Y));
-    }
+    ensure_float_matvec_scratch();
     if (!(e->flags & FLAG_KSEG)) {
         int e8 = quantize_f_pow2(src, e->cols, SP_X);
         matvec_f_one(e, ldexpf(1.0f, e8), dst, 0, 0);

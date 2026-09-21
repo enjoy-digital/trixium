@@ -290,12 +290,11 @@ static float *fetch_f32(const struct bons_entry *e)
     return dst;
 }
 
-// The rotation: x' = R (s * x) per block - one engine matvec per block tensor.
-static void rotate_f(const float *src, float *dst, int width)
+// Portable fallback for targets without scratchpad STORE + cache invalidation.  The XCU1525
+// uses the fused path below; keeping this implementation preserves every other hybrid target.
+static void rotate_f_legacy(const float *src, float *dst, int width)
 {
-    int B = H->hadamard_block;
-    if (!B) { memcpy(dst, src, (size_t)width*sizeof(float)); return; }
-    int wi = -1;
+    int B = H->hadamard_block, wi = -1;
     for (int i = 0; i < 4; i++) if ((int)H->hadamard_widths[i] == width) wi = i;
     if (wi < 0) { printf("hybrid: no rotation for width %d\n", width); return; }
     for (int b = 0; b < width/B; b++) {
@@ -304,12 +303,26 @@ static void rotate_f(const float *src, float *dst, int width)
     }
 }
 
+static int rotate_quantize_f(const float *src, int width)
+{
+    int e8 = infer_rotate_quantize_f(src, (uint32_t)width);
+    if (e8 != INFER_ROTATE_UNSUPPORTED) return e8;
+    rotate_f_legacy(src, rot, width);
+    return infer_quantize_f(rot, (uint32_t)width);
+}
+
 // A projection with a folded weight: rotate the input, then the matvec.
 static void proj_f(const struct bons_entry *e, const float *src, float *dst)
 {
     if (H->hadamard_block) {
-        rotate_f(src, rot, infer_matvec_cols(e));   // The whole width, K-segments included.
-        infer_matvec_f(e, rot, dst);
+        uint32_t width = infer_matvec_cols(e);      // The whole width, K-segments included.
+        int e8 = infer_rotate_quantize_f(src, width);
+        if (e8 != INFER_ROTATE_UNSUPPORTED) {
+            infer_matvec_f_rotated_quantized(e, e8, dst);
+        } else {
+            rotate_f_legacy(src, rot, (int)width);
+            infer_matvec_f(e, rot, dst);
+        }
     } else {
         infer_matvec_f(e, src, dst);
     }
@@ -615,15 +628,14 @@ static void deltanet_layer(int l, const float *h, float *out)
     float *win  = dn_conv + (uint64_t)s*(conv_k - 1)*C;
 
     uint64_t t0 = perf_now64();
-    const float *folded = h;
+    int e8;
     if (H->hadamard_block) {
-        // Both folded projections consume the same input basis.  proj_f used to repeat
-        // this five-block rotation for each tensor even though infer_matvec_f leaves rot
-        // untouched (48 redundant full-width rotations per 27B forward).
-        rotate_f(h, rot, n_embd);
-        folded = rot;
+        // Both folded projections consume the same input basis.  Rotate and quantize once;
+        // the exact Q8 bytes remain resident in SP_X for both engine projections.
+        e8 = rotate_quantize_f(h, n_embd);
+    } else {
+        e8 = infer_quantize_f(h, n_embd);
     }
-    int e8 = infer_quantize_f(folded, n_embd);
     infer_matvec_f_quantized(model_entry(ROLE_ATTN_QKV, l), e8, qkv);
     infer_matvec_f_quantized(model_entry(ROLE_ATTN_ZGATE, l), e8, zb);
     e8 = infer_quantize_f(h, n_embd);                           // beta/alpha are not folded
@@ -762,14 +774,14 @@ static void attention_layer(int l, const float *h, float *out)
     int a = attn_slot[l];
     float *K = kc + (uint64_t)a*ctx_cap*kv_dim, *V = vc + (uint64_t)a*ctx_cap*kv_dim;
     int gated = H->attn_gated;
-    const float *pin = h;
+    int e8;
     if (H->hadamard_block) {
         // Q/K/V share the input and folded basis: rotate once, not once per projection.
         // This removes another 32 full-width rotations per 27B forward.
-        rotate_f(h, rot, n_embd);
-        pin = rot;
+        e8 = rotate_quantize_f(h, n_embd);
+    } else {
+        e8 = infer_quantize_f(h, n_embd);
     }
-    int e8 = infer_quantize_f(pin, n_embd);
     infer_matvec_f_quantized(model_entry(ROLE_ATTN_Q, l), e8, gated ? qfull : qb);
     infer_matvec_f_quantized(model_entry(ROLE_ATTN_K, l), e8, kb);
     infer_matvec_f_quantized(model_entry(ROLE_ATTN_V, l), e8, vb);
@@ -856,10 +868,13 @@ int hybrid_forward(int token, int want_logits)
         hyb_cyc_resid += perf_now64() - t0;
         t0 = perf_now64();
         rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
-        if (H->hadamard_block) rotate_f(hb, rot, n_embd); else memcpy(rot, hb, (size_t)n_embd*4);
+        int e8;
+        if (H->hadamard_block)
+            e8 = rotate_quantize_f(hb, n_embd);
+        else
+            e8 = infer_quantize_f(hb, n_embd);
         hyb_cyc_fprep += perf_now64() - t0;
         t0 = perf_now64();
-        int e8 = infer_quantize_f(rot, n_embd);
         infer_matvec_f_quantized(model_entry(ROLE_FFN_GATE, l), e8, gateb);
         infer_matvec_f_quantized(model_entry(ROLE_FFN_UP, l), e8, upb);
         hyb_cyc_fproj += perf_now64() - t0;
