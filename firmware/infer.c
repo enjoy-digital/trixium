@@ -40,6 +40,7 @@ static COLD void cold_path(void) { __asm__ volatile("" ::: "memory"); }
 #include "perf.h"
 #include "vec.h"
 #include "seq.h"
+#include "progs.h"
 
 // newlib-libm compatibility: the toolchain libm.a references __errno, absent from the
 // picolibc environment LiteX links against.
@@ -472,11 +473,8 @@ static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
 // cannot discard dirty data.  Targets without STORE + Zicbom keep the direct SP path.
 static int32_t *i32_stage;
 
-// Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
-// scaled by xscale) into dst[gathered global order: chan*rows + row]. With `acc` the int32
-// results are added into acc[] instead (a K-segment of a wide matvec; the caller scales).
-COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t rows,
-                          float xscale, float *dst, int32_t *acc, int acc_add, int dma_result)
+static void matvec_engine_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows,
+                               uint32_t sp_dst)
 {
     uint32_t rb = bons_row_beats(e->cols, e->kind, e->group);
     struct engine_op op = {0};
@@ -490,23 +488,39 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
     op.bias   = e->bias;
     op.rshift = e->rshift;
     op.xsrc   = SP_X;
-    op.dst    = SP_Y;
+    op.dst    = sp_dst;
     engine_run(&op);
+}
 
-    perf_enter(OP_NORM_I32);
-    uint32_t count = rows*n_ch;
-    const volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
+static const volatile int32_t *stage_i32_results(uint32_t sp_src, uint32_t count,
+                                                  int dma_result)
+{
+    const volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + sp_src);
 #if defined(BONSAI_HAS_KVSTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE)
     if (dma_result) {
         uint32_t eng_addr = (uint32_t)((uintptr_t)i32_stage - MAIN_RAM_BASE
                                       + BONSAI_MEM_CPU_OFFSET);
-        engine_store(0, eng_addr, (count*4 + 31)/32, SP_Y);
+        engine_store(0, eng_addr, (count*4 + 31)/32, sp_src);
         invd_cpu_dcache_range(i32_stage, count*4);
         y = i32_stage;
     }
 #else
     (void)dma_result;
 #endif
+    return y;
+}
+
+// Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
+// scaled by xscale) into dst[gathered global order: chan*rows + row]. With `acc` the int32
+// results are added into acc[] instead (a K-segment of a wide matvec; the caller scales).
+COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t rows,
+                          float xscale, float *dst, int32_t *acc, int acc_add, int dma_result)
+{
+    matvec_engine_rows(e, row0, rows, SP_Y);
+
+    perf_enter(OP_NORM_I32);
+    uint32_t count = rows*n_ch;
+    const volatile int32_t *y = stage_i32_results(SP_Y, count, dma_result);
     if (acc) {
         if (acc != (const int32_t *)y || acc_add) {
             uint32_t i = 0;
@@ -639,6 +653,44 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
     int e8 = f32_quant_e8(src, cols);
     float is = ldexpf(1.0f, -e8);
     uint32_t c0 = 0;
+#ifdef CSR_VECUNIT_BASE
+    // The 27B's two FFN-down segments each produce one 20 KiB int32 vector.  Keep both
+    // inside the two scratchpad result banks, add later segments into the first with the
+    // existing 8-lane vector program, then DMA/convert only the final sum.  This removes
+    // one controller-0 STORE plus both CPU-side accumulator passes per layer.  Wider result
+    // tensors retain the generic main-RAM accumulator below.
+    if ((uint64_t)e->rows*4 <= (SP_H - SP_YU)) {
+        for (int k = 0; k < nseg; k++) {
+            const struct bons_entry *seg = model_entry_kseg(e, k);
+            perf_enter(OP_QUANT8);
+            volatile uint32_t *x = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_X);
+            for (uint32_t i = 0; i < seg->cols; i += 4)
+                x[i/4] = f32_pack_q8x4(src + c0 + i, is);
+            perf_exit(OP_QUANT8);
+            matvec_engine_rows(seg, 0, seg->rows/n_ch, k ? SP_YU : SP_Y);
+            if (k) {
+                perf_enter(OP_NORM_I32);
+                int32_t a[4] = {SP_Y, SP_YU, SP_Y, (int32_t)((e->rows + 7)/8)};
+                vec_run(PROG_REDUCE_ACC, a, 4);
+                perf_exit(OP_NORM_I32);
+            }
+            c0 += seg->cols;
+        }
+        perf_enter(OP_NORM_I32);
+        const volatile int32_t *y = stage_i32_results(SP_Y, e->rows, 1);
+        float sc = ldexpf(1.0f, e8 + (int)e->rshift - (int)e->bias);
+        uint32_t i = 0;
+        for (; i + 3 < e->rows; i += 4) {
+            float f0 = (float)y[i + 0], f1 = (float)y[i + 1];
+            float f2 = (float)y[i + 2], f3 = (float)y[i + 3];
+            dst[i + 0] = f0*sc; dst[i + 1] = f1*sc;
+            dst[i + 2] = f2*sc; dst[i + 3] = f3*sc;
+        }
+        for (; i < e->rows; i++) dst[i] = (float)y[i]*sc;
+        perf_exit(OP_NORM_I32);
+        return;
+    }
+#endif
     for (int k = 0; k < nseg; k++) {
         const struct bons_entry *seg = model_entry_kseg(e, k);
         // The old path wrote the whole quantised vector to kseg_x8, read it back to copy
@@ -808,8 +860,6 @@ COLD static void rope_apply(float *vec, int n_heads_v, int pos)
 }
 
 #ifdef CSR_VECUNIT_BASE
-#include "progs.h"
-
 // Score padding granule: softmax8's x2 unroll (ISA rev 2 microcode) walks two 16-entry
 // blocks per iteration and has no odd-tail form, so scores are padded to a 32-multiple
 // with INT32_MIN there (those entries emit p8 = 0 - the sum and the AXPY do not change).
