@@ -177,7 +177,7 @@ class BonsaiXCU1525SoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
                  ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
-                 port_width=512,
+                 port_width=512, with_memory_traffic=False,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -315,6 +315,10 @@ class BonsaiXCU1525SoC(SoCCore):
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew)
             add_bonsai_cluster(self, engine_axis, config)
+            if with_memory_traffic:
+                from trixium.gateware.traffic import add_memory_traffic
+                add_memory_traffic(self, engine_axis,
+                    [core.controller.interface for core in self.sdrams])
             add_cluster_constraints(platform, with_vecunit=with_vecunit)
             if cluster_with_dnrec:
                 # Vendor implementations are target-owned, not portable-core sources.
@@ -361,6 +365,7 @@ def main():
     parser.add_target_argument("--chan-skew",       default=0x8000, type=lambda x: int(x, 0), help="Extra per-channel offset inside a controller so the windows start in different DDR4 bank groups (default 32 KB; 0 = none).")
     parser.add_target_argument("--port-width",      default=512, type=int, help="Crossbar port width per engine channel: 512 (LiteX AXIUpConverter, default) or 256 (LiteDRAM's native up-converter).")
     parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
+    parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent AXI/controller traffic counters (new CSR bank).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
 
@@ -376,6 +381,7 @@ def main():
         chan_stride     = args.chan_stride,
         chan_skew       = args.chan_skew,
         port_width      = args.port_width,
+        with_memory_traffic = args.with_memory_traffic,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates

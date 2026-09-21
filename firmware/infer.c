@@ -23,6 +23,7 @@
 #include "hybrid.h"
 #include "model.h"
 #include "infer.h"
+#include "static_memory.h"
 
 // Code layout only (2026-09-08): the per-layer hot path is ~28 KB of text against a 32 KB
 // I$ with no L2 behind it (a miss is a ~150-cycle HBM round trip), and tprof showed the
@@ -2067,10 +2068,13 @@ static void seq_build_attn(void)
 // FFN block on whichever path ran, plus one layer's fine-grained trace per forward
 // (layer 0): descriptor timestamps for the list path, step timestamps for the op path.
 int fprof_use = 0;
-static uint64_t fprof_acc_list[4], fprof_acc_ops[4];
+static uint64_t *const fprof_acc_list = (uint64_t *)(BONSAI_FPROF_BUFFER_ADDR);
+static uint64_t *const fprof_acc_ops = (uint64_t *)(BONSAI_FPROF_BUFFER_ADDR + 32);
 static uint32_t fprof_nlist, fprof_nops;
-static uint32_t fprof_ts[16]; static int fprof_nts;
-static uint32_t fprof_steps[8]; static int fprof_nsteps;
+static uint32_t *const fprof_ts = (uint32_t *)(BONSAI_FPROF_BUFFER_ADDR + 64);
+static int fprof_nts;
+static uint32_t *const fprof_steps = (uint32_t *)(BONSAI_FPROF_BUFFER_ADDR + 128);
+static int fprof_nsteps;
 void fprof_reset(void)
 {
     for (int i = 0; i < 4; i++) fprof_acc_list[i] = fprof_acc_ops[i] = 0;
@@ -3835,7 +3839,7 @@ attn_scores: ;
                 if (!attn_prepatched)
                     attn_patch_slots(l, 0, n_head, 0);
                 attn_prepatched = 0;
-                static uint32_t ats[192];
+                uint32_t *const ats = (uint32_t *)BONSAI_ATRACE_BUFFER_ADDR;
                 int an = seq_run_trace((uint32_t)seq_attn_base,
                                        (uint32_t)attn_list_len(n_head), ats, 192);
                 printf("ATRACE %d marks (deltas):", an);

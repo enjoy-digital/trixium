@@ -132,6 +132,7 @@ def test_engine_port_path_through_the_controller(port_width, base_skew):
 
     class _CtrlDUT(Module):
         def __init__(self):
+            from trixium.gateware.traffic import BonsaiAXITraffic, BonsaiLiteDRAMTraffic
             module = _SimDDR4(int(100e6), "1:4")
             self.submodules.phy  = SDRAMPHYModel(module=module, data_width=64,
                                                  clk_freq=int(100e6), init=[])
@@ -139,8 +140,13 @@ def test_engine_port_path_through_the_controller(port_width, base_skew):
                                                 timing_settings=module.timing_settings,
                                                 clk_freq=int(100e6))
             self.axis, self.readers, self.writers = [], [], []
+            self.monitors = []
+            self.submodules.payload = BonsaiLiteDRAMTraffic(self.core.controller.interface)
             for i in range(2):
                 axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
+                monitor = BonsaiAXITraffic(axi, index=i)
+                setattr(self.submodules, f'traffic{i}', monitor)
+                self.monitors.append(monitor)
                 for j, m in enumerate(_engine_port(self.core, axi, port_width)):
                     setattr(self.submodules, f"glue{i}_{j}", m)
                 rd = BonsaiAXIReader(axi); wr = BonsaiAXIWriter(axi)
@@ -155,6 +161,7 @@ def test_engine_port_path_through_the_controller(port_width, base_skew):
     payloads = [rng.integers(0, 256, 32*n_beats, dtype=np.uint8).tobytes() for _ in range(2)]
     bases = [0x0A0_0000 + base_skew, 0x0A0_0000 + 0x20_0000 + base_skew]   # Two channels' test addresses.
     got = [[], []]
+    finished = [False, False]
 
     def port_driver(i):
         wr, rd = dut.writers[i], dut.readers[i]
@@ -194,13 +201,31 @@ def test_engine_port_path_through_the_controller(port_width, base_skew):
             yield
         assert len(got[i]) == n_beats, f"port {i}: {len(got[i])} of {n_beats} beats read back"
         assert got[i] == words, f"port {i}: read data differs"
+        finished[i] = True
+
+    def verify_traffic():
+        while not all(finished):
+            yield
+        for _ in range(8):
+            yield  # Event-register latency and final bus response.
+        for monitor in dut.monitors:
+            assert (yield monitor.counters[0]) == n_beats*32
+            assert (yield monitor.counters[1]) == n_beats*32
+            assert (yield monitor.counters[4]) == 0
+        # The unmerged 512-bit bridge rereads both halves separately. Merged
+        # unaligned 16-beat bursts each span 9 words instead of 8.
+        reads_per_port = (n_beats if port_width == 512 else
+                          n_beats//2 + (n_beats//16 if base_skew else 0))
+        writes_per_port = n_beats//2 if port_width == 256 else n_beats
+        assert (yield dut.payload.counters[0]) == 2*reads_per_port*64
+        assert (yield dut.payload.counters[1]) == 2*writes_per_port*64
 
     def control():
         # As after sdram_init(): DFI to the hardware controller, clocks enabled.
         yield dut.core.dfii._control.storage.eq(0b1111)
         yield
 
-    run_simulation(dut, [control(), port_driver(0), port_driver(1)])
+    run_simulation(dut, [control(), port_driver(0), port_driver(1), verify_traffic()])
 
 
 @pytest.mark.parametrize("port_width", [256, 512, "512m"])

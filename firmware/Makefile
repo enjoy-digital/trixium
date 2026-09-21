@@ -25,7 +25,7 @@ CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
 # GCC contracts a*b+c into fmadd by default once the F extension is in -march.
 CFLAGS += -ffp-contract=off
 
-OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o hybrid.o
+OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o traffic.o ops.o vec.o seq.o ddr.o hybrid.o
 
 
 # Objects are tree-specific: the generated CSR map differs between BUILD_DIRs, so an object

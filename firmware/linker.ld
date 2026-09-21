@@ -108,6 +108,7 @@ SECTIONS
  * the one firmware built with its stack there coincided with back-to-back host crashes.
  * Check after adding statics:  riscv64-unknown-elf-nm bonsai.elf | grep -E "_ebss|_fstack" */
 PROVIDE(_fstack = ORIGIN(sram) + LENGTH(sram));
+ASSERT(_fstack - _ebss >= 4096, "firmware must leave at least 4 KiB of SRAM for stack")
 
 PROVIDE(_fdata_rom = LOADADDR(.data));
 PROVIDE(_edata_rom = LOADADDR(.data) + SIZEOF(.data));

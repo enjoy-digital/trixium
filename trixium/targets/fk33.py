@@ -59,6 +59,7 @@ class _CRG(LiteXModule):
 class BonsaiSoC(SoCCore):
     def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
                  with_nvme=False, with_vecunit=False, with_dual=False, hbm_tck=900,
+                 with_memory_traffic=False,
                  **kwargs):
         # Phase-2 exploration flags (see docs/phase2.md).
         if with_nvme:
@@ -155,6 +156,9 @@ class BonsaiSoC(SoCCore):
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew)
             add_bonsai_cluster(self, engine_axis, config)
+            if with_memory_traffic:
+                from trixium.gateware.traffic import add_memory_traffic
+                add_memory_traffic(self, engine_axis)
             add_cluster_constraints(platform, with_vecunit=with_vecunit)
             if cluster_with_dnrec:
                 # Vendor implementations are target-owned, not portable-core sources.
@@ -203,6 +207,7 @@ def main():
     parser.add_target_argument("--with-nvme",    action="store_true",       help="Phase-2: standalone NVMe weight loading (LiteNVMe root, no host PCIe) - not implemented yet.")
     parser.add_target_argument("--hbm-tck",      default=900, type=int, choices=[800, 900], help="HBM stack clock MHz: 900 (AXI 225-450) or 800 (AXI 200-400, -11%% bandwidth).")
     parser.add_target_argument("--with-dual",    action="store_true",       help="Phase-2: dual-Q GQA + speculative pair-verify datapath (~2x engine area; needs headroom).")
+    parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent accelerator AXI counters (not physical HBM traffic).")
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
 
@@ -231,6 +236,7 @@ def main():
         with_nvme       = args.with_nvme,
         with_vecunit    = args.with_vecunit,
         with_dual       = args.with_dual,
+        with_memory_traffic = args.with_memory_traffic,
         hbm_tck         = args.hbm_tck,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,

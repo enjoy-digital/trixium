@@ -74,7 +74,7 @@ DDR4_SIM_CSR_STRIDE  = 0x1000
 class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
                  dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra="",
-                 mem="hbm", n_memctrl=4, update_repo="no"):
+                 mem="hbm", n_memctrl=4, update_repo="no", with_memory_traffic=False):
         assert mem in ("hbm", "ddr4")
         platform = Platform()
         self.comb += platform.trace.eq(1)
@@ -182,6 +182,11 @@ class BonsaiSimSoC(SoCCore):
             with_vecunit=True, with_dual=dual, with_sp_csr=False,
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
             chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0))
+        if with_memory_traffic:
+            from trixium.gateware.traffic import add_memory_traffic
+            controllers = [getattr(self, 'sdram' + (str(i) if i else '')).controller.interface
+                           for i in range(n_memctrl)] if mem == 'ddr4' else []
+            add_memory_traffic(self, axis, controllers)
         self.comb += [
             self._prof_pads.eng_busy.eq(self.engine.busy),
             self._prof_pads.vec_busy.eq(self.vecunit.busy),
@@ -313,6 +318,7 @@ def main():
              "controllers, main_ram on controller 0, chan_mod channels per controller; "
              "builds in build/sim_ddr4 (the firmware must be built against that tree).")
     parser.add_argument("--n-memctrl",      default=4, type=int, help="--mem ddr4: controllers.")
+    parser.add_argument("--with-memory-traffic", action="store_true", help="Enable coherent memory traffic counters.")
     args = parser.parse_args()
     out_dir = "build/sim" if args.mem == "hbm" else "build/sim_ddr4"
 
@@ -323,7 +329,8 @@ def main():
         soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
-            mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo)
+            mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
+            with_memory_traffic=args.with_memory_traffic)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -332,7 +339,8 @@ def main():
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=args.dual,
         cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
-        mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo)
+        mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
+        with_memory_traffic=args.with_memory_traffic)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the

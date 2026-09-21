@@ -50,6 +50,7 @@ _Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "d
 #include "seq.h"
 #include "vec.h"
 #include "progs.h"
+#include "static_memory.h"
 
 /*-----------------------------------------------------------------------*/
 /* Console                                                               */
@@ -58,7 +59,7 @@ _Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "d
 static char *readstr(void)
 {
     char c[2];
-    static char s[1024];
+    char *const s = (char *)BONSAI_CONSOLE_LINE_ADDR;
     static int ptr = 0;
 
     if (readchar_nonblock()) {
@@ -79,7 +80,7 @@ static char *readstr(void)
             ptr = 0;
             return s;
         default:
-            if (ptr >= (int)(sizeof(s) - 1))
+            if (ptr >= BONSAI_CONSOLE_LINE_SIZE - 1)
                 break;
             fputs(c, stdout);
             s[ptr] = c[0];
@@ -478,7 +479,7 @@ static void genb_cmd(char *args)
 
 static void gen_cmd(char *args)
 {
-    static int prompt[64];
+    int *const prompt = (int *)BONSAI_CONSOLE_PROMPT_ADDR;
     char *tok = get_token(&args);
     int n = parse_int(tok);
     int np = 0;
