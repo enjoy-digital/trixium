@@ -355,7 +355,7 @@ def main():
     parser.add_argument("--with-memory-traffic", action="store_true", help="Enable coherent memory traffic counters.")
     parser.add_argument("--with-native", action="store_true", help="Enable the experimental shared native projection engine.")
     parser.add_argument("--with-hadamard", action="store_true", help="Enable experimental sequenced scratchpad integer rotations.")
-    parser.add_argument("--with-activation-quantize", action="store_true", help="Enable experimental resident FP32 block/vector quantization.")
+    parser.add_argument("--with-activation-quantize", action="store_true", help="Enable experimental resident FP32 and post-rotation Q8 quantization.")
     parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
     out_dir = "build/sim" if args.mem == "hbm" else "build/sim_ddr4"

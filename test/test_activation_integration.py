@@ -5,11 +5,11 @@ import shutil
 import subprocess
 
 import pytest
-from migen import C, Cat, Signal, run_simulation
+from migen import C, Cat, Memory, Module, Signal, run_simulation
 from migen.fhdl import verilog
 
 from trixium.gateware.integration import BonsaiClusterConfig
-from trixium.model.activation import scratchpad_quantize_descriptor
+from trixium.model.activation import scratchpad_quantize_descriptor, scratchpad_requantize_descriptor
 from test_activation_sp import bits, pack, reference
 from test_hadamard_integration import install_list
 from test_integration import SoC, write
@@ -26,6 +26,14 @@ def test_activation_descriptor_and_configuration():
     for options in ({'with_vecunit': False}, {'scratchpad_size': 512*1024}):
         with pytest.raises(ValueError):
             BonsaiClusterConfig(with_activation_quantize=True, **options)
+    assert scratchpad_requantize_descriptor(src=32, dst=64, exponents=96, maxima=128,
+        result_exponent=160, blocks=17) == [5, 32, 64, 96, 128, 160, 17] + [0]*9
+    for changes in ({'src': 1}, {'dst': -32}, {'exponents': 1 << 24}, {'maxima': 127},
+                    {'result_exponent': 1 << 24}, {'blocks': 0}, {'blocks': 65536}):
+        args = dict(src=32, dst=64, exponents=96, maxima=128, result_exponent=160, blocks=17)
+        args.update(changes)
+        with pytest.raises(ValueError):
+            scratchpad_requantize_descriptor(**args)
 
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
@@ -40,6 +48,53 @@ def test_quantization_only_profile_validates_full_list_before_fetch(base, count)
             assert (yield dut.busy) and (yield dut.activation_quantize_error.status) == 1
             assert not (yield dut.sp_active)
             yield
+    run_simulation(dut, run())
+
+
+@pytest.mark.parametrize('failure', [0, 128])
+def test_requantization_dispatch_without_hadamard_and_completion_publication(failure):
+    from trixium.gateware.sequencer import BonsaiSequencer
+    dut = Module()
+    dut.submodules.seq = seq = BonsaiSequencer(with_activation_quantize=True)
+    words = scratchpad_requantize_descriptor(src=0x10000, dst=0x8000, exponents=0x800,
+        maxima=0x900, result_exponent=0xa00, blocks=17)
+    mem = Memory(256, 2, init=[pack(words[:8], 32), pack(words[8:], 32)])
+    port = mem.get_port()
+    dut.specials += mem, port
+    dut.comb += [port.adr.eq(seq.sp_adr), seq.sp_dat.eq(port.dat_r)]
+    def run():
+        assert (yield seq.activation_quantize_abi.status) == 0x10001
+        yield from write(seq.base, 0)
+        yield from write(seq.count, 1)
+        yield from write(seq.start, 1)
+        cmd = seq.activation_quantize_cmd
+        for _ in range(50):
+            if (yield cmd.valid):
+                break
+            yield
+        else:
+            raise AssertionError('unit 5 did not dispatch without Hadamard')
+        expected_fields = dict(src=0x10000, dst=0x8000, exponents=0x800, maxima=0x900,
+                               result_exponent=0xa00, blocks=17, elements=1024, requantize=1,
+                               protect_start=0, protect_end=64)
+        for _ in range(5):
+            assert (yield cmd.valid) and not (yield seq.status.fields.dcount)
+            for name, value in expected_fields.items():
+                assert (yield getattr(cmd, name)) == value
+            yield
+        yield cmd.ready.eq(1)
+        yield
+        yield cmd.ready.eq(0)
+        for _ in range(5):
+            yield
+            assert (yield seq.busy) and not (yield seq.status.fields.dcount)
+        yield seq.activation_quantize_done.eq(not failure)
+        yield seq.activation_quantize_failed.eq(failure)
+        for _ in range(10):
+            yield
+        assert (yield seq.activation_quantize_error.status) == failure << 8
+        assert (yield seq.status.fields.dcount) == (0 if failure else 1)
+        assert bool((yield seq.busy)) == bool(failure)
     run_simulation(dut, run())
 
 

@@ -408,7 +408,7 @@ def main():
     parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent AXI/controller traffic counters (new CSR bank).")
     parser.add_target_argument("--with-native", action="store_true", help="Experimental shared native PTQ/Q8 engine and append-only controls; not resident runtime qualification.")
     parser.add_target_argument("--with-hadamard", action="store_true", help="Experimental sequenced scratchpad integer rotations; not resident runtime qualification.")
-    parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 block/vector quantization; not resident runtime qualification.")
+    parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 and post-rotation Q8 quantization; not resident runtime qualification.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()

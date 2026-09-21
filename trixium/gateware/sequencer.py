@@ -56,6 +56,9 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           See docs/hadamard-scratchpad.md for bounds, ownership and raw numerics.
   quant:  Optional unit 4, always serialized; w0 exactly 4, w1 FP32 src,
           w2 Q8 dst, w3 exponent array, w4 elements/block, w5 blocks, w6..w15 zero.
+  requant: Unit 5 (quant ABI >=1.1), serialized; w0 exactly 5, w1 raw int32 src,
+           w2 Q8 dst, w3 input exponent array, w4 raw absmax array, w5 result
+           exponent, w6 blocks of 1024, w7..w15 zero. See docs/rotation-requantization.md.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -110,10 +113,11 @@ class BonsaiSequencer(LiteXModule):
             self.activation_quantize_cmd = stream.Endpoint(ACTIVATION_COMMAND)
             self.activation_quantize_done = Signal()
             self.activation_quantize_failed = Signal(8)
-            self.activation_quantize_abi = CSRStatus(32, reset=0x00010000)
+            self.activation_quantize_abi = CSRStatus(32, reset=0x00010001)
             self.activation_quantize_error = CSRStatus(32, description=
                 "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, "
-                "bits8..15 conversion-unit error (bit14 protects descriptor list).")
+                "bits8..15 conversion-unit error (bit14 protects descriptor list; "
+                "bit15 rejects invalid rotation metadata/raw values).")
             extension_errors.append(self.activation_quantize_error)
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
@@ -228,14 +232,19 @@ class BonsaiSequencer(LiteXModule):
             ).Else(NextState("DISPATCH_HAD"))]
         if with_activation_quantize:
             malformed = Signal()
+            requantize = Signal()
             command = self.activation_quantize_cmd
             self.comb += [
-                malformed.eq((w(0, 0) != 4) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
-                    (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) | (w(0, 5)[16:] != 0) |
-                    (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                requantize.eq(w(0, 0)[0:4] == 5),
+                malformed.eq((w(0, 0) != Mux(requantize, 5, 4)) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                    (w(0, 3)[24:] != 0) | (w(0, 7) != 0) | (d1 != 0) |
+                    Mux(requantize, (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) | (w(0, 6)[16:] != 0),
+                        (w(0, 4)[16:] != 0) | (w(0, 5)[16:] != 0) | (w(0, 6) != 0))),
                 command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
-                command.exponents.eq(w(0, 3)[:24]), command.elements.eq(w(0, 4)[:16]),
-                command.blocks.eq(w(0, 5)[:16]), command.protect_start.eq(list_base),
+                command.exponents.eq(w(0, 3)[:24]), command.elements.eq(Mux(requantize, 1024, w(0, 4)[:16])),
+                command.blocks.eq(Mux(requantize, w(0, 6)[:16], w(0, 5)[:16])),
+                command.requantize.eq(requantize), command.maxima.eq(Mux(requantize, w(0, 4)[:24], 0)),
+                command.result_exponent.eq(Mux(requantize, w(0, 5)[:24], 0)), command.protect_start.eq(list_base),
                 command.protect_end.eq(list_end),
             ]
             quant_dispatch = [If(malformed,
@@ -565,6 +574,7 @@ class BonsaiSequencer(LiteXModule):
                 )
             ).Elif(unit == 3, *(had_dispatch if with_hadamard else unknown_unit)
             ).Elif(unit == 4, *(quant_dispatch if with_activation_quantize else unknown_unit)
+            ).Elif(unit == 5, *(quant_dispatch if with_activation_quantize else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:

@@ -233,7 +233,7 @@ def main():
     parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent accelerator AXI counters (not physical HBM traffic).")
     parser.add_target_argument("--with-native", action="store_true", help="Experimental shared native PTQ/Q8 engine and append-only controls; no FK33 deployment qualification.")
     parser.add_target_argument("--with-hadamard", action="store_true", help="Experimental sequenced scratchpad integer rotations; no FK33 deployment qualification.")
-    parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 block/vector quantization; no FK33 deployment qualification.")
+    parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 and post-rotation Q8 quantization; no FK33 deployment qualification.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
