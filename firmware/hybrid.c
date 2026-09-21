@@ -620,10 +620,13 @@ static void deltanet_layer(int l, const float *h, float *out)
     dn_cyc_conv += perf_now64() - t0;
     // q, k (per key head, L2-normalised), v.
     t0 = perf_now64();
-    memcpy(qb, convb, (size_t)nq*4);
-    memcpy(kb, convb + nq, (size_t)nq*4);
-    memcpy(vb, convb + 2*nq, (size_t)nvh*4);
-    for (int hh = 0; hh < nk; hh++) { l2norm_fv(qb + hh*hk, hk); l2norm_fv(kb + hh*hk, hk); }
+    // The convolution output is dead after this layer.  Consume its Q/K/V slices in place
+    // instead of copying all C floats into three work buffers (~6 MiB per 27B forward).
+    float *dn_q = convb, *dn_k = convb + nq, *dn_v = convb + 2*nq;
+    for (int hh = 0; hh < nk; hh++) {
+        l2norm_fv(dn_q + hh*hk, hk);
+        l2norm_fv(dn_k + hh*hk, hk);
+    }
     dn_cyc_prep += perf_now64() - t0;
     // The recurrence per value head (llama.cpp's autoregressive kernel): M = S[hh] rows j.
     float scale = 1.0f/sqrtf((float)hk);
@@ -643,7 +646,7 @@ static void deltanet_layer(int l, const float *h, float *out)
             kh = hh % nk;
             gpos = kh*rep + hh/nk;
         }
-        const float *qh = qb + kh*hk, *kk = kb + kh*hk, *vh = vb + hh*hv;
+        const float *qh = dn_q + kh*hk, *kk = dn_k + kh*hk, *vh = dn_v + hh*hv;
         float *M = dn_hw ? NULL : S + (uint64_t)hh*hv*hk;
         t0 = perf_now64();
         float decay = expf(gb[hh]);
