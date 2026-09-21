@@ -3298,6 +3298,26 @@ static int dbg_armed;
 static char dbg_dump_tag[16];  // `dbgdump <tag> <layer> <pos>`: print that region whole.
 static int  dbg_dump_l, dbg_dump_pos = -1;
 void infer_dbg(int n) { dbg_armed = n; }
+
+static void dbg_typed(const char *tag, int layer, const void *values, uint32_t n,
+                      const char *dtype)
+{
+    if (!dbg_armed) return;
+    // f32/u32 are both four bytes, little-endian on the supported RISC-V targets.
+    // Do not convert floats to integers: +/-zero and exact FP32 rounding matter.
+    const uint8_t *p = values;
+    uint32_t hash = 2166136261u;
+    for (uint32_t i = 0; i < 4*n; i++) hash = (hash ^ p[i])*16777619u;
+    printf("DBG pos=%d l=%d %s dtype=%s n=%lu e=0 %08lx\n", n_pos, layer, tag, dtype,
+           (unsigned long)n, (unsigned long)hash);
+}
+
+void infer_dbg_f32(const char *tag, int layer, const float *values, uint32_t n)
+{
+    _Static_assert(sizeof(float) == 4, "trace ABI requires float32");
+    dbg_typed(tag, layer, values, n, "f32");
+}
+
 void infer_dbg_dump(const char *tag, int l, int pos)
 {
     int i = 0;
@@ -3349,6 +3369,13 @@ static int forward(int token, int want_logits)
     if (hybrid_present()) {          // The 27B's layers: hybrid.c, the CPU path.
         infer_forwards++;
         int t = hybrid_forward(token, want_logits);
+        if (dbg_armed) {
+            if (want_logits) {
+                uint32_t token_bits = (uint32_t)t;
+                dbg_typed("argmax", -1, &token_bits, 1, "u32");
+            }
+            dbg_armed--;
+        }
         n_pos = hybrid_pos();
         return t;
     }

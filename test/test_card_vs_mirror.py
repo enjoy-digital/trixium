@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools.card_vs_mirror import cmd_compare, parse
+from tools.card_vs_mirror import cmd_compare, parse, fnv, format_typed_trace
 
 
 EMBED = "DBG pos=0 l=-1 embed e=-12 1234abcd amax=42 v0..3=1,2,3,4\n"
@@ -53,3 +53,27 @@ def test_parse_reports_line_and_key(tmp_path):
 
 def test_missing_file_fails(tmp_path):
     assert cmd_compare(SimpleNamespace(mirror=tmp_path / "absent", card="", verbose=False)) == 1
+
+
+def test_typed_float_bits_not_integer_cast(tmp_path):
+    import struct
+    line = format_typed_trace(0, 2, "ffn_res", "f32", [0.0, -0.0, 1.25, -2.5]) + "\n"
+    expected = fnv(struct.pack("<ffff", 0.0, -0.0, 1.25, -2.5))
+    assert f"dtype=f32 n=4 e=0 {expected:08x}" in line
+    assert compare(tmp_path, line, line) == 0
+    # Same hash/exponent isn't sufficient: array shape and interpretation are part of ABI.
+    assert compare(tmp_path, line, line.replace("n=4", "n=5")) == 1
+    assert compare(tmp_path, line, line.replace("dtype=f32", "dtype=i32")) == 1
+    assert compare(tmp_path, line, line.replace("dtype=f32 n=4 ", "")) == 1
+    assert compare(tmp_path, line, line.replace("n=4", "n=0")) == 1
+
+
+def test_typed_argmax_hash():
+    import struct
+    line = format_typed_trace(2, -1, "argmax", "u32", [11751])
+    assert line.endswith(f"{fnv(struct.pack('<I', 11751)):08x}")
+
+
+def test_ids_do_not_require_tokenizer():
+    from tools.card_vs_mirror import prompt_ids
+    assert prompt_ids(SimpleNamespace(ids="1 2 3", tokenizer="missing")) == [1, 2, 3]

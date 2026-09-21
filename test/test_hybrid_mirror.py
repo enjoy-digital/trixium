@@ -38,7 +38,8 @@ def _lroundf(x):
     return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
 
 
-def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None, fast_cfg=None):
+def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None, fast_cfg=None,
+                      trace=None):
     """exact=True: fp32 weights and no activation quantization (the golden's arithmetic),
     which tests the mirror's structure against the golden independently of the int8 noise.
     fast=True: the DeltaNet recurrence in the fast path's arithmetic (docs/xcu1525.md) -
@@ -402,29 +403,51 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
             out[hh] = o
         return proj(layout.ROLE_ATTN_OUT, l, out.reshape(-1))
 
-    def forward(tok, pos):
+    def checkpoint(pos, layer, tag, values, dtype="f32"):
+        if trace is not None:
+            trace(pos, layer, tag, dtype, np.asarray(values).copy())
+
+    def forward(tok, pos, want_logits=True):
         x = (mant[tok].astype(f32)*f32(np.exp2(f32(exps[tok])))).astype(f32)
+        checkpoint(pos, -1, "emb", x)
         for l in range(n_layer):
             hn = rmsnorm(x, norm_attn[l])
-            x = (x + (deltanet(l, hn) if dn[l] else attention(l, hn, pos))).astype(f32)
+            checkpoint(pos, l, "attn_norm", hn)
+            y = deltanet(l, hn) if dn[l] else attention(l, hn, pos)
+            checkpoint(pos, l, "dn_out" if dn[l] else "attn_out", y)
+            x = (x + y).astype(f32)
+            checkpoint(pos, l, "attn_res", x)
             hn = rmsnorm(x, norm_ffn[l])
+            checkpoint(pos, l, "ffn_norm", hn)
             r = rotate(hn, n_embd) if B else hn
             gate = matvec_f(entry(layout.ROLE_FFN_GATE, l), r)
             up   = matvec_f(entry(layout.ROLE_FFN_UP, l), r)
+            checkpoint(pos, l, "ffn_gate", gate)
+            checkpoint(pos, l, "ffn_up", up)
             act  = (silu(gate)*up).astype(f32)
-            x = (x + proj(layout.ROLE_FFN_DOWN, l, act)).astype(f32)
+            checkpoint(pos, l, "ffn_act", act)
+            y = proj(layout.ROLE_FFN_DOWN, l, act)
+            checkpoint(pos, l, "ffn_down", y)
+            x = (x + y).astype(f32)
+            checkpoint(pos, l, "ffn_res", x)
+        if not want_logits:
+            return None
         hn = rmsnorm(x, out_norm)
-        head = entry(layout.ROLE_LM_HEAD, 0) or entry(layout.ROLE_TOK_EMB, 0)
+        checkpoint(pos, -1, "out_norm", hn)
         logits = proj(layout.ROLE_LM_HEAD if entry(layout.ROLE_LM_HEAD, 0) else layout.ROLE_TOK_EMB, 0, hn)
-        return int(np.argmax(logits[:h["vocab"]]))
+        checkpoint(pos, -1, "logits", logits[:h["vocab"]])
+        best = int(np.argmax(logits[:h["vocab"]]))
+        checkpoint(pos, -1, "argmax", [best], "u32")
+        return best
 
     out, pos = [], 0
     tok = None
-    for t in prompt:
-        tok = forward(t, pos); pos += 1
-    for _ in range(n_new):
+    for i, t in enumerate(prompt):
+        tok = forward(t, pos, i == len(prompt) - 1); pos += 1
+    for i in range(n_new):
         out.append(tok)
-        tok = forward(tok, pos); pos += 1
+        if i + 1 < n_new:  # Match firmware: no unused forward after the final output.
+            tok = forward(tok, pos); pos += 1
     return out
 
 
@@ -442,7 +465,22 @@ def test_mirror_agrees_with_the_fp32_golden_on_the_tiny_hybrid():
         img_path, _, _ = generate(d, 2, 1234, cfg=cfg)
         img = BONSReader(img_path)
         got = hybrid27_generate(img, [1, 2, 3], 4, exact=True)
-        quant = hybrid27_generate(img, [1, 2, 3], 4)
+        events = []
+        def trace(pos, layer, tag, dtype, values):
+            events.append((pos, layer, tag, dtype, np.asarray(values).size))
+        quant = hybrid27_generate(img, [1, 2, 3], 4, trace=trace)
+        # Match the firmware's contract, including NO logits on early prefill forwards
+        # and NO unused forward after the last output token.
+        assert len(events) == 6*(1 + 9*cfg.n_layer) + 4*3
+        assert sorted({e[0] for e in events}) == list(range(6))
+        assert [(p, n) for p, l, tag, dtype, n in events if tag == "argmax"] == [
+            (p, 1) for p in range(2, 6)]
+        for p in range(6):
+            for l in range(cfg.n_layer):
+                tags = [tag for pos, layer, tag, dtype, n in events if (pos, layer) == (p, l)]
+                assert tags == ["attn_norm", "dn_out" if cfg.layer_type(l) == "deltanet" else "attn_out",
+                                "attn_res", "ffn_norm", "ffn_gate", "ffn_up", "ffn_act",
+                                "ffn_down", "ffn_res"]
     specs = make_tiny_hybrid_tensors(cfg, 1234)
     t = {}
     for s in specs:

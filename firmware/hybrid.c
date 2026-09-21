@@ -852,10 +852,12 @@ int hybrid_forward(int token, int want_logits)
     uint64_t t0 = perf_now64();
     if (infer_embed_f(token, xb) < 0) return -1;
     hyb_cyc_embed += perf_now64() - t0;
+    infer_dbg_f32("emb", -1, xb, n_embd);
     for (int l = 0; l < n_layer; l++) {
         t0 = perf_now64();
         rmsnorm_fv(hb, xb, norm_attn[l], n_embd);
         hyb_cyc_anorm += perf_now64() - t0;
+        infer_dbg_f32("attn_norm", l, hb, n_embd);
         t0 = perf_now64();
         if (dn_slot[l] >= 0) {
             deltanet_layer(l, hb, tmp_h);
@@ -864,11 +866,14 @@ int hybrid_forward(int token, int want_logits)
             attention_layer(l, hb, tmp_h);
             hyb_cyc_attn += perf_now64() - t0;
         }
+        infer_dbg_f32(dn_slot[l] >= 0 ? "dn_out" : "attn_out", l, tmp_h, n_embd);
         t0 = perf_now64();
         add_fv(xb, tmp_h, n_embd);
         hyb_cyc_resid += perf_now64() - t0;
+        infer_dbg_f32("attn_res", l, xb, n_embd);
         t0 = perf_now64();
         rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
+        infer_dbg_f32("ffn_norm", l, hb, n_embd);
         int e8;
         if (H->hadamard_block)
             e8 = rotate_quantize_f(hb, n_embd);
@@ -879,15 +884,20 @@ int hybrid_forward(int token, int want_logits)
         infer_matvec_f_quantized(model_entry(ROLE_FFN_GATE, l), e8, gateb);
         infer_matvec_f_quantized(model_entry(ROLE_FFN_UP, l), e8, upb);
         hyb_cyc_fproj += perf_now64() - t0;
+        infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
+        infer_dbg_f32("ffn_up", l, upb, ffn_dim);
         t0 = perf_now64();
         silu_mul_fv(gateb, upb, gateb, ffn_dim);
         hyb_cyc_fact += perf_now64() - t0;
+        infer_dbg_f32("ffn_act", l, gateb, ffn_dim);
         t0 = perf_now64();
         proj_f(model_entry(ROLE_FFN_DOWN, l), gateb, tmp_h);
         hyb_cyc_fdown += perf_now64() - t0;
+        infer_dbg_f32("ffn_down", l, tmp_h, n_embd);
         t0 = perf_now64();
         add_fv(xb, tmp_h, n_embd);
         hyb_cyc_resid += perf_now64() - t0;
+        infer_dbg_f32("ffn_res", l, xb, n_embd);
     }
     pos++;
     hyb_forwards_profiled++;
@@ -896,9 +906,11 @@ int hybrid_forward(int token, int want_logits)
     const struct bons_entry *on = model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32);
     static float *out_norm; if (!out_norm) out_norm = fetch_f32(on);
     rmsnorm_fv(hb, xb, out_norm, n_embd);
+    infer_dbg_f32("out_norm", -1, hb, n_embd);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head) head = model_entry(ROLE_TOK_EMB, 0);
     proj_f(head, hb, logits);
+    infer_dbg_f32("logits", -1, logits, H->vocab);
     int best = 0; float bv = logits[0];
     for (uint32_t i = 1; i < H->vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = (int)i; }
     hyb_cyc_logits += perf_now64() - t0;
