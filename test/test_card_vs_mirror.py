@@ -21,6 +21,7 @@ def compare(tmp_path, mirror, card):
 
 def test_matching_trace_with_chatter(tmp_path):
     assert compare(tmp_path, EMBED + ARGMAX, "boot chatter\n" + EMBED + ARGMAX) == 0
+    assert compare(tmp_path, EMBED + ARGMAX, "GEN:" + EMBED + " 11751" + ARGMAX) == 0
 
 
 @pytest.mark.parametrize("mirror,card", [
