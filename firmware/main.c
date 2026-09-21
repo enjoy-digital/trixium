@@ -205,19 +205,6 @@ static void hwops_cmd(char *args)
     hwops_print();
 }
 
-static void print_u64_dec(uint64_t v)
-{
-    // LiteX's minimal printf treats %llu as %lu.  Long 27B benchmarks exceed 32 bits,
-    // so format the few 64-bit values here without pulling a larger printf into firmware.
-    char buf[20];
-    int n = 0;
-    do {
-        buf[n++] = '0' + (char)(v % 10);
-        v /= 10;
-    } while (v);
-    while (n) putchar(buf[--n]);
-}
-
 static void bench_cmd(char *args)
 {
     char *tok = get_token(&args);
@@ -233,11 +220,11 @@ static void bench_cmd(char *args)
     puts("");
     perf_print();
     printf("BENCH: %d tokens, ", count);
-    print_u64_dec(dt);
+    perf_print_u64(dt);
     printf(" cycles total");
     if (count > 0) {
         printf(", ");
-        print_u64_dec(dt/count);
+        perf_print_u64(dt/count);
         printf(" cycles/token (%lu.%03lu tok/s @%luMHz)",
                (unsigned long)(((uint64_t)CONFIG_CLOCK_FREQUENCY*count)/dt),
                (unsigned long)((((uint64_t)CONFIG_CLOCK_FREQUENCY*count*1000)/dt) % 1000),
@@ -247,7 +234,7 @@ static void bench_cmd(char *args)
     // running the unused final forward (bench 64 = 3 prompt + 63 = 66 forwards, was 67).
     if (fwd > 0) {
         printf(", %lu forwards, ", (unsigned long)fwd);
-        print_u64_dec(dt/fwd);
+        perf_print_u64(dt/fwd);
         printf(" cycles/fwd");
     }
     puts("");

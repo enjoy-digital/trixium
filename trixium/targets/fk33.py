@@ -216,8 +216,9 @@ class BonsaiSoC(SoCCore):
                 self.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit())
                 self.spmux = BonsaiScratchpadClientMux(vecunit, self.dnunit)
                 sp_client = self.spmux
-                # Packaged Vivado cores need output-product generation before the
-                # top-level synthesis.  add_ip() makes LiteX emit that flow.
+                # Register packaged Vivado cores as IPs, rather than ordinary sources.
+                # LiteX then emits read_ip/generate_target/synth_ip before top-level
+                # synthesis; add_source() leaves the modules unresolved on a clean build.
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
                 self.add_constant("BONSAI_HAS_DNREC")

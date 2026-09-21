@@ -3,7 +3,7 @@
 // Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
 //
-// Per-op cycle profiling on timer0 (free-running down-counter). The whole offload ladder is
+// Per-op cycle profiling on the coherent 64-bit architectural counter. The offload ladder is
 // driven by these numbers: profile -> move the heaviest op to hardware -> re-profile.
 
 #ifndef PERF_H
@@ -26,24 +26,26 @@ enum perf_op {
     OP_SILU_MUL,
     OP_RESID_ADD,
     OP_LMHEAD,      // Chunked LM head scan + argmax.
-    OP_ENGINE_WAIT, // Inside engine_run() polls (also counted within the enclosing op).
+    OP_ENGINE_WAIT, // Engine polling; may overlap op brackets, not always enclosed by one.
     OP_COUNT,
 };
 
 void     perf_init(void);
 void     perf_reset(void);
-uint32_t perf_now(void); // Free-running cycle counter (wraps; deltas are valid).
+uint32_t perf_now(void); // Legacy timer: only intervals shorter than 2^32 cycles are valid.
 uint64_t perf_now64(void); // Architectural cycle/cycleh counter for long benchmarks.
 void     perf_enter(enum perf_op op);
 void     perf_exit(enum perf_op op);
 void     perf_print(void); // Dump per-op {calls, cycles} table + engine counters.
+void     perf_print_u64(uint64_t v); // LiteX printf does not implement %llu.
+void     perf_print_overlap(void);
 void     perf_ovl_mark(void);               // C2-1a: overlap-window start.
-void     perf_ovl_acc(uint32_t acc[4]);     // C2-1a: add window deltas to acc[tot,eng,vec,both].
-void     perf_ovl_report(const char *tag, const uint32_t acc[4]);
+void     perf_ovl_acc(uint64_t acc[4]);     // Zero-init; acc[0] == UINT64_MAX means invalid.
+void     perf_ovl_report(const char *tag, const uint64_t acc[4]);
 
 // Accumulators exposed for bench.
-extern uint32_t perf_cycles[OP_COUNT];
-extern uint32_t perf_calls[OP_COUNT];
+extern uint64_t perf_cycles[OP_COUNT];
+extern uint64_t perf_calls[OP_COUNT];
 
 // tprof: full-token trace. `tprof arm` on the console arms it; the next want_logits
 // forward records events (tag, t, cyc_eng, cyc_vec) until it returns, then disarms.

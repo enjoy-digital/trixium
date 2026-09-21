@@ -86,14 +86,28 @@ class BonsaiEngineCSR(LiteXModule):
         self.perf_ar    = CSRStatus(32, description="AR stall cycles of selected reader.")
         self.perf_r     = CSRStatus(32, description="R stall cycles of selected reader.")
 
-        # Unit-overlap counters (free-running, low 32 bits). Answers the one question that
-        # decides whether a dual-issue sequencer is worth building: how much of a token
-        # already has both units busy, and how much has NEITHER - the latter being pure
-        # serialisation, which is the headroom.
+        # Legacy low-word counters: retain their addresses for existing firmware/tools.
+        # Neither-busy also includes CPU arithmetic, not just serialization/dispatch.
         self.cyc_total  = CSRStatus(32, description="Free-running cycles.")
         self.cyc_eng    = CSRStatus(32, description="Cycles with the engine busy.")
         self.cyc_vec    = CSRStatus(32, description="Cycles with the vector unit busy.")
         self.cyc_both   = CSRStatus(32, description="Cycles with BOTH busy (overlap).")
+
+        # Append-only ABI: one strobe freezes ALL counters on the same sys edge. Reads
+        # of a 64-bit CSR take multiple bus transactions on RV32; do not expose live
+        # high/low words or capture each unit independently. Values remain stable until
+        # the next snapshot; software must serialize access to this shared snapshot bank.
+        self.perf_snapshot = CSRStorage(1, description="Write 1: atomically latch 64-bit overlap counters.")
+        self.snap_total = CSRStatus(64, description="Snapshot: total cycles.")
+        self.snap_eng = CSRStatus(64, description="Snapshot: engine-busy cycles.")
+        self.snap_vec = CSRStatus(64, description="Snapshot: vector/DeltaNet-client busy cycles.")
+        self.snap_both = CSRStatus(64, description="Snapshot: both clients busy.")
+        self.sync += If(self.perf_snapshot.re & self.perf_snapshot.storage,
+            self.snap_total.status.eq(engine.cyc_total),
+            self.snap_eng.status.eq(engine.cyc_eng),
+            self.snap_vec.status.eq(engine.cyc_vec),
+            self.snap_both.status.eq(engine.cyc_both),
+        )
 
         # # #
 

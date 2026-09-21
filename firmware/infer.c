@@ -2067,7 +2067,7 @@ static void seq_build_attn(void)
 // FFN block on whichever path ran, plus one layer's fine-grained trace per forward
 // (layer 0): descriptor timestamps for the list path, step timestamps for the op path.
 int fprof_use = 0;
-static uint32_t fprof_acc_list[4], fprof_acc_ops[4];
+static uint64_t fprof_acc_list[4], fprof_acc_ops[4];
 static uint32_t fprof_nlist, fprof_nops;
 static uint32_t fprof_ts[16]; static int fprof_nts;
 static uint32_t fprof_steps[8]; static int fprof_nsteps;

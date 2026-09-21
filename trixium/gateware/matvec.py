@@ -191,16 +191,17 @@ class BonsaiMatVecEngine(LiteXModule):
         # Overlap counters. The MAC array is idle ~92% of a token and the sequencer runs one
         # descriptor at a time, so the question that decides whether dual-issue is worth
         # building is: how much of the token has BOTH units busy already? Free-running from
-        # reset; the headroom is total - eng - vec + both, i.e. cycles where NEITHER ran,
-        # which is pure serialisation and dispatch.
+        # reset. Neither includes CPU arithmetic and memory stalls as well as dispatch;
+        # it is NOT a prediction of the gain from dual issue. The vector busy input can
+        # include the DeltaNet client through the shared scratchpad mux.
         #
         # Counted here rather than in the CSR front end because the engine already holds a
         # vec_busy_in reference; adding one in csr_front would mean a new integration signal
         # in BOTH SoC definitions, which is exactly the drift the guard test exists to catch.
-        self.cyc_total = Signal(48)
-        self.cyc_eng   = Signal(48)
-        self.cyc_vec   = Signal(48)
-        self.cyc_both  = Signal(48)
+        self.cyc_total = Signal(64)
+        self.cyc_eng   = Signal(64)
+        self.cyc_vec   = Signal(64)
+        self.cyc_both  = Signal(64)
         self.busy      = Signal()      # declared early: the counters below need it
         self.sync += [
             self.cyc_total.eq(self.cyc_total + 1),
