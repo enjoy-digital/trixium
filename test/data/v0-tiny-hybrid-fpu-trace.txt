@@ -2,7 +2,7 @@
 # Image SHA256: c3132a6ac34b860268dc74ee9c241847004b9a1e7470dd007b81c4adc95f2764
 # Firmware SHA256: e299a3f71fc91212faca286b1ff7309112a3d330eac5cf2ca9f58c293fc77737
 # Command: dbg 3; gen 1 1 2 3. SiLU: existing firmware lookup/interpolation implementation.
-# See docs/measurements/v0-2026-09-21.md for scope and the known Python-mirror mismatch.
+# See docs/measurements/v0-2026-09-21.md for scope; the RV32F SiLU mirror now matches all points.
 DBG pos=0 l=-1 emb dtype=f32 n=256 e=0 86dc3c3a
 DBG pos=0 l=0 attn_norm dtype=f32 n=256 e=0 6f46ef1d
 DBG pos=0 l=0 dn_out dtype=f32 n=256 e=0 2c76d833

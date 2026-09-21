@@ -75,9 +75,6 @@ static uint32_t hyb_forwards_profiled;
 // polynomial in fastmath.h is limited by its dependent FMA chain and FP divide.  Linear
 // interpolation at 1/128 spacing has <4.4e-6 absolute error over [-16, 16], while this
 // 16 KiB table and the activations' much smaller hot interval fit the 32 KiB D-cache.
-#define SILU_LUT_SCALE 128
-#define SILU_LUT_LIMIT 16
-#define SILU_LUT_N (2*SILU_LUT_LIMIT*SILU_LUT_SCALE)
 static float *silu_lut;
 
 #ifdef BONSAI_HAS_DNREC
@@ -192,20 +189,15 @@ static float softplusf(float x){ return x > 20.0f ? x : log1pf(expf(x)); }
 
 static void silu_lut_init(void)
 {
-    for (int i = 0; i <= SILU_LUT_N; i++) {
-        float x = -SILU_LUT_LIMIT + (float)i*(1.0f/SILU_LUT_SCALE);
+    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) {
+        float x = -BONSAI_SILU_LUT_LIMIT + (float)i*(1.0f/BONSAI_SILU_LUT_SCALE);
         silu_lut[i] = x/(1.0f + expf(-x));
     }
 }
 
 static inline float siluf(float x)
 {
-    if (x >= SILU_LUT_LIMIT || x <= -SILU_LUT_LIMIT)
-        return bonsai_siluf(x);
-    float u = (x + SILU_LUT_LIMIT)*SILU_LUT_SCALE;
-    int i = (int)u;
-    float f = u - (float)i;
-    return __builtin_fmaf(f, silu_lut[i + 1] - silu_lut[i], silu_lut[i]);
+    return bonsai_silu_lookup(x, silu_lut);
 }
 
 static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
@@ -420,7 +412,7 @@ int hybrid_init(void)
     uint64_t room = infer_heap_room(1);
     // Work buffers: the widest activation a few times over, plus the logits.
     uint64_t work_b = 24u*(uint64_t)(ffn_dim > 2*nq + nvh ? ffn_dim : 2*nq + nvh)*4
-                    + 4u*H->vocab + (256u << 10) + sizeof(float)*(SILU_LUT_N + 1);
+                    + 4u*H->vocab + (256u << 10) + sizeof(float)*(BONSAI_SILU_LUT_N + 1);
     while (ctx_cap > 16 && state_b + kv_b + work_b > room) {
         ctx_cap /= 2;
         kv_b = (uint64_t)n_attn*ctx_cap*kv_dim*4*2;
@@ -436,7 +428,7 @@ int hybrid_init(void)
     dn_conv_pos = n_dn ? infer_halloc(n_dn, 0) : NULL;
     kc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
-    silu_lut = infer_halloc(sizeof(float)*(SILU_LUT_N + 1), 0);
+    silu_lut = infer_halloc(sizeof(float)*(BONSAI_SILU_LUT_N + 1), 0);
     silu_lut_init();
 
     int wmax = n_embd;

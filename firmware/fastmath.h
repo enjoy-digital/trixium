@@ -50,4 +50,22 @@ static inline float bonsai_siluf(float x)
     return x/(1.0f + bonsai_expf_bounded(-x));
 }
 
+#define BONSAI_SILU_LUT_SCALE 128
+#define BONSAI_SILU_LUT_LIMIT 16
+#define BONSAI_SILU_LUT_N (2*BONSAI_SILU_LUT_LIMIT*BONSAI_SILU_LUT_SCALE)
+
+// Finite-input lookup shared by the firmware and target-math regression harness.
+static inline float bonsai_silu_lookup(float x, const float *lut)
+{
+    if (x >= BONSAI_SILU_LUT_LIMIT || x <= -BONSAI_SILU_LUT_LIMIT)
+        return bonsai_siluf(x);
+    float u = (x + BONSAI_SILU_LUT_LIMIT)*BONSAI_SILU_LUT_SCALE;
+    int i = (int)u;
+    // The largest float below 16 rounds (x + 16) to 32, making i == N.
+    // Its interpolation fraction is zero; return the endpoint without reading N+1.
+    if (i >= BONSAI_SILU_LUT_N) return lut[BONSAI_SILU_LUT_N];
+    float f = u - (float)i;
+    return __builtin_fmaf(f, lut[i + 1] - lut[i], lut[i]);
+}
+
 #endif
