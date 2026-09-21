@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "perf.h"
+#include "bench.h"
 
 uint64_t test_clock, test_live[4], test_snap[4];
 uint32_t eng_poll_spins, eng_poll_waits, vec_poll_spins, vec_poll_waits;
@@ -24,6 +25,21 @@ static void advance(uint64_t dt)
 
 int main(void)
 {
+    struct bench_samples samples = {.start = 100};
+    assert(bench_decode_wall(&samples) == 0);
+    bench_token_ready(&samples, 150); // TTFT = 50, not a decode token.
+    bench_token_emitted(&samples, 157);
+    assert(bench_decode_compute(&samples) == 0);
+    bench_token_ready(&samples, 217); // 60 compute + 7 UART cycles.
+    bench_token_emitted(&samples, 222);
+    bench_token_ready(&samples, 222 + (1ULL << 33));
+    bench_token_emitted(&samples, 231 + (1ULL << 33));
+    assert(samples.count == 3);
+    assert(samples.first - samples.start == 50);
+    assert(samples.emit_cycles == 21);
+    assert(bench_decode_wall(&samples) == (1ULL << 33) + 72);
+    assert(bench_decode_compute(&samples) == (1ULL << 33) + 60);
+
     perf_init();
     perf_enter(OP_EMBED);
     advance((1ULL << 32) + 17);

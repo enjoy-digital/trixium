@@ -585,6 +585,7 @@ void hybrid_stats_print(void)
 }
 
 int hybrid_pos(void) { return pos; }
+int hybrid_context_capacity(void) { return ctx_cap; }
 
 // Layers ----------------------------------------------------------------------------------------
 

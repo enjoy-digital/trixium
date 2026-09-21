@@ -17,6 +17,13 @@ int  infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(i
 int  infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok));
 int  infer_kv_resident(void);       // Tokens in the KV cache after a generation (= n_pos).
 uint32_t infer_gen_serial(void);    // Bumped by every generation.
+int infer_context_capacity(void);  // Actual allocation, not the image's requested max_ctx.
+struct infer_prefill_profile {
+    uint64_t reset_cycles, prefill_cycles;
+    uint32_t tokens, forwards;
+    int valid; // Only set after the complete prompt was successfully processed.
+};
+const struct infer_prefill_profile *infer_last_prefill(void);
 // Stop set for infer_generate: a generated token in it is emitted and ends the request
 // (the chat tools pass <|im_end|>; the tokenizer lives on the host). n = 0 clears it.
 #define INFER_STOP_MAX 4

@@ -4540,7 +4540,12 @@ int infer_init(void)
         max_ctx = H->max_ctx;
         n_pos = 0;
         heap_hi = 0;
-        return hybrid_init();
+        int rc = hybrid_init();
+        // The hybrid allocator may halve the requested context to fit main_ram. The
+        // request/generation bounds must use that allocation too, otherwise forward()
+        // hits its smaller cap and its -1 sentinel can be emitted as a token.
+        if (rc == 0) max_ctx = hybrid_context_capacity();
+        return rc;
     }
 
     // Norms: fetch each F32 tensor (replicated; channel 0 copy) to the CPU.
@@ -4973,9 +4978,12 @@ static int gen_is_stop(int tok)
 }
 
 static uint32_t gen_serial;   // Bumped per generation: a continuation must follow its own.
+static struct infer_prefill_profile last_prefill;
 
 int infer_kv_resident(void) { return n_pos; }
 uint32_t infer_gen_serial(void) { return gen_serial; }
+int infer_context_capacity(void) { return max_ctx; }
+const struct infer_prefill_profile *infer_last_prefill(void) { return &last_prefill; }
 
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {
@@ -4991,6 +4999,7 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
 // 0.6 s -> 1.6 s over three turns, 2026-09-11).
 int infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok))
 {
+    memset(&last_prefill, 0, sizeof(last_prefill));
     // An id past the vocabulary makes the embedding fetch read a row that does not exist -
     // an engine stall only reconfiguring the FPGA clears. It happened: the console dropped
     // characters from a long `tok` line and two ids merged (2026-09-11). Refuse the
@@ -5011,6 +5020,7 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
     if (resident <= 0 || resident > n || resident != n_pos)
         resident = 0;
     gen_serial++;
+    uint64_t reset_start = perf_now64();
     if (resident == 0) {
         n_pos = 0; // Reset the KV cache (fresh generation).
         if (hybrid_present()) hybrid_reset();
@@ -5024,15 +5034,22 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
             for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
 #endif
     }
+    last_prefill.reset_cycles = perf_now64() - reset_start;
     if (resident == n) {
         printf(" [nothing new to forward]");
         return -1;
     }
     int tok = -1;
+    uint32_t prefill_f0 = infer_forwards;
+    uint64_t prefill_start = perf_now64();
     for (int i = resident; i < n; i++) {
         tok = forward(buf[i], i == n - 1);
         if (engine_wedged) { printf(" [engine wedged during the prompt]"); return -1; }
     }
+    last_prefill.prefill_cycles = perf_now64() - prefill_start;
+    last_prefill.tokens = n - resident;
+    last_prefill.forwards = infer_forwards - prefill_f0;
+    last_prefill.valid = 1;
     int count = 0;
     for (int i = 0; i < max_new; i++) {
         if (n_pos >= max_ctx)

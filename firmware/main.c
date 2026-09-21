@@ -46,6 +46,7 @@ _Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "d
 #include "infer.h"
 #include "ops.h"
 #include "perf.h"
+#include "bench.h"
 #include "seq.h"
 #include "vec.h"
 #include "progs.h"
@@ -205,16 +206,34 @@ static void hwops_cmd(char *args)
     hwops_print();
 }
 
+static struct bench_samples bench_samples;
+
+static void bench_emit_token(int tok)
+{
+    bench_token_ready(&bench_samples, perf_now64());
+    emit_token(tok);
+    bench_token_emitted(&bench_samples, perf_now64());
+}
+
+static void bench_field(const char *name, uint64_t value)
+{
+    printf(" %s=", name);
+    perf_print_u64(value);
+}
+
 static void bench_cmd(char *args)
 {
     char *tok = get_token(&args);
     int n = (*tok) ? parse_int(tok) : 4;
+    if (n <= 0) { puts("BENCH ERR: token count must be positive"); return; }
     static const int prompt[3] = {1, 2, 3};
     perf_reset();
     uint32_t f0 = infer_forwards;
     uint64_t t0 = perf_now64();
+    memset(&bench_samples, 0, sizeof(bench_samples));
+    bench_samples.start = t0;
     printf("GEN:");
-    int count = infer_generate(prompt, 3, n, emit_token);
+    int count = infer_generate(prompt, 3, n, bench_emit_token);
     uint64_t dt = perf_now64() - t0;
     uint32_t fwd = infer_forwards - f0;
     puts("");
@@ -237,6 +256,25 @@ static void bench_cmd(char *args)
         perf_print_u64(dt/fwd);
         printf(" cycles/fwd");
     }
+    puts("");
+    const struct infer_prefill_profile *p = infer_last_prefill();
+    printf("BENCH_PHASE v=1");
+    bench_field("valid", count > 0 && p->valid);
+    bench_field("clock_hz", CONFIG_CLOCK_FREQUENCY);
+    bench_field("requested_tokens", n);
+    bench_field("generated_tokens", bench_samples.count);
+    bench_field("prompt_tokens", p->tokens);
+    bench_field("prefill_forwards", p->forwards);
+    bench_field("reset_cycles", p->reset_cycles);
+    bench_field("prefill_cycles", p->prefill_cycles);
+    bench_field("ttft_cycles", bench_samples.count ? bench_samples.first - t0 : 0);
+    bench_field("decode_tokens", bench_samples.count ? bench_samples.count - 1 : 0);
+    bench_field("decode_cycles", bench_decode_compute(&bench_samples));
+    bench_field("decode_wall_cycles", bench_decode_wall(&bench_samples));
+    bench_field("emit_cycles", bench_samples.emit_cycles);
+    bench_field("total_cycles", dt);
+    bench_field("context_capacity", infer_context_capacity());
+    bench_field("context_used", infer_kv_resident());
     puts("");
 }
 
