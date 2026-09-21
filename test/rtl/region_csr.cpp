@@ -60,7 +60,8 @@ int main() {
         for (unsigned i=0; i<90; i++) clock();
         dut.freeze=0;
         for (unsigned i=0; i<3000 && dut.reset_busy; i++) clock();
-        require(!dut.reset_busy && !dut.reset_stuck && !dut.error && !dut.status, "failed reset/drain");
+        require(!dut.reset_busy && !dut.reset_stuck && !dut.error && !dut.status
+                && !dut.v_error && !dut.v_status, "failed reset/drain");
     };
     auto upload=[&](unsigned offset, unsigned beats, unsigned expected_count, bool hold_b) {
         dut.freeze=hold_b; arm(offset, beats);
@@ -128,6 +129,40 @@ int main() {
             require(dut.debug_data[j]==word, "portable driver payload mismatch");
         }
     }
+    auto read_arm=[&](uint64_t offset, unsigned beats, unsigned dst=0x400) {
+        write(dut.v_region_re, dut.v_region_storage, 7);
+        write(dut.v_offset_re, dut.v_offset_storage, offset);
+        write(dut.v_length_re, dut.v_length_storage, beats);
+        write(dut.v_dst_re, dut.v_dst_storage, dst);
+        write(dut.v_start_re, dut.v_start_storage, 1);
+    };
+    auto read_verify=[&](unsigned completed) {
+        read_arm(0xc000,39);
+        write(dut.v_offset_re, dut.v_offset_storage, uint64_t(1)<<48);
+        write(dut.v_dst_re, dut.v_dst_storage, 0x8000);
+        for (unsigned i=0; i<5000 && dut.v_completed!=completed; i++) clock();
+        require(!dut.v_error && dut.v_completed==completed && !dut.v_status && dut.v_beats==39, "readback completion");
+        for (unsigned i=0; i<39; i++) {
+            dut.debug_addr=0xc000/32+i; dut.sp_addr=0x400/32+i; dut.eval();
+            for (unsigned j=0; j<8; j++) require(dut.sp_data[j]==dut.debug_data[j], "upload readback mismatch");
+        }
+    };
+    read_verify(1);
+    // Reset with real accepted reads outstanding. Old responses must drain to
+    // the shim, not a new read's destination or its success accounting.
+    dut.freeze=1; read_arm(0xc000,39);
+    for (unsigned i=0; i<60; i++) clock();
+    require(dut.v_status&1, "readback not busy before reset");
+    reset(); require(dut.v_completed==1, "cancelled read counted as success");
+    read_verify(2); require(dut.v_accepted==3, "read accepted accounting");
+    dut.freeze=1; read_arm(0xc000,39);
+    write(dut.v_start_re, dut.v_start_storage, 1);
+    require((dut.v_status&4) && (dut.v_error&256), "duplicate read start not rejected");
+    reset(); require(dut.v_completed==2, "failed read counted as success");
+    read_arm(uint64_t(1)<<32,1);
+    for (unsigned i=0; i<40; i++) clock();
+    require((dut.v_status&4) && dut.v_error==2 && dut.v_completed==2, "read offset aliased");
+    reset(); read_verify(3);
     rc=bns_region_upload(&io, 7, uint64_t(1)<<32, payload+1, 32, 10000, &progress);
     require(rc==BNS_UP_HARDWARE && progress.hardware_error==2 && !progress.completed_bytes, "high offset aliased");
     reset();
@@ -135,5 +170,5 @@ int main() {
     rc=bns_region_upload(&io, 7, 0x1000, payload+1, 32, 100, &progress);
     require(rc==BNS_UP_TIMEOUT && !progress.completed_bytes, "missing B response did not time out");
     reset();
-    std::puts("exact CSR uploads, credit exhaustion, reset/drain and portable C driver passed");
+    std::puts("exact CSR uploads/readbacks, credit exhaustion, reset/drain and portable C upload driver passed");
 }

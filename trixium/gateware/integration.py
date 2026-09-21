@@ -101,7 +101,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative", "zzregion"):
+    for name in ("scratchpad", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative", "zzregion", "zzverify"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
@@ -149,6 +149,9 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         from trixium.gateware.native_csr import BonsaiNativeCSR
         soc.zznative = BonsaiNativeCSR(soc.engine, soc.engine_csr)
         soc.add_constant('BONSAI_HAS_NATIVE_ENGINE')
+        from trixium.gateware.region_read_csr import BonsaiRegionReadCSR
+        soc.zzverify = BonsaiRegionReadCSR(soc.engine, soc.engine_csr)
+        soc.add_constant('BONSAI_HAS_REGION_READ')
     soc.comb += [
         soc.engrst.trigger.eq(soc.engine_csr.rst_trigger),
         soc.engine_csr.rst_busy.eq(soc.engrst.busy),

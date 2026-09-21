@@ -260,7 +260,33 @@ class BonsaiMatVecEngine(LiteXModule):
         native_mode = C(0, 1)
         native_config_error = C(0, 1)
         native_complete = C(1, 1)
+        raw_mode, raw_accept, raw_error = C(0, 1), C(0, 1), C(0, 8)
+        raw_address, raw_complete = C(0, 64), C(1, 1)
         if with_native:
+            from trixium.capabilities import Access
+            from trixium.gateware.region_span import RegionSpanValidator
+            from trixium.gateware.axi_read_monitor import AXIReadMonitor
+            raw_mode, raw_accept, raw_address = Signal(), Signal(), Signal(64)
+            self.region_read_cmd = raw = stream.Endpoint([
+                ('region', 32), ('offset', 64), ('length', 24), ('dst', 24)])
+            self.region_read_error = raw_error = Signal(8)
+            self.region_read_done, self.region_read_busy, self.region_read_failed = Signal(), Signal(), Signal()
+            self.region_read_beats = Signal(24)
+            self.submodules.region_read_span = span = RegionSpanValidator(
+                native_regions, native_reservations,
+                zip(native_endpoints, [axi.address_width for axi in hbm_axis]), access=Access.READ)
+            raw_config = Signal(4)
+            raw_sp_end = Signal(30)
+            self.comb += [
+                span.region.eq(raw.region), span.offset.eq(raw.offset), span.length.eq(raw.length << 5),
+                raw_sp_end.eq(raw.dst + (raw.length << 5)),
+                raw_accept.eq(raw.valid & raw.ready),
+            ]
+            self.sync += If(raw_accept,
+                raw_address.eq(span.address),
+                raw_config.eq(Cat(span.error, (raw.dst[:5] != 0) | (raw_sp_end > scratchpad.size))),
+            )
+            self.region_read_monitors = []
             self.native_mode = native_mode = Signal()
             self.native_cfg = cfg = stream.Endpoint([
                 ("chan", 5), ("region", 32), ("offset", 64), ("stride", 64)])
@@ -333,6 +359,10 @@ class BonsaiMatVecEngine(LiteXModule):
             rbuf = stream.Buffer([("data", 256)])
             setattr(self.submodules, f"rbuf{i}", rbuf)
             if with_native:
+                monitor = AXIReadMonitor(axi)
+                setattr(self.submodules, f'region_read_monitor{i}', monitor)
+                self.region_read_monitors.append(monitor)
+                self.comb += monitor.enable.eq(raw_mode & (fetch_chan == i))
                 transport = NativeReadTransport(axi.address_width)
                 nreader = NativeRegionReader(axi, native_regions, native_reservations,
                                              endpoint=native_endpoints[i], transport=transport)
@@ -390,6 +420,22 @@ class BonsaiMatVecEngine(LiteXModule):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
+        if with_native:
+            self.sync += [
+                If(self.cmd.valid & self.cmd.ready, raw_mode.eq(0)),
+                If(raw_accept,
+                    raw_mode.eq(1),
+                    *[cmd_r[k].eq({'kind': 2, 'wlen': raw.length, 'dst': raw.dst,
+                                  'chan': span.port}.get(k, 0)) for k in cmd_r]),
+            ]
+            raw_complete = Signal()
+            self.comb += [
+                raw_error.eq(Cat(raw_config, Array([m.error for m in self.region_read_monitors])[fetch_chan])),
+                raw_complete.eq(Array([r.idle & m.drained for r, m in
+                                      zip(self.readers, self.region_read_monitors)])[fetch_chan]),
+                self.region_read_done.eq(self.done & raw_mode),
+            ]
+        command_accept = (self.cmd.valid & self.cmd.ready) | raw_accept
         store_mode = Signal()
         axpy_mode  = Signal()
         self.comb += [
@@ -460,7 +506,8 @@ class BonsaiMatVecEngine(LiteXModule):
         # instead of dropping results and hanging the op.
         pipe_errors = [(p.error | p.overflow) & (~native_mode | (p.rows != 0)) for p in self.pipes]
         backend_error = (reduce_or([r.error != 0 for r in self.native_readers]) if with_native else C(0, 1))
-        self.comb += self.error.eq(reduce_or(pipe_errors) | (native_mode & (native_config_error | backend_error)))
+        self.comb += self.error.eq(reduce_or(pipe_errors) | (native_mode & (native_config_error | backend_error))
+                                  | (raw_mode & (raw_error != 0)))
 
         # x-fill ------------------------------------------------------------------------------
         fill_width = 11 if with_native else 10
@@ -791,11 +838,12 @@ class BonsaiMatVecEngine(LiteXModule):
         fetch_valid = Signal()
         fetch_data  = Signal(256)
         fetch_cnt   = Signal(24)
+        fetch_wcnt  = Signal(24)
         fetch_take = Signal() # A fetch beat is actually consumed this cycle.
         self.comb += [
             fetch_valid.eq(reduce_or(fetch_valids)),
             fetch_data.eq(Array(fetch_datas)[fetch_chan]),
-            fetch_take.eq(fetch_valid & fetch_rdy),
+            fetch_take.eq(fetch_valid & fetch_rdy & (~raw_mode | ((fetch_wcnt < cmd_r['wlen']) & (raw_error == 0)))),
         ]
 
         # Scratchpad write port: fetch beats, one merged ilv beat, one wide AXPY beat, or
@@ -806,7 +854,6 @@ class BonsaiMatVecEngine(LiteXModule):
         slot = Signal(24)
         # Fetch write addressing counts at the comb stage (beats arrive every cycle;
         # the registered fetch_cnt lags one cycle and is only the terminator).
-        fetch_wcnt   = Signal(24)
         eng_gw_adr_c = Signal(len(scratchpad.gather.adr))
         eng_gw_we_c  = Signal(8)
         eng_gw_dat_c = Signal(256)
@@ -821,7 +868,7 @@ class BonsaiMatVecEngine(LiteXModule):
         busy_d = Signal()
         self.sync += busy_d.eq(self.busy)
         self.comb += self.sp_busy.eq(self.busy | busy_d)
-        self.sync += If(self.cmd.valid & self.cmd.ready,
+        self.sync += If(command_accept,
             fetch_wcnt.eq(0),
         ).Elif(fetch_mode & fetch_take,
             # Equivalent to (eng_gw_we_c != 0) in fetch mode, but off the reader valids
@@ -908,7 +955,7 @@ class BonsaiMatVecEngine(LiteXModule):
             return sigs[0]
         wr_absmax = _maxtree(lane_abs)
         self.sync += [
-            If(self.cmd.valid & self.cmd.ready,
+            If(command_accept,
                 self.absmax.eq(0),
             ).Elif(~fetch_mode & (wr_absmax > self.absmax),
                 self.absmax.eq(wr_absmax),
@@ -1028,7 +1075,8 @@ class BonsaiMatVecEngine(LiteXModule):
         self.fsm = fsm = FSM(reset_state="IDLE")
         start_pulse = Signal()
         for i, pipe in enumerate(self.pipes):
-            self.sync += pipe.start.eq(start_pulse & (~native_mode | (cmd_r['rows'] != 0) | (i < cmd_r['rem'])))
+            self.sync += pipe.start.eq(start_pulse & ~raw_mode
+                                      & (~native_mode | (cmd_r['rows'] != 0) | (i < cmd_r['rem'])))
         for pk in packs:
             self.comb += pk.clear.eq(start_pulse)   # No partial beat survives an op boundary.
         if with_native:
@@ -1039,6 +1087,13 @@ class BonsaiMatVecEngine(LiteXModule):
             all_issued, native_complete = Signal(), Signal()
             self.native_failed = Signal()
             self.comb += [
+                raw.ready.eq(fsm.ongoing('IDLE') & ~self.cmd.valid & ~cfg.valid
+                             & ~self.sp_busy & ~self.vec_busy_in & ~scratchpad.sbw_pending
+                             & reduce(and_, [r.idle for r in self.readers])
+                             & (C(1, 1) if seq is None else ~seq.busy)),
+                self.region_read_busy.eq(raw_mode & ~fsm.ongoing('IDLE')),
+                self.region_read_failed.eq(raw_mode & fsm.ongoing('N_FAILED')),
+                self.region_read_beats.eq(fetch_cnt),
                 active_mask.eq(Cat(*[(cmd_r['rows'] != 0) | (i < cmd_r['rem']) for i in range(n)])),
                 all_issued.eq((issued & active_mask) == active_mask),
                 native_complete.eq((completed & active_mask) == active_mask),
@@ -1071,11 +1126,15 @@ class BonsaiMatVecEngine(LiteXModule):
                 NextValue(fill_beat, 0),
                 NextValue(result_cnt, 0),
                 NextState("START"),
+            ).Elif(raw_accept,
+                NextValue(fill_beat, 0),
+                NextValue(result_cnt, 0),
+                NextState('START'),
             )
         )
         fsm.act("START",
             start_pulse.eq(1),
-            If(native_mode & native_config_error,
+            If((native_mode & native_config_error) | (raw_mode & (raw_error != 0)),
                 NextState('N_FAILED') if with_native else NextState('IDLE'),
             ).Elif(fetch_mode,
                 NextState("ISSUE"), # No x-fill for fetches.
@@ -1140,20 +1199,21 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             *[c.valid.eq(~fetch_mode | (fetch_chan == i))
               for i, c in enumerate(read_cmds)],
-            *[c.addr.eq(cmd_r["wbase"] + _chan_off(i))
+            *[c.addr.eq(Mux(raw_mode, raw_address, cmd_r["wbase"] + _chan_off(i)))
               for i, c in enumerate(read_cmds)],
             *[c.len.eq(cmd_r["wlen"]
                 + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
               for i, c in enumerate(read_cmds)],
-            # NOTE: this waits on readers[0] alone. A reader only accepts while idle
+            # Legacy NOTE: this waits on readers[0] alone. A reader only accepts while idle
             # (sink.ready = ~active), and readers do not always go idle together - with
             # rem != 0 they get different lengths, and a fetch commands one channel - so in
             # principle a reader still draining would miss its command. Measured on the card
             # it does not happen: at the stall every channel had delivered exactly the beats
             # commanded (ch0=10/10, ch1..7=5/5). Fixing it anyway cost WNS 0.015 -> -0.766 ns
             # on a design with no margin, and changed nothing, so it is left as written and
-            # recorded here instead.
-            If(read_cmds[0].ready,
+            # recorded here instead. Bounded raw reads use their selected port's
+            # own handshake and require idle readers before command acceptance.
+            If(Mux(raw_mode, Array([c.ready for c in read_cmds])[fetch_chan], read_cmds[0].ready),
                 NextState("RUN"),
             )
         )
@@ -1176,7 +1236,7 @@ class BonsaiMatVecEngine(LiteXModule):
         ]
         fsm.act("RUN",
             self.busy.eq(1),
-            If(native_mode & self.error,
+            If((native_mode | raw_mode) & self.error,
                 NextState('N_FAILED') if with_native else NextState('IDLE'),
             ).Elif(Mux(fetch_mode,
                    fetch_cnt == cmd_r["wlen"],
@@ -1185,7 +1245,7 @@ class BonsaiMatVecEngine(LiteXModule):
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
                        Mux(axpy_mode, ax_total, mv_total)))
                & ~gw_pending  # Queued writes must be in RAM before done.
-               & ~am_busy & (~native_mode | native_complete),
+               & ~am_busy & (~native_mode | native_complete) & (~raw_mode | raw_complete),
                 self.done.eq(1),
                 NextState("IDLE"),
             )

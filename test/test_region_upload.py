@@ -404,6 +404,17 @@ def test_compiled_region_csr_credit_batches_and_inflight_reset(tmp_path):
             ports[name+'_'+field] = getattr(getattr(dut.zzregion, name), field)
     ports.update(reset_re=dut.engine_csr.soft_reset.re, reset_storage=dut.engine_csr.soft_reset.storage,
                  reset_busy=dut.engrst.busy, reset_stuck=dut.engrst.stuck, freeze=dut.model.freeze)
+    for name in ('error', 'beats', 'accepted', 'completed'):
+        ports['v_'+name] = getattr(dut.zzverify, name).status
+    ports['v_status'] = Signal(3)
+    dut.comb += ports['v_status'].eq(Cat(dut.zzverify.status.fields.busy,
+        dut.zzverify.status.fields.pending, dut.zzverify.status.fields.failed))
+    for name in ('region', 'offset', 'length', 'dst', 'start'):
+        for field in ('storage', 're'):
+            ports['v_'+name+'_'+field] = getattr(getattr(dut.zzverify, name), field)
+    spdebug = dut.scratchpad.mem.get_port(async_read=True)
+    dut.specials += spdebug
+    ports.update(sp_addr=spdebug.adr, sp_data=spdebug.dat_r)
     debug = dut.model.mem.get_port(async_read=True)
     dut.specials += debug
     ports.update(debug_addr=debug.adr, debug_data=debug.dat_r)

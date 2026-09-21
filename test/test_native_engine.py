@@ -159,6 +159,7 @@ def test_native_engine_shared_fill_compute_and_gather(n, kind, rows, rem, groups
 
 
 def test_native_and_legacy_commands_reuse_same_engine():
+    from test_region_read import submit as submit_read
     dut = NativeEngineDUT(n=2)
     cases = [make_engine_case(dut, kind=kind, native=native, seed=120+i, qn=qn)
              for i, (kind, native, qn) in enumerate([(0, False, False), (1, True, True),
@@ -170,6 +171,19 @@ def test_native_and_legacy_commands_reuse_same_engine():
             memory.update(case['memory'])
             yield from submit_engine(dut, case)
             yield from finish_engine(dut, case)
+            payload = bytes(range(64))
+            memory.update({(1 << 32)+0x100+i: b for i, b in enumerate(payload)})
+            yield from submit_read(dut.engine, 42, 0x100, 2, 0xe000)
+            for _ in range(300):
+                yield
+                assert not (yield dut.engine.error)
+                if (yield dut.engine.region_read_done):
+                    break
+            else:
+                raise AssertionError('raw read between projections timed out')
+            yield
+            for i in range(2):
+                assert (yield dut.sp.mem[0xe000//32+i]) == int.from_bytes(payload[32*i:32*(i+1)], 'little')
     run_simulation(dut, [run()] + [memory_server(SimpleNamespace(axi=axi), memory, observed[i], seed=90+i)
                                   for i, axi in enumerate(dut.axis)])
 
