@@ -76,7 +76,10 @@ int main(int argc, char **argv) {
     // Use the high bits: the low two LCG bits repeat every four calls, which
     // can phase-lock a two-port idle bus into permanently deasserting ARREADY.
     auto random=[&]() { state=state*1664525u+1013904223u; return state >> 16; };
-    for (unsigned cycle=0; cycle<30000; cycle++) {
+    // Full 48x5120 beta/alpha projections exceed the small-row fixture budget.
+    // Bound by the commanded work as well as a fixed startup/drain allowance.
+    const uint64_t cycle_budget=30000ull+16ull*(h[3]+(h[4]!=0))*h[6];
+    for (uint64_t cycle=0; cycle<cycle_budget; cycle++) {
         for (unsigned port=0; port<2; port++) {
             auto &p=ports[port]; *p.ar_ready=random()%4 != 0;
             if (!held[port]) {

@@ -381,6 +381,9 @@ def test_legacy_c_upload_rejects_v4_before_mmio(tmp_path):
         pytest.skip('native C compiler required')
     source = ROOT / 'trixium/software/user/bonsai_loader.c'
     names = sorted(set(re.findall(r'\bCSR_[A-Z0-9_]+\b', source.read_text())))
+    # This is an old-map/version-gate test. Do not accidentally enable new
+    # optional region banks with invented alphabetical (ABI-invalid) offsets.
+    names = [name for name in names if not name.startswith(('CSR_ZZREGION_', 'CSR_ZZVERIFY_'))]
     (tmp_path / 'csr.h').write_text('\n'.join(f'#define {name} {i*4}' for i, name in enumerate(names)))
     (tmp_path / 'soc.h').write_text('#define BONSAI_CHAN_WEIGHT_BASE 0x14000000\n'
                                   '#define BONSAI_CHAN_STRIDE 0x10000000\n#define BONSAI_N_CHANNELS 16\n')
@@ -389,8 +392,11 @@ def test_legacy_c_upload_rejects_v4_before_mmio(tmp_path):
     harness.write_text('#include "bonsai_loader.h"\n'
                        'int main(int argc, char **argv) { return loader_upload_image(argv[1], 0) ? 1 : 0; }\n')
     exe = tmp_path / 'load-test'
-    subprocess.run([cc, '-O2', '-I'+str(tmp_path), '-I'+str(source.parent),
-                    str(source), str(harness), '-o', str(exe)], check=True, capture_output=True)
+    library = source.parent.parent / 'lib'
+    subprocess.run([cc, '-O2', '-I'+str(tmp_path), '-I'+str(source.parent), '-I'+str(library),
+                    str(source), str(library / 'bonsai_region_upload.c'),
+                    str(library / 'bonsai_region_read.c'), str(harness), '-o', str(exe)],
+                   check=True, capture_output=True)
     path, _, _ = make_image(tmp_path)
     p = subprocess.run([str(exe), str(path)], capture_output=True, text=True)
     assert p.returncode == 0 and 'legacy loader accepts BONS v2/v3, not v4' in p.stderr
