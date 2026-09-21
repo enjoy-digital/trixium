@@ -796,7 +796,13 @@ static void attention_layer(int l, const float *h, float *out)
         for (int t = 0; t < T; t++) {
             const float *kt = K + (uint64_t)t*kv_dim + kvh*head_dim;
             float sc = 0;
-            for (int i = 0; i < head_dim; i++) sc += qh[i]*kt[i];
+            int i = 0;
+            // Keep the reference's sequential FP32 sum, with less loop control.
+            for (; i + 3 < head_dim; i += 4) {
+                sc += qh[i + 0]*kt[i + 0]; sc += qh[i + 1]*kt[i + 1];
+                sc += qh[i + 2]*kt[i + 2]; sc += qh[i + 3]*kt[i + 3];
+            }
+            for (; i < head_dim; i++) sc += qh[i]*kt[i];
             scores[t] = sc*scale;
             if (scores[t] > mx) mx = scores[t];
         }
@@ -807,11 +813,21 @@ static void attention_layer(int l, const float *h, float *out)
         for (int t = 0; t < T; t++) {
             const float *vt = V + (uint64_t)t*kv_dim + kvh*head_dim;
             float p = scores[t]/sum;
-            for (int i = 0; i < head_dim; i++) oh[i] += p*vt[i];
+            int i = 0;
+            for (; i + 3 < head_dim; i += 4) {
+                oh[i + 0] += p*vt[i + 0]; oh[i + 1] += p*vt[i + 1];
+                oh[i + 2] += p*vt[i + 2]; oh[i + 3] += p*vt[i + 3];
+            }
+            for (; i < head_dim; i++) oh[i] += p*vt[i];
         }
         if (gated) {
             const float *g = qfull + hh*2*head_dim + head_dim;
-            for (int i = 0; i < head_dim; i++) oh[i] *= sigmoidf(g[i]);
+            int i = 0;
+            for (; i + 3 < head_dim; i += 4) {
+                oh[i + 0] *= sigmoidf(g[i + 0]); oh[i + 1] *= sigmoidf(g[i + 1]);
+                oh[i + 2] *= sigmoidf(g[i + 2]); oh[i + 3] *= sigmoidf(g[i + 3]);
+            }
+            for (; i < head_dim; i++) oh[i] *= sigmoidf(g[i]);
         }
     }
     proj_f(model_entry(ROLE_ATTN_OUT, l), attnb, out);
