@@ -5,6 +5,53 @@ from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
 
+class Fp32AbsmaxWord(LiteXModule):
+    """Elastic finite absmax reduction of one word, not a whole vector.
+
+    Magnitudes are positive binary32 bit patterns (31 bits). Nonfinite lanes
+    contribute zero and set error. first/last are passed through unchanged.
+    The operation owner accumulates these word maxima/errors and chooses e8
+    only after the final result. Default latency is three clocks, interval one.
+    """
+    def __init__(self, lanes=8):
+        if not isinstance(lanes, int) or lanes < 1 or lanes > 16 or lanes & (lanes - 1):
+            raise ValueError("lanes must be a power of two in [1, 16]")
+        self.sink = stream.Endpoint([("data", lanes*32)])
+        self.source = stream.Endpoint([("absmax", 31), ("error", 1)])
+        self.cancel = Signal()
+        levels = max(1, lanes.bit_length() - 1)
+        valid, ready = [Signal() for _ in range(levels)], [Signal() for _ in range(levels)]
+        first, last = [Signal() for _ in range(levels)], [Signal() for _ in range(levels)]
+        values, errors = [], []
+        for lane in range(lanes):
+            word = self.sink.data[32*lane:32*(lane+1)]
+            bad = Signal()
+            value = Signal(31)
+            self.comb += [bad.eq(word[23:31] == 255), value.eq(Mux(bad, 0, word[:31]))]
+            values.append(value)
+            errors.append(bad)
+        for level in range(levels):
+            nxt_values = [Signal(31) for _ in range(max(1, len(values)//2))]
+            nxt_errors = [Signal() for _ in nxt_values]
+            updates = []
+            for index, (value, error) in enumerate(zip(nxt_values, nxt_errors)):
+                a, b = 2*index, min(2*index + 1, len(values) - 1)
+                updates += [value.eq(Mux(values[a] > values[b], values[a], values[b])),
+                            error.eq(errors[a] | errors[b])]
+            previous_valid = self.sink.valid if level == 0 else valid[level - 1]
+            updates += [first[level].eq(self.sink.first if level == 0 else first[level - 1]),
+                        last[level].eq(self.sink.last if level == 0 else last[level - 1])]
+            self.comb += ready[level].eq(~valid[level] |
+                (self.source.ready if level == levels - 1 else ready[level + 1]))
+            self.sync += If(self.cancel, valid[level].eq(0)).Elif(ready[level],
+                valid[level].eq(previous_valid), If(previous_valid, *updates))
+            values, errors = nxt_values, nxt_errors
+        self.comb += [self.sink.ready.eq(ready[0] & ~self.cancel),
+                      self.source.valid.eq(valid[-1] & ~self.cancel),
+                      self.source.absmax.eq(values[0]), self.source.error.eq(errors[0]),
+                      self.source.first.eq(first[-1]), self.source.last.eq(last[-1])]
+
+
 class Fp32ToQ8(LiteXModule):
     """Three-stage elastic FP32 -> symmetric int8 converter, eight lanes by default.
 

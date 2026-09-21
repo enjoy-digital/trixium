@@ -11,7 +11,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.gateware.activation_quantize import Fp32ToQ8
+from trixium.gateware.activation_quantize import Fp32AbsmaxWord, Fp32ToQ8
 
 
 def bits(value):
@@ -118,6 +118,51 @@ def test_fp32_q8_invalid_lane_configuration():
     for lanes in (0, 3, 32):
         with pytest.raises(ValueError):
             Fp32ToQ8(lanes)
+        with pytest.raises(ValueError):
+            Fp32AbsmaxWord(lanes)
+
+
+@pytest.mark.parametrize('lanes', [1, 2, 8, 16])
+def test_fp32_absmax_word_elastic_metadata_and_cancel(lanes):
+    dut = Fp32AbsmaxWord(lanes)
+    rng = random.Random(481)
+    vectors = [[rng.getrandbits(32) for _ in range(lanes)] for _ in range(200)]
+    vectors[0] = [0x7fc00001]*lanes
+    vectors[1] = [0x80000000]*lanes
+    def run():
+        index, pending, held = 0, [], None
+        for cycle in range(1500):
+            cancel = cycle in (2, 9, 73, 123)
+            yield dut.cancel.eq(cancel)
+            yield dut.source.ready.eq(rng.randrange(4) != 0)
+            yield dut.sink.valid.eq(index < len(vectors))
+            if index < len(vectors):
+                yield dut.sink.data.eq(sum(w << (32*i) for i, w in enumerate(vectors[index])))
+                yield dut.sink.first.eq(index % 11 == 0)
+                yield dut.sink.last.eq(index % 11 == 10)
+            yield
+            if cancel:
+                assert not (yield dut.sink.ready) and not (yield dut.source.valid)
+                pending.clear()
+                held = None
+                continue
+            payload = ((yield dut.source.absmax), (yield dut.source.error),
+                       (yield dut.source.first), (yield dut.source.last))
+            if held is not None:
+                assert (yield dut.source.valid) and payload == held
+            held = payload if (yield dut.source.valid) and not (yield dut.source.ready) else None
+            if (yield dut.sink.valid) and (yield dut.sink.ready):
+                values = [struct.unpack('<f', struct.pack('<I', word))[0] for word in vectors[index]]
+                finite = [abs(x) for x in values if math.isfinite(x)]
+                pending.append((bits(max(finite, default=0.0)), len(finite) != lanes,
+                                index % 11 == 0, index % 11 == 10))
+                index += 1
+            if (yield dut.source.valid) and (yield dut.source.ready):
+                assert pending and payload == pending.pop(0)
+            if index == len(vectors) and not pending:
+                return
+        raise AssertionError('word absmax did not drain')
+    run_simulation(dut, run())
 
 
 def test_fp32_q8_compiled_float_oracle_and_reset(tmp_path):

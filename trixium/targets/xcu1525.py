@@ -189,7 +189,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  ddr_fast_clock_buffer="bufgce",
-                 with_hadamard=False,
+                 with_hadamard=False, with_activation_quantize=False,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -343,7 +343,8 @@ class BonsaiXCU1525SoC(SoCCore):
             config = BonsaiClusterConfig(
                 with_vecunit=with_vecunit, with_dual=with_dual,
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
-                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard, **native)
+                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
+                with_activation_quantize=with_activation_quantize, **native)
             add_bonsai_cluster(self, engine_axis, config)
             if with_memory_traffic:
                 from trixium.gateware.traffic import add_memory_traffic
@@ -407,6 +408,7 @@ def main():
     parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent AXI/controller traffic counters (new CSR bank).")
     parser.add_target_argument("--with-native", action="store_true", help="Experimental shared native PTQ/Q8 engine and append-only controls; not resident runtime qualification.")
     parser.add_target_argument("--with-hadamard", action="store_true", help="Experimental sequenced scratchpad integer rotations; not resident runtime qualification.")
+    parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 block/vector quantization; not resident runtime qualification.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
@@ -428,6 +430,7 @@ def main():
         with_native       = args.with_native,
         ddr_fast_clock_buffer = args.ddr_fast_clock_buffer,
         with_hadamard     = args.with_hadamard,
+        with_activation_quantize = args.with_activation_quantize,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates

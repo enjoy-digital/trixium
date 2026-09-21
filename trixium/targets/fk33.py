@@ -60,7 +60,7 @@ class BonsaiSoC(SoCCore):
     def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
                  with_nvme=False, with_vecunit=False, with_dual=False, hbm_tck=900,
                  with_memory_traffic=False, with_capabilities=True, with_native=False,
-                 with_hadamard=False,
+                 with_hadamard=False, with_activation_quantize=False,
                  **kwargs):
         # Phase-2 exploration flags (see docs/phase2.md).
         if with_nvme:
@@ -169,7 +169,8 @@ class BonsaiSoC(SoCCore):
             config = BonsaiClusterConfig(
                 with_vecunit=with_vecunit, with_dual=with_dual,
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
-                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard, **native)
+                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
+                with_activation_quantize=with_activation_quantize, **native)
             add_bonsai_cluster(self, engine_axis, config)
             if with_memory_traffic:
                 from trixium.gateware.traffic import add_memory_traffic
@@ -232,6 +233,7 @@ def main():
     parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent accelerator AXI counters (not physical HBM traffic).")
     parser.add_target_argument("--with-native", action="store_true", help="Experimental shared native PTQ/Q8 engine and append-only controls; no FK33 deployment qualification.")
     parser.add_target_argument("--with-hadamard", action="store_true", help="Experimental sequenced scratchpad integer rotations; no FK33 deployment qualification.")
+    parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 block/vector quantization; no FK33 deployment qualification.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
@@ -265,6 +267,7 @@ def main():
         with_capabilities = not args.no_capabilities,
         with_native       = args.with_native,
         with_hadamard     = args.with_hadamard,
+        with_activation_quantize = args.with_activation_quantize,
         hbm_tck         = args.hbm_tck,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,

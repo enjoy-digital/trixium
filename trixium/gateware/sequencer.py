@@ -54,6 +54,8 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   had:    Optional unit 3, always serialized; w0 exactly 3, w1 src, w2 signs,
           w3 dst, w4 block count, w5 stats, w6 inverse (0/1), w7..w15 zero.
           See docs/hadamard-scratchpad.md for bounds, ownership and raw numerics.
+  quant:  Optional unit 4, always serialized; w0 exactly 4, w1 FP32 src,
+          w2 Q8 dst, w3 exponent array, w4 elements/block, w5 blocks, w6..w15 zero.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -75,9 +77,10 @@ from litex.soc.interconnect import stream
 # BonsaiSequencer ----------------------------------------------------------------------------------
 
 class BonsaiSequencer(LiteXModule):
-    def __init__(self, *, with_hadamard=False, scratchpad_size=256*1024):
-        if with_hadamard and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
-            raise ValueError("Hadamard sequencer needs an aligned scratchpad within its 13-bit address space")
+    def __init__(self, *, with_hadamard=False, with_activation_quantize=False, scratchpad_size=256*1024):
+        extended = with_hadamard or with_activation_quantize
+        if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
+            raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
         self.count  = CSRStorage(16, description="Descriptor count (stop descriptor also ends).")
         self.start  = CSRStorage(1,  description="Write 1 to run the list.")
@@ -91,6 +94,7 @@ class BonsaiSequencer(LiteXModule):
             CSRField("busy",   size=1),
             CSRField("dcount", size=16, offset=8, description="Descriptors completed."),
         ])
+        extension_errors = []
         if with_hadamard:
             from trixium.gateware.hadamard_sp import HADAMARD_COMMAND
             self.hadamard_cmd = stream.Endpoint(HADAMARD_COMMAND)
@@ -100,6 +104,17 @@ class BonsaiSequencer(LiteXModule):
             self.hadamard_error = CSRStatus(32, description=
                 "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, "
                 "bit2 output overlaps descriptor list, bits8..15 rotation-unit error.")
+            extension_errors.append(self.hadamard_error)
+        if with_activation_quantize:
+            from trixium.gateware.activation_sp import ACTIVATION_COMMAND
+            self.activation_quantize_cmd = stream.Endpoint(ACTIVATION_COMMAND)
+            self.activation_quantize_done = Signal()
+            self.activation_quantize_failed = Signal(8)
+            self.activation_quantize_abi = CSRStatus(32, reset=0x00010000)
+            self.activation_quantize_error = CSRStatus(32, description=
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, "
+                "bits8..15 conversion-unit error (bit14 protects descriptor list).")
+            extension_errors.append(self.activation_quantize_error)
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
@@ -180,15 +195,22 @@ class BonsaiSequencer(LiteXModule):
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
 
         list_ok = C(1, 1)
-        had_dispatch, unknown_unit = [], [NextState("IDLE")]
-        if with_hadamard:
+        had_dispatch, quant_dispatch, bad_list = [], [], []
+        unknown_unit = [NextState("IDLE")]
+        if extended:
             list_base = Signal(24)
             list_end = Signal(32)
             start_end = Signal(32)
+            self.comb += start_end.eq(self.base.storage + (self.count.storage << 6))
+            list_ok = (self.base.storage[:5] == 0) & (start_end <= scratchpad_size)
+            self.sync += If(self.start.re & self.start.storage & ~self.busy,
+                list_base.eq(self.base.storage), list_end.eq(start_end))
+            unknown_unit = [*[NextValue(error.status, 2) for error in extension_errors], NextState("EXT_FAILED")]
+            bad_list = [*[NextValue(error.status, 1) for error in extension_errors], NextState("EXT_FAILED")]
+        if with_hadamard:
             dst_end, stats_end = Signal(64), Signal(64)
             malformed, list_overlap = Signal(), Signal()
             self.comb += [
-                start_end.eq(self.base.storage + (self.count.storage << 6)),
                 dst_end.eq(w(0, 3) + (w(0, 4) << 12)),
                 stats_end.eq(w(0, 5) + (((w(0, 4) + C(7, 33)) >> 3) << 5)),
                 malformed.eq((w(0, 0) != 3) | (w(0, 1)[24:] != 0) |
@@ -200,14 +222,25 @@ class BonsaiSequencer(LiteXModule):
                 self.hadamard_cmd.dst.eq(w(0, 3)[:24]), self.hadamard_cmd.blocks.eq(w(0, 4)[:16]),
                 self.hadamard_cmd.stats.eq(w(0, 5)[:24]), self.hadamard_cmd.inverse.eq(w(0, 6)[0]),
             ]
-            list_ok = (self.base.storage[:5] == 0) & (start_end <= scratchpad_size)
-            self.sync += If(self.start.re & self.start.storage & ~self.busy,
-                list_base.eq(self.base.storage), list_end.eq(start_end))
             had_dispatch = [If(malformed | list_overlap,
                 NextValue(self.hadamard_error.status, Cat(C(0, 1), malformed, list_overlap)),
-                NextState("HAD_FAILED"),
+                NextState("EXT_FAILED"),
             ).Else(NextState("DISPATCH_HAD"))]
-            unknown_unit = [NextValue(self.hadamard_error.status, 2), NextState("HAD_FAILED")]
+        if with_activation_quantize:
+            malformed = Signal()
+            command = self.activation_quantize_cmd
+            self.comb += [
+                malformed.eq((w(0, 0) != 4) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                    (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) | (w(0, 5)[16:] != 0) |
+                    (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
+                command.exponents.eq(w(0, 3)[:24]), command.elements.eq(w(0, 4)[:16]),
+                command.blocks.eq(w(0, 5)[:16]), command.protect_start.eq(list_base),
+                command.protect_end.eq(list_end),
+            ]
+            quant_dispatch = [If(malformed,
+                NextValue(self.activation_quantize_error.status, 2), NextState("EXT_FAILED"),
+            ).Else(NextState("DISPATCH_QUANT"))]
 
         unit    = Signal(4)
         argsrc  = Signal(16)
@@ -430,9 +463,7 @@ class BonsaiSequencer(LiteXModule):
                 NextValue(dptr, self.base.storage[5:]),
                 NextValue(left, self.count.storage),
                 NextValue(dcount, 0),
-                If(list_ok, NextState("SBDRAIN")).Else(
-                    *([NextValue(self.hadamard_error.status, 1), NextState("HAD_FAILED")]
-                      if with_hadamard else [])),
+                If(list_ok, NextState("SBDRAIN")).Else(*bad_list),
             )
         )
         fsm.act("SBDRAIN", # Let every patch posted for this list land before fetching it.
@@ -533,6 +564,7 @@ class BonsaiSequencer(LiteXModule):
                     NextState("WAIT_VEC"),
                 )
             ).Elif(unit == 3, *(had_dispatch if with_hadamard else unknown_unit)
+            ).Elif(unit == 4, *(quant_dispatch if with_activation_quantize else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -548,10 +580,20 @@ class BonsaiSequencer(LiteXModule):
                 self.busy.eq(1),
                 If(self.hadamard_failed != 0,
                     NextValue(self.hadamard_error.status, self.hadamard_failed << 8),
-                    NextState("HAD_FAILED"),
+                    NextState("EXT_FAILED"),
                 ).Elif(self.hadamard_done, NextState("NEXT")),
             )
-            fsm.act("HAD_FAILED", self.busy.eq(1))
+        if with_activation_quantize:
+            fsm.act("DISPATCH_QUANT", self.busy.eq(1),
+                If(~eng_inflight, self.activation_quantize_cmd.valid.eq(1),
+                    If(self.activation_quantize_cmd.ready, NextState("WAIT_QUANT"))))
+            fsm.act("WAIT_QUANT", self.busy.eq(1),
+                If(self.activation_quantize_failed != 0,
+                    NextValue(self.activation_quantize_error.status, self.activation_quantize_failed << 8),
+                    NextState("EXT_FAILED"),
+                ).Elif(self.activation_quantize_done, NextState("NEXT")))
+        if extended:
+            fsm.act("EXT_FAILED", self.busy.eq(1))
         fsm.act("WAIT_ENG",
             self.busy.eq(1),
             If(self.eng_done,

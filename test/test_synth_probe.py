@@ -35,10 +35,12 @@ def test_probe_memory_files_stay_in_output_and_existing_output_is_preserved(tmp_
     assert {p.name: p.read_bytes() for p in output.iterdir()} == original
 
 
-def test_activation_probe_cli(tmp_path):
+@pytest.mark.parametrize('adapter', [False, True])
+def test_activation_probe_cli(tmp_path, adapter):
     tool = Path(__file__).resolve().parents[1] / 'tools/synth_activation_quantize.py'
     output = tmp_path / 'out'
-    result = subprocess.run([sys.executable, str(tool), '--output-dir', str(output)],
+    result = subprocess.run([sys.executable, str(tool), '--output-dir', str(output)] +
+                            (['--scratchpad-adapter'] if adapter else []),
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert {p.name for p in output.iterdir()} == {'activation_quantize.v', 'synth.xdc', 'synth.tcl'}
@@ -48,3 +50,9 @@ def test_activation_probe_cli(tmp_path):
                                '--part', 'part; exit'], capture_output=True, text=True, timeout=30)
     assert rejected.returncode != 0 and 'invalid FPGA part name' in rejected.stderr
     assert not (tmp_path / 'bad').exists()
+    if adapter:
+        rejected = subprocess.run([sys.executable, str(tool), '--output-dir', str(tmp_path / 'bad'),
+                                   '--scratchpad-adapter', '--lanes', '16'],
+                                  capture_output=True, text=True, timeout=30)
+        assert rejected.returncode != 0 and 'eight fixed lanes' in rejected.stderr
+        assert not (tmp_path / 'bad').exists()
