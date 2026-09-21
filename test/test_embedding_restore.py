@@ -242,12 +242,14 @@ def test_embedding_kernel_parameter_validation(groups, width):
         EmbeddingRestore(groups, width)
 
 
-def test_embedding_synthesis_probe_refuses_overwrite_and_bad_parameters(tmp_path):
+@pytest.mark.parametrize('adapter', [False, True])
+def test_embedding_synthesis_probe_refuses_overwrite_and_bad_parameters(tmp_path, adapter):
     import subprocess
     import sys
     tool = Path(__file__).resolve().parents[1] / 'tools/synth_embedding_restore.py'
     output = tmp_path / 'probe'
-    args = [sys.executable, str(tool), '--output-dir', str(output)]
+    flags = ['--scratchpad-adapter'] if adapter else []
+    args = [sys.executable, str(tool), '--output-dir', str(output), *flags]
     run = subprocess.run(args, capture_output=True, text=True, timeout=30)
     assert run.returncode == 0, run.stderr
     saved = {p.name: p.read_bytes() for p in output.iterdir()}
@@ -256,6 +258,6 @@ def test_embedding_synthesis_probe_refuses_overwrite_and_bad_parameters(tmp_path
     assert saved == {p.name: p.read_bytes() for p in output.iterdir()}
     for bad in (['--max-groups', '7'], ['--input-width', '33'], ['--part', 'x; error injected']):
         invalid = tmp_path / 'bad'
-        assert subprocess.run([sys.executable, str(tool), '--output-dir', str(invalid)] + bad,
+        assert subprocess.run([sys.executable, str(tool), '--output-dir', str(invalid), *flags] + bad,
             capture_output=True, timeout=30).returncode != 0
         assert not invalid.exists()
