@@ -636,7 +636,25 @@ static void deltanet_layer(int l, const float *h, float *out)
         int p0 = dn_conv_pos[s], p1 = p0 == 2 ? 0 : p0 + 1;
         int p2 = p1 == 2 ? 0 : p1 + 1;
         const float *x0 = win + p0*C, *x1 = win + p1*C, *x2 = win + p2*C;
-        for (int c = 0; c < C; c++) {
+        int c = 0;
+        // Four channels have no dependency.  Preserve each channel's tap order while
+        // exposing independent multiply/add and LUT chains to the in-order RV32F core.
+        for (; c + 3 < C; c += 4) {
+            const float *cw0 = w + 4*(c + 0), *cw1 = w + 4*(c + 1);
+            const float *cw2 = w + 4*(c + 2), *cw3 = w + 4*(c + 3);
+            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            a0 += cw0[0]*x0[c + 0]; a1 += cw1[0]*x0[c + 1];
+            a2 += cw2[0]*x0[c + 2]; a3 += cw3[0]*x0[c + 3];
+            a0 += cw0[1]*x1[c + 0]; a1 += cw1[1]*x1[c + 1];
+            a2 += cw2[1]*x1[c + 2]; a3 += cw3[1]*x1[c + 3];
+            a0 += cw0[2]*x2[c + 0]; a1 += cw1[2]*x2[c + 1];
+            a2 += cw2[2]*x2[c + 2]; a3 += cw3[2]*x2[c + 3];
+            a0 += cw0[3]*qkv[c + 0]; a1 += cw1[3]*qkv[c + 1];
+            a2 += cw2[3]*qkv[c + 2]; a3 += cw3[3]*qkv[c + 3];
+            convb[c + 0] = siluf(a0); convb[c + 1] = siluf(a1);
+            convb[c + 2] = siluf(a2); convb[c + 3] = siluf(a3);
+        }
+        for (; c < C; c++) {
             const float *cw = w + 4*c;
             float acc = 0;
             acc += cw[0]*x0[c];
