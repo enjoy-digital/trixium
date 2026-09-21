@@ -561,8 +561,17 @@ static void deltanet_layer(int l, const float *h, float *out)
     float *win  = dn_conv + (uint64_t)s*(conv_k - 1)*C;
 
     uint64_t t0 = perf_now64();
-    proj_f(model_entry(ROLE_ATTN_QKV, l), h, qkv);
-    proj_f(model_entry(ROLE_ATTN_ZGATE, l), h, zb);
+    if (H->hadamard_block) {
+        // Both folded projections consume the same input basis.  proj_f used to repeat
+        // this five-block rotation for each tensor even though infer_matvec_f leaves rot
+        // untouched (48 redundant full-width rotations per 27B forward).
+        rotate_f(h, rot, n_embd);
+        infer_matvec_f(model_entry(ROLE_ATTN_QKV, l), rot, qkv);
+        infer_matvec_f(model_entry(ROLE_ATTN_ZGATE, l), rot, zb);
+    } else {
+        infer_matvec_f(model_entry(ROLE_ATTN_QKV, l), h, qkv);
+        infer_matvec_f(model_entry(ROLE_ATTN_ZGATE, l), h, zb);
+    }
     infer_matvec_f(model_entry(ROLE_SSM_BETA, l), h, betab);    // not folded
     infer_matvec_f(model_entry(ROLE_SSM_ALPHA, l), h, alphab);
     dn_cyc_inproj += perf_now64() - t0;
@@ -657,9 +666,16 @@ static void attention_layer(int l, const float *h, float *out)
     int a = attn_slot[l];
     float *K = kc + (uint64_t)a*ctx_cap*kv_dim, *V = vc + (uint64_t)a*ctx_cap*kv_dim;
     int gated = H->attn_gated;
-    proj_f(model_entry(ROLE_ATTN_Q, l), h, gated ? qfull : qb);
-    proj_f(model_entry(ROLE_ATTN_K, l), h, kb);
-    proj_f(model_entry(ROLE_ATTN_V, l), h, vb);
+    const float *pin = h;
+    if (H->hadamard_block) {
+        // Q/K/V share the input and folded basis: rotate once, not once per projection.
+        // This removes another 32 full-width rotations per 27B forward.
+        rotate_f(h, rot, n_embd);
+        pin = rot;
+    }
+    infer_matvec_f(model_entry(ROLE_ATTN_Q, l), pin, gated ? qfull : qb);
+    infer_matvec_f(model_entry(ROLE_ATTN_K, l), pin, kb);
+    infer_matvec_f(model_entry(ROLE_ATTN_V, l), pin, vb);
     if (gated)   // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
