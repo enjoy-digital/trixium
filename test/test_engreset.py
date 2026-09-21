@@ -8,6 +8,11 @@ again with bit-exact results. The scratchpad and the loader's ports are untouche
 """
 
 import numpy as np
+from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 from migen import *
 from migen.sim import run_simulation
 
@@ -22,6 +27,33 @@ from trixium.gateware.matvec import BonsaiMatVecEngine
 from trixium.gateware.loader import BonsaiHBMLoader
 from trixium.gateware.engreset import BonsaiEngineResetDomain
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+
+
+def test_compiled_system_reset_reaches_registered_engine_domain(tmp_path):
+    from migen.fhdl import verilog
+    verilator = shutil.which('verilator')
+    if not verilator:
+        pytest.skip('Verilator required to check generated reset priority')
+    dut = Module()
+    axi = AXIInterface(data_width=256, address_width=33, id_width=4)
+    dut.submodules.domain = domain = BonsaiEngineResetDomain([axi], hold_cycles=8)
+    counter, load, value, enable = Signal(32, reset=0x1234), Signal(), Signal(32), Signal()
+    dut.sync.eng += If(load, counter.eq(value)).Elif(enable, counter.eq(counter+1))
+    ports = dict(counter=counter, load=load, value=value, enable=enable,
+                 trigger=domain.trigger, engine_reset=domain.cd_eng.rst,
+                 holding=domain.holding, busy=domain.busy)
+    for name, signal in ports.items():
+        signal.name_override = name
+    rtl = tmp_path / 'engreset.v'
+    verilog.convert(dut, ios=set(ports.values()), name='engreset').write(str(rtl))
+    obj = tmp_path / 'obj'
+    built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
+        '--Mdir', str(obj), '--top-module', 'engreset', str(rtl),
+        str((Path(__file__).parent / 'rtl/engreset.cpp').resolve())], capture_output=True, text=True, timeout=120)
+    assert built.returncode == 0, built.stdout[-6000:]+built.stderr[-6000:]
+    run = subprocess.run([str(obj / 'Vengreset')], capture_output=True, text=True, timeout=20)
+    assert run.returncode == 0, run.stdout+run.stderr
+    assert 'ENGRESET_SYSTEM_PASS' in run.stdout
 
 
 class _DUT(LiteXModule):

@@ -33,6 +33,11 @@ from trixium.gateware.axi_shim import AXIResetShim
 class BonsaiEngineResetDomain(LiteXModule):
     def __init__(self, axis, hold_cycles=64, stuck_cycles=1 << 20):
         self.cd_eng  = ClockDomain("eng")
+        # This register implements its own reset equation below. Migen's
+        # ordinary sys reset insertion would otherwise append eng_rst <= 0,
+        # overriding eng_rst <= sys_rst | holding exactly while sys_rst is high.
+        # Keep the registered high-fanout reset, but do not reset its flop low.
+        self.cd_eng.rst.reset_less = True
         self.trigger = Signal()      # One-cycle pulse: start a soft reset.
         self.holding = Signal()      # The reset is asserted (hold_cycles after trigger).
         self.busy    = Signal()      # Some port is still draining: do not submit yet.
