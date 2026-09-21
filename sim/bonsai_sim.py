@@ -75,7 +75,7 @@ class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
                  dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra="",
                  mem="hbm", n_memctrl=4, update_repo="no", with_memory_traffic=False,
-                 with_capabilities=True, with_native=False):
+                 with_capabilities=True, with_native=False, with_hadamard=False):
         assert mem in ("hbm", "ddr4")
         platform = Platform()
         self.comb += platform.trace.eq(1)
@@ -208,7 +208,8 @@ class BonsaiSimSoC(SoCCore):
         config = BonsaiClusterConfig(
             with_vecunit=True, with_dual=dual, with_sp_csr=with_native, append_sp_csr=with_native,
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
-            chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0, **native)
+            chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0,
+            with_hadamard=with_hadamard, **native)
         add_bonsai_cluster(self, axis, config)
         if with_memory_traffic:
             from trixium.gateware.traffic import add_memory_traffic
@@ -353,6 +354,7 @@ def main():
     parser.add_argument("--n-memctrl",      default=4, type=int, help="--mem ddr4: controllers.")
     parser.add_argument("--with-memory-traffic", action="store_true", help="Enable coherent memory traffic counters.")
     parser.add_argument("--with-native", action="store_true", help="Enable the experimental shared native projection engine.")
+    parser.add_argument("--with-hadamard", action="store_true", help="Enable experimental sequenced scratchpad integer rotations.")
     parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
     out_dir = "build/sim" if args.mem == "hbm" else "build/sim_ddr4"
@@ -366,7 +368,7 @@ def main():
             hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
             mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
             with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
-            with_native=args.with_native)
+            with_native=args.with_native, with_hadamard=args.with_hadamard)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -379,7 +381,7 @@ def main():
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
         mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
         with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
-        with_native=args.with_native)
+        with_native=args.with_native, with_hadamard=args.with_hadamard)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the

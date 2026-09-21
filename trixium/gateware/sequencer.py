@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiSequencer: hardware execution of descriptor lists (engine + vector-unit ops).
+"""BonsaiSequencer: hardware execution of descriptor lists (engine/vector/rotation ops).
 
 Op dispatch from the CPU costs ~1k cycles per op (CSR writes + completion polling) and the
 engine/vector units serialize behind it - at N >= 16 channels dispatch dominates the token
@@ -51,8 +51,12 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           w8 = xsrc;  w9 = dst;  w10 = chan;
           w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE, F1-1).
   vec:    w1 = pc;  w2..w9 = args 0..7.
+  had:    Optional unit 3, always serialized; w0 exactly 3, w1 src, w2 signs,
+          w3 dst, w4 block count, w5 stats, w6 inverse (0/1), w7..w15 zero.
+          See docs/hadamard-scratchpad.md for bounds, ownership and raw numerics.
 
-Numerics are UNCHANGED - sequencing is transparent; the golden mirrors need no update.
+Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
+it does not silently replace a legacy dense rotation or its quantization boundary.
 
 Scratchpad access rides the engine fill port (never a fifth RAM port): descriptors are
 fetched only while both units are idle, so the integrator grants the port as
@@ -66,11 +70,14 @@ from migen import *
 from litex.gen import *
 
 from litex.soc.interconnect.csr import *
+from litex.soc.interconnect import stream
 
 # BonsaiSequencer ----------------------------------------------------------------------------------
 
 class BonsaiSequencer(LiteXModule):
-    def __init__(self):
+    def __init__(self, *, with_hadamard=False, scratchpad_size=256*1024):
+        if with_hadamard and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
+            raise ValueError("Hadamard sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
         self.count  = CSRStorage(16, description="Descriptor count (stop descriptor also ends).")
         self.start  = CSRStorage(1,  description="Write 1 to run the list.")
@@ -84,6 +91,15 @@ class BonsaiSequencer(LiteXModule):
             CSRField("busy",   size=1),
             CSRField("dcount", size=16, offset=8, description="Descriptors completed."),
         ])
+        if with_hadamard:
+            from trixium.gateware.hadamard_sp import HADAMARD_COMMAND
+            self.hadamard_cmd = stream.Endpoint(HADAMARD_COMMAND)
+            self.hadamard_done = Signal()
+            self.hadamard_failed = Signal(8)
+            self.hadamard_abi = CSRStatus(32, reset=0x00010000)
+            self.hadamard_error = CSRStatus(32, description=
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, "
+                "bit2 output overlaps descriptor list, bits8..15 rotation-unit error.")
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
@@ -162,6 +178,36 @@ class BonsaiSequencer(LiteXModule):
 
         def w(beat, i): # Word i of a captured beat.
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
+
+        list_ok = C(1, 1)
+        had_dispatch, unknown_unit = [], [NextState("IDLE")]
+        if with_hadamard:
+            list_base = Signal(24)
+            list_end = Signal(32)
+            start_end = Signal(32)
+            dst_end, stats_end = Signal(64), Signal(64)
+            malformed, list_overlap = Signal(), Signal()
+            self.comb += [
+                start_end.eq(self.base.storage + (self.count.storage << 6)),
+                dst_end.eq(w(0, 3) + (w(0, 4) << 12)),
+                stats_end.eq(w(0, 5) + (((w(0, 4) + C(7, 33)) >> 3) << 5)),
+                malformed.eq((w(0, 0) != 3) | (w(0, 1)[24:] != 0) |
+                    (w(0, 2)[24:] != 0) | (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
+                    (w(0, 5)[24:] != 0) | (w(0, 6)[1:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                list_overlap.eq(((w(0, 3) < list_end) & (list_base < dst_end)) |
+                                ((w(0, 5) < list_end) & (list_base < stats_end))),
+                self.hadamard_cmd.src.eq(w(0, 1)[:24]), self.hadamard_cmd.signs.eq(w(0, 2)[:24]),
+                self.hadamard_cmd.dst.eq(w(0, 3)[:24]), self.hadamard_cmd.blocks.eq(w(0, 4)[:16]),
+                self.hadamard_cmd.stats.eq(w(0, 5)[:24]), self.hadamard_cmd.inverse.eq(w(0, 6)[0]),
+            ]
+            list_ok = (self.base.storage[:5] == 0) & (start_end <= scratchpad_size)
+            self.sync += If(self.start.re & self.start.storage & ~self.busy,
+                list_base.eq(self.base.storage), list_end.eq(start_end))
+            had_dispatch = [If(malformed | list_overlap,
+                NextValue(self.hadamard_error.status, Cat(C(0, 1), malformed, list_overlap)),
+                NextState("HAD_FAILED"),
+            ).Else(NextState("DISPATCH_HAD"))]
+            unknown_unit = [NextValue(self.hadamard_error.status, 2), NextState("HAD_FAILED")]
 
         unit    = Signal(4)
         argsrc  = Signal(16)
@@ -384,7 +430,9 @@ class BonsaiSequencer(LiteXModule):
                 NextValue(dptr, self.base.storage[5:]),
                 NextValue(left, self.count.storage),
                 NextValue(dcount, 0),
-                NextState("SBDRAIN"),
+                If(list_ok, NextState("SBDRAIN")).Else(
+                    *([NextValue(self.hadamard_error.status, 1), NextState("HAD_FAILED")]
+                      if with_hadamard else [])),
             )
         )
         fsm.act("SBDRAIN", # Let every patch posted for this list land before fetching it.
@@ -484,10 +532,26 @@ class BonsaiSequencer(LiteXModule):
                     self.vec_start.eq(1),
                     NextState("WAIT_VEC"),
                 )
-            ).Else(
-                NextState("IDLE"), # Unknown unit: stop (firmware bug guard).
-            )
+            ).Elif(unit == 3, *(had_dispatch if with_hadamard else unknown_unit)
+            ).Else(*unknown_unit)
         )
+        if with_hadamard:
+            fsm.act("DISPATCH_HAD",
+                self.busy.eq(1),
+                # Always serialize, irrespective of an earlier engine's NOWAIT.
+                If(~eng_inflight,
+                    self.hadamard_cmd.valid.eq(1),
+                    If(self.hadamard_cmd.ready, NextState("WAIT_HAD")),
+                ),
+            )
+            fsm.act("WAIT_HAD",
+                self.busy.eq(1),
+                If(self.hadamard_failed != 0,
+                    NextValue(self.hadamard_error.status, self.hadamard_failed << 8),
+                    NextState("HAD_FAILED"),
+                ).Elif(self.hadamard_done, NextState("NEXT")),
+            )
+            fsm.act("HAD_FAILED", self.busy.eq(1))
         fsm.act("WAIT_ENG",
             self.busy.eq(1),
             If(self.eng_done,

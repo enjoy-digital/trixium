@@ -58,6 +58,7 @@ class BonsaiClusterConfig:
     native_reservations: tuple = ()
     native_endpoints: tuple = ()
     append_sp_csr: bool = False  # New peek bank after existing banks (targets that had no sp_csr).
+    with_hadamard: bool = False
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -66,6 +67,8 @@ class BonsaiClusterConfig:
             raise ValueError('native reservations/endpoints require a native region table')
         if self.with_dnrec and not self.with_vecunit:
             raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
+        if self.with_hadamard and (not self.with_vecunit or self.scratchpad_size > 256*1024):
+            raise ValueError("Hadamard needs the vector/sequencer arbiter and at most 256 KiB scratchpad")
         if self.append_sp_csr and not self.with_sp_csr:
             raise ValueError('append_sp_csr requires a scratchpad CSR port')
         for name in ("chan_stride", "chan_mod"):
@@ -104,7 +107,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative", "zzregion", "zzverify"):
+    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "hadmux", "zznative", "zzregion", "zzverify"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
@@ -120,7 +123,8 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     vecunit = seq = None
     if config.with_vecunit:
         vecunit = soc.vecunit = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
-        seq = soc.seq = ClockDomainsRenamer("eng")(BonsaiSequencer())
+        seq = soc.seq = ClockDomainsRenamer("eng")(BonsaiSequencer(
+            with_hadamard=config.with_hadamard, scratchpad_size=config.scratchpad_size))
         soc.comb += [
             vecunit.seq_en.eq(seq.busy),
             vecunit.seq_start.eq(seq.vec_start),
@@ -139,10 +143,24 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     sp_client = vecunit
     if config.with_dnrec:
         from trixium.gateware.deltanet import BonsaiDeltaNetUnit, BonsaiScratchpadClientMux
-        soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit())
+        soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(with_dispatch_guard=config.with_hadamard))
         soc.spmux = BonsaiScratchpadClientMux(vecunit, soc.dnunit)
         sp_client = soc.spmux
         soc.add_constant("BONSAI_HAS_DNREC")
+
+    previous_sp_client = sp_client
+    if config.with_hadamard:
+        from trixium.gateware.hadamard_sp import BonsaiHadamardScratchpad
+        from trixium.gateware.deltanet import BonsaiScratchpadClientMux
+        soc.hadamard = ClockDomainsRenamer("eng")(BonsaiHadamardScratchpad(config.scratchpad_size))
+        soc.hadmux = BonsaiScratchpadClientMux(sp_client, soc.hadamard)
+        sp_client = soc.hadmux
+        if config.with_dnrec:
+            # Manual vector starts are already masked by seq_en. Apply the same
+            # ownership rule to manual recurrence starts; never steal a read port.
+            soc.comb += soc.dnunit.dispatch_allowed.eq(~seq.busy)
+        soc.add_constant("BONSAI_HAS_HADAMARD")
+        soc.add_constant("BONSAI_HADAMARD_BLOCK", 1024)
 
     placement = dict(chan_stride=config.chan_stride, chan_mod=config.chan_mod,
                      chan_skew=config.chan_skew)
@@ -152,6 +170,20 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
                           seq=seq, dual=config.with_dual, **placement, **native))
     soc.engine_csr = BonsaiEngineCSR(soc.engine, seq=seq)
+    if config.with_hadamard:
+        from migen import Signal
+        available = Signal()
+        soc.comb += [
+            available.eq(~soc.engine.sp_busy & ~previous_sp_client.busy &
+                         ~soc.scratchpad.sbw_pending & ~soc.engine_csr.rst_busy &
+                         ~soc.engine_csr.rst_trigger),
+            seq.hadamard_cmd.connect(soc.hadamard.cmd, omit={"valid", "ready"}),
+            soc.hadamard.cmd.valid.eq(seq.hadamard_cmd.valid & available),
+            seq.hadamard_cmd.ready.eq(soc.hadamard.cmd.ready & available),
+            seq.hadamard_done.eq(soc.hadamard.done),
+            seq.hadamard_failed.eq(soc.hadamard.error),
+            soc.hadamard.cancel.eq(soc.engine_csr.rst_trigger | soc.engine_csr.rst_busy),
+        ]
     if config.native_regions:
         from trixium.gateware.native_csr import BonsaiNativeCSR
         soc.zznative = BonsaiNativeCSR(soc.engine, soc.engine_csr)

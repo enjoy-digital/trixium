@@ -630,7 +630,7 @@ class BonsaiDeltaNetUnit(LiteXModule):
     give this unit priority while it is busy without adding scratchpad ports.
     """
 
-    def __init__(self, core=None, rows=128, cols=128, lanes=8):
+    def __init__(self, core=None, rows=128, cols=128, lanes=8, *, with_dispatch_guard=False):
         if core is None:
             core = BonsaiDeltaNetRecurrence(rows=rows, cols=cols, lanes=lanes)
         self.core = core
@@ -649,7 +649,9 @@ class BonsaiDeltaNetUnit(LiteXModule):
         self.beta  = CSRStorage(32, description="FP32 beta bits.")
         self.scale = CSRStorage(32, description="FP32 1/sqrt(cols) bits.")
         self.submit = CSRStorage(1, description="Write 1 to run one head recurrence.")
-        self.status = CSRStatus(fields=[CSRField("busy", size=1)])
+        self.status = CSRStatus(fields=[CSRField("busy", size=1)] +
+            ([CSRField("rejected", size=1, description="Manual submit while sequencer owns scratchpad; reset required.")]
+             if with_dispatch_guard else []))
         self.done_count = CSRStatus(32)
 
         self.busy = Signal()
@@ -661,6 +663,10 @@ class BonsaiDeltaNetUnit(LiteXModule):
         self.sp_wr_we  = Signal(8)
         self.sp_wr_dat = Signal(256)
         self.sp_wr_gnt = Signal()
+        dispatch_allowed = C(1, 1)
+        if with_dispatch_guard:
+            self.dispatch_allowed = dispatch_allowed = Signal(reset=1)
+            self.sync += If(self.submit.re & ~dispatch_allowed, self.status.fields.rejected.eq(1))
 
         fsm = FSM(reset_state="IDLE")
         self.submodules.fsm = fsm
@@ -743,7 +749,7 @@ class BonsaiDeltaNetUnit(LiteXModule):
             return [NextValue(issue, 0), NextValue(response, 0), NextState(state)]
 
         fsm.act("IDLE",
-            If(self.submit.re, *begin_load("LOAD_Q"))
+            If(self.submit.re & dispatch_allowed, *begin_load("LOAD_Q"))
         )
         for name, next_name in (("LOAD_Q", "LOAD_K"), ("LOAD_K", "LOAD_V"),
                                 ("LOAD_V", "STATE_INIT")):

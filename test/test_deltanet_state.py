@@ -4,6 +4,8 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
+import pytest
+
 from migen import *
 from migen.fhdl.tools import list_targets
 from migen.sim import run_simulation
@@ -273,14 +275,15 @@ def test_deltanet_recurrence_scheduler_preserves_row_order():
     assert result["cycles"] < 2000
 
 
-def test_deltanet_scratchpad_unit_moves_a_complete_head():
+@pytest.mark.parametrize('with_guard', [False, True])
+def test_deltanet_scratchpad_unit_moves_a_complete_head(with_guard):
     rows, cols, lanes = 96, 16, 8
     core = BonsaiDeltaNetRecurrence(
         rows=rows, cols=cols, lanes=lanes,
         add_factory=_IntAdd, mul_factory=_IntMul,
         negate=lambda x: -x,
     )
-    dut = BonsaiDeltaNetUnit(core=core)
+    dut = BonsaiDeltaNetUnit(core=core, with_dispatch_guard=with_guard)
     state = [[1 + (r % 3) + (c % 2) for c in range(cols)] for r in range(rows)]
     kval = [1, 1] + [0]*(cols - 2)
     qval = [1, 1] + [0]*(cols - 2)
@@ -324,6 +327,23 @@ def test_deltanet_scratchpad_unit_moves_a_complete_head():
     result = {}
 
     def gen():
+        if with_guard:
+            yield dut.dispatch_allowed.eq(0)
+            yield dut.submit.re.eq(1)
+            yield
+            yield dut.submit.re.eq(0)
+            for _ in range(8):
+                yield
+                assert not (yield dut.busy)
+                assert not (yield dut.sp_rd_req)
+                assert not (yield dut.sp_wr_req)
+                assert (yield dut.done_count.status) == 0
+                assert (yield dut.status.fields.rejected)
+            # Rejected work is not queued when ownership becomes available.
+            yield dut.dispatch_allowed.eq(1)
+            for _ in range(4):
+                yield
+                assert not (yield dut.busy)
         for csr, value in ((dut.q_base, qbase), (dut.k_base, kbase),
                            (dut.v_base, vbase), (dut.state_base, sbase),
                            (dut.out_base, obase), (dut.decay, 1),
@@ -350,6 +370,8 @@ def test_deltanet_scratchpad_unit_moves_a_complete_head():
             word = (yield mem[obase//32 + i//8])
             outs.append((word >> (32*(i % 8))) & 0xffffffff)
         result["out"] = outs
+        if with_guard:
+            assert (yield dut.status.fields.rejected)  # Sticky until reset.
 
     run_simulation(dut, gen())
     assert result["state"] == expected
