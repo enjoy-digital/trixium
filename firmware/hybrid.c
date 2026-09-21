@@ -561,19 +561,20 @@ static void deltanet_layer(int l, const float *h, float *out)
     float *win  = dn_conv + (uint64_t)s*(conv_k - 1)*C;
 
     uint64_t t0 = perf_now64();
+    const float *folded = h;
     if (H->hadamard_block) {
         // Both folded projections consume the same input basis.  proj_f used to repeat
         // this five-block rotation for each tensor even though infer_matvec_f leaves rot
         // untouched (48 redundant full-width rotations per 27B forward).
         rotate_f(h, rot, n_embd);
-        infer_matvec_f(model_entry(ROLE_ATTN_QKV, l), rot, qkv);
-        infer_matvec_f(model_entry(ROLE_ATTN_ZGATE, l), rot, zb);
-    } else {
-        infer_matvec_f(model_entry(ROLE_ATTN_QKV, l), h, qkv);
-        infer_matvec_f(model_entry(ROLE_ATTN_ZGATE, l), h, zb);
+        folded = rot;
     }
-    infer_matvec_f(model_entry(ROLE_SSM_BETA, l), h, betab);    // not folded
-    infer_matvec_f(model_entry(ROLE_SSM_ALPHA, l), h, alphab);
+    int e8 = infer_quantize_f(folded, n_embd);
+    infer_matvec_f_quantized(model_entry(ROLE_ATTN_QKV, l), e8, qkv);
+    infer_matvec_f_quantized(model_entry(ROLE_ATTN_ZGATE, l), e8, zb);
+    e8 = infer_quantize_f(h, n_embd);                           // beta/alpha are not folded
+    infer_matvec_f_quantized(model_entry(ROLE_SSM_BETA, l), e8, betab);
+    infer_matvec_f_quantized(model_entry(ROLE_SSM_ALPHA, l), e8, alphab);
     dn_cyc_inproj += perf_now64() - t0;
     t0 = perf_now64();
     for (int hh = 0; hh < nv; hh++) {
@@ -673,9 +674,10 @@ static void attention_layer(int l, const float *h, float *out)
         rotate_f(h, rot, n_embd);
         pin = rot;
     }
-    infer_matvec_f(model_entry(ROLE_ATTN_Q, l), pin, gated ? qfull : qb);
-    infer_matvec_f(model_entry(ROLE_ATTN_K, l), pin, kb);
-    infer_matvec_f(model_entry(ROLE_ATTN_V, l), pin, vb);
+    int e8 = infer_quantize_f(pin, n_embd);
+    infer_matvec_f_quantized(model_entry(ROLE_ATTN_Q, l), e8, gated ? qfull : qb);
+    infer_matvec_f_quantized(model_entry(ROLE_ATTN_K, l), e8, kb);
+    infer_matvec_f_quantized(model_entry(ROLE_ATTN_V, l), e8, vb);
     if (gated)   // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
@@ -746,8 +748,9 @@ int hybrid_forward(int token, int want_logits)
         if (H->hadamard_block) rotate_f(hb, rot, n_embd); else memcpy(rot, hb, (size_t)n_embd*4);
         hyb_cyc_fprep += perf_now64() - t0;
         t0 = perf_now64();
-        infer_matvec_f(model_entry(ROLE_FFN_GATE, l), rot, gateb);
-        infer_matvec_f(model_entry(ROLE_FFN_UP, l), rot, upb);
+        int e8 = infer_quantize_f(rot, n_embd);
+        infer_matvec_f_quantized(model_entry(ROLE_FFN_GATE, l), e8, gateb);
+        infer_matvec_f_quantized(model_entry(ROLE_FFN_UP, l), e8, upb);
         hyb_cyc_fproj += perf_now64() - t0;
         t0 = perf_now64();
         for (int i = 0; i < ffn_dim; i++) gateb[i] = siluf(gateb[i])*upb[i];

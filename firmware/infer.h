@@ -65,6 +65,8 @@ void infer_spec_stats(int *acc, int *rej);  // Accepted / rejected draft counts.
 struct bons_entry;
 uint32_t infer_matvec_cols(const struct bons_entry *e);   // K of the whole matvec (K-segments summed).
 void     infer_matvec_f(const struct bons_entry *e, const float *src, float *dst);
+int      infer_quantize_f(const float *src, uint32_t n);  // Put Q8 input in SP_X; return exponent.
+void     infer_matvec_f_quantized(const struct bons_entry *e, int e8, float *dst);
 void    *infer_halloc(uint64_t n, int big);
 uint64_t infer_heap_room(int big);
 void     infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n);

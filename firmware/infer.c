@@ -552,6 +552,20 @@ uint32_t infer_matvec_cols(const struct bons_entry *e)   // K of the whole matve
 }
 
 static int32_t *kseg_acc;    // rows int32, sized on first use to the widest such tensor.
+
+int infer_quantize_f(const float *src, uint32_t n)
+{
+    return quantize_f_pow2(src, n, SP_X);
+}
+
+void infer_matvec_f_quantized(const struct bons_entry *e, int e8, float *dst)
+{
+    // SP_X is read-only to the engine, so consecutive non-K-segment projections with the
+    // same input can reuse its exact bytes and exponent.  hybrid.c is the only caller.
+    if (!rot_scratch) rot_scratch = halloc((SP_H - SP_Y));
+    matvec_f_one(e, ldexpf(1.0f, e8), dst, 0, 0);
+}
+
 void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
 {
     if (!rot_scratch) rot_scratch = halloc((SP_H - SP_Y));
@@ -564,15 +578,12 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
     uint32_t cols = infer_matvec_cols(e);
     if (!kseg_acc) {
         // The widest K-split tensor decides both buffers (the table is small; once).
-        uint32_t max_rows = 0, max_cols = 0;
+        uint32_t max_rows = 0;
         const struct bons_entry *tab = model_entry_at(0);
         for (uint32_t i = 0; i < H->n_tensors; i++) {
             const struct bons_entry *t = &tab[i];
             if (!(t->flags & FLAG_KSEG) || t->kseg != 0) continue;
-            uint32_t c = 0;
-            for (int k = 0; k < model_entry_nkseg(t); k++) c += model_entry_kseg(t, k)->cols;
             if (t->rows > max_rows) max_rows = t->rows;
-            if (c > max_cols) max_cols = c;
         }
         kseg_acc = halloc(max_rows*4);
     }
