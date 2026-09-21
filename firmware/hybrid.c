@@ -32,6 +32,7 @@
 #include "infer.h"
 #include "hybrid.h"
 #include "perf.h"
+#include "fastmath.h"
 
 static const struct bons_header *H;
 static int n_ch, n_embd, n_head, n_kv_head, head_dim, ffn_dim, n_layer, q_dim, kv_dim, n_rep;
@@ -177,7 +178,6 @@ int hybrid_present(void)
 // Helpers -------------------------------------------------------------------------------------
 
 static float sigmoidf(float x) { return 1.0f/(1.0f + expf(-x)); }
-static float siluf(float x)    { return x/(1.0f + expf(-x)); }
 static float softplusf(float x){ return x > 20.0f ? x : log1pf(expf(x)); }
 
 static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
@@ -549,7 +549,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         float acc = 0;
         for (int i = 0; i < conv_k - 1; i++) acc += w[c*conv_k + i]*win[i*C + c];
         acc += w[c*conv_k + conv_k - 1]*qkv[c];
-        convb[c] = siluf(acc);
+        convb[c] = bonsai_siluf(acc);
     }
     for (int i = 0; i < conv_k - 2; i++)
         memcpy(win + i*C, win + (i + 1)*C, (size_t)C*4);
@@ -614,7 +614,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         rmsnorm_fv(delta, oh, norm_ssm[l], hv);
         float *dst = og + gpos*hv;
         const float *z = zb + hh*hv;
-        for (int j = 0; j < hv; j++) dst[j] = delta[j]*siluf(z[j]);
+        for (int j = 0; j < hv; j++) dst[j] = delta[j]*bonsai_siluf(z[j]);
         dn_cyc_gate += perf_now64() - t0;
     }
     t0 = perf_now64();
@@ -704,7 +704,7 @@ int hybrid_forward(int token, int want_logits)
         infer_matvec_f(model_entry(ROLE_FFN_UP, l), rot, upb);
         hyb_cyc_fproj += perf_now64() - t0;
         t0 = perf_now64();
-        for (int i = 0; i < ffn_dim; i++) gateb[i] = siluf(gateb[i])*upb[i];
+        for (int i = 0; i < ffn_dim; i++) gateb[i] = bonsai_siluf(gateb[i])*upb[i];
         hyb_cyc_fact += perf_now64() - t0;
         t0 = perf_now64();
         proj_f(model_entry(ROLE_FFN_DOWN, l), gateb, tmp_h);
