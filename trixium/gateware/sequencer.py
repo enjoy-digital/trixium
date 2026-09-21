@@ -61,6 +61,9 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
            exponent, w6 blocks of 1024, w7..w15 zero. See docs/rotation-requantization.md.
   native: Optional units 6 (pipe region/offset/stride setup) and 7 (projection),
           always serialized. See docs/native-sequencer.md for their strict ABI.
+  restore: Optional unit 8, serialized; w0 exactly 8, w1 int32 src, w2 FP32 dst,
+           w3 resident exponent beat, w4 elements, w5 signed adjustment (R-B),
+           w6..w15 zero. See docs/projection-restoration.md.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -82,10 +85,11 @@ from litex.soc.interconnect import stream
 # BonsaiSequencer ----------------------------------------------------------------------------------
 
 class BonsaiSequencer(LiteXModule):
-    def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0, scratchpad_size=256*1024):
+    def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0,
+                 with_projection_restore=False, scratchpad_size=256*1024):
         if not isinstance(native_pipes, int) or not 0 <= native_pipes <= 31:
             raise ValueError('native_pipes must be in [0, 31]')
-        extended = with_hadamard or with_activation_quantize or native_pipes
+        extended = with_hadamard or with_activation_quantize or native_pipes or with_projection_restore
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
@@ -136,6 +140,18 @@ class BonsaiSequencer(LiteXModule):
             self.native_engine_busy = Signal()
             self.native_manual_drain = Signal()
             self.eng_native = Signal()
+        if with_projection_restore:
+            # Append after native CSRs so all previously existing profiles keep
+            # their register addresses when this independent option is enabled.
+            from trixium.gateware.projection_restore_sp import RESTORE_COMMAND
+            self.projection_restore_cmd = stream.Endpoint(RESTORE_COMMAND)
+            self.projection_restore_done = Signal()
+            self.projection_restore_failed = Signal(8)
+            self.projection_restore_abi = CSRStatus(32, reset=0x00010000)
+            self.projection_restore_error = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
+                'bits8..15 restoration-client error (bit14 protects the full descriptor list).')
+            extension_errors.append(self.projection_restore_error)
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
@@ -216,7 +232,7 @@ class BonsaiSequencer(LiteXModule):
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
 
         list_ok = C(1, 1)
-        had_dispatch, quant_dispatch, bad_list = [], [], []
+        had_dispatch, quant_dispatch, restore_dispatch, bad_list = [], [], [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24)
@@ -267,6 +283,21 @@ class BonsaiSequencer(LiteXModule):
             quant_dispatch = [If(malformed,
                 NextValue(self.activation_quantize_error.status, 2), NextState("EXT_FAILED"),
             ).Else(NextState("DISPATCH_QUANT"))]
+        if with_projection_restore:
+            malformed = Signal()
+            command = self.projection_restore_cmd
+            self.comb += [
+                malformed.eq((w(0, 0) != 8) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                    (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
+                    (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
+                command.exponents.eq(w(0, 3)[:24]), command.elements.eq(w(0, 4)[:16]),
+                command.adjustment.eq(w(0, 5)),
+                command.protect_start.eq(list_base), command.protect_end.eq(list_end),
+            ]
+            restore_dispatch = [If(malformed,
+                NextValue(self.projection_restore_error.status, 2), NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_RESTORE'))]
         if native_pipes:
             cfg_malformed, cfg_channel_bad = Signal(), Signal()
             projection_malformed, projection_overlap = Signal(), Signal()
@@ -632,6 +663,7 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 5, *(quant_dispatch if with_activation_quantize else unknown_unit)
             ).Elif(unit == 6, *(cfg_dispatch if native_pipes else unknown_unit)
             ).Elif(unit == 7, *(native_dispatch if native_pipes else unknown_unit)
+            ).Elif(unit == 8, *(restore_dispatch if with_projection_restore else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -661,6 +693,15 @@ class BonsaiSequencer(LiteXModule):
                 ).Elif(self.activation_quantize_done, NextState("NEXT")))
         if extended:
             fsm.act("EXT_FAILED", self.busy.eq(1))
+        if with_projection_restore:
+            fsm.act('DISPATCH_RESTORE', self.busy.eq(1),
+                If(~eng_inflight, self.projection_restore_cmd.valid.eq(1),
+                    If(self.projection_restore_cmd.ready, NextState('WAIT_RESTORE'))))
+            fsm.act('WAIT_RESTORE', self.busy.eq(1),
+                If(self.projection_restore_failed != 0,
+                    NextValue(self.projection_restore_error.status, self.projection_restore_failed << 8),
+                    NextState('EXT_FAILED'),
+                ).Elif(self.projection_restore_done, NextState('NEXT')))
         if native_pipes:
             fsm.act('DISPATCH_NATIVE_CFG', self.busy.eq(1),
                 If(self.native_failed,

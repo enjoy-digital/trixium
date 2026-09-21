@@ -36,7 +36,8 @@ class BonsaiProjectionRestoreScratchpad(LiteXModule):
     6 protected output. Any failure stays busy until cancel/reset; all partial
     output is invalid. done publishes success only after all accepted writes
     and a drain cycle. This client does not combine K-segments or publish a
-    model result, and is not yet connected to board/sequencer construction.
+    model result. Optional sequencer unit 8 supplies exclusive ownership and
+    the protected descriptor-list interval through the shared integration.
     """
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:

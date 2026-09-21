@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause
-// Full shared scratchpad: FP32 -> block Q8 -> Hadamard -> whole-vector Q8.
+// Full shared scratchpad: FP32 -> block Q8 -> Hadamard -> whole-vector Q8,
+// optionally native K-segments -> wrapping int32 reduce -> restored FP32.
 #include "Vactivation_cluster.h"
 #include "verilated.h"
 #include <algorithm>
@@ -9,12 +10,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 static void require(bool ok, const char *why) {
     if (!ok) { std::fprintf(stderr, "%s\n", why); std::exit(1); }
 }
 static uint32_t rng=537;
+#ifdef NATIVE_CHAIN
+static constexpr unsigned native_bias=12, native_rshift=5;
+static constexpr int native_factor=1 << (native_bias-native_rshift);
+#endif
 static uint32_t random_word() { rng=rng*1664525u+1013904223u; return rng; }
 static uint32_t bits(float x) { uint32_t u; std::memcpy(&u, &x, 4); return u; }
 static void tick(Vactivation_cluster &d) { d.sys_clk=0; d.eval(); d.sys_clk=1; d.eval(); }
@@ -47,13 +53,24 @@ static void start(Vactivation_cluster &d, const std::array<uint32_t, 16> &words,
         unsigned per_segment=groups/segments;
         for (unsigned segment=0; segment<segments; segment++) {
             const std::array<uint32_t,16> cfg={6,0,7,0x10000+segment*per_segment*28,0,136*28,0,0,0,0,0,0,0,0,0,0};
-            const std::array<uint32_t,16> project={7,0,3,0,0,0,per_segment<<8,0,
+            const std::array<uint32_t,16> project={7,0,3,0,0,0,per_segment<<8,native_bias | (native_rshift<<16),
                 0xa000+segment*per_segment*128,0xe800+segment*32,0,0,0,0,0,0};
             for (unsigned i=0; i<16; i++) access(d,64*count+i*4,true,cfg[i]);
             count++;
             for (unsigned i=0; i<16; i++) access(d,64*count+i*4,true,project[i]);
             count++;
         }
+        if (segments==2) {
+            // Existing vector program, out-of-place so each native partial
+            // remains independently checkable. Its int32 VADD wraps before FP32.
+            const std::array<uint32_t,16> reduce={2,0,0xe800,0xe820,0xe840,1,0,0,0,0,0,0,0,0,0,0};
+            for (unsigned i=0; i<16; i++) access(d,64*count+i*4,true,reduce[i]);
+            count++;
+        }
+        const std::array<uint32_t,16> restore={8,segments==2 ? 0xe840u : 0xe800u,0xe860,0xa00,3,
+            uint32_t(int(native_rshift)-int(native_bias)),0,0,0,0,0,0,0,0,0,0};
+        for (unsigned i=0; i<16; i++) access(d,64*count+i*4,true,restore[i]);
+        count++;
 #endif
     }
     d.seq_base=0; d.seq_count=count; d.seq_start=1; d.seq_start_re=1; tick(d); d.seq_start_re=0;
@@ -65,7 +82,7 @@ static void reset_cluster(Vactivation_cluster &d) {
     require(!d.reset_busy && !d.reset_stuck && !(d.seq_status & 1) && !d.seq_error && !d.had_error,
             "cluster reset did not recover");
 #ifdef NATIVE_CHAIN
-    require(!d.native_error,"native sequencer did not reset");
+    require(!d.native_error && !d.restore_error && !d.restore_busy,"native/restoration sequencer did not reset");
 #endif
 }
 static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks, bool rotate=false, bool wide_scales=true) {
@@ -102,6 +119,10 @@ static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks,
     if (rotate) {
         for (unsigned i=0; i<8; i++) access(d,0xa00+i*4,true,0xdeadbeef);
         access(d,0x9ffc,true,0xdeadbeef); access(d,0xa000+length,true,0xdeadbeef);
+#ifdef NATIVE_CHAIN
+        for (unsigned i=0; i<16; i++) access(d,0xe800+i*4,true,0); // Reduction padding.
+        for (unsigned i=0; i<8; i++) access(d,0xe860+i*4,true,0xdeadbeef);
+#endif
     }
     start(d, quant(elements,blocks), rotate);
     unsigned cycles=0;
@@ -109,14 +130,14 @@ static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks,
         require(!d.seq_error && !d.had_error, "resident conversion/rotation failed");
 #ifdef NATIVE_CHAIN
         if (d.native_error) std::fprintf(stderr,"native error=%x dcount=%u\n",d.native_error,d.seq_status>>8);
-        require(!d.native_error,"resident native projection failed");
+        require(!d.native_error && !d.restore_error,"resident native projection/restoration failed");
 #endif
         if (!(d.seq_status & 1)) break;
         tick(d);
     }
     unsigned descriptors=rotate ? 3 : 1;
 #ifdef NATIVE_CHAIN
-    if (rotate) descriptors += length>96*128 ? 4 : 2;
+    if (rotate) descriptors += length>96*128 ? 6 : 3;
 #endif
     require(cycles<100000 && ((d.seq_status >> 8) & 0xffff)==descriptors, "list did not retire exactly");
     require(d.quant_blocks==blocks && d.quant_reads==(rotate ? blocks*130 : length/4) && d.quant_writes==length/32,
@@ -175,8 +196,24 @@ static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks,
         require(access(d,0x9ffc,false)==0xdeadbeef && access(d,0xa000+length,false)==0xdeadbeef,"requant output guard clobbered");
 #ifdef NATIVE_CHAIN
         for (unsigned part=0; part<length/segment; part++) for (unsigned row=0; row<3; row++)
-            require(int32_t(access(d,0xe800+part*32+row*4,false))==projections[part][row],
+            require(int32_t(access(d,0xe800+part*32+row*4,false))==projections[part][row]*native_factor,
                     "resident Q8 to compact native projection mismatch");
+        for (unsigned row=0; row<3; row++) {
+            // Explicit unsigned wrapping, avoiding signed C++ overflow UB.
+            uint32_t combined=uint32_t(projections[0][row]*native_factor);
+            if (length/segment==2) {
+                combined += uint32_t(projections[1][row]*native_factor);
+                require(access(d,0xe840+row*4,false)==combined,"resident integer K-segment reduction mismatch");
+            }
+            int32_t integer;
+            std::memcpy(&integer,&combined,4);
+            volatile float converted=float(integer), restore_scale=std::ldexp(1.0f,exponent+int(native_rshift)-int(native_bias));
+            float restored=converted*restore_scale;
+            require(access(d,0xe860+row*4,false)==bits(restored),"resident restored FP32 projection mismatch");
+        }
+        for (unsigned row=3; row<8; row++)
+            require(access(d,0xe860+row*4,false)==0xdeadbeef,"restoration tail clobbered");
+        require(d.restore_reads==2 && d.restore_writes==1,"restoration traffic mismatch");
 #endif
     }
     std::printf("resident_quant elements=%u blocks=%u rotate=%u wide_scales=%u sequence_cycles=%u\n",elements,blocks,rotate,wide_scales,cycles);
@@ -185,6 +222,18 @@ int main() {
     Vactivation_cluster d;
     d.sys_rst=1; tick(d); tick(d); d.sys_rst=0;
     for (unsigned i=0; i<100; i++) tick(d);
+#ifdef NATIVE_CHAIN
+    std::ifstream program("reduce_program.bin",std::ios::binary);
+    require(program.good(),"missing assembled vector reduction program");
+    d.prog_address=0; d.prog_address_re=1; tick(d); d.prog_address_re=0; tick(d);
+    std::array<unsigned char,4> code{};
+    unsigned instructions=0;
+    while (program.read(reinterpret_cast<char*>(code.data()),4)) {
+        d.prog_value=uint32_t(code[0]) | uint32_t(code[1])<<8 | uint32_t(code[2])<<16 | uint32_t(code[3])<<24;
+        d.prog_re=1; tick(d); d.prog_re=0; tick(d); instructions++;
+    }
+    require(program.eof() && !program.gcount() && instructions>0,"truncated reduction program");
+#endif
     complete(d,1024,17,true); complete(d,1024,17,true,false);
     complete(d,17408,1); complete(d,5120,1); complete(d,32,5);
     for (unsigned stop : {20u,160u,260u,1300u,6000u,22000u,23000u}) {
@@ -200,7 +249,68 @@ int main() {
     require(native_wait<50000,"native reset case never entered projection");
     for (unsigned i=0; i<100; i++) tick(d);
     reset_cluster(d); complete(d,1024,17,true,false);
-    std::puts("NATIVE_CHAIN_PASS full_ffn_segments=68+68 rows=3 native_reset_reuse=1");
+    // Common reset while the restoration client owns the shared ports; no CPU
+    // staging in the list, then reuse the same microcode and all resident units.
+    start(d,quant(1024,17),true);
+    unsigned restore_wait=0;
+    while (restore_wait++<50000 && !d.restore_busy) tick(d);
+    require(restore_wait<50000,"restoration reset case never entered client");
+    for (unsigned i=0; i<5; i++) tick(d);
+    reset_cluster(d); complete(d,1024,17,true,false);
+    std::puts("NATIVE_CHAIN_PASS full_ffn_segments=68+68 rows=3 bias=12 rshift=5 native_reset_reuse=1 restore_reset_reuse=1 integer_reduce=1 final_fp32=1");
+    {
+        // Exercise the conversion's rounding boundary through the ACTUAL vector
+        // program and shared memory, not only through scalar primitive tests.
+        const std::array<uint32_t,8> a={16777217u,0x7fffffffu,0x80000000u,uint32_t(-7),16777219u,0,1,0xffffffffu};
+        const std::array<uint32_t,8> b={uint32_t(-16777216),1,0xffffffffu,7,uint32_t(-16777216),0,0xffffffffu,1};
+        for (unsigned i=0; i<8; i++) { access(d,0xe800+i*4,true,a[i]); access(d,0xe820+i*4,true,b[i]); }
+        access(d,0xa00,true,0);
+        const std::array<uint32_t,16> reduce={2,0,0xe800,0xe820,0xe840,1,0,0,0,0,0,0,0,0,0,0};
+        const std::array<uint32_t,16> restore={8,0xe840,0xe840,0xa00,8,0,0,0,0,0,0,0,0,0,0,0};
+        for (unsigned i=0; i<16; i++) { access(d,i*4,true,reduce[i]); access(d,64+i*4,true,restore[i]); }
+        d.seq_base=0; d.seq_count=2; d.seq_start=1; d.seq_start_re=1; tick(d); d.seq_start_re=0;
+        for (unsigned i=0; i<300 && (d.seq_status&1); i++) tick(d);
+        require(!(d.seq_status&1) && !d.restore_error && (d.seq_status>>8)==2,"integer reduce/restore did not retire");
+        for (unsigned i=0; i<8; i++) {
+            uint32_t combined=a[i]+b[i];
+            int32_t integer;
+            std::memcpy(&integer,&combined,4);
+            require(access(d,0xe840+i*4,false)==bits(float(integer)),"integer wrap/FP32 rounding order mismatch");
+        }
+        require(access(d,0xe840,false)==bits(1.0f),"K-segments were converted before summation");
+        std::puts("RESTORE_CHAIN_NUMERICS_PASS int32_wrap=1 conversion_after_reduce=1 inplace=1");
+    }
+    for (unsigned mode=0; mode<20; mode++) {
+        std::array<uint32_t,16> words={8,0xe800,0xe860,0xa00,3,0,0,0,0,0,0,0,0,0,0,0};
+        for (unsigned i=0; i<8; i++) access(d,0xe800+i*4,true,0);
+        access(d,0xa00,true,0); access(d,0xe860,true,0xdeadbeef);
+        if (mode==0) words[0] |= 1u<<9;
+        if (mode>=1 && mode<=3) words[mode] |= 1u<<24;
+        if (mode==4) words[4]=65536;
+        if (mode==5) words[6]=1;
+        if (mode==6) words[15]=1;
+        if (mode==7) words[1]++;
+        if (mode==8) words[2]++;
+        if (mode==9) words[3]++;
+        if (mode==10) words[4]=0;
+        if (mode==11) { words[1]=0x3ffe0; words[4]=9; }
+        if (mode==12) words[3]=0xffffe0;
+        if (mode==13) { words[2]=0xe820; words[4]=17; }
+        if (mode==14) words[2]=64; // Protect the entire two-descriptor list.
+        if (mode==15) access(d,0xa00,true,128);
+        if (mode==16) access(d,0xa00,true,0x40000000);
+        if (mode==17) { access(d,0xa00,true,0x7fffffff); words[5]=1; }
+        if (mode==18) { access(d,0xa00,true,0x80000000); words[5]=0xffffffff; }
+        if (mode==19) { access(d,0xa00,true,127); access(d,0xe800,true,0x7fffffff); }
+        for (unsigned i=0; i<16; i++) { access(d,i*4,true,words[i]); access(d,64+i*4,true,0); }
+        d.seq_base=0; d.seq_count=2; d.seq_start=1; d.seq_start_re=1; tick(d); d.seq_start_re=0;
+        for (unsigned i=0; i<100; i++) tick(d);
+        require((d.seq_status&1) && d.restore_error && !((d.seq_status>>8)&0xffff),"invalid restoration was published");
+        require(access(d,0,false)==words[0] && access(d,64,false)==0,"invalid restoration corrupted descriptor list");
+        require(access(d,0xe860,false)==0xdeadbeef,"invalid restoration wrote output");
+        reset_cluster(d);
+    }
+    std::puts("RESTORE_CHAIN_REJECT_PASS cases=20 common_reset=20");
 #endif
     for (unsigned mode=0; mode<15; mode++) {
         auto words=quant(1024,1);

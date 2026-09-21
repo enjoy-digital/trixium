@@ -146,7 +146,8 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path, nati
     if native:
         from test_native_reader import region
         options = dict(native_regions=(region(7, size=256*1024),), native_endpoints=(0,))
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, with_activation_quantize=True, **options), n=1)
+    dut = SoC(BonsaiClusterConfig(with_hadamard=True, with_activation_quantize=True,
+                                 with_projection_restore=native, **options), n=1)
     if native:
         import numpy as np
         from trixium.model.qformats import ptq1_0_pack
@@ -172,7 +173,16 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path, nati
         quant_writes=dut.activation_quantize.output_beats)
     if native:
         signals.update(native_error=dut.seq.native_error.status, engine_done=dut.engine_csr.done_count.status,
-                       engine_busy=dut.engine.busy)
+                       engine_busy=dut.engine.busy, restore_error=dut.seq.projection_restore_error.status,
+                       restore_busy=dut.projection_restore.busy,
+                       restore_reads=dut.projection_restore.read_beats,
+                       restore_writes=dut.projection_restore.output_beats,
+                       prog_value=dut.vecunit.prog.storage, prog_re=dut.vecunit.prog.re,
+                       prog_address=dut.vecunit.prog_adr.storage, prog_address_re=dut.vecunit.prog_adr.re)
+        from trixium.model import asm
+        import struct
+        program = asm.assemble(asm.prog_reduce_acc())
+        (tmp_path / 'reduce_program.bin').write_bytes(struct.pack('<' + 'I'*len(program), *program))
     for name, signal in signals.items():
         signal.name_override = name
     rtl = tmp_path / 'activation_cluster.v'

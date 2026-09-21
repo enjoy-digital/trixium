@@ -60,6 +60,7 @@ class BonsaiClusterConfig:
     append_sp_csr: bool = False  # New peek bank after existing banks (targets that had no sp_csr).
     with_hadamard: bool = False
     with_activation_quantize: bool = False
+    with_projection_restore: bool = False
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -68,7 +69,7 @@ class BonsaiClusterConfig:
             raise ValueError('native reservations/endpoints require a native region table')
         if self.with_dnrec and not self.with_vecunit:
             raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
-        if (self.with_hadamard or self.with_activation_quantize) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
+        if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
             raise ValueError("Resident clients need the vector/sequencer arbiter and at most 256 KiB scratchpad")
         if self.native_regions and self.with_vecunit and self.scratchpad_size > 256*1024:
             raise ValueError('Native sequencer needs at most 256 KiB scratchpad')
@@ -111,7 +112,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "hadmux", "activation_quantize", "actmux", "zznative", "zzregion", "zzverify"):
+    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "hadmux", "activation_quantize", "actmux", "projection_restore", "restoremux", "zznative", "zzregion", "zzverify"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
@@ -129,6 +130,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         vecunit = soc.vecunit = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
         seq = soc.seq = ClockDomainsRenamer("eng")(BonsaiSequencer(
             with_hadamard=config.with_hadamard, with_activation_quantize=config.with_activation_quantize,
+            with_projection_restore=config.with_projection_restore,
             native_pipes=len(ports) if config.native_regions else 0, scratchpad_size=config.scratchpad_size))
         soc.comb += [
             vecunit.seq_en.eq(seq.busy),
@@ -149,14 +151,14 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     if config.with_dnrec:
         from trixium.gateware.deltanet import BonsaiDeltaNetUnit, BonsaiScratchpadClientMux
         soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(
-            with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.native_regions)))
+            with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.native_regions)))
         soc.spmux = BonsaiScratchpadClientMux(vecunit, soc.dnunit)
         sp_client = soc.spmux
         soc.add_constant("BONSAI_HAS_DNREC")
 
     previous_sp_client = sp_client
     extensions = []
-    if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize or config.native_regions):
+    if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.native_regions):
         # Manual vector starts are already masked by seq_en. Apply the same
         # ownership rule to manual recurrence starts; never steal a read port.
         soc.comb += soc.dnunit.dispatch_allowed.eq(~seq.busy)
@@ -177,6 +179,14 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         sp_client = soc.actmux
         extensions.append(("activation_quantize", soc.activation_quantize))
         soc.add_constant("BONSAI_HAS_ACTIVATION_QUANTIZE")
+    if config.with_projection_restore:
+        from trixium.gateware.projection_restore_sp import BonsaiProjectionRestoreScratchpad
+        from trixium.gateware.deltanet import BonsaiScratchpadClientMux
+        soc.projection_restore = ClockDomainsRenamer("eng")(BonsaiProjectionRestoreScratchpad(config.scratchpad_size))
+        soc.restoremux = BonsaiScratchpadClientMux(sp_client, soc.projection_restore)
+        sp_client = soc.restoremux
+        extensions.append(("projection_restore", soc.projection_restore))
+        soc.add_constant("BONSAI_HAS_PROJECTION_RESTORE")
 
     placement = dict(chan_stride=config.chan_stride, chan_mod=config.chan_mod,
                      chan_skew=config.chan_skew)

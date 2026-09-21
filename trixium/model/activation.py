@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-2-Clause
-"""Portable resident FP32 -> block/vector Q8 descriptor encoding."""
+"""Portable resident activation conversion and projection restoration descriptors."""
 
 
 def scratchpad_quantize_descriptor(*, src, dst, exponents, elements, blocks=1):
@@ -35,3 +35,21 @@ def scratchpad_requantize_descriptor(*, src, dst, exponents, maxima, result_expo
     if not isinstance(blocks, int) or not 1 <= blocks < 65536:
         raise ValueError('blocks must be in [1, 65535]')
     return [5, src, dst, exponents, maxima, result_exponent, blocks] + [0]*9
+
+
+def scratchpad_restore_descriptor(*, src, dst, exponents, elements, adjustment=0):
+    """Encode optional unit 8; check seq.projection_restore_abi major 1 first.
+
+    Restore int32 to FP32 after any wrapping int32 K-segment reduction. The
+    low lane at exponents holds signed int32 e8; adjustment is normally R-B.
+    The client validates the full-width sum, physical spans and list protection.
+    src==dst is supported; inactive final destination lanes are preserved.
+    """
+    for name, value in (('src', src), ('dst', dst), ('exponents', exponents)):
+        if not isinstance(value, int) or value < 0 or value >= 1 << 24 or value % 32:
+            raise ValueError(name + ' must be a 32-byte-aligned unsigned 24-bit address')
+    if not isinstance(elements, int) or not 1 <= elements < 65536:
+        raise ValueError('elements must be in [1, 65535]')
+    if not isinstance(adjustment, int) or not -(1 << 31) <= adjustment < 1 << 31:
+        raise ValueError('adjustment must be a signed int32')
+    return [8, src, dst, exponents, elements, adjustment & 0xffffffff] + [0]*10
