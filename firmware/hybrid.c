@@ -70,6 +70,15 @@ static uint64_t hyb_cyc_resid, hyb_cyc_fprep, hyb_cyc_fproj, hyb_cyc_fact;
 static uint64_t hyb_cyc_fdown, hyb_cyc_logits;
 static uint32_t hyb_forwards_profiled;
 
+// The 27B evaluates SiLU about 1.9 million times per forward.  Even the range-reduced
+// polynomial in fastmath.h is limited by its dependent FMA chain and FP divide.  Linear
+// interpolation at 1/128 spacing has <4.4e-6 absolute error over [-16, 16], while this
+// 16 KiB table and the activations' much smaller hot interval fit the 32 KiB D-cache.
+#define SILU_LUT_SCALE 128
+#define SILU_LUT_LIMIT 16
+#define SILU_LUT_N (2*SILU_LUT_LIMIT*SILU_LUT_SCALE)
+static float *silu_lut;
+
 #ifdef BONSAI_HAS_DNREC
 #define DN_SP_STATE 0x00000u
 #define DN_SP_Q     0x10000u
@@ -179,6 +188,24 @@ int hybrid_present(void)
 
 static float sigmoidf(float x) { return 1.0f/(1.0f + expf(-x)); }
 static float softplusf(float x){ return x > 20.0f ? x : log1pf(expf(x)); }
+
+static void silu_lut_init(void)
+{
+    for (int i = 0; i <= SILU_LUT_N; i++) {
+        float x = -SILU_LUT_LIMIT + (float)i*(1.0f/SILU_LUT_SCALE);
+        silu_lut[i] = x/(1.0f + expf(-x));
+    }
+}
+
+static inline float siluf(float x)
+{
+    if (x >= SILU_LUT_LIMIT || x <= -SILU_LUT_LIMIT)
+        return bonsai_siluf(x);
+    float u = (x + SILU_LUT_LIMIT)*SILU_LUT_SCALE;
+    int i = (int)u;
+    float f = u - (float)i;
+    return __builtin_fmaf(f, silu_lut[i + 1] - silu_lut[i], silu_lut[i]);
+}
 
 static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
 {
@@ -327,7 +354,8 @@ int hybrid_init(void)
     uint64_t kv_b = (uint64_t)n_attn*ctx_cap*kv_dim*4*2;
     uint64_t room = infer_heap_room(1);
     // Work buffers: the widest activation a few times over, plus the logits.
-    uint64_t work_b = 24u*(uint64_t)(ffn_dim > 2*nq + nvh ? ffn_dim : 2*nq + nvh)*4 + 4u*H->vocab + (256u << 10);
+    uint64_t work_b = 24u*(uint64_t)(ffn_dim > 2*nq + nvh ? ffn_dim : 2*nq + nvh)*4
+                    + 4u*H->vocab + (256u << 10) + sizeof(float)*(SILU_LUT_N + 1);
     while (ctx_cap > 16 && state_b + kv_b + work_b > room) {
         ctx_cap /= 2;
         kv_b = (uint64_t)n_attn*ctx_cap*kv_dim*4*2;
@@ -342,6 +370,8 @@ int hybrid_init(void)
     dn_conv  = n_dn ? infer_halloc((uint64_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4, 1) : NULL;
     kc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
+    silu_lut = infer_halloc(sizeof(float)*(SILU_LUT_N + 1), 0);
+    silu_lut_init();
 
     int wmax = n_embd;
     if (ffn_dim > wmax) wmax = ffn_dim;
@@ -549,7 +579,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         float acc = 0;
         for (int i = 0; i < conv_k - 1; i++) acc += w[c*conv_k + i]*win[i*C + c];
         acc += w[c*conv_k + conv_k - 1]*qkv[c];
-        convb[c] = bonsai_siluf(acc);
+        convb[c] = siluf(acc);
     }
     for (int i = 0; i < conv_k - 2; i++)
         memcpy(win + i*C, win + (i + 1)*C, (size_t)C*4);
@@ -614,7 +644,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         rmsnorm_fv(delta, oh, norm_ssm[l], hv);
         float *dst = og + gpos*hv;
         const float *z = zb + hh*hv;
-        for (int j = 0; j < hv; j++) dst[j] = delta[j]*bonsai_siluf(z[j]);
+        for (int j = 0; j < hv; j++) dst[j] = delta[j]*siluf(z[j]);
         dn_cyc_gate += perf_now64() - t0;
     }
     t0 = perf_now64();
@@ -704,7 +734,7 @@ int hybrid_forward(int token, int want_logits)
         infer_matvec_f(model_entry(ROLE_FFN_UP, l), rot, upb);
         hyb_cyc_fproj += perf_now64() - t0;
         t0 = perf_now64();
-        for (int i = 0; i < ffn_dim; i++) gateb[i] = bonsai_siluf(gateb[i])*upb[i];
+        for (int i = 0; i < ffn_dim; i++) gateb[i] = siluf(gateb[i])*upb[i];
         hyb_cyc_fact += perf_now64() - t0;
         t0 = perf_now64();
         proj_f(model_entry(ROLE_FFN_DOWN, l), gateb, tmp_h);

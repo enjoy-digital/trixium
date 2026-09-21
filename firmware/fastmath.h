@@ -45,6 +45,7 @@ static inline float bonsai_siluf(float x)
     // the discarded sigmoid correction is about one ulp of x; the polynomial path is used
     // at the boundary so the function remains continuous to FP32 precision.
     if (x > 16.0f) return x;
+    if (x < -80.0f) return -0.0f;
     if (x < -16.0f) return x*bonsai_expf_bounded(x);
     return x/(1.0f + bonsai_expf_bounded(-x));
 }
