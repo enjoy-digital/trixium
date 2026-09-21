@@ -203,7 +203,7 @@ class BonsaiSimSoC(SoCCore):
                     for c in range(n_channels)]
             return regions, reservations
         native = (native_read_options(*memory_description(),
-                   list(range(n_channels)) if mem == 'hbm' else [c//chan_mod for c in range(n_channels)])
+                   list(range(n_channels)) if mem == 'hbm' else [c//chan_mod for c in range(n_channels)], write=True)
                   if with_native else {})
         config = BonsaiClusterConfig(
             with_vecunit=True, with_dual=dual, with_sp_csr=False,

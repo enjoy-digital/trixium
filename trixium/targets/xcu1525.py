@@ -327,7 +327,7 @@ class BonsaiXCU1525SoC(SoCCore):
                     for c in range(engine_channels)]
                 return regions, reservations
             native = (native_read_options(*memory_description(),
-                       [c//chan_mod for c in range(engine_channels)]) if with_native else {})
+                       [c//chan_mod for c in range(engine_channels)], write=True) if with_native else {})
             config = BonsaiClusterConfig(
                 with_vecunit=with_vecunit, with_dual=with_dual,
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,

@@ -29,7 +29,8 @@ def add_capabilities(soc, config, memory_ports, regions, reservations=(), *, sys
     """Install after cluster and optional traffic monitors; never infer a board.
 
     The experimental native projection CSR path is not a complete region-I/O
-    runtime: uploader and execution lowering are still missing. Keep the public
+    runtime: raw readback and execution lowering are still missing, despite the
+    experimental checked uploader. Keep the public
     contract conservative until those interfaces are implemented and qualified;
     physical capacity or an opt-in target flag alone must not advertise them.
     """

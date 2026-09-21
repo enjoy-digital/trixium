@@ -29,7 +29,25 @@ SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 # BonsaiHBMLoader ----------------------------------------------------------------------------------
 
 class BonsaiHBMLoader(LiteXModule):
-    def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0):
+    def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0,
+                 *, regions=None, reservations=(), endpoints=None):
+        with_regions = regions is not None
+        if with_regions:
+            from trixium.capabilities import Access
+            from trixium.gateware.region_span import RegionSpanValidator
+            endpoints = tuple(endpoints or [0]*len(hbm_axis))
+            if len(endpoints) != len(hbm_axis):
+                raise ValueError('one endpoint is required per loader transport port')
+            self.region_cmd = stream.Endpoint([('region', 32), ('offset', 64), ('length', 24)])
+            self.region_data = stream.Endpoint([('data', 256)])
+            self.region_abort = Signal()
+            self.region_busy, self.region_done, self.region_failed = Signal(), Signal(), Signal()
+            self.region_error = Signal(8)
+            self.region_beats = Signal(24)
+            self.region_validator = validator = RegionSpanValidator(regions, reservations,
+                [(endpoint, axi.address_width) for endpoint, axi in zip(endpoints, hbm_axis)], access=Access.WRITE)
+            self.comb += [validator.region.eq(self.region_cmd.region), validator.offset.eq(self.region_cmd.offset),
+                          validator.length.eq(self.region_cmd.length << 5)]
         # chan_stride: byte distance between channel windows, added IN HARDWARE to host
         # uploads (base + chan*stride, 33 bits) exactly as the engine adds it for reads
         # and stores - so the host writes the channel-relative base and channel 15's
@@ -122,7 +140,7 @@ class BonsaiHBMLoader(LiteXModule):
         self.writers = []
         self.wbufs   = []
         for i, axi in enumerate(hbm_axis):
-            writer = BonsaiAXIWriter(axi)
+            writer = BonsaiAXIWriter(axi, checked=with_regions)
             setattr(self.submodules, f"writer{i}", writer)
             self.writers.append(writer)
             wbuf = stream.Buffer([("data", 256)])
@@ -167,6 +185,61 @@ class BonsaiHBMLoader(LiteXModule):
         )
 
         self.fsm = fsm = FSM(reset_state="IDLE")
+        region_idle = []
+        if with_regions:
+            region_port, region_address, region_length = Signal(5), Signal(64), Signal(24)
+            region_fault = Signal(8)
+            writer_error = Signal(4)
+            self.comb += [
+                writer_error.eq(Array([w.error for w in self.writers])[region_port]),
+                self.region_busy.eq(fsm.ongoing('REGION_CMD') | fsm.ongoing('REGION_DATA')
+                                    | fsm.ongoing('REGION_DRAIN') | fsm.ongoing('REGION_FAILED')),
+                self.region_failed.eq(fsm.ongoing('REGION_FAILED')),
+                self.region_error.eq(region_fault | Mux(self.region_busy, writer_error << 3, 0)),
+                self.region_cmd.ready.eq(fsm.ongoing('IDLE') & ~(self.start.re & self.start.storage)
+                                         & ~self.store_cmd.valid & ~self.region_abort),
+            ]
+            region_idle = [If(self.region_cmd.valid & self.region_cmd.ready,
+                NextValue(region_port, validator.port), NextValue(region_address, validator.address),
+                NextValue(region_length, self.region_cmd.length), NextValue(self.region_beats, 0),
+                NextValue(region_fault, validator.error),
+                If(validator.valid, NextState('REGION_CMD')).Else(NextState('REGION_FAILED')),
+            )]
+            fsm.act('REGION_CMD',
+                *[w.sink_cmd.valid.eq((region_port == i) & ~self.region_abort & (writer_error == 0))
+                  for i, w in enumerate(self.writers)],
+                *[w.sink_cmd.addr.eq(region_address) for w in self.writers],
+                *[w.sink_cmd.len.eq(region_length) for w in self.writers],
+                If(self.region_abort | (writer_error != 0),
+                    NextValue(region_fault, region_fault | (self.region_abort << 7)), NextState('REGION_FAILED'),
+                ).Elif(Array([w.sink_cmd.ready for w in self.writers])[region_port], NextState('REGION_DATA')),
+            )
+            framing_bad = Signal()
+            self.comb += framing_bad.eq(self.region_data.last != (self.region_beats == region_length-1))
+            fsm.act('REGION_DATA',
+                *[w.sink.valid.eq((region_port == i) & self.region_data.valid & ~framing_bad
+                                  & ~self.region_abort & (writer_error == 0)) for i, w in enumerate(self.wbufs)],
+                *[w.sink.data.eq(self.region_data.data) for w in self.wbufs],
+                self.region_data.ready.eq(Array([w.sink.ready for w in self.wbufs])[region_port]
+                                          & ~self.region_abort & (writer_error == 0)),
+                If(self.region_abort | (writer_error != 0) | (self.region_data.valid & framing_bad),
+                    NextValue(region_fault, region_fault | ((self.region_abort
+                              | (self.region_data.valid & framing_bad)) << 7)), NextState('REGION_FAILED'),
+                ).Elif(self.region_data.valid & self.region_data.ready,
+                    NextValue(self.region_beats, self.region_beats+1),
+                    If(self.region_beats == region_length-1, NextState('REGION_DRAIN')),
+                ),
+            )
+            fsm.act('REGION_DRAIN',
+                If(self.region_abort | (writer_error != 0),
+                    NextValue(region_fault, region_fault | (self.region_abort << 7)), NextState('REGION_FAILED'),
+                ).Elif(Array([w.idle for w in self.writers])[region_port],
+                    self.region_done.eq(1), NextState('IDLE'),
+                ),
+            )
+            # Full cluster reset/drain is required after failure. Never retract
+            # the writer's held AW/W here or falsely acknowledge partial writes.
+            fsm.act('REGION_FAILED')
         fsm.act("IDLE",
             # Deliberately NOT ready here.
             #
@@ -192,7 +265,7 @@ class BonsaiHBMLoader(LiteXModule):
                 NextValue(st_len,  self.store_cmd.len),
                 NextValue(st_cnt,  0),
                 NextState("EST_CMD"),
-            )
+            ).Else(*region_idle)
         )
         fsm.act("EST_CMD",
             *[w.sink_cmd.valid.eq(st_chan == i) for i, w in enumerate(self.writers)],

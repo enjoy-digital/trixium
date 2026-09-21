@@ -28,16 +28,18 @@ from trixium.gateware.csr_front import BonsaiEngineCSR
 from trixium.gateware.loader import BonsaiHBMLoader
 
 
-def native_read_options(regions, reservations, endpoints):
-    """Opt-in read policy for the experimental native engine, not capability bits.
+def native_read_options(regions, reservations, endpoints, *, write=False):
+    """Opt-in memory policy for the experimental native engine, not capability bits.
 
     The target supplies physical facts/reservations once. Grant READ to the
     bounded native path without mutating its conservative public capability
-    records; the region-aware uploader/runtime ABI still needs integration.
+    records. Optionally grant WRITE for the checked region-upload path as well;
+    this is still not a complete public region-I/O/runtime capability.
     """
     from dataclasses import replace
     from trixium.capabilities import Access
-    return dict(native_regions=tuple(replace(r, access=Access.READ) for r in regions),
+    access = Access.READ | (Access.WRITE if write else Access(0))
+    return dict(native_regions=tuple(replace(r, access=access) for r in regions),
                 native_reservations=tuple(reservations), native_endpoints=tuple(endpoints))
 
 
@@ -82,8 +84,9 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
 
     All memory ports are 256-bit AXI in sys. Legacy commands and upload/store
     retain stride/mod/skew placement. Optional native projections use explicit
-    region/offset/stride descriptors on the same reader and MAC per pipe; upload
-    and sequencer lowering for that layout are not yet implemented. Ports are
+    region/offset/stride descriptors on the same reader and MAC per pipe; optional
+    checked region uploads share the existing writers. Sequencer lowering for
+    that layout is not yet implemented. Ports are
     storage endpoints, not an assertion about board capacity.
     """
     ports = list(memory_ports)
@@ -98,7 +101,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative"):
+    for name in ("scratchpad", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "zznative", "zzregion"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
@@ -154,8 +157,16 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     if config.with_dual:
         soc.add_constant("BONSAI_HAS_DUALQ")
 
+    from trixium.capabilities import Access
+    region_upload = (dict(regions=config.native_regions, reservations=config.native_reservations,
+                          endpoints=config.native_endpoints)
+                     if any(r.access & Access.WRITE for r in config.native_regions) else {})
     soc.loader = ClockDomainsRenamer("eng")(
-        BonsaiHBMLoader(axis, data_width=config.loader_data_width, **placement))
+        BonsaiHBMLoader(axis, data_width=config.loader_data_width, **placement, **region_upload))
+    if region_upload:
+        from trixium.gateware.region_csr import BonsaiRegionUploadCSR
+        soc.zzregion = BonsaiRegionUploadCSR(soc.loader, soc.engine_csr)
+        soc.add_constant('BONSAI_HAS_REGION_UPLOAD')
     soc.comb += [
         soc.engine.store_cmd.connect(soc.loader.store_cmd),
         soc.engine.store_data.connect(soc.loader.store_data),

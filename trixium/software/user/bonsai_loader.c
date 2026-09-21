@@ -7,9 +7,11 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "bonsai_loader.h"
+#include "bonsai_region_upload.h"
 
 /* Keep in sync with trixium/layout.py and the generated soc.h / csr.h. */
 #include "soc.h"
@@ -109,6 +111,49 @@ static void loader_wait(int chan, uint32_t base, uint64_t beats)
 }
 
 static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, uint64_t beats);
+
+#ifdef CSR_ZZREGION_BASE
+/* Assert the generated map's ABI offsets before using the portable driver. */
+_Static_assert(CSR_ZZREGION_OFFSET_ADDR-CSR_ZZREGION_BASE == BNS_UP_OFFSET_HI, "region offset CSR layout");
+_Static_assert(CSR_ZZREGION_POKE_ADDR-CSR_ZZREGION_BASE == BNS_UP_POKE, "region payload CSR layout");
+_Static_assert(CSR_ZZREGION_COMPLETED_ADDR-CSR_ZZREGION_BASE == BNS_UP_COMPLETED, "region completion CSR layout");
+static uint32_t region_read(void *context, uint32_t offset)
+{
+    (void)context;
+    return BAR_R(CSR_ZZREGION_BASE+offset);
+}
+static void region_write(void *context, uint32_t offset, uint32_t value)
+{
+    (void)context;
+    BAR_W(CSR_ZZREGION_BASE+offset, value);
+}
+static uint64_t region_now(void *context)
+{
+    (void)context;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) { perror("clock_gettime"); exit(1); }
+    return (uint64_t)ts.tv_sec*1000000u + (uint64_t)ts.tv_nsec/1000u;
+}
+static void region_wait(void *context) { (void)context; usleep(100); }
+#endif
+
+void loader_transfer_region(uint32_t region, uint64_t offset, const uint8_t *data, uint64_t bytes)
+{
+#ifdef CSR_ZZREGION_BASE
+    if (!bar) { fprintf(stderr, "region upload requires mapped BAR0\n"); exit(1); }
+    const struct bns_upload_io io = {NULL, region_read, region_write, region_now, region_wait};
+    struct bns_upload_progress progress;
+    int rc = bns_region_upload(&io, region, offset, data, bytes, UINT64_C(60000000), &progress);
+    if (!rc) return;
+    fprintf(stderr, "region upload failed rc=%d region=%u offset=%016llx acknowledged=%llu/%llu error=%04x; "
+            "discard the allocation and reset/drain before reuse\n", rc, region, (unsigned long long)offset,
+            (unsigned long long)progress.completed_bytes, (unsigned long long)bytes, progress.hardware_error);
+#else
+    (void)region; (void)offset; (void)data; (void)bytes;
+    fprintf(stderr, "region upload unavailable in these legacy build headers\n");
+#endif
+    exit(1);
+}
 
 /* The gateware loader counts a transfer in 24 bits of beats (512 MB); the 27B's 641 MB
  * channel payloads wrapped it and the host spun forever on a full FIFO (2026-09-19).

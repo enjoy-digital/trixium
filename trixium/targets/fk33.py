@@ -163,7 +163,7 @@ class BonsaiSoC(SoCCore):
                                 Reservation(HBM_META_OFFSET//HBM_CHANNEL_SIZE, ReservationKind.UPLOAD_STAGING,
                                             HBM_META_OFFSET % HBM_CHANNEL_SIZE, 0x100000)]
                 return regions, reservations
-            native = (native_read_options(*memory_description(), [0]*engine_channels)
+            native = (native_read_options(*memory_description(), [0]*engine_channels, write=True)
                       if with_native else {})
             config = BonsaiClusterConfig(
                 with_vecunit=with_vecunit, with_dual=with_dual,

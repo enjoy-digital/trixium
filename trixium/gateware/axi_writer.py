@@ -29,12 +29,17 @@ from trixium.layout import BEAT_BYTES
 # BonsaiAXIWriter ----------------------------------------------------------------------------------
 
 class BonsaiAXIWriter(LiteXModule):
-    def __init__(self, axi, burst_beats=16):
+    def __init__(self, axi, burst_beats=16, *, checked=False, max_pending=8):
         assert axi.data_width == 256
         assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"
         self.sink_cmd  = cmd  = stream.Endpoint([("addr", axi.address_width), ("len", 24)])
         self.sink_data = data = stream.Endpoint([("data", 256)])
         self.idle      = Signal()
+        if checked and not 1 <= max_pending <= 128:
+            raise ValueError('checked writer requires 1..128 pending write credits')
+        # Optional guarded transport for region uploads. Errors require reset;
+        # validly accepted writes still drain. Default legacy RTL is retained.
+        self.error = Signal(4) if checked else C(0, 4)
 
         # # #
 
@@ -45,12 +50,13 @@ class BonsaiAXIWriter(LiteXModule):
         beats_left = Signal(24)
         active     = Signal()
 
-        self.comb += cmd.ready.eq(~active)
+        self.comb += cmd.ready.eq((self.idle & (self.error == 0)) if checked else ~active)
+        cmd_ok = ((cmd.addr[:beat_shift] == 0) & (cmd.len != 0)) if checked else C(1, 1)
         self.sync += [
             If(cmd.valid & cmd.ready,
                 cur_addr.eq(cmd.addr),
                 beats_left.eq(cmd.len),
-                active.eq(cmd.len != 0),
+                active.eq((cmd.len != 0) & cmd_ok),
             )
         ]
 
@@ -76,15 +82,31 @@ class BonsaiAXIWriter(LiteXModule):
         # Issued-burst queue: W beats stream only for accepted AWs.
         winfo = stream.SyncFIFO([("len", 8)], 8)
         self.submodules += winfo
+        outstanding = Signal(max=max_pending + 1) if checked else Signal(8)
+        self.outstanding = outstanding
+        aw_prepared = Signal() if checked else C(0, 1)
+
+        if checked:
+            # Queue W metadata BEFORE AW handshakes: an AXI slave is allowed to
+            # wait for WVALID before AWREADY. Never make WVALID wait for AWREADY.
+            # One held AW reserves one credit; no other AW can increase the
+            # count while it is held, so its valid/address remain stable.
+            self.comb += [
+                winfo.sink.valid.eq(active & ~aw_prepared & (outstanding < max_pending)),
+                axi.aw.valid.eq(aw_prepared),
+            ]
+            self.sync += If(winfo.sink.valid & winfo.sink.ready, aw_prepared.eq(1)
+                            ).Elif(axi.aw.valid & axi.aw.ready, aw_prepared.eq(0))
+        else:
+            self.comb += [axi.aw.valid.eq(active & winfo.sink.ready),
+                          winfo.sink.valid.eq(axi.aw.valid & axi.aw.ready)]
 
         self.comb += [
-            axi.aw.valid.eq(active & winfo.sink.ready),
             axi.aw.addr.eq(cur_addr),
             axi.aw.len.eq(burst_len - 1),
             axi.aw.size.eq(beat_shift),
             axi.aw.burst.eq(BURST_INCR),
             axi.aw.id.eq(0),
-            winfo.sink.valid.eq(axi.aw.valid & axi.aw.ready),
             winfo.sink.len.eq(burst_len),
         ]
         self.sync += [
@@ -152,14 +174,33 @@ class BonsaiAXIWriter(LiteXModule):
         ]
 
         # B responses (valid sampled through a register: no comb path off the macro pin).
-        outstanding = Signal(8)
         b_valid_r   = Signal()
         self.comb += axi.b.ready.eq(1)
+        ack = axi.b.valid
+        if checked:
+            aw_due, w_done = Signal(max=max_pending + 1), Signal(max=max_pending + 2)
+            aw_fire, w_last, ack = Signal(), Signal(), Signal()
+            self.comb += [
+                aw_fire.eq(axi.aw.valid & axi.aw.ready),
+                w_last.eq(axi.w.valid & axi.w.ready & axi.w.last),
+                ack.eq(axi.b.valid & (axi.b.id == 0)
+                       & ((aw_due != 0) | aw_fire) & ((w_done != 0) | w_last)),
+            ]
+            self.sync += [
+                aw_due.eq(aw_due + aw_fire - ack),
+                w_done.eq(w_done + w_last - ack),
+                # RESPONSE=1, ID=2, unmatched/early B=4, bad command=8.
+                self.error.eq(self.error | Cat(axi.b.valid & (axi.b.resp != 0),
+                    axi.b.valid & (axi.b.id != 0), axi.b.valid & ~ack,
+                    cmd.valid & cmd.ready & ~cmd_ok)),
+            ]
         self.sync += [
-            b_valid_r.eq(axi.b.valid),
+            b_valid_r.eq(ack),
             outstanding.eq(outstanding
                 + Mux(axi.aw.valid & axi.aw.ready, 1, 0)
                 - Mux(b_valid_r, 1, 0)),
         ]
 
-        self.comb += self.idle.eq(~active & ~w_active & (outstanding == 0) & ~winfo.source.valid)
+        self.comb += self.idle.eq(~active & ~w_active & (outstanding == 0) & ~winfo.source.valid
+                                 & ((~aw_prepared & ~wo_valid & ~ws_valid & ~b_valid_r)
+                                    if checked else C(1, 1)))

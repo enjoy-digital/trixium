@@ -26,6 +26,13 @@ void     loader_cpu_reset(void);
  * with BONSAI_LOADER_ADDS_CHAN_OFFSET the gateware adds chan*stride itself. */
 void     loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t beats);
 
+/* Experimental bounded region upload (zzregion ABI), not legacy channel placement.
+ * Requires matching native-build headers, exclusive device ownership and a
+ * prevalidated model allocation. bytes/offset must be 32-byte aligned; padding
+ * belongs to that allocation. Does not reset on failure or verify by readback.
+ */
+void     loader_transfer_region(uint32_t region, uint64_t offset, const uint8_t *data, uint64_t bytes);
+
 /* Upload a BONS image: header+table to the channel-0 staging area (the firmware's
  * `hdrload` copies it into CPU memory), then every channel's payload to its own window.
  * Returns the number of payload bytes written, 0 on a refused image (channel-count

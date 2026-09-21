@@ -183,6 +183,9 @@ def test_native_configuration_is_explicit_frozen_and_separate_from_public_caps()
     original = region(access=Access(0))
     native_read_options([original], [], [0])
     assert original.access == Access(0)
+    writable = native_read_options([original], [], [0], write=True)
+    assert writable['native_regions'][0].access == Access.READ | Access.WRITE
+    assert original.access == Access(0)
     with pytest.raises(ValueError, match='every compute port'):
         add_bonsai_cluster(LiteXModule(), [AXIInterface(data_width=256)]*2, config)
     default = SoC(BonsaiClusterConfig(with_vecunit=False), n=1)
