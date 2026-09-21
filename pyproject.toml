@@ -25,3 +25,6 @@ bonsai = "trixium.cli:main"
 [tool.setuptools.packages.find]
 include = ["trixium*"]
 exclude = ["trixium.software*"]
+
+[tool.setuptools.package-data]
+trixium = ["software/lib/*.c", "software/lib/*.h"]

@@ -6,12 +6,12 @@ BUILD_DIR ?= ../../../build/n16_212_v15b
 # what host code compiles against; the deploy script regenerates them next to the build.
 GEN_INC   := $(BUILD_DIR)/driver/kernel
 
-CFLAGS=-O2 -Wall -g -I$(GEN_INC) -I$(BUILD_DIR)/software/include -I../kernel -Iliblitepcie -MMD -fPIC
+CFLAGS=-O2 -Wall -g -I$(GEN_INC) -I$(BUILD_DIR)/software/include -I../kernel -Iliblitepcie -I../lib -MMD -fPIC
 LDFLAGS=-g
 CC=$(CROSS_COMPILE)gcc
 AR=ar
 
-PROGS=bonsai_util bonsai_load bonsai_chat
+PROGS=bonsai_util bonsai_load bonsai_chat bonsai_caps
 
 all: $(PROGS)
 
@@ -28,6 +28,12 @@ bonsai_load: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_load.o
 bonsai_chat: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_chat.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
+bonsai_caps: liblitepcie/liblitepcie.a bonsai_caps.o caps_parser.o
+	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
+
+caps_parser.o: ../lib/bonsai_caps.c ../lib/bonsai_caps.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+
 clean:
 	rm -f $(PROGS) *.o *.a *.d *~ liblitepcie/*.a liblitepcie/*.o liblitepcie/*.d
 
@@ -38,3 +44,15 @@ liblitepcie/%.o: liblitepcie/%.c
 	$(CC) -c $(CFLAGS) -o $@ $<
 
 -include $(wildcard *.d)
+
+# Switching maps must rebuild host objects even when the selected headers are
+# OLDER than the previous build's objects. Do not reuse a utility with stale CSR
+# addresses. A content-sensitive stamp changes only when the configuration does;
+# no deletion of unrelated objects/artifacts is needed.
+BUILD_STAMP := .build_config
+BUILD_KEY := $(abspath $(BUILD_DIR))|$(CC)|$(CFLAGS)|$(LDFLAGS)
+ifneq ($(strip $(file <$(BUILD_STAMP))),$(strip $(BUILD_KEY)))
+$(file >$(BUILD_STAMP),$(BUILD_KEY))
+endif
+$(PROGS:%=%.o) bonsai_loader.o caps_parser.o \
+liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash.o liblitepcie/litepcie_helpers.o: $(BUILD_STAMP)

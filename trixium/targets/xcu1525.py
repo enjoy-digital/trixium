@@ -177,7 +177,7 @@ class BonsaiXCU1525SoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
                  ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
-                 port_width=512, with_memory_traffic=False,
+                 port_width=512, with_memory_traffic=False, with_capabilities=True,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -207,6 +207,7 @@ class BonsaiXCU1525SoC(SoCCore):
             self.csr.add(f"sdram{sfx}",  DDR_CSR_PAGE0 + 2*i)
             self.csr.add(f"ddrphy{sfx}", DDR_CSR_PAGE0 + 2*i + 1)
         self.sdrams = []
+        memory_sizes = []
         for i in range(ddram_channels):
             sfx = "" if i == 0 else str(i)
             phy = usddrphy.USPDDRPHY(
@@ -225,6 +226,8 @@ class BonsaiXCU1525SoC(SoCCore):
             phy.settings.write_dq_dqs_training = True
             setattr(self, f"ddrphy{sfx}", phy)
             module = module_cls(sys_clk_freq, "1:4")
+            g = module.geom_settings
+            memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits))*phy.settings.nranks*phy.settings.databits//8)
             if i == 0:
                 self.add_sdram("sdram",
                     phy           = phy,
@@ -345,6 +348,24 @@ class BonsaiXCU1525SoC(SoCCore):
             if cluster_n_memctrl is not None:
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
 
+            if with_capabilities:
+                from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
+                from trixium.gateware.capabilities import add_capabilities
+                regions = [MemoryRegion(i, MemoryKind.DDR4, i, 0, size, locality=i)
+                           for i, size in enumerate(memory_sizes)]
+                reservations = [Reservation(0, ReservationKind.CPU, 0, self.bus.regions['main_ram'].size),
+                                Reservation(0, ReservationKind.UPLOAD_STAGING,
+                                            cluster_weight_base - 0x100000, 0x100000)]
+                # Same reserved page as firmware/ddr.c; include every skewed window.
+                test_base = cluster_weight_base + chan_stride - (cluster_weight_base % chan_stride)
+                test_base -= (chan_mod - 1)*chan_skew + 0x1000
+                reservations += [Reservation(c//chan_mod, ReservationKind.DIAGNOSTIC,
+                    test_base + (c % chan_mod)*(chan_stride + chan_skew), 0x1000)
+                    for c in range(engine_channels)]
+                configured_sys_hz = round(self.crg.pll.compute_config()['clkout0_freq']/4)
+                self.bonsai_capabilities = add_capabilities(self, config, engine_axis, regions, reservations,
+                                                           sys_hz=configured_sys_hz)
+
 
         self.add_constant("BONSAI_DDR_CSR_STRIDE", DDR_CSR_STRIDE)
 
@@ -366,6 +387,7 @@ def main():
     parser.add_target_argument("--port-width",      default=512, type=int, help="Crossbar port width per engine channel: 512 (LiteX AXIUpConverter, default) or 256 (LiteDRAM's native up-converter).")
     parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
     parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent AXI/controller traffic counters (new CSR bank).")
+    parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
 
@@ -382,6 +404,7 @@ def main():
         chan_skew       = args.chan_skew,
         port_width      = args.port_width,
         with_memory_traffic = args.with_memory_traffic,
+        with_capabilities = not args.no_capabilities,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates
@@ -402,6 +425,8 @@ def main():
             builder.compile_software = False
             builder.compile_gateware = False
         builder.build(**parser.toolchain_argdict)
+        if hasattr(soc, 'bonsai_capabilities'):
+            soc.bonsai_capabilities.write_artifacts(builder.output_dir)
 
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))

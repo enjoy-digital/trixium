@@ -59,7 +59,7 @@ class _CRG(LiteXModule):
 class BonsaiSoC(SoCCore):
     def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
                  with_nvme=False, with_vecunit=False, with_dual=False, hbm_tck=900,
-                 with_memory_traffic=False,
+                 with_memory_traffic=False, with_capabilities=True,
                  **kwargs):
         # Phase-2 exploration flags (see docs/phase2.md).
         if with_nvme:
@@ -185,6 +185,24 @@ class BonsaiSoC(SoCCore):
             if cluster_n_memctrl is not None:
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
 
+            if with_capabilities:
+                from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
+                from trixium.gateware.capabilities import add_capabilities
+                from trixium.layout import HBM_NCHANNELS, HBM_CHANNEL_SIZE, HBM_META_OFFSET
+                regions = [MemoryRegion(i, MemoryKind.HBM, 0, i*HBM_CHANNEL_SIZE,
+                                        HBM_CHANNEL_SIZE, locality=i) for i in range(HBM_NCHANNELS)]
+                # Port 0 sees GLOBAL HBM addresses: today's CPU main_ram is PC4,
+                # not PC0. F0 will explicitly remap it; capability facts must not
+                # claim that future mapping is already implemented.
+                cpu = self.bus.regions['main_ram']
+                reservations = [Reservation(cpu.origin//HBM_CHANNEL_SIZE, ReservationKind.CPU,
+                                            cpu.origin % HBM_CHANNEL_SIZE, cpu.size),
+                                Reservation(HBM_META_OFFSET//HBM_CHANNEL_SIZE, ReservationKind.UPLOAD_STAGING,
+                                            HBM_META_OFFSET % HBM_CHANNEL_SIZE, 0x100000)]
+                configured_sys_hz = round(self.crg.pll.compute_config()['clkout0_freq'])
+                self.bonsai_capabilities = add_capabilities(self, config, engine_axis, regions, reservations,
+                                                           sys_hz=configured_sys_hz)
+
 
         # Per-channel HBM bandwidth BIST (channels not owned by the engine). Skipped on
         # phase-2 inference builds (--with-vecunit): its 20+ channels of unsliced macro-
@@ -208,6 +226,7 @@ def main():
     parser.add_target_argument("--hbm-tck",      default=900, type=int, choices=[800, 900], help="HBM stack clock MHz: 900 (AXI 225-450) or 800 (AXI 200-400, -11%% bandwidth).")
     parser.add_target_argument("--with-dual",    action="store_true",       help="Phase-2: dual-Q GQA + speculative pair-verify datapath (~2x engine area; needs headroom).")
     parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent accelerator AXI counters (not physical HBM traffic).")
+    parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
 
@@ -237,6 +256,7 @@ def main():
         with_vecunit    = args.with_vecunit,
         with_dual       = args.with_dual,
         with_memory_traffic = args.with_memory_traffic,
+        with_capabilities = not args.no_capabilities,
         hbm_tck         = args.hbm_tck,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,
@@ -262,6 +282,8 @@ def main():
             builder.compile_software = False
             builder.compile_gateware = False
         builder.build(**parser.toolchain_argdict)
+        if hasattr(soc, 'bonsai_capabilities'):
+            soc.bonsai_capabilities.write_artifacts(builder.output_dir)
 
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))

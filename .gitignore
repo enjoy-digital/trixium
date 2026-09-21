@@ -88,3 +88,5 @@ firmware/progs.h
 vivado_pid*.str
 vivado*.jou
 vivado*.log
+trixium/software/user/.build_config
+trixium/software/user/bonsai_caps
