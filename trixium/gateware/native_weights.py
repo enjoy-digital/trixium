@@ -2,8 +2,9 @@
 """Bounded native weights -> semantic groups, independent of AXI/DDR/HBM.
 
 PTQ1_0 retains its exact trit order and FP16 bits; Q8_0 retains signed-byte bits.
-No arithmetic quantization, row packet expansion or scale RAM is involved. These
-components are not connected to the legacy MAC/command frontend yet.
+No arithmetic quantization, row packet expansion or scale RAM is involved. The
+optional BonsaiChannelPipe semantic ingress accepts these groups; board command
+frontends still use the default legacy interface and do not advertise native I/O.
 """
 from migen import *
 from litex.gen import LiteXModule
