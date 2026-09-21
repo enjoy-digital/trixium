@@ -16,6 +16,7 @@
 #include <generated/csr.h>
 #include <generated/soc.h>
 #include <generated/mem.h>
+#include <system.h>
 
 #include "bons.h"
 #include "engine.h"
@@ -453,11 +454,18 @@ static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
 }
 #endif
 
+// Hybrid float-result staging.  CPU reads of the scratchpad use a registered 32-bit
+// Wishbone sideband (several round trips per word).  On the XCU1525 the engine can STORE
+// the gathered SP_Y stream into controller-0 main RAM, where the CPU consumes it through
+// its burst-filled D-cache.  This buffer is read-only to the CPU, so post-DMA invalidation
+// cannot discard dirty data.  Targets without STORE + Zicbom keep the direct SP path.
+static int32_t *i32_stage;
+
 // Run an engine matvec for tensor e on rows [row0, row0+rows) per channel; results (float,
 // scaled by xscale) into dst[gathered global order: chan*rows + row]. With `acc` the int32
 // results are added into acc[] instead (a K-segment of a wide matvec; the caller scales).
 COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t rows,
-                          float xscale, float *dst, int32_t *acc, int acc_add)
+                          float xscale, float *dst, int32_t *acc, int acc_add, int dma_result)
 {
     uint32_t rb = bons_row_beats(e->cols, e->kind, e->group);
     struct engine_op op = {0};
@@ -475,16 +483,30 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
     engine_run(&op);
 
     perf_enter(OP_NORM_I32);
-    volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
+    uint32_t count = rows*n_ch;
+    const volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
+#if defined(BONSAI_HAS_KVSTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE)
+    if (dma_result) {
+        uint32_t eng_addr = (uint32_t)((uintptr_t)i32_stage - MAIN_RAM_BASE
+                                      + BONSAI_MEM_CPU_OFFSET);
+        engine_store(0, eng_addr, (count*4 + 31)/32, SP_Y);
+        invd_cpu_dcache_range(i32_stage, count*4);
+        y = i32_stage;
+    }
+#else
+    (void)dma_result;
+#endif
     if (acc) {
-        if (acc_add) {
-            for (uint32_t i = 0; i < rows*n_ch; i++) acc[i] += y[i];
-        } else {
-            for (uint32_t i = 0; i < rows*n_ch; i++) acc[i] = y[i];
+        if (acc != (const int32_t *)y || acc_add) {
+            if (acc_add) {
+                for (uint32_t i = 0; i < count; i++) acc[i] += y[i];
+            } else {
+                for (uint32_t i = 0; i < count; i++) acc[i] = y[i];
+            }
         }
     } else {
         float sc = ldexpf(xscale, (int)e->rshift - (int)e->bias);
-        uint32_t count = rows*n_ch, i = 0;
+        uint32_t i = 0;
         // Four independent conversions let the in-order RV32F core overlap fcvt/fmul
         // latency and remove three quarters of the loop-control instructions.
         for (; i + 3 < count; i += 4) {
@@ -514,10 +536,10 @@ static void matvec_f_one(const struct bons_entry *e, float xs, float *dst, int32
         uint32_t n = (rpc - r0 < chunk) ? rpc - r0 : chunk;
         // matvec_rows_f gathers chan*n + row: unshuffle into row order per channel.
         if (n == rpc) {
-            matvec_rows_f(e, r0, n, xs, dst, acc, acc_add);
+            matvec_rows_f(e, r0, n, xs, dst, acc, acc_add, 1);
         } else if (acc) {
             // K-segment: the int32 results arrive as [chan][n]; add them at [chan][rpc].
-            matvec_rows_f(e, r0, n, xs, 0, (int32_t *)rot_scratch, 0);
+            matvec_rows_f(e, r0, n, xs, 0, (int32_t *)rot_scratch, 0, 1);
             volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
             (void)y;
             for (int c = 0; c < n_ch; c++)
@@ -529,7 +551,7 @@ static void matvec_f_one(const struct bons_entry *e, float xs, float *dst, int32
         } else {
             // Results arrive as [chan][n] at the scratchpad; scatter them into the
             // caller's [chan][rpc] row order straight from there.
-            matvec_rows_f(e, r0, n, xs, rot_scratch, 0, 0);
+            matvec_rows_f(e, r0, n, xs, rot_scratch, 0, 0, 1);
             for (int c = 0; c < n_ch; c++)
                 for (uint32_t i = 0; i < n; i++)
                     dst[(uint32_t)c*rpc + r0 + i] = rot_scratch[(uint32_t)c*n + i];
@@ -562,13 +584,19 @@ void infer_matvec_f_quantized(const struct bons_entry *e, int e8, float *dst)
 {
     // SP_X is read-only to the engine, so consecutive non-K-segment projections with the
     // same input can reuse its exact bytes and exponent.  hybrid.c is the only caller.
-    if (!rot_scratch) rot_scratch = halloc((SP_H - SP_Y));
+    if (!rot_scratch) {
+        rot_scratch = halloc((SP_H - SP_Y));
+        i32_stage   = halloc((SP_H - SP_Y));
+    }
     matvec_f_one(e, ldexpf(1.0f, e8), dst, 0, 0);
 }
 
 void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
 {
-    if (!rot_scratch) rot_scratch = halloc((SP_H - SP_Y));
+    if (!rot_scratch) {
+        rot_scratch = halloc((SP_H - SP_Y));
+        i32_stage   = halloc((SP_H - SP_Y));
+    }
     if (!(e->flags & FLAG_KSEG)) {
         int e8 = quantize_f_pow2(src, e->cols, SP_X);
         matvec_f_one(e, ldexpf(1.0f, e8), dst, 0, 0);
@@ -3452,9 +3480,9 @@ embed_done: ;
 #endif
         {
         float sx = ldexpf(1.0f, E_NORM + sx8);
-        matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q, 0, 0);
-        matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k, 0, 0);
-        matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v, 0, 0);
+        matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q, 0, 0, 0);
+        matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k, 0, 0, 0);
+        matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v, 0, 0, 0);
         }
 
         perf_enter(OP_QKNORM);
