@@ -20,8 +20,9 @@
 # The whole SoC - CPU, engine cluster, the four controllers - runs in one `sys` domain at
 # the DDR4 controller clock (125 MHz with the USPDDRPHY: 4:1, DDR4-1000). No clock-domain
 # crossing anywhere; the accelerator has 4.8 ns of margin from its 212.5 MHz closure on the
-# FK33. --sys-clk-freq raises the DDR rate (150-166 MHz = DDR4-1200/1333) once the board
-# can calibrate it.
+# FK33. --sys-clk-freq=150e6 selects DDR4-1200; the current ISERDESE3 configuration
+# has a 1.600 ns minimum clock period, so >156.25 MHz is not a qualified option.
+# See docs/vcu-clock-qualification.md before changing clocks or deploying a build.
 
 import os
 
@@ -49,7 +50,9 @@ from litepcie.software import generate_litepcie_software
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(LiteXModule):
-    def __init__(self, platform, sys_clk_freq, clk_channel=0):
+    def __init__(self, platform, sys_clk_freq, clk_channel=0, fast_clock_buffer="bufgce"):
+        if fast_clock_buffer not in ("bufgce", "bufgce-div"):
+            raise ValueError("fast_clock_buffer must be bufgce or bufgce-div")
         self.rst       = Signal()
         self.cd_sys    = ClockDomain()
         self.cd_sys4x  = ClockDomain()
@@ -59,8 +62,8 @@ class _CRG(LiteXModule):
         # # #
 
         # One MMCM (on DDR channel 0's 300 MHz reference) for the whole SoC: sys and sys4x
-        # come from the same VCO through the BUFGCE_DIV / BUFGCE pair the PHY needs for a
-        # known phase relation. The four PHYs share them; the USPDDRPHY captures on sys4x
+        # come from the same MMCM output through parallel global buffers (slow /4,
+        # fast /1). The four PHYs share them; the USPDDRPHY captures on sys4x
         # through calibrated IDELAYs, so per-bank skew is absorbed by the read leveling.
         self.pll = pll = USPMMCM(speedgrade=-2)
         self.comb += pll.reset.eq(self.rst)
@@ -69,13 +72,20 @@ class _CRG(LiteXModule):
         pll.create_clkout(self.cd_idelay, 500e6)
         platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
-        self.specials += [
-            Instance("BUFGCE_DIV",
-                p_BUFGCE_DIVIDE=4,
-                i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys.clk),
-            Instance("BUFGCE",
-                i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk),
-        ]
+        self.specials += Instance("BUFGCE_DIV",
+            p_BUFGCE_DIVIDE=4,
+            i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys.clk)
+        if fast_clock_buffer == "bufgce-div":
+            # Opt-in timing experiment: UG949 permits a second BUFGCE_DIV with
+            # divide=1 on CLK. Match buffer types while preserving the same MMCM
+            # output, fabric/CLKDIV clock and clock-delay group. This is NOT a
+            # waiver or a timing-closure claim; route and apply the strict gate.
+            self.specials += Instance("BUFGCE_DIV",
+                p_BUFGCE_DIVIDE=1,
+                i_CE=1, i_CLR=0, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk)
+        else:
+            self.specials += Instance("BUFGCE",
+                i_CE=1, i_I=self.cd_pll4x.clk, o_O=self.cd_sys4x.clk)
 
         # These parallel buffers share one MMCM output, but their distribution trees
         # have very different loads (sys fabric vs four PHYs across three SLRs).
@@ -178,6 +188,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
                  ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
+                 ddr_fast_clock_buffer="bufgce",
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -187,7 +198,7 @@ class BonsaiXCU1525SoC(SoCCore):
         platform = sqrl_xcu1525.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.crg = _CRG(platform, sys_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq, fast_clock_buffer=ddr_fast_clock_buffer)
 
         # SoCCore ----------------------------------------------------------------------------------
         if kwargs.get("uart_name", "serial") == "serial":
@@ -380,6 +391,8 @@ def main():
     parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform,
                                  description="TriXium SoC on the SQRL XCU1525.")
     parser.add_target_argument("--sys-clk-freq",    default=125e6, type=float, help="System clock = DDR4 controller clock (4:1).")
+    parser.add_target_argument("--ddr-fast-clock-buffer", default="bufgce", choices=["bufgce", "bufgce-div"],
+                               help="DDR CLK buffer: legacy BUFGCE or experimental BUFGCE_DIV /1; both require strict routed timing qualification.")
     parser.add_target_argument("--pcie-lanes",      default=4, type=int,       choices=[2, 4, 8, 16], help="PCIe lane count.")
     parser.add_target_argument("--driver",          action="store_true",       help="Generate LitePCIe driver headers.")
     parser.add_target_argument("--engine-channels", default=16, type=int,      help="Engine channel count (a multiple of the DDR4 channel count).")
@@ -411,6 +424,7 @@ def main():
         with_memory_traffic = args.with_memory_traffic,
         with_capabilities = not args.no_capabilities,
         with_native       = args.with_native,
+        ddr_fast_clock_buffer = args.ddr_fast_clock_buffer,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates
