@@ -1086,11 +1086,17 @@ class BonsaiMatVecEngine(LiteXModule):
             active_mask = Signal(n)
             all_issued, native_complete = Signal(), Signal()
             self.native_failed = Signal()
+            raw_owner = C(1, 1) if seq is None else ~seq.busy
+            if seq is not None and hasattr(seq, 'region_fetch_cmd'):
+                # The shared read-control mux selects the sequencer during
+                # list ownership. Older queued manual reads may drain only in
+                # SBDRAIN; no new manual command is admitted during the list.
+                raw_owner = ~seq.busy | seq.native_manual_drain | seq.region_fetch_cmd.valid
             self.comb += [
                 raw.ready.eq(fsm.ongoing('IDLE') & ~self.cmd.valid & ~cfg.valid
                              & ~self.sp_busy & ~self.vec_busy_in & ~scratchpad.sbw_pending
                              & reduce(and_, [r.idle for r in self.readers])
-                             & (C(1, 1) if seq is None else ~seq.busy)),
+                             & raw_owner),
                 self.region_read_busy.eq(raw_mode & ~fsm.ongoing('IDLE')),
                 self.region_read_failed.eq(raw_mode & fsm.ongoing('N_FAILED')),
                 self.region_read_beats.eq(fetch_cnt),

@@ -67,6 +67,10 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   embedding: Optional unit 9, serialized; w0 exactly 9, w1 compact PTQ src,
              w2 inverse signs, w3 FP32 dst, w4 groups, w5..w15 zero.
              See docs/native-embedding-restoration.md.
+  region fetch: Optional unit 10, serialized; w0 exactly 10, w1 region ID,
+                w2/w3 64-bit byte offset low/high, w4 full 32-byte beat count,
+                w5 scratchpad dst, w6..w15 zero. Bounds/reservations/transport
+                checks use the shared region reader; no legacy physical address.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -89,9 +93,12 @@ from litex.soc.interconnect import stream
 
 class BonsaiSequencer(LiteXModule):
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0,
-                 with_projection_restore=False, with_embedding_restore=False, scratchpad_size=256*1024):
+                 with_projection_restore=False, with_embedding_restore=False,
+                 with_region_fetch=False, scratchpad_size=256*1024):
         if not isinstance(native_pipes, int) or not 0 <= native_pipes <= 31:
             raise ValueError('native_pipes must be in [0, 31]')
+        if with_region_fetch and not native_pipes:
+            raise ValueError('Sequenced region fetch requires native memory support')
         extended = with_hadamard or with_activation_quantize or native_pipes or with_projection_restore or with_embedding_restore
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
@@ -170,6 +177,19 @@ class BonsaiSequencer(LiteXModule):
                 'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
                 'bits8..23 embedding-client error (bit10 protects the full descriptor list).')
             extension_errors.append(self.embedding_restore_error)
+        if with_region_fetch:
+            self.region_fetch_cmd = stream.Endpoint([
+                ('region', 32), ('offset', 64), ('length', 24), ('dst', 24)])
+            self.region_fetch_done = Signal()
+            self.region_fetch_failed = Signal(9)
+            self.region_fetch_manual_pending = Signal()
+            self.region_fetch_manual_failed = Signal()
+            self.region_fetch_abi = CSRStatus(32, reset=0x00010000)
+            self.region_fetch_error = CSRStatus(32, description=
+                'Sticky until common reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
+                'bit2 output overlaps list, bit3 older manual read failure, '
+                'bits8..15 transport/config errors, bit16 failed reader state.')
+            extension_errors.append(self.region_fetch_error)
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
@@ -251,6 +271,7 @@ class BonsaiSequencer(LiteXModule):
 
         list_ok = C(1, 1)
         had_dispatch, quant_dispatch, restore_dispatch, embedding_dispatch, bad_list = [], [], [], [], []
+        region_fetch_dispatch = []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24)
@@ -330,6 +351,22 @@ class BonsaiSequencer(LiteXModule):
             embedding_dispatch = [If(malformed,
                 NextValue(self.embedding_restore_error.status, 2), NextState('EXT_FAILED'),
             ).Else(NextState('DISPATCH_EMBEDDING'))]
+        if with_region_fetch:
+            malformed, list_overlap = Signal(), Signal()
+            destination_end = Signal(64)
+            command = self.region_fetch_cmd
+            self.comb += [
+                malformed.eq((w(0, 0) != 10) | (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) |
+                    (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                destination_end.eq(w(0, 5) + (w(0, 4) << 5)),
+                list_overlap.eq((w(0, 4) != 0) & (w(0, 5) < list_end) & (list_base < destination_end)),
+                command.region.eq(w(0, 1)), command.offset.eq(Cat(w(0, 2), w(0, 3))),
+                command.length.eq(w(0, 4)[:24]), command.dst.eq(w(0, 5)[:24]),
+            ]
+            region_fetch_dispatch = [If(malformed | list_overlap,
+                NextValue(self.region_fetch_error.status, Cat(C(0, 1), malformed, list_overlap)),
+                NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_REGION_FETCH'))]
         if native_pipes:
             cfg_malformed, cfg_channel_bad = Signal(), Signal()
             projection_malformed, projection_overlap = Signal(), Signal()
@@ -455,7 +492,10 @@ class BonsaiSequencer(LiteXModule):
         cap_acc = Signal()
         cap_sel = Signal(2)
         self.sync += [
-            cap_d.eq(Cat(self.busy & self.eng_done, cap_d[0])),
+            # SBDRAIN can finish older manual commands while busy is asserted.
+            # Their completion must never replay a previous list's k capture.
+            cap_d.eq(Cat(self.busy & self.eng_done &
+                         (~self.native_manual_drain if native_pipes else C(1, 1)), cap_d[0])),
             # Latched at the DISPATCH handshake: with NOWAIT the descriptor buffer holds a
             # LATER descriptor when done pulses. Serial lists latch identical values (the
             # buffer does not move during WAIT_ENG).
@@ -593,11 +633,15 @@ class BonsaiSequencer(LiteXModule):
             self.busy.eq(1),
             *([self.native_manual_drain.eq(1)] if native_pipes else []),
             If(~self.sbw_pending &
-               (~(self.native_manual_pending | self.native_engine_busy) if native_pipes else C(1, 1)),
+               (~(self.native_manual_pending | self.native_engine_busy) if native_pipes else C(1, 1)) &
+               (~self.region_fetch_manual_pending if with_region_fetch else C(1, 1)),
                 NextState("FETCH0"),
             ),
             *([If(self.native_failed, NextValue(self.native_error.status, 256), NextState('EXT_FAILED'))]
               if native_pipes else []),
+            *([If(self.region_fetch_manual_failed,
+                NextValue(self.region_fetch_error.status, 8 | (self.region_fetch_failed << 8)),
+                NextState('EXT_FAILED'))] if with_region_fetch else []),
         )
         fsm.act("FETCH0",
             self.busy.eq(1),
@@ -697,6 +741,7 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 7, *(native_dispatch if native_pipes else unknown_unit)
             ).Elif(unit == 8, *(restore_dispatch if with_projection_restore else unknown_unit)
             ).Elif(unit == 9, *(embedding_dispatch if with_embedding_restore else unknown_unit)
+            ).Elif(unit == 10, *(region_fetch_dispatch if with_region_fetch else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -744,6 +789,23 @@ class BonsaiSequencer(LiteXModule):
                     NextValue(self.embedding_restore_error.status, self.embedding_restore_failed << 8),
                     NextState('EXT_FAILED'),
                 ).Elif(self.embedding_restore_done, NextState('NEXT')))
+        if with_region_fetch:
+            fsm.act('DISPATCH_REGION_FETCH', self.busy.eq(1),
+                If(self.region_fetch_failed != 0,
+                    NextValue(self.region_fetch_error.status, self.region_fetch_failed << 8),
+                    NextState('EXT_FAILED'),
+                ).Elif(~eng_inflight,
+                    self.region_fetch_cmd.valid.eq(1),
+                    If(self.region_fetch_cmd.ready,
+                        # Raw reads pulse eng_done too. Clear stale k-capture
+                        # controls via the ordinary engine-dispatch bookkeeping;
+                        # exact w0=10 has no NOWAIT or capture flags set.
+                        eng_disp.eq(1), NextState('WAIT_REGION_FETCH'))))
+            fsm.act('WAIT_REGION_FETCH', self.busy.eq(1),
+                If(self.region_fetch_failed != 0,
+                    NextValue(self.region_fetch_error.status, self.region_fetch_failed << 8),
+                    NextState('EXT_FAILED'),
+                ).Elif(self.region_fetch_done, NextState('NEXT')))
         if native_pipes:
             fsm.act('DISPATCH_NATIVE_CFG', self.busy.eq(1),
                 If(self.native_failed,

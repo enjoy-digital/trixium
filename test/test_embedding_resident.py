@@ -14,6 +14,7 @@ from trixium.gateware.integration import BonsaiClusterConfig
 from trixium.model import qformats
 from trixium.model.activation import scratchpad_quantize_descriptor
 from trixium.model.embedding import scratchpad_embedding_descriptor
+from trixium.model.native_sequence import region_fetch_descriptor
 from trixium.model.gguf_reader import GGUFReader
 from trixium.model.golden import config_from_gguf
 from test_activation_sp import reference
@@ -23,8 +24,8 @@ from test_integration import SoC
 from test_native_reader import region
 
 
-@pytest.mark.parametrize('companions', [False, True])
-def test_compiled_embedding_resident_chain(tmp_path, companions):
+@pytest.mark.parametrize('companions,region_fetch', [(False, False), (True, False), (True, True)])
+def test_compiled_embedding_resident_chain(tmp_path, companions, region_fetch):
     verilator = shutil.which('verilator')
     if not verilator:
         pytest.skip('Verilator required for resident embedding chain')
@@ -38,11 +39,13 @@ def test_compiled_embedding_resident_chain(tmp_path, companions):
         profiles.append((scales, codes.reshape(-1), np.asarray(config_from_gguf(reader).hadamard_signs[5120])))
     else:
         profiles.append(example(40, seed=943, span=4))
-    options = (dict(native_regions=(region(7, size=256*1024),), native_endpoints=(0,)) if companions else {})
+    options = (dict(native_regions=(region(42, size=1 << 33) if region_fetch else region(7, size=256*1024),),
+                    native_endpoints=(0,)) if companions else {})
     dut = SoC(BonsaiClusterConfig(with_embedding_restore=True, with_activation_quantize=True,
-        with_hadamard=companions, with_projection_restore=companions, **options), n=1)
+        with_hadamard=companions, with_projection_restore=companions,
+        with_region_fetch=region_fetch, **options), n=1)
     memory = bytearray(256*1024)
-    vectors = bytearray(struct.pack('<II', 0x45525331, len(profiles)))
+    vectors = bytearray(struct.pack('<III', 0x45525331, len(profiles), int(region_fetch)))
     for profile, (scales, codes, signs) in enumerate(profiles):
         raw = qformats.ptq1_0_pack(scales, codes.reshape(-1, 128)).tobytes()
         sign_bytes = b''.join(packed(signs[i:i+128] < 0, 1).to_bytes(16, 'little') for i in range(0, 5120, 128))
@@ -52,6 +55,9 @@ def test_compiled_embedding_resident_chain(tmp_path, companions):
         _, embedding_e, fp = golden(scales, codes, signs)
         q8, exponent = reference(fp.view(np.uint32).tolist())
         def fetch(base, length, dst, nowait=False):
+            if region_fetch:
+                return region_fetch_descriptor(region=42, offset=base+((1 << 32) if nowait else 0),
+                                               length=length//32, dst=dst)
             return [1 | (int(nowait) << 9), 2, 0, 0, base, length//32, 0, 0, 0, dst] + [0]*6
         def store(base, length, src):
             return [1, 3, 0, 0, base, length//32, 0, 0, src, 0] + [0]*6
@@ -90,7 +96,12 @@ def test_compiled_embedding_resident_chain(tmp_path, companions):
         quant_blocks=dut.activation_quantize.blocks_done,
         reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
         reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
-        engine_done=dut.engine_csr.done_count.status, engine_busy=dut.engine.busy)
+        engine_done=dut.engine_csr.done_count.status, engine_busy=dut.engine.busy,
+        region_error=dut.seq.region_fetch_error.status if region_fetch else Signal(32),
+        manual_read_accepted=dut.zzverify.accepted.status if companions else Signal(32),
+        manual_read_completed=dut.zzverify.completed.status if companions else Signal(32),
+        ar_valid=dut.ports[0].ar.valid, ar_ready=dut.ports[0].ar.ready,
+        ar_addr=dut.ports[0].ar.addr, ar_len=dut.ports[0].ar.len)
     for name, signal in ports.items():
         signal.name_override = name
     rtl = tmp_path / 'embedding_resident.v'
@@ -110,4 +121,4 @@ def test_compiled_embedding_resident_chain(tmp_path, companions):
     assert result.returncode == 0, result.stdout+result.stderr
     assert '$readmem file not found' not in result.stdout
     assert 'EMBEDDING_RESIDENT_PASS' in result.stdout
-    print(f'companions={companions} local_27b={local}\n{result.stdout}')
+    print(f'companions={companions} region_fetch={region_fetch} local_27b={local}\n{result.stdout}')

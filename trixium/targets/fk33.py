@@ -62,6 +62,7 @@ class BonsaiSoC(SoCCore):
                  with_memory_traffic=False, with_capabilities=True, with_native=False,
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
                  with_embedding_restore=False,
+                 with_region_fetch=False,
                  **kwargs):
         # Phase-2 exploration flags (see docs/phase2.md).
         if with_nvme:
@@ -172,7 +173,7 @@ class BonsaiSoC(SoCCore):
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
                 with_activation_quantize=with_activation_quantize, with_projection_restore=with_projection_restore,
-                with_embedding_restore=with_embedding_restore, **native)
+                with_embedding_restore=with_embedding_restore, with_region_fetch=with_region_fetch, **native)
             add_bonsai_cluster(self, engine_axis, config)
             if with_memory_traffic:
                 from trixium.gateware.traffic import add_memory_traffic
@@ -238,6 +239,7 @@ def main():
     parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 and post-rotation Q8 quantization; no FK33 deployment qualification.")
     parser.add_target_argument("--with-projection-restore", action="store_true", help="Experimental resident int32 projection to FP32 restoration; no FK33 deployment qualification.")
     parser.add_target_argument("--with-embedding-restore", action="store_true", help="Experimental compact PTQ embedding restoration; no FK33 deployment qualification.")
+    parser.add_target_argument("--with-region-fetch", action="store_true", help="Experimental sequenced 64-bit checked region reads; requires --with-native.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
@@ -274,6 +276,7 @@ def main():
         with_activation_quantize = args.with_activation_quantize,
         with_projection_restore = args.with_projection_restore,
         with_embedding_restore = args.with_embedding_restore,
+        with_region_fetch = args.with_region_fetch,
         hbm_tck         = args.hbm_tck,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,

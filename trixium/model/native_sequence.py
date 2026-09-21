@@ -22,6 +22,24 @@ def native_pipe_descriptor(*, pipe, region, offset, stride):
             stride & 0xffffffff, stride >> 32] + [0]*9
 
 
+def region_fetch_descriptor(*, region, offset, length, dst):
+    """Encode optional unit 10; check seq.region_fetch_abi major 1 first.
+
+    offset is region-relative bytes; length is a count of full 32-byte beats.
+    The shared reader checks access/reservations, endpoint/address reachability,
+    full source/destination spans and AXI completion. The sequencer protects its
+    entire active descriptor list. A failed read requires common reset/drain and
+    invalidates the whole destination, including any prefix already written.
+    This fetch does not establish that an uploaded model allocation is valid.
+    """
+    for name, value, width in (('region', region, 32), ('offset', offset, 64),
+                               ('length', length, 24), ('dst', dst, 24)):
+        _unsigned(name, value, width)
+    if not length or offset % 32 or dst % 32:
+        raise ValueError('region fetch needs positive beats and 32-byte-aligned offset/dst')
+    return [10, region, offset & 0xffffffff, offset >> 32, length, dst] + [0]*10
+
+
 def native_projection_descriptor(*, kind, rows, groups, bias, rshift, xsrc, dst,
                                  rem=0, interleaved=False, suppress_writes=False,
                                  dual=False, qstride=0):

@@ -62,6 +62,7 @@ class BonsaiClusterConfig:
     with_activation_quantize: bool = False
     with_projection_restore: bool = False
     with_embedding_restore: bool = False
+    with_region_fetch: bool = False
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -70,6 +71,8 @@ class BonsaiClusterConfig:
             raise ValueError('native reservations/endpoints require a native region table')
         if self.with_dnrec and not self.with_vecunit:
             raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
+        if self.with_region_fetch and (not self.native_regions or not self.with_vecunit):
+            raise ValueError('Sequenced region fetch needs native memory regions and the vector/sequencer arbiter')
         if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore or self.with_embedding_restore) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
             raise ValueError("Resident clients need the vector/sequencer arbiter and at most 256 KiB scratchpad")
         if self.native_regions and self.with_vecunit and self.scratchpad_size > 256*1024:
@@ -133,6 +136,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             with_hadamard=config.with_hadamard, with_activation_quantize=config.with_activation_quantize,
             with_projection_restore=config.with_projection_restore,
             with_embedding_restore=config.with_embedding_restore,
+            with_region_fetch=config.with_region_fetch,
             native_pipes=len(ports) if config.native_regions else 0, scratchpad_size=config.scratchpad_size))
         soc.comb += [
             vecunit.seq_en.eq(seq.busy),
@@ -231,8 +235,10 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             soc.add_constant('BONSAI_HAS_NATIVE_SEQ')
         from trixium.gateware.region_read_csr import BonsaiRegionReadCSR
         soc.zzverify = BonsaiRegionReadCSR(soc.engine, soc.engine_csr,
-                                         scratchpad_csr=sp_csr)
+                                         scratchpad_csr=sp_csr, seq=seq if config.with_region_fetch else None)
         soc.add_constant('BONSAI_HAS_REGION_READ')
+        if config.with_region_fetch:
+            soc.add_constant('BONSAI_HAS_REGION_FETCH_SEQ')
     soc.comb += [
         soc.engrst.trigger.eq(soc.engine_csr.rst_trigger),
         soc.engine_csr.rst_busy.eq(soc.engrst.busy),

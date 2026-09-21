@@ -28,7 +28,7 @@ static void reset(Vembedding_resident &d) {
     d.reset_value=1; d.reset_re=1; tick(d); d.reset_re=0;
     for (unsigned i=0; i<100; i++) tick(d);
     require(!d.reset_busy && !d.reset_stuck && !(d.seq_status&1) && !d.embedding_error
-        && !d.quant_error && !d.embedding_busy && !d.quant_busy && !d.engine_busy,"common reset failed");
+        && !d.quant_error && !d.region_error && !d.embedding_busy && !d.quant_busy && !d.engine_busy,"common reset failed");
 }
 static void start(Vembedding_resident &d, unsigned descriptors) {
     d.seq_base=0; d.seq_count=descriptors; d.seq_start=1; d.seq_start_re=1;
@@ -36,7 +36,7 @@ static void start(Vembedding_resident &d, unsigned descriptors) {
 }
 int main() {
     std::ifstream f("vectors.bin",std::ios::binary);
-    require(word(f)==0x45525331,"bad vector magic"); unsigned profiles=word(f);
+    require(word(f)==0x45525331,"bad vector magic"); unsigned profiles=word(f), region_fetch=word(f);
     Vembedding_resident d; d.sys_rst=1; tick(d); tick(d); d.sys_rst=0;
     for (unsigned profile=0; profile<profiles; profile++) {
         unsigned nw=word(f), nc=word(f), nd=word(f), exponent=word(f);
@@ -77,20 +77,35 @@ int main() {
         require(interrupted && (d.seq_status&1),"reset missed requested stage"); reset(d);
 
         install(); unsigned before=d.engine_done; start(d,nd); bool saw_embedding=false;
+        unsigned input_beats=0, readback_beats=0;
         for (cycle=0; cycle<100000; cycle++) {
             if (d.embedding_error || d.quant_error)
                 std::fprintf(stderr,"profile=%u cycle=%u embedding=%x quant=%x dcount=%u\n",
                              profile,cycle,d.embedding_error,d.quant_error,d.seq_status>>8);
-            require(!d.embedding_error && !d.quant_error,"resident sequence failed");
+            require(!d.embedding_error && !d.quant_error && !d.region_error,"resident sequence failed");
             if (d.embedding_busy) {
                 saw_embedding=true;
                 require(d.engine_done-before==2 && !d.engine_busy && !d.quant_busy,"embedding ownership overlap");
             }
             if (!(d.seq_status&1)) break;
-            tick(d);
+            d.sys_clk=0; d.eval();
+            if (d.ar_valid && d.ar_ready) {
+                unsigned count=d.ar_len+1;
+                unsigned retired=d.engine_done-before;
+                uint64_t base=retired==0 ? 0x1000+profile*0x2000 : 0x2000+profile*0x2000;
+                if (retired<2) {
+                    if (region_fetch) base+=uint64_t(1)<<32;
+                    unsigned offset=retired==0 ? input_beats : input_beats-35;
+                    require(d.ar_addr==base+offset*32,"model fetch lost region offset or high address bits");
+                    input_beats+=count;
+                } else readback_beats+=count;
+            }
+            d.sys_clk=1; d.eval();
         }
         require(cycle<100000 && saw_embedding && (d.seq_status>>8)==nd,"sequence did not retire");
         require(d.engine_done-before==6,"wrong fetch/store retirement count");
+        require(input_beats==55 && readback_beats==800,"wrong physical read traffic");
+        require(!d.manual_read_accepted && !d.manual_read_completed,"sequenced read credited manual CSR completion");
         require(d.embedding_reads==55 && d.embedding_writes==640,"embedding transaction count");
         require(d.embedding_exponent==(exponent&1023),"embedding exponent mismatch");
         // FP32 absmax and conversion make two complete input passes.
@@ -103,5 +118,5 @@ int main() {
         std::printf("EMBEDDING_RESIDENT profile=%u descriptors=%u cycles=%u\n",profile,nd,cycle);
     }
     require(f.peek()==std::char_traits<char>::eof(),"trailing vector bytes");
-    std::printf("EMBEDDING_RESIDENT_PASS profiles=%u rejected=3 common_reset_reuse=3\n",profiles);
+    std::printf("EMBEDDING_RESIDENT_PASS profiles=%u rejected=3 common_reset_reuse=3 region_fetch=%u\n",profiles,region_fetch);
 }
