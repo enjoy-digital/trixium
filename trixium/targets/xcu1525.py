@@ -7,7 +7,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # TriXium on the SQRL XCU1525: XCVU9P, four DDR4 x64 channels, PCIe. The same engine
-# cluster as the FK33 (one marked block, identical in both targets) over LiteDRAM: engine channel c
+# cluster as the FK33 (one shared integration module) over LiteDRAM: engine channel c
 # streams from DDR4 controller c // 4 through a 256-bit crossbar port, at the FK33's
 # per-channel window constants inside that controller (chan_mod = 4), so the images and the
 # firmware constants are the same on both boards. Design decisions, projection and status:
@@ -295,146 +295,33 @@ class BonsaiXCU1525SoC(SoCCore):
         cluster_chan_skew      = chan_skew
         cluster_weight_base    = HBM_WEIGHT_BASE
         cluster_with_dnrec     = True  # Exact FP32 recurrence for the 27B fast path.
-        # Bonsai cluster: begin. This block is byte-identical in every board target
-        # (test_layout_contract.py diffs the marked regions): the per-board knobs are
-        # the cluster_* variables set just above it. Migen names every signal by the
-        # frame it was created in, so a shared function would rename the FK33 netlist
-        # wholesale (2026-09-18) - hence inline, and checked.
+        # One portable wiring implementation; board policy stays here.
         if with_bonsai:
-            from trixium.gateware.scratchpad import BonsaiScratchpad
-            from trixium.gateware.matvec import BonsaiMatVecEngine
-            from trixium.gateware.csr_front import BonsaiEngineCSR
-            from trixium.gateware.loader import BonsaiHBMLoader
+            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
+            from trixium.gateware.xilinx_constraints import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
-
-            self.scratchpad = BonsaiScratchpad(size=256*1024)
-            # The engine cluster lives in the soft-resettable `eng` domain (engreset.py):
-            # a wedged op is a CSR write away from recovery instead of a reconfigure. Its
-            # memory ports go through the AXI shims, which keep the protocol whole meanwhile.
-            from trixium.gateware.engreset import BonsaiEngineResetDomain
-            self.engrst = BonsaiEngineResetDomain(engine_axis)
-            engine_axis = self.engrst.masters
-            self.add_constant("BONSAI_HAS_ENGRESET")
-            # The eng reset is held for 64 cycles, so its net may take several to arrive:
-            # without this Vivado puts the 90k-fanout net on a BUFG and 16k flop R pins
-            # miss by 0.4 ns (n16_212_v15a: 22,046 failing endpoints, 16,286 of them R).
-            # Setup 4 / hold 3 cycles: every flop is in reset well inside the hold, and the
-            # CPU's first submit after the release is hundreds of cycles away.
-            platform.add_platform_command(
-                "set_multicycle_path -setup 4 -from "
-                "[get_cells -hierarchical -filter {{NAME =~ *eng_rst_reg*}}]")
-            platform.add_platform_command(
-                "set_multicycle_path -hold 3 -from "
-                "[get_cells -hierarchical -filter {{NAME =~ *eng_rst_reg*}}]")
-            vecunit = None
-            if with_vecunit:
-                from trixium.gateware.vector import BonsaiVectorUnit
-                vecunit = self.vecunit = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
-                self.add_constant("BONSAI_HAS_VECUNIT")
-                self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set.
-                self.add_constant("BONSAI_VEC_LOOPS2")   # Second loop level (2026-08-30).
-            seq = None
-            if with_vecunit:
-                from trixium.gateware.sequencer import BonsaiSequencer
-                self.add_constant("BONSAI_SEQ_LUT")      # A5-from-LUT arg source (2026-09-09).
-                seq = self.seq = ClockDomainsRenamer("eng")(BonsaiSequencer())
-                self.comb += [
-                    vecunit.seq_en.eq(seq.busy),
-                    vecunit.seq_start.eq(seq.vec_start),
-                    vecunit.seq_pc.eq(seq.vec_pc),
-                    seq.vec_done.eq(vecunit.done),
-                    seq.vec_res6.eq(vecunit.res6.status),
-                    vecunit.seq_seed7.eq(seq.vec_seed7), # res6 chaining, or engine absmax (w0[4]).
-                ]
-                self.comb += [vecunit.seq_args[i].eq(seq.vec_args[i]) for i in range(8)]
-                self.add_constant("BONSAI_HAS_SEQ")
-                # The 4KB vec imem must stay in distributed RAM: as BRAM, Vivado packs the
-                # FETCHR register into the BRAM output stage, re-anchoring the decode
-                # launch to the BRAM's clock-to-out + placement (the overnight worst path).
-                platform.add_platform_command(
-                    "set_property RAM_STYLE distributed "
-                    "[get_cells -hierarchical -filter {{NAME =~ *imem_reg*}}]")
-                # (The vecunit multicycle constraints were removed with the V1 pipeline,
-                # 2026-08-29: every stage is a true single-cycle path. They had been dead
-                # in the netlist anyway - the operand register was emitted under a
-                # namer-collided name and the ROM output cells are absorbed into the
-                # RAMB18 output stage, so the regexes matched nothing.)
-            sp_client = vecunit
+            config = BonsaiClusterConfig(
+                with_vecunit=with_vecunit, with_dual=with_dual,
+                with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
+                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew)
+            add_bonsai_cluster(self, engine_axis, config)
+            add_cluster_constraints(platform, with_vecunit=with_vecunit)
             if cluster_with_dnrec:
-                assert vecunit is not None, "DeltaNet recurrence needs the scratchpad arbiter"
-                from trixium.gateware.deltanet import BonsaiDeltaNetUnit, BonsaiScratchpadClientMux
-                self.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit())
-                self.spmux = BonsaiScratchpadClientMux(vecunit, self.dnunit)
-                sp_client = self.spmux
-                # Register packaged Vivado cores as IPs, rather than ordinary sources.
-                # LiteX then emits read_ip/generate_target/synth_ip before top-level
-                # synthesis; add_source() leaves the modules unresolved on a clean build.
+                # Vendor implementations are target-owned, not portable-core sources.
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
-                self.add_constant("BONSAI_HAS_DNREC")
-            self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
-            self.engine     = ClockDomainsRenamer("eng")(
-                BonsaiMatVecEngine(self.scratchpad, engine_axis, vecunit=sp_client,
-                                   seq=seq, dual=with_dual, chan_stride=cluster_chan_stride,
-                                   chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew))
-            if with_dual:
-                # S3 dual-Q GQA + S6 speculative pair-verify: ~2x the engine datapath.
-                self.add_constant("BONSAI_HAS_DUALQ")
-            self.engine_csr = BonsaiEngineCSR(self.engine, seq=seq)
-            self.comb += [
-                self.engrst.trigger.eq(self.engine_csr.rst_trigger),
-                self.engine_csr.rst_busy.eq(self.engrst.busy),
-                self.engine_csr.rst_stuck.eq(self.engrst.stuck),
-            ]
-            # Channel offsets added in hardware on the upload path too (33-bit windows,
-            # N=16 puts channel 15 above 4 GB); the host tools read
-            # BONSAI_LOADER_ADDS_CHAN_OFFSET and stop adding c*STRIDE themselves.
-            self.loader     = ClockDomainsRenamer("eng")(
-                BonsaiHBMLoader(engine_axis, data_width=128, chan_stride=cluster_chan_stride,
-                                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew))
-            # Engine kind-3 STORE (KV append) rides the loader's writers.
-            self.comb += [
-                self.engine.store_cmd.connect(self.loader.store_cmd),
-                self.engine.store_data.connect(self.loader.store_data),
-                self.engine.store_busy.eq(self.loader.store_busy),
-            ]
-            self.add_constant("BONSAI_HAS_KVSTORE")
-            self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
-            # Sideband (wishbone/CSR) scratchpad access only while all units are idle.
-            units_idle = ~self.engine.sp_busy
-            if sp_client is not None:
-                units_idle = units_idle & ~sp_client.busy
-            if seq is not None:
-                units_idle = units_idle & ~seq.busy
-            self.comb += self.scratchpad.units_idle.eq(units_idle)
-            self.add_constant("BONSAI_SP_SB_SLOT", 1) # Per-cycle sideband slot present.
-            self.add_constant("BONSAI_SP_SB_RSLOT", 1) # Read slot: reads grant mid-list.
-            # Vector ISA encoding (model.asm): the firmware Makefile reads this to emit a
-            # progs.h that matches the bitstream. Absent = the original 8-register encoding.
-            if vecunit is not None: # A build without --with-vecunit has no encoding to name.
-                self.add_constant("BONSAI_VEC_VREGS", vecunit.vregs)
-            self.sp_csr     = self.scratchpad.add_csr_port() # Host peek/poke over BAR0/JTAG.
-
-            # Scratchpad on the SoC bus (uncached: shared with the engine).
             self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
                 SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
+            self.comb += self.pcie_dma0.source.connect(
+                self.loader.sink, keep={"valid", "ready", "data"})
 
-            # Weight upload: PCIe DMA0 host->device stream feeds the loader.
-            self.comb += [
-                self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"}),
-            ]
-
-            # Firmware contract: the BONS header+table are staged 1 MB below engine channel
-            # 0's window and copied to main_ram + HDR_CPU_OFFSET; engine-channel payloads one
-            # cluster_chan_stride apart from cluster_weight_base, each in its own window
-            # (the offset is added in hardware; layout.py has the geometry of each board).
+            # Board memory map and host-upload convention (legacy v2/v3 images).
             from trixium.layout import HDR_CPU_OFFSET
+            self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
             self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
             self.add_constant("BONSAI_CHAN_WEIGHT_BASE", cluster_weight_base)
             self.add_constant("BONSAI_CHAN_STRIDE",      cluster_chan_stride)
             self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
-            # Several memory controllers (the XCU1525): the firmware's overlap check and
-            # its controller init read these; absent, the FK33's flat HBM geometry.
             if cluster_chan_mod:
                 self.add_constant("BONSAI_CHAN_MOD", cluster_chan_mod)
             if cluster_chan_skew:
@@ -443,8 +330,6 @@ class BonsaiXCU1525SoC(SoCCore):
                 self.add_constant("BONSAI_MEM_CPU_OFFSET", cluster_mem_cpu_offset)
             if cluster_n_memctrl is not None:
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
-
-        # Bonsai cluster: end.
 
 
         self.add_constant("BONSAI_DDR_CSR_STRIDE", DDR_CSR_STRIDE)

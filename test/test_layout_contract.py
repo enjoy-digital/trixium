@@ -106,71 +106,26 @@ def test_tiny_image_roundtrip(tmp_path):
                               reader.tensor_channel_bytes("token_embd.weight", 1))
     assert np.array_equal(reader.tensor_channel_bytes("blk.0.attn_norm.weight", 0),
                           reader.tensor_channel_bytes("blk.0.attn_norm.weight", 1))
-def test_soc_definitions_wire_the_sequencer_alike():
-    """The board targets and sim/bonsai_sim.py must wire the vecunit/sequencer identically.
+def test_targets_use_one_cluster_implementation():
+    """The former source-copy guard is replaced by a shared construction boundary.
 
-    There are two SoC definitions - hardware and Verilator sim - and every integration
-    signal has to be spelled out in both. When they drift, the sim silently stops testing
-    what the hardware does, which is the worst possible failure: gates pass, hardware is
-    wrong, or (as happened) a sim gate fails for a reason that exists only in the sim.
-
-    Paid for twice now. The include-guard case let bonsai_load upload to a stale base. The
-    seq_seed7 case wired the S7 seed straight from vec_res6 in the sim only, which made the
-    descriptor's w0[4] absmax-seed select a no-op there: the spill persisted the softmax p8
-    sum instead of the engine absmax, norm_i32 took its shift from that, and every head came
-    out misscaled. It cost several 12-minute Verilator runs and a wrong root-cause call
-    before an XPROBE showed `am` equal to `P8` exactly.
-
-    A grep is crude, but it is instant and it fails loudly on the one thing that went wrong.
+    Functional seam/reset/store tests live in test_integration.py; these checks
+    prevent a target from silently reinstating its own divergent third copy.
+    Internal Migen names are allowed to change, but require fresh physical gates.
     """
-    import re
+    import ast
     from pathlib import Path
-
     root = Path(__file__).resolve().parent.parent
-    srcs = {
-        "trixium.py":         (root/"trixium.py").read_text(),
-        "trixium_xcu1525.py": (root/"trixium_xcu1525.py").read_text(),
-        "sim/bonsai_sim.py":       (root/"sim/bonsai_sim.py").read_text(),
-    }
-    # (signal, expected right-hand side) for the vecunit<->sequencer seam.
-    seam = [
-        ("seq_seed7", "vec_seed7"),  # NOT vec_res6: that bypasses the w0[4] mux.
-        ("seq_start", "vec_start"),
-        ("seq_pc",    "vec_pc"),
-    ]
-    for fname, text in srcs.items():
-        for sig, want in seam:
-            m = re.search(rf"vecunit\.{sig}\.eq\(\s*(?:self\.)?seq\.(\w+)", text)
-            assert m, f"{fname}: no wiring found for vecunit.{sig}"
-            assert m.group(1) == want, (
-                f"{fname}: vecunit.{sig} is wired from seq.{m.group(1)}, expected "
-                f"seq.{want}. The two SoC definitions have drifted - see this test's "
-                f"docstring for what that costs.")
+    for fname in ("trixium.py", "trixium_xcu1525.py", "sim/bonsai_sim.py"):
+        tree = ast.parse((root / fname).read_text())
+        calls = [node.func.id for node in ast.walk(tree)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+        assert calls.count("add_bonsai_cluster") == 1, fname
+        for constructor in ("BonsaiMatVecEngine", "BonsaiVectorUnit", "BonsaiSequencer",
+                            "BonsaiEngineCSR", "BonsaiHBMLoader", "BonsaiEngineResetDomain"):
+            assert constructor not in calls, (fname, constructor)
 
-
-def test_board_targets_share_the_cluster_block():
-    """trixium.py (FK33) and trixium_xcu1525.py instantiate the engine cluster
-    from one byte-identical block, marked `# Bonsai cluster: begin` / `end`.
-
-    A shared function would be the obvious way to keep two board targets from drifting,
-    and it is exactly what cannot be done here: Migen names every signal by the frame it
-    was created in, so moving the block into a function renamed every cluster signal in the
-    FK33 netlist (`add_bonsai_cluster_engine_csr_bias_storage`, 11k lines of diff for a
-    pure move, 2026-09-18). The operating board's netlist stays as it is; the two copies
-    are checked instead. The per-board knobs live in the cluster_* variables set just
-    before the block, so the block itself never mentions a board.
-    """
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent
-    blocks = {}
-    for fname in ("trixium.py", "trixium_xcu1525.py"):
-        text  = (root/fname).read_text()
-        begin = text.index("        # Bonsai cluster: begin")
-        end   = text.index("        # Bonsai cluster: end")
-        blocks[fname] = text[begin:end]
-        for knob in ("with_bonsai", "cluster_chan_mod", "cluster_mem_cpu_offset",
-                     "cluster_n_memctrl"):
-            assert f"{knob} " in text[:begin], f"{fname}: {knob} must be set before the block"
-    a, b = blocks.values()
-    assert a == b, "the two board targets' cluster blocks differ"
+    portable = (root / "trixium/gateware/integration.py").read_text()
+    assert "vecunit.seq_seed7.eq(seq.vec_seed7)" in portable
+    assert "platform.add_ip" not in portable
+    assert "add_platform_command" not in portable

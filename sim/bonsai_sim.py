@@ -43,13 +43,7 @@ from litex.soc.integration.builder import Builder
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.scratchpad import BonsaiScratchpad
-from trixium.gateware.matvec import BonsaiMatVecEngine
-from trixium.gateware.csr_front import BonsaiEngineCSR
-from trixium.gateware.vector import BonsaiVectorUnit
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
-from trixium.gateware.loader import BonsaiHBMLoader
-from trixium.gateware.sequencer import BonsaiSequencer
 from trixium.model.bons import BONSReader
 
 # Constants ----------------------------------------------------------------------------------------
@@ -162,7 +156,6 @@ class BonsaiSimSoC(SoCCore):
         self._prof_pads = platform.request("prof")
 
         # Scratchpad + engine + the memory system.
-        self.scratchpad = BonsaiScratchpad(size=256*1024)
         axis = []
         n_channels = img.header["n_channels"] if img is not None else 2
         chan_mod = 0
@@ -183,68 +176,17 @@ class BonsaiSimSoC(SoCCore):
                 axis.append(axi)
         else:
             chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
-        # Same soft-resettable domain + AXI shims as trixium.py (engreset.py).
-        from trixium.gateware.engreset import BonsaiEngineResetDomain
-        self.engrst = BonsaiEngineResetDomain(axis)
-        axis = self.engrst.masters
-        self.add_constant("BONSAI_HAS_ENGRESET")
-        self.vecunit    = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
-        self.seq = ClockDomainsRenamer("eng")(BonsaiSequencer())
-        self.comb += [
-            self.vecunit.seq_en.eq(self.seq.busy),
-            self.vecunit.seq_start.eq(self.seq.vec_start),
-            self.vecunit.seq_pc.eq(self.seq.vec_pc),
-            self.seq.vec_done.eq(self.vecunit.done),
-            self.seq.vec_res6.eq(self.vecunit.res6.status),
-            # Must match trixium.py: res6 chaining, or the engine absmax when the
-            # descriptor sets w0[4]. Wiring this from vec_res6 directly made seed_abs a
-            # silent no-op in sim - the spill then persisted the p8 sum instead of the
-            # absmax, which is what 'am == P8 exactly' in the XPROBE output showed.
-            self.vecunit.seq_seed7.eq(self.seq.vec_seed7),
-        ]
-        self.comb += [self.vecunit.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-        self.engine     = ClockDomainsRenamer("eng")(
-            BonsaiMatVecEngine(self.scratchpad, axis, vecunit=self.vecunit, seq=self.seq, dual=dual,
-                               chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
-                               chan_mod=chan_mod,
-                               chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0))
-        self.engine_csr = BonsaiEngineCSR(self.engine, seq=self.seq)
-        self.comb += [
-            self.engrst.trigger.eq(self.engine_csr.rst_trigger),
-            self.engine_csr.rst_busy.eq(self.engrst.busy),
-            self.engine_csr.rst_stuck.eq(self.engrst.stuck),
-        ]
-        self.add_constant("BONSAI_HAS_SEQ")
+        # Same integration as both hardware targets; only memory/physical policy differs.
+        from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
+        add_bonsai_cluster(self, axis, BonsaiClusterConfig(
+            with_vecunit=True, with_dual=dual, with_sp_csr=False,
+            chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
+            chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0))
         self.comb += [
             self._prof_pads.eng_busy.eq(self.engine.busy),
             self._prof_pads.vec_busy.eq(self.vecunit.busy),
             self._prof_pads.seq_busy.eq(self.seq.busy),
         ]
-        # Loader: PCIe sink dangles in sim; its per-channel AXI writers carry the engine's
-        # kind-3 STORE ops (KV append).
-        self.loader = ClockDomainsRenamer("eng")(BonsaiHBMLoader(axis,
-            chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0, chan_mod=chan_mod,
-            chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0))
-        self.comb += [
-            self.engine.store_cmd.connect(self.loader.store_cmd),
-            self.engine.store_data.connect(self.loader.store_data),
-            self.engine.store_busy.eq(self.loader.store_busy),
-            # Sideband (wishbone) scratchpad access is granted only while every unit
-            # that touches the two memory ports is idle.
-            self.scratchpad.units_idle.eq(~self.engine.sp_busy & ~self.vecunit.busy
-                                          & ~self.seq.busy),
-        ]
-        self.add_constant("BONSAI_SP_SB_SLOT", 1) # Per-cycle sideband slot present.
-        self.add_constant("BONSAI_SP_SB_RSLOT", 1) # Read slot: reads grant mid-list.
-        self.add_constant("BONSAI_VEC_VREGS", self.vecunit.vregs) # Encoding (model.asm).
-        self.add_constant("BONSAI_HAS_KVSTORE")
-        self.add_constant("BONSAI_HAS_TOPK") # Argmax tap + suppressed writes.
-        if dual: # Matches the hardware --with-dual option.
-            self.add_constant("BONSAI_HAS_DUALQ")
-        self.add_constant("BONSAI_HAS_VECUNIT")
-        self.add_constant("BONSAI_HAS_VECUNIT2") # M4 program set (rmsnorm scalar ops + rsqrt fix).
-        self.add_constant("BONSAI_VEC_LOOPS2")   # Second loop level (2026-08-30).
-        self.add_constant("BONSAI_SEQ_LUT")      # A5-from-LUT arg source (2026-09-09).
 
         self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
             SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
