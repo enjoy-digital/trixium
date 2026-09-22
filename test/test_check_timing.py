@@ -62,3 +62,43 @@ def test_real_v8_report_if_available():
     assert row[0] > 0 and row[4] > 0 and row[8] < 0
     assert row[10] == 16 and failed
     assert strict_failures(row, failed)
+
+
+V8_PLUS = "0.033 0.000 0 1339665 0.010 0.000 0 1339662 -0.003 -0.036 16 383698"
+
+
+def test_serializer_baseline_waiver_scope(tmp_path):
+    from tools.check_timing import SERIALIZER_BASELINES
+    v8 = SERIALIZER_BASELINES["v8"]
+    # Exactly the v8 family on a new build: waived, and reported as such.
+    parsed = parse_full(report(tmp_path, V8_PLUS, "Timing constraints are not met.\n"))
+    assert strict_failures(*parsed, serializer_baseline=v8) == []
+    assert any("serializer-skew" in w for w in strict_failures.waived)
+    # Worse on any one number is not waived.
+    for column, value in ((8, "-0.004"), (9, "-0.040"), (10, "17")):
+        fields = V8_PLUS.split()
+        fields[column] = value
+        parsed = parse_full(report(tmp_path, " ".join(fields), "Timing constraints are not met.\n"))
+        assert strict_failures(*parsed, serializer_baseline=v8)
+    # A setup miss is never waived, even with a clean serializer family.
+    fields = V8_PLUS.split()
+    fields[0], fields[1], fields[2] = "-0.010", "-0.020", "2"
+    parsed = parse_full(report(tmp_path, " ".join(fields), "Timing constraints are not met.\n"))
+    bad = strict_failures(*parsed, serializer_baseline=v8)
+    assert any("setup" in b for b in bad)
+    # Without the flag the same report is rejected as before.
+    parsed = parse_full(report(tmp_path, V8_PLUS, "Timing constraints are not met.\n"))
+    assert strict_failures(*parsed)
+
+
+def test_cli_waiver_verdict_and_v10(tmp_path):
+    path = report(tmp_path, V8_PLUS, "Timing constraints are not met.\n")
+    tool = ROOT / "tools/check_timing.py"
+    result = subprocess.run([sys.executable, str(tool), "--strict", "--serializer-baseline", "v8",
+                             str(path)], capture_output=True, text=True)
+    assert result.returncode == 0 and "PASS WITH WAIVER" in result.stdout and "-0.003" in result.stdout
+    v10 = ROOT / "build/xcu1525_n16_150_v10_dualdiv_native/gateware/sqrl_xcu1525_mem48_timing.rpt"
+    if v10.exists():
+        result = subprocess.run([sys.executable, str(tool), "--strict", "--serializer-baseline", "v8",
+                                 str(v10)], capture_output=True, text=True)
+        assert result.returncode == 1 and "DO NOT SHIP" in result.stdout and "setup" in result.stdout
