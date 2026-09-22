@@ -46,9 +46,10 @@ def make_engine_case(dut, kind=0, rows=3, rem=0, groups=2, qn=False, ilv=False, 
         indices = (list(range(i, total, n)) if ilv else
                    list(range(i*rows+min(i, rem), i*rows+min(i, rem)+rows+(i < rem))))
         region_id, base = (7, 0) if i % 2 == 0 else (42, 1 << 32)
-        offset = i*8192 + 16
+        offset = i*8192 + 32
         block_bytes = 28 if kind == 0 else 34
-        stride = groups*block_bytes + 3
+        # Device rows are beat-aligned: stride is the padded span plus an aligned gap.
+        stride = qformats.native_row_span(groups, block_bytes) + 32
         descriptors.append((region_id, offset, stride))
         if native:
             for row, index in enumerate(indices):
@@ -56,7 +57,7 @@ def make_engine_case(dut, kind=0, rows=3, rem=0, groups=2, qn=False, ilv=False, 
                 payload = pack(scales[index], values[index].reshape(groups, -1)).tobytes()
                 address = base+offset+row*stride
                 memory.update({address+j: v for j, v in enumerate(payload)})
-                reads.append((i, address & -32, (address%32 + len(payload)+31)//32))
+                reads.append((i, address, qformats.native_row_beats(groups, block_bytes)))
         else:
             assert rem == 0
             spec = TensorSpec('w', layout.ROLE_ATTN_Q, 0, kind, rows, cols,

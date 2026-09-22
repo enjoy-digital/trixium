@@ -272,3 +272,33 @@ DEQUANT = {
     GGML_PQ2_0:  q2_0_dequant,
     GGML_PTQ1_0: ptq1_0_dequant,
 }
+
+# Native device row layout ------------------------------------------------------------------------
+#
+# The native weight reader (gateware/native_reader.py) streams 32-byte beats and frames
+# every row on beat boundaries: a row of `groups` blocks occupies ceil(groups*block/32)
+# beats and the tail of its last beat is padding the decoder never looks at. Row offsets
+# and strides must be multiples of 32. This is the device placement contract; the BONS v4
+# artifact itself stays contiguous. Only the FFN-down K-segments of the 27B (68 groups =
+# 1904 bytes, half a beat short) actually gain padding: 0.8% on that tensor.
+
+NATIVE_BEAT = 32
+NATIVE_BLOCK_BYTES = {143: 28, 8: 34}  # GGML type -> bytes per block (PTQ1_0, Q8_0)
+
+def native_row_beats(groups, block_bytes):
+    """Beats one row of `groups` native blocks occupies on the device."""
+    return (groups*block_bytes + NATIVE_BEAT - 1)//NATIVE_BEAT
+
+def native_row_span(groups, block_bytes):
+    """Bytes one row occupies on the device, padding included (the minimum stride)."""
+    return native_row_beats(groups, block_bytes)*NATIVE_BEAT
+
+def pad_native_rows(rows, fill=b'\xa5'):
+    """Concatenate `rows` (bytes objects) padding each to a beat boundary.
+
+    The fill byte is deliberately nonzero: padding must be ignored, not decoded as zero."""
+    out = bytearray()
+    for row in rows:
+        out += row
+        out += fill*((-len(row)) % NATIVE_BEAT)
+    return bytes(out)

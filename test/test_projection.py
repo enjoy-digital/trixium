@@ -213,13 +213,14 @@ def projection_engine_case(projection, reference, seed=38):
     for pipe, base in enumerate((0, 1 << 32)):
         start = pipe * per_pipe + min(pipe, rem)
         count = per_pipe + (pipe < rem)
-        offset, stride = 0x10013, projection.row_bytes + 3
+        # Device rows are beat-aligned; a spare beat between rows exercises the stride.
+        offset, stride = 0x10020, projection.device_stride + 32
         descriptors.append((7 if pipe == 0 else 42, offset, stride))
         for i in range(count):
             payload = projection.read_rows(start + i, 1)
             address = base + offset + i * stride
             memory.update({address + j: b for j, b in enumerate(payload)})
-            reads.append((pipe, address & -32, (address % 32 + len(payload) + 31) // 32))
+            reads.append((pipe, address, (len(payload) + 31) // 32))
     cmd = dict(native=True, kind=1, rows=per_pipe, rem=rem, cols=cols, cbeats=groups,
                sbeats=(groups+15)//16, wbase=0, wlen=0, bias=projection.bias, rshift=projection.rshift,
                rshift2=0, xsrc=0, dst=0xc004, qn=False, qstride=rows+3, ilv=False, supw=0, xred=0)

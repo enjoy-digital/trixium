@@ -70,6 +70,16 @@ class ReferenceQ8Projection:
         return self.shape[1] // 32 * 34
 
     @property
+    def device_stride(self):
+        """Bytes per row once uploaded: rows are beat-padded on the device.
+
+        The native reader requires 32-byte-aligned rows/strides (qformats.native_row_span);
+        for 5,120-column Q8 rows the padding is zero, so the compact and device layouts
+        coincide. Any other geometry must upload rows padded to this stride."""
+        from trixium.model.qformats import native_row_span
+        return native_row_span(self.shape[1] // 32, 34)
+
+    @property
     def sha256(self):
         return hashlib.sha256(self.payload).digest()
 
@@ -184,9 +194,11 @@ def resident_reference_q8_descriptors(projection, *, pipe_locations, q8_src, exp
     if fp32_src is not None:
         descriptors.append(scratchpad_quantize_descriptor(src=fp32_src, dst=q8_src,
                                                           exponents=exponents, elements=cols))
+    if any(offset % 32 for _, offset in locations):
+        raise ValueError('native pipe rows must start on 32-byte boundaries')
     for pipe, (region, offset) in enumerate(locations):
         descriptors.append(native_pipe_descriptor(pipe=pipe, region=region, offset=offset,
-                                                  stride=projection.row_bytes))
+                                                  stride=projection.device_stride))
     descriptors.append(native_projection_descriptor(kind=1, rows=per_pipe, rem=rem, groups=cols//32,
         bias=projection.bias, rshift=projection.rshift, xsrc=q8_src, dst=int32_dst))
     descriptors.append(scratchpad_restore_descriptor(src=int32_dst, dst=fp32_dst, exponents=exponents,

@@ -54,7 +54,15 @@ int main(int argc, char **argv) {
     const bool ptq = encoding == 5;
     unsigned block = ptq ? 28 : 34, total = rows*groups;
     require(data.size() == total*block, "input bytes");
-    while (data.size() % 32) data.push_back(0xa5);
+    // Device row layout: every row is padded to a 32-byte beat boundary (nonzero fill:
+    // padding must be ignored by the decoder, not decoded as zero).
+    const std::vector<uint8_t> blocks = data;  // the contiguous reference
+    std::vector<uint8_t> padded;
+    for (unsigned r=0; r<rows; r++) {
+        padded.insert(padded.end(), blocks.begin()+r*groups*block, blocks.begin()+(r+1)*groups*block);
+        while (padded.size() % 32) padded.push_back(0xa5);
+    }
+    data.swap(padded);
     Vnative_weights dut;
     auto clock = [&]() { dut.sys_clk=0; dut.eval(); dut.sys_clk=1; dut.eval(); };
     dut.sys_rst=1;
@@ -96,7 +104,7 @@ int main(int argc, char **argv) {
         if (dut.source_valid && dut.source_ready) {
             require(received < total, "duplicate output");
             uint32_t words[8]; unsigned scale;
-            reference(&data[received*block], ptq, words, scale);
+            reference(&blocks[received*block], ptq, words, scale);
             for (unsigned i=0; i<8; i++) {
                 if (words[i] != out[i]) {
                     std::fprintf(stderr, "group %u word %u: expected %08x, got %08x, cycle %u\n",

@@ -5,6 +5,12 @@ PTQ1_0 retains its exact trit order and FP16 bits; Q8_0 retains signed-byte bits
 No arithmetic quantization, row packet expansion or scale RAM is involved. The
 optional BonsaiChannelPipe semantic ingress accepts these groups; board command
 frontends still use the default legacy interface and do not advertise native I/O.
+
+Rows are framed on 32-byte beats: a row of `groups` blocks occupies
+ceil(groups*block_bytes/32) beats and the tail of its last beat is padding that
+is never decoded. Device placement pads every row (and every K-segment start)
+to a beat boundary; the memory reader therefore needs no byte-shifting packer.
+For rows == 1 this is the same contract as a contiguous stream.
 """
 from migen import *
 from litex.gen import LiteXModule
@@ -21,6 +27,19 @@ GROUP_LAYOUT = [('codes', 256), ('scale', 16), ('kind', 1), ('error', 1),
 # kind=0: 128 two-bit ternary codes (code 1 is zero); kind=1: 32 int8 bit patterns.
 # scale is the exact little-endian FP16 bit pattern, NOT a converted value.
 # first/last endpoint flags delimit the complete command, not each row.
+
+
+def trit_digits(byte):
+    """The five ternary codes of one PTQ1_0 byte, in extraction order.
+
+    Digit k is the top two bits of 3*((byte*3**k) mod 256): the stored byte is
+    ceil(base3*256/243), so repeated multiplication by three peels the digits
+    off most-significant first. Every byte value yields codes in 0..2.
+    """
+    return [(3*((byte*3**k) & 0xff)) >> 8 for k in range(5)]
+
+
+TRIT_TABLE = [sum(d << (2*k) for k, d in enumerate(trit_digits(q))) for q in range(256)]
 
 
 class NativeBlockDecoder(LiteXModule):
@@ -73,20 +92,26 @@ class NativeBlockDecoder(LiteXModule):
         # PTQ1_0: qs[0:16] encodes five interleaved runs of 16 elements,
         # qs[16:24] five runs of 8, then qh[0:2] four runs of 2.
         # Do NOT use q//3**n: the stored byte is ceil(base3*256/243).
+        # One 256-entry table per byte (TRIT_TABLE, generated from the exact
+        # multiply-by-3 extraction) instead of five chained constant multiplies:
+        # a single LUT/F7/F8 level, about a third of the logic (v10 review).
+        # An Array of constants lowers to one Verilog case per byte and simulates
+        # as a list index, unlike an explicit 256-way Case.
+        tables = {trits: Array(C(TRIT_TABLE[q] & ((1 << 2*trits) - 1), 2*trits) for q in range(256))
+                  for trits in (4, 5)}
         for byte_index in range(26):
             byte = raw.data[8*byte_index:8*(byte_index + 1)]
-            for trit in range(5 if byte_index < 24 else 4):
+            trits = 5 if byte_index < 24 else 4
+            digits = Signal(2*trits, name=f'digits{byte_index}')
+            self.comb += digits.eq(tables[trits][byte])
+            for trit in range(trits):
                 if byte_index < 16:
                     element = 16*trit + byte_index
                 elif byte_index < 24:
                     element = 80 + 8*trit + byte_index - 16
                 else:
                     element = 120 + 2*trit + byte_index - 24
-                wrapped = Signal(8)
-                tripled = Signal(10)
-                self.comb += [wrapped.eq(byte * (3**trit)),
-                              tripled.eq((wrapped << 1) + wrapped),
-                              ternary_codes[2*element:2*(element + 1)].eq(tripled[8:10])]
+                self.comb += ternary_codes[2*element:2*(element + 1)].eq(digits[2*trit:2*trit + 2])
         self.sync += If(take_result & raw.valid & ~self.clear,
             If(raw.encoding == PTQ1_0,
                 result.codes.eq(ternary_codes), result.scale.eq(raw.data[208:224]),
@@ -99,10 +124,13 @@ class NativeBlockDecoder(LiteXModule):
 class NativeWeightStream(LiteXModule):
     """Frame 256-bit memory beats into native blocks using a 64-byte reservoir.
 
-    start latches rows/groups/encoding; byte zero of the first beat is the first
-    block. The last beat may contain up to 31 ignored high padding bytes. sink.last
-    must mark exactly ceil(rows*groups*block_bytes/32) beats. Command-level I/O
-    supplies these aligned data and drains its own outstanding AXI traffic.
+    start latches rows/groups/encoding; the next cycle derives the row geometry
+    (no beat is accepted before that). Byte zero of the first beat is the first
+    block. Every row occupies beats_per_row = ceil(groups*block_bytes/32) beats;
+    the padding tail of a row's last beat is ignored, so rows*beats_per_row
+    beats carry the command and sink.last must mark exactly the final one.
+    Command-level I/O supplies these aligned data and drains its own
+    outstanding AXI traffic.
 
     On bad framing the decoder flushes; incoming beats drain through the next
     last, then done pulses with sticky error. A missing last therefore needs an
@@ -134,10 +162,17 @@ class NativeWeightStream(LiteXModule):
         fmt = Signal(8)
         block_units = Signal(5)
         groups_per_row = Signal(16)
+        rows_total = Signal(16)
         row, group = Signal(16), Signal(16)
-        groups_left = Signal(32)
-        units_left = Signal(37)
-        beats_left = Signal(33)
+        finished = Signal()          # every group of the command has been popped
+        group_last, command_last = Signal(), Signal()
+        # Row geometry, derived one cycle after start from the latched command.
+        units_per_row = Signal(21)   # halfwords of payload in one row
+        beats_per_row = Signal(17)   # 32-byte beats occupied by one row
+        units_left = Signal(21)      # payload halfwords still expected in this row
+        beats_left = Signal(17)      # beats still expected in this row
+        rows_left = Signal(16)       # rows still expected, including the current one
+        preparing = Signal()
         first = Signal()
         draining = Signal()
         pop, push, bad_frame = Signal(), Signal(), Signal()
@@ -145,67 +180,87 @@ class NativeWeightStream(LiteXModule):
         incoming = Signal(5)
         shifted = Signal(512)
         append_shift = Signal(9)
-        total_groups = Signal(32)
-        total_units = Signal(37)
+        masked = Signal(256)
+        row_units = Signal(21)
         config_ok = Signal()
+        row_last_beat, command_last_beat = Signal(), Signal()
         self.comb += [
-            total_groups.eq(self.rows * self.groups),
-            total_units.eq(Mux(self.encoding == PTQ1_0, total_groups * 14, total_groups * 17)),
+            # 14g = 16g - 2g and 17g = 16g + g: carry chains, not a combinational DSP.
+            row_units.eq(Mux(fmt == PTQ1_0, (groups_per_row << 4) - (groups_per_row << 1),
+                             (groups_per_row << 4) + groups_per_row)),
+            group_last.eq(group == groups_per_row - 1),
+            command_last.eq(group_last & (row == rows_total - 1)),
             self.buffered_bytes.eq(count << 1),
             config_ok.eq((self.rows != 0) & (self.groups != 0)
                          & ((self.encoding == PTQ1_0) | (self.encoding == Q8_0))),
-            decoder.sink.valid.eq(self.busy & ~draining & (groups_left != 0)
+            decoder.sink.valid.eq(self.busy & ~preparing & ~draining & ~finished
                                   & (count >= block_units) & ~self.cancel),
             decoder.sink.data.eq(buffer[:272]), decoder.sink.encoding.eq(fmt),
             decoder.sink.row.eq(row), decoder.sink.group.eq(group),
-            decoder.sink.row_last.eq(group == groups_per_row - 1),
-            decoder.sink.first.eq(first), decoder.sink.last.eq(groups_left == 1),
+            decoder.sink.row_last.eq(group_last),
+            decoder.sink.first.eq(first), decoder.sink.last.eq(command_last),
             pop.eq(decoder.sink.valid & decoder.sink.ready),
             remaining.eq(count - Mux(pop, block_units, 0)),
             shifted.eq(Mux(pop, Mux(fmt == PTQ1_0, buffer >> 224, buffer >> 272), buffer)),
+            # The last beat of a row carries only its remaining payload halfwords;
+            # its padding is masked BEFORE the append, or it would be ORed into the
+            # next row's data once the reservoir shifts (ties-to-junk, caught in test).
             incoming.eq(Mux(units_left < 16, units_left, 16)),
             # A nested (remaining[:5] << 4) used as a Verilog shift amount is
             # self-sized to FIVE bits, unlike Migen simulation. Explicit concat
             # preserves all nine address bits (caught by compiled RTL tests).
             append_shift.eq(Cat(C(0, 4), remaining[:5])),
-            self.sink.ready.eq(self.busy & ~self.cancel
-                               & (draining | ((beats_left != 0) & (remaining <= 16)))),
+            row_last_beat.eq(beats_left == 1),
+            command_last_beat.eq(row_last_beat & (rows_left == 1)),
+            self.sink.ready.eq(self.busy & ~preparing & ~self.cancel
+                               & (draining | ((rows_left != 0) & (remaining <= 16)))),
             push.eq(self.sink.valid & self.sink.ready),
-            bad_frame.eq(push & ~draining & (self.sink.last != (beats_left == 1))),
+            bad_frame.eq(push & ~draining & (self.sink.last != command_last_beat)),
             decoder.clear.eq(self.cancel | bad_frame | (self.start & ~self.busy)),
             decoder.source.connect(self.source),
         ]
+        for unit in range(16):
+            self.comb += masked[16*unit:16*(unit + 1)].eq(
+                Mux(unit < incoming, self.sink.data[16*unit:16*(unit + 1)], 0))
         self.sync += [
             self.done.eq(0),
             If(self.cancel,
                 self.done.eq(self.busy), self.busy.eq(0), self.cancelled.eq(1),
-                buffer.eq(0), count.eq(0), draining.eq(0),
+                buffer.eq(0), count.eq(0), draining.eq(0), preparing.eq(0),
             ).Elif(self.start & ~self.busy,
                 self.error.eq(~config_ok), self.cancelled.eq(0),
-                self.busy.eq(config_ok), self.done.eq(~config_ok),
+                self.busy.eq(config_ok), self.done.eq(~config_ok), preparing.eq(config_ok),
                 fmt.eq(self.encoding), block_units.eq(Mux(self.encoding == PTQ1_0, 14, 17)),
-                groups_per_row.eq(self.groups), row.eq(0), group.eq(0), first.eq(1),
-                groups_left.eq(total_groups), units_left.eq(total_units),
-                beats_left.eq((total_units + 15) >> 4),
+                groups_per_row.eq(self.groups), rows_left.eq(self.rows), rows_total.eq(self.rows),
+                row.eq(0), group.eq(0), first.eq(1), finished.eq(0),
                 buffer.eq(0), count.eq(0), draining.eq(0),
             ).Elif(self.busy,
                 If(self.start, self.error.eq(1)),  # Cannot overwrite a live command.
-                If(bad_frame | draining,
+                If(preparing,
+                    preparing.eq(0),
+                    units_per_row.eq(row_units), units_left.eq(row_units),
+                    beats_per_row.eq((row_units + 15) >> 4), beats_left.eq((row_units + 15) >> 4),
+                ).Elif(bad_frame | draining,
                     self.error.eq(1), draining.eq(1), buffer.eq(0), count.eq(0),
                     If(push & self.sink.last,
                         self.busy.eq(0), self.done.eq(1), draining.eq(0),
                     ),
                 ).Else(
                     If(push | pop,
-                        buffer.eq(shifted | Mux(push, self.sink.data << append_shift, 0)),
+                        buffer.eq(shifted | Mux(push, masked << append_shift, 0)),
                         count.eq(remaining + Mux(push, incoming, 0)),
                     ),
                     If(push,
-                        units_left.eq(units_left - incoming), beats_left.eq(beats_left - 1),
+                        If(row_last_beat,
+                            units_left.eq(units_per_row), beats_left.eq(beats_per_row),
+                            rows_left.eq(rows_left - 1),
+                        ).Else(
+                            units_left.eq(units_left - incoming), beats_left.eq(beats_left - 1),
+                        ),
                     ),
                     If(pop,
-                        first.eq(0), groups_left.eq(groups_left - 1),
-                        If(group == groups_per_row - 1,
+                        first.eq(0), finished.eq(command_last),
+                        If(group_last,
                             row.eq(row + 1), group.eq(0),
                         ).Else(group.eq(group + 1)),
                     ),

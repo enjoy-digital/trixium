@@ -36,7 +36,8 @@ int bns_seq_desc_quantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t
 int bns_seq_desc_requantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t dst,
                            uint32_t exponents, uint32_t maxima, uint32_t result_exponent,
                            uint32_t blocks);
-/* Unit 6, native ABI 1: full 64-bit row offset/stride; no byte-alignment narrowing. */
+/* Unit 6, native ABI 1: full 64-bit row offset/stride, both multiples of 32 (device rows are
+ * beat-aligned; the reader rejects unaligned values as a configuration error). */
 int bns_seq_desc_native_pipe(struct bns_seq_descriptor *out, uint32_t pipe, uint32_t region,
                             uint64_t offset, uint64_t stride);
 struct bns_seq_projection {

@@ -11,6 +11,10 @@ def _unsigned(name, value, width):
 def native_pipe_descriptor(*, pipe, region, offset, stride):
     """Configure one pipe using a region ID and full 64-bit byte offset/stride.
 
+    Device rows are beat-aligned: offset and stride must be multiples of 32
+    (qformats.native_row_span gives the padded stride); the reader rejects
+    anything else as a configuration error. The encoder does not check this so
+    that rejection tests can still build such descriptors.
     Check seq.native_abi major 1 first. Hardware checks the actual pipe count;
     region/reachability/row-span checks occur before each native memory request.
     Descriptors persist between projections but must be reinstalled after reset.

@@ -9,8 +9,8 @@ from test_integration import SoC, write
 from test_native_reader import region
 
 
-def configure(dut, offset=15, region_id=7):
-    for name, value in dict(chan=0, region=region_id, offset=offset, stride=31).items():
+def configure(dut, offset=32, region_id=7):
+    for name, value in dict(chan=0, region=region_id, offset=offset, stride=32).items():
         yield from write(getattr(dut.zznative, name), value)
     yield from write(dut.zznative.commit, 1)
 
@@ -34,9 +34,9 @@ def test_native_csr_snapshot_queue_order_and_full_reset(with_vecunit):
     positive = qformats.ptq1_0_pack(np.ones(1, dtype=np.float16), np.full((1, 128), 2, dtype=np.uint8)).tobytes()
     zero = qformats.ptq1_0_pack(np.ones(1, dtype=np.float16), np.ones((1, 128), dtype=np.uint8)).tobytes()
     memory = bytearray([0xa5])*(256*1024)
-    for offset, payload in [(15, positive), (8192, zero)]:
+    for offset, payload in [(32, positive), (8192, zero)]:
         for row in range(3):
-            memory[offset+row*31:offset+row*31+28] = payload
+            memory[offset+row*32:offset+row*32+28] = payload
     def reset():
         yield from write(dut.engine_csr.soft_reset, 1)
         for _ in range(90):
@@ -128,7 +128,7 @@ def test_native_list_drains_older_manual_work_and_rejects_new_manual_requests():
     dut = SoC(BonsaiClusterConfig(native_regions=(region(size=256*1024),), native_endpoints=(0,),
                                  scratchpad_size=32*1024), n=1)
     memory = bytearray(256*1024)
-    for offset, code in ((15, 2), (8192, 1), (16384, 0)):
+    for offset, code in ((32, 2), (8192, 1), (16384, 0)):
         payload = qformats.ptq1_0_pack(np.ones(1, dtype=np.float16), np.full((1, 128), code, dtype=np.uint8)).tobytes()
         memory[offset:offset+28] = payload
     memory[0x1000:0x1080] = bytes([1])*128
@@ -138,7 +138,7 @@ def test_native_list_drains_older_manual_work_and_rejects_new_manual_requests():
                 yield dut.models[0].mem[pos//32].eq(int.from_bytes(memory[pos:pos+32], 'little'))
         for beat in range(4):
             yield dut.scratchpad.mem[0x800//32 + beat].eq(int.from_bytes(bytes([1])*32, 'little'))
-        yield from configure(dut, offset=15)
+        yield from configure(dut, offset=32)
         yield from write(dut.zznative.mode, 1)
         for name, value in dict(kind=0, rows=1, cbeats=1, bias=0, rshift=0, xsrc=0x800, dst=0x4000).items():
             yield from write(getattr(dut.engine_csr, name), value)
@@ -152,7 +152,7 @@ def test_native_list_drains_older_manual_work_and_rejects_new_manual_requests():
         yield from write(dut.engine_csr.submit, 1)
         assert (yield dut.zznative.status.fields.pending) and (yield dut.engine_csr.status.fields.pending)
         fetch = [1 | 1 << 9, 2, 0, 0, 0x1000, 4, 0, 0, 0, 0x800, 0] + [0]*5
-        descriptors = [fetch, native_pipe_descriptor(pipe=0, region=7, offset=16384, stride=28),
+        descriptors = [fetch, native_pipe_descriptor(pipe=0, region=7, offset=16384, stride=32),
             native_projection_descriptor(kind=0, rows=1, groups=1, bias=0, rshift=0, xsrc=0x800, dst=0x4040)]
         yield from install_list(dut, descriptors)
         assert (yield dut.seq.native_manual_drain)
@@ -190,7 +190,7 @@ def test_native_list_drains_older_manual_work_and_rejects_new_manual_requests():
         # An actual reader failure propagates through the sequencer; the
         # preceding configuration retires, but the failed projection does not.
         yield dut.scratchpad.mem[0x4060//32].eq(0xdeadbeef)
-        bad = [native_pipe_descriptor(pipe=0, region=99, offset=0, stride=28),
+        bad = [native_pipe_descriptor(pipe=0, region=99, offset=0, stride=32),
             native_projection_descriptor(kind=0, rows=1, groups=1, bias=0, rshift=0, xsrc=0x800, dst=0x4060)]
         yield from install_list(dut, bad)
         for _ in range(400):

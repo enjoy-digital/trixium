@@ -91,8 +91,8 @@ def command(dut, encoding, rows, groups, seed=1, stalls=True, hold_output=0, sta
     blocks = [bytes(rng.randrange(256) for _ in range(size)) for _ in range(rows*groups)]
     expected = [decoded(b, encoding, i // groups, i % groups, groups, i == 0, i == len(blocks)-1)
                 for i, b in enumerate(blocks)]
-    payload = b''.join(blocks)
-    payload += bytes([0xa5]) * ((-len(payload)) % 32)  # Nonzero read-ahead/padding is ignored.
+    # Every row is padded to a beat boundary on the device; nonzero padding is ignored.
+    payload = qformats.pad_native_rows([b''.join(blocks[r*groups:(r+1)*groups]) for r in range(rows)])
     beats = [int.from_bytes(payload[i:i+32], 'little') for i in range(0, len(payload), 32)]
     yield dut.sink.valid.eq(0)
     yield dut.source.ready.eq(0)

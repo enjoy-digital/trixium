@@ -72,9 +72,11 @@ def make_case(kind, rows, groups, qn=False, seed=1, channel=0, channels=1):
     xb += bytes((-len(xb)) % 128)
     pack = qformats.ptq1_0_pack if kind == KIND_OP_TERNARY else qformats.q8_0_pack
     payload = pack(scales.reshape(-1), values.reshape(rows*groups, -1)).tobytes()
-    payload += bytes([0xa5])*((-len(payload)) % 32)
+    row_bytes = groups*(28 if kind == KIND_OP_TERNARY else 34)
+    # The native stream frames beat-aligned device rows: pad every row, nonzero fill.
+    native = qformats.pad_native_rows([payload[r*row_bytes:(r+1)*row_bytes] for r in range(rows)])
     return dict(kind=kind, rows=rows, groups=groups, qn=qn, bias=bias, shift=shift, shift2=shift2,
-                expected=expected, xb=bytes(xb), payload=payload)
+                expected=expected, xb=bytes(xb), payload=payload, native=native)
 
 
 def overflow_case(kind, qn=False, negative=False):
@@ -105,10 +107,11 @@ def overflow_case(kind, qn=False, negative=False):
     xb += bytes((-len(xb)) % 128)
     pack = qformats.ptq1_0_pack if kind == KIND_OP_TERNARY else qformats.q8_0_pack
     payload = pack(scales.reshape(-1), values.reshape(rows*groups, -1)).tobytes()
-    payload += bytes((-len(payload)) % 32)
+    row_bytes = groups*(28 if kind == KIND_OP_TERNARY else 34)
+    native = qformats.pad_native_rows([payload[r*row_bytes:(r+1)*row_bytes] for r in range(rows)], fill=b'\0')
     shift = 0 if kind == KIND_OP_TERNARY else (40 if kind == KIND_OP_Q8 else 7)
     return dict(kind=kind, rows=rows, groups=groups, qn=qn, bias=22, shift=shift, shift2=shift,
-                xb=bytes(xb), payload=payload, expected=[])
+                xb=bytes(xb), payload=payload, native=native, expected=[])
 
 
 def drive(dut, case, *, gaps=True, output_stall=0, seed=3, legacy=False):
@@ -151,6 +154,8 @@ def drive(dut, case, *, gaps=True, output_stall=0, seed=3, legacy=False):
     yield pipe.start.eq(0)
     yield decoder.start.eq(0)
     yield
+    if not legacy:
+        payload = case['native']
     beats = [int.from_bytes(payload[i:i+32], 'little') for i in range(0, len(payload), 32)]
     sent, offered, done, held = 0, False, False, None
     result = {}
@@ -419,7 +424,7 @@ def test_semantic_arithmetic_overflow_is_reported(kind, qn):
         yield pipe.start.eq(0)
         yield decoder.start.eq(0)
         yield pipe.source.ready.eq(1)
-        payload = case['payload']
+        payload = case['native']
         for offset in range(0, len(payload), 32):
             yield decoder.sink.valid.eq(1)
             yield decoder.sink.data.eq(int.from_bytes(payload[offset:offset+32], 'little'))
@@ -525,9 +530,9 @@ def test_compiled_native_mac_matches_python_reference(tmp_path, compiled_native_
         case = make_case(kind, rows, groups, qn, seed=92+kind+groups, channel=2, channels=4)
         expected = np.concatenate(case['expected']).astype('<i4').tobytes()
         header = struct.pack('<10I', kind, rows, groups, qn, case['bias'], case['shift'], case['shift2'],
-                             len(case['xb']), len(case['payload']), len(expected)//4)
+                             len(case['xb']), len(case['native']), len(expected)//4)
         vector = tmp_path / 'vector'
-        vector.write_bytes(header + case['xb'] + case['payload'] + expected)
+        vector.write_bytes(header + case['xb'] + case['native'] + expected)
         result = subprocess.run([str(compiled_native_mac), str(vector)], capture_output=True,
                                 text=True, timeout=15)
         assert result.returncode == 0, (kind, rows, groups, qn, result.stdout, result.stderr)
@@ -535,8 +540,8 @@ def test_compiled_native_mac_matches_python_reference(tmp_path, compiled_native_
         for qn, negative in [(False, False), (True, False), (False, True), (True, True)]:
             case = overflow_case(kind, qn, negative=negative)
             header = struct.pack('<10I', kind, case['rows'], case['groups'], qn, case['bias'],
-                                 case['shift'], case['shift2'], len(case['xb']), len(case['payload']), 0)
-            vector.write_bytes(header + case['xb'] + case['payload'])
+                                 case['shift'], case['shift2'], len(case['xb']), len(case['native']), 0)
+            vector.write_bytes(header + case['xb'] + case['native'])
             result = subprocess.run([str(compiled_native_mac), str(vector), 'arithmetic-error'],
                                     capture_output=True, text=True, timeout=15)
             assert result.returncode == 0, (kind, qn, negative, result.stdout, result.stderr)

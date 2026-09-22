@@ -33,12 +33,17 @@ class ReaderDUT(Module):
 
 
 def row_case(encoding, rows, groups, offset, stride, region_id=7, base=0, seed=5):
+    """One strided native read: rows live at beat-aligned offset + row*stride.
+
+    Memory outside the rows' payload bytes reads back as 0xa5 (memory_server):
+    the padding tail of each row's last beat is therefore nonzero and must be
+    ignored, not decoded."""
     rng = random.Random(seed)
     block_bytes = 28 if encoding == PTQ1_0 else 34
     memory, expected, spans = {}, [], []
     for row in range(rows):
         start = base + offset + row*stride
-        spans.append((start & -32, ((start % 32) + groups*block_bytes + 31)//32))
+        spans.append((start, qformats.native_row_beats(groups, block_bytes)))
         for group in range(groups):
             block = rng.randbytes(block_bytes)
             memory.update({start+group*block_bytes+i: b for i, b in enumerate(block)})
@@ -141,12 +146,12 @@ def collect(unit, cmd, expected, error=0, cancel_after=None):
 
 @pytest.mark.parametrize('encoding', [PTQ1_0, Q8_0])
 @pytest.mark.parametrize('rows,groups,prefix,gap', [
-    (17, 1, 31, 3), (5, 9, 2, 60), (3, 68, 16, 1904), (2, 136, 0, 32),
+    (17, 1, 32, 0), (5, 9, 0, 64), (3, 68, 32, 1920), (2, 136, 0, 32),
 ])
 def test_strided_native_reads_above_4g(encoding, rows, groups, prefix, gap):
     block_bytes = 28 if encoding == PTQ1_0 else 34
     cmd, memory, expected, spans = row_case(encoding, rows, groups,
-        (1 << 32) + 4064 + prefix, groups*block_bytes + gap)
+        (1 << 32) + 4064 + prefix, qformats.native_row_span(groups, block_bytes) + gap)
     dut = ReaderDUT()
     observed = []
     run_simulation(dut, [collect(dut.unit, cmd, expected), memory_server(dut, memory, observed)])
@@ -158,8 +163,8 @@ def test_strided_native_reads_above_4g(encoding, rows, groups, prefix, gap):
 
 def test_region_base_and_mode_reuse():
     regions = [region(7, base=1 << 32, size=1 << 20), region(42, size=1 << 20)]
-    cases = [row_case(PTQ1_0, 3, 1, 14, 30, base=1 << 32),
-             row_case(Q8_0, 3, 2, 30, 96, region_id=42, seed=9)]
+    cases = [row_case(PTQ1_0, 3, 1, 32, 32, base=1 << 32),
+             row_case(Q8_0, 3, 2, 64, 96, region_id=42, seed=9)]
     dut = ReaderDUT(regions)
     observed = []
     memory = {addr: value for _, data, _, _ in cases for addr, value in data.items()}
@@ -170,8 +175,11 @@ def test_region_base_and_mode_reuse():
 
 
 @pytest.mark.parametrize('change', [dict(region=99), dict(rows=0), dict(groups=0),
-                                   dict(encoding=255), dict(stride=27)])
+                                   dict(encoding=255), dict(stride=27), dict(stride=0),
+                                   dict(offset=16), dict(offset=1), dict(stride=48)])
 def test_bad_configuration_does_not_issue(change):
+    # Unaligned offsets/strides and a stride below one row are configuration errors:
+    # the device layout pads rows to beats, so a byte packer is not needed.
     cmd, memory, expected, _ = row_case(PTQ1_0, 2, 1, 0, 32)
     cmd.update(change)
     dut, observed = ReaderDUT(), []
@@ -180,22 +188,23 @@ def test_bad_configuration_does_not_issue(change):
 
 
 @pytest.mark.parametrize('offset,reservations,width', [
-    (4090, (), 34),  # Tail read crosses the end of the selected 4 KiB region.
+    (4096, (), 34),  # The row starts at the end of the selected 4 KiB region.
+    (4064+32, (), 34),  # Its padded beat would cross the end of the region.
     (1 << 40, (), 34),  # Must not truncate to AXI width.
-    (2**64-8, (), 64),  # Must not wrap offset + length at 64 bits.
-    (33, (Reservation(7, ReservationKind.SYSTEM, 0, 40),), 34),  # Aligned prefix is reserved.
-    (3, (Reservation(7, ReservationKind.SYSTEM, 31, 1),), 34),  # Trailing read-ahead is reserved.
+    (2**64-32, (), 64),  # Must not wrap offset + length at 64 bits.
+    (32, (Reservation(7, ReservationKind.SYSTEM, 0, 40),), 34),  # Row start is reserved.
+    (0, (Reservation(7, ReservationKind.SYSTEM, 31, 1),), 34),  # The padding tail is reserved.
 ])
 def test_aligned_span_bounds_before_io(offset, reservations, width):
-    cmd, memory, expected, _ = row_case(PTQ1_0, 1, 1, offset, 28)
+    cmd, memory, expected, _ = row_case(PTQ1_0, 1, 1, offset, 32)
     dut, observed = ReaderDUT([region(size=4096)], reservations, width), []
     run_simulation(dut, [collect(dut.unit, cmd, [], error=ERROR_BOUNDS), memory_server(dut, memory, observed)])
     assert not observed
 
 
 def test_later_invalid_row_drains_prior_requests_and_reuses():
-    cmd, memory, _, _ = row_case(PTQ1_0, 5, 1, 4000, 32)
-    good, data, expected, _ = row_case(Q8_0, 2, 1, 0, 36)
+    cmd, memory, _, _ = row_case(PTQ1_0, 5, 1, 3968, 32)  # Rows 4 and 5 fall outside 4 KiB.
+    good, data, expected, _ = row_case(Q8_0, 2, 1, 0, 64)
     memory.update(data)
     dut, observed = ReaderDUT([region(size=4096)]), []
     def run():
@@ -207,7 +216,7 @@ def test_later_invalid_row_drains_prior_requests_and_reuses():
 
 @pytest.mark.parametrize('response_error', [False, True])
 def test_cancel_or_response_failure_drains(response_error):
-    cmd, memory, _, _ = row_case(PTQ1_0, 9, 68, 16, 3808)
+    cmd, memory, _, _ = row_case(PTQ1_0, 9, 68, 32, 3840)
     dut, observed = ReaderDUT(), []
     error = ERROR_RESPONSE if response_error else 0
     def run():
@@ -217,20 +226,20 @@ def test_cancel_or_response_failure_drains(response_error):
             assert not (yield dut.unit.source.valid)
         if not response_error:
             small = dict(cmd, rows=1)
-            _, _, expected, _ = row_case(PTQ1_0, 1, 68, 16, 3808)
+            _, _, expected, _ = row_case(PTQ1_0, 1, 68, 32, 3840)
             yield from collect(dut.unit, small, expected)
     run_simulation(dut, [run(), memory_server(dut, memory, observed, response_error=response_error)])
 
 
 def test_unknown_response_id_is_not_silently_truncated():
-    cmd, memory, _, _ = row_case(Q8_0, 5, 9, 16, 320)
+    cmd, memory, _, _ = row_case(Q8_0, 5, 9, 32, 320)
     dut, observed = ReaderDUT(), []
     run_simulation(dut, [collect(dut.unit, cmd, [], error=ERROR_RESPONSE),
                          memory_server(dut, memory, observed, wrong_id=True)])
 
 
 def test_early_row_last_fails_and_does_not_claim_transport_recovery():
-    cmd, memory, _, _ = row_case(PTQ1_0, 1, 9, 0, 252)
+    cmd, memory, _, _ = row_case(PTQ1_0, 1, 9, 0, 256)
     dut, observed = ReaderDUT(), []
     def run():
         yield from submit(dut.unit, cmd)
@@ -254,14 +263,14 @@ def test_early_row_last_fails_and_does_not_claim_transport_recovery():
     ([region(endpoint=1)], 34), ([region(access=Access(0))], 34),
 ])
 def test_unreachable_or_disallowed_region_is_rejected(regions, width):
-    cmd, memory, _, _ = row_case(PTQ1_0, 1, 1, 0, 28)
+    cmd, memory, _, _ = row_case(PTQ1_0, 1, 1, 0, 32)
     dut, observed = ReaderDUT(regions, width=width), []
     run_simulation(dut, [collect(dut.unit, cmd, [], error=ERROR_CONFIG), memory_server(dut, memory, observed)])
     assert not observed
 
 
 def test_physical_base_must_fit_axi_width():
-    cmd, memory, _, _ = row_case(PTQ1_0, 1, 1, 0, 28, base=1 << 32)
+    cmd, memory, _, _ = row_case(PTQ1_0, 1, 1, 0, 32, base=1 << 32)
     dut, observed = ReaderDUT([region(base=1 << 32, size=4096)], width=32), []
     run_simulation(dut, [collect(dut.unit, cmd, [], error=ERROR_BOUNDS), memory_server(dut, memory, observed)])
     assert not observed
@@ -302,9 +311,17 @@ def test_real_27b_ffn_k_segments_through_axi_and_mac():
     bias = bx.choose_scale_bias(exponents)
     shift = bx.choose_result_shift(all_scales, bias)
     row0, nrows, native_row = 1137, 2, 136*28
+    # Device placement pads each 68-group K-segment (1904 bytes) to a beat boundary:
+    # a row occupies 3840 bytes and segment 1 starts at +1920, not +1904.
+    segment_span = qformats.native_row_span(68, 28)
+    device_row = 2*segment_span
     payload = bytes(raw[row0*native_row:(row0+nrows)*native_row])
     physical_base = (1 << 32) + 64
-    memory = {physical_base+i: b for i, b in enumerate(payload)}
+    memory = {}
+    for r in range(nrows):
+        for segment in (0, 1):
+            chunk = payload[r*native_row+segment*1904:r*native_row+(segment+1)*1904]
+            memory.update({physical_base+r*device_row+segment*segment_span+i: b for i, b in enumerate(chunk)})
     # Quantized activations are selected ONCE at whole-tensor width, then sliced.
     x = np.random.default_rng(315).integers(-128, 128, cols, dtype=np.int8)
     dut, observed = ReaderDUT(), []
@@ -327,8 +344,8 @@ def test_real_27b_ffn_k_segments_through_axi_and_mac():
                 payload[r*native_row+segment*1904:r*native_row+(segment+1)*1904] for r in range(nrows)))
             expected = bx.matvec_ternary(scales.reshape(nrows, 68), codes.reshape(nrows, 8704),
                                         x[segment*8704:(segment+1)*8704], bias, shift)
-            yield from submit(dut.unit, dict(region=7, offset=physical_base+segment*1904,
-                                             stride=native_row, rows=nrows, groups=68, encoding=PTQ1_0))
+            yield from submit(dut.unit, dict(region=7, offset=physical_base+segment*segment_span,
+                                             stride=device_row, rows=nrows, groups=68, encoding=PTQ1_0))
             got, decoded = [], False
             for cycle in range(10000):
                 yield pipe.source.ready.eq(cycle >= 150 and cycle % 3 != 0)
@@ -346,7 +363,7 @@ def test_real_27b_ffn_k_segments_through_axi_and_mac():
             else:
                 raise AssertionError('real K-segment MAC timeout')
     run_simulation(dut, [run(), memory_server(dut, memory, observed)])
-    wanted = [((physical_base+s*1904+r*native_row) & -32) + b*32
+    wanted = [physical_base+s*segment_span+r*device_row + b*32
               for s in range(2) for r in range(nrows) for b in range(60)]
     actual = [addr+i*32 for addr, beats, _ in observed for i in range(beats)]
     assert actual == wanted
@@ -386,22 +403,27 @@ def compiled_native_reader(tmp_path_factory):
 def test_compiled_native_region_reader(tmp_path, compiled_native_reader):
     cases = []
     for encoding in (PTQ1_0, Q8_0):
-        for prefix in range(32):
-            block = 28 if encoding == PTQ1_0 else 34
-            cases.append((row_case(encoding, 9, 1, (1 << 32)+4064+prefix, block+3), 0, 0))
-        cases += [(row_case(encoding, 3, 68, (1 << 32)+1904, 3808 if encoding == PTQ1_0 else 4800), 0, 0),
-                  (row_case(encoding, 2, 136, (1 << 32), 136*block), 0, 0)]
+        block = 28 if encoding == PTQ1_0 else 34
+        for groups in range(1, 12):  # Every padding tail length of both block sizes.
+            span = qformats.native_row_span(groups, block)
+            cases.append((row_case(encoding, 9, groups, (1 << 32)+4064, span + 32*(groups % 3)), 0, 0))
+        cases += [(row_case(encoding, 3, 68, (1 << 32)+1920, 2*qformats.native_row_span(68, block)), 0, 0),
+                  (row_case(encoding, 2, 136, (1 << 32), qformats.native_row_span(136, block)), 0, 0)]
+        # Unaligned offsets/strides are rejected before any memory access.
+        cases += [(row_case(encoding, 2, 1, (1 << 32)+prefix, 64), ERROR_CONFIG, 0)
+                  for prefix in (1, 16, 31)]
+        cases.append((row_case(encoding, 2, 1, 1 << 32, block+3), ERROR_CONFIG, 0))
     # Each flag is exercised with multiple accepted row commands in flight.
-    case = row_case(PTQ1_0, 9, 68, 16, 3808)
+    case = row_case(PTQ1_0, 9, 68, 32, 3840)
     cases += [(case, ERROR_RESPONSE, 1), (case, 0, 2), (case, ERROR_RESPONSE, 4)]
-    for offset in (2**64-8, 1 << 40, (1 << 33)-16):
-        cases.append((row_case(PTQ1_0, 1, 1, offset, 28), ERROR_BOUNDS, 0))
+    for offset in (2**64-32, 1 << 40, 1 << 33):
+        cases.append((row_case(PTQ1_0, 1, 1, offset, 32), ERROR_BOUNDS, 0))
     cases += [(row_case(PTQ1_0, 3, 1, 32, 2**64-32), ERROR_BOUNDS, 0),
               (row_case(Q8_0, 4, 1, (1 << 33)-192, 64), ERROR_BOUNDS, 0),
-              (row_case(Q8_0, 3, 9, 17, 308, base=1 << 33, region_id=42), 0, 0)]
+              (row_case(Q8_0, 3, 9, 32, 320, base=1 << 33, region_id=42), 0, 0)]
     for index, ((cmd, memory, expected, spans), error, flags) in enumerate(cases):
         reads = [addr+i*32 for addr, beats in spans for i in range(beats)
-                 if error != ERROR_BOUNDS or addr+beats*32 <= 1 << 33]
+                 if error != ERROR_CONFIG and (error != ERROR_BOUNDS or addr+beats*32 <= 1 << 33)]
         addresses = sorted(set(reads))
         header = struct.pack('<10I2Q', cmd['encoding'], cmd['rows'], cmd['groups'], cmd['region'],
                              error, flags, len(addresses), len(expected), len(reads), 0,
