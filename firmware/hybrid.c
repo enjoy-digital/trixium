@@ -33,6 +33,7 @@
 #include "hybrid.h"
 #include "perf.h"
 #include "fastmath.h"
+#include "resident.h"
 
 static const struct bons_header *H;
 static int n_ch, n_embd, n_head, n_kv_head, head_dim, ffn_dim, n_layer, q_dim, kv_dim, n_rep;
@@ -295,7 +296,7 @@ static void rotate_f_legacy(const float *src, float *dst, int width)
     }
 }
 
-static int rotate_quantize_f(const float *src, int width)
+static int rotate_quantize_legacy(const float *src, int width)
 {
     int e8 = infer_rotate_quantize_f(src, (uint32_t)width);
     if (e8 != INFER_ROTATE_UNSUPPORTED) return e8;
@@ -303,13 +304,56 @@ static int rotate_quantize_f(const float *src, int width)
     return infer_quantize_f(rot, (uint32_t)width);
 }
 
+// Resident preparation (resident.c: units 4/3/5 in the scratchpad) with the legacy CPU
+// path as fallback. The prepared source is remembered so a matvec the resident path
+// declines (LM head rows, a failed list) can requantize on the CPU and go the old way.
+#define E8_RESIDENT 0x40000001
+
+static int prepare_f(const float *src, int width, int rotate)
+{
+    struct resident_state *R = resident_state();
+    R->prep_src = src; R->prep_width = width; R->prep_rotate = rotate;
+    if (resident_prepare(src, (uint32_t)width, rotate) == 0)
+        return E8_RESIDENT;
+    return rotate ? rotate_quantize_legacy(src, width) : infer_quantize_f(src, (uint32_t)width);
+}
+
+static int rotate_quantize_f(const float *src, int width)
+{
+    return prepare_f(src, width, 1);
+}
+
+static int quantize_f(const float *src, int width)
+{
+    return prepare_f(src, width, 0);
+}
+
+static void matvec_q(const struct bons_entry *e, int e8, float *dst)
+{
+    if (e8 == E8_RESIDENT) {
+        if (resident_matvec(e, dst) == 0)
+            return;
+        // Declined or failed: the CPU path needs its own Q8 in SP_X.
+        const struct resident_state *R = resident_state();
+        e8 = R->prep_rotate ? rotate_quantize_legacy(R->prep_src, R->prep_width)
+                            : infer_quantize_f(R->prep_src, (uint32_t)R->prep_width);
+        if (e8 == E8_RESIDENT) return;   // Cannot happen: the legacy path never returns it.
+    }
+    if (e->flags & FLAG_KSEG)
+        infer_matvec_f_rotated_quantized(e, e8, dst);
+    else
+        infer_matvec_f_quantized(e, e8, dst);
+}
+
 // A projection with a folded weight: rotate the input, then the matvec.
 static void proj_f(const struct bons_entry *e, const float *src, float *dst)
 {
     if (H->hadamard_block) {
         uint32_t width = infer_matvec_cols(e);      // The whole width, K-segments included.
-        int e8 = infer_rotate_quantize_f(src, width);
-        if (e8 != INFER_ROTATE_UNSUPPORTED) {
+        int e8 = prepare_f(src, (int)width, 1);
+        if (e8 == E8_RESIDENT) {
+            matvec_q(e, e8, dst);
+        } else if (e8 != INFER_ROTATE_UNSUPPORTED) {
             infer_matvec_f_rotated_quantized(e, e8, dst);
         } else {
             rotate_f_legacy(src, rot, (int)width);
@@ -481,6 +525,10 @@ int hybrid_init(void)
         rope_freq[i] = powf((float)H->rope_theta, -2.0f*i/rope_n);
     rope_pos_cached = -1;
     hybrid_reset();
+    if (H->hadamard_block && resident_available()) {
+        if (resident_init() == 0)
+            puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
+    }
     printf("hybrid: %d DeltaNet + %d attention layers, dn %d/%d heads x %d/%d, conv %d, "
            "rope %d/%d, gate %d, hadamard %d (widths", n_dn, n_attn, nv, nk, hv, hk, conv_k,
            rope_n, head_dim, H->attn_gated, H->hadamard_block);
@@ -520,6 +568,7 @@ void hybrid_stats_reset(void)
     hyb_cyc_resid = hyb_cyc_fprep = hyb_cyc_fproj = hyb_cyc_fact = 0;
     hyb_cyc_fdown = hyb_cyc_logits = 0;
     hyb_forwards_profiled = 0;
+    resident_stats_reset();
 }
 
 void hybrid_stats_print(void)
@@ -561,6 +610,16 @@ void hybrid_stats_print(void)
                (unsigned long)(hyb_cyc_fdown/hyb_forwards_profiled),
                (unsigned long)(hyb_cyc_logits/hyb_forwards_profiled),
                (unsigned long)(ht/hyb_forwards_profiled));
+        const struct resident_state *R = resident_state();
+        if (R->prepares || R->matvecs || R->fallbacks)
+            printf("resprof: per fwd %lu prepares (%lu cycles) %lu matvecs (%lu cycles) "
+                   "%lu fallbacks, resident %s\n",
+                   (unsigned long)(R->prepares/hyb_forwards_profiled),
+                   (unsigned long)(R->prepare_cycles/hyb_forwards_profiled),
+                   (unsigned long)(R->matvecs/hyb_forwards_profiled),
+                   (unsigned long)(R->matvec_cycles/hyb_forwards_profiled),
+                   (unsigned long)(R->fallbacks/hyb_forwards_profiled),
+                   resident_active() ? "on" : "off");
         uint64_t dt = dn_cyc_inproj + dn_cyc_act + dn_cyc_conv + dn_cyc_prep
                     + dn_cyc_heads + dn_cyc_gate + dn_cyc_outproj;
         printf("dnprof: avg cycles/fwd inproj %lu act %lu conv %lu prep %lu "
@@ -627,13 +686,13 @@ static void deltanet_layer(int l, const float *h, float *out)
         // the exact Q8 bytes remain resident in SP_X for both engine projections.
         e8 = rotate_quantize_f(h, n_embd);
     } else {
-        e8 = infer_quantize_f(h, n_embd);
+        e8 = quantize_f(h, n_embd);
     }
-    infer_matvec_f_quantized(model_entry(ROLE_ATTN_QKV, l), e8, qkv);
-    infer_matvec_f_quantized(model_entry(ROLE_ATTN_ZGATE, l), e8, zb);
-    e8 = infer_quantize_f(h, n_embd);                           // beta/alpha are not folded
-    infer_matvec_f_quantized(model_entry(ROLE_SSM_BETA, l), e8, betab);
-    infer_matvec_f_quantized(model_entry(ROLE_SSM_ALPHA, l), e8, alphab);
+    matvec_q(model_entry(ROLE_ATTN_QKV, l), e8, qkv);
+    matvec_q(model_entry(ROLE_ATTN_ZGATE, l), e8, zb);
+    e8 = quantize_f(h, n_embd);                                 // beta/alpha are not folded
+    matvec_q(model_entry(ROLE_SSM_BETA, l), e8, betab);
+    matvec_q(model_entry(ROLE_SSM_ALPHA, l), e8, alphab);
     dn_cyc_inproj += perf_now64() - t0;
     t0 = perf_now64();
     for (int hh = 0; hh < nv; hh++) {
@@ -773,11 +832,11 @@ static void attention_layer(int l, const float *h, float *out)
         // This removes another 32 full-width rotations per 27B forward.
         e8 = rotate_quantize_f(h, n_embd);
     } else {
-        e8 = infer_quantize_f(h, n_embd);
+        e8 = quantize_f(h, n_embd);
     }
-    infer_matvec_f_quantized(model_entry(ROLE_ATTN_Q, l), e8, gated ? qfull : qb);
-    infer_matvec_f_quantized(model_entry(ROLE_ATTN_K, l), e8, kb);
-    infer_matvec_f_quantized(model_entry(ROLE_ATTN_V, l), e8, vb);
+    matvec_q(model_entry(ROLE_ATTN_Q, l), e8, gated ? qfull : qb);
+    matvec_q(model_entry(ROLE_ATTN_K, l), e8, kb);
+    matvec_q(model_entry(ROLE_ATTN_V, l), e8, vb);
     if (gated)   // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
@@ -870,11 +929,11 @@ int hybrid_forward(int token, int want_logits)
         if (H->hadamard_block)
             e8 = rotate_quantize_f(hb, n_embd);
         else
-            e8 = infer_quantize_f(hb, n_embd);
+            e8 = quantize_f(hb, n_embd);
         hyb_cyc_fprep += perf_now64() - t0;
         t0 = perf_now64();
-        infer_matvec_f_quantized(model_entry(ROLE_FFN_GATE, l), e8, gateb);
-        infer_matvec_f_quantized(model_entry(ROLE_FFN_UP, l), e8, upb);
+        matvec_q(model_entry(ROLE_FFN_GATE, l), e8, gateb);
+        matvec_q(model_entry(ROLE_FFN_UP, l), e8, upb);
         hyb_cyc_fproj += perf_now64() - t0;
         infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
         infer_dbg_f32("ffn_up", l, upb, ffn_dim);

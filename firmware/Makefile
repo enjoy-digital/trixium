@@ -25,7 +25,11 @@ CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
 # GCC contracts a*b+c into fmadd by default once the F extension is in -march.
 CFLAGS += -ffp-contract=off
 
-OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o traffic.o ops.o vec.o seq.o ddr.o hybrid.o
+OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o traffic.o ops.o vec.o seq.o ddr.o hybrid.o \
+          resident.o bonsai_sequence.o
+# The portable descriptor encoders shared with the host tools (no MMIO, no board policy).
+PORTABLE_LIB = ../trixium/software/lib
+CFLAGS += -I$(PORTABLE_LIB)
 
 
 # Objects are tree-specific: the generated CSR map differs between BUILD_DIRs, so an object
@@ -61,7 +65,7 @@ VREGS := $(if $(VREGS),$(VREGS),8)
 progs.h: FORCE
 	cd .. && python3 -m trixium.model.asm firmware/progs.h --vregs $(VREGS)
 FORCE:
-infer.o main.o vec.o: progs.h
+infer.o main.o vec.o resident.o: progs.h
 
 %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
@@ -88,7 +92,7 @@ bonsai.elf: $(OBJECTS)
 
 -include $(OBJECTS:.o=.d)
 
-VPATH = $(BIOS_DIRECTORY):$(BIOS_DIRECTORY)/cmds:$(CPU_DIRECTORY)
+VPATH = $(BIOS_DIRECTORY):$(BIOS_DIRECTORY)/cmds:$(CPU_DIRECTORY):$(PORTABLE_LIB)
 
 %.o: %.c
 	$(compile)

@@ -144,4 +144,32 @@ BONSAI_TINY_HYBRID = ModelConfig(
     hadamard_signs = None,   # filled by tinygen (deterministic from the seed)
 )
 
-CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B, BONSAI_TINY_HYBRID)}
+# bonsai-tiny-hybrid-1k: the same topology with every rotation width a multiple of 1,024,
+# the hardware FWHT block (units 3/5 of the resident path are fixed at N=1024; the 27B's
+# widths 5120/4096/6144/17408 all are). Sized for the sim: n_embd 1024, ffn 2048, q 1024,
+# DeltaNet value width 1024. ~33 M weights; a forward costs minutes of Verilator time.
+BONSAI_TINY_HYBRID_1K = ModelConfig(
+    name           = "bonsai-tiny-hybrid-1k",
+    n_layer        = 3,
+    n_embd         = 1024,
+    n_head         = 8,
+    n_kv_head      = 2,
+    head_dim       = 128,
+    ffn_dim        = 2048,
+    vocab          = 512,
+    max_ctx        = 64,
+    rope_theta     = 10000000.0,
+    layer_types    = ("deltanet", "deltanet", "attn"),
+    dn_num_v_heads = 8,
+    dn_num_k_heads = 2,
+    dn_k_head_dim  = 128,
+    dn_v_head_dim  = 128,
+    dn_conv_kernel = 4,
+    rope_dims      = 32,
+    attn_gated     = True,
+    hadamard_block = 1024,
+    hadamard_signs = None,
+)
+
+CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B, BONSAI_TINY_HYBRID,
+                               BONSAI_TINY_HYBRID_1K)}

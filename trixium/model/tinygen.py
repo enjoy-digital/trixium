@@ -140,12 +140,13 @@ def main():
     parser.add_argument("--channels", default=2, type=int,   help="Channel shard count.")
     parser.add_argument("--seed",     default=1234, type=int)
     parser.add_argument("--hybrid",   action="store_true", help="bonsai-tiny-hybrid (the 27B's shape).")
+    parser.add_argument("--hybrid-1k", action="store_true",
+                        help="bonsai-tiny-hybrid-1k: 1,024-wide rotation blocks (the resident path).")
     parser.add_argument("--kseg-max", default=None, type=int, help="Split matvecs wider than this (K-segments).")
     args = parser.parse_args()
-    from trixium.model.configs import BONSAI_TINY_HYBRID
-    img, man, manifest = generate(args.out, args.channels, args.seed,
-                                  cfg=BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY,
-                                  kseg_max=args.kseg_max)
+    from trixium.model.configs import BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K
+    cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
+    img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")
     print(f"manifest : {man}")
     print(f"payload  : {manifest['payload_beats']} beats/channel "

@@ -48,6 +48,7 @@ _Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "d
 #include "perf.h"
 #include "bench.h"
 #include "seq.h"
+#include "resident.h"
 #include "vec.h"
 #include "progs.h"
 #include "static_memory.h"
@@ -821,6 +822,13 @@ static void console_service(void)
             infer_seq(0);
         printf("SEQ %s (off runs the same ops CPU-dispatched per head, ~20%% slower)\n",
                seq_use ? "on" : "off");
+    }
+    else if (strcmp(token, "resident") == 0) {
+        if (strncmp(str, "on", 2) == 0)  resident_enable(1);
+        if (strncmp(str, "off", 3) == 0) resident_enable(0);
+        printf("RESIDENT %s (27B projections through scratchpad quantize/rotate/restore "
+               "lists; hardware %s)\n", resident_active() ? "on" : "off",
+               resident_available() ? "present" : "absent");
     }
     else if (strcmp(token, "engdiag") == 0) {
         if (strncmp(str, "on", 2) == 0)  engine_diag = 1;
