@@ -151,14 +151,19 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path, nati
     if native:
         import numpy as np
         from trixium.model.qformats import ptq1_0_pack
-        # Three complete compact rows. The two 68-group segments retain a
-        # whole-row stride, and consume the resident Q8 slices without host IO.
+        # Three complete compact rows, placed as the device layout requires: each
+        # 68-group segment padded to a beat boundary (1904 -> 1920 bytes), so a
+        # row spans 3840 bytes and segment 1 starts at +1920. The segments consume
+        # the resident Q8 slices without host IO.
+        from trixium.model.qformats import native_row_span
+        segment_span = native_row_span(68, 28)
         raw = bytearray(256*1024)
         for row in range(3):
             codes = np.array([(i*7 + i//13 + row) % 3 for i in range(17408)], dtype=np.uint8)
             payload = ptq1_0_pack(np.ones(136, dtype=np.float16), codes.reshape(136, 128)).tobytes()
-            base = 0x10000 + row*136*28
-            raw[base:base + len(payload)] = payload
+            for segment in range(2):
+                base = 0x10000 + row*2*segment_span + segment*segment_span
+                raw[base:base + 68*28] = payload[segment*68*28:(segment+1)*68*28]
         dut.models[0].mem.init = [int.from_bytes(raw[i:i+32], 'little') for i in range(0, len(raw), 32)]
     bus = dut.scratchpad.add_wishbone_port()
     status = Signal(24)

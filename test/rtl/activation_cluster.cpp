@@ -52,7 +52,12 @@ static void start(Vactivation_cluster &d, const std::array<uint32_t, 16> &words,
         unsigned segments=groups>96 ? 2 : 1;
         unsigned per_segment=groups/segments;
         for (unsigned segment=0; segment<segments; segment++) {
-            const std::array<uint32_t,16> cfg={6,0,7,0x10000+segment*per_segment*28,0,136*28,0,0,0,0,0,0,0,0,0,0};
+            // Device rows are beat-aligned: the three stored rows are two padded
+            // 68-group segments each (1904 -> 1920 bytes), so every row starts
+            // 3840 bytes after the previous one and segment 1 starts at +1920.
+            // Shorter commands read the first groups of those same rows.
+            const unsigned segment_span=(68*28+31)/32*32, row_stride=2*segment_span;
+            const std::array<uint32_t,16> cfg={6,0,7,0x10000+segment*segment_span,0,row_stride,0,0,0,0,0,0,0,0,0,0};
             const std::array<uint32_t,16> project={7,0,3,0,0,0,per_segment<<8,native_bias | (native_rshift<<16),
                 0xa000+segment*per_segment*128,0xe800+segment*32,0,0,0,0,0,0};
             for (unsigned i=0; i<16; i++) access(d,64*count+i*4,true,cfg[i]);
