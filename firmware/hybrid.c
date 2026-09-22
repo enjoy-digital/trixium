@@ -78,6 +78,8 @@ static uint32_t hyb_forwards_profiled;
 // 16 KiB table and the activations' much smaller hot interval fit the 32 KiB D-cache.
 static float *silu_lut;
 
+int dn_pipe_use;   // Console `dnpipe`: DeltaNet head state store/fetch pipelining (DNREC only).
+
 #ifdef BONSAI_HAS_DNREC
 #define DN_SP_STATE 0x00000u
 #define DN_SP_Q     0x10000u
@@ -100,13 +102,46 @@ static uint32_t dn_head_addr(uint32_t global_head)
     return dn_hbm_base + (global_head/(uint32_t)n_ch)*DN_HEAD_BYTES;
 }
 
+// Head pipelining (console `dnpipe on|off`, default off until board-validated): the
+// state STORE of head i and the state FETCH of head i+1 are submitted back to back
+// without waiting (the CSR front holds one pending op behind the running one, and the
+// engine runs them in order, so the FETCH cannot overwrite the state before the STORE
+// has read it) and run under the CPU's output read and next-head parameter writes.
+// Measured v8: fetch 2650 + store 4915 cycles per head against 3114 + 4898 of CPU work
+// (build/v0-826f4ae-bench8.log), 2304 heads per 27B forward.
+static int dn_pipe_prefetched = -1;   // Global head whose state FETCH is in flight, or -1.
+static uint32_t dn_pipe_done0;        // done_count before the STORE: FETCH done at +2.
+static int dn_pipe_store_open;        // A STORE was submitted and never joined.
+
+static void dn_pipe_join(void)
+{
+    if (!dn_pipe_store_open)
+        return;
+    uint32_t need = dn_pipe_prefetched >= 0 ? 2u : 1u, spins = 0;
+    while ((uint32_t)(engine_csr_done_count_read() - dn_pipe_done0) < need) {
+        if (++spins > 4000000u) {
+            puts("DNSTALL: pipelined state store/fetch did not complete");
+            engine_wedged = 1;
+            break;
+        }
+    }
+    dn_pipe_store_open = 0;
+}
+
 static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
                        const float *vh, float decay, float beta, float scale, float *oh,
-                       int load_qk)
+                       int load_qk, int next_head)
 {
     uint8_t chan = global_head % (uint32_t)n_ch;
     uint64_t t0 = perf_now64();
-    engine_fetch(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+    if (dn_pipe_prefetched == (int)global_head) {
+        dn_pipe_join();                 // The prefetched state is in the scratchpad once both landed.
+        dn_pipe_prefetched = -1;
+    } else {
+        dn_pipe_join();                 // Never let a FETCH race an unjoined STORE.
+        dn_pipe_prefetched = -1;
+        engine_fetch(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+    }
     dn_cyc_fetch += perf_now64() - t0;
 
     t0 = perf_now64();
@@ -135,7 +170,22 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
     dn_cyc_core += perf_now64() - t0;
 
     t0 = perf_now64();
-    engine_store(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+    if (dn_pipe_use && !engine_wedged) {
+        struct engine_op st = {0};
+        st.kind = ENGINE_KIND_STORE; st.chan = chan;
+        st.wbase = dn_head_addr(global_head); st.wlen = DN_HEAD_BEATS; st.xsrc = DN_SP_STATE;
+        dn_pipe_done0 = engine_submit(&st);
+        dn_pipe_store_open = 1;
+        if (next_head >= 0) {
+            struct engine_op ft = {0};
+            ft.kind = ENGINE_KIND_FETCH; ft.chan = (uint8_t)((uint32_t)next_head % (uint32_t)n_ch);
+            ft.wbase = dn_head_addr((uint32_t)next_head); ft.wlen = DN_HEAD_BEATS; ft.dst = DN_SP_STATE;
+            engine_submit(&ft);         // Queued behind the STORE; joined by the next head.
+            dn_pipe_prefetched = next_head;
+        }
+    } else {
+        engine_store(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+    }
     dn_cyc_store += perf_now64() - t0;
 
     t0 = perf_now64();
@@ -786,8 +836,14 @@ static void deltanet_layer(int l, const float *h, float *out)
         float *oh = ob + hh*hv;
         if (dn_hw) {
 #ifdef BONSAI_HAS_DNREC
+            // The next head in visiting order (hi+1 -> its hh), for the state prefetch.
+            int next_head = -1;
+            if (dn_pipe_use && hi + 1 < nv) {
+                int nkh = (hi + 1)/rep, nr = hi + 1 - nkh*rep;
+                next_head = (int)((uint32_t)s*nv) + nr*nk + nkh;
+            }
             dn_hw_head((uint32_t)s*nv + (uint32_t)hh, qh, kk, vh, decay,
-                       betab[hh], scale, oh, load_qk);
+                       betab[hh], scale, oh, load_qk, next_head);
 #endif
         } else {
             // One pass over the state: row j's delta depends on row j alone, so the decay,
@@ -816,6 +872,9 @@ static void deltanet_layer(int l, const float *h, float *out)
         silu_mul_fv(dst, delta, z, hv);
         dn_cyc_gate += perf_now64() - t0;
     }
+#ifdef BONSAI_HAS_DNREC
+    dn_pipe_join();                 // The last head's state must be in DDR before any other op.
+#endif
     t0 = perf_now64();
     proj_f(model_entry(ROLE_SSM_OUT, l), og, out);
     dn_cyc_outproj += perf_now64() - t0;

@@ -823,6 +823,13 @@ static void console_service(void)
         printf("SEQ %s (off runs the same ops CPU-dispatched per head, ~20%% slower)\n",
                seq_use ? "on" : "off");
     }
+    else if (strcmp(token, "dnpipe") == 0) {
+        extern int dn_pipe_use;
+        if (strncmp(str, "on", 2) == 0)  dn_pipe_use = 1;
+        if (strncmp(str, "off", 3) == 0) dn_pipe_use = 0;
+        printf("DNPIPE %s (DeltaNet head state store/fetch under the CPU's head work)\n",
+               dn_pipe_use ? "on" : "off");
+    }
     else if (strcmp(token, "resident") == 0) {
         if (strncmp(str, "on", 2) == 0)  resident_enable(1);
         if (strncmp(str, "off", 3) == 0) resident_enable(0);
