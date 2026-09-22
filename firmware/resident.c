@@ -49,6 +49,7 @@
 #define RS_MAX   0x364C0u  // Per-block raw absmax.
 #define RS_SIGN  0x3C000u  // Sign bits, 128 B per Hadamard block, all widths (persists).
 #define RS_SIGN_END 0x3D000u   // = SP_DESC.
+#define RS_SP_END   0x32000u   // RS_F's region ends where the persistent Q8 vector starts.
 
 #define RS_ROWS_MAX  24576u    // int32 results per chunk that fit RS_Y.
 #define RS_WIDTH_MAX 17408u    // FP32 source that fits RS_F (and Q8 that fits RS_Q8B/RS_XW).
@@ -243,8 +244,12 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     uint32_t n = 0;
     desc_fetch(n++, eng_addr(src), width*4/32, RS_F);
     if (rotate) {
+        // unit 4's `elements` is PER BLOCK (gateware: total = elements*blocks), so the
+        // rotated form asks for width/B independent 1,024-element exponents, one per
+        // Hadamard block. Passing the whole width here quantizes width*blocks elements
+        // with the wrong block boundaries and reads past the vector.
         uint32_t blocks = width/B;
-        bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, width, blocks);      desc_words(n++, &d);
+        bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(n++, &d);
         bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(n++, &d);
         bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks); desc_words(n++, &d);
     } else {
@@ -271,9 +276,14 @@ int resident_matvec(const struct bons_entry *e, float *dst)
         R->fallbacks++;
         return -1;
     }
-    uint64_t t0 = perf_now64();
-    uint32_t rows = e->rows, rpc = rows/(uint32_t)R->n_ch;
+    uint32_t rows = e->rows;
     uint32_t ystride = ((rows*4 + 31) & ~31u);   // One int32 result stream per segment.
+    if ((uint64_t)nseg*ystride > RS_F - RS_Y || rows*4 > RS_SP_END - RS_F) {
+        R->fallbacks++;                          // The segment partials or the FP32 result
+        return -1;                               // would not fit their resident regions.
+    }
+    uint64_t t0 = perf_now64();
+    uint32_t rpc = rows/(uint32_t)R->n_ch;
     uint32_t n = 0, xoff = 0;
     for (int k = 0; k < nseg; k++) {
         const struct bons_entry *seg = nseg > 1 ? model_entry_kseg(e, k) : e;
