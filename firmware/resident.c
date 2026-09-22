@@ -34,7 +34,8 @@
 
 #if defined(BONSAI_HAS_SEQ) && defined(BONSAI_HAS_HADAMARD) && \
     defined(BONSAI_HAS_ACTIVATION_QUANTIZE) && defined(BONSAI_HAS_PROJECTION_RESTORE) && \
-    defined(BONSAI_HAS_KVSTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE)
+    defined(BONSAI_HAS_KVSTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE) && \
+    defined(HAS_FLUSH_CPU_DCACHE_RANGE) && defined(HAS_CLEAN_CPU_DCACHE_RANGE)
 #define RESIDENT_BUILT 1
 #else
 #define RESIDENT_BUILT 0
@@ -237,9 +238,8 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     }
     uint64_t t0 = perf_now64();
     // The CPU wrote src through its write-back L1: make it visible to the engine's FETCH.
-#ifdef HAS_CLEAN_CPU_DCACHE_RANGE
+    // Clean, not flush: a clean line cannot clobber what the engine reads back.
     clean_cpu_dcache_range((void *)src, width*4);
-#endif
     struct bns_seq_descriptor d;
     uint32_t n = 0;
     desc_fetch(n++, eng_addr(src), width*4/32, RS_F);
@@ -315,6 +315,13 @@ int resident_matvec(const struct bons_entry *e, float *dst)
         return -1;
     }
     desc_words(n++, &d);
+    // The destination is an ordinary hybrid buffer the CPU wrote on earlier forwards, so
+    // it can hold DIRTY lines. One evicted while the engine's STORE is in flight would
+    // overwrite the result in DDR, and the invalidate below would then expose the stale
+    // value - rare, data-dependent corruption. Clean AND invalidate before the store, so
+    // the CPU holds no copy of this span at all. (infer.c's i32_stage needs only the
+    // invalidate: nothing but the engine ever writes it.)
+    flush_cpu_dcache_range(dst, rows*4);
     desc_store(n++, eng_addr(dst), rows*4/32, RS_F);
     seq_desc_stop(n++);
     int rc = run_list(n, "matvec");
