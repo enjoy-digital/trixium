@@ -36,8 +36,9 @@ int  resident_prepare(const float *src, uint32_t width, int rotate);
 int  resident_matvec(const struct bons_entry *e, float *dst);
 
 // Unit 11 (BONSAI_HAS_SILU): load the firmware's SiLU table into the unit (after
-// resident_init). 0 = the FFN activation can run resident.
-int  resident_silu_init(const float *lut);
+// resident_init), through `stage` (main RAM, 32-byte aligned, 1,025*32 bytes, free after
+// the call), and self-test it. 0 = the FFN activation can run resident.
+int  resident_silu_init(const float *lut, uint32_t *stage);
 int  resident_silu_active(void);
 void resident_silu_enable(int on);   // Console A/B.
 // With the FFN input prepared (resident_prepare), compute act = up * silu(gate) in the

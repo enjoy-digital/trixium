@@ -62,6 +62,11 @@ class SiluMulKernel(LiteXModule):
         lut_r = lut.get_port(has_re=True, mode=READ_FIRST)
         dlut_r = dlut.get_port(has_re=True, mode=READ_FIRST)
         self.specials += lut, dlut, lut_w, dlut_w, lut_r, dlut_r
+        # Handles for tests to preload the tables. Never CSR-exported: AutoCSR turns a Memory
+        # attribute into a CSR-bus SRAM with a THIRD (sys, read/write) port, which Verilator
+        # simulates exactly but Vivado cannot map onto a BRAM - v13's tables read wrong on
+        # the board while every simulation passed.
+        self.autocsr_exclude = {"lut_mem", "dlut_mem"}
         self.lut_mem, self.dlut_mem = lut, dlut
         self.comb += [
             lut_w.we.eq(self.lut_we), lut_w.adr.eq(self.lut_adr), lut_w.dat_w.eq(self.lut_dat),

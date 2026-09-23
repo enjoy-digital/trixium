@@ -582,7 +582,8 @@ int hybrid_init(void)
     if (H->hadamard_block && resident_available()) {
         if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
-            if (resident_silu_init(silu_lut) == 0)
+            uint32_t *stage = infer_halloc(1025*32, 0);   // Table image for the DMA.
+            if (resident_silu_init(silu_lut, stage) == 0)
                 puts("hybrid: resident FFN activation (unit 11 SiLU-multiply) on");
         }
     }

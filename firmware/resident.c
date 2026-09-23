@@ -415,6 +415,15 @@ static int silu_selftest(void)
         g[i] = (i % 61 == 7) ? special[(i/61) % 8] : a.u;
         m[i] = mult[i % 8];
     }
+    uint32_t lost = 0;
+    for (uint32_t i = 0; i < SILU_SELFTEST_N; i++) {
+        a.f = -100.0f + (float)i*0.3125f;
+        if (g[i] != ((i % 61 == 7) ? special[(i/61) % 8] : a.u) || m[i] != mult[i % 8])
+            lost++;
+    }
+    if (lost)
+        printf("resident: silu self-test inputs: %lu of %lu CPU-written elements read back wrong\n",
+               (unsigned long)lost, (unsigned long)SILU_SELFTEST_N);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
     bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, SILU_SELFTEST_N);
@@ -441,28 +450,93 @@ static int silu_selftest(void)
     return (bad || fixups != patched || !fixups) ? -1 : 0;
 }
 
-int resident_silu_init(const float *lut)
+#define SILU_IMAGE_WORDS (1025u*8u)
+
+// Diagnostic, run when the self-test fails: every table node g = -16 + k/128 (F = 0, so
+// the unit must return lut[k] exactly for m = 1) and every midpoint (F = 1/2, the slopes),
+// inputs DMA-staged, results against the CPU. Prints which indices fail and their pattern.
+static void silu_probe(uint32_t *stage, int half)
+{
+    struct resident_state *R = resident_state();
+    const uint32_t N = BONSAI_SILU_LUT_N;           // k = 0 (g = -16) is a fixup; skipped.
+    union { float f; uint32_t u; } a, c;
+    for (uint32_t k = 0; k < N; k++) {
+        a.f = -16.0f + ((float)k + (half ? 0.5f : 0.0f))*(1.0f/128.0f);
+        stage[k] = a.u;
+        stage[N + k] = 0x3f800000u;
+    }
+    clean_cpu_dcache_range(stage, 2*N*4);
+    struct bns_seq_descriptor d;
+    uint32_t n = 0;
+    desc_fetch(n++, eng_addr(stage), N*4/32, RS_F);
+    desc_fetch(n++, eng_addr(stage + N), N*4/32, RS_Y);
+    bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, N);
+    desc_words(n++, &d);
+    seq_desc_stop(n++);
+    if (run_list(n, "silu probe"))
+        return;
+    const volatile uint32_t *r = (const volatile uint32_t *)(SCRATCHPAD_BASE + RS_F);
+    uint32_t bad = 0, lo = 0, hi = 0, lane[8] = {0}, printed = 0;
+    for (uint32_t k = 1; k < N; k++) {
+        a.f = -16.0f + ((float)k + (half ? 0.5f : 0.0f))*(1.0f/128.0f);
+        c.f = bonsai_silu_lookup(a.f, R->silu_lut);
+        if (r[k] == c.u)
+            continue;
+        if (!bad++) lo = k;
+        hi = k;
+        lane[k % 8]++;
+        if (printed++ < 6)
+            printf("  probe%s k=%lu g=%08lx: unit %08lx, cpu %08lx\n", half ? "-mid" : "",
+                   (unsigned long)k, (unsigned long)a.u, (unsigned long)r[k], (unsigned long)c.u);
+    }
+    printf("resident: silu probe %s: %lu of %lu wrong, k %lu..%lu, per lane %lu %lu %lu %lu %lu %lu %lu %lu\n",
+           half ? "midpoints" : "nodes", (unsigned long)bad, (unsigned long)(N - 1),
+           (unsigned long)lo, (unsigned long)hi,
+           (unsigned long)lane[0], (unsigned long)lane[1], (unsigned long)lane[2], (unsigned long)lane[3],
+           (unsigned long)lane[4], (unsigned long)lane[5], (unsigned long)lane[6], (unsigned long)lane[7]);
+}
+
+int resident_silu_init(const float *lut, uint32_t *stage)
 {
     struct resident_state *R = resident_state();
     R->silu_ready = 0;
     R->silu_lut = lut;
-    if (!R->ready || (seq_silu_abi_read() >> 16) != 1)
+    if (!R->ready || !stage || ((uintptr_t)stage & 31) || (seq_silu_abi_read() >> 16) != 1)
         return -1;
     // The table image the unit loads: lut[0..4096] (lut[4096] alone in beat 512) and the
     // interpolation slopes lut[i+1] - lut[i], one FP32 subtraction each - exactly what
-    // bonsai_silu_lookup computes per element. Staged in RS_F (transient), loaded once.
-    volatile uint32_t *w = (volatile uint32_t *)(SCRATCHPAD_BASE + RS_F);
+    // bonsai_silu_lookup computes per element. Built in main RAM and DMA-fetched into RS_F
+    // in the same list as the LOAD, like every other bulk transfer, then read back: a bad
+    // image is reported as such instead of as self-test mismatches. (v13's 82 self-test
+    // mismatches were the kernel tables exported over the CSR bus - see silu_mul.py.)
     union { float f; uint32_t u; } v;
-    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) { v.f = lut[i]; w[i] = v.u; }
-    for (int i = BONSAI_SILU_LUT_N + 1; i < 513*8; i++) w[i] = 0;
-    for (int i = 0; i < BONSAI_SILU_LUT_N; i++) { v.f = lut[i + 1] - lut[i]; w[513*8 + i] = v.u; }
+    for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++) stage[i] = 0;
+    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) { v.f = lut[i]; stage[i] = v.u; }
+    for (int i = 0; i < BONSAI_SILU_LUT_N; i++) { v.f = lut[i + 1] - lut[i]; stage[513*8 + i] = v.u; }
+    clean_cpu_dcache_range(stage, SILU_IMAGE_WORDS*4);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
+    desc_fetch(n++, eng_addr(stage), SILU_IMAGE_WORDS/8, RS_F);
     bns_seq_desc_silu_load(&d, RS_F);
     desc_words(n++, &d);
     seq_desc_stop(n++);
-    if (run_list(n, "silu table load") || silu_selftest())
+    if (run_list(n, "silu table load"))
         return -1;
+    // What the unit read must be the image: compare the scratchpad copy word for word.
+    const volatile uint32_t *w = (const volatile uint32_t *)(SCRATCHPAD_BASE + RS_F);
+    uint32_t bad = 0, first = 0;
+    for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++)
+        if (w[i] != stage[i] && !bad++) first = i;
+    if (bad) {
+        printf("resident: silu table image in the scratchpad differs in %lu words (first %lu) - off\n",
+               (unsigned long)bad, (unsigned long)first);
+        return -1;
+    }
+    if (silu_selftest()) {
+        silu_probe(stage, 0);
+        silu_probe(stage, 1);
+        return -1;
+    }
     R->silu_ready = 1;
     return 0;
 }
@@ -520,7 +594,10 @@ decline:
 
 #else
 
-int resident_silu_init(const float *lut) { resident_state()->silu_lut = lut; return -1; }
+int resident_silu_init(const float *lut, uint32_t *stage)
+{
+    (void)stage; resident_state()->silu_lut = lut; return -1;
+}
 int resident_silu_active(void) { return 0; }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)
@@ -543,7 +620,10 @@ int resident_matvec(const struct bons_entry *e, float *dst)
 {
     (void)e; (void)dst; resident_state()->fallbacks++; return -1;
 }
-int resident_silu_init(const float *lut) { resident_state()->silu_lut = lut; return -1; }
+int resident_silu_init(const float *lut, uint32_t *stage)
+{
+    (void)stage; resident_state()->silu_lut = lut; return -1;
+}
 int resident_silu_active(void) { return 0; }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)

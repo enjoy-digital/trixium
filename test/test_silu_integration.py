@@ -209,3 +209,11 @@ def test_cluster_list_protection_and_reset_recovery():
         assert (yield dut.scratchpad.mem[0x800//32]) == pack(mem[0x800//4:0x800//4 + 8])
         assert (yield dut.scratchpad.mem[0x1800//32]) == pack(mem[0x1800//4:0x1800//4 + 8])
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+
+
+def test_no_cluster_memory_is_exported_over_the_csr_bus():
+    """AutoCSR exports Memory attributes as CSR SRAMs with an extra sys write port: the
+    kernel tables became 3-port memories that simulated fine and broke on the board."""
+    dut = SoC(BonsaiClusterConfig(with_silu=True, with_projection_restore=True, with_hadamard=True,
+                                  with_activation_quantize=True, scratchpad_size=64*1024), n=1)
+    assert list(dut.get_memories()) == []
