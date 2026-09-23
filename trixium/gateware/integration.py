@@ -16,8 +16,10 @@ Currently eng uses the sys clock with an independent soft reset. Connecting port
 in another clock domain requires an explicit target-side CDC adapter.
 """
 from dataclasses import dataclass
+from functools import reduce
+from operator import or_
 
-from migen import ClockDomainsRenamer
+from migen import C, ClockDomainsRenamer
 
 from trixium.gateware.scratchpad import BonsaiScratchpad
 from trixium.gateware.engreset import BonsaiEngineResetDomain
@@ -116,7 +118,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "hadmux", "activation_quantize", "actmux", "projection_restore", "restoremux", "embedding_restore", "embeddingmux", "zznative", "zzregion", "zzverify"):
+    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "activation_quantize", "projection_restore", "embedding_restore", "sparb", "zznative", "zzregion", "zzverify"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
@@ -153,16 +155,21 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             soc.add_constant(name)
         soc.add_constant("BONSAI_VEC_VREGS", vecunit.vregs)
 
-    sp_client = vecunit
+    # Scratchpad clients besides the vector unit, in attach order: the LAST busy one owns
+    # the port (the priority the former nested BonsaiScratchpadClientMux chain gave). One
+    # flat BonsaiScratchpadArbiter is built after all of them, so the BRAM address/data/
+    # enable see log2(clients) levels instead of one serial mux per unit (v11 failed setup
+    # on that chain with seven clients; the arbiter is proven equal to it).
+    sp_clients = []
+    base_busy = [vecunit.busy] if vecunit is not None else []
     if config.with_dnrec:
-        from trixium.gateware.deltanet import BonsaiDeltaNetUnit, BonsaiScratchpadClientMux
+        from trixium.gateware.deltanet import BonsaiDeltaNetUnit
         soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(
             with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.native_regions)))
-        soc.spmux = BonsaiScratchpadClientMux(vecunit, soc.dnunit)
-        sp_client = soc.spmux
+        sp_clients.append(soc.dnunit)
+        base_busy.append(soc.dnunit.busy)
         soc.add_constant("BONSAI_HAS_DNREC")
 
-    previous_sp_client = sp_client
     extensions = []
     if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.native_regions):
         # Manual vector starts are already masked by seq_en. Apply the same
@@ -170,35 +177,27 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         soc.comb += soc.dnunit.dispatch_allowed.eq(~seq.busy)
     if config.with_hadamard:
         from trixium.gateware.hadamard_sp import BonsaiHadamardScratchpad
-        from trixium.gateware.deltanet import BonsaiScratchpadClientMux
         soc.hadamard = ClockDomainsRenamer("eng")(BonsaiHadamardScratchpad(config.scratchpad_size))
-        soc.hadmux = BonsaiScratchpadClientMux(sp_client, soc.hadamard)
-        sp_client = soc.hadmux
+        sp_clients.append(soc.hadamard)
         extensions.append(("hadamard", soc.hadamard))
         soc.add_constant("BONSAI_HAS_HADAMARD")
         soc.add_constant("BONSAI_HADAMARD_BLOCK", 1024)
     if config.with_activation_quantize:
         from trixium.gateware.activation_sp import BonsaiActivationScratchpad
-        from trixium.gateware.deltanet import BonsaiScratchpadClientMux
         soc.activation_quantize = ClockDomainsRenamer("eng")(BonsaiActivationScratchpad(config.scratchpad_size))
-        soc.actmux = BonsaiScratchpadClientMux(sp_client, soc.activation_quantize)
-        sp_client = soc.actmux
+        sp_clients.append(soc.activation_quantize)
         extensions.append(("activation_quantize", soc.activation_quantize))
         soc.add_constant("BONSAI_HAS_ACTIVATION_QUANTIZE")
     if config.with_projection_restore:
         from trixium.gateware.projection_restore_sp import BonsaiProjectionRestoreScratchpad
-        from trixium.gateware.deltanet import BonsaiScratchpadClientMux
         soc.projection_restore = ClockDomainsRenamer("eng")(BonsaiProjectionRestoreScratchpad(config.scratchpad_size))
-        soc.restoremux = BonsaiScratchpadClientMux(sp_client, soc.projection_restore)
-        sp_client = soc.restoremux
+        sp_clients.append(soc.projection_restore)
         extensions.append(("projection_restore", soc.projection_restore))
         soc.add_constant("BONSAI_HAS_PROJECTION_RESTORE")
     if config.with_embedding_restore:
         from trixium.gateware.embedding_restore_sp import BonsaiEmbeddingScratchpad
-        from trixium.gateware.deltanet import BonsaiScratchpadClientMux
         soc.embedding_restore = ClockDomainsRenamer("eng")(BonsaiEmbeddingScratchpad(config.scratchpad_size))
-        soc.embeddingmux = BonsaiScratchpadClientMux(sp_client, soc.embedding_restore)
-        sp_client = soc.embeddingmux
+        sp_clients.append(soc.embedding_restore)
         extensions.append(("embedding_restore", soc.embedding_restore))
         soc.add_constant("BONSAI_HAS_EMBEDDING_RESTORE")
 
@@ -206,6 +205,13 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
                      chan_skew=config.chan_skew)
     native = (dict(native_regions=config.native_regions, native_reservations=config.native_reservations,
                    native_endpoints=config.native_endpoints) if config.native_regions else {})
+    sp_client = vecunit
+    if sp_clients:
+        if vecunit is None:  # The chain had the same requirement (it wrapped the vector unit).
+            raise ValueError("scratchpad units need the vector unit as the arbiter's base client")
+        from trixium.gateware.deltanet import BonsaiScratchpadArbiter
+        soc.sparb = BonsaiScratchpadArbiter(vecunit, sp_clients)
+        sp_client = soc.sparb
     soc.engine = ClockDomainsRenamer("eng")(
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
                           seq=seq, dual=config.with_dual, **placement, **native))
@@ -213,7 +219,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     for name, unit in extensions:
         from migen import Signal
         available = Signal()
-        other_idle = ~previous_sp_client.busy
+        other_idle = ~reduce(or_, base_busy, C(0, 1))
         for other_name, other in extensions:
             if other_name != name:
                 other_idle = other_idle & ~other.busy
