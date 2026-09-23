@@ -78,7 +78,10 @@ static uint32_t hyb_forwards_profiled;
 // 16 KiB table and the activations' much smaller hot interval fit the 32 KiB D-cache.
 static float *silu_lut;
 
-int dn_pipe_use;   // Console `dnpipe`: DeltaNet head state store/fetch pipelining (DNREC only).
+// Console `dnpipe`: DeltaNet head state store/fetch pipelining (DNREC only). Default on since
+// the v12 board run (2026-09-23): bit-exact in all four resident/dnpipe configurations,
+// 23,709 -> 17,231 cycles per head (docs/measurements/v12-2026-09-23.md).
+int dn_pipe_use = 1;
 
 #ifdef BONSAI_HAS_DNREC
 #define DN_SP_STATE 0x00000u
@@ -102,7 +105,7 @@ static uint32_t dn_head_addr(uint32_t global_head)
     return dn_hbm_base + (global_head/(uint32_t)n_ch)*DN_HEAD_BYTES;
 }
 
-// Head pipelining (console `dnpipe on|off`, default off until board-validated): the
+// Head pipelining (console `dnpipe on|off`, default on since the v12 board run): the
 // state STORE of head i and the state FETCH of head i+1 are submitted back to back
 // without waiting (the CSR front holds one pending op behind the running one, and the
 // engine runs them in order, so the FETCH cannot overwrite the state before the STORE
