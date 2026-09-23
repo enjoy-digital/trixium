@@ -61,6 +61,13 @@ int bns_seq_desc_embedding(struct bns_seq_descriptor *out, uint32_t src, uint32_
  * hardware. Read success alone does not publish a valid model allocation. */
 int bns_seq_desc_region_fetch(struct bns_seq_descriptor *out, uint32_t region,
                              uint64_t offset, uint32_t length, uint32_t dst);
+/* Unit 11, silu ABI 1: dst[i] = m[i]*silu(g[i]) bit-exact with the firmware's
+ * lookup; fixup elements keep g in dst and set bit i of the fixmap bitmap
+ * (ceil(elements/32) words, all written). dst == src_g or disjoint. */
+int bns_seq_desc_silu(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                     uint32_t dst, uint32_t fixmap, uint32_t elements);
+/* Unit 11 table load: 1,025 beats at src, lut[0..4096] then dlut from beat 513. */
+int bns_seq_desc_silu_load(struct bns_seq_descriptor *out, uint32_t src);
 /* Exactly 64 little-endian bytes; bytes may be unaligned. The two objects must
  * not overlap. NULL input/output is rejected without modifying the output. */
 int bns_seq_desc_encode_le(void *bytes, const struct bns_seq_descriptor *descriptor);

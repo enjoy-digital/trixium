@@ -11,6 +11,7 @@ import pytest
 
 from trixium.model.activation import (
     scratchpad_quantize_descriptor, scratchpad_requantize_descriptor, scratchpad_restore_descriptor,
+    scratchpad_silu_descriptor,
 )
 from trixium.model.embedding import scratchpad_embedding_descriptor
 from trixium.model.hadamard import scratchpad_rotation_descriptor
@@ -40,6 +41,7 @@ SCHEMAS = {
     'restore': (scratchpad_restore_descriptor, 'src dst exponents elements adjustment'),
     'embedding': (scratchpad_embedding_descriptor, 'src signs dst groups'),
     'region_fetch': (region_fetch_descriptor, 'region offset length dst'),
+    'silu': (scratchpad_silu_descriptor, 'src_g src_m dst fixmap elements'),
 }
 
 
@@ -82,6 +84,7 @@ def base(name):
         'restore': dict(src=32, dst=64, exponents=96, elements=173, adjustment=-13),
         'embedding': dict(src=32, signs=64, dst=96, groups=40),
         'region_fetch': dict(region=0xfedcba98, offset=0x123456789abcde00, length=35, dst=32),
+        'silu': dict(src_g=32, src_m=64, dst=32, fixmap=96, elements=17408),
     }[name]
 
 
@@ -92,7 +95,8 @@ def test_c_matches_python_for_boundary_and_random_descriptors(encoder, name):
     for _ in range(64):
         args = base(name)
         for field in args:
-            if field in ('src', 'signs', 'dst', 'stats', 'xsrc', 'exponents', 'maxima', 'result_exponent'):
+            if field in ('src', 'signs', 'dst', 'stats', 'xsrc', 'exponents', 'maxima', 'result_exponent',
+                         'src_g', 'src_m', 'fixmap'):
                 alignment = 4 if name == 'native_projection' and field == 'dst' else 32
                 args[field] = rng.randrange((1 << 24)//alignment)*alignment
             elif field in ('offset', 'stride'):
@@ -117,6 +121,7 @@ def test_c_matches_python_for_boundary_and_random_descriptors(encoder, name):
         'restore': [('adjustment', -(1 << 31)), ('adjustment', (1 << 31)-1), ('elements', 1), ('elements', 65535)],
         'embedding': [('groups', 8), ('groups', 512)],
         'region_fetch': [('offset', (1 << 64)-32), ('length', (1 << 24)-1), ('dst', (1 << 24)-32)],
+        'silu': [('elements', 1), ('elements', 65535), ('fixmap', (1 << 24)-32)],
     }
     cases += [dict(base(name), **{field: value}) for field, value in boundaries[name]]
     for args in cases:
@@ -137,7 +142,8 @@ def test_invalid_fields_and_null_never_modify_output(encoder, name):
     assert call(encoder, name, args, None) == -1
     cases = []
     for field in args:
-        if field in ('src', 'signs', 'dst', 'stats', 'xsrc', 'exponents', 'maxima', 'result_exponent'):
+        if field in ('src', 'signs', 'dst', 'stats', 'xsrc', 'exponents', 'maxima', 'result_exponent',
+                         'src_g', 'src_m', 'fixmap'):
             cases += [dict(args, **{field: value}) for value in (1, 1 << 24, 0xffffffff)]
         elif field in ('kind', 'inverse', 'interleaved', 'suppress_writes', 'dual'):
             cases.append(dict(args, **{field: 2}))
@@ -158,6 +164,18 @@ def test_invalid_fields_and_null_never_modify_output(encoder, name):
         with pytest.raises(ValueError):
             SCHEMAS[name][0](**invalid)
         assert call(encoder, name, invalid, ct.byref(out)) == -1
+        assert bytes(out) == saved
+
+
+def test_silu_table_load_encoder(encoder):
+    encoder.bns_seq_desc_silu_load.argtypes = [ct.POINTER(Descriptor), ct.c_uint32]
+    out = Descriptor((ct.c_uint32*16)(*[0xdeadbeef]*16))
+    for src in (0, 32, (1 << 24)-32):
+        assert encoder.bns_seq_desc_silu_load(ct.byref(out), src) == 0
+        assert list(out.word) == scratchpad_silu_descriptor(src_g=src, load=True)
+    saved = bytes(out)
+    for src in (1, 1 << 24):
+        assert encoder.bns_seq_desc_silu_load(ct.byref(out), src) == -1
         assert bytes(out) == saved
 
 

@@ -71,6 +71,10 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
                 w2/w3 64-bit byte offset low/high, w4 full 32-byte beat count,
                 w5 scratchpad dst, w6..w15 zero. Bounds/reservations/transport
                 checks use the shared region reader; no legacy physical address.
+  silu:   Optional unit 11, serialized; w0 exactly 11, w1 FP32 gate src, w2 FP32
+          multiplier src, w3 dst (== w1 or disjoint), w4 fixup bitmap, w5 elements,
+          w6 op (0 RUN, 1 LOAD tables from w1), w7..w15 zero. seq.silu_fixups sums
+          the flagged elements of the list. See gateware/silu_sp.py.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -94,12 +98,13 @@ from litex.soc.interconnect import stream
 class BonsaiSequencer(LiteXModule):
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0,
                  with_projection_restore=False, with_embedding_restore=False,
-                 with_region_fetch=False, scratchpad_size=256*1024):
+                 with_region_fetch=False, with_silu=False, scratchpad_size=256*1024):
         if not isinstance(native_pipes, int) or not 0 <= native_pipes <= 31:
             raise ValueError('native_pipes must be in [0, 31]')
         if with_region_fetch and not native_pipes:
             raise ValueError('Sequenced region fetch requires native memory support')
-        extended = with_hadamard or with_activation_quantize or native_pipes or with_projection_restore or with_embedding_restore
+        extended = (with_hadamard or with_activation_quantize or native_pipes or with_projection_restore or
+                    with_embedding_restore or with_silu)
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
@@ -190,6 +195,20 @@ class BonsaiSequencer(LiteXModule):
                 'bit2 output overlaps list, bit3 older manual read failure, '
                 'bits8..15 transport/config errors, bit16 failed reader state.')
             extension_errors.append(self.region_fetch_error)
+        if with_silu:
+            # Append-only, after every other optional block.
+            from trixium.gateware.silu_sp import SILU_COMMAND
+            self.silu_cmd = stream.Endpoint(SILU_COMMAND)
+            self.silu_done = Signal()
+            self.silu_failed = Signal(8)
+            self.silu_unit_fixups = Signal(16)
+            self.silu_abi = CSRStatus(32, reset=0x00010000)
+            self.silu_error = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
+                'bits8..15 SiLU-client error (bit14 protects the full descriptor list).')
+            self.silu_fixups = CSRStatus(32, description=
+                'Fixup elements flagged by unit 11 since the last list start (all its RUN descriptors).')
+            extension_errors.append(self.silu_error)
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
@@ -271,7 +290,7 @@ class BonsaiSequencer(LiteXModule):
 
         list_ok = C(1, 1)
         had_dispatch, quant_dispatch, restore_dispatch, embedding_dispatch, bad_list = [], [], [], [], []
-        region_fetch_dispatch = []
+        region_fetch_dispatch, silu_dispatch = [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24)
@@ -351,6 +370,23 @@ class BonsaiSequencer(LiteXModule):
             embedding_dispatch = [If(malformed,
                 NextValue(self.embedding_restore_error.status, 2), NextState('EXT_FAILED'),
             ).Else(NextState('DISPATCH_EMBEDDING'))]
+        if with_silu:
+            malformed = Signal()
+            command = self.silu_cmd
+            self.comb += [
+                malformed.eq((w(0, 0) != 11) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                    (w(0, 3)[24:] != 0) | (w(0, 4)[24:] != 0) | (w(0, 5)[16:] != 0) |
+                    (w(0, 6)[1:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                command.src_g.eq(w(0, 1)[:24]), command.src_m.eq(w(0, 2)[:24]),
+                command.dst.eq(w(0, 3)[:24]), command.fixmap.eq(w(0, 4)[:24]),
+                command.elements.eq(w(0, 5)[:16]), command.op.eq(w(0, 6)[0]),
+                command.protect_start.eq(list_base), command.protect_end.eq(list_end),
+            ]
+            self.sync += If(self.start.re & self.start.storage & ~self.busy,
+                self.silu_fixups.status.eq(0))
+            silu_dispatch = [If(malformed,
+                NextValue(self.silu_error.status, 2), NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_SILU'))]
         if with_region_fetch:
             malformed, list_overlap = Signal(), Signal()
             destination_end = Signal(64)
@@ -742,6 +778,7 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 8, *(restore_dispatch if with_projection_restore else unknown_unit)
             ).Elif(unit == 9, *(embedding_dispatch if with_embedding_restore else unknown_unit)
             ).Elif(unit == 10, *(region_fetch_dispatch if with_region_fetch else unknown_unit)
+            ).Elif(unit == 11, *(silu_dispatch if with_silu else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -789,6 +826,17 @@ class BonsaiSequencer(LiteXModule):
                     NextValue(self.embedding_restore_error.status, self.embedding_restore_failed << 8),
                     NextState('EXT_FAILED'),
                 ).Elif(self.embedding_restore_done, NextState('NEXT')))
+        if with_silu:
+            fsm.act('DISPATCH_SILU', self.busy.eq(1),
+                If(~eng_inflight, self.silu_cmd.valid.eq(1),
+                    If(self.silu_cmd.ready, NextState('WAIT_SILU'))))
+            fsm.act('WAIT_SILU', self.busy.eq(1),
+                If(self.silu_failed != 0,
+                    NextValue(self.silu_error.status, self.silu_failed << 8),
+                    NextState('EXT_FAILED'),
+                ).Elif(self.silu_done,
+                    NextValue(self.silu_fixups.status, self.silu_fixups.status + self.silu_unit_fixups),
+                    NextState('NEXT')))
         if with_region_fetch:
             fsm.act('DISPATCH_REGION_FETCH', self.busy.eq(1),
                 If(self.region_fetch_failed != 0,

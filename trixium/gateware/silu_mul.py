@@ -30,7 +30,7 @@ from litex.soc.interconnect import stream
 
 LUT_N = 4096
 IN_LAYOUT = [("g", 32), ("m", 32)]
-OUT_LAYOUT = [("r", 32), ("fixup", 1)]
+OUT_LAYOUT = [("r", 32), ("fixup", 1), ("g", 32)]   # g: the input gate, for fixup lanes
 
 KIND_TABLE, KIND_PASS, KIND_NEGZERO, KIND_FIXUP = range(4)
 
@@ -48,18 +48,21 @@ def _lzc(value, width):
 class SiluMulKernel(LiteXModule):
     LATENCY = 9
 
-    def __init__(self):
+    def __init__(self, tables=None):
+        # tables=(lut, dlut) preloads the memories (simulation/tests); hardware loads them
+        # through the write ports.
         self.sink = sink = stream.Endpoint(IN_LAYOUT)
         self.source = source = stream.Endpoint(OUT_LAYOUT)
         self.lut_we, self.lut_adr, self.lut_dat = Signal(), Signal(13), Signal(32)
         self.dlut_we, self.dlut_adr, self.dlut_dat = Signal(), Signal(12), Signal(32)
 
-        lut = Memory(32, LUT_N + 1)
-        dlut = Memory(32, LUT_N)
+        lut = Memory(32, LUT_N + 1, init=list(tables[0]) if tables else None)
+        dlut = Memory(32, LUT_N, init=list(tables[1]) if tables else None)
         lut_w, dlut_w = lut.get_port(write_capable=True), dlut.get_port(write_capable=True)
         lut_r = lut.get_port(has_re=True, mode=READ_FIRST)
         dlut_r = dlut.get_port(has_re=True, mode=READ_FIRST)
         self.specials += lut, dlut, lut_w, dlut_w, lut_r, dlut_r
+        self.lut_mem, self.dlut_mem = lut, dlut
         self.comb += [
             lut_w.we.eq(self.lut_we), lut_w.adr.eq(self.lut_adr), lut_w.dat_w.eq(self.lut_dat),
             dlut_w.we.eq(self.dlut_we), dlut_w.adr.eq(self.dlut_adr), dlut_w.dat_w.eq(self.dlut_dat),
@@ -335,4 +338,6 @@ class SiluMulKernel(LiteXModule):
         out_r = Signal(32)
         out_fix = Signal()
         self.sync += If(ce, out_r.eq(r9), out_fix.eq((kind[8] == KIND_FIXUP) | underflow))
-        self.comb += [source.r.eq(out_r), source.fixup.eq(out_fix)]
+        # The input gate travels with its result: a client writes it back unchanged for a
+        # fixup lane, so the CPU can recompute that element from the original inputs.
+        self.comb += [source.r.eq(out_r), source.fixup.eq(out_fix), source.g.eq(g[n])]

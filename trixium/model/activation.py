@@ -37,6 +37,36 @@ def scratchpad_requantize_descriptor(*, src, dst, exponents, maxima, result_expo
     return [5, src, dst, exponents, maxima, result_exponent, blocks] + [0]*9
 
 
+def scratchpad_silu_descriptor(*, src_g, src_m=0, dst=0, fixmap=0, elements=0, load=False):
+    """Encode optional unit 11; check seq.silu_abi major 1 first.
+
+    RUN: dst[i] = m[i] * silu(g[i]) bit-exact with the firmware, fixup elements keep g in
+    dst and set bit i of the fixmap bitmap (ceil(elements/32) words, all written).
+    dst == src_g or disjoint; fixmap disjoint from everything. load=True reads the
+    1,025-beat table image at src_g (silu_table_image) instead; other fields must be 0.
+    """
+    names = ('src_g',) if load else ('src_g', 'src_m', 'dst', 'fixmap')
+    for name, value in (('src_g', src_g), ('src_m', src_m), ('dst', dst), ('fixmap', fixmap)):
+        if name not in names:
+            if value:
+                raise ValueError(name + ' must be 0 for a table load')
+        elif not isinstance(value, int) or value < 0 or value >= 1 << 24 or value % 32:
+            raise ValueError(name + ' must be a 32-byte-aligned unsigned 24-bit address')
+    if load:
+        if elements:
+            raise ValueError('a table load has no elements')
+    elif not isinstance(elements, int) or not 1 <= elements < 65536:
+        raise ValueError('elements must be in [1, 65535]')
+    return [11, src_g, src_m, dst, fixmap, elements, int(load)] + [0]*9
+
+
+def silu_table_image(lut, dlut):
+    """The unit-11 LOAD image as 32-bit words: lut[0..4096] then pad to beat 513, dlut."""
+    if len(lut) != 4097 or len(dlut) != 4096:
+        raise ValueError('lut must have 4097 entries and dlut 4096')
+    return list(lut) + [0]*7 + list(dlut)
+
+
 def scratchpad_restore_descriptor(*, src, dst, exponents, elements, adjustment=0):
     """Encode optional unit 8; check seq.projection_restore_abi major 1 first.
 

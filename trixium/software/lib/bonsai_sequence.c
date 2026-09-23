@@ -91,6 +91,23 @@ int bns_seq_desc_embedding(struct bns_seq_descriptor *out, uint32_t src, uint32_
     d.word[0]=9; d.word[1]=src; d.word[2]=signs; d.word[3]=dst; d.word[4]=groups;
     *out=d; return BNS_SEQ_DESC_OK;
 }
+int bns_seq_desc_silu(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                     uint32_t dst, uint32_t fixmap, uint32_t elements)
+{
+    struct bns_seq_descriptor d = {{0}};
+    if (!out || !sp_address(src_g, 32) || !sp_address(src_m, 32) || !sp_address(dst, 32)
+        || !sp_address(fixmap, 32) || !count16(elements)) return BNS_SEQ_DESC_INVALID;
+    d.word[0]=11; d.word[1]=src_g; d.word[2]=src_m; d.word[3]=dst; d.word[4]=fixmap;
+    d.word[5]=elements;
+    *out=d; return BNS_SEQ_DESC_OK;
+}
+int bns_seq_desc_silu_load(struct bns_seq_descriptor *out, uint32_t src)
+{
+    struct bns_seq_descriptor d = {{0}};
+    if (!out || !sp_address(src, 32)) return BNS_SEQ_DESC_INVALID;
+    d.word[0]=11; d.word[1]=src; d.word[6]=1;
+    *out=d; return BNS_SEQ_DESC_OK;
+}
 int bns_seq_desc_region_fetch(struct bns_seq_descriptor *out, uint32_t region,
                              uint64_t offset, uint32_t length, uint32_t dst)
 {
