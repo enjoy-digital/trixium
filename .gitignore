@@ -81,6 +81,7 @@ tools/vsim/obj/
 rom*.init
 tools/vsim/obj_engine/
 firmware/.build_dir_stamp
+firmware/.build.lock
 /trace.json
 firmware/progs.h
 
