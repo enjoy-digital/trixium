@@ -959,6 +959,26 @@ int main(void)
         // and the tiny sim model (2 layers) still runs every leg. GEN-HW stays: two
         // tokens through the hardware path cost 35 ms and prove the units are alive.
         const int big_model = model_header()->n_layer > 8;
+        if (!big_model) {
+            // Harness hook for the simulation tools (sim_resident_gate/bench): they need only
+            // the console, and on the 1k tiny model the three legs cost ~70 minutes of
+            // Verilator time. Offer the skip here, after the firmware is running - an early
+            // key would reach the LiteX BIOS, where Q aborts the boot. Only tiny models get
+            // here; 2 M cycles is ~30 s of simulation wall time and 13 ms on a board. With
+            // no key, or any other key, the legs run exactly as before.
+            puts("BOOT-LEGS (q to skip)");
+            uint64_t t_wait = perf_now64();
+            while (perf_now64() - t_wait < 2000000u) {
+                if (readchar_nonblock()) {
+                    char c = getchar();
+                    if (c == 'q' || c == 'Q') {
+                        puts("boot legs skipped");
+                        goto boot_demo_done;
+                    }
+                    break;
+                }
+            }
+        }
         if (big_model) {
             puts("GEN skipped at boot on this model size (`hwops all cpu` + `gen` runs the CPU reference)");
         } else {
