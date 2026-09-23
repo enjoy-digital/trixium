@@ -26,13 +26,27 @@ int  resident_init(void);        // Extract the rotation sign bits from the imag
 void resident_enable(int on);    // Console A/B: default on when available.
 int  resident_active(void);      // available && enabled && not disabled by a failure.
 
-// Quantize src[width] (FP32, main RAM) into the resident Q8 vector, rotating it first when
+// Quantize src[width] (FP32, main RAM; NULL = the activation resident_ffn_act left in the
+// scratchpad) into the resident Q8 vector, rotating it first when
 // `rotate` (width must be a multiple of the Hadamard block). Leaves the whole-vector
 // exponent resident too. 0 = ok, -1 = unsupported/failed (caller falls back).
 int  resident_prepare(const float *src, uint32_t width, int rotate);
 // Multiply the resident Q8 vector by tensor e (K-segments summed in int32), restore FP32 and
 // DMA the rows into dst (main RAM, 32-byte aligned, rows*4 bytes). 0 = ok, -1 = unsupported.
 int  resident_matvec(const struct bons_entry *e, float *dst);
+
+// Unit 11 (BONSAI_HAS_SILU): load the firmware's SiLU table into the unit (after
+// resident_init). 0 = the FFN activation can run resident.
+int  resident_silu_init(const float *lut);
+int  resident_silu_active(void);
+void resident_silu_enable(int on);   // Console A/B.
+// With the FFN input prepared (resident_prepare), compute act = up * silu(gate) in the
+// scratchpad (bit-exact with hybrid.c's silu_mul_fv; the rare out-of-range elements are
+// recomputed on the CPU) and leave it in RS_F for resident_prepare(NULL, ...). act also
+// receives a copy in main RAM (the fallback source); gate_out/up_out, when not NULL,
+// receive the projections for traces. All 32-byte aligned. 0 = ok, -1 = declined/failed.
+int  resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
+                      float *act, float *gate_out, float *up_out);
 
 // State and per-forward accounting (cycles include the descriptor build and the CPU-side
 // cache work). Lives in the main_ram static window (static_memory.h), not SRAM .bss: the
@@ -44,6 +58,10 @@ struct resident_state {
     const float *prep_src;       // hybrid.c: the last prepared source, for a CPU fallback.
     int32_t prep_width, prep_rotate;
     uint8_t enabled, disabled, ready, n_ch;
+    uint64_t silu_cycles;
+    uint32_t silu_lists, silu_fixups;
+    const float *silu_lut;
+    uint8_t silu_enabled, silu_ready, act_resident;
 };
 struct resident_state *resident_state(void);
 void resident_stats_reset(void);

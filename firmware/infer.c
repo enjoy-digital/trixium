@@ -3302,6 +3302,7 @@ static int dbg_armed;
 static char dbg_dump_tag[16];  // `dbgdump <tag> <layer> <pos>`: print that region whole.
 static int  dbg_dump_l, dbg_dump_pos = -1;
 void infer_dbg(int n) { dbg_armed = n; }
+int infer_dbg_armed(void) { return dbg_armed; }
 
 static void dbg_typed(const char *tag, int layer, const void *values, uint32_t n,
                       const char *dtype)

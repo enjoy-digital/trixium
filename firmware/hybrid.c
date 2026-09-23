@@ -43,7 +43,7 @@ static float rms_eps;
 
 // Float work buffers (main_ram).
 static float *xb, *hb, *rot, *qkv, *zb, *betab, *alphab, *gb, *convb, *qb, *kb, *vb, *ob, *og,
-             *gateb, *upb, *attnb, *logits, *scores, *delta, *qfull, *tmp_h;
+             *gateb, *upb, *actb, *attnb, *logits, *scores, *delta, *qfull, *tmp_h;
 // Per-layer tables: index by layer (NULL where the layer has no such tensor).
 static float **norm_attn, **norm_ffn, **norm_q, **norm_k, **norm_ssm, **ssm_a, **ssm_dt, **conv_w;
 static int   *dn_slot, *attn_slot;   // layer -> DeltaNet / attention index, -1 otherwise.
@@ -544,6 +544,7 @@ int hybrid_init(void)
     qfull = infer_halloc((2*q_dim + 16)*4, 0);
     attnb = infer_halloc((q_dim + 16)*4, 0);
     gateb = infer_halloc(ffn_dim*4, 0); upb = infer_halloc(ffn_dim*4, 0);
+    actb = infer_halloc(ffn_dim*4, 0);   // Resident FFN activation (gateb keeps the gate trace).
     scores = infer_halloc(ctx_cap*4, 0);
     logits = infer_halloc((uint64_t)H->vocab*4 + 64*n_ch*4, 1);
     if (!logits) { printf("hybrid: no room for the logits\n"); return -1; }
@@ -579,8 +580,11 @@ int hybrid_init(void)
     rope_pos_cached = -1;
     hybrid_reset();
     if (H->hadamard_block && resident_available()) {
-        if (resident_init() == 0)
+        if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
+            if (resident_silu_init(silu_lut) == 0)
+                puts("hybrid: resident FFN activation (unit 11 SiLU-multiply) on");
+        }
     }
     printf("hybrid: %d DeltaNet + %d attention layers, dn %d/%d heads x %d/%d, conv %d, "
            "rope %d/%d, gate %d, hadamard %d (widths", n_dn, n_attn, nv, nk, hv, hk, conv_k,
@@ -676,6 +680,11 @@ void hybrid_stats_print(void)
                    (unsigned long)(R->matvec_cycles/hyb_forwards_profiled),
                    (unsigned long)(R->fallbacks/hyb_forwards_profiled),
                    resident_active() ? "on" : "off");
+        if (R->silu_lists)
+            printf("siluprof: per fwd %lu ffn lists (%lu cycles), %lu fixups total\n",
+                   (unsigned long)(R->silu_lists/hyb_forwards_profiled),
+                   (unsigned long)(R->silu_cycles/hyb_forwards_profiled),
+                   (unsigned long)R->silu_fixups);
         uint64_t dt = dn_cyc_inproj + dn_cyc_act + dn_cyc_conv + dn_cyc_prep
                     + dn_cyc_heads + dn_cyc_gate + dn_cyc_outproj;
         printf("dnprof: avg cycles/fwd inproj %lu act %lu conv %lu prep %lu "
@@ -997,18 +1006,44 @@ int hybrid_forward(int token, int want_logits)
             e8 = quantize_f(hb, n_embd);
         hyb_cyc_fprep += perf_now64() - t0;
         t0 = perf_now64();
-        matvec_q(model_entry(ROLE_FFN_GATE, l), e8, gateb);
-        matvec_q(model_entry(ROLE_FFN_UP, l), e8, upb);
-        hyb_cyc_fproj += perf_now64() - t0;
-        infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
-        infer_dbg_f32("ffn_up", l, upb, ffn_dim);
-        t0 = perf_now64();
-        silu_mul_fv(gateb, upb, gateb, ffn_dim);
-        hyb_cyc_fact += perf_now64() - t0;
-        infer_dbg_f32("ffn_act", l, gateb, ffn_dim);
-        t0 = perf_now64();
-        proj_f(model_entry(ROLE_FFN_DOWN, l), gateb, tmp_h);
-        hyb_cyc_fdown += perf_now64() - t0;
+        const struct bons_entry *down = model_entry(ROLE_FFN_DOWN, l);
+        // Resident FFN: gate, up and act = up*silu(gate) in one scratchpad list, the act
+        // then prepared for the down projection where it already is (no FETCH). The gate
+        // and up projections reach main RAM only when traced.
+        int fused = 0;
+        if (e8 == E8_RESIDENT && H->hadamard_block && resident_silu_active() &&
+            infer_matvec_cols(down) == (uint32_t)ffn_dim) {
+            int traced = infer_dbg_armed();
+            fused = resident_ffn_act(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l),
+                                     actb, traced ? gateb : NULL, traced ? upb : NULL) == 0;
+        }
+        if (fused) {
+            hyb_cyc_fproj += perf_now64() - t0;
+            infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
+            infer_dbg_f32("ffn_up", l, upb, ffn_dim);
+            infer_dbg_f32("ffn_act", l, actb, ffn_dim);
+            t0 = perf_now64();
+            struct resident_state *R = resident_state();
+            R->prep_src = actb; R->prep_width = ffn_dim; R->prep_rotate = 1;
+            if (resident_prepare(NULL, (uint32_t)ffn_dim, 1) == 0)
+                matvec_q(down, E8_RESIDENT, tmp_h);
+            else
+                proj_f(down, actb, tmp_h);
+            hyb_cyc_fdown += perf_now64() - t0;
+        } else {
+            matvec_q(model_entry(ROLE_FFN_GATE, l), e8, gateb);
+            matvec_q(model_entry(ROLE_FFN_UP, l), e8, upb);
+            hyb_cyc_fproj += perf_now64() - t0;
+            infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
+            infer_dbg_f32("ffn_up", l, upb, ffn_dim);
+            t0 = perf_now64();
+            silu_mul_fv(gateb, upb, gateb, ffn_dim);
+            hyb_cyc_fact += perf_now64() - t0;
+            infer_dbg_f32("ffn_act", l, gateb, ffn_dim);
+            t0 = perf_now64();
+            proj_f(down, gateb, tmp_h);
+            hyb_cyc_fdown += perf_now64() - t0;
+        }
         infer_dbg_f32("ffn_down", l, tmp_h, n_embd);
         t0 = perf_now64();
         add_fv(xb, tmp_h, n_embd);

@@ -31,6 +31,7 @@
 #include "bonsai_sequence.h"
 #include "progs.h"
 #include "static_memory.h"
+#include "fastmath.h"
 
 #if defined(BONSAI_HAS_SEQ) && defined(BONSAI_HAS_HADAMARD) && \
     defined(BONSAI_HAS_ACTIVATION_QUANTIZE) && defined(BONSAI_HAS_PROJECTION_RESTORE) && \
@@ -55,6 +56,17 @@
 #define RS_ROWS_MAX  24576u    // int32 results per chunk that fit RS_Y.
 #define RS_WIDTH_MAX 17408u    // FP32 source that fits RS_F (and Q8 that fits RS_Q8B/RS_XW).
 #define RS_DESC0     0         // Descriptor slots 0..15: the hybrid path builds no other list.
+#define RS_DESC_MAX  16u
+
+// Unit 11 (SiLU-multiply). The FFN activation runs gate -> RS_F, up -> RS_Y (restored in
+// place), SiLU in place over RS_F; its fixup bitmap lands in RS_Q8B, which only a prepare
+// uses. The 1,025-beat table image is staged in RS_F once, at init.
+#if defined(BONSAI_HAS_SILU)
+#define SILU_BUILT RESIDENT_BUILT
+#else
+#define SILU_BUILT 0
+#endif
+#define RS_FIXMAP RS_Q8B
 
 static uint8_t initialized;   // The window struct is not BSS: zero it once, here.
 
@@ -64,6 +76,7 @@ struct resident_state *resident_state(void)
     if (!initialized) {
         memset(R, 0, sizeof *R);
         R->enabled = 1;
+        R->silu_enabled = 1;
         initialized = 1;
     }
     return R;
@@ -74,9 +87,12 @@ void resident_stats_reset(void)
     struct resident_state *R = resident_state();
     R->prepare_cycles = R->matvec_cycles = 0;
     R->prepares = R->matvecs = R->fallbacks = 0;
+    R->silu_cycles = 0;
+    R->silu_lists = R->silu_fixups = 0;
 }
 
 void resident_enable(int on) { resident_state()->enabled = on ? 1 : 0; }
+void resident_silu_enable(int on) { resident_state()->silu_enabled = on ? 1 : 0; }
 
 int resident_available(void)
 {
@@ -133,6 +149,7 @@ static int run_list(uint32_t count, const char *what)
         R->disabled = 1;
         return -1;
     }
+    R->act_resident = 0;   // Every list may rewrite RS_F; resident_ffn_act re-arms it.
     seq_list_start(RS_DESC0, count);
     uint32_t spins = 0;
     for (;;) {
@@ -140,13 +157,16 @@ static int run_list(uint32_t count, const char *what)
         if (!(st & 1))
             break;
         uint32_t eq = seq_activation_quantize_error_read(), eh = seq_hadamard_error_read(),
-                 er = seq_projection_restore_error_read();
-        if ((eq | eh | er) || ++spins > 4000000u) {
+                 er = seq_projection_restore_error_read(), es = 0;
+#if SILU_BUILT
+        es = seq_silu_error_read();
+#endif
+        if ((eq | eh | er | es) || ++spins > 4000000u) {
             printf("resident: %s list failed at dcount %lu (quantize %08lx hadamard %08lx "
-                   "restore %08lx eng %02lx)%s - engine soft reset, resident path off\n",
+                   "restore %08lx silu %08lx eng %02lx)%s - engine soft reset, resident path off\n",
                    what, (unsigned long)(st >> 8), (unsigned long)eq, (unsigned long)eh,
-                   (unsigned long)er, (unsigned long)engine_csr_status_read(),
-                   (eq | eh | er) ? "" : " [timeout]");
+                   (unsigned long)er, (unsigned long)es, (unsigned long)engine_csr_status_read(),
+                   (eq | eh | er | es) ? "" : " [timeout]");
             R->disabled = 1;
             engine_recover();
             return -1;
@@ -223,7 +243,8 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
 {
     struct resident_state *R = resident_state();
     const struct bons_header *H = model_header();
-    if (!resident_active() || width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)src & 31)) {
+    if (!resident_active() || width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)src & 31) ||
+        (!src && !R->act_resident)) {
         R->fallbacks++;
         return -1;
     }
@@ -237,12 +258,16 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
         }
     }
     uint64_t t0 = perf_now64();
-    // The CPU wrote src through its write-back L1: make it visible to the engine's FETCH.
-    // Clean, not flush: a clean line cannot clobber what the engine reads back.
-    clean_cpu_dcache_range((void *)src, width*4);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
-    desc_fetch(n++, eng_addr(src), width*4/32, RS_F);
+    if (src) {
+        // The CPU wrote src through its write-back L1: make it visible to the engine's
+        // FETCH. Clean, not flush: a clean line cannot clobber what the engine reads back.
+        clean_cpu_dcache_range((void *)src, width*4);
+        desc_fetch(n++, eng_addr(src), width*4/32, RS_F);
+    }
+    // src == NULL: the FP32 source is already in RS_F (resident_ffn_act) - consumed here.
+    R->act_resident = 0;
     if (rotate) {
         // unit 4's `elements` is PER BLOCK (gateware: total = elements*blocks), so the
         // rotated form asks for width/B independent 1,024-element exponents, one per
@@ -262,29 +287,28 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     return rc;
 }
 
-int resident_matvec(const struct bons_entry *e, float *dst)
+// Descriptors for dst_sp = FP32(e * resident Q8): engine matvec per K-segment, int32
+// segment sum, restore into dst_sp (RS_F, or RS_Y in place). Appends at *n; -1 = the
+// tensor or its results do not fit the resident map (nothing is run).
+static int build_matvec(uint32_t *n, const struct bons_entry *e, uint32_t dst_sp)
 {
     struct resident_state *R = resident_state();
-    if (!resident_active() || !e || ((uintptr_t)dst & 31) || e->rows % 8 ||
-        e->rows > RS_ROWS_MAX || e->rows % (uint32_t)R->n_ch ||
-        (e->kind != KIND_TERNARY && e->kind != KIND_Q8)) {
-        R->fallbacks++;
+    if (!e || e->rows % 8 || e->rows > RS_ROWS_MAX || e->rows % (uint32_t)R->n_ch ||
+        (e->kind != KIND_TERNARY && e->kind != KIND_Q8))
         return -1;
-    }
     int nseg = (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
-    if (nseg < 1 || nseg > 4) {
-        R->fallbacks++;
+    if (nseg < 1 || nseg > 4)
         return -1;
-    }
     uint32_t rows = e->rows;
     uint32_t ystride = ((rows*4 + 31) & ~31u);   // One int32 result stream per segment.
-    if ((uint64_t)nseg*ystride > RS_F - RS_Y || rows*4 > RS_SP_END - RS_F) {
-        R->fallbacks++;                          // The segment partials or the FP32 result
-        return -1;                               // would not fit their resident regions.
-    }
-    uint64_t t0 = perf_now64();
+    if ((uint64_t)nseg*ystride > RS_F - RS_Y)    // The segment partials must fit RS_Y,
+        return -1;
+    if (dst_sp == RS_F ? rows*4 > RS_SP_END - RS_F : dst_sp != RS_Y)   // the result its region,
+        return -1;
+    if (*n + 2u*(uint32_t)nseg > RS_DESC_MAX - 1u)                       // and the list its slots.
+        return -1;
     uint32_t rpc = rows/(uint32_t)R->n_ch;
-    uint32_t n = 0, xoff = 0;
+    uint32_t xoff = 0;
     for (int k = 0; k < nseg; k++) {
         const struct bons_entry *seg = nseg > 1 ? model_entry_kseg(e, k) : e;
         uint32_t rb = bons_row_beats(seg->cols, seg->kind, seg->group);
@@ -300,37 +324,213 @@ int resident_matvec(const struct bons_entry *e, float *dst)
         op.rshift = seg->rshift;
         op.xsrc   = RS_XW + xoff;
         op.dst    = RS_Y + (uint32_t)k*ystride;
-        seq_desc_engine(n++, &op);
+        seq_desc_engine((*n)++, &op);
         if (k) {
             // Wrapping int32 sum of the segment partials, as the fused path's reduce_acc.
             int32_t a[4] = {(int32_t)RS_Y, (int32_t)(RS_Y + (uint32_t)k*ystride),
                             (int32_t)RS_Y, (int32_t)((rows + 7)/8)};
-            seq_desc_vec(n++, PROG_REDUCE_ACC, a, 4, 0);
+            seq_desc_vec((*n)++, PROG_REDUCE_ACC, a, 4, 0);
         }
         xoff += seg->cols;
     }
     struct bns_seq_descriptor d;
-    if (bns_seq_desc_restore(&d, RS_Y, RS_F, RS_E8, rows, (int32_t)e->rshift - (int32_t)e->bias)) {
+    if (bns_seq_desc_restore(&d, RS_Y, dst_sp, RS_E8, rows, (int32_t)e->rshift - (int32_t)e->bias))
+        return -1;
+    desc_words((*n)++, &d);
+    return 0;
+}
+
+// The destination is an ordinary hybrid buffer the CPU wrote on earlier forwards, so it
+// can hold DIRTY lines. One evicted while the engine's STORE is in flight would overwrite
+// the result in DDR, and the invalidate after the list would then expose the stale value -
+// rare, data-dependent corruption. Clean AND invalidate before the store, so the CPU holds
+// no copy of this span at all. (infer.c's i32_stage needs only the invalidate: nothing but
+// the engine ever writes it.)
+static void store_out(uint32_t *n, float *dst, uint32_t rows, uint32_t sp_src)
+{
+    flush_cpu_dcache_range(dst, rows*4);
+    desc_store((*n)++, eng_addr(dst), (rows*4 + 31)/32, sp_src);
+}
+
+int resident_matvec(const struct bons_entry *e, float *dst)
+{
+    struct resident_state *R = resident_state();
+    uint32_t n = 0;
+    if (!resident_active() || ((uintptr_t)dst & 31) || build_matvec(&n, e, RS_F)) {
         R->fallbacks++;
         return -1;
     }
-    desc_words(n++, &d);
-    // The destination is an ordinary hybrid buffer the CPU wrote on earlier forwards, so
-    // it can hold DIRTY lines. One evicted while the engine's STORE is in flight would
-    // overwrite the result in DDR, and the invalidate below would then expose the stale
-    // value - rare, data-dependent corruption. Clean AND invalidate before the store, so
-    // the CPU holds no copy of this span at all. (infer.c's i32_stage needs only the
-    // invalidate: nothing but the engine ever writes it.)
-    flush_cpu_dcache_range(dst, rows*4);
-    desc_store(n++, eng_addr(dst), rows*4/32, RS_F);
+    uint64_t t0 = perf_now64();
+    store_out(&n, dst, e->rows, RS_F);
     seq_desc_stop(n++);
     int rc = run_list(n, "matvec");
     if (!rc)
-        invd_cpu_dcache_range(dst, rows*4);
+        invd_cpu_dcache_range(dst, e->rows*4);
     R->matvec_cycles += perf_now64() - t0;
     R->matvecs++;
     return rc;
 }
+
+#if SILU_BUILT
+
+// Recompute the lanes the unit flagged (they hold g): the firmware's own expression, into
+// RS_F and, when given, the main-RAM copy.
+static uint32_t silu_patch(uint32_t rows, float *act)
+{
+    struct resident_state *R = resident_state();
+    const volatile uint32_t *bits = (const volatile uint32_t *)(SCRATCHPAD_BASE + RS_FIXMAP);
+    volatile float *f = (volatile float *)(SCRATCHPAD_BASE + RS_F);
+    const volatile float *m = (const volatile float *)(SCRATCHPAD_BASE + RS_Y);
+    uint32_t patched = 0;
+    for (uint32_t w = 0; w < (rows + 31)/32; w++) {
+        uint32_t word = bits[w];
+        while (word) {
+            uint32_t i = 32*w + (uint32_t)__builtin_ctz(word);
+            word &= word - 1;
+            float r = m[i]*bonsai_silu_lookup(f[i], R->silu_lut);
+            f[i] = r;
+            if (act) act[i] = r;
+            patched++;
+        }
+    }
+    return patched;
+}
+
+// End-to-end check at boot: gates across every range (table, both polynomial tails, 16,
+// the pass-through and -0 ranges, specials) times ordinary, huge and subnormal
+// multipliers, through the unit and the fixup patch, against the CPU element by element.
+#define SILU_SELFTEST_N 640u
+static int silu_selftest(void)
+{
+    struct resident_state *R = resident_state();
+    volatile uint32_t *g = (volatile uint32_t *)(SCRATCHPAD_BASE + RS_F);
+    volatile uint32_t *m = (volatile uint32_t *)(SCRATCHPAD_BASE + RS_Y);
+    union { float f; uint32_t u; } a, b, c;
+    static const uint32_t special[8] = {0x7f800000u, 0xff800000u, 0x7fc00000u, 0x00000001u,
+                                        0x80000000u, 0x41800000u, 0xc1800000u, 0xc2a00000u};
+    static const uint32_t mult[8] = {0x3f800000u, 0xbfa00000u, 0x40490fdbu, 0x3a83126fu,
+                                     0x7e967699u, 0x00000003u, 0x0da24260u, 0x80000000u};
+    for (uint32_t i = 0; i < SILU_SELFTEST_N; i++) {
+        a.f = -100.0f + (float)i*0.3125f;             // -100 .. 99.7: every range
+        g[i] = (i % 61 == 7) ? special[(i/61) % 8] : a.u;
+        m[i] = mult[i % 8];
+    }
+    struct bns_seq_descriptor d;
+    uint32_t n = 0;
+    bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, SILU_SELFTEST_N);
+    desc_words(n++, &d);
+    seq_desc_stop(n++);
+    // The inputs are regenerated below; RS_F is overwritten in place.
+    if (run_list(n, "silu self-test"))
+        return -1;
+    uint32_t fixups = seq_silu_fixups_read(), patched = silu_patch(SILU_SELFTEST_N, NULL);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < SILU_SELFTEST_N; i++) {
+        a.f = -100.0f + (float)i*0.3125f;
+        a.u = (i % 61 == 7) ? special[(i/61) % 8] : a.u;
+        b.u = mult[i % 8];
+        c.f = b.f*bonsai_silu_lookup(a.f, R->silu_lut);
+        if (g[i] != c.u && bad++ < 4)
+            printf("resident: silu self-test element %lu g=%08lx m=%08lx: unit %08lx, cpu %08lx\n",
+                   (unsigned long)i, (unsigned long)a.u, (unsigned long)b.u,
+                   (unsigned long)g[i], (unsigned long)c.u);
+    }
+    printf("resident: silu self-test %lu elements, %lu fixups (%lu patched), %lu mismatches\n",
+           (unsigned long)SILU_SELFTEST_N, (unsigned long)fixups, (unsigned long)patched,
+           (unsigned long)bad);
+    return (bad || fixups != patched || !fixups) ? -1 : 0;
+}
+
+int resident_silu_init(const float *lut)
+{
+    struct resident_state *R = resident_state();
+    R->silu_ready = 0;
+    R->silu_lut = lut;
+    if (!R->ready || (seq_silu_abi_read() >> 16) != 1)
+        return -1;
+    // The table image the unit loads: lut[0..4096] (lut[4096] alone in beat 512) and the
+    // interpolation slopes lut[i+1] - lut[i], one FP32 subtraction each - exactly what
+    // bonsai_silu_lookup computes per element. Staged in RS_F (transient), loaded once.
+    volatile uint32_t *w = (volatile uint32_t *)(SCRATCHPAD_BASE + RS_F);
+    union { float f; uint32_t u; } v;
+    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) { v.f = lut[i]; w[i] = v.u; }
+    for (int i = BONSAI_SILU_LUT_N + 1; i < 513*8; i++) w[i] = 0;
+    for (int i = 0; i < BONSAI_SILU_LUT_N; i++) { v.f = lut[i + 1] - lut[i]; w[513*8 + i] = v.u; }
+    struct bns_seq_descriptor d;
+    uint32_t n = 0;
+    bns_seq_desc_silu_load(&d, RS_F);
+    desc_words(n++, &d);
+    seq_desc_stop(n++);
+    if (run_list(n, "silu table load") || silu_selftest())
+        return -1;
+    R->silu_ready = 1;
+    return 0;
+}
+
+int resident_silu_active(void)
+{
+    struct resident_state *R = resident_state();
+    return resident_active() && R->silu_ready && R->silu_enabled;
+}
+
+int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
+                     float *act, float *gate_out, float *up_out)
+{
+    struct resident_state *R = resident_state();
+    uint32_t n = 0;
+    if (!resident_silu_active() || !gate || !up || gate->rows != up->rows ||
+        gate->rows > RS_WIDTH_MAX || ((uintptr_t)act & 31) ||
+        ((uintptr_t)gate_out & 31) || ((uintptr_t)up_out & 31)) {
+        R->fallbacks++;
+        return -1;
+    }
+    uint32_t rows = gate->rows;
+    uint64_t t0 = perf_now64();
+    struct bns_seq_descriptor d;
+    if (build_matvec(&n, gate, RS_F) || (gate_out && n > RS_DESC_MAX - 6u)) goto decline;
+    if (gate_out) store_out(&n, gate_out, rows, RS_F);
+    if (build_matvec(&n, up, RS_Y) || n + (up_out ? 4u : 3u) > RS_DESC_MAX) goto decline;
+    if (up_out) store_out(&n, up_out, rows, RS_Y);
+    bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, rows);
+    desc_words(n++, &d);
+    // The activation also goes to main RAM: the down projection's CPU fallback and the
+    // traces read it there. Fixup lanes are patched in both copies below.
+    store_out(&n, act, rows, RS_F);
+    seq_desc_stop(n++);
+    int rc = run_list(n, "ffn activation");
+    if (!rc) {
+        invd_cpu_dcache_range(act, rows*4);
+        if (gate_out) invd_cpu_dcache_range(gate_out, rows*4);
+        if (up_out) invd_cpu_dcache_range(up_out, rows*4);
+        // Elements outside the unit's exact range (|gate| tails, specials, non-normal
+        // products) kept g in RS_F; recompute them with the firmware's own function.
+        uint32_t fixups = seq_silu_fixups_read();
+        R->silu_fixups += fixups;
+        if (fixups)
+            silu_patch(rows, act);
+        R->act_resident = 1;
+    }
+    R->silu_cycles += perf_now64() - t0;
+    R->silu_lists++;
+    return rc;
+decline:
+    R->fallbacks++;
+    return -1;
+}
+
+#else
+
+int resident_silu_init(const float *lut) { resident_state()->silu_lut = lut; return -1; }
+int resident_silu_active(void) { return 0; }
+int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
+                     float *act, float *gate_out, float *up_out)
+{
+    (void)gate; (void)up; (void)act; (void)gate_out; (void)up_out;
+    resident_state()->fallbacks++;
+    return -1;
+}
+
+#endif
 
 #else  // !RESIDENT_BUILT
 
@@ -342,6 +542,15 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
 int resident_matvec(const struct bons_entry *e, float *dst)
 {
     (void)e; (void)dst; resident_state()->fallbacks++; return -1;
+}
+int resident_silu_init(const float *lut) { resident_state()->silu_lut = lut; return -1; }
+int resident_silu_active(void) { return 0; }
+int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
+                     float *act, float *gate_out, float *up_out)
+{
+    (void)gate; (void)up; (void)act; (void)gate_out; (void)up_out;
+    resident_state()->fallbacks++;
+    return -1;
 }
 
 #endif

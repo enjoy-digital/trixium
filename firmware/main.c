@@ -830,6 +830,12 @@ static void console_service(void)
         printf("DNPIPE %s (DeltaNet head state store/fetch under the CPU's head work)\n",
                dn_pipe_use ? "on" : "off");
     }
+    else if (strcmp(token, "silu") == 0) {
+        if (strncmp(str, "on", 2) == 0)  resident_silu_enable(1);
+        if (strncmp(str, "off", 3) == 0) resident_silu_enable(0);
+        printf("SILU %s (FFN activation through the unit 11 SiLU-multiply list)\n",
+               resident_silu_active() ? "on" : "off");
+    }
     else if (strcmp(token, "resident") == 0) {
         if (strncmp(str, "on", 2) == 0)  resident_enable(1);
         if (strncmp(str, "off", 3) == 0) resident_enable(0);
