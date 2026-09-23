@@ -623,24 +623,27 @@ void hybrid_stats_reset(void)
 
 void hybrid_stats_print(void)
 {
-    if (!dn_hw || !dn_heads_profiled)
-        return;
-    uint32_t heads_per_forward = (uint32_t)n_dn*(uint32_t)nv;
-    uint32_t forwards = heads_per_forward ? dn_heads_profiled/heads_per_forward : 0;
-    uint64_t total = dn_cyc_fetch + dn_cyc_params + dn_cyc_core
-                   + dn_cyc_store + dn_cyc_output;
-    printf("dnhw: %lu heads/%lu forwards, avg cycles/head fetch %lu params %lu "
-           "core %lu store %lu output %lu total %lu",
-           (unsigned long)dn_heads_profiled, (unsigned long)forwards,
-           (unsigned long)(dn_cyc_fetch/dn_heads_profiled),
-           (unsigned long)(dn_cyc_params/dn_heads_profiled),
-           (unsigned long)(dn_cyc_core/dn_heads_profiled),
-           (unsigned long)(dn_cyc_store/dn_heads_profiled),
-           (unsigned long)(dn_cyc_output/dn_heads_profiled),
-           (unsigned long)(total/dn_heads_profiled));
-    if (forwards)
-        printf(", %lu cycles/forward", (unsigned long)(total/forwards));
-    puts("");
+    // The per-head recurrence line exists only with the hardware DeltaNet; the per-stage
+    // and resident profiles below do not depend on it (they used to sit behind the same
+    // early return, so a DNREC-less simulation printed neither).
+    if (dn_hw && dn_heads_profiled) {
+        uint32_t heads_per_forward = (uint32_t)n_dn*(uint32_t)nv;
+        uint32_t forwards = heads_per_forward ? dn_heads_profiled/heads_per_forward : 0;
+        uint64_t total = dn_cyc_fetch + dn_cyc_params + dn_cyc_core
+                       + dn_cyc_store + dn_cyc_output;
+        printf("dnhw: %lu heads/%lu forwards, avg cycles/head fetch %lu params %lu "
+               "core %lu store %lu output %lu total %lu",
+               (unsigned long)dn_heads_profiled, (unsigned long)forwards,
+               (unsigned long)(dn_cyc_fetch/dn_heads_profiled),
+               (unsigned long)(dn_cyc_params/dn_heads_profiled),
+               (unsigned long)(dn_cyc_core/dn_heads_profiled),
+               (unsigned long)(dn_cyc_store/dn_heads_profiled),
+               (unsigned long)(dn_cyc_output/dn_heads_profiled),
+               (unsigned long)(total/dn_heads_profiled));
+        if (forwards)
+            printf(", %lu cycles/forward", (unsigned long)(total/forwards));
+        puts("");
+    }
     if (hyb_forwards_profiled) {
         uint64_t ht = hyb_cyc_embed + hyb_cyc_anorm + hyb_cyc_dn + hyb_cyc_attn
                     + hyb_cyc_resid + hyb_cyc_fprep + hyb_cyc_fproj + hyb_cyc_fact
