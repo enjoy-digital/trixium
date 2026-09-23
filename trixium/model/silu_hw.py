@@ -188,3 +188,80 @@ def silu_mul_fast(g, m, lut=None, dlut=None):
     if rk == "zero" and (m & 0x7FFFFFFF) and (s & 0x7FFFFFFF):
         return 0, True                              # underflow of a nonzero product
     return r, False
+
+
+# The RTL's arithmetic structure --------------------------------------------------------------
+#
+# In the table range the FP32 sum a = RNE(g + 16) is always a multiple of 2**-20: on
+# [16, 32) the binary32 grid is 2**-19, on [8, 16) it is 2**-20, and below 8 (g in
+# (-16, -8)) the subtraction 16 - |g| is exact (Sterbenz) with |g| itself on the 2**-20
+# grid. So a is the 26-bit integer a20 = a * 2**20, u = a * 128 has integer part
+# i = a20 >> 13 and fraction f = (a20 & 0x1FFF) * 2**-13: a 13-bit fixed-point fraction.
+# The "add 16" is a shift-and-round of g's significand, and the FMA's first operand is a
+# 13-bit integer rather than a general float. silu_mul_fixed() below is structured stage
+# for stage like the RTL; test_silu_hw.py proves it equal to silu_mul_fast().
+
+def rne_scale(n, k):
+    """RNE(n * 2**k) as an integer, for n >= 0 (k <= 0 rounds; k > 0 is exact)."""
+    if k >= 0:
+        return n << k
+    s = -k
+    if s > n.bit_length() + 1:
+        return 0                                   # below half an ulp, no tie possible
+    q, rem, half = n >> s, n & ((1 << s) - 1), 1 << (s - 1)
+    return q + (1 if rem > half or (rem == half and q & 1) else 0)
+
+
+def add16_fixed(g):
+    """a20 = RNE_f32(g + 16) * 2**20 for |g| < 16 (finite)."""
+    sign, n, e, kind = decode(g)
+    if kind == "zero":
+        return 16 << 20
+    if not sign:                                   # a in [16, 32]: grid 2**-19
+        return ((1 << 23) + rne_scale(n, e + 19)) << 1
+    return (1 << 24) - rne_scale(n, e + 20)        # a in (0, 16]: grid 2**-20 (exact below 8)
+
+
+def fma_fixed(F, d, c):
+    """RNE_f32(F * 2**-13 * d + c) for a 13-bit F and table words d, c (normal or zero)."""
+    ds, dn, de, _ = decode(d)
+    cs, cn, ce, _ = decode(c)
+    return round_to_f32(*_sum([(ds, F * dn, de - 13), (cs, cn, ce)]))
+
+
+def classify(g, m):
+    """The kernel's first stage: 'table', 'pass' (s = g), 'negzero' (s = -0.0) or 'fixup'."""
+    _, _, _, gk = decode(g)
+    _, _, _, mk = decode(m)
+    if gk in ("nan", "inf") or mk in ("nan", "inf", "subnormal"):
+        return "fixup"
+    mag, neg = g & 0x7FFFFFFF, g >> 31
+    if mag < F32_16:
+        return "table"
+    if not neg and mag > F32_16:
+        return "pass"
+    if neg and mag > 0x42A00000:
+        return "negzero"
+    return "fixup"
+
+
+def silu_mul_fixed(g, m, lut=None, dlut=None):
+    """silu_mul_fast restructured as the RTL computes it: (result bits, fixup)."""
+    if lut is None:
+        lut, dlut = tables()
+    kind = classify(g, m)
+    if kind == "fixup":
+        return 0, True
+    if kind == "pass":
+        s = g
+    elif kind == "negzero":
+        s = F32_NEG_ZERO
+    else:
+        a20 = add16_fixed(g)
+        i, F = a20 >> 13, a20 & 0x1FFF
+        s = lut[LUT_N] if i >= LUT_N else fma_fixed(F, dlut[i], lut[i])
+    r = f32_mul(m, s)
+    rk = decode(r)[3]
+    if rk in ("subnormal", "inf", "nan") or (rk == "zero" and (m & 0x7FFFFFFF) and (s & 0x7FFFFFFF)):
+        return 0, True
+    return r, False

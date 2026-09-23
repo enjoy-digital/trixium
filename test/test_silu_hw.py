@@ -130,3 +130,25 @@ def test_fast_path_never_needs_subnormal_fma_operands():
     # Smallest a: g = -16 + 2**-20 (the ulp of |g| in [8, 16)).
     a = f32_add(f32_bits(np.float32(-16 + 2.0**-20)), F32_16)
     assert decode(a)[3] == "normal"
+
+
+def test_fixed_point_structure_equals_the_float_model():
+    """a20 is exact, i/f come out of it by shifts, and the restricted FMA equals f32_fma."""
+    from trixium.model.silu_hw import add16_fixed, silu_mul_fixed
+    lut, dlut = tables()
+    grid = [g for g in firmware_grid() if (g & 0x7FFFFFFF) < F32_16]
+    for g in grid:
+        a = f32_add(g, F32_16)
+        s, n, e, kind = decode(a)
+        assert kind == "normal" and s == 0
+        # a is on the 2**-20 grid: n * 2**(e+20) is an integer. (Just below 8 the FP32
+        # exponent's grid is 2**-21, but the significand then ends in a zero bit.)
+        k = e + 20
+        assert k >= 0 or n % (1 << -k) == 0, hex(g)
+        assert add16_fixed(g) == (n << k if k >= 0 else n >> -k), hex(g)
+    rng = np.random.default_rng(5)
+    gates = [f32_bits(x) for x in rng.uniform(-16, 16, 40000).astype(np.float32)]
+    gates += [f32_bits(x) for x in (rng.normal(0, 1, 20000) * np.exp2(rng.integers(-60, 4, 20000))).astype(np.float32)]
+    mults = [f32_bits(x) for x in rng.normal(0, 3, len(gates)).astype(np.float32)]
+    for g, m in zip(grid + gates, MULTIPLIERS * (len(grid)//len(MULTIPLIERS) + 1) + mults):
+        assert silu_mul_fixed(g, m, lut, dlut) == silu_mul_fast(g, m, lut, dlut), (hex(g), hex(m))
