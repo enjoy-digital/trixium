@@ -409,6 +409,34 @@ static void mvtest_cmd(char *str)
            e->bias, e->rshift, (unsigned long)csum);
 }
 
+// Engine streaming efficiency on one real tensor: `mvbw <role> <layer> [reps]` times reps
+// matvecs through the legacy command path and compares the cycles with the tensor's beats
+// per channel (the floor at one 32-byte beat per channel per clock).
+static void mvbw_cmd(char *str)
+{
+    char *r = get_token(&str), *l = get_token(&str), *n = get_token(&str);
+    if (*r == 0) { puts("usage: mvbw <role> <layer> [reps]"); return; }
+    if (model_header()->magic != BONS_MAGIC) { puts("mvbw: no model"); return; }
+    const struct bons_entry *e = model_entry((int)strtoul(r, NULL, 0), *l ? (int)strtoul(l, NULL, 0) : 0);
+    int reps = *n ? (int)strtoul(n, NULL, 0) : 4;
+    if (!e || (e->kind != KIND_TERNARY && e->kind != KIND_Q8) || e->rows*4 > 0x30000) {
+        puts("mvbw: no such matvec tensor (or its result does not fit the scratchpad)");
+        return;
+    }
+    fill_x_pattern(0, e->cols);
+    model_matvec(e, 0, 0x8000);                    // warm: descriptors, first-touch
+    uint64_t t0 = perf_now64();
+    for (int i = 0; i < reps; i++)
+        model_matvec(e, 0, 0x8000);
+    uint64_t dt = (perf_now64() - t0)/(uint64_t)(reps > 0 ? reps : 1);
+    uint64_t beats = e->chan_len_beats;
+    printf("MVBW role=%u layer=%u rows=%lu cols=%lu kind=%u: %lu cycles/matvec, %lu beats/channel, "
+           "%lu.%02lu beats/channel/clock (%lu%% of 1.0)\n", e->role, e->layer,
+           (unsigned long)e->rows, (unsigned long)e->cols, e->kind, (unsigned long)dt,
+           (unsigned long)beats, (unsigned long)(beats/dt), (unsigned long)(beats*100/dt % 100),
+           (unsigned long)(beats*100/dt));
+}
+
 static int parse_int(const char *s)
 {
     int v = 0;
@@ -581,6 +609,8 @@ static void console_service(void)
         peek_cmd(str);
     else if (strcmp(token, "mvtest") == 0)
         mvtest_cmd(str);
+    else if (strcmp(token, "mvbw") == 0)
+        mvbw_cmd(str);
     else if (strcmp(token, "selftest") == 0)
         selftest();
     else if (strcmp(token, "gen") == 0)

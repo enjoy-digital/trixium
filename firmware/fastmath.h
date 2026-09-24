@@ -68,4 +68,33 @@ static inline float bonsai_silu_lookup(float x, const float *lut)
     return __builtin_fmaf(f, lut[i + 1] - lut[i], lut[i]);
 }
 
+// Canonical sigmoid (docs/canonical-reductions.md, "sigmoid"): the SiLU lookup's form on a
+// sigmoid table, with tails from the same bounded exp - no libm expf anywhere, so the
+// firmware, the mirror and a table-driven unit agree bit for bit. The table is built by
+// bonsai_sigmoid_point at the 4,097 grid points.
+static inline float bonsai_sigmoid_point(float x)          // x in [-16, 80]
+{
+    return 1.0f/(1.0f + bonsai_expf_bounded(-x));
+}
+
+static inline float bonsai_sigmoid_tail(float x)           // |x| >= 16, finite
+{
+    if (x > 80.0f) return 1.0f;
+    if (x >= 16.0f) return bonsai_sigmoid_point(x);
+    if (x < -80.0f) return 0.0f;
+    float e = bonsai_expf_bounded(x);
+    return e/(1.0f + e);
+}
+
+static inline float bonsai_sigmoid_lookup(float x, const float *lut)
+{
+    if (x >= BONSAI_SILU_LUT_LIMIT || x <= -BONSAI_SILU_LUT_LIMIT)
+        return bonsai_sigmoid_tail(x);
+    float u = (x + BONSAI_SILU_LUT_LIMIT)*BONSAI_SILU_LUT_SCALE;
+    int i = (int)u;
+    if (i >= BONSAI_SILU_LUT_N) return lut[BONSAI_SILU_LUT_N];
+    float f = u - (float)i;
+    return __builtin_fmaf(f, lut[i + 1] - lut[i], lut[i]);
+}
+
 #endif

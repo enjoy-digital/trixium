@@ -34,6 +34,7 @@
 #include "perf.h"
 #include "fastmath.h"
 #include "resident.h"
+#include "static_memory.h"
 
 static const struct bons_header *H;
 static int n_ch, n_embd, n_head, n_kv_head, head_dim, ffn_dim, n_layer, q_dim, kv_dim, n_rep;
@@ -70,6 +71,18 @@ static uint64_t dn_cyc_heads, dn_cyc_gate, dn_cyc_outproj;
 static uint64_t hyb_cyc_embed, hyb_cyc_anorm, hyb_cyc_dn, hyb_cyc_attn;
 static uint64_t hyb_cyc_resid, hyb_cyc_fprep, hyb_cyc_fproj, hyb_cyc_fact;
 static uint64_t hyb_cyc_fdown, hyb_cyc_logits;
+// Attention sub-stages (sum = hyb_cyc_attn): prepare, Q/K/V projections, per-head norms +
+// RoPE, scores/softmax/values/gate (incl. the KV write), output projection.
+// Weight beats one forward streams per channel (every matvec tensor once, K-segments
+// included, the LM head once): the bandwidth floor is this many cycles at one 32-byte
+// beat per channel per clock. New profile counters live here, in the main_ram static
+// window: the 8 KiB SRAM's .bss is at its 4 KiB stack floor (48 more bytes broke the link).
+struct hyb_prof {
+    uint64_t at_prep, at_qkv, at_rope, at_core, at_out;
+    uint64_t fwd_weight_beats;
+};
+#define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
+_Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
 static uint32_t hyb_forwards_profiled;
 
 // The 27B evaluates SiLU about 1.9 million times per forward.  Even the range-reduced
@@ -238,7 +251,8 @@ int hybrid_present(void)
 
 // Helpers -------------------------------------------------------------------------------------
 
-static float sigmoidf(float x) { return 1.0f/(1.0f + expf(-x)); }
+static float *sigmoid_lut;
+static float sigmoidf(float x) { return bonsai_sigmoid_lookup(x, sigmoid_lut); }
 static float softplusf(float x){ return x > 20.0f ? x : log1pf(expf(x)); }
 
 static void silu_lut_init(void)
@@ -254,18 +268,28 @@ static inline float siluf(float x)
     return bonsai_silu_lookup(x, silu_lut);
 }
 
+// The canonical FP32 sum of squares (docs/canonical-reductions.md): 64 partial sums, element
+// i into partial i % 64 in index order (each term x*x rounded, then added, starting from
+// +0), then a halving tree P[j] += P[j + w] for w = 32, 16, ..., 1. A scratchpad unit that
+// takes one 8-float beat per clock revisits each partial every 8 clocks, so it can use a
+// pipelined adder and still reproduce this bit for bit; the mirror does the same.
+static float sumsq64(const float *v, int n)
+{
+    float P[64];
+    for (int k = 0; k < 64; k++) {
+        float acc = 0;
+        for (int i = k; i < n; i += 64) acc += v[i]*v[i];
+        P[k] = acc;
+    }
+    for (int w = 32; w; w >>= 1)
+        for (int j = 0; j < w; j++) P[j] += P[j + w];
+    return P[0];
+}
+
 static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
 {
-    float ss = 0;
-    int i = 0;
-    // Keep the exact sequential sum, but remove three quarters of its loop control.
-    for (; i + 3 < n; i += 4) {
-        ss += src[i + 0]*src[i + 0];
-        ss += src[i + 1]*src[i + 1];
-        ss += src[i + 2]*src[i + 2];
-        ss += src[i + 3]*src[i + 3];
-    }
-    for (; i < n; i++) ss += src[i]*src[i];
+    float ss = sumsq64(src, n);
+    int i;
     float r = 1.0f/sqrtf(ss/n + rms_eps);
     i = 0;
     for (; i + 3 < n; i += 4) {
@@ -279,15 +303,8 @@ static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
 
 static void l2norm_fv(float *v, int n)   // ggml_l2_norm: v / max(|v|, eps)
 {
-    float ss = 0;
-    int i = 0;
-    for (; i + 3 < n; i += 4) {
-        ss += v[i + 0]*v[i + 0];
-        ss += v[i + 1]*v[i + 1];
-        ss += v[i + 2]*v[i + 2];
-        ss += v[i + 3]*v[i + 3];
-    }
-    for (; i < n; i++) ss += v[i]*v[i];
+    float ss = sumsq64(v, n);
+    int i;
     float nrm = sqrtf(ss);
     if (nrm < rms_eps) nrm = rms_eps;
     i = 0;
@@ -527,6 +544,9 @@ int hybrid_init(void)
     vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     silu_lut = infer_halloc(sizeof(float)*(BONSAI_SILU_LUT_N + 1), 0);
     silu_lut_init();
+    sigmoid_lut = infer_halloc(sizeof(float)*(BONSAI_SILU_LUT_N + 1), 0);
+    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++)
+        sigmoid_lut[i] = bonsai_sigmoid_point(-BONSAI_SILU_LUT_LIMIT + (float)i*(1.0f/BONSAI_SILU_LUT_SCALE));
 
     int wmax = n_embd;
     if (ffn_dim > wmax) wmax = ffn_dim;
@@ -587,6 +607,22 @@ int hybrid_init(void)
                 puts("hybrid: resident FFN activation (unit 11 SiLU-multiply) on");
         }
     }
+    {
+        static const int roles[] = {ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
+            ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN, ROLE_ATTN_QKV, ROLE_ATTN_ZGATE,
+            ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA};
+        HP->fwd_weight_beats = 0;
+        for (int l = 0; l < n_layer; l++)
+            for (unsigned r = 0; r < sizeof roles/sizeof roles[0]; r++) {
+                const struct bons_entry *e = model_entry(roles[r], l);
+                int nseg = e && (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
+                for (int k = 0; e && k < nseg; k++)
+                    HP->fwd_weight_beats += (nseg > 1 ? model_entry_kseg(e, k) : e)->chan_len_beats;
+            }
+        const struct bons_entry *lm = model_entry(ROLE_LM_HEAD, 0);
+        if (!lm) lm = model_entry(ROLE_TOK_EMB, 0);
+        if (lm) HP->fwd_weight_beats += lm->chan_len_beats;
+    }
     printf("hybrid: %d DeltaNet + %d attention layers, dn %d/%d heads x %d/%d, conv %d, "
            "rope %d/%d, gate %d, hadamard %d (widths", n_dn, n_attn, nv, nk, hv, hk, conv_k,
            rope_n, head_dim, H->attn_gated, H->hadamard_block);
@@ -625,6 +661,7 @@ void hybrid_stats_reset(void)
     hyb_cyc_embed = hyb_cyc_anorm = hyb_cyc_dn = hyb_cyc_attn = 0;
     hyb_cyc_resid = hyb_cyc_fprep = hyb_cyc_fproj = hyb_cyc_fact = 0;
     hyb_cyc_fdown = hyb_cyc_logits = 0;
+    HP->at_prep = HP->at_qkv = HP->at_rope = HP->at_core = HP->at_out = 0;
     hyb_forwards_profiled = 0;
     resident_stats_reset();
 }
@@ -671,6 +708,23 @@ void hybrid_stats_print(void)
                (unsigned long)(hyb_cyc_fdown/hyb_forwards_profiled),
                (unsigned long)(hyb_cyc_logits/hyb_forwards_profiled),
                (unsigned long)(ht/hyb_forwards_profiled));
+        if (hyb_cyc_attn)
+            printf("attnprof: avg cycles/fwd prep %lu qkv %lu normrope %lu core %lu out %lu\n",
+                   (unsigned long)(HP->at_prep/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_qkv/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_rope/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_core/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_out/hyb_forwards_profiled));
+        if (HP->fwd_weight_beats) {
+            // Floor: every channel streams its share of every tensor at one beat per clock.
+            uint64_t fwd = ht/hyb_forwards_profiled;
+            printf("floor: %lu MB weights/forward over %d channels = %lu cycles at 1 beat/"
+                   "channel/clock; instrumented forward %lu cycles = %lu.%02lux the floor\n",
+                   (unsigned long)(HP->fwd_weight_beats*32*(uint64_t)n_ch >> 20), n_ch,
+                   (unsigned long)HP->fwd_weight_beats, (unsigned long)fwd,
+                   (unsigned long)(fwd/HP->fwd_weight_beats),
+                   (unsigned long)((fwd*100/HP->fwd_weight_beats) % 100));
+        }
         const struct resident_state *R = resident_state();
         if (R->prepares || R->matvecs || R->fallbacks)
             printf("resprof: per fwd %lu prepares (%lu cycles) %lu matvecs (%lu cycles) "
@@ -902,6 +956,7 @@ static void attention_layer(int l, const float *h, float *out)
     float *K = kc + (uint64_t)a*ctx_cap*kv_dim, *V = vc + (uint64_t)a*ctx_cap*kv_dim;
     int gated = H->attn_gated;
     int e8;
+    uint64_t t0 = perf_now64(), t1;
     if (H->hadamard_block) {
         // Q/K/V share the input and folded basis: rotate once, not once per projection.
         // This removes another 32 full-width rotations per 27B forward.
@@ -909,9 +964,11 @@ static void attention_layer(int l, const float *h, float *out)
     } else {
         e8 = quantize_f(h, n_embd);
     }
+    t1 = perf_now64(); HP->at_prep += t1 - t0; t0 = t1;
     matvec_q(model_entry(ROLE_ATTN_Q, l), e8, gated ? qfull : qb);
     matvec_q(model_entry(ROLE_ATTN_K, l), e8, kb);
     matvec_q(model_entry(ROLE_ATTN_V, l), e8, vb);
+    t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
     if (gated)   // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
@@ -924,6 +981,7 @@ static void attention_layer(int l, const float *h, float *out)
         rmsnorm_fv(kb + hh*head_dim, kb + hh*head_dim, norm_k[l], head_dim);
         rope_apply_partial(kb + hh*head_dim);
     }
+    t1 = perf_now64(); HP->at_rope += t1 - t0; t0 = t1;
     memcpy(K + (uint64_t)pos*kv_dim, kb, (size_t)kv_dim*4);
     memcpy(V + (uint64_t)pos*kv_dim, vb, (size_t)kv_dim*4);
     int   T = pos + 1;
@@ -969,7 +1027,9 @@ static void attention_layer(int l, const float *h, float *out)
             for (; i < head_dim; i++) oh[i] *= sigmoidf(g[i]);
         }
     }
+    t1 = perf_now64(); HP->at_core += t1 - t0; t0 = t1;
     proj_f(model_entry(ROLE_ATTN_OUT, l), attnb, out);
+    HP->at_out += perf_now64() - t0;
 }
 
 int hybrid_forward(int token, int want_logits)

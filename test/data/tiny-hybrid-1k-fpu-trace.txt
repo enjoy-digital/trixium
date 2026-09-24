@@ -1,0 +1,91 @@
+
+bonsai> gen 1 1 2 3
+GEN:DBG pos=0 l=-1 emb dtype=f32 n=1024 e=0 7f19f34e
+DBG pos=0 l=0 attn_norm dtype=f32 n=1024 e=0 10b47e68
+DBG pos=0 l=0 dn_out dtype=f32 n=1024 e=0 41b438bd
+DBG pos=0 l=0 attn_res dtype=f32 n=1024 e=0 bdc9f22b
+DBG pos=0 l=0 ffn_norm dtype=f32 n=1024 e=0 b327ba66
+DBG pos=0 l=0 ffn_gate dtype=f32 n=2048 e=0 ace854b1
+DBG pos=0 l=0 ffn_up dtype=f32 n=2048 e=0 0adcdaf6
+DBG pos=0 l=0 ffn_act dtype=f32 n=2048 e=0 782f3e03
+DBG pos=0 l=0 ffn_down dtype=f32 n=1024 e=0 03634f40
+DBG pos=0 l=0 ffn_res dtype=f32 n=1024 e=0 4b50db3b
+DBG pos=0 l=1 attn_norm dtype=f32 n=1024 e=0 9e04292c
+DBG pos=0 l=1 dn_out dtype=f32 n=1024 e=0 863e542f
+DBG pos=0 l=1 attn_res dtype=f32 n=1024 e=0 20a5a579
+DBG pos=0 l=1 ffn_norm dtype=f32 n=1024 e=0 20ecbd81
+DBG pos=0 l=1 ffn_gate dtype=f32 n=2048 e=0 55be07d7
+DBG pos=0 l=1 ffn_up dtype=f32 n=2048 e=0 31be3a20
+DBG pos=0 l=1 ffn_act dtype=f32 n=2048 e=0 ba1bbd99
+DBG pos=0 l=1 ffn_down dtype=f32 n=1024 e=0 b196a8b7
+DBG pos=0 l=1 ffn_res dtype=f32 n=1024 e=0 a8a4b142
+DBG pos=0 l=2 attn_norm dtype=f32 n=1024 e=0 9ab7baa4
+DBG pos=0 l=2 attn_out dtype=f32 n=1024 e=0 8298e660
+DBG pos=0 l=2 attn_res dtype=f32 n=1024 e=0 34c4ae2f
+DBG pos=0 l=2 ffn_norm dtype=f32 n=1024 e=0 0fd0719e
+DBG pos=0 l=2 ffn_gate dtype=f32 n=2048 e=0 2c3cfe19
+DBG pos=0 l=2 ffn_up dtype=f32 n=2048 e=0 7511b244
+DBG pos=0 l=2 ffn_act dtype=f32 n=2048 e=0 1418bdb1
+DBG pos=0 l=2 ffn_down dtype=f32 n=1024 e=0 4704cdb3
+DBG pos=0 l=2 ffn_res dtype=f32 n=1024 e=0 127b1c3b
+DBG pos=1 l=-1 emb dtype=f32 n=1024 e=0 a84729fe
+DBG pos=1 l=0 attn_norm dtype=f32 n=1024 e=0 71d377d0
+DBG pos=1 l=0 dn_out dtype=f32 n=1024 e=0 788d5bef
+DBG pos=1 l=0 attn_res dtype=f32 n=1024 e=0 14072549
+DBG pos=1 l=0 ffn_norm dtype=f32 n=1024 e=0 77cfe963
+DBG pos=1 l=0 ffn_gate dtype=f32 n=2048 e=0 6859b056
+DBG pos=1 l=0 ffn_up dtype=f32 n=2048 e=0 67121a17
+DBG pos=1 l=0 ffn_act dtype=f32 n=2048 e=0 19e29ad8
+DBG pos=1 l=0 ffn_down dtype=f32 n=1024 e=0 161c9ca5
+DBG pos=1 l=0 ffn_res dtype=f32 n=1024 e=0 41c77d3b
+DBG pos=1 l=1 attn_norm dtype=f32 n=1024 e=0 ec19773e
+DBG pos=1 l=1 dn_out dtype=f32 n=1024 e=0 2860d52f
+DBG pos=1 l=1 attn_res dtype=f32 n=1024 e=0 8ef0aa24
+DBG pos=1 l=1 ffn_norm dtype=f32 n=1024 e=0 a067065b
+DBG pos=1 l=1 ffn_gate dtype=f32 n=2048 e=0 72dcd409
+DBG pos=1 l=1 ffn_up dtype=f32 n=2048 e=0 f2e2c6f7
+DBG pos=1 l=1 ffn_act dtype=f32 n=2048 e=0 9450409b
+DBG pos=1 l=1 ffn_down dtype=f32 n=1024 e=0 f1738371
+DBG pos=1 l=1 ffn_res dtype=f32 n=1024 e=0 c174c679
+DBG pos=1 l=2 attn_norm dtype=f32 n=1024 e=0 2117eb78
+DBG pos=1 l=2 attn_out dtype=f32 n=1024 e=0 e99bd361
+DBG pos=1 l=2 attn_res dtype=f32 n=1024 e=0 6d2f75f8
+DBG pos=1 l=2 ffn_norm dtype=f32 n=1024 e=0 f70b24e8
+DBG pos=1 l=2 ffn_gate dtype=f32 n=2048 e=0 dec83968
+DBG pos=1 l=2 ffn_up dtype=f32 n=2048 e=0 416a6c89
+DBG pos=1 l=2 ffn_act dtype=f32 n=2048 e=0 96aec2f1
+DBG pos=1 l=2 ffn_down dtype=f32 n=1024 e=0 3975aaf7
+DBG pos=1 l=2 ffn_res dtype=f32 n=1024 e=0 3936fb33
+DBG pos=2 l=-1 emb dtype=f32 n=1024 e=0 ef90343d
+DBG pos=2 l=0 attn_norm dtype=f32 n=1024 e=0 fe04bf82
+DBG pos=2 l=0 dn_out dtype=f32 n=1024 e=0 a4a73e2f
+DBG pos=2 l=0 attn_res dtype=f32 n=1024 e=0 fb1fe276
+DBG pos=2 l=0 ffn_norm dtype=f32 n=1024 e=0 c8984ff4
+DBG pos=2 l=0 ffn_gate dtype=f32 n=2048 e=0 611bdfd2
+DBG pos=2 l=0 ffn_up dtype=f32 n=2048 e=0 4102a905
+DBG pos=2 l=0 ffn_act dtype=f32 n=2048 e=0 b3db9679
+DBG pos=2 l=0 ffn_down dtype=f32 n=1024 e=0 c5998301
+DBG pos=2 l=0 ffn_res dtype=f32 n=1024 e=0 4e9e6083
+DBG pos=2 l=1 attn_norm dtype=f32 n=1024 e=0 e66b3846
+DBG pos=2 l=1 dn_out dtype=f32 n=1024 e=0 1f6b530f
+DBG pos=2 l=1 attn_res dtype=f32 n=1024 e=0 6a73bda0
+DBG pos=2 l=1 ffn_norm dtype=f32 n=1024 e=0 c2c304f3
+DBG pos=2 l=1 ffn_gate dtype=f32 n=2048 e=0 e4bef7ea
+DBG pos=2 l=1 ffn_up dtype=f32 n=2048 e=0 2daca1e8
+DBG pos=2 l=1 ffn_act dtype=f32 n=2048 e=0 d0383522
+DBG pos=2 l=1 ffn_down dtype=f32 n=1024 e=0 9727b739
+DBG pos=2 l=1 ffn_res dtype=f32 n=1024 e=0 b9bb00f1
+DBG pos=2 l=2 attn_norm dtype=f32 n=1024 e=0 1dcff453
+DBG pos=2 l=2 attn_out dtype=f32 n=1024 e=0 d192e184
+DBG pos=2 l=2 attn_res dtype=f32 n=1024 e=0 eb889d67
+DBG pos=2 l=2 ffn_norm dtype=f32 n=1024 e=0 2ad00b24
+DBG pos=2 l=2 ffn_gate dtype=f32 n=2048 e=0 efa3468d
+DBG pos=2 l=2 ffn_up dtype=f32 n=2048 e=0 7c3d5ee5
+DBG pos=2 l=2 ffn_act dtype=f32 n=2048 e=0 842088cf
+DBG pos=2 l=2 ffn_down dtype=f32 n=1024 e=0 af4cfe42
+DBG pos=2 l=2 ffn_res dtype=f32 n=1024 e=0 fe1bc152
+DBG pos=2 l=-1 out_norm dtype=f32 n=1024 e=0 2e63572f
+DBG pos=2 l=-1 logits dtype=f32 n=512 e=0 03cc0bb6
+DBG pos=2 l=-1 argmax dtype=u32 n=1 e=0 d892dbc7
+ 146
+GEN DONE
