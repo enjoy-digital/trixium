@@ -65,6 +65,8 @@ void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, ui
                     uint32_t dst_sp);
 void rl_prepare(const float *src, uint32_t width, int rotate);   // src NULL: already in RS_F
 void rl_desc(const struct bns_seq_descriptor *d);
+struct engine_op;
+void rl_engine(const struct engine_op *op);                       // any engine op, in order
 int  rl_run(const char *what);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,

@@ -64,6 +64,12 @@ static int    rope_pos_cached;
 // Exact-FP32 recurrence accelerator. The fixed gateware geometry is the 27B's 128x128
 // matrix; other hybrid test models keep using the scalar CPU implementation below.
 static int      dn_hw;
+#ifdef BONSAI_HAS_ATTNSTREAM
+static uint32_t at_hbm_base, at_slots, at_rowbeats;
+static int at_geom_ok;
+static float *at_buf;
+#endif
+
 static uint32_t dn_hbm_base;
 
 // The first board run needs to distinguish a compute limit from a DDR/scratchpad/dispatch
@@ -91,6 +97,8 @@ struct hyb_prof {
     uint8_t xres_enabled;            // console `xres on|off`: the resident residual stream
     uint8_t dnstream_enabled;        // console `dnstream on|off` (taken at the next reset)
     uint8_t dnstream_active;         // the layout in engine DDR since the last reset
+    uint8_t attnstream_enabled;      // console `attnstream on|off` (taken at the next reset)
+    uint8_t attnstream_active;       // K/V rows also appended to engine DDR since the reset
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -288,6 +296,15 @@ void hybrid_dnstream_enable(int on)
 #endif
 }
 int hybrid_dnstream_enabled(void) { return HP->dnstream_enabled; }
+void hybrid_attnstream_enable(int on)
+{
+#ifdef BONSAI_HAS_ATTNSTREAM
+    HP->attnstream_enabled = on ? 1 : 0;
+#else
+    (void)on;
+#endif
+}
+int hybrid_attnstream_enabled(void) { return HP->attnstream_enabled; }
 void hybrid_xres_enable(int on) { HP->xres_enabled = on ? 1 : 0; }
 int hybrid_xres_enabled(void) { return HP->xres_enabled && resident_active(); }
 int hybrid_dnres_enabled(void)
@@ -578,6 +595,37 @@ int hybrid_init(void)
         dnunit_out_base_write(DN_SP_OUT);
     }
 #endif
+#ifdef BONSAI_HAS_ATTNSTREAM
+    // Attention stream (engine op 6): K and V rows position-striped over the channels (row
+    // t on channel t % n_ch, slot t / n_ch), per attention layer a K span then a V span,
+    // above the DeltaNet state. main RAM keeps its copy (the CPU path's, always complete).
+    at_geom_ok = 0;
+    {
+        uint32_t kv_base = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFFu) & ~0xFFFu);
+        uint32_t kv_rb = 1u + (uint32_t)head_dim/32u;
+        uint32_t kv_region = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch*kv_rb;
+        uint64_t base = (uint64_t)kv_base + (uint64_t)n_layer*n_kv_head*2u*kv_region*32u;
+#ifdef BONSAI_HAS_DNREC
+        if (dn_hw)
+            base = (uint64_t)dn_hbm_base + ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
+#endif
+        base = (base + 0xFFFu) & ~0xFFFull;
+        uint32_t skew_count = BONSAI_CHAN_MOD ? BONSAI_CHAN_MOD - 1u : 0u;
+        uint64_t limit = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + BONSAI_CHAN_STRIDE
+                       - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE) - 0x1000u
+                       - (uint64_t)skew_count*BONSAI_CHAN_SKEW;
+        at_rowbeats = (uint32_t)(n_kv_head*head_dim)/8u;
+        at_slots = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
+        uint64_t end = base + (uint64_t)n_attn*2u*at_slots*at_rowbeats*32u;
+        at_hbm_base = (uint32_t)base;
+        at_geom_ok = n_attn && n_head <= BONSAI_ATTN_LANES && n_kv_head <= BONSAI_ATTN_GROUPS &&
+                     head_dim >= 8 && head_dim <= BONSAI_ATTN_HD_MAX && !(head_dim & (head_dim - 1)) &&
+                     n_head % n_kv_head == 0 && at_rowbeats <= 255 && end <= limit;
+        if (n_attn && !at_geom_ok)
+            printf("hybrid: attention stream off (geometry or K/V span %08lx..%08lx past %08lx)\n",
+                   (unsigned long)base, (unsigned long)end, (unsigned long)limit);
+    }
+#endif
     // FP32 state. The matrix lives in engine DDR when the recurrence accelerator is
     // available; the short causal-convolution history remains in main RAM either way.
     uint64_t matrix_b = (uint64_t)n_dn*nv*hv*hk*4;
@@ -628,6 +676,11 @@ int hybrid_init(void)
     gateb = infer_halloc(ffn_dim*4, 0); upb = infer_halloc(ffn_dim*4, 0);
     actb = infer_halloc(ffn_dim*4, 0);   // Resident FFN activation (gateb keeps the gate trace).
     scores = infer_halloc(ctx_cap*4, 0);
+#ifdef BONSAI_HAS_ATTNSTREAM
+    // Scores, then p, for every head: [n_head][ctx_cap rounded to 8].
+    at_buf = at_geom_ok ? infer_halloc((uint64_t)n_head*((ctx_cap + 7) & ~7)*4, 1) : NULL;
+    if (!at_buf) at_geom_ok = 0;
+#endif
     logits = infer_halloc((uint64_t)H->vocab*4 + 64*n_ch*4, 1);
     if (!logits) { printf("hybrid: no room for the logits\n"); return -1; }
 
@@ -661,6 +714,12 @@ int hybrid_init(void)
         rope_freq[i] = powf((float)H->rope_theta, -2.0f*i/rope_n);
     rope_pos_cached = -1;
     HP->dnstream_active = 0;
+    HP->attnstream_active = 0;
+#ifdef BONSAI_HAS_ATTNSTREAM
+    HP->attnstream_enabled = 1;
+#else
+    HP->attnstream_enabled = 0;
+#endif
 #ifdef BONSAI_HAS_DNSTREAM
     HP->dnstream_enabled = 1;
 #else
@@ -720,6 +779,9 @@ int hybrid_init(void)
 void hybrid_reset(void)
 {
     pos = 0;
+#ifdef BONSAI_HAS_ATTNSTREAM
+    HP->attnstream_active = HP->attnstream_enabled && at_geom_ok && resident_active();
+#endif
     if (dn_hw) {
 #ifdef BONSAI_HAS_DNREC
         dn_hw_reset();
@@ -1331,6 +1393,78 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 }
 #endif
 
+#ifdef BONSAI_HAS_ATTNSTREAM
+// Attention stream (engine op 6, gateware/attn_stream.py). Scratchpad while the attention
+// core runs (the q/k/v list has stored its outputs; RS_Y and RS_F are free until the out
+// projection's prepare):
+#define AT_QO   RS_Y_ADDR              // q heads, then the outputs: n_head*hd floats
+#define AT_KST  (RS_Y_ADDR + 0x6000u)  // this token's K row (kv_dim floats)
+#define AT_VST  (RS_Y_ADDR + 0x7000u)  // this token's V row
+#define AT_REC  (RS_Y_ADDR + 0x8000u)  // the scores record, then the values record
+#define AT_SP   RS_F_ADDR              // scores, then p: [n_head][T rounded to 8]
+#define AT_SP_END 0x32000u
+
+// Appends this token's K/V row to engine DDR (every token while the stream is on), then runs
+// the two passes around the firmware's own softmax. 0: attnb holds the ungated outputs;
+// -1: the CPU loop runs on main RAM's copy (a long context, or a list failure, which also
+// turns the stream off until the next reset).
+static int attn_stream(int a, int T, float scale)
+{
+    uint32_t hd = (uint32_t)head_dim, nq = (uint32_t)n_head, nkv = (uint32_t)n_kv_head;
+    uint32_t Tp = ((uint32_t)T + 7u) & ~7u, rb = at_rowbeats, rowbytes = rb*32u;
+    uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes;
+    uint32_t vspan = kspan + at_slots*rowbytes;
+    uint32_t p = (uint32_t)T - 1u, nch = (uint32_t)n_ch;
+    int fits = nq*hd*4u <= AT_KST - AT_QO && (uint32_t)kv_dim*4u <= AT_VST - AT_KST &&
+               nq*Tp*4u <= AT_SP_END - AT_SP && T <= BONSAI_ATTN_T_MAX;
+    struct engine_op o;
+    rl_begin();
+    rl_fetch(kb, (uint32_t)kv_dim*4u, AT_KST);
+    rl_fetch(vb, (uint32_t)kv_dim*4u, AT_VST);
+    memset(&o, 0, sizeof o);
+    o.kind = ENGINE_KIND_STORE; o.chan = (uint8_t)(p % nch); o.wlen = rb;
+    o.wbase = kspan + p/nch*rowbytes; o.xsrc = AT_KST; rl_engine(&o);
+    o.wbase = vspan + p/nch*rowbytes; o.xsrc = AT_VST; rl_engine(&o);
+    volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + AT_REC);
+    if (fits) {
+        uint32_t w0 = nq << 8 | (nq/nkv) << 16 | nkv << 24;
+        rec[0] = w0 | 0;  rec[1] = (uint32_t)T; rec[2] = hd; rec[3] = AT_QO; rec[4] = hd*4u;
+        rec[5] = AT_SP;   rec[6] = Tp*4u; rec[7] = f32_bits_any(scale);
+        rec[8] = w0 | 1;  rec[9] = (uint32_t)T; rec[10] = hd; rec[11] = AT_SP; rec[12] = Tp*4u;
+        rec[13] = AT_QO;  rec[14] = hd*4u; rec[15] = 0;
+        rl_fetch(qb, nq*hd*4u, AT_QO);
+        memset(&o, 0, sizeof o);
+        o.kind = ENGINE_KIND_ATTN; o.rows = (uint16_t)((uint32_t)T/nch); o.rem = (uint8_t)((uint32_t)T % nch);
+        o.wbase = kspan; o.wlen = (uint32_t)o.rows*rb; o.cbeats = (uint8_t)rb; o.xsrc = AT_REC;
+        rl_engine(&o);
+        rl_store(at_buf, nq*Tp*4u, AT_SP);
+    }
+    if (rl_run("attention scores")) {
+        HP->attnstream_active = 0;
+        return -1;
+    }
+    if (!fits)
+        return -1;
+    // The softmax exactly as the CPU loop computes it.
+    for (uint32_t hh = 0; hh < nq; hh++) {
+        float *sc = at_buf + hh*Tp, mx = -1e30f, sum = 0;
+        for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
+        for (int t = 0; t < T; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+        for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
+    }
+    rl_begin();
+    rl_fetch(at_buf, nq*Tp*4u, AT_SP);
+    o.wbase = vspan; o.xsrc = AT_REC + 32u;
+    rl_engine(&o);
+    rl_store(attnb, nq*hd*4u, AT_QO);
+    if (rl_run("attention values")) {
+        HP->attnstream_active = 0;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static void attention_layer(int l, const float *h, float *out)
 {
     int a = attn_slot[l];
@@ -1402,7 +1536,14 @@ static void attention_layer(int l, const float *h, float *out)
     memcpy(V + (uint64_t)pos*kv_dim, vb, (size_t)kv_dim*4);
     int   T = pos + 1;
     float scale = 1.0f/sqrtf((float)head_dim);
+    int streamed = 0;
+#ifdef BONSAI_HAS_ATTNSTREAM
+    if (HP->attnstream_active)
+        streamed = attn_stream(a, T, scale) == 0;
+#endif
     for (int hh = 0; hh < n_head; hh++) {
+        float *oh = attnb + hh*head_dim;
+        if (!streamed) {
         int kvh = hh/n_rep;
         const float *qh = qb + hh*head_dim;
         float mx = -1e30f;
@@ -1421,7 +1562,6 @@ static void attention_layer(int l, const float *h, float *out)
         }
         float sum = 0;
         for (int t = 0; t < T; t++) { scores[t] = expf(scores[t] - mx); sum += scores[t]; }
-        float *oh = attnb + hh*head_dim;
         for (int i = 0; i < head_dim; i++) oh[i] = 0;
         for (int t = 0; t < T; t++) {
             const float *vt = V + (uint64_t)t*kv_dim + kvh*head_dim;
@@ -1432,6 +1572,7 @@ static void attention_layer(int l, const float *h, float *out)
                 oh[i + 2] += p*vt[i + 2]; oh[i + 3] += p*vt[i + 3];
             }
             for (; i < head_dim; i++) oh[i] += p*vt[i];
+        }
         }
         if (gated) {
             const float *g = qfull + hh*2*head_dim + head_dim;

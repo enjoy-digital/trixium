@@ -866,6 +866,12 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) hybrid_xres_enable(0);
         printf("XRES %s (the residual stream and its norms resident)\n", hybrid_xres_enabled() ? "on" : "off");
     }
+    else if (strcmp(token, "attnstream") == 0) {
+        if (strncmp(str, "on", 2) == 0)  hybrid_attnstream_enable(1);
+        if (strncmp(str, "off", 3) == 0) hybrid_attnstream_enable(0);
+        printf("ATTNSTREAM %s (attention scores/values on engine op 6; takes effect at the next reset)\n",
+               hybrid_attnstream_enabled() ? "on" : "off");
+    }
     else if (strcmp(token, "dnstream") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_dnstream_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_dnstream_enable(0);

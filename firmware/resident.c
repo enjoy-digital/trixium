@@ -501,6 +501,12 @@ void rl_desc(const struct bns_seq_descriptor *d)
     desc_words(RL.n++, d);
 }
 
+void rl_engine(const struct engine_op *op)
+{
+    if (!rl_room(1)) return;
+    seq_desc_engine(RL.n++, op);
+}
+
 void rl_prepare(const float *src, uint32_t width, int rotate)
 {
     struct resident_state *R = resident_state();
@@ -820,6 +826,7 @@ void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, ui
 { (void)e; (void)row0; (void)rows; (void)ystage; (void)dst_sp; }
 void rl_prepare(const float *src, uint32_t width, int rotate) { (void)src; (void)width; (void)rotate; }
 void rl_desc(const struct bns_seq_descriptor *d) { (void)d; }
+void rl_engine(const struct engine_op *op) { (void)op; }
 int  rl_run(const char *what) { (void)what; return -1; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
