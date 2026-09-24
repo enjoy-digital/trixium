@@ -110,7 +110,7 @@ class BonsaiNormScratchpad(LiteXModule):
         Pa = Array(P)
 
         # Weight buffer: one 256-bit word per beat.
-        wbuf = Memory(256, WMAX//8)
+        wbuf = Memory(256, WMAX//8, name="norm_wbuf")
         wr_port = wbuf.get_port(write_capable=True)
         rd_port = wbuf.get_port()
         self.specials += wbuf, wr_port, rd_port

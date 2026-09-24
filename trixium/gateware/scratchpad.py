@@ -69,7 +69,8 @@ class BonsaiScratchpad(LiteXModule):
 
         # # #
 
-        self.mem = mem = Memory(256, depth, init=init)
+        # Named for the block-RAM style constraint (xilinx_constraints.py).
+        self.mem = mem = Memory(256, depth, init=init, name="bonsai_scratchpad")
         self.specials += mem
         port_r = mem.get_port()
         port_w = mem.get_port(write_capable=True, we_granularity=8)
