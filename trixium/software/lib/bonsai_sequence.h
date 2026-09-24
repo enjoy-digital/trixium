@@ -76,6 +76,10 @@ int bns_seq_desc_silu_ex(struct bns_seq_descriptor *out, uint32_t src_g, uint32_
 /* Unit 12, norm ABI 1: RMSNorm (l2 = 0, weight) or L2 (l2 = 1) over nseg segments of n. */
 int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src, uint32_t dst,
                      uint32_t weight, uint32_t n, uint32_t nseg, uint32_t eps_bits);
+/* Unit 12 (ABI >= 1.1) with strided segments (beats between segment starts, 0 = n/8). */
+int bns_seq_desc_norm_strided(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src,
+                             uint32_t dst, uint32_t weight, uint32_t n, uint32_t nseg,
+                             uint32_t eps_bits, uint32_t src_stride, uint32_t dst_stride);
 /* Unit 13, conv ABI 1: the DeltaNet 4-tap causal conv, window x0..x2, input x3, taps w. */
 int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, uint32_t x2,
                      uint32_t x3, uint32_t w, uint32_t dst, uint32_t channels);

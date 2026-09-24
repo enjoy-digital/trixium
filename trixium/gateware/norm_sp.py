@@ -10,7 +10,8 @@ sum64 is the canonical reduction of docs/canonical-reductions.md (64 partials, i
 index order, then a halving tree); every operation is an exact IEEE binary32 operation
 (gateware/fp32_exact.py), so there are no fixups. `w` (RMS only, n values) is read once
 per command into an internal buffer and shared by every segment. dst == src (in place)
-or disjoint.
+or disjoint. Segments may be strided (src_stride / dst_stride in beats, 0 = contiguous):
+the attention's q heads sit between their gates in the Q projection output.
 
 Per segment: pass 1 streams the segment through 8 multipliers and 8 adders into the 64
 partials (each revisited every 8 beats, past the adder's latency), the tree and the
@@ -29,7 +30,8 @@ from litex.soc.interconnect import stream
 from trixium.gateware.fp32_exact import FP32Add, FP32DivSqrt, FP32Mul, _lzc, _shift_left
 
 NORM_COMMAND = [("op", 1), ("src", 24), ("dst", 24), ("weight", 24), ("n", 16), ("nseg", 16),
-                ("eps", 32), ("protect_start", 24), ("protect_end", 24)]
+                ("eps", 32), ("src_stride", 16), ("dst_stride", 16),
+                ("protect_start", 24), ("protect_end", 24)]
 OP_RMS, OP_L2 = 0, 1
 WMAX = 8192                     # largest n (27B: n_embd 5120)
 F32_ONE = 0x3F800000
@@ -62,16 +64,23 @@ class BonsaiNormScratchpad(LiteXModule):
         nbeats = Signal(13)                          # beats per segment
         seg_bytes = Signal(24)
         total = Signal(64)                           # bytes of all segments
+        s_stride, d_stride = Signal(16), Signal(16)  # beats between segment starts
+        s_span, d_span = Signal(64), Signal(64)      # bytes from the first to the end of the last
         ends = {k: Signal(64, name=f"end_{k}") for k in ("src", "dst", "weight")}
         geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
         self.comb += [
             nbeats.eq(cap["n"][3:16]),
             seg_bytes.eq(cap["n"] << 2),
             total.eq(seg_bytes*cap["nseg"]),
-            ends["src"].eq(cap["src"] + total),
-            ends["dst"].eq(cap["dst"] + total),
+            s_stride.eq(Mux(cap["src_stride"] == 0, nbeats, cap["src_stride"])),
+            d_stride.eq(Mux(cap["dst_stride"] == 0, nbeats, cap["dst_stride"])),
+            s_span.eq(((cap["nseg"] - 1)*s_stride << 5) + seg_bytes),
+            d_span.eq(((cap["nseg"] - 1)*d_stride << 5) + seg_bytes),
+            ends["src"].eq(cap["src"] + s_span),
+            ends["dst"].eq(cap["dst"] + d_span),
             ends["weight"].eq(cap["weight"] + seg_bytes),
             geometry_bad.eq((cap["n"][:3] != 0) | (cap["n"] == 0) | (cap["n"] > WMAX) |
+                            (s_stride < nbeats) | (d_stride < nbeats) |
                             (cap["nseg"] == 0) | (cap["src"][:5] != 0) | (cap["dst"][:5] != 0) |
                             (rms & (cap["weight"][:5] != 0)) |
                             (cap["protect_start"] > cap["protect_end"])),
@@ -79,7 +88,8 @@ class BonsaiNormScratchpad(LiteXModule):
                           (rms & (ends["weight"] > scratchpad_size)) |
                           (cap["protect_end"] > scratchpad_size)),
             overlap_bad.eq(
-                ((cap["dst"] != cap["src"]) & (cap["dst"] < ends["src"]) & (cap["src"] < ends["dst"])) |
+                (((cap["dst"] != cap["src"]) | (s_stride != d_stride)) &
+                 (cap["dst"] < ends["src"]) & (cap["src"] < ends["dst"])) |
                 (rms & (cap["dst"] < ends["weight"]) & (cap["weight"] < ends["dst"]))),
             protected_bad.eq((cap["protect_start"] != cap["protect_end"]) &
                              (cap["dst"] < cap["protect_end"]) & (cap["protect_start"] < ends["dst"])),
@@ -131,8 +141,8 @@ class BonsaiNormScratchpad(LiteXModule):
         seg_src = Signal(24)
         seg_dst = Signal(24)
         self.comb += [
-            seg_src.eq(cap["src"] + seg*seg_bytes),
-            seg_dst.eq(cap["dst"] + seg*seg_bytes),
+            seg_src.eq(cap["src"] + ((seg*s_stride) << 5)),
+            seg_dst.eq(cap["dst"] + ((seg*d_stride) << 5)),
         ]
 
         # Read issue per phase.

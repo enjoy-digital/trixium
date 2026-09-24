@@ -131,6 +131,18 @@ int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src,
     d.word[5]=eps_bits; d.word[6]=l2;
     *out=d; return BNS_SEQ_DESC_OK;
 }
+int bns_seq_desc_norm_strided(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src,
+                             uint32_t dst, uint32_t weight, uint32_t n, uint32_t nseg,
+                             uint32_t eps_bits, uint32_t src_stride, uint32_t dst_stride)
+{
+    struct bns_seq_descriptor d = {{0}};
+    if (bns_seq_desc_norm(&d, l2, src, dst, weight, n, nseg, eps_bits)
+        || (src_stride && (src_stride < n/8 || src_stride > 0xFFFF))
+        || (dst_stride && (dst_stride < n/8 || dst_stride > 0xFFFF))) return BNS_SEQ_DESC_INVALID;
+    if (!out) return BNS_SEQ_DESC_INVALID;
+    d.word[7] = src_stride | dst_stride << 16;
+    *out=d; return BNS_SEQ_DESC_OK;
+}
 int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, uint32_t x2,
                      uint32_t x3, uint32_t w, uint32_t dst, uint32_t channels)
 {

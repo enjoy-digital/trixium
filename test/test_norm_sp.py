@@ -37,12 +37,14 @@ def sumsq64(x):
 def reference(mem, cmd):
     """Apply one command to a uint32 word image (hybrid.c rmsnorm_fv / l2norm_fv)."""
     n, nseg = cmd["n"], cmd["nseg"]
+    ss_ = (cmd.get("src_stride") or n//8)*8           # floats between segment starts
+    ds_ = (cmd.get("dst_stride") or n//8)*8
     eps = np.uint32(cmd["eps"]).view(f32)
     w = mem[cmd["weight"]//4:cmd["weight"]//4 + n].view(f32) if cmd["op"] == OP_RMS else np.ones(n, f32)
     out = []
     with np.errstate(all="ignore"):
         for s in range(nseg):
-            x = mem[cmd["src"]//4 + s*n:cmd["src"]//4 + (s + 1)*n].view(f32).copy()
+            x = mem[cmd["src"]//4 + s*ss_:cmd["src"]//4 + s*ss_ + n].view(f32).copy()
             ss = sumsq64(x)
             if cmd["op"] == OP_RMS:
                 r = f32(f32(1)/f32(np.sqrt(f32(f32(ss/f32(n)) + eps))))
@@ -53,12 +55,12 @@ def reference(mem, cmd):
                 r = f32(f32(1)/nrm)
             out.append(canon((((x*r).astype(f32))*w).astype(f32).view(np.uint32)))
     for s, y in enumerate(out):
-        mem[cmd["dst"]//4 + s*n:cmd["dst"]//4 + (s + 1)*n] = y
+        mem[cmd["dst"]//4 + s*ds_:cmd["dst"]//4 + s*ds_ + n] = y
 
 
 def command(op, src, dst, n, nseg, weight=0, **extra):
     c = dict(op=op, src=src, dst=dst, weight=weight, n=n, nseg=nseg,
-             eps=int(EPS.view(np.uint32)), protect_start=0, protect_end=0)
+             eps=int(EPS.view(np.uint32)), src_stride=0, dst_stride=0, protect_start=0, protect_end=0)
     c.update(extra)
     return c
 
@@ -101,6 +103,13 @@ def test_compiled_norms_equal_the_firmware_definition(tmp_path, binary):
     # DeltaNet q/k L2: 32 x 128 (one zero segment: sqrt(0) < eps).
     put(0x28000, np.concatenate([activations(rng, 128, "zero" if i == 5 else "normal") for i in range(32)]))
     cmds.append((command(OP_L2, 0x28000, 0x2C000, 128, 32), 0))
+    # The attention q heads in place inside [q | gate] (24 x 256, stride 2*256 floats = 64
+    # beats); the gates between them stay untouched.
+    put(0x30000, rng.normal(0, 1, 2*24*256 - 256))
+    put(0x2F000, rng.normal(1, 0.3, 256))
+    cmds.append((command(OP_RMS, 0x30000, 0x30000, 256, 24, weight=0x2F000, src_stride=64, dst_stride=64), 0))
+    # A stride shorter than a segment is a geometry error.
+    cmds.append((command(OP_RMS, 0x30000, 0x30000, 256, 24, weight=0x2F000, src_stride=16, dst_stride=16), 1))
     # Rejects: misaligned, n % 8, bounds, overlap, protected output.
     cmds.append((command(OP_RMS, 0x20004, 0x30000, 128, 1, weight=0x26000), 1))
     cmds.append((command(OP_RMS, 0x20000, 0x30000, 12, 1, weight=0x26000), 1))

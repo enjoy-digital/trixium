@@ -74,7 +74,8 @@ def _sp_address(name, value):
         raise ValueError(name + ' must be a 32-byte-aligned unsigned 24-bit address')
 
 
-def scratchpad_norm_descriptor(*, src, dst, n, nseg=1, eps, weight=0, l2=False):
+def scratchpad_norm_descriptor(*, src, dst, n, nseg=1, eps, weight=0, l2=False, src_stride=0,
+                               dst_stride=0):
     """Encode optional unit 12 (seq.norm_abi major 1): RMSNorm (weight) or L2 over nseg
     segments of n FP32 values; eps as FP32 bits. docs/canonical-reductions.md."""
     for name, value in (('src', src), ('dst', dst), ('weight', weight)):
@@ -87,7 +88,10 @@ def scratchpad_norm_descriptor(*, src, dst, n, nseg=1, eps, weight=0, l2=False):
         raise ValueError('eps must be FP32 bits')
     if l2 not in (0, 1):
         raise ValueError('l2 must be 0 (RMS) or 1 (L2)')
-    return [12, src, dst, weight, n | nseg << 16, eps, int(l2)] + [0]*9
+    for name, value in (('src_stride', src_stride), ('dst_stride', dst_stride)):
+        if not isinstance(value, int) or not (value == 0 or n//8 <= value < 65536):
+            raise ValueError(name + ' must be 0 or at least n/8 beats')
+    return [12, src, dst, weight, n | nseg << 16, eps, int(l2), src_stride | dst_stride << 16] + [0]*8
 
 
 def scratchpad_conv_descriptor(*, x0, x1, x2, x3, w, dst, channels):
