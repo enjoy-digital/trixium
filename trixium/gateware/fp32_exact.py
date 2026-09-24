@@ -386,3 +386,33 @@ class FP32DivSqrt(LiteXModule):
                 ],
             }),
         ]
+
+
+class _ValidAdapter(LiteXModule):
+    """The vendor-operator interface (a, b, valid -> result, result_valid, `latency`) over
+    an exact pipeline, for units written against gateware/fp32.py (the DeltaNet recurrence)."""
+    def __init__(self, op_cls):
+        self.a, self.b, self.valid = Signal(32), Signal(32), Signal()
+        self.result, self.result_valid = Signal(32), Signal()
+        self.submodules.op = op = op_cls()
+        self.comb += [op.a.eq(self.a), op.b.eq(self.b), self.result.eq(op.r)]
+        prev = self.valid
+        for i in range(op_cls.LATENCY):
+            v = Signal(name=f"valid{i}")
+            self.sync += v.eq(prev)
+            prev = v
+        self.comb += self.result_valid.eq(prev)
+
+
+class ExactFP32Add(_ValidAdapter):
+    latency = FP32Add.LATENCY
+
+    def __init__(self):
+        _ValidAdapter.__init__(self, FP32Add)
+
+
+class ExactFP32Mul(_ValidAdapter):
+    latency = FP32Mul.LATENCY
+
+    def __init__(self):
+        _ValidAdapter.__init__(self, FP32Mul)

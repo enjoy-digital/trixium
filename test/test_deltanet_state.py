@@ -377,3 +377,99 @@ def test_deltanet_scratchpad_unit_moves_a_complete_head(with_guard):
     assert result["state"] == expected
     assert result["out"] == expected_out
     assert result["cycles"] < 3000
+
+
+def test_deltanet_recurrence_exact_fp32_matches_the_mirror():
+    """The recurrence on the portable exact operators equals the mirror's float32 loop
+    (test_hybrid_mirror.deltanet) bit for bit - the same formula the CPU path runs."""
+    import numpy as np
+    from trixium.gateware.fp32_exact import ExactFP32Add, ExactFP32Mul
+    f32 = np.float32
+    rows, cols, lanes = 48, 16, 8
+    dut = BonsaiDeltaNetRecurrence(rows=rows, cols=cols, lanes=lanes,
+                                   add_factory=ExactFP32Add, mul_factory=ExactFP32Mul)
+    rng = np.random.default_rng(8)
+    M = rng.normal(0, 0.5, (rows, cols)).astype(f32)
+    M[0, 0], M[1, 1] = f32(1e-40), f32(-0.0)             # a subnormal and a signed zero
+    q = rng.normal(0, 0.3, cols).astype(f32)
+    k = rng.normal(0, 0.3, cols).astype(f32)
+    v = rng.normal(0, 1, rows).astype(f32)
+    decay, beta, scale = f32(0.97), f32(0.6), f32(1/np.sqrt(128))
+    want = M.copy()
+    want_out = np.empty(rows, f32)
+    for j in range(rows):
+        Mj, dot = want[j], f32(0)
+        for i in range(cols):
+            Mj[i] = f32(Mj[i]*decay)
+            dot = f32(dot + f32(Mj[i]*k[i]))
+        delta = f32(f32(v[j] - dot)*beta)
+        dot = f32(0)
+        for i in range(cols):
+            Mj[i] = f32(Mj[i] + f32(delta*k[i]))
+            dot = f32(dot + f32(Mj[i]*q[i]))
+        want_out[j] = f32(dot*scale)
+    bits = lambda x: int(np.asarray(x, f32).view(np.uint32))
+    words = M.view(np.uint32)
+    beats = [sum(int(words[r, c0 + i]) << (32*i) for i in range(8))
+             for r in range(rows) for c0 in range(0, cols, 8)]
+    result = {}
+
+    def gen():
+        yield dut.state.load_start.eq(1)
+        yield
+        yield dut.state.load_start.eq(0)
+        for bi, word in enumerate(beats):
+            yield dut.state.load_beat.eq(bi)
+            yield dut.state.load_data.eq(word)
+            yield dut.state.load_valid.eq(1)
+            yield
+            while not (yield dut.state.load_ready):
+                yield
+        yield dut.state.load_valid.eq(0)
+        for _ in range(1000):
+            if (yield dut.state.load_done):
+                break
+            yield
+        for kind, vec in ((0, q), (1, k), (2, v)):
+            for i, x in enumerate(vec):
+                yield dut.param_kind.eq(kind)
+                yield dut.param_index.eq(i)
+                yield dut.param_data.eq(bits(x))
+                yield dut.param_we.eq(1)
+                yield
+                yield dut.param_we.eq(0)
+        yield dut.decay.eq(bits(decay))
+        yield dut.beta.eq(bits(beta))
+        yield dut.scale.eq(bits(scale))
+        yield dut.start.eq(1)
+        yield
+        yield dut.start.eq(0)
+        for _ in range(6000):
+            if (yield dut.done):
+                break
+            yield
+        else:
+            raise AssertionError("recurrence timeout")
+        yield
+        got = np.zeros((rows, cols), np.uint32)
+        groups = cols//8
+        for r in range(rows):
+            bank, phase = r % lanes, r//lanes
+            for g in range(groups):
+                word = (yield dut.state.memories[bank][phase*groups + g])
+                for i in range(8):
+                    got[r, 8*g + i] = (word >> (32*i)) & 0xffffffff
+        result["state"] = got
+        outs = np.zeros(rows, np.uint32)
+        for phase in range(rows//lanes):
+            yield dut.out_row_phase.eq(phase)
+            yield
+            word = (yield dut.out_data)
+            for lane in range(lanes):
+                outs[phase*lanes + lane] = (word >> (32*lane)) & 0xffffffff
+        result["out"] = outs
+
+    run_simulation(dut, gen())
+    bad = np.argwhere(result["state"] != want.view(np.uint32))
+    assert not len(bad), [(tuple(i), hex(int(result["state"][tuple(i)])), hex(int(want.view(np.uint32)[tuple(i)]))) for i in bad[:6]]
+    assert np.array_equal(result["out"], want_out.view(np.uint32)), (result["out"][:4], want_out.view(np.uint32)[:4])

@@ -50,6 +50,7 @@ class BonsaiClusterConfig:
     with_vecunit: bool = True
     with_dual: bool = False
     with_dnrec: bool = False
+    dnrec_exact: bool = True     # Portable exact IEEE operators (fp32_exact), not the vendor IP.
     chan_stride: int = 0
     chan_mod: int = 0
     chan_skew: int = 0
@@ -168,7 +169,14 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     base_busy = [vecunit.busy] if vecunit is not None else []
     if config.with_dnrec:
         from trixium.gateware.deltanet import BonsaiDeltaNetUnit
-        soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(
+        core = None
+        if config.dnrec_exact:
+            # Full IEEE binary32 (subnormals, canonical NaN): the CPU's semantics, and
+            # simulable by Verilator. The vendor operators flush subnormals.
+            from trixium.gateware.deltanet import BonsaiDeltaNetRecurrence
+            from trixium.gateware.fp32_exact import ExactFP32Add, ExactFP32Mul
+            core = BonsaiDeltaNetRecurrence(add_factory=ExactFP32Add, mul_factory=ExactFP32Mul)
+        soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(core=core,
             with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.with_silu or config.with_norm or config.with_conv or config.native_regions)))
         sp_clients.append(soc.dnunit)
         base_busy.append(soc.dnunit.busy)

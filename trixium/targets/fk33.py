@@ -180,7 +180,7 @@ class BonsaiSoC(SoCCore):
                 from trixium.gateware.traffic import add_memory_traffic
                 add_memory_traffic(self, engine_axis)
             add_cluster_constraints(platform, with_vecunit=with_vecunit)
-            if cluster_with_dnrec:
+            if cluster_with_dnrec and not config.dnrec_exact:
                 # Vendor implementations are target-owned, not portable-core sources.
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))

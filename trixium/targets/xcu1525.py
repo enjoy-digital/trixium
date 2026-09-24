@@ -355,7 +355,7 @@ class BonsaiXCU1525SoC(SoCCore):
                 add_memory_traffic(self, engine_axis,
                     [core.controller.interface for core in self.sdrams])
             add_cluster_constraints(platform, with_vecunit=with_vecunit)
-            if cluster_with_dnrec:
+            if cluster_with_dnrec and not config.dnrec_exact:
                 # Vendor implementations are target-owned, not portable-core sources.
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
