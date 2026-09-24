@@ -153,7 +153,7 @@ struct list_prof {
     uint32_t calls, n;
     uint64_t cyc[RS_DESC_MAX];
 };
-#define LISTPROF_N 8
+#define LISTPROF_N 16
 #define LP ((struct list_prof *)BONSAI_LISTPROF_ADDR)
 
 void resident_listprof_reset(void)

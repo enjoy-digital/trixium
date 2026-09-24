@@ -1004,23 +1004,32 @@ static uint32_t f32_bits_any(float x)
 // only the per-head scalars and the rare SiLU fixups. Bit-exact with deltanet_layer (the
 // sim gate compares them checkpoint by checkpoint). Scratchpad map for this layer:
 #define DNR_QKV   0x04800u        // qkv, then conv+SiLU output, q/k L2-normed in place (4C)
+#define XRES_SP   0x36600u        // the resident residual stream (above the persistent map)
 static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 
 static int deltanet_layer_resident(int l, const float *h, float *out)
 {
     int s = dn_slot[l];
     uint32_t C = (uint32_t)(2*nq + nvh);
-    uint32_t Z = dnr_align(DNR_QKV + 4*C), BA = dnr_align(Z + 4*(uint32_t)nvh);
+    // z is restored at Z and parked in main RAM (zb) for the heads, whose outputs take its
+    // place (HO == Z); two 64 KB head-state slots then fit above the small regions, over
+    // RS_F and RS_XW (both idle during the heads); z comes back at Z2 (slot 0) for the
+    // gated norm.
+    uint32_t Z = dnr_align(DNR_QKV + 4*C), HO = Z, BA = dnr_align(Z + 4*(uint32_t)nvh);
     uint32_t AL = BA + dnr_align(4*(uint32_t)nv), FIX = AL + dnr_align(4*(uint32_t)nv);
-    uint32_t HO = dnr_align(FIX + 4*((C > (uint32_t)nvh ? C : (uint32_t)nvh) + 31)/32);
-    uint32_t NW = dnr_align(HO + 4*(uint32_t)nvh);
+    uint32_t NW = dnr_align(FIX + 4*((C > (uint32_t)nvh ? C : (uint32_t)nvh) + 31)/32);
+    uint32_t SLOT0 = (NW + dnr_align(4*(uint32_t)hv) + 1023u) & ~1023u, Z2 = SLOT0;
     const uint32_t CH = 2048, W = RS_F_ADDR, X = RS_F_ADDR + 16*CH;
     uint32_t eps = f32_bits_any(rms_eps);
     if (!HP->dnres_enabled || !resident_silu_active() || !H->hadamard_block || conv_k != 4 ||
-        NW + dnr_align(4*(uint32_t)hv) > RS_F_ADDR || C % 8 || hv % 8 || hk % 8 ||
+        Z2 + 4u*(uint32_t)nvh > RS_F_ADDR || C % 8 || hv % 8 || hk % 8 ||
         (seq_silu_abi_read() & 0xffff) < 1 || (seq_norm_abi_read() >> 16) != 1 ||
         (seq_conv_abi_read() >> 16) != 1)
         return -1;
+#ifdef BONSAI_HAS_DNREC
+    if (dn_hw && (SLOT0 + 2u*DN_HEAD_BYTES > XRES_SP || nv > 64))
+        return -1;                     // the two head-state slots must fit below x
+#endif
     float *win = dn_conv + (uint64_t)s*(conv_k - 1)*C;
     struct bns_seq_descriptor d;
 
@@ -1035,6 +1044,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
     rl_store(betab, dnr_align(4*(uint32_t)nv), BA);
     rl_store(alphab, dnr_align(4*(uint32_t)nv), AL);
+    rl_store(zb, dnr_align(4*(uint32_t)nvh), Z);
     if (rl_run("deltanet projections"))
         return -1;                     // nothing of the layer's state has moved yet
     dn_cyc_inproj += perf_now64() - t0;
@@ -1083,24 +1093,56 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     int rep = nv/nk;
     if (dn_hw) {
 #ifdef BONSAI_HAS_DNREC
-        dn_sp_state = RS_F_ADDR;
-        dnunit_state_base_write(RS_F_ADDR);
+        // Two state slots: the FETCH of head i+1 runs on the engine while the unit
+        // computes head i; the STORE of head i follows. The engine runs ops in order and
+        // holds one pending behind the running one, so a submit first waits for at most
+        // one outstanding op, and a slot is reused only behind its own STORE.
+        uint32_t slot[2] = {SLOT0, SLOT0 + DN_HEAD_BYTES};
+        dn_pipe_join();
+        uint32_t done0 = engine_csr_done_count_read(), sub = 0, fetched[2] = {0, 0};
+#define DNR_WAIT(k) do { uint32_t sp_ = 0; \
+            while ((uint32_t)(engine_csr_done_count_read() - done0) < (k)) \
+                if (++sp_ > 4000000u) { puts("DNSTALL: head state transfer"); engine_wedged = 1; goto fatal; } \
+        } while (0)
+#define DNR_OP(kind_, head_, slot_) do { \
+            if (sub > 1) DNR_WAIT(sub - 1); \
+            struct engine_op o_ = {0}; uint32_t g_ = (uint32_t)(head_); \
+            o_.kind = (kind_); o_.chan = (uint8_t)(g_ % (uint32_t)n_ch); o_.wbase = dn_head_addr(g_); \
+            o_.wlen = DN_HEAD_BEATS; o_.dst = (slot_); o_.xsrc = (slot_); \
+            engine_submit(&o_); sub++; \
+        } while (0)
+        int hh_of[64];
+        for (int hi = 0; hi < nv && hi < 64; hi++) {
+            int kh = hi/rep, r = hi - kh*rep;
+            hh_of[hi] = r*nk + kh;
+        }
+        DNR_OP(ENGINE_KIND_FETCH, (uint32_t)s*nv + hh_of[0], slot[0]);
+        fetched[0] = sub;
         for (int hi = 0; hi < nv; hi++) {
-            int kh = hi/rep, r = hi - kh*rep, hh = r*nk + kh;
-            int next_head = -1;
-            if (dn_pipe_use && hi + 1 < nv) {
-                int nkh = (hi + 1)/rep, nr = hi + 1 - nkh*rep;
-                next_head = (int)((uint32_t)s*nv) + nr*nk + nkh;
-            }
+            int hh = hh_of[hi], kh = hi/rep, b = hi & 1;
+            DNR_WAIT(fetched[b]);
+            dnunit_state_base_write(slot[b]);
             dnunit_q_base_write(DNR_QKV + 4u*(uint32_t)(kh*hk));
             dnunit_k_base_write(DNR_QKV + 4u*(uint32_t)(nq + kh*hk));
             dnunit_v_base_write(DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv));
             dnunit_out_base_write(HO + 4u*(uint32_t)(hh*hv));
-            dn_hw_head((uint32_t)s*nv + (uint32_t)hh, NULL, NULL, NULL, expf(gb[hh]), betab[hh],
-                       scale, NULL, r == 0, next_head);
+            dnunit_decay_write(f32_bits(expf(gb[hh])));
+            dnunit_beta_write(f32_bits(betab[hh]));
+            dnunit_scale_write(f32_bits(scale));
+            uint32_t udone = dnunit_done_count_read();
+            dnunit_submit_write(1);
+            if (hi + 1 < nv) {
+                DNR_OP(ENGINE_KIND_FETCH, (uint32_t)s*nv + hh_of[hi + 1], slot[b ^ 1]);
+                fetched[b ^ 1] = sub;
+            }
+            uint32_t spins = 0;
+            while (dnunit_done_count_read() == udone)
+                if (++spins > 4000000u) { puts("DNSTALL: recurrence command did not complete"); engine_wedged = 1; goto fatal; }
+            DNR_OP(ENGINE_KIND_STORE, (uint32_t)s*nv + hh, slot[b]);
         }
-        dn_pipe_join();
-        dn_sp_state = DN_SP_STATE;
+        DNR_WAIT(sub);
+#undef DNR_OP
+#undef DNR_WAIT
         dnunit_state_base_write(DN_SP_STATE);
         dnunit_q_base_write(DN_SP_Q); dnunit_k_base_write(DN_SP_K);
         dnunit_v_base_write(DN_SP_V); dnunit_out_base_write(DN_SP_OUT);
@@ -1143,15 +1185,16 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     t0 = perf_now64();
     rl_begin();
     rl_fetch(norm_ssm[l], dnr_align(4*(uint32_t)hv), NW);
+    rl_fetch(zb, dnr_align(4*(uint32_t)nvh), Z2);
     bns_seq_desc_norm(&d, 0, HO, HO, NW, (uint32_t)hv, (uint32_t)nv, eps);
     rl_desc(&d);
-    bns_seq_desc_silu_ex(&d, Z, HO, RS_F_ADDR, FIX, (uint32_t)nvh, 0, (uint32_t)hv/8, (uint32_t)nk,
+    bns_seq_desc_silu_ex(&d, Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, 0, (uint32_t)hv/8, (uint32_t)nk,
                          (uint32_t)rep);
     rl_desc(&d);
     if (rl_run("deltanet gated norm"))
         goto fatal;
     if (seq_silu_fixups_read())
-        resident_silu_patch(Z, HO, RS_F_ADDR, FIX, (uint32_t)nvh, (uint32_t)hv, (uint32_t)nk, (uint32_t)rep);
+        resident_silu_patch(Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, (uint32_t)hv, (uint32_t)nk, (uint32_t)rep);
     // The CPU fallback of the out projection reads og from main RAM.
     rl_begin();
     rl_store(og, dnr_align(4*(uint32_t)nvh), RS_F_ADDR);
@@ -1182,7 +1225,6 @@ fatal:
 // the norms (unit 12) read it and leave hb in RS_F (and main RAM, for the mixers and the
 // traces); the residual adds (unit 13 op 1) add the layer outputs into it. xb (main RAM)
 // is only brought up to date for traces and for the LM head.
-#define XRES_SP 0x36600u               // above the persistent resident map, below RS_SIGN
 static int xres_ok(void)
 {
     return HP->xres_enabled && resident_active() && n_embd % 8 == 0 && n_embd <= 8192 &&
@@ -1222,6 +1264,38 @@ static void attention_layer(int l, const float *h, float *out)
     int gated = H->attn_gated;
     int e8;
     uint64_t t0 = perf_now64(), t1;
+    int normed = 0;
+#ifdef DNRES_BUILT
+    // Resident: Q/K/V in one list with the per-head q/k RMSNorms on unit 12 (the q heads
+    // strided between their gates), everything stored for the CPU's RoPE and scores.
+    uint32_t qrows = (uint32_t)(gated ? 2*q_dim : q_dim);
+    uint32_t QS = RS_Y_ADDR, KS = QS + 4*qrows, VS = KS + 4*(uint32_t)kv_dim;
+    uint32_t NQ = VS + 4*(uint32_t)kv_dim, NK = NQ + 4*(uint32_t)head_dim;
+    if (H->hadamard_block && resident_active() && HP->dnres_enabled && head_dim % 8 == 0 &&
+        NK + 4u*(uint32_t)head_dim <= RS_F_ADDR && (seq_norm_abi_read() & 0xffff) >= 1) {
+        struct bns_seq_descriptor d;
+        uint32_t eps = f32_bits_any(rms_eps), hb8 = (uint32_t)head_dim/8;
+        rl_begin();
+        rl_prepare(h, (uint32_t)n_embd, 1);
+        rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
+        rl_matvec(model_entry(ROLE_ATTN_K, l), KS, KS);
+        rl_matvec(model_entry(ROLE_ATTN_V, l), VS, VS);
+        rl_fetch(norm_q[l], 4*(uint32_t)head_dim, NQ);
+        rl_fetch(norm_k[l], 4*(uint32_t)head_dim, NK);
+        bns_seq_desc_norm_strided(&d, 0, QS, QS, NQ, (uint32_t)head_dim, (uint32_t)n_head, eps,
+                                  gated ? 2*hb8 : hb8, gated ? 2*hb8 : hb8);
+        rl_desc(&d);
+        bns_seq_desc_norm(&d, 0, KS, KS, NK, (uint32_t)head_dim, (uint32_t)n_kv_head, eps);
+        rl_desc(&d);
+        rl_store(gated ? qfull : qb, 4*qrows, QS);
+        rl_store(kb, 4*(uint32_t)kv_dim, KS);
+        rl_store(vb, 4*(uint32_t)kv_dim, VS);
+        normed = rl_run("attention q/k/v") == 0;
+    }
+#endif
+    if (normed) {
+        t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
+    } else {
     if (H->hadamard_block) {
         // Q/K/V share the input and folded basis: rotate once, not once per projection.
         // This removes another 32 full-width rotations per 27B forward.
@@ -1234,16 +1308,19 @@ static void attention_layer(int l, const float *h, float *out)
     matvec_q(model_entry(ROLE_ATTN_K, l), e8, kb);
     matvec_q(model_entry(ROLE_ATTN_V, l), e8, vb);
     t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
+    }
     if (gated)   // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
     rope_prepare(pos);
     for (int hh = 0; hh < n_head; hh++) {
-        rmsnorm_fv(qb + hh*head_dim, qb + hh*head_dim, norm_q[l], head_dim);
+        if (!normed)
+            rmsnorm_fv(qb + hh*head_dim, qb + hh*head_dim, norm_q[l], head_dim);
         rope_apply_partial(qb + hh*head_dim);
     }
     for (int hh = 0; hh < n_kv_head; hh++) {
-        rmsnorm_fv(kb + hh*head_dim, kb + hh*head_dim, norm_k[l], head_dim);
+        if (!normed)
+            rmsnorm_fv(kb + hh*head_dim, kb + hh*head_dim, norm_k[l], head_dim);
         rope_apply_partial(kb + hh*head_dim);
     }
     t1 = perf_now64(); HP->at_rope += t1 - t0; t0 = t1;
