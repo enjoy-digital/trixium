@@ -48,18 +48,29 @@ def _lzc(value, width):
 class SiluMulKernel(LiteXModule):
     LATENCY = 9
 
-    def __init__(self, tables=None):
+    def __init__(self, tables=None, sets=1):
         # tables=(lut, dlut) preloads the memories (simulation/tests); hardware loads them
-        # through the write ports.
+        # through the write ports. sets > 1: that many resident table pairs (the SiLU's and
+        # the attention gate's sigmoid), written through lut_set, read through table_sel.
         self.sink = sink = stream.Endpoint(IN_LAYOUT)
         self.source = source = stream.Endpoint(OUT_LAYOUT)
         self.lut_we, self.lut_adr, self.lut_dat = Signal(), Signal(13), Signal(32)
         # Held for a whole run: the pass-through and -0 kinds are fixups instead (any table).
         self.table_only = Signal()
+        sb = max(1, (sets - 1).bit_length())
+        self.table_sel = Signal(sb)     # Held for a whole run: the table pair it reads.
+        self.lut_set = Signal(sb)       # The pair lut_we/dlut_we write.
         self.dlut_we, self.dlut_adr, self.dlut_dat = Signal(), Signal(12), Signal(32)
 
-        lut = Memory(32, LUT_N + 1, init=list(tables[0]) if tables else None)
-        dlut = Memory(32, LUT_N, init=list(tables[1]) if tables else None)
+        if sets > 1:
+            # Set s at [s*8192, s*8192 + 4097) and [s*4096, (s+1)*4096): a set bit on top.
+            lut = Memory(32, sets*2*LUT_N, init=list(tables[0]) if tables else None)
+            dlut = Memory(32, sets*LUT_N, init=list(tables[1]) if tables else None)
+            lut_wadr, dlut_wadr = Cat(self.lut_adr, self.lut_set), Cat(self.dlut_adr, self.lut_set)
+        else:
+            lut = Memory(32, LUT_N + 1, init=list(tables[0]) if tables else None)
+            dlut = Memory(32, LUT_N, init=list(tables[1]) if tables else None)
+            lut_wadr, dlut_wadr = self.lut_adr, self.dlut_adr
         lut_w, dlut_w = lut.get_port(write_capable=True), dlut.get_port(write_capable=True)
         lut_r = lut.get_port(has_re=True, mode=READ_FIRST)
         dlut_r = dlut.get_port(has_re=True, mode=READ_FIRST)
@@ -71,8 +82,8 @@ class SiluMulKernel(LiteXModule):
         self.autocsr_exclude = {"lut_mem", "dlut_mem"}
         self.lut_mem, self.dlut_mem = lut, dlut
         self.comb += [
-            lut_w.we.eq(self.lut_we), lut_w.adr.eq(self.lut_adr), lut_w.dat_w.eq(self.lut_dat),
-            dlut_w.we.eq(self.dlut_we), dlut_w.adr.eq(self.dlut_adr), dlut_w.dat_w.eq(self.dlut_dat),
+            lut_w.we.eq(self.lut_we), lut_w.adr.eq(lut_wadr), lut_w.dat_w.eq(self.lut_dat),
+            dlut_w.we.eq(self.dlut_we), dlut_w.adr.eq(dlut_wadr), dlut_w.dat_w.eq(self.dlut_dat),
         ]
 
         # Global stall: every stage advances together when the output can move.
@@ -153,8 +164,9 @@ class SiluMulKernel(LiteXModule):
         self.comb += [
             idx.eq(a20[13:26]),
             endpoint2.eq(idx >= LUT_N),
-            lut_r.adr.eq(Mux(endpoint2, LUT_N, idx)),
-            dlut_r.adr.eq(idx[0:12]),
+            lut_r.adr.eq(Cat(Mux(endpoint2, LUT_N, idx)[:13], self.table_sel) if sets > 1
+                         else Mux(endpoint2, LUT_N, idx)),
+            dlut_r.adr.eq(Cat(idx[0:12], self.table_sel) if sets > 1 else idx[0:12]),
             lut_r.re.eq(ce), dlut_r.re.eq(ce),
         ]
         F2 = Signal(13)

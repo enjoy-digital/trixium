@@ -77,6 +77,10 @@ int bns_seq_desc_silu_ex(struct bns_seq_descriptor *out, uint32_t src_g, uint32_
  * range a fixup (no SiLU pass-through or -0) - for a table other than SiLU's (the sigmoid). */
 int bns_seq_desc_silu_table(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
                            uint32_t dst, uint32_t fixmap, uint32_t elements);
+/* ABI >= 1.3: a second resident table pair (set 1) - loaded once, selected per run. */
+int bns_seq_desc_silu_table_set(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                               uint32_t dst, uint32_t fixmap, uint32_t elements, uint32_t set);
+int bns_seq_desc_silu_load_set(struct bns_seq_descriptor *out, uint32_t src, uint32_t set);
 /* Unit 12, norm ABI 1: RMSNorm (l2 = 0, weight) or L2 (l2 = 1) over nseg segments of n. */
 int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src, uint32_t dst,
                      uint32_t weight, uint32_t n, uint32_t nseg, uint32_t eps_bits);

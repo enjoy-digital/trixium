@@ -74,7 +74,8 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   silu:   Optional unit 11 (ABI 1.1), serialized; w0 exactly 11, w1 FP32 gate src, w2
           FP32 multiplier src, w3 dst (== w1 or disjoint), w4 fixup bitmap, w5 elements,
           w6 op (bit0: 0 RUN, 1 LOAD tables from w1) | unit_m << 1 (m = 1.0, w2 unused)
-          | table_only << 2 (ABI 1.2: pass-through/-0 kinds are fixups - any table),
+          | table_only << 2 (ABI 1.2: pass-through/-0 kinds are fixups - any table)
+          | table_set << 3 (ABI 1.3: the resident table pair a LOAD writes and a RUN reads),
           w7 seg_beats | perm_a << 16 | perm_b << 24 (permuted output segments, 0 = none),
           w8..w15 zero. seq.silu_fixups sums the flagged elements of the list.
   norm:   Optional unit 12 (ABI 1.1), serialized; w0 exactly 12, w1 src, w2 dst, w3 weight,
@@ -211,7 +212,7 @@ class BonsaiSequencer(LiteXModule):
             self.silu_done = Signal()
             self.silu_failed = Signal(8)
             self.silu_unit_fixups = Signal(16)
-            self.silu_abi = CSRStatus(32, reset=0x00010002)
+            self.silu_abi = CSRStatus(32, reset=0x00010003)
             self.silu_error = CSRStatus(32, description=
                 'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
                 'bits8..15 SiLU-client error (bit14 protects the full descriptor list).')
@@ -419,11 +420,12 @@ class BonsaiSequencer(LiteXModule):
             self.comb += [
                 malformed.eq((w(0, 0) != 11) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 4)[24:] != 0) | (w(0, 5)[16:] != 0) |
-                    (w(0, 6)[3:] != 0) | (d1 != 0)),
+                    (w(0, 6)[4:] != 0) | (d1 != 0)),
                 command.src_g.eq(w(0, 1)[:24]), command.src_m.eq(w(0, 2)[:24]),
                 command.dst.eq(w(0, 3)[:24]), command.fixmap.eq(w(0, 4)[:24]),
                 command.elements.eq(w(0, 5)[:16]), command.op.eq(w(0, 6)[0]),
                 command.unit_m.eq(w(0, 6)[1]), command.table_only.eq(w(0, 6)[2]),
+                command.table_set.eq(w(0, 6)[3]),
                 command.seg_beats.eq(w(0, 7)[:16]),
                 command.perm_a.eq(w(0, 7)[16:24]), command.perm_b.eq(w(0, 7)[24:32]),
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),

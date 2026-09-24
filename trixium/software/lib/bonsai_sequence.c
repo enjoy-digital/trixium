@@ -124,8 +124,21 @@ int bns_seq_desc_silu_ex(struct bns_seq_descriptor *out, uint32_t src_g, uint32_
 int bns_seq_desc_silu_table(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
                            uint32_t dst, uint32_t fixmap, uint32_t elements)
 {
+    return bns_seq_desc_silu_table_set(out, src_g, src_m, dst, fixmap, elements, 0);
+}
+int bns_seq_desc_silu_table_set(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                               uint32_t dst, uint32_t fixmap, uint32_t elements, uint32_t set)
+{
+    if (set > 1) return BNS_SEQ_DESC_INVALID;
     int rc = bns_seq_desc_silu_ex(out, src_g, src_m, dst, fixmap, elements, 0, 0, 0, 0);
-    if (rc == BNS_SEQ_DESC_OK) out->word[6] |= 1u << 2;
+    if (rc == BNS_SEQ_DESC_OK) out->word[6] |= 1u << 2 | set << 3;
+    return rc;
+}
+int bns_seq_desc_silu_load_set(struct bns_seq_descriptor *out, uint32_t src, uint32_t set)
+{
+    if (set > 1) return BNS_SEQ_DESC_INVALID;
+    int rc = bns_seq_desc_silu_load(out, src);
+    if (rc == BNS_SEQ_DESC_OK) out->word[6] |= set << 3;
     return rc;
 }
 int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src, uint32_t dst,

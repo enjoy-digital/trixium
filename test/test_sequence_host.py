@@ -213,6 +213,15 @@ def test_silu_table_only_encoder(encoder):
     saved = bytes(out)
     assert encoder.bns_seq_desc_silu_table(ct.byref(out), 33, 64, 32, 96, 8) == -1
     assert bytes(out) == saved
+    encoder.bns_seq_desc_silu_table_set.argtypes = [ct.POINTER(Descriptor)] + [ct.c_uint32]*6
+    encoder.bns_seq_desc_silu_load_set.argtypes = [ct.POINTER(Descriptor), ct.c_uint32, ct.c_uint32]
+    assert encoder.bns_seq_desc_silu_table_set(ct.byref(out), *args.values(), 1) == 0
+    assert list(out.word) == scratchpad_silu_descriptor(**args, table_only=True, table_set=1)
+    assert encoder.bns_seq_desc_silu_load_set(ct.byref(out), 0x1000, 1) == 0
+    assert list(out.word) == scratchpad_silu_descriptor(src_g=0x1000, load=True, table_set=1)
+    saved = bytes(out)
+    assert encoder.bns_seq_desc_silu_load_set(ct.byref(out), 0x1000, 2) == -1
+    assert bytes(out) == saved
 
 
 def test_stop_and_null_byte_encoder(encoder):

@@ -103,7 +103,7 @@ struct resident_state {
     // main RAM and a gated list swaps the sigmoid's in and the SiLU's back.
     const uint32_t *silu_image, *sig_image;
     const float *sig_lut;
-    uint8_t gate_ready;
+    uint8_t gate_ready, gate_set;   // gate_set: the sigmoid is resident in table set 1 (ABI 1.3)
     uint32_t gate_fixups;
 };
 struct resident_state *resident_state(void);

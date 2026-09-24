@@ -317,19 +317,27 @@ def test_compiled_table_only_sigmoid(tmp_path):
     binary = build_client(BonsaiSiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
     rng = np.random.default_rng(21)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
-    tab, pair = 0x37000, sigmoid_tables()
+    # Both tables resident (ABI 1.3): the SiLU's in set 0, the sigmoid's in set 1.
+    tab, pair, tab0 = 0x37000, sigmoid_tables(), 0x26000
     mem[tab//4:tab//4 + LOAD_BEATS*8] = table_image(pair)
+    mem[tab0//4:tab0//4 + LOAD_BEATS*8] = table_image()
     n = 6144
     g = rng.normal(0, 4, n).astype(np.float32)
     g[:12] = [16, -16, 17.5, 90, -85, -100, 15.999999, -15.999999, 0, -0.0, 79, -79]
     m = rng.normal(0, 1, n).astype(np.float32)
     mem[0:n] = g.view(np.uint32)
     mem[0x10000//4:0x10000//4 + n] = m.view(np.uint32)
-    cmds = [(run_cmd(op=OP_LOAD, src_g=tab), 0),
+    cmds = [(run_cmd(op=OP_LOAD, src_g=tab, table_set=1), 0),
+            (run_cmd(op=OP_LOAD, src_g=tab0), 0),
             # In place over the gates: m (the attention outputs) stays for the CPU's fixups.
-            (run_cmd(src_g=0x0, src_m=0x10000, dst=0x0, fixmap=0x2F000, elements=n, table_only=1), 0)]
+            (run_cmd(src_g=0x0, src_m=0x10000, dst=0x0, fixmap=0x2F000, elements=n, table_only=1,
+                     table_set=1), 0),
+            # The SiLU in set 0 is still intact.
+            (run_cmd(src_g=0x20000, src_m=0x10000, dst=0x24000, fixmap=0x2F800, elements=2048), 0)]
+    mem[0x20000//4:0x20000//4 + 2048] = g[:2048].view(np.uint32)
     want = mem.copy()
-    fixups = reference(want, cmds[1][0], pair)
+    fixups = reference(want, cmds[2][0], pair)
+    reference(want, cmds[3][0])
     got, lines = run_client(binary, SILU_COMMAND, mem, cmds, tmp_path)
     bad = np.nonzero(got != want)[0]
     assert not len(bad), [(hex(4*i), hex(int(got[i])), hex(int(want[i]))) for i in bad[:10]]

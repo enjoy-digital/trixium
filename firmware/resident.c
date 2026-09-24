@@ -763,6 +763,19 @@ int resident_gate_init(const float *sig_lut, uint32_t *image)
     clean_cpu_dcache_range(image, SILU_IMAGE_WORDS*4);
     R->sig_image = image;
     R->sig_lut = sig_lut;
+    R->gate_set = 0;
+    if ((seq_silu_abi_read() & 0xffff) >= 3) {
+        // A second resident table pair: load the sigmoid once, runs select it (no swaps).
+        struct bns_seq_descriptor d;
+        uint32_t n = 0;
+        desc_fetch(n++, eng_addr(image), SILU_IMAGE_WORDS/8, RS_F);
+        bns_seq_desc_silu_load_set(&d, RS_F, 1);
+        desc_words(n++, &d);
+        seq_desc_stop(n++);
+        if (run_list(n, "sigmoid table load"))
+            return -1;
+        R->gate_set = 1;
+    }
     R->gate_ready = 1;
     return 0;
 }
@@ -795,7 +808,10 @@ int resident_gate_active(void)
 static void rl_table(const uint32_t *image, uint32_t img_sp)
 {
     struct bns_seq_descriptor d;
-    if (!resident_gate_active() || !rl_room(2)) { RL.bad = 1; return; }
+    if (!resident_gate_active()) { RL.bad = 1; return; }
+    if (resident_state()->gate_set)
+        return;                        // Both tables resident: nothing to swap.
+    if (!rl_room(2)) return;
     desc_fetch(RL.n++, eng_addr(image), SILU_IMAGE_WORDS/8, img_sp);
     bns_seq_desc_silu_load(&d, img_sp);
     desc_words(RL.n++, &d);
@@ -807,7 +823,8 @@ void rl_gate_end(uint32_t img_sp)   { rl_table(resident_state()->silu_image, img
 void rl_gate_seg(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp, uint32_t n)
 {
     struct bns_seq_descriptor d;
-    if (!rl_room(1) || bns_seq_desc_silu_table(&d, g_sp, m_sp, dst_sp, fixmap_sp, n)) { RL.bad = 1; return; }
+    if (!rl_room(1) || bns_seq_desc_silu_table_set(&d, g_sp, m_sp, dst_sp, fixmap_sp, n,
+                                                   resident_state()->gate_set)) { RL.bad = 1; return; }
     desc_words(RL.n++, &d);
 }
 

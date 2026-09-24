@@ -28,13 +28,13 @@ from trixium.gateware.silu_mul import SiluMulKernel, LUT_N
 
 SILU_COMMAND = [("op", 1), ("src_g", 24), ("src_m", 24), ("dst", 24), ("fixmap", 24),
                 ("elements", 16), ("unit_m", 1), ("seg_beats", 16), ("perm_a", 8), ("perm_b", 8),
-                ("protect_start", 24), ("protect_end", 24), ("table_only", 1)]
+                ("protect_start", 24), ("protect_end", 24), ("table_only", 1), ("table_set", 1)]
 OP_RUN, OP_LOAD = 0, 1
 LOAD_BEATS = 513 + 512
 
 
 class BonsaiSiluScratchpad(LiteXModule):
-    def __init__(self, scratchpad_size=256*1024, tables=None):
+    def __init__(self, scratchpad_size=256*1024, tables=None, sets=2):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")
         self.cmd = stream.Endpoint(SILU_COMMAND)
@@ -46,7 +46,8 @@ class BonsaiSiluScratchpad(LiteXModule):
         self.sp_rd_adr, self.sp_wr_adr = Signal(13), Signal(13)
         self.sp_rd_dat, self.sp_wr_dat = Signal(256), Signal(256)
         self.sp_wr_we = Signal(8)
-        self.kernel = kernel = ResetInserter()(SiluMulKernel(tables))
+        self.kernel = kernel = ResetInserter()(SiluMulKernel(tables, sets=sets))
+        self.sets = sets
 
         IDLE, VALIDATE, LOAD, RUN, FINISH, FAILED = range(6)
         state = Signal(3, reset=IDLE)
@@ -76,6 +77,7 @@ class BonsaiSiluScratchpad(LiteXModule):
             ends["dst"].eq(cap["dst"] + (beats << 5)),
             ends["fixmap"].eq(cap["fixmap"] + (fix_beats << 5)),
             geometry_bad.eq((cap["src_g"][:5] != 0) | (cap["protect_start"] > cap["protect_end"]) |
+                (cap["table_set"] >= sets) |
                 (~load & ((cap["elements"] == 0) | (~unit_m & (cap["src_m"][:5] != 0)) |
                           (cap["dst"][:5] != 0) | (cap["fixmap"][:5] != 0) |
                           # A permuted output: whole segments of whole beats, a full grid.
@@ -110,6 +112,8 @@ class BonsaiSiluScratchpad(LiteXModule):
             pairs.reset.eq(clear),
             kernel.reset.eq(clear),
             kernel.table_only.eq(cap["table_only"]),
+            kernel.table_sel.eq(cap["table_set"] if sets > 1 else 0),
+            kernel.lut_set.eq(cap["table_set"] if sets > 1 else 0),
             can_issue.eq((issued < beats) & ((pairs.level + in_flight) < 2)),
         ]
 

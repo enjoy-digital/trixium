@@ -38,7 +38,8 @@ def scratchpad_requantize_descriptor(*, src, dst, exponents, maxima, result_expo
 
 
 def scratchpad_silu_descriptor(*, src_g, src_m=0, dst=0, fixmap=0, elements=0, load=False,
-                               unit_m=False, seg_beats=0, perm_a=0, perm_b=0, table_only=False):
+                               unit_m=False, seg_beats=0, perm_a=0, perm_b=0, table_only=False,
+                               table_set=0):
     """Encode optional unit 11; check seq.silu_abi major 1 first.
 
     RUN: dst[i] = m[i] * silu(g[i]) bit-exact with the firmware, fixup elements keep g in
@@ -66,7 +67,7 @@ def scratchpad_silu_descriptor(*, src_g, src_m=0, dst=0, fixmap=0, elements=0, l
     if perm_a > 1 and seg_beats*perm_a*perm_b*8 != elements:
         raise ValueError('a permuted output needs elements == seg_beats*8*perm_a*perm_b')
     return [11, src_g, src_m, dst, fixmap, elements,
-            int(load) | int(bool(unit_m)) << 1 | int(bool(table_only)) << 2,
+            int(load) | int(bool(unit_m)) << 1 | int(bool(table_only)) << 2 | int(table_set) << 3,
             seg_beats | perm_a << 16 | perm_b << 24] + [0]*8
 
 
