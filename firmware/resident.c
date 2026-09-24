@@ -792,24 +792,31 @@ int resident_gate_active(void)
     return resident_silu_active() && resident_state()->gate_ready;
 }
 
-void rl_gate(uint32_t g_sp, uint32_t m_sp, uint32_t fixmap_sp, uint32_t img_sp, uint32_t n)
+static void rl_table(const uint32_t *image, uint32_t img_sp)
 {
-    struct resident_state *R = resident_state();
     struct bns_seq_descriptor d;
-    if (!resident_gate_active() || !rl_room(6)) { RL.bad = 1; return; }
-    desc_fetch(RL.n++, eng_addr(R->sig_image), SILU_IMAGE_WORDS/8, img_sp);
-    bns_seq_desc_silu_load(&d, img_sp);                          desc_words(RL.n++, &d);
-    if (bns_seq_desc_silu_table(&d, g_sp, m_sp, g_sp, fixmap_sp, n)) { RL.bad = 1; return; }
+    if (!resident_gate_active() || !rl_room(2)) { RL.bad = 1; return; }
+    desc_fetch(RL.n++, eng_addr(image), SILU_IMAGE_WORDS/8, img_sp);
+    bns_seq_desc_silu_load(&d, img_sp);
     desc_words(RL.n++, &d);
-    desc_fetch(RL.n++, eng_addr(R->silu_image), SILU_IMAGE_WORDS/8, img_sp);
-    bns_seq_desc_silu_load(&d, img_sp);                          desc_words(RL.n++, &d);
 }
 
-uint32_t resident_gate_patch(uint32_t fixmap_sp, const float *g, uint32_t m_sp, float *dst,
+void rl_gate_begin(uint32_t img_sp) { rl_table(resident_state()->sig_image, img_sp); }
+void rl_gate_end(uint32_t img_sp)   { rl_table(resident_state()->silu_image, img_sp); }
+
+void rl_gate_seg(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp, uint32_t n)
+{
+    struct bns_seq_descriptor d;
+    if (!rl_room(1) || bns_seq_desc_silu_table(&d, g_sp, m_sp, dst_sp, fixmap_sp, n)) { RL.bad = 1; return; }
+    desc_words(RL.n++, &d);
+}
+
+uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, float *dst,
                              uint32_t n)
 {
     struct resident_state *R = resident_state();
     const volatile uint32_t *bits = (const volatile uint32_t *)(SCRATCHPAD_BASE + fixmap_sp);
+    const volatile float *g = (const volatile float *)(SCRATCHPAD_BASE + g_sp);
     const volatile float *m = (const volatile float *)(SCRATCHPAD_BASE + m_sp);
     uint32_t patched = 0;
     for (uint32_t w = 0; w < (n + 31)/32; w++) {
@@ -896,14 +903,16 @@ int resident_gate_init(const float *sig_lut, uint32_t *image)
 }
 int resident_gate_active(void) { return 0; }
 int resident_silu_restore(void) { return -1; }
-void rl_gate(uint32_t g_sp, uint32_t m_sp, uint32_t fixmap_sp, uint32_t img_sp, uint32_t n)
+void rl_gate_begin(uint32_t img_sp) { (void)img_sp; }
+void rl_gate_end(uint32_t img_sp) { (void)img_sp; }
+void rl_gate_seg(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp, uint32_t n)
 {
-    (void)g_sp; (void)m_sp; (void)fixmap_sp; (void)img_sp; (void)n;
+    (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n;
 }
-uint32_t resident_gate_patch(uint32_t fixmap_sp, const float *g, uint32_t m_sp, float *dst,
+uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, float *dst,
                              uint32_t n)
 {
-    (void)fixmap_sp; (void)g; (void)m_sp; (void)dst; (void)n; return 0;
+    (void)fixmap_sp; (void)g_sp; (void)m_sp; (void)dst; (void)n; return 0;
 }
 
 #endif
@@ -957,14 +966,16 @@ int resident_gate_init(const float *sig_lut, uint32_t *image)
 }
 int resident_gate_active(void) { return 0; }
 int resident_silu_restore(void) { return -1; }
-void rl_gate(uint32_t g_sp, uint32_t m_sp, uint32_t fixmap_sp, uint32_t img_sp, uint32_t n)
+void rl_gate_begin(uint32_t img_sp) { (void)img_sp; }
+void rl_gate_end(uint32_t img_sp) { (void)img_sp; }
+void rl_gate_seg(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp, uint32_t n)
 {
-    (void)g_sp; (void)m_sp; (void)fixmap_sp; (void)img_sp; (void)n;
+    (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n;
 }
-uint32_t resident_gate_patch(uint32_t fixmap_sp, const float *g, uint32_t m_sp, float *dst,
+uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, float *dst,
                              uint32_t n)
 {
-    (void)fixmap_sp; (void)g; (void)m_sp; (void)dst; (void)n; return 0;
+    (void)fixmap_sp; (void)g_sp; (void)m_sp; (void)dst; (void)n; return 0;
 }
 
 #endif

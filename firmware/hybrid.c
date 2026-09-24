@@ -68,7 +68,6 @@ static int      dn_hw;
 static uint32_t at_hbm_base, at_slots, at_rowbeats;
 static int at_geom_ok;
 static float *at_buf;
-static float *at_gates;               // [n_head][head_dim]: the output gates, compacted
 #endif
 
 static uint32_t dn_hbm_base;
@@ -680,7 +679,6 @@ int hybrid_init(void)
 #ifdef BONSAI_HAS_ATTNSTREAM
     // Scores, then p, for every head: [n_head][ctx_cap rounded to 8].
     at_buf = at_geom_ok ? infer_halloc((uint64_t)n_head*((ctx_cap + 7) & ~7)*4, 1) : NULL;
-    at_gates = at_geom_ok && H->attn_gated ? infer_halloc((uint64_t)q_dim*4, 0) : NULL;
     if (!at_buf) at_geom_ok = 0;
 #endif
     logits = infer_halloc((uint64_t)H->vocab*4 + 64*n_ch*4, 1);
@@ -1405,28 +1403,34 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 // Attention stream (engine op 6, gateware/attn_stream.py). Scratchpad while the attention
 // core runs (the q/k/v list has stored its outputs; RS_Y and RS_F are free until the out
 // projection's prepare):
-#define AT_QO   RS_Y_ADDR              // q heads, then the outputs: n_head*hd floats
-#define AT_KST  (RS_Y_ADDR + 0x6000u)  // this token's K row (kv_dim floats)
-#define AT_VST  (RS_Y_ADDR + 0x7000u)  // this token's V row
-#define AT_REC  (RS_Y_ADDR + 0x8000u)  // the scores record, then the values record
-#define AT_SP   RS_F_ADDR              // scores, then p: [n_head][T rounded to 8]
+#define AT_Q    RS_Y_ADDR              // q heads (in [q | gate] when gated): <= 48 KB
+#define AT_KST  (RS_Y_ADDR + 0xC000u)  // this token's K row (kv_dim floats)
+#define AT_VST  (RS_Y_ADDR + 0xD000u)  // this token's V row
+#define AT_REC  (RS_Y_ADDR + 0xE000u)  // the scores record, then the values record
+#define AT_O    (RS_Y_ADDR + 0xE400u)  // the outputs: n_head*hd floats, <= 24 KB
+#define AT_O_END (RS_Y_ADDR + 0x18000u)
+#define AT_SP   RS_F_ADDR              // scores, then p: [n_head][T rounded to 8]; then
+#define AT_D    RS_F_ADDR              // the gated outputs,
+#define AT_FX   (RS_F_ADDR + 0x6000u)  // their fixup maps (32 B per head),
+#define AT_IMG  (RS_F_ADDR + 0x8000u)  // and the unit-11 table image (1,025 beats)
 #define AT_SP_END 0x32000u
 
 // Appends this token's K/V row to engine DDR (every token while the stream is on), then runs
-// the two passes around the firmware's own softmax. 0: attnb holds the ungated outputs;
-// 1: the gated outputs (unit 11 applied the gate, the CPU patched its fixups); -1: the CPU
-// loop runs on main RAM's copy (a long context, or a list failure, which also turns the
-// stream off until the next reset).
-#define AT_G    AT_SP                  // after the values: the gates, gated in place
-static int attn_stream(int a, int T, float scale, int gated)
+// the two passes around the firmware's own softmax, and the output gate on unit 11 when it
+// can. q: the roped query heads in main RAM, qstride floats apart (2*hd inside [q | gate],
+// the gates behind each head). 0: attnb holds the ungated outputs; 1: the gated outputs;
+// -1: the CPU loop runs on main RAM's copy (a long context, or a list failure, which also
+// turns the stream off until the next reset).
+static int attn_stream(int a, int T, float scale, int gated, const float *q, uint32_t qstride)
 {
     uint32_t hd = (uint32_t)head_dim, nq = (uint32_t)n_head, nkv = (uint32_t)n_kv_head;
     uint32_t Tp = ((uint32_t)T + 7u) & ~7u, rb = at_rowbeats, rowbytes = rb*32u;
     uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes;
     uint32_t vspan = kspan + at_slots*rowbytes;
     uint32_t p = (uint32_t)T - 1u, nch = (uint32_t)n_ch;
-    int fits = nq*hd*4u <= AT_KST - AT_QO && (uint32_t)kv_dim*4u <= AT_VST - AT_KST &&
-               nq*Tp*4u <= AT_SP_END - AT_SP && T <= BONSAI_ATTN_T_MAX;
+    int fits = nq*qstride*4u <= AT_KST - AT_Q && (uint32_t)kv_dim*4u <= AT_VST - AT_KST &&
+               nq*hd*4u <= AT_O_END - AT_O && nq*Tp*4u <= AT_SP_END - AT_SP &&
+               T <= BONSAI_ATTN_T_MAX;
     struct engine_op o;
     rl_begin();
     rl_fetch(kb, (uint32_t)kv_dim*4u, AT_KST);
@@ -1438,11 +1442,11 @@ static int attn_stream(int a, int T, float scale, int gated)
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + AT_REC);
     if (fits) {
         uint32_t w0 = nq << 8 | (nq/nkv) << 16 | nkv << 24;
-        rec[0] = w0 | 0;  rec[1] = (uint32_t)T; rec[2] = hd; rec[3] = AT_QO; rec[4] = hd*4u;
+        rec[0] = w0 | 0;  rec[1] = (uint32_t)T; rec[2] = hd; rec[3] = AT_Q; rec[4] = qstride*4u;
         rec[5] = AT_SP;   rec[6] = Tp*4u; rec[7] = f32_bits_any(scale);
         rec[8] = w0 | 1;  rec[9] = (uint32_t)T; rec[10] = hd; rec[11] = AT_SP; rec[12] = Tp*4u;
-        rec[13] = AT_QO;  rec[14] = hd*4u; rec[15] = 0;
-        rl_fetch(qb, nq*hd*4u, AT_QO);
+        rec[13] = AT_O;   rec[14] = hd*4u; rec[15] = 0;
+        rl_fetch(q, nq*qstride*4u, AT_Q);
         memset(&o, 0, sizeof o);
         o.kind = ENGINE_KIND_ATTN; o.rows = (uint16_t)((uint32_t)T/nch); o.rem = (uint8_t)((uint32_t)T % nch);
         o.wbase = kspan; o.wlen = (uint32_t)o.rows*rb; o.cbeats = (uint8_t)rb; o.xsrc = AT_REC;
@@ -1462,20 +1466,23 @@ static int attn_stream(int a, int T, float scale, int gated)
         for (int t = 0; t < T; t++) { sc[t] = bonsai_softmax_exp(sc[t] - mx); sum += sc[t]; }
         for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
     }
-    // The gate on unit 11 when it can: gates in place (m, the outputs, stays for the fixups),
-    // its fixup map and the table image behind them in RS_F.
-    uint32_t fx = AT_G + nq*hd*4u, img = AT_SP + 0x8000u;
-    int unit_gate = gated && at_gates && resident_gate_active() && fx + 1024u <= img;
+    // The gate on unit 11 when it can: one run per head over the gates in AT_Q, into AT_D
+    // (disjoint: the outputs in AT_O and the gates stay for the fixups).
+    int unit_gate = gated && qstride == 2u*hd && resident_gate_active() && hd <= 256u &&
+                    nq*hd*4u <= AT_FX - AT_D && nq*32u <= AT_IMG - AT_FX;
     rl_begin();
     rl_fetch(at_buf, nq*Tp*4u, AT_SP);
     o.wbase = vspan; o.xsrc = AT_REC + 32u;
     rl_engine(&o);
     if (unit_gate) {
-        rl_fetch(at_gates, nq*hd*4u, AT_G);
-        rl_gate(AT_G, AT_QO, fx, img, nq*hd);
-        rl_store(attnb, nq*hd*4u, AT_G);
+        rl_gate_begin(AT_IMG);
+        for (uint32_t hh = 0; hh < nq; hh++)
+            rl_gate_seg(AT_Q + (hh*qstride + hd)*4u, AT_O + hh*hd*4u, AT_D + hh*hd*4u,
+                        AT_FX + hh*32u, hd);
+        rl_gate_end(AT_IMG);
+        rl_store(attnb, nq*hd*4u, AT_D);
     } else {
-        rl_store(attnb, nq*hd*4u, AT_QO);
+        rl_store(attnb, nq*hd*4u, AT_O);
     }
     if (rl_run(unit_gate ? "attention values+gate" : "attention values")) {
         HP->attnstream_active = 0;
@@ -1485,7 +1492,9 @@ static int attn_stream(int a, int T, float scale, int gated)
     }
 #ifdef CSR_SEQ_SILU_FIXUPS_ADDR
     if (unit_gate && seq_silu_fixups_read())
-        resident_gate_patch(fx, at_gates, AT_QO, attnb, nq*hd);
+        for (uint32_t hh = 0; hh < nq; hh++)
+            resident_gate_patch(AT_FX + hh*32u, AT_Q + (hh*qstride + hd)*4u, AT_O + hh*hd*4u,
+                                attnb + hh*hd, hd);
 #endif
     return unit_gate ? 1 : 0;
 }
@@ -1543,20 +1552,23 @@ static void attention_layer(int l, const float *h, float *out)
     matvec_q(model_entry(ROLE_ATTN_V, l), e8, vb);
     t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
     }
-    if (gated) { // [q | gate] per head
+    // The stream reads the q heads where they are (inside [q | gate] when gated, the
+    // unit's lane stride); the CPU loop wants them contiguous in qb, copied only if it runs.
+    int q_in_place = 0;
+#ifdef BONSAI_HAS_ATTNSTREAM
+    q_in_place = gated && HP->attnstream_active;
+#endif
+    float *qheads = q_in_place ? qfull : qb;
+    int qstride = q_in_place ? 2*head_dim : head_dim;
+    if (gated && !q_in_place) // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
-#ifdef BONSAI_HAS_ATTNSTREAM
-        if (at_gates && HP->attnstream_active)
-            for (int hh = 0; hh < n_head; hh++)
-                memcpy(at_gates + hh*head_dim, qfull + hh*2*head_dim + head_dim, (size_t)head_dim*4);
-#endif
-    }
     rope_prepare(pos);
     for (int hh = 0; hh < n_head; hh++) {
+        float *qh = qheads + hh*qstride;
         if (!normed)
-            rmsnorm_fv(qb + hh*head_dim, qb + hh*head_dim, norm_q[l], head_dim);
-        rope_apply_partial(qb + hh*head_dim);
+            rmsnorm_fv(qh, qh, norm_q[l], head_dim);
+        rope_apply_partial(qh);
     }
     for (int hh = 0; hh < n_kv_head; hh++) {
         if (!normed)
@@ -1571,10 +1583,13 @@ static void attention_layer(int l, const float *h, float *out)
     int streamed = 0;                  // 1: attnb holds the outputs, 2: gated too
 #ifdef BONSAI_HAS_ATTNSTREAM
     if (HP->attnstream_active) {
-        int rc = attn_stream(a, T, scale, gated);
+        int rc = attn_stream(a, T, scale, gated, qheads, (uint32_t)qstride);
         streamed = rc < 0 ? 0 : 1 + rc;
     }
 #endif
+    if (!streamed && q_in_place)           // the CPU loop after all: its contiguous q
+        for (int hh = 0; hh < n_head; hh++)
+            memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
     for (int hh = 0; hh < n_head; hh++) {
         float *oh = attnb + hh*head_dim;
         if (!streamed) {

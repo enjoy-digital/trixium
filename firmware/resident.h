@@ -67,14 +67,18 @@ void rl_prepare(const float *src, uint32_t width, int rotate);   // src NULL: al
 void rl_desc(const struct bns_seq_descriptor *d);
 struct engine_op;
 void rl_engine(const struct engine_op *op);                       // any engine op, in order
-// dst = m * sigmoid(g) on unit 11, in place over g (a scratchpad image area of 1,025 beats at
-// img_sp is overwritten; the SiLU table is restored before the list ends). Then, after the
-// list, resident_gate_patch() recomputes the flagged elements into dst (main RAM).
+// The attention output gate, dst = m * sigmoid(g) on unit 11 (table only): rl_gate_begin loads
+// the sigmoid table through the 1,025-beat image area img_sp, rl_gate_seg adds one run (dst
+// disjoint from g and m, or == g; fixmap 32-byte aligned), rl_gate_end reloads the SiLU table.
+// After the list, resident_gate_patch() recomputes each run's flagged elements from the
+// scratchpad's g and m into dst (main RAM).
 int  resident_gate_init(const float *sig_lut, uint32_t *image);
 int  resident_gate_active(void);
+void rl_gate_begin(uint32_t img_sp);
+void rl_gate_seg(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp, uint32_t n);
+void rl_gate_end(uint32_t img_sp);
 int  resident_silu_restore(void);    // reload the SiLU table (after a failed gated list)
-void rl_gate(uint32_t g_sp, uint32_t m_sp, uint32_t fixmap_sp, uint32_t img_sp, uint32_t n);
-uint32_t resident_gate_patch(uint32_t fixmap_sp, const float *g, uint32_t m_sp, float *dst,
+uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, float *dst,
                              uint32_t n);
 int  rl_run(const char *what);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
