@@ -99,6 +99,15 @@ def scratchpad_conv_descriptor(*, x0, x1, x2, x3, w, dst, channels):
     return [13, x0, x1, x2, x3, w, dst, channels] + [0]*8
 
 
+def scratchpad_add_descriptor(*, a, b, dst, n):
+    """Unit 13 op 1: dst = a + b over n FP32 values (the residual add); dst == a or b."""
+    for name, value in (('a', a), ('b', b), ('dst', dst)):
+        _sp_address(name, value)
+    if not isinstance(n, int) or not 8 <= n < 65536 or n % 8:
+        raise ValueError('n must be a multiple of 8 in [8, 65528]')
+    return [13, a, 0, 0, b, 0, dst, n | 1 << 16] + [0]*8
+
+
 def silu_table_image(lut, dlut):
     """The unit-11 LOAD image as 32-bit words: lut[0..4096] then pad to beat 513, dlut."""
     if len(lut) != 4097 or len(dlut) != 4096:

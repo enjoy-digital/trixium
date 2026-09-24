@@ -79,6 +79,8 @@ int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src,
 /* Unit 13, conv ABI 1: the DeltaNet 4-tap causal conv, window x0..x2, input x3, taps w. */
 int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, uint32_t x2,
                      uint32_t x3, uint32_t w, uint32_t dst, uint32_t channels);
+/* Unit 13 op 1: dst = a + b over n FP32 values (the residual add); dst == a or b. */
+int bns_seq_desc_add(struct bns_seq_descriptor *out, uint32_t a, uint32_t b, uint32_t dst, uint32_t n);
 /* Exactly 64 little-endian bytes; bytes may be unaligned. The two objects must
  * not overlap. NULL input/output is rejected without modifying the output. */
 int bns_seq_desc_encode_le(void *bytes, const struct bns_seq_descriptor *descriptor);

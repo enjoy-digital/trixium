@@ -18,6 +18,12 @@ def canon(bits):
 
 def reference(mem, cmd):
     n = cmd["channels"]
+    if cmd.get("op"):
+        a = mem[cmd["x0"]//4:cmd["x0"]//4 + n].view(f32)
+        b = mem[cmd["x3"]//4:cmd["x3"]//4 + n].view(f32)
+        with np.errstate(all="ignore"):
+            mem[cmd["dst"]//4:cmd["dst"]//4 + n] = canon((a + b).astype(f32).view(np.uint32))
+        return
     x = [mem[cmd[k]//4:cmd[k]//4 + n].view(f32) for k in ("x0", "x1", "x2", "x3")]
     w = mem[cmd["w"]//4:cmd["w"]//4 + 4*n].view(f32).reshape(n, 4)
     with np.errstate(all="ignore"):
@@ -28,7 +34,7 @@ def reference(mem, cmd):
 
 
 def command(x0, x1, x2, x3, w, dst, channels, **extra):
-    c = dict(x0=x0, x1=x1, x2=x2, x3=x3, w=w, dst=dst, channels=channels, protect_start=0, protect_end=0)
+    c = dict(op=0, x0=x0, x1=x1, x2=x2, x3=x3, w=w, dst=dst, channels=channels, protect_start=0, protect_end=0)
     c.update(extra)
     return c
 
@@ -48,6 +54,8 @@ def test_compiled_conv_equals_the_firmware(tmp_path, binary):
         v = rng.normal(0, 1.5, n).astype(f32)
         if k == 3:
             v[:8] = [0, -0.0, 1e-42, -1e-40, np.inf, -np.inf, np.nan, 3e38]
+        if k == 0:
+            v[:4] = [-0.0, -0.0, 0.0, 5.0]
         put(a, v)
     taps = rng.normal(0, 0.5, 4*n).astype(f32)
     taps[:4] = [0, -0.0, 2.0, -1.0]
@@ -55,6 +63,8 @@ def test_compiled_conv_equals_the_firmware(tmp_path, binary):
     cmds = [(command(0x00000, 0x02000, 0x04000, 0x06000, 0x08000, 0x10000, n), 0),
             # In place over x3, a short tail-free run.
             (command(0x00000, 0x02000, 0x04000, 0x06000, 0x08000, 0x06000, 64), 0),
+            # The residual add (x1, x2, w ignored), in place over x0, with signed zeros.
+            (command(0x00000, 0x3FFE0, 0x3FFE0, 0x06000, 0x3FFE0, 0x00000, 2048, op=1), 0),
             # Rejects.
             (command(0x00000, 0x02000, 0x04000, 0x06000, 0x08000, 0x10000, 12), 1),
             (command(0x00004, 0x02000, 0x04000, 0x06000, 0x08000, 0x10000, 8), 1),

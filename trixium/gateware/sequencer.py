@@ -79,7 +79,8 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   norm:   Optional unit 12, serialized; w0 exactly 12, w1 src, w2 dst, w3 weight, w4 n |
           nseg << 16, w5 FP32 eps, w6 op (0 RMS, 1 L2), w7..w15 zero. gateware/norm_sp.py.
   conv:   Optional unit 13, serialized; w0 exactly 13, w1..w3 window slots x0..x2, w4 new
-          input x3, w5 taps, w6 dst, w7 channels, w8..w15 zero. gateware/conv_sp.py.
+          input x3, w5 taps, w6 dst, w7 channels | op << 16 (op 1: dst = x0 + x3, the
+          residual add), w8..w15 zero. gateware/conv_sp.py.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -432,10 +433,10 @@ class BonsaiSequencer(LiteXModule):
             command = self.conv_cmd
             self.comb += [
                 malformed.eq((w(0, 0) != 13) | reduce(or_, [w(0, i)[24:] != 0 for i in range(1, 7)]) |
-                    (w(0, 7)[16:] != 0) | (d1 != 0)),
+                    (w(0, 7)[17:] != 0) | (d1 != 0)),
                 command.x0.eq(w(0, 1)[:24]), command.x1.eq(w(0, 2)[:24]), command.x2.eq(w(0, 3)[:24]),
                 command.x3.eq(w(0, 4)[:24]), command.w.eq(w(0, 5)[:24]), command.dst.eq(w(0, 6)[:24]),
-                command.channels.eq(w(0, 7)[:16]),
+                command.channels.eq(w(0, 7)[:16]), command.op.eq(w(0, 7)[16]),
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             conv_dispatch = [If(malformed,

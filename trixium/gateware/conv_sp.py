@@ -5,6 +5,9 @@ For `channels` channels (a multiple of 8), bit-exact with hybrid.c's 4-tap conv:
 
   y[c] = (((+0 + w[4c]*x0[c]) + w[4c+1]*x1[c]) + w[4c+2]*x2[c]) + w[4c+3]*x3[c]
 
+op 1 (ADD) is the residual add instead: y[c] = x0[c] + x3[c] (one exact add; x1, x2, w
+unused), dst == x0 or x3 in place.
+
 x0, x1, x2 are the window slots oldest to newest, x3 the new input (the QKV projection),
 w the per-channel taps interleaved as in the model (4 FP32 per channel). The SiLU that
 follows is unit 11 with a unit multiplier. Every operation is exact IEEE binary32
@@ -28,8 +31,9 @@ from litex.soc.interconnect import stream
 
 from trixium.gateware.fp32_exact import FP32Add, FP32Mul
 
-CONV_COMMAND = [("x0", 24), ("x1", 24), ("x2", 24), ("x3", 24), ("w", 24), ("dst", 24),
+CONV_COMMAND = [("op", 1), ("x0", 24), ("x1", 24), ("x2", 24), ("x3", 24), ("w", 24), ("dst", 24),
                 ("channels", 16), ("protect_start", 24), ("protect_end", 24)]
+OP_CONV, OP_ADD = 0, 1
 
 
 def _delay(module, value, cycles, name):
@@ -58,6 +62,8 @@ class BonsaiConvScratchpad(LiteXModule):
         groups = Signal(13)
         vbytes, wbytes = Signal(24), Signal(24)
         names = ("x0", "x1", "x2", "x3", "w", "dst")
+        add = cap["op"] == OP_ADD
+        used = {"x0": C(1, 1), "x1": ~add, "x2": ~add, "x3": C(1, 1), "w": ~add, "dst": C(1, 1)}
         ends = {k: Signal(64, name=f"end_{k}") for k in names}
         geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
 
@@ -69,12 +75,15 @@ class BonsaiConvScratchpad(LiteXModule):
             *[ends[k].eq(cap[k] + (wbytes if k == "w" else vbytes)) for k in names],
             geometry_bad.eq((cap["channels"] == 0) | (cap["channels"][:3] != 0) |
                             (cap["protect_start"] > cap["protect_end"]) |
-                            reduce(or_, [cap[k][:5] != 0 for k in names])),
-            bounds_bad.eq(reduce(or_, [ends[k] > scratchpad_size for k in names]) |
+                            reduce(or_, [used[k] & (cap[k][:5] != 0) for k in names])),
+            bounds_bad.eq(reduce(or_, [used[k] & (ends[k] > scratchpad_size) for k in names]) |
                           (cap["protect_end"] > scratchpad_size)),
-            overlap_bad.eq(~disjoint("dst", "x0") | ~disjoint("dst", "x1") | ~disjoint("dst", "x2") |
-                           ~disjoint("dst", "w") |
-                           (~disjoint("dst", "x3") & (cap["dst"] != cap["x3"]))),
+            overlap_bad.eq(Mux(add,
+                (~disjoint("dst", "x0") & (cap["dst"] != cap["x0"])) |
+                (~disjoint("dst", "x3") & (cap["dst"] != cap["x3"])),
+                ~disjoint("dst", "x0") | ~disjoint("dst", "x1") | ~disjoint("dst", "x2") |
+                ~disjoint("dst", "w") |
+                (~disjoint("dst", "x3") & (cap["dst"] != cap["x3"])))),
             protected_bad.eq((cap["protect_start"] != cap["protect_end"]) &
                              (cap["dst"] < cap["protect_end"]) & (cap["protect_start"] < ends["dst"])),
         ]
@@ -111,8 +120,9 @@ class BonsaiConvScratchpad(LiteXModule):
             rd_pending.eq(issue), rd_sub.eq(sub), rd_bank.eq(rbank),
             If(clear, grp.eq(0), sub.eq(0), rbank.eq(0),
             ).Elif(issue,
-                self.read_beats.eq(self.read_beats + 1), sub.eq(sub + 1),
-                If(sub == 7, grp.eq(grp + 1), rbank.eq(~rbank)),
+                self.read_beats.eq(self.read_beats + 1),
+                sub.eq(Mux(add, Mux(sub == 0, 3, 0), sub + 1)),
+                If(Mux(add, sub == 3, sub == 7), grp.eq(grp + 1), rbank.eq(~rbank)),
             ),
         ]
         for b in range(2):
@@ -136,7 +146,7 @@ class BonsaiConvScratchpad(LiteXModule):
         # A bank is full once its 8th beat has landed; it empties when its last lane is fed.
         for b in range(2):
             self.sync += If(clear, bank_full[b].eq(0)).Else(
-                If(rd_pending & (rd_bank == b) & (rd_sub == 7), bank_full[b].eq(1)),
+                If(rd_pending & (rd_bank == b) & (rd_sub == Mux(add, 3, 7)), bank_full[b].eq(1)),
                 If(feed & (cbank == b) & (lane == 7), bank_full[b].eq(0)))
         self.sync += If(clear, cbank.eq(0), lane.eq(0), cgrp.eq(0)).Elif(feed,
             lane.eq(lane + 1),
@@ -165,8 +175,12 @@ class BonsaiConvScratchpad(LiteXModule):
         p1 = muls[1].r
         p2 = _delay(self, muls[2].r, L_A, "p2d")
         p3 = _delay(self, muls[3].r, 2*L_A, "p3d")
+        # ADD: x0 + x3 on adds[0], aligned with the conv path by a delay before it.
+        x0d = _delay(self, xs[0], L_M, "x0d")
+        x3d = _delay(self, xs[3], L_M, "x3d")
+        addr_r = _delay(self, adds[0].r, 2*L_A, "addr")
         self.comb += [
-            adds[0].a.eq(a1), adds[0].b.eq(p1),
+            adds[0].a.eq(Mux(add, x0d, a1)), adds[0].b.eq(Mux(add, x3d, p1)),
             adds[1].a.eq(adds[0].r), adds[1].b.eq(p2),
             adds[2].a.eq(adds[1].r), adds[2].b.eq(p3),
         ]
@@ -175,10 +189,10 @@ class BonsaiConvScratchpad(LiteXModule):
         y_lane = _delay(self, lane, LAT, "yl")
         acc = [Signal(32, name=f"yacc{j}") for j in range(7)]
         for j in range(7):
-            self.sync += If(y_valid & (y_lane == j), acc[j].eq(adds[2].r))
+            self.sync += If(y_valid & (y_lane == j), acc[j].eq(Mux(add, addr_r, adds[2].r)))
         self.comb += [
             ofifo.we.eq(y_valid & (y_lane == 7) & ~clear),
-            ofifo.din.eq(Cat(*acc, adds[2].r)),
+            ofifo.din.eq(Cat(*acc, Mux(add, addr_r, adds[2].r))),
         ]
         self.sync += If(clear, groups_in_flight.eq(0)).Else(
             groups_in_flight.eq(groups_in_flight + (feed & (lane == 0)) - ofifo.we))

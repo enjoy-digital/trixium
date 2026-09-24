@@ -142,6 +142,14 @@ int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, 
     d.word[6]=dst; d.word[7]=channels;
     *out=d; return BNS_SEQ_DESC_OK;
 }
+int bns_seq_desc_add(struct bns_seq_descriptor *out, uint32_t a, uint32_t b, uint32_t dst, uint32_t n)
+{
+    struct bns_seq_descriptor d = {{0}};
+    if (!out || !sp_address(a, 32) || !sp_address(b, 32) || !sp_address(dst, 32)
+        || n < 8 || n > 0xFFFF || n % 8) return BNS_SEQ_DESC_INVALID;
+    d.word[0]=13; d.word[1]=a; d.word[4]=b; d.word[6]=dst; d.word[7]=n | 1u << 16;
+    *out=d; return BNS_SEQ_DESC_OK;
+}
 int bns_seq_desc_region_fetch(struct bns_seq_descriptor *out, uint32_t region,
                              uint64_t offset, uint32_t length, uint32_t dst)
 {
