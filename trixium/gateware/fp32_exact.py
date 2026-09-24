@@ -23,22 +23,42 @@ CANONICAL_NAN = 0x7FC00000
 
 def _shift_right_sticky(value, width, amount, amount_max, out_width):
     """Combinational (value >> amount) truncated to out_width bits, plus a sticky bit that
-    is the OR of every bit shifted out below the kept field. amount in [0, amount_max]."""
+    is the OR of every bit shifted out below the kept field. amount in [0, amount_max];
+    larger amounts behave as amount_max (callers clamp). A logarithmic barrel shifter of
+    fixed-width constant-shift stages: no Migen variable shift (the Verilog width pitfall),
+    a fraction of the area of a one-hot case mux."""
     q, sticky = Signal(out_width), Signal()
-    cases = {}
-    for s in range(amount_max + 1):
-        kept = value[s:] if s < width else C(0, 1)
-        lost = value[:s] if s else C(0, 1)
-        cases[s] = [q.eq(kept), sticky.eq(lost != 0 if s else 0)]
-    cases["default"] = [q.eq(0), sticky.eq(value != 0)]
-    return q, sticky, Case(amount, cases)
+    bits = max(1, amount_max.bit_length())
+    stmts = []
+    cur = Signal(width, name="rs_in")
+    stmts.append(cur.eq(value))
+    st = C(0, 1)
+    for k in range(bits):
+        sh = 1 << k
+        nxt, nst = Signal(width, name=f"rs{k}"), Signal(name=f"rs_st{k}")
+        lost = cur[:sh] if sh < width else cur
+        kept = Cat(cur[sh:], C(0, sh)) if sh < width else C(0, width)
+        stmts += [nxt.eq(Mux(amount[k], kept, cur)), nst.eq(st | (amount[k] & (lost != 0)))]
+        cur, st = nxt, nst
+    over = amount > amount_max                   # beyond the range: everything shifts out
+    stmts += [q.eq(Mux(over, 0, cur)), sticky.eq(Mux(over, value != 0, st))]
+    return q, sticky, stmts
 
 
 def _shift_left(value, amount, amount_max, out_width):
     out = Signal(out_width)
-    cases = {s: out.eq(value << s) for s in range(amount_max + 1)}
-    cases["default"] = out.eq(0)
-    return out, Case(amount, cases)
+    bits = max(1, amount_max.bit_length())
+    stmts = []
+    cur = Signal(out_width, name="ls_in")
+    stmts.append(cur.eq(value))
+    for k in range(bits):
+        sh = 1 << k
+        nxt = Signal(out_width, name=f"ls{k}")
+        shifted = Cat(C(0, sh), cur[:out_width - sh]) if sh < out_width else C(0, out_width)
+        stmts.append(nxt.eq(Mux(amount[k], shifted, cur)))
+        cur = nxt
+    stmts.append(out.eq(Mux(amount > amount_max, 0, cur)))
+    return out, stmts
 
 
 def _lzc(value, width):
