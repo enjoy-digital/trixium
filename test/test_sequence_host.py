@@ -11,8 +11,9 @@ import pytest
 
 from trixium.model.activation import (
     scratchpad_quantize_descriptor, scratchpad_requantize_descriptor, scratchpad_restore_descriptor,
-    scratchpad_silu_descriptor,
+    scratchpad_silu_descriptor, scratchpad_norm_descriptor, scratchpad_conv_descriptor,
 )
+
 from trixium.model.embedding import scratchpad_embedding_descriptor
 from trixium.model.hadamard import scratchpad_rotation_descriptor
 from trixium.model.native_sequence import (
@@ -20,6 +21,10 @@ from trixium.model.native_sequence import (
 )
 
 LIB = Path(__file__).resolve().parents[1] / 'trixium/software/lib'
+
+
+def _norm_py(l2, src, dst, weight, n, nseg, eps):
+    return scratchpad_norm_descriptor(src=src, dst=dst, weight=weight, n=n, nseg=nseg, eps=eps, l2=l2)
 
 
 class Descriptor(ct.Structure):
@@ -42,6 +47,8 @@ SCHEMAS = {
     'embedding': (scratchpad_embedding_descriptor, 'src signs dst groups'),
     'region_fetch': (region_fetch_descriptor, 'region offset length dst'),
     'silu': (scratchpad_silu_descriptor, 'src_g src_m dst fixmap elements'),
+    'norm': (_norm_py, 'l2 src dst weight n nseg eps'),
+    'conv': (scratchpad_conv_descriptor, 'x0 x1 x2 x3 w dst channels'),
 }
 
 
@@ -85,6 +92,8 @@ def base(name):
         'embedding': dict(src=32, signs=64, dst=96, groups=40),
         'region_fetch': dict(region=0xfedcba98, offset=0x123456789abcde00, length=35, dst=32),
         'silu': dict(src_g=32, src_m=64, dst=32, fixmap=96, elements=17408),
+        'norm': dict(l2=0, src=32, dst=64, weight=96, n=5120, nseg=1, eps=0x358637bd),
+        'conv': dict(x0=0, x1=32, x2=64, x3=96, w=128, dst=160, channels=2048),
     }[name]
 
 
@@ -96,7 +105,7 @@ def test_c_matches_python_for_boundary_and_random_descriptors(encoder, name):
         args = base(name)
         for field in args:
             if field in ('src', 'signs', 'dst', 'stats', 'xsrc', 'exponents', 'maxima', 'result_exponent',
-                         'src_g', 'src_m', 'fixmap'):
+                         'src_g', 'src_m', 'fixmap', 'x0', 'x1', 'x2', 'x3', 'w', 'weight'):
                 alignment = 4 if name == 'native_projection' and field == 'dst' else 32
                 args[field] = rng.randrange((1 << 24)//alignment)*alignment
             elif field in ('offset', 'stride'):
@@ -110,6 +119,10 @@ def test_c_matches_python_for_boundary_and_random_descriptors(encoder, name):
             elif field == 'length': args[field] = rng.randrange(1, 1 << 24)
             elif field == 'adjustment': args[field] = rng.randrange(-(1 << 31), 1 << 31)
             elif field == 'elements' and name == 'quantize': args[field] = rng.randrange(1, 2048)*32
+            elif field == 'n': args[field] = rng.randrange(1, 1025)*8
+            elif field == 'channels': args[field] = rng.randrange(1, 8192)*8
+            elif field == 'eps': args[field] = rng.getrandbits(32)
+            elif field == 'l2': args[field] = rng.randrange(2)
             else: args[field] = rng.randrange(1, 65536)
         cases.append(args)
     boundaries = {
@@ -122,6 +135,8 @@ def test_c_matches_python_for_boundary_and_random_descriptors(encoder, name):
         'embedding': [('groups', 8), ('groups', 512)],
         'region_fetch': [('offset', (1 << 64)-32), ('length', (1 << 24)-1), ('dst', (1 << 24)-32)],
         'silu': [('elements', 1), ('elements', 65535), ('fixmap', (1 << 24)-32)],
+        'norm': [('n', 8), ('n', 8192), ('nseg', 65535), ('l2', 1), ('eps', (1 << 32)-1)],
+        'conv': [('channels', 8), ('channels', 65528)],
     }
     cases += [dict(base(name), **{field: value}) for field, value in boundaries[name]]
     for args in cases:
@@ -143,17 +158,20 @@ def test_invalid_fields_and_null_never_modify_output(encoder, name):
     cases = []
     for field in args:
         if field in ('src', 'signs', 'dst', 'stats', 'xsrc', 'exponents', 'maxima', 'result_exponent',
-                         'src_g', 'src_m', 'fixmap'):
+                         'src_g', 'src_m', 'fixmap', 'x0', 'x1', 'x2', 'x3', 'w', 'weight'):
             cases += [dict(args, **{field: value}) for value in (1, 1 << 24, 0xffffffff)]
         elif field in ('kind', 'inverse', 'interleaved', 'suppress_writes', 'dual'):
             cases.append(dict(args, **{field: 2}))
         elif field == 'offset' and name == 'region_fetch': cases.append(dict(args, offset=1))
-        elif field in ('offset', 'stride', 'region', 'adjustment'): pass  # Full declared C width is encodable.
+        elif field in ('offset', 'stride', 'region', 'adjustment', 'eps'): pass  # Full C width is encodable.
+        elif field == 'l2': cases.append(dict(args, l2=2))
+        elif field == 'n': cases += [dict(args, n=v) for v in (0, 12, 8200)]
+        elif field == 'channels': cases += [dict(args, channels=v) for v in (0, 12, 65536)]
         else:
             high = {'pipe': 32, 'rem': 32, 'bias': 128, 'rshift': 64, 'length': 1 << 24,
                     'groups': 520 if name == 'embedding' else 256}.get(field, 65536)
             cases.append(dict(args, **{field: high}))
-            if field in ('groups', 'length', 'elements', 'blocks'):
+            if field in ('groups', 'length', 'elements', 'blocks', 'nseg'):
                 cases.append(dict(args, **{field: 0}))
     if name == 'native_projection':
         cases.append(dict(args, rows=0, rem=0))

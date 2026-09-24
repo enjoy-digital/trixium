@@ -68,6 +68,17 @@ int bns_seq_desc_silu(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t s
                      uint32_t dst, uint32_t fixmap, uint32_t elements);
 /* Unit 11 table load: 1,025 beats at src, lut[0..4096] then dlut from beat 513. */
 int bns_seq_desc_silu_load(struct bns_seq_descriptor *out, uint32_t src);
+/* Unit 11 (ABI >= 1.1) with options: unit_m (m = 1.0, src_m unused) and permuted output
+ * segments (source segment s of seg_beats beats -> destination (s % a)*b + s / a). */
+int bns_seq_desc_silu_ex(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                        uint32_t dst, uint32_t fixmap, uint32_t elements, uint32_t unit_m,
+                        uint32_t seg_beats, uint32_t perm_a, uint32_t perm_b);
+/* Unit 12, norm ABI 1: RMSNorm (l2 = 0, weight) or L2 (l2 = 1) over nseg segments of n. */
+int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src, uint32_t dst,
+                     uint32_t weight, uint32_t n, uint32_t nseg, uint32_t eps_bits);
+/* Unit 13, conv ABI 1: the DeltaNet 4-tap causal conv, window x0..x2, input x3, taps w. */
+int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, uint32_t x2,
+                     uint32_t x3, uint32_t w, uint32_t dst, uint32_t channels);
 /* Exactly 64 little-endian bytes; bytes may be unaligned. The two objects must
  * not overlap. NULL input/output is rejected without modifying the output. */
 int bns_seq_desc_encode_le(void *bytes, const struct bns_seq_descriptor *descriptor);

@@ -66,6 +66,8 @@ class BonsaiClusterConfig:
     with_embedding_restore: bool = False
     with_region_fetch: bool = False
     with_silu: bool = False
+    with_norm: bool = False
+    with_conv: bool = False
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -76,7 +78,7 @@ class BonsaiClusterConfig:
             raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
         if self.with_region_fetch and (not self.native_regions or not self.with_vecunit):
             raise ValueError('Sequenced region fetch needs native memory regions and the vector/sequencer arbiter')
-        if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore or self.with_embedding_restore or self.with_silu) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
+        if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore or self.with_embedding_restore or self.with_silu or self.with_norm or self.with_conv) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
             raise ValueError("Resident clients need the vector/sequencer arbiter and at most 256 KiB scratchpad")
         if self.native_regions and self.with_vecunit and self.scratchpad_size > 256*1024:
             raise ValueError('Native sequencer needs at most 256 KiB scratchpad')
@@ -119,7 +121,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "activation_quantize", "projection_restore", "embedding_restore", "silu", "sparb", "zznative", "zzregion", "zzverify"):
+    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "activation_quantize", "projection_restore", "embedding_restore", "silu", "norm", "conv", "sparb", "zznative", "zzregion", "zzverify"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
@@ -140,6 +142,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             with_projection_restore=config.with_projection_restore,
             with_embedding_restore=config.with_embedding_restore,
             with_region_fetch=config.with_region_fetch, with_silu=config.with_silu,
+            with_norm=config.with_norm, with_conv=config.with_conv,
             native_pipes=len(ports) if config.native_regions else 0, scratchpad_size=config.scratchpad_size))
         soc.comb += [
             vecunit.seq_en.eq(seq.busy),
@@ -166,13 +169,13 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     if config.with_dnrec:
         from trixium.gateware.deltanet import BonsaiDeltaNetUnit
         soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(
-            with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.with_silu or config.native_regions)))
+            with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.with_silu or config.with_norm or config.with_conv or config.native_regions)))
         sp_clients.append(soc.dnunit)
         base_busy.append(soc.dnunit.busy)
         soc.add_constant("BONSAI_HAS_DNREC")
 
     extensions = []
-    if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.with_silu or config.native_regions):
+    if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.with_silu or config.with_norm or config.with_conv or config.native_regions):
         # Manual vector starts are already masked by seq_en. Apply the same
         # ownership rule to manual recurrence starts; never steal a read port.
         soc.comb += soc.dnunit.dispatch_allowed.eq(~seq.busy)
@@ -208,6 +211,18 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         extensions.append(("silu", soc.silu))
         soc.comb += seq.silu_unit_fixups.eq(soc.silu.fixups)
         soc.add_constant("BONSAI_HAS_SILU")
+    if config.with_norm:
+        from trixium.gateware.norm_sp import BonsaiNormScratchpad
+        soc.norm = ClockDomainsRenamer("eng")(BonsaiNormScratchpad(config.scratchpad_size))
+        sp_clients.append(soc.norm)
+        extensions.append(("norm", soc.norm))
+        soc.add_constant("BONSAI_HAS_NORM")
+    if config.with_conv:
+        from trixium.gateware.conv_sp import BonsaiConvScratchpad
+        soc.conv = ClockDomainsRenamer("eng")(BonsaiConvScratchpad(config.scratchpad_size))
+        sp_clients.append(soc.conv)
+        extensions.append(("conv", soc.conv))
+        soc.add_constant("BONSAI_HAS_CONV")
 
     placement = dict(chan_stride=config.chan_stride, chan_mod=config.chan_mod,
                      chan_skew=config.chan_skew)

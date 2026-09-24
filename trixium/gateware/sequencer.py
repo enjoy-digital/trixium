@@ -71,10 +71,15 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
                 w2/w3 64-bit byte offset low/high, w4 full 32-byte beat count,
                 w5 scratchpad dst, w6..w15 zero. Bounds/reservations/transport
                 checks use the shared region reader; no legacy physical address.
-  silu:   Optional unit 11, serialized; w0 exactly 11, w1 FP32 gate src, w2 FP32
-          multiplier src, w3 dst (== w1 or disjoint), w4 fixup bitmap, w5 elements,
-          w6 op (0 RUN, 1 LOAD tables from w1), w7..w15 zero. seq.silu_fixups sums
-          the flagged elements of the list. See gateware/silu_sp.py.
+  silu:   Optional unit 11 (ABI 1.1), serialized; w0 exactly 11, w1 FP32 gate src, w2
+          FP32 multiplier src, w3 dst (== w1 or disjoint), w4 fixup bitmap, w5 elements,
+          w6 op (bit0: 0 RUN, 1 LOAD tables from w1) | unit_m << 1 (m = 1.0, w2 unused),
+          w7 seg_beats | perm_a << 16 | perm_b << 24 (permuted output segments, 0 = none),
+          w8..w15 zero. seq.silu_fixups sums the flagged elements of the list.
+  norm:   Optional unit 12, serialized; w0 exactly 12, w1 src, w2 dst, w3 weight, w4 n |
+          nseg << 16, w5 FP32 eps, w6 op (0 RMS, 1 L2), w7..w15 zero. gateware/norm_sp.py.
+  conv:   Optional unit 13, serialized; w0 exactly 13, w1..w3 window slots x0..x2, w4 new
+          input x3, w5 taps, w6 dst, w7 channels, w8..w15 zero. gateware/conv_sp.py.
 
 Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
 it does not silently replace a legacy dense rotation or its quantization boundary.
@@ -98,13 +103,14 @@ from litex.soc.interconnect import stream
 class BonsaiSequencer(LiteXModule):
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0,
                  with_projection_restore=False, with_embedding_restore=False,
-                 with_region_fetch=False, with_silu=False, scratchpad_size=256*1024):
+                 with_region_fetch=False, with_silu=False, with_norm=False, with_conv=False,
+                 scratchpad_size=256*1024):
         if not isinstance(native_pipes, int) or not 0 <= native_pipes <= 31:
             raise ValueError('native_pipes must be in [0, 31]')
         if with_region_fetch and not native_pipes:
             raise ValueError('Sequenced region fetch requires native memory support')
         extended = (with_hadamard or with_activation_quantize or native_pipes or with_projection_restore or
-                    with_embedding_restore or with_silu)
+                    with_embedding_restore or with_silu or with_norm or with_conv)
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
@@ -202,13 +208,31 @@ class BonsaiSequencer(LiteXModule):
             self.silu_done = Signal()
             self.silu_failed = Signal(8)
             self.silu_unit_fixups = Signal(16)
-            self.silu_abi = CSRStatus(32, reset=0x00010000)
+            self.silu_abi = CSRStatus(32, reset=0x00010001)
             self.silu_error = CSRStatus(32, description=
                 'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
                 'bits8..15 SiLU-client error (bit14 protects the full descriptor list).')
             self.silu_fixups = CSRStatus(32, description=
                 'Fixup elements flagged by unit 11 since the last list start (all its RUN descriptors).')
             extension_errors.append(self.silu_error)
+        if with_norm:
+            from trixium.gateware.norm_sp import NORM_COMMAND
+            self.norm_cmd = stream.Endpoint(NORM_COMMAND)
+            self.norm_done, self.norm_failed = Signal(), Signal(8)
+            self.norm_abi = CSRStatus(32, reset=0x00010000)
+            self.norm_error = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
+                'bits8..15 norm-client error (bit14 protects the full descriptor list).')
+            extension_errors.append(self.norm_error)
+        if with_conv:
+            from trixium.gateware.conv_sp import CONV_COMMAND
+            self.conv_cmd = stream.Endpoint(CONV_COMMAND)
+            self.conv_done, self.conv_failed = Signal(), Signal(8)
+            self.conv_abi = CSRStatus(32, reset=0x00010000)
+            self.conv_error = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
+                'bits8..15 conv-client error (bit14 protects the full descriptor list).')
+            extension_errors.append(self.conv_error)
 
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
@@ -290,7 +314,7 @@ class BonsaiSequencer(LiteXModule):
 
         list_ok = C(1, 1)
         had_dispatch, quant_dispatch, restore_dispatch, embedding_dispatch, bad_list = [], [], [], [], []
-        region_fetch_dispatch, silu_dispatch = [], []
+        region_fetch_dispatch, silu_dispatch, norm_dispatch, conv_dispatch = [], [], [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24)
@@ -376,10 +400,12 @@ class BonsaiSequencer(LiteXModule):
             self.comb += [
                 malformed.eq((w(0, 0) != 11) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 4)[24:] != 0) | (w(0, 5)[16:] != 0) |
-                    (w(0, 6)[1:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                    (w(0, 6)[2:] != 0) | (d1 != 0)),
                 command.src_g.eq(w(0, 1)[:24]), command.src_m.eq(w(0, 2)[:24]),
                 command.dst.eq(w(0, 3)[:24]), command.fixmap.eq(w(0, 4)[:24]),
                 command.elements.eq(w(0, 5)[:16]), command.op.eq(w(0, 6)[0]),
+                command.unit_m.eq(w(0, 6)[1]), command.seg_beats.eq(w(0, 7)[:16]),
+                command.perm_a.eq(w(0, 7)[16:24]), command.perm_b.eq(w(0, 7)[24:32]),
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             self.sync += If(self.start.re & self.start.storage & ~self.busy,
@@ -387,6 +413,34 @@ class BonsaiSequencer(LiteXModule):
             silu_dispatch = [If(malformed,
                 NextValue(self.silu_error.status, 2), NextState('EXT_FAILED'),
             ).Else(NextState('DISPATCH_SILU'))]
+        if with_norm:
+            malformed = Signal()
+            command = self.norm_cmd
+            self.comb += [
+                malformed.eq((w(0, 0) != 12) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                    (w(0, 3)[24:] != 0) | (w(0, 6)[1:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
+                command.weight.eq(w(0, 3)[:24]), command.n.eq(w(0, 4)[:16]),
+                command.nseg.eq(w(0, 4)[16:32]), command.eps.eq(w(0, 5)), command.op.eq(w(0, 6)[0]),
+                command.protect_start.eq(list_base), command.protect_end.eq(list_end),
+            ]
+            norm_dispatch = [If(malformed,
+                NextValue(self.norm_error.status, 2), NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_NORM'))]
+        if with_conv:
+            malformed = Signal()
+            command = self.conv_cmd
+            self.comb += [
+                malformed.eq((w(0, 0) != 13) | reduce(or_, [w(0, i)[24:] != 0 for i in range(1, 7)]) |
+                    (w(0, 7)[16:] != 0) | (d1 != 0)),
+                command.x0.eq(w(0, 1)[:24]), command.x1.eq(w(0, 2)[:24]), command.x2.eq(w(0, 3)[:24]),
+                command.x3.eq(w(0, 4)[:24]), command.w.eq(w(0, 5)[:24]), command.dst.eq(w(0, 6)[:24]),
+                command.channels.eq(w(0, 7)[:16]),
+                command.protect_start.eq(list_base), command.protect_end.eq(list_end),
+            ]
+            conv_dispatch = [If(malformed,
+                NextValue(self.conv_error.status, 2), NextState('EXT_FAILED'),
+            ).Else(NextState('DISPATCH_CONV'))]
         if with_region_fetch:
             malformed, list_overlap = Signal(), Signal()
             destination_end = Signal(64)
@@ -779,6 +833,8 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 9, *(embedding_dispatch if with_embedding_restore else unknown_unit)
             ).Elif(unit == 10, *(region_fetch_dispatch if with_region_fetch else unknown_unit)
             ).Elif(unit == 11, *(silu_dispatch if with_silu else unknown_unit)
+            ).Elif(unit == 12, *(norm_dispatch if with_norm else unknown_unit)
+            ).Elif(unit == 13, *(conv_dispatch if with_conv else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -837,6 +893,18 @@ class BonsaiSequencer(LiteXModule):
                 ).Elif(self.silu_done,
                     NextValue(self.silu_fixups.status, self.silu_fixups.status + self.silu_unit_fixups),
                     NextState('NEXT')))
+        for name, enabled in (("norm", with_norm), ("conv", with_conv)):
+            if not enabled:
+                continue
+            cmd, failed, done = (getattr(self, name + "_cmd"), getattr(self, name + "_failed"),
+                                 getattr(self, name + "_done"))
+            error = getattr(self, name + "_error")
+            fsm.act('DISPATCH_' + name.upper(), self.busy.eq(1),
+                If(~eng_inflight, cmd.valid.eq(1), If(cmd.ready, NextState('WAIT_' + name.upper()))))
+            fsm.act('WAIT_' + name.upper(), self.busy.eq(1),
+                If(failed != 0,
+                    NextValue(error.status, failed << 8), NextState('EXT_FAILED'),
+                ).Elif(done, NextState('NEXT')))
         if with_region_fetch:
             fsm.act('DISPATCH_REGION_FETCH', self.busy.eq(1),
                 If(self.region_fetch_failed != 0,

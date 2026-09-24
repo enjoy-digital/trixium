@@ -51,7 +51,7 @@ def fixture(descriptors):
 
 
 @pytest.mark.parametrize('field,value', [(0, 11 | 1 << 9), (0, 12), (1, 1 << 24), (2, 1 << 24),
-    (3, 1 << 24), (4, 1 << 24), (5, 65536), (6, 2)] + [(field, 1) for field in range(7, 16)])
+    (3, 1 << 24), (4, 1 << 24), (5, 65536), (6, 4)] + [(field, 1) for field in range(8, 16)])
 def test_reserved_fields_rejected_before_dispatch(field, value):
     words = descriptor()
     words[field] = value
@@ -72,7 +72,7 @@ def test_dispatch_fields_fixup_sum_and_failure_wins(failure):
     dut = fixture([scratchpad_silu_descriptor(src_g=0x2000, load=True), descriptor(), descriptor(elements=40)])
     seq, cmd = dut.seq, dut.seq.silu_cmd
     def run():
-        assert (yield seq.silu_abi.status) == 0x10000
+        assert (yield seq.silu_abi.status) == 0x10001
         yield from write(seq.base, 0)
         yield from write(seq.count, 3)
         yield from write(seq.start, 1)

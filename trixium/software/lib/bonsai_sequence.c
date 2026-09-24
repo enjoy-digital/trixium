@@ -108,6 +108,40 @@ int bns_seq_desc_silu_load(struct bns_seq_descriptor *out, uint32_t src)
     d.word[0]=11; d.word[1]=src; d.word[6]=1;
     *out=d; return BNS_SEQ_DESC_OK;
 }
+int bns_seq_desc_silu_ex(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                        uint32_t dst, uint32_t fixmap, uint32_t elements, uint32_t unit_m,
+                        uint32_t seg_beats, uint32_t perm_a, uint32_t perm_b)
+{
+    struct bns_seq_descriptor d = {{0}};
+    if (!out || !sp_address(src_g, 32) || !sp_address(src_m, 32) || !sp_address(dst, 32)
+        || !sp_address(fixmap, 32) || !count16(elements) || unit_m > 1 || seg_beats > 0xFFFF
+        || perm_a > 0xFF || perm_b > 0xFF
+        || (perm_a > 1 && (uint64_t)seg_beats*perm_a*perm_b*8 != elements)) return BNS_SEQ_DESC_INVALID;
+    d.word[0]=11; d.word[1]=src_g; d.word[2]=src_m; d.word[3]=dst; d.word[4]=fixmap;
+    d.word[5]=elements; d.word[6]=unit_m << 1; d.word[7]=seg_beats | perm_a << 16 | perm_b << 24;
+    *out=d; return BNS_SEQ_DESC_OK;
+}
+int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src, uint32_t dst,
+                     uint32_t weight, uint32_t n, uint32_t nseg, uint32_t eps_bits)
+{
+    struct bns_seq_descriptor d = {{0}};
+    if (!out || l2 > 1 || !sp_address(src, 32) || !sp_address(dst, 32) || !sp_address(weight, 32)
+        || n < 8 || n > 8192 || n % 8 || !count16(nseg)) return BNS_SEQ_DESC_INVALID;
+    d.word[0]=12; d.word[1]=src; d.word[2]=dst; d.word[3]=weight; d.word[4]=n | nseg << 16;
+    d.word[5]=eps_bits; d.word[6]=l2;
+    *out=d; return BNS_SEQ_DESC_OK;
+}
+int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, uint32_t x2,
+                     uint32_t x3, uint32_t w, uint32_t dst, uint32_t channels)
+{
+    struct bns_seq_descriptor d = {{0}};
+    if (!out || !sp_address(x0, 32) || !sp_address(x1, 32) || !sp_address(x2, 32)
+        || !sp_address(x3, 32) || !sp_address(w, 32) || !sp_address(dst, 32)
+        || channels < 8 || channels > 0xFFFF || channels % 8) return BNS_SEQ_DESC_INVALID;
+    d.word[0]=13; d.word[1]=x0; d.word[2]=x1; d.word[3]=x2; d.word[4]=x3; d.word[5]=w;
+    d.word[6]=dst; d.word[7]=channels;
+    *out=d; return BNS_SEQ_DESC_OK;
+}
 int bns_seq_desc_region_fetch(struct bns_seq_descriptor *out, uint32_t region,
                              uint64_t offset, uint32_t length, uint32_t dst)
 {
