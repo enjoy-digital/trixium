@@ -138,12 +138,10 @@ class BonsaiNormScratchpad(LiteXModule):
             self.cmd.ready.eq((state == S["IDLE"]) & ~self.cancel),
             self.busy.eq(state != S["IDLE"]),
         ]
+        # Segment bases, advanced by one stride per segment (a seg*stride product fed the
+        # read address every clock: the unit's critical path, +0.35 ns synthesis-only).
         seg_src = Signal(24)
         seg_dst = Signal(24)
-        self.comb += [
-            seg_src.eq(cap["src"] + ((seg*s_stride) << 5)),
-            seg_dst.eq(cap["dst"] + ((seg*d_stride) << 5)),
-        ]
 
         # Read issue per phase.
         issue = Signal()
@@ -281,7 +279,8 @@ class BonsaiNormScratchpad(LiteXModule):
                 S["VALIDATE"]: If(geometry_bad | bounds_bad | overlap_bad | protected_bad,
                     self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
                     state.eq(S["FAILED"]),
-                ).Else(beat.eq(0), state.eq(Mux(rms, S["WLOAD"], S["P1"]))),
+                ).Else(beat.eq(0), seg_src.eq(cap["src"]), seg_dst.eq(cap["dst"]),
+                       state.eq(Mux(rms, S["WLOAD"], S["P1"]))),
                 S["WLOAD"]: If((beat == nbeats) & ~rd_pending, beat.eq(0), state.eq(S["P1"])),
                 S["P1"]: If(beat == nbeats, state.eq(S["P1_DRAIN"])),
                 S["P1_DRAIN"]: If((p1_inflight == 0) & ~rd_pending,
@@ -321,7 +320,9 @@ class BonsaiNormScratchpad(LiteXModule):
                 S["P2_DRAIN"]: If((inflight == 0) & ~ofifo.readable & ~rd_pending,
                     If(seg + 1 == cap["nseg"],
                         state.eq(S["FINISH"]),
-                    ).Else(seg.eq(seg + 1), beat.eq(0), state.eq(S["P1"]))),
+                    ).Else(seg.eq(seg + 1), beat.eq(0),
+                           seg_src.eq(seg_src + (s_stride << 5)), seg_dst.eq(seg_dst + (d_stride << 5)),
+                           state.eq(S["P1"]))),
                 S["FINISH"]: [self.done.eq(1), state.eq(S["IDLE"])],
             })),
         ]
