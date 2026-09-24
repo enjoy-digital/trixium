@@ -61,6 +61,8 @@ void rl_begin(void);
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store(void *dst, uint32_t bytes, uint32_t sp);
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
+void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage,
+                    uint32_t dst_sp);
 void rl_prepare(const float *src, uint32_t width, int rotate);   // src NULL: already in RS_F
 void rl_desc(const struct bns_seq_descriptor *d);
 int  rl_run(const char *what);

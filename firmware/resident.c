@@ -356,24 +356,31 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
 // Descriptors for dst_sp = FP32(e * resident Q8): engine matvec per K-segment, int32
 // segment sum, restore into dst_sp (RS_F, or RS_Y in place). Appends at *n; -1 = the
 // tensor or its results do not fit the resident map (nothing is run).
-static int build_matvec_at(uint32_t *n, const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
+static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t row0,
+                             uint32_t rows, uint32_t ystage, uint32_t dst_sp);
+static int build_matvec_at(uint32_t *n, const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
+{
+    return e ? build_matvec_rows(n, e, 0, e->rows, ystage, dst_sp) : -1;
+}
 static int build_matvec(uint32_t *n, const struct bons_entry *e, uint32_t dst_sp)
 {
     return build_matvec_at(n, e, RS_Y, dst_sp);
 }
 
-// ystage: where the int32 segment partials go (RS_Y, or another region the caller keeps
-// clear of RS_F and the persistent map); dst_sp: RS_F, or ystage itself (restore in place).
-static int build_matvec_at(uint32_t *n, const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
+// Rows [row0, row0 + rows) of e (row0 and rows multiples of the channel count: channel c
+// holds rows c, c + n_ch, ...). ystage: where the int32 segment partials go (RS_Y, or
+// another region the caller keeps clear of RS_F and the persistent map); dst_sp: RS_F, or
+// ystage itself (restore in place).
+static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t row0,
+                             uint32_t rows, uint32_t ystage, uint32_t dst_sp)
 {
     struct resident_state *R = resident_state();
-    if (!e || e->rows % 8 || e->rows > RS_ROWS_MAX || e->rows % (uint32_t)R->n_ch ||
-        (e->kind != KIND_TERNARY && e->kind != KIND_Q8))
+    if (!e || rows % 8 || rows > RS_ROWS_MAX || rows % (uint32_t)R->n_ch || row0 % (uint32_t)R->n_ch ||
+        row0 + rows > e->rows || (e->kind != KIND_TERNARY && e->kind != KIND_Q8))
         return -1;
     int nseg = (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
     if (nseg < 1 || nseg > 4)
         return -1;
-    uint32_t rows = e->rows;
     uint32_t ystride = ((rows*4 + 31) & ~31u);   // One int32 result stream per segment.
     if (ystage % 32 || ystage + (uint64_t)nseg*ystride > RS_F)   // The partials fit below RS_F,
         return -1;
@@ -390,7 +397,7 @@ static int build_matvec_at(uint32_t *n, const struct bons_entry *e, uint32_t yst
         op.kind   = (seg->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
         op.rows   = rpc;
         op.cols   = seg->cols;
-        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + seg->chan_base_beats*32;
+        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + (seg->chan_base_beats + (row0/(uint32_t)R->n_ch)*rb)*32;
         op.wlen   = rpc*rb;
         op.sbeats = bons_scale_beats(seg->cols, seg->group);
         op.cbeats = bons_code_beats(seg->cols, seg->kind);
@@ -480,6 +487,12 @@ void rl_store(void *dst, uint32_t bytes, uint32_t sp)
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
 {
     if (!rl_room(9) || build_matvec_at(&RL.n, e, ystage, dst_sp)) RL.bad = 1;
+}
+
+void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage,
+                    uint32_t dst_sp)
+{
+    if (!rl_room(9) || build_matvec_rows(&RL.n, e, row0, rows, ystage, dst_sp)) RL.bad = 1;
 }
 
 void rl_desc(const struct bns_seq_descriptor *d)
@@ -803,6 +816,8 @@ void rl_begin(void) {}
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp) { (void)src; (void)bytes; (void)sp; }
 void rl_store(void *dst, uint32_t bytes, uint32_t sp) { (void)dst; (void)bytes; (void)sp; }
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp) { (void)e; (void)ystage; (void)dst_sp; }
+void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage, uint32_t dst_sp)
+{ (void)e; (void)row0; (void)rows; (void)ystage; (void)dst_sp; }
 void rl_prepare(const float *src, uint32_t width, int rotate) { (void)src; (void)width; (void)rotate; }
 void rl_desc(const struct bns_seq_descriptor *d) { (void)d; }
 int  rl_run(const char *what) { (void)what; return -1; }

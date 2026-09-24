@@ -423,3 +423,89 @@ class ExactFP32Mul(_ValidAdapter):
 
     def __init__(self):
         _ValidAdapter.__init__(self, FP32Mul)
+
+
+class FP32ArgmaxTracker(LiteXModule):
+    """The CPU's greedy argmax over a stream of FP32 beats, bit for bit:
+
+        best = x[0]; idx = 0; for i >= 1: if (x[i] > best) { best = x[i]; idx = i; }
+
+    - a NaN never compares greater, and a NaN as the very first element freezes the result
+      at index 0 (every later comparison with it is false);
+    - -0 and +0 are equal (the earlier one stays); ties keep the earlier index.
+    `beat` delivers 8 lanes (lane j = element count + j) with `mask` of active lanes (a
+    prefix); state persists across beats and commands until `clear`. Pipelined: a 3-level
+    tree over the lanes, then the combination with the running best, 5 clocks behind.
+    """
+    def __init__(self):
+        self.clear = Signal()
+        self.valid, self.data, self.mask = Signal(), Signal(256), Signal(8)
+        self.best_valid, self.best_val, self.best_idx = Signal(), Signal(32), Signal(32)
+        count = Signal(32)
+        # S0: register the beat with its base index and whether it starts the stream.
+        s0_v, s0_d, s0_m, s0_base, s0_first = Signal(), Signal(256), Signal(8), Signal(32), Signal()
+        started = Signal()
+        active = Signal(4)                     # lanes in this beat (the mask is a prefix)
+        self.comb += active.eq(sum(self.mask[j] for j in range(8)))
+        self.sync += If(self.clear, count.eq(0), started.eq(0), s0_v.eq(0)).Else(
+            s0_v.eq(self.valid), s0_d.eq(self.data), s0_m.eq(self.mask), s0_base.eq(count),
+            s0_first.eq(self.valid & ~started),
+            If(self.valid, count.eq(count + active), started.eq(1)))
+
+        def key(x):
+            k = Signal(32)
+            zero = x[:31] == 0
+            self.comb += k.eq(Mux(zero, 0x80000000, Mux(x[31], ~x, x | 0x80000000)))
+            return k
+
+        def nan(x):
+            return (x[23:31] == 0xFF) & (x[:23] != 0)
+
+        # S1: per-lane candidates (valid, key, value, lane) and the first lane's NaN flag.
+        cands = []
+        for j in range(8):
+            x = s0_d[32*j:32*j + 32]
+            cands.append((s0_m[j] & ~nan(x), key(x), x, C(j, 3)))
+        s1 = []
+        for a, b in zip(cands[0::2], cands[1::2]):
+            v, k, x, l = Signal(), Signal(32), Signal(32), Signal(3)
+            take_a = a[0] & (~b[0] | (a[1] >= b[1]))
+            self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])), x.eq(Mux(take_a, a[2], b[2])),
+                          l.eq(Mux(take_a, a[3], b[3]))]
+            s1.append((v, k, x, l))
+        s1_v, s1_base, s1_first, s1_nan0 = Signal(), Signal(32), Signal(), Signal()
+        s1_x0 = Signal(32)
+        self.sync += [s1_v.eq(s0_v & ~self.clear), s1_base.eq(s0_base), s1_first.eq(s0_first),
+                      s1_nan0.eq(nan(s0_d[:32])), s1_x0.eq(s0_d[:32])]
+        level, pipe = s1, [(s1_v, s1_base, s1_first, s1_nan0, s1_x0)]
+        for depth in (2, 3):
+            nxt = []
+            for a, b in zip(level[0::2], level[1::2]):
+                v, k, x, l = Signal(), Signal(32), Signal(32), Signal(3)
+                take_a = a[0] & (~b[0] | (a[1] >= b[1]))
+                self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])), x.eq(Mux(take_a, a[2], b[2])),
+                              l.eq(Mux(take_a, a[3], b[3]))]
+                nxt.append((v, k, x, l))
+            level = nxt
+            pv, pb, pf, pn, px = pipe[-1]
+            q = (Signal(), Signal(32), Signal(), Signal(), Signal(32))
+            self.sync += [q[0].eq(pv & ~self.clear), q[1].eq(pb), q[2].eq(pf), q[3].eq(pn), q[4].eq(px)]
+            pipe.append(q)
+        (wv, wk, wx, wl), = level
+        bv, bbase, bfirst, bnan0, bx0 = pipe[-1]
+        # Combine with the running best.
+        frozen, rkey = Signal(), Signal(32)
+        self.sync += If(self.clear,
+            self.best_valid.eq(0), frozen.eq(0),
+        ).Elif(bv,
+            If(bfirst,
+                self.best_valid.eq(1),
+                If(bnan0,
+                    frozen.eq(1), self.best_val.eq(bx0), self.best_idx.eq(bbase),
+                ).Else(
+                    rkey.eq(wk), self.best_val.eq(wx), self.best_idx.eq(bbase + wl),
+                ),
+            ).Elif(~frozen & wv & (wk > rkey),
+                rkey.eq(wk), self.best_val.eq(wx), self.best_idx.eq(bbase + wl),
+            ),
+        )

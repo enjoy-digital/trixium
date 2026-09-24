@@ -236,6 +236,16 @@ class BonsaiSequencer(LiteXModule):
                 'bits8..15 conv-client error (bit14 protects the full descriptor list).')
             extension_errors.append(self.conv_error)
 
+        if with_projection_restore:
+            # Appended last: every earlier register keeps its address.
+            self.restore_argmax_clear = Signal()
+            self.restore_argmax_valid_in = Signal()
+            self.restore_argmax_idx_in, self.restore_argmax_val_in = Signal(32), Signal(32)
+            self.restore_argmax_idx = CSRStatus(32, description=
+                'Greedy argmax (first max, NaN-first frozen) of every unit-8 output since the '
+                'last list start: the element index, 0xFFFFFFFF before any output.')
+            self.restore_argmax_val = CSRStatus(32, description='Its FP32 value (0 when none yet).')
+
         # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
         self.eng_valid  = Signal()
         self.eng_ready  = Signal()
@@ -382,6 +392,12 @@ class BonsaiSequencer(LiteXModule):
             restore_dispatch = [If(malformed,
                 NextValue(self.projection_restore_error.status, 2), NextState('EXT_FAILED'),
             ).Else(NextState('DISPATCH_RESTORE'))]
+            self.comb += [
+                self.restore_argmax_clear.eq(self.start.re & self.start.storage & ~self.busy),
+                self.restore_argmax_idx.status.eq(Mux(self.restore_argmax_valid_in,
+                                                      self.restore_argmax_idx_in, 0xFFFFFFFF)),
+                self.restore_argmax_val.status.eq(self.restore_argmax_val_in),
+            ]
         if with_embedding_restore:
             malformed = Signal()
             command = self.embedding_restore_cmd

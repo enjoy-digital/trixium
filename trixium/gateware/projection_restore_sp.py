@@ -6,6 +6,7 @@ from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
 from trixium.gateware.projection_restore import I32ToFp32Scaled
+from trixium.gateware.fp32_exact import FP32ArgmaxTracker
 
 
 RESTORE_COMMAND = [("src", 24), ("dst", 24), ("exponents", 24),
@@ -53,6 +54,11 @@ class BonsaiProjectionRestoreScratchpad(LiteXModule):
         self.sp_wr_we = Signal(8)
         self.restore = restore = I32ToFp32Scaled()
         self.responses = responses = ResetInserter()(SyncFIFO(width=258, depth=2))
+        # The greedy argmax of everything this unit writes, across commands, until
+        # argmax_clear (the sequencer's list start): the LM head's token without the CPU
+        # reading the logits back (the firmware loop's semantics, gateware/fp32_exact.py).
+        self.argmax = argmax = FP32ArgmaxTracker()
+        self.argmax_clear = Signal()
 
         IDLE, VALIDATE, META_REQ, META_CAPTURE, META_CHECK, RUN, DRAIN, FINISH, FAILED = range(9)
         state = Signal(4, reset=IDLE)
@@ -117,6 +123,8 @@ class BonsaiProjectionRestoreScratchpad(LiteXModule):
             self.sp_wr_dat.eq(restore.source.data), self.sp_wr_we.eq(mask),
             restore.source.ready.eq(active & self.sp_wr_gnt & ~failed & ~self.cancel),
             written.eq(self.sp_wr_req & self.sp_wr_gnt),
+            argmax.clear.eq(self.argmax_clear),
+            argmax.valid.eq(written), argmax.data.eq(restore.source.data), argmax.mask.eq(mask),
         ]
         for lane in range(8):
             self.comb += restore.sink.data[32*lane:32*(lane+1)].eq(

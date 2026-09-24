@@ -205,6 +205,12 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         soc.projection_restore = ClockDomainsRenamer("eng")(BonsaiProjectionRestoreScratchpad(config.scratchpad_size))
         sp_clients.append(soc.projection_restore)
         extensions.append(("projection_restore", soc.projection_restore))
+        soc.comb += [
+            soc.projection_restore.argmax_clear.eq(seq.restore_argmax_clear),
+            seq.restore_argmax_valid_in.eq(soc.projection_restore.argmax.best_valid),
+            seq.restore_argmax_idx_in.eq(soc.projection_restore.argmax.best_idx),
+            seq.restore_argmax_val_in.eq(soc.projection_restore.argmax.best_val),
+        ]
         soc.add_constant("BONSAI_HAS_PROJECTION_RESTORE")
     if config.with_embedding_restore:
         from trixium.gateware.embedding_restore_sp import BonsaiEmbeddingScratchpad

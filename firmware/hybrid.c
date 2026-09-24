@@ -1497,10 +1497,39 @@ int hybrid_forward(int token, int want_logits)
     infer_dbg_f32("out_norm", -1, hb, n_embd);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head) head = model_entry(ROLE_TOK_EMB, 0);
-    proj_f(head, hb, logits);
+    int head_done = 0;
+    if (H->hadamard_block && resident_active() && head &&
+        (head->kind == KIND_TERNARY || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)) {
+        // The LM head as ONE list: the rotated input once, then row chunks that fit RS_F
+        // (restored FP32) and the int32 staging below it, each stored into logits.
+        uint32_t unit = 8u*(uint32_t)n_ch, room = (0x32000u - RS_F_ADDR)/4;
+        uint32_t chunk = (room < 24576u ? room : 24576u)/unit*unit;
+        rl_begin();
+        rl_prepare(hb, (uint32_t)n_embd, 1);
+        for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
+            uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk;
+            rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
+            rl_store(logits + r0, (rows*4 + 31u) & ~31u, RS_F_ADDR);
+        }
+        head_done = rl_run("lm head") == 0;
+    }
+    if (!head_done)
+        proj_f(head, hb, logits);
     infer_dbg_f32("logits", -1, logits, H->vocab);
-    int best = 0; float bv = logits[0];
-    for (uint32_t i = 1; i < H->vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = (int)i; }
+    int best = -1;
+#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+    // The restore unit tracked the firmware loop's greedy argmax over everything the LM
+    // head list restored; rows past the vocabulary (padding) winning means: loop instead.
+    if (head_done) {
+        uint32_t i = seq_restore_argmax_idx_read();
+        if (i < H->vocab) best = (int)i;
+    }
+#endif
+    if (best < 0) {
+        float bv = logits[0];
+        best = 0;
+        for (uint32_t i = 1; i < H->vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = (int)i; }
+    }
     hyb_cyc_logits += perf_now64() - t0;
     return best;
 }
