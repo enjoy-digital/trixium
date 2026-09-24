@@ -49,6 +49,7 @@ _Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "d
 #include "bench.h"
 #include "seq.h"
 #include "resident.h"
+#include "hybrid.h"
 #include "vec.h"
 #include "progs.h"
 #include "static_memory.h"
@@ -859,6 +860,16 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) dn_pipe_use = 0;
         printf("DNPIPE %s (DeltaNet head state store/fetch under the CPU's head work)\n",
                dn_pipe_use ? "on" : "off");
+    }
+    else if (strcmp(token, "xres") == 0) {
+        if (strncmp(str, "on", 2) == 0)  hybrid_xres_enable(1);
+        if (strncmp(str, "off", 3) == 0) hybrid_xres_enable(0);
+        printf("XRES %s (the residual stream and its norms resident)\n", hybrid_xres_enabled() ? "on" : "off");
+    }
+    else if (strcmp(token, "dnres") == 0) {
+        if (strncmp(str, "on", 2) == 0)  hybrid_dnres_enable(1);
+        if (strncmp(str, "off", 3) == 0) hybrid_dnres_enable(0);
+        printf("DNRES %s (DeltaNet layers as scratchpad lists)\n", hybrid_dnres_enabled() ? "on" : "off");
     }
     else if (strcmp(token, "silu") == 0) {
         if (strncmp(str, "on", 2) == 0)  resident_silu_enable(1);

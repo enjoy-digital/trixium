@@ -46,8 +46,27 @@ void resident_silu_enable(int on);   // Console A/B.
 // recomputed on the CPU) and leave it in RS_F for resident_prepare(NULL, ...). act also
 // receives a copy in main RAM (the fallback source); gate_out/up_out, when not NULL,
 // receive the projections for traces. All 32-byte aligned. 0 = ok, -1 = declined/failed.
+void resident_mark_act(void);      // RS_F holds the next prepare's FP32 source (a list left it)
 int  resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                       float *act, float *gate_out, float *up_out);
+
+// List builder (resident.c): compose one descriptor list from transfers, prepares, matvecs
+// and raw descriptors, then run it. Any invalid step marks the list bad: rl_run returns -1
+// without running anything. Fixed regions shared with the calls above:
+#define RS_Q8B_ADDR 0x00000u
+#define RS_Y_ADDR   0x04800u
+#define RS_F_ADDR   0x1C800u
+struct bns_seq_descriptor;
+void rl_begin(void);
+void rl_fetch(const void *src, uint32_t bytes, uint32_t sp);
+void rl_store(void *dst, uint32_t bytes, uint32_t sp);
+void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
+void rl_prepare(const float *src, uint32_t width, int rotate);   // src NULL: already in RS_F
+void rl_desc(const struct bns_seq_descriptor *d);
+int  rl_run(const char *what);
+// Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
+uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
+                             uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b);
 
 // State and per-forward accounting (cycles include the descriptor build and the CPU-side
 // cache work). Lives in the main_ram static window (static_memory.h), not SRAM .bss: the
@@ -66,5 +85,6 @@ struct resident_state {
 };
 struct resident_state *resident_state(void);
 void resident_stats_reset(void);
+void resident_listprof_print(uint32_t forwards);   // `listprof` lines (stats)
 
 #endif

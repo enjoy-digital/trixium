@@ -172,7 +172,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     def l2norm(x):
         nrm = f32(np.sqrt(_sumsq64(x)))
         nrm = max(nrm, eps)
-        return (x/nrm).astype(f32)
+        return (x*f32(f32(1)/nrm)).astype(f32)     # canonical: reciprocal, then multiply
 
     def sigmoid(x): return (f32(1.0)/(f32(1.0) + np.exp(-x, dtype=f32))).astype(f32)
     if silu_mode == "rv32f":

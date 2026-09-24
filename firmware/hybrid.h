@@ -12,6 +12,10 @@ int  hybrid_init(void);                     // After the header checks; 0 on suc
 void hybrid_reset(void);                    // New generation: states and position to zero.
 void hybrid_stats_reset(void);              // Reset exact-recurrence stage cycle counters.
 void hybrid_stats_print(void);              // Print averages when the recurrence HW is active.
+void hybrid_dnres_enable(int on);             // Console `dnres`: the resident DeltaNet layer.
+int  hybrid_dnres_enabled(void);
+void hybrid_xres_enable(int on);              // Console `xres`: the resident residual stream.
+int  hybrid_xres_enabled(void);
 int  hybrid_pos(void);                      // Positions processed since the reset.
 int  hybrid_context_capacity(void);         // Actual KV allocation after heap-fit reduction.
 int  hybrid_forward(int token, int want_logits); // Next token (argmax) or -1.

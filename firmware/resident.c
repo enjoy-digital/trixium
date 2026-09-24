@@ -56,7 +56,7 @@
 #define RS_ROWS_MAX  24576u    // int32 results per chunk that fit RS_Y.
 #define RS_WIDTH_MAX 17408u    // FP32 source that fits RS_F (and Q8 that fits RS_Q8B/RS_XW).
 #define RS_DESC0     0         // Descriptor slots 0..15: the hybrid path builds no other list.
-#define RS_DESC_MAX  16u
+#define RS_DESC_MAX  64u      // of the 192 slots in SP_DESC.
 
 // Unit 11 (SiLU-multiply). The FFN activation runs gate -> RS_F, up -> RS_Y (restored in
 // place), SiLU in place over RS_F; its fixup bitmap lands in RS_Q8B, which only a prepare
@@ -68,6 +68,7 @@
 #endif
 #define RS_FIXMAP RS_Q8B
 
+void resident_listprof_reset(void);
 static uint8_t initialized;   // The window struct is not BSS: zero it once, here.
 
 struct resident_state *resident_state(void)
@@ -88,11 +89,13 @@ void resident_stats_reset(void)
     R->prepare_cycles = R->matvec_cycles = 0;
     R->prepares = R->matvecs = R->fallbacks = 0;
     R->silu_cycles = 0;
+    resident_listprof_reset();
     R->silu_lists = R->silu_fixups = 0;
 }
 
 void resident_enable(int on) { resident_state()->enabled = on ? 1 : 0; }
 void resident_silu_enable(int on) { resident_state()->silu_enabled = on ? 1 : 0; }
+void resident_mark_act(void) { resident_state()->act_resident = 1; }
 
 int resident_available(void)
 {
@@ -142,9 +145,52 @@ static void desc_store(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_
 
 // Run a list and report the resident units' failures at once instead of after the
 // sequencer's stall timeout: a failed unit parks the list busy until the engine reset.
+// Per-descriptor list profile (console `stats`): cycles from one completed descriptor to
+// the next, accumulated per list name (the `what` pointer) and descriptor index. The
+// completion poll below reads the sequencer anyway; one timer read per poll is the cost.
+struct list_prof {
+    const char *what;
+    uint32_t calls, n;
+    uint64_t cyc[RS_DESC_MAX];
+};
+#define LISTPROF_N 8
+#define LP ((struct list_prof *)BONSAI_LISTPROF_ADDR)
+
+void resident_listprof_reset(void)
+{
+    memset(LP, 0, sizeof(struct list_prof)*LISTPROF_N);
+}
+
+void resident_listprof_print(uint32_t forwards)
+{
+    for (int i = 0; i < LISTPROF_N && LP[i].what; i++) {
+        struct list_prof *p = &LP[i];
+        if (!p->calls || !forwards) continue;
+        uint64_t total = 0;
+        for (uint32_t d = 0; d < p->n; d++) total += p->cyc[d];
+        printf("listprof %s: %lu calls/fwd, %lu cycles/call:", p->what,
+               (unsigned long)(p->calls/forwards), (unsigned long)(total/p->calls));
+        for (uint32_t d = 0; d < p->n; d++)
+            printf(" %lu", (unsigned long)(p->cyc[d]/p->calls));
+        puts("");
+    }
+}
+
+static struct list_prof *listprof_slot(const char *what)
+{
+    for (int i = 0; i < LISTPROF_N; i++) {
+        if (LP[i].what == what) return &LP[i];
+        if (!LP[i].what) { LP[i].what = what; return &LP[i]; }
+    }
+    return 0;
+}
+
 static int run_list(uint32_t count, const char *what)
 {
     struct resident_state *R = resident_state();
+    struct list_prof *prof = listprof_slot(what);
+    uint32_t last_d = 0;
+    uint64_t last_t = perf_now64();
     if (seq_wedged) {
         R->disabled = 1;
         return -1;
@@ -154,16 +200,36 @@ static int run_list(uint32_t count, const char *what)
     uint32_t spins = 0;
     for (;;) {
         uint32_t st = seq_status_read();
-        if (!(st & 1))
+        if (prof) {
+            uint32_t dc = st >> 8;
+            if (dc != last_d && dc < RS_DESC_MAX) {
+                uint64_t now = perf_now64();
+                prof->cyc[last_d] += now - last_t;       // descriptor last_d (and any skipped)
+                last_t = now; last_d = dc;
+            }
+        }
+        if (!(st & 1)) {
+            if (prof) {
+                if (last_d < RS_DESC_MAX) prof->cyc[last_d] += perf_now64() - last_t;
+                prof->calls++;
+                if (count > prof->n) prof->n = count;
+            }
             break;
+        }
         uint32_t eq = seq_activation_quantize_error_read(), eh = seq_hadamard_error_read(),
                  er = seq_projection_restore_error_read(), es = 0;
 #if SILU_BUILT
         es = seq_silu_error_read();
 #endif
+#ifdef CSR_SEQ_NORM_ERROR_ADDR
+        es |= seq_norm_error_read();
+#endif
+#ifdef CSR_SEQ_CONV_ERROR_ADDR
+        es |= seq_conv_error_read();
+#endif
         if ((eq | eh | er | es) || ++spins > 4000000u) {
             printf("resident: %s list failed at dcount %lu (quantize %08lx hadamard %08lx "
-                   "restore %08lx silu %08lx eng %02lx)%s - engine soft reset, resident path off\n",
+                   "restore %08lx silu/norm/conv %08lx eng %02lx)%s - engine soft reset, resident path off\n",
                    what, (unsigned long)(st >> 8), (unsigned long)eq, (unsigned long)eh,
                    (unsigned long)er, (unsigned long)es, (unsigned long)engine_csr_status_read(),
                    (eq | eh | er | es) ? "" : " [timeout]");
@@ -290,7 +356,15 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
 // Descriptors for dst_sp = FP32(e * resident Q8): engine matvec per K-segment, int32
 // segment sum, restore into dst_sp (RS_F, or RS_Y in place). Appends at *n; -1 = the
 // tensor or its results do not fit the resident map (nothing is run).
+static int build_matvec_at(uint32_t *n, const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
 static int build_matvec(uint32_t *n, const struct bons_entry *e, uint32_t dst_sp)
+{
+    return build_matvec_at(n, e, RS_Y, dst_sp);
+}
+
+// ystage: where the int32 segment partials go (RS_Y, or another region the caller keeps
+// clear of RS_F and the persistent map); dst_sp: RS_F, or ystage itself (restore in place).
+static int build_matvec_at(uint32_t *n, const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
 {
     struct resident_state *R = resident_state();
     if (!e || e->rows % 8 || e->rows > RS_ROWS_MAX || e->rows % (uint32_t)R->n_ch ||
@@ -301,9 +375,9 @@ static int build_matvec(uint32_t *n, const struct bons_entry *e, uint32_t dst_sp
         return -1;
     uint32_t rows = e->rows;
     uint32_t ystride = ((rows*4 + 31) & ~31u);   // One int32 result stream per segment.
-    if ((uint64_t)nseg*ystride > RS_F - RS_Y)    // The segment partials must fit RS_Y,
+    if (ystage % 32 || ystage + (uint64_t)nseg*ystride > RS_F)   // The partials fit below RS_F,
         return -1;
-    if (dst_sp == RS_F ? rows*4 > RS_SP_END - RS_F : dst_sp != RS_Y)   // the result its region,
+    if (dst_sp == RS_F ? rows*4 > RS_SP_END - RS_F : dst_sp != ystage)   // the result its region,
         return -1;
     if (*n + 2u*(uint32_t)nseg > RS_DESC_MAX - 1u)                       // and the list its slots.
         return -1;
@@ -323,18 +397,18 @@ static int build_matvec(uint32_t *n, const struct bons_entry *e, uint32_t dst_sp
         op.bias   = seg->bias;
         op.rshift = seg->rshift;
         op.xsrc   = RS_XW + xoff;
-        op.dst    = RS_Y + (uint32_t)k*ystride;
+        op.dst    = ystage + (uint32_t)k*ystride;
         seq_desc_engine((*n)++, &op);
         if (k) {
             // Wrapping int32 sum of the segment partials, as the fused path's reduce_acc.
-            int32_t a[4] = {(int32_t)RS_Y, (int32_t)(RS_Y + (uint32_t)k*ystride),
-                            (int32_t)RS_Y, (int32_t)((rows + 7)/8)};
+            int32_t a[4] = {(int32_t)ystage, (int32_t)(ystage + (uint32_t)k*ystride),
+                            (int32_t)ystage, (int32_t)((rows + 7)/8)};
             seq_desc_vec((*n)++, PROG_REDUCE_ACC, a, 4, 0);
         }
         xoff += seg->cols;
     }
     struct bns_seq_descriptor d;
-    if (bns_seq_desc_restore(&d, RS_Y, dst_sp, RS_E8, rows, (int32_t)e->rshift - (int32_t)e->bias))
+    if (bns_seq_desc_restore(&d, ystage, dst_sp, RS_E8, rows, (int32_t)e->rshift - (int32_t)e->bias))
         return -1;
     desc_words((*n)++, &d);
     return 0;
@@ -371,6 +445,82 @@ int resident_matvec(const struct bons_entry *e, float *dst)
     return rc;
 }
 
+// General lists (resident.h, "list builder"): hybrid.c composes whole-layer lists from
+// these. Every main-RAM transfer does its own cache maintenance; stores are invalidated
+// after a successful run.
+static struct {
+    uint32_t n, ninv, bad;
+    void *inv[16];
+    uint32_t inv_bytes[16];
+} RL;
+
+void rl_begin(void) { RL.n = RL.ninv = RL.bad = 0; }
+
+static int rl_room(uint32_t k)
+{
+    if (RL.n + k + 1 > RS_DESC_MAX) RL.bad = 1;
+    return !RL.bad;
+}
+
+void rl_fetch(const void *src, uint32_t bytes, uint32_t sp)
+{
+    if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
+    clean_cpu_dcache_range((void *)src, bytes);
+    desc_fetch(RL.n++, eng_addr(src), bytes/32, sp);
+}
+
+void rl_store(void *dst, uint32_t bytes, uint32_t sp)
+{
+    if (!rl_room(1) || ((uintptr_t)dst & 31) || bytes % 32 || sp % 32 || RL.ninv >= 16) { RL.bad = 1; return; }
+    flush_cpu_dcache_range(dst, bytes);
+    desc_store(RL.n++, eng_addr(dst), bytes/32, sp);
+    RL.inv[RL.ninv] = dst; RL.inv_bytes[RL.ninv++] = bytes;
+}
+
+void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
+{
+    if (!rl_room(9) || build_matvec_at(&RL.n, e, ystage, dst_sp)) RL.bad = 1;
+}
+
+void rl_desc(const struct bns_seq_descriptor *d)
+{
+    if (!rl_room(1)) return;
+    desc_words(RL.n++, d);
+}
+
+void rl_prepare(const float *src, uint32_t width, int rotate)
+{
+    struct resident_state *R = resident_state();
+    const struct bons_header *H = model_header();
+    uint32_t B = (uint32_t)H->hadamard_block;
+    struct bns_seq_descriptor d;
+    if (!rl_room(4) || width > RS_WIDTH_MAX || width % 32) { RL.bad = 1; return; }
+    if (src)
+        rl_fetch(src, width*4, RS_F);
+    if (rotate) {
+        int wi = width_index(H, width);
+        if (wi < 0 || width/B > 32) { RL.bad = 1; return; }
+        uint32_t blocks = width/B;
+        bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RL.n++, &d);
+        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(RL.n++, &d);
+        bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks); desc_words(RL.n++, &d);
+    } else {
+        bns_seq_desc_quantize(&d, RS_F, RS_XW, RS_E8, width, 1);              desc_words(RL.n++, &d);
+    }
+}
+
+int rl_run(const char *what)
+{
+    if (RL.bad || !resident_active())
+        return -1;
+    seq_desc_stop(RL.n++);
+    int rc = run_list(RL.n, what);
+    if (!rc)
+        for (uint32_t i = 0; i < RL.ninv; i++)
+            invd_cpu_dcache_range(RL.inv[i], RL.inv_bytes[i]);
+    return rc;
+}
+
 #if SILU_BUILT
 
 // Recompute the lanes the unit flagged (they hold g): the firmware's own expression, into
@@ -390,6 +540,35 @@ static uint32_t silu_patch(uint32_t rows, float *act)
             float r = m[i]*bonsai_silu_lookup(f[i], R->silu_lut);
             f[i] = r;
             if (act) act[i] = r;
+            patched++;
+        }
+    }
+    return patched;
+}
+
+// The general form for list builders (resident.h): g at g_sp, m at m_sp (0: m = 1.0), the
+// result at dst_sp with the unit's optional segment permutation, the bitmap at fixmap_sp.
+uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
+                             uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b)
+{
+    struct resident_state *R = resident_state();
+    const volatile uint32_t *bits = (const volatile uint32_t *)(SCRATCHPAD_BASE + fixmap_sp);
+    const volatile float *g = (const volatile float *)(SCRATCHPAD_BASE + g_sp);
+    const volatile float *m = (const volatile float *)(SCRATCHPAD_BASE + m_sp);
+    volatile float *dst = (volatile float *)(SCRATCHPAD_BASE + dst_sp);
+    uint32_t patched = 0;
+    for (uint32_t w = 0; w < (n + 31)/32; w++) {
+        uint32_t word = bits[w];
+        while (word) {
+            uint32_t i = 32*w + (uint32_t)__builtin_ctz(word);
+            word &= word - 1;
+            uint32_t o = i;
+            if (perm_a > 1) {
+                uint32_t sg = i/seg, within = i - sg*seg;
+                o = ((sg % perm_a)*perm_b + sg/perm_a)*seg + within;
+            }
+            float mv = m_sp ? m[i] : 1.0f;
+            dst[o] = mv*bonsai_silu_lookup(g[i], R->silu_lut);
             patched++;
         }
     }
@@ -599,6 +778,12 @@ int resident_silu_init(const float *lut, uint32_t *stage)
     (void)stage; resident_state()->silu_lut = lut; return -1;
 }
 int resident_silu_active(void) { return 0; }
+uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
+                             uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b)
+{
+    (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
+    return 0;
+}
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)
 {
@@ -610,6 +795,17 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
 #endif
 
 #else  // !RESIDENT_BUILT
+
+void resident_listprof_reset(void) {}
+void resident_listprof_print(uint32_t forwards) { (void)forwards; }
+
+void rl_begin(void) {}
+void rl_fetch(const void *src, uint32_t bytes, uint32_t sp) { (void)src; (void)bytes; (void)sp; }
+void rl_store(void *dst, uint32_t bytes, uint32_t sp) { (void)dst; (void)bytes; (void)sp; }
+void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp) { (void)e; (void)ystage; (void)dst_sp; }
+void rl_prepare(const float *src, uint32_t width, int rotate) { (void)src; (void)width; (void)rotate; }
+void rl_desc(const struct bns_seq_descriptor *d) { (void)d; }
+int  rl_run(const char *what) { (void)what; return -1; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
 int resident_prepare(const float *src, uint32_t width, int rotate)
@@ -625,6 +821,12 @@ int resident_silu_init(const float *lut, uint32_t *stage)
     (void)stage; resident_state()->silu_lut = lut; return -1;
 }
 int resident_silu_active(void) { return 0; }
+uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
+                             uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b)
+{
+    (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
+    return 0;
+}
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)
 {

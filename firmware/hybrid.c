@@ -31,6 +31,12 @@
 #include "engine.h"
 #include "infer.h"
 #include "hybrid.h"
+#include "bonsai_sequence.h"
+
+// The resident DeltaNet layer needs units 11 (SiLU), 12 (norm) and 13 (conv).
+#if defined(BONSAI_HAS_NORM) && defined(BONSAI_HAS_CONV) && defined(BONSAI_HAS_SILU)
+#define DNRES_BUILT 1
+#endif
 #include "perf.h"
 #include "fastmath.h"
 #include "resident.h"
@@ -80,6 +86,9 @@ static uint64_t hyb_cyc_fdown, hyb_cyc_logits;
 struct hyb_prof {
     uint64_t at_prep, at_qkv, at_rope, at_core, at_out;
     uint64_t fwd_weight_beats;
+    uint32_t dn_state_sp;
+    uint8_t dnres_enabled;           // console `dnres on|off`: the resident DeltaNet layer
+    uint8_t xres_enabled;            // console `xres on|off`: the resident residual stream
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -112,6 +121,10 @@ static uint32_t f32_bits(float x)
     union { float f; uint32_t u; } v = { .f = x };
     return v.u;
 }
+
+// Scratchpad staging of the head state (HP->dn_sp_state): DN_SP_STATE for the CPU-side
+// layer, RS_F for the resident layer (whose q/k/v and outputs sit where DN_SP_STATE is).
+#define dn_sp_state (HP->dn_state_sp)
 
 static uint32_t dn_head_addr(uint32_t global_head)
 {
@@ -156,7 +169,7 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
     } else {
         dn_pipe_join();                 // Never let a FETCH race an unjoined STORE.
         dn_pipe_prefetched = -1;
-        engine_fetch(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+        engine_fetch(chan, dn_head_addr(global_head), DN_HEAD_BEATS, dn_sp_state);
     }
     dn_cyc_fetch += perf_now64() - t0;
 
@@ -164,9 +177,12 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
     volatile float *sq = (volatile float *)(SCRATCHPAD_BASE + DN_SP_Q);
     volatile float *sk = (volatile float *)(SCRATCHPAD_BASE + DN_SP_K);
     volatile float *sv = (volatile float *)(SCRATCHPAD_BASE + DN_SP_V);
-    if (load_qk)
+    // qh == NULL: the caller pointed the unit's q/k/v bases at scratchpad data (resident
+    // layer); nothing to copy.
+    if (qh && load_qk)
         for (uint32_t i = 0; i < DN_HW_COLS; i++) { sq[i] = qh[i]; sk[i] = kh[i]; }
-    for (uint32_t i = 0; i < DN_HW_ROWS; i++) sv[i] = vh[i];
+    if (qh)
+        for (uint32_t i = 0; i < DN_HW_ROWS; i++) sv[i] = vh[i];
 
     dnunit_decay_write(f32_bits(decay));
     dnunit_beta_write(f32_bits(beta));
@@ -189,24 +205,25 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
     if (dn_pipe_use && !engine_wedged) {
         struct engine_op st = {0};
         st.kind = ENGINE_KIND_STORE; st.chan = chan;
-        st.wbase = dn_head_addr(global_head); st.wlen = DN_HEAD_BEATS; st.xsrc = DN_SP_STATE;
+        st.wbase = dn_head_addr(global_head); st.wlen = DN_HEAD_BEATS; st.xsrc = dn_sp_state;
         dn_pipe_done0 = engine_submit(&st);
         dn_pipe_store_open = 1;
         if (next_head >= 0) {
             struct engine_op ft = {0};
             ft.kind = ENGINE_KIND_FETCH; ft.chan = (uint8_t)((uint32_t)next_head % (uint32_t)n_ch);
-            ft.wbase = dn_head_addr((uint32_t)next_head); ft.wlen = DN_HEAD_BEATS; ft.dst = DN_SP_STATE;
+            ft.wbase = dn_head_addr((uint32_t)next_head); ft.wlen = DN_HEAD_BEATS; ft.dst = dn_sp_state;
             engine_submit(&ft);         // Queued behind the STORE; joined by the next head.
             dn_pipe_prefetched = next_head;
         }
     } else {
-        engine_store(chan, dn_head_addr(global_head), DN_HEAD_BEATS, DN_SP_STATE);
+        engine_store(chan, dn_head_addr(global_head), DN_HEAD_BEATS, dn_sp_state);
     }
     dn_cyc_store += perf_now64() - t0;
 
     t0 = perf_now64();
     volatile float *so = (volatile float *)(SCRATCHPAD_BASE + DN_SP_OUT);
-    for (uint32_t i = 0; i < DN_HW_ROWS; i++) oh[i] = so[i];
+    if (oh)                                // NULL: the output base is the resident layer's
+        for (uint32_t i = 0; i < DN_HW_ROWS; i++) oh[i] = so[i];
     dn_cyc_output += perf_now64() - t0;
     dn_heads_profiled++;
 }
@@ -241,6 +258,18 @@ static void dn_hw_reset(void)
     }
 }
 #endif
+
+void hybrid_dnres_enable(int on) { HP->dnres_enabled = on ? 1 : 0; }
+void hybrid_xres_enable(int on) { HP->xres_enabled = on ? 1 : 0; }
+int hybrid_xres_enabled(void) { return HP->xres_enabled && resident_active(); }
+int hybrid_dnres_enabled(void)
+{
+#ifdef DNRES_BUILT
+    return HP->dnres_enabled && resident_silu_active();
+#else
+    return 0;
+#endif
+}
 
 int hybrid_present(void)
 {
@@ -307,12 +336,15 @@ static void l2norm_fv(float *v, int n)   // ggml_l2_norm: v / max(|v|, eps)
     int i;
     float nrm = sqrtf(ss);
     if (nrm < rms_eps) nrm = rms_eps;
+    // Canonical (docs/canonical-reductions.md): one correctly rounded reciprocal, then a
+    // multiply per element - what the norm unit does - not a divide per element.
+    float inv = 1.0f/nrm;
     i = 0;
     for (; i + 3 < n; i += 4) {
-        v[i + 0] /= nrm; v[i + 1] /= nrm;
-        v[i + 2] /= nrm; v[i + 3] /= nrm;
+        v[i + 0] *= inv; v[i + 1] *= inv;
+        v[i + 2] *= inv; v[i + 3] *= inv;
     }
-    for (; i < n; i++) v[i] /= nrm;
+    for (; i < n; i++) v[i] *= inv;
 }
 
 static void silu_mul_fv(float *dst, const float *mul, const float *gate, int n)
@@ -509,6 +541,8 @@ int hybrid_init(void)
                    (unsigned long)limit);
             return -1;
         }
+        HP->dn_state_sp = DN_SP_STATE;
+        HP->dnres_enabled = 1;
         dnunit_state_base_write(DN_SP_STATE);
         dnunit_q_base_write(DN_SP_Q);
         dnunit_k_base_write(DN_SP_K);
@@ -599,12 +633,20 @@ int hybrid_init(void)
         rope_freq[i] = powf((float)H->rope_theta, -2.0f*i/rope_n);
     rope_pos_cached = -1;
     hybrid_reset();
+    HP->dnres_enabled = 0;
+    HP->xres_enabled = 0;
     if (H->hadamard_block && resident_available()) {
         if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
             uint32_t *stage = infer_halloc(1025*32, 0);   // Table image for the DMA.
             if (resident_silu_init(silu_lut, stage) == 0)
                 puts("hybrid: resident FFN activation (unit 11 SiLU-multiply) on");
+#ifdef DNRES_BUILT
+            HP->dnres_enabled = 1;
+            HP->xres_enabled = 1;
+            if (n_dn && resident_silu_active())
+                puts("hybrid: resident DeltaNet layer (conv/norm/SiLU units, lists) on");
+#endif
         }
     }
     {
@@ -735,6 +777,7 @@ void hybrid_stats_print(void)
                    (unsigned long)(R->matvec_cycles/hyb_forwards_profiled),
                    (unsigned long)(R->fallbacks/hyb_forwards_profiled),
                    resident_active() ? "on" : "off");
+        resident_listprof_print(hyb_forwards_profiled);
         if (R->silu_lists)
             printf("siluprof: per fwd %lu ffn lists (%lu cycles), %lu fixups total\n",
                    (unsigned long)(R->silu_lists/hyb_forwards_profiled),
@@ -950,6 +993,228 @@ static void deltanet_layer(int l, const float *h, float *out)
     dn_cyc_outproj += perf_now64() - t0;
 }
 
+#ifdef DNRES_BUILT
+static uint32_t f32_bits_any(float x)
+{
+    union { float f; uint32_t u; } v = { .f = x };
+    return v.u;
+}
+// The resident DeltaNet layer: the whole layer in scratchpad lists (units 1/3/4/5/8 for the
+// projections, 13 conv, 11 SiLU, 12 norms, the recurrence unit per head), the CPU doing
+// only the per-head scalars and the rare SiLU fixups. Bit-exact with deltanet_layer (the
+// sim gate compares them checkpoint by checkpoint). Scratchpad map for this layer:
+#define DNR_QKV   0x04800u        // qkv, then conv+SiLU output, q/k L2-normed in place (4C)
+static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
+
+static int deltanet_layer_resident(int l, const float *h, float *out)
+{
+    int s = dn_slot[l];
+    uint32_t C = (uint32_t)(2*nq + nvh);
+    uint32_t Z = dnr_align(DNR_QKV + 4*C), BA = dnr_align(Z + 4*(uint32_t)nvh);
+    uint32_t AL = BA + dnr_align(4*(uint32_t)nv), FIX = AL + dnr_align(4*(uint32_t)nv);
+    uint32_t HO = dnr_align(FIX + 4*((C > (uint32_t)nvh ? C : (uint32_t)nvh) + 31)/32);
+    uint32_t NW = dnr_align(HO + 4*(uint32_t)nvh);
+    const uint32_t CH = 2048, W = RS_F_ADDR, X = RS_F_ADDR + 16*CH;
+    uint32_t eps = f32_bits_any(rms_eps);
+    if (!HP->dnres_enabled || !resident_silu_active() || !H->hadamard_block || conv_k != 4 ||
+        NW + dnr_align(4*(uint32_t)hv) > RS_F_ADDR || C % 8 || hv % 8 || hk % 8 ||
+        (seq_silu_abi_read() & 0xffff) < 1 || (seq_norm_abi_read() >> 16) != 1 ||
+        (seq_conv_abi_read() >> 16) != 1)
+        return -1;
+    float *win = dn_conv + (uint64_t)s*(conv_k - 1)*C;
+    struct bns_seq_descriptor d;
+
+    // A: projections. qkv and z restored in place where they will be used.
+    uint64_t t0 = perf_now64();
+    rl_begin();
+    rl_prepare(h, (uint32_t)n_embd, 1);
+    rl_matvec(model_entry(ROLE_ATTN_QKV, l), DNR_QKV, DNR_QKV);
+    rl_matvec(model_entry(ROLE_ATTN_ZGATE, l), Z, Z);
+    rl_prepare(h, (uint32_t)n_embd, 0);                              // beta/alpha are not folded
+    rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
+    rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
+    rl_store(betab, dnr_align(4*(uint32_t)nv), BA);
+    rl_store(alphab, dnr_align(4*(uint32_t)nv), AL);
+    if (rl_run("deltanet projections"))
+        return -1;                     // nothing of the layer's state has moved yet
+    dn_cyc_inproj += perf_now64() - t0;
+    t0 = perf_now64();
+    for (int hh = 0; hh < nv; hh++) {
+        betab[hh] = sigmoidf(betab[hh]);
+        gb[hh]    = softplusf(alphab[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
+    }
+    dn_cyc_act += perf_now64() - t0;
+
+    // B: causal conv in chunks (window slots oldest to newest p0, p1, p2; the new input
+    // replaces p0 after its chunk was read), then SiLU in place with a unit multiplier.
+    t0 = perf_now64();
+    int p0 = dn_conv_pos[s], p1 = p0 == 2 ? 0 : p0 + 1, p2 = p1 == 2 ? 0 : p1 + 1;
+    float *x0 = win + (uint64_t)p0*C, *x1 = win + (uint64_t)p1*C, *x2 = win + (uint64_t)p2*C;
+    rl_begin();
+    for (uint32_t c0 = 0; c0 < C; c0 += CH) {
+        uint32_t ch = C - c0 < CH ? C - c0 : CH;
+        rl_fetch(conv_w[l] + 4*c0, 16*ch, W);
+        rl_fetch(x0 + c0, 4*ch, X);
+        rl_fetch(x1 + c0, 4*ch, X + 4*CH);
+        rl_fetch(x2 + c0, 4*ch, X + 8*CH);
+        rl_store(x0 + c0, 4*ch, DNR_QKV + 4*c0);
+        bns_seq_desc_conv(&d, X, X + 4*CH, X + 8*CH, DNR_QKV + 4*c0, W, DNR_QKV + 4*c0, ch);
+        rl_desc(&d);
+    }
+    bns_seq_desc_silu_ex(&d, DNR_QKV, DNR_QKV, DNR_QKV, FIX, C, 1, 0, 0, 0);
+    rl_desc(&d);
+    if (rl_run("deltanet conv"))
+        goto fatal;
+    dn_conv_pos[s] = (uint8_t)p1;
+    if (seq_silu_fixups_read())
+        resident_silu_patch(DNR_QKV, 0, DNR_QKV, FIX, C, 0, 0, 0);
+    dn_cyc_conv += perf_now64() - t0;
+    t0 = perf_now64();
+    rl_begin();
+    bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
+    rl_desc(&d);
+    if (rl_run("deltanet q/k l2"))
+        goto fatal;
+    dn_cyc_prep += perf_now64() - t0;
+
+    // Heads: outputs in natural head order at HO.
+    t0 = perf_now64();
+    float scale = 1.0f/sqrtf((float)hk);
+    int rep = nv/nk;
+    if (dn_hw) {
+#ifdef BONSAI_HAS_DNREC
+        dn_sp_state = RS_F_ADDR;
+        dnunit_state_base_write(RS_F_ADDR);
+        for (int hi = 0; hi < nv; hi++) {
+            int kh = hi/rep, r = hi - kh*rep, hh = r*nk + kh;
+            int next_head = -1;
+            if (dn_pipe_use && hi + 1 < nv) {
+                int nkh = (hi + 1)/rep, nr = hi + 1 - nkh*rep;
+                next_head = (int)((uint32_t)s*nv) + nr*nk + nkh;
+            }
+            dnunit_q_base_write(DNR_QKV + 4u*(uint32_t)(kh*hk));
+            dnunit_k_base_write(DNR_QKV + 4u*(uint32_t)(nq + kh*hk));
+            dnunit_v_base_write(DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv));
+            dnunit_out_base_write(HO + 4u*(uint32_t)(hh*hv));
+            dn_hw_head((uint32_t)s*nv + (uint32_t)hh, NULL, NULL, NULL, expf(gb[hh]), betab[hh],
+                       scale, NULL, r == 0, next_head);
+        }
+        dn_pipe_join();
+        dn_sp_state = DN_SP_STATE;
+        dnunit_state_base_write(DN_SP_STATE);
+        dnunit_q_base_write(DN_SP_Q); dnunit_k_base_write(DN_SP_K);
+        dnunit_v_base_write(DN_SP_V); dnunit_out_base_write(DN_SP_OUT);
+        if (engine_wedged)
+            goto fatal;
+#endif
+    } else {
+        // No recurrence unit (a simulation without --with-dnrec): the CPU recurrence on
+        // the normalised q/k/v, then its outputs back into the scratchpad.
+        rl_begin();
+        rl_store(convb, dnr_align(4*C), DNR_QKV);
+        if (rl_run("deltanet qkv out"))
+            goto fatal;
+        const float *dn_q = convb, *dn_k = convb + nq, *dn_v = convb + 2*nq;
+        for (int hh = 0; hh < nv; hh++) {
+            int kh = hh % nk;
+            const float *qh = dn_q + kh*hk, *kk = dn_k + kh*hk, *vh = dn_v + hh*hv;
+            float *M = dn_state + ((uint64_t)s*nv + hh)*hv*hk, *oh = ob + hh*hv;
+            float decay = expf(gb[hh]);
+            int j = 0;
+            for (; j + 3 < hv; j += 4)
+                deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
+            for (; j < hv; j++) {
+                float *Mj = M + j*hk, dot = 0;
+                for (int i = 0; i < hk; i++) { Mj[i] *= decay; dot += Mj[i]*kk[i]; }
+                float dj = (vh[j] - dot)*betab[hh];
+                dot = 0;
+                for (int i = 0; i < hk; i++) { Mj[i] += dj*kk[i]; dot += Mj[i]*qh[i]; }
+                oh[j] = dot*scale;
+            }
+        }
+        rl_begin();
+        rl_fetch(ob, dnr_align(4*(uint32_t)nvh), HO);
+        if (rl_run("deltanet heads in"))
+            goto fatal;
+    }
+    dn_cyc_heads += perf_now64() - t0;
+
+    // C: gated RMSNorm over the heads, x SiLU(z), into the grouped order at RS_F (og).
+    t0 = perf_now64();
+    rl_begin();
+    rl_fetch(norm_ssm[l], dnr_align(4*(uint32_t)hv), NW);
+    bns_seq_desc_norm(&d, 0, HO, HO, NW, (uint32_t)hv, (uint32_t)nv, eps);
+    rl_desc(&d);
+    bns_seq_desc_silu_ex(&d, Z, HO, RS_F_ADDR, FIX, (uint32_t)nvh, 0, (uint32_t)hv/8, (uint32_t)nk,
+                         (uint32_t)rep);
+    rl_desc(&d);
+    if (rl_run("deltanet gated norm"))
+        goto fatal;
+    if (seq_silu_fixups_read())
+        resident_silu_patch(Z, HO, RS_F_ADDR, FIX, (uint32_t)nvh, (uint32_t)hv, (uint32_t)nk, (uint32_t)rep);
+    // The CPU fallback of the out projection reads og from main RAM.
+    rl_begin();
+    rl_store(og, dnr_align(4*(uint32_t)nvh), RS_F_ADDR);
+    if (rl_run("deltanet og out"))
+        goto fatal;
+    dn_cyc_gate += perf_now64() - t0;
+
+    t0 = perf_now64();
+    struct resident_state *R = resident_state();
+    R->prep_src = og; R->prep_width = nvh; R->prep_rotate = 1;
+    resident_mark_act();
+    if (resident_prepare(NULL, (uint32_t)nvh, 1) == 0)
+        matvec_q(model_entry(ROLE_SSM_OUT, l), E8_RESIDENT, out);
+    else
+        proj_f(model_entry(ROLE_SSM_OUT, l), og, out);
+    dn_cyc_outproj += perf_now64() - t0;
+    return 0;
+fatal:
+    // A list failed after the layer's window/state started to move: the forward cannot be
+    // recomputed on the CPU. The resident path is off (run_list); report and stop.
+    puts("hybrid: resident DeltaNet layer failed mid-layer - this token is invalid");
+    return -2;
+}
+#endif
+
+#ifdef DNRES_BUILT
+// The resident residual stream: x lives in the scratchpad at XRES_SP for the whole forward;
+// the norms (unit 12) read it and leave hb in RS_F (and main RAM, for the mixers and the
+// traces); the residual adds (unit 13 op 1) add the layer outputs into it. xb (main RAM)
+// is only brought up to date for traces and for the LM head.
+#define XRES_SP 0x36600u               // above the persistent resident map, below RS_SIGN
+static int xres_ok(void)
+{
+    return HP->xres_enabled && resident_active() && n_embd % 8 == 0 && n_embd <= 8192 &&
+           XRES_SP + 4u*(uint32_t)n_embd <= 0x3C000u &&
+           (seq_norm_abi_read() >> 16) == 1 && (seq_conv_abi_read() >> 16) == 1;
+}
+
+static int xres_list(const float *y, const float *w, int load, int sync)
+{
+    struct bns_seq_descriptor d;
+    uint32_t n = (uint32_t)n_embd, bytes = 4*n;
+    uint32_t wsp = RS_Y_ADDR + ((bytes + 31u) & ~31u);
+    rl_begin();
+    if (load)
+        rl_fetch(xb, bytes, XRES_SP);
+    if (y) {
+        rl_fetch(y, bytes, RS_Y_ADDR);
+        bns_seq_desc_add(&d, XRES_SP, RS_Y_ADDR, XRES_SP, n);
+        rl_desc(&d);
+    }
+    if (sync)
+        rl_store(xb, bytes, XRES_SP);
+    if (w) {
+        rl_fetch(w, bytes, wsp);
+        bns_seq_desc_norm(&d, 0, XRES_SP, RS_F_ADDR, wsp, n, 1, f32_bits_any(rms_eps));
+        rl_desc(&d);
+        rl_store(hb, bytes, RS_F_ADDR);
+    }
+    return rl_run("residual stream");
+}
+#endif
+
 static void attention_layer(int l, const float *h, float *out)
 {
     int a = attn_slot[l];
@@ -1039,14 +1304,31 @@ int hybrid_forward(int token, int want_logits)
     if (infer_embed_f(token, xb) < 0) return -1;
     hyb_cyc_embed += perf_now64() - t0;
     infer_dbg_f32("emb", -1, xb, n_embd);
+    int xres = 0;
+#ifdef DNRES_BUILT
+    xres = xres_ok();
+#endif
+    int traced = infer_dbg_armed();
     for (int l = 0; l < n_layer; l++) {
         t0 = perf_now64();
-        rmsnorm_fv(hb, xb, norm_attn[l], n_embd);
+        if (xres) {
+#ifdef DNRES_BUILT
+            if (xres_list(NULL, norm_attn[l], l == 0, 0)) return -1;
+#endif
+        } else {
+            rmsnorm_fv(hb, xb, norm_attn[l], n_embd);
+        }
         hyb_cyc_anorm += perf_now64() - t0;
         infer_dbg_f32("attn_norm", l, hb, n_embd);
         t0 = perf_now64();
         if (dn_slot[l] >= 0) {
-            deltanet_layer(l, hb, tmp_h);
+            int rc = -1;
+#ifdef DNRES_BUILT
+            rc = deltanet_layer_resident(l, hb, tmp_h);
+            if (rc == -2) return -1;
+#endif
+            if (rc)
+                deltanet_layer(l, hb, tmp_h);
             hyb_cyc_dn += perf_now64() - t0;
         } else {
             attention_layer(l, hb, tmp_h);
@@ -1054,11 +1336,21 @@ int hybrid_forward(int token, int want_logits)
         }
         infer_dbg_f32(dn_slot[l] >= 0 ? "dn_out" : "attn_out", l, tmp_h, n_embd);
         t0 = perf_now64();
-        add_fv(xb, tmp_h, n_embd);
-        hyb_cyc_resid += perf_now64() - t0;
-        infer_dbg_f32("attn_res", l, xb, n_embd);
-        t0 = perf_now64();
-        rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
+        if (xres) {
+#ifdef DNRES_BUILT
+            // Residual add, the FFN norm, and xb for the trace when traced.
+            if (xres_list(tmp_h, norm_ffn[l], 0, traced)) return -1;
+#endif
+            hyb_cyc_resid += perf_now64() - t0;
+            infer_dbg_f32("attn_res", l, xb, n_embd);
+            t0 = perf_now64();
+        } else {
+            add_fv(xb, tmp_h, n_embd);
+            hyb_cyc_resid += perf_now64() - t0;
+            infer_dbg_f32("attn_res", l, xb, n_embd);
+            t0 = perf_now64();
+            rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
+        }
         infer_dbg_f32("ffn_norm", l, hb, n_embd);
         int e8;
         if (H->hadamard_block)
@@ -1107,7 +1399,14 @@ int hybrid_forward(int token, int want_logits)
         }
         infer_dbg_f32("ffn_down", l, tmp_h, n_embd);
         t0 = perf_now64();
-        add_fv(xb, tmp_h, n_embd);
+        if (xres) {
+#ifdef DNRES_BUILT
+            // The last layer brings xb up to date for the LM head.
+            if (xres_list(tmp_h, NULL, 0, traced || l == n_layer - 1)) return -1;
+#endif
+        } else {
+            add_fv(xb, tmp_h, n_embd);
+        }
         hyb_cyc_resid += perf_now64() - t0;
         infer_dbg_f32("ffn_res", l, xb, n_embd);
     }
