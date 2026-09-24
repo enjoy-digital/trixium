@@ -73,6 +73,10 @@ int bns_seq_desc_silu_load(struct bns_seq_descriptor *out, uint32_t src);
 int bns_seq_desc_silu_ex(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
                         uint32_t dst, uint32_t fixmap, uint32_t elements, uint32_t unit_m,
                         uint32_t seg_beats, uint32_t perm_a, uint32_t perm_b);
+/* Unit 11 (ABI >= 1.2), table only: dst = m * table(g) with every element outside the table
+ * range a fixup (no SiLU pass-through or -0) - for a table other than SiLU's (the sigmoid). */
+int bns_seq_desc_silu_table(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                           uint32_t dst, uint32_t fixmap, uint32_t elements);
 /* Unit 12, norm ABI 1: RMSNorm (l2 = 0, weight) or L2 (l2 = 1) over nseg segments of n. */
 int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src, uint32_t dst,
                      uint32_t weight, uint32_t n, uint32_t nseg, uint32_t eps_bits);

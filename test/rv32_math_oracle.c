@@ -48,8 +48,9 @@ void _start(void)
     }
     float x;
     while (transfer(0, &x, sizeof(x))) {
-        float out[4] = {__ieee754_expf(x), bonsai_siluf(x), bonsai_silu_lookup(x, lut),
-                        bonsai_sigmoid_lookup(x, slut)};
+        float neg = x < 0.0f ? x : -x;     /* softmax arguments are s - max <= 0 */
+        float out[5] = {__ieee754_expf(x), bonsai_siluf(x), bonsai_silu_lookup(x, lut),
+                        bonsai_sigmoid_lookup(x, slut), bonsai_softmax_exp(neg)};
         transfer(1, out, sizeof(out));
     }
     quit(0);

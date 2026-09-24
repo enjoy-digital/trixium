@@ -245,11 +245,17 @@ def classify(g, m):
     return "fixup"
 
 
-def silu_mul_fixed(g, m, lut=None, dlut=None):
-    """silu_mul_fast restructured as the RTL computes it: (result bits, fixup)."""
+def silu_mul_fixed(g, m, lut=None, dlut=None, table_only=False):
+    """silu_mul_fast restructured as the RTL computes it: (result bits, fixup).
+
+    table_only (unit 11 ABI 1.2): the SiLU-specific out-of-table results (pass-through
+    above 16, -0 below -80) become fixups too, so any table - the canonical sigmoid's -
+    runs through the unit with the CPU patching everything outside [-16, 16)."""
     if lut is None:
         lut, dlut = tables()
     kind = classify(g, m)
+    if table_only and kind in ("pass", "negzero"):
+        kind = "fixup"
     if kind == "fixup":
         return 0, True
     if kind == "pass":

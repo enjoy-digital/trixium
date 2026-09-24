@@ -28,7 +28,7 @@ from trixium.gateware.silu_mul import SiluMulKernel, LUT_N
 
 SILU_COMMAND = [("op", 1), ("src_g", 24), ("src_m", 24), ("dst", 24), ("fixmap", 24),
                 ("elements", 16), ("unit_m", 1), ("seg_beats", 16), ("perm_a", 8), ("perm_b", 8),
-                ("protect_start", 24), ("protect_end", 24)]
+                ("protect_start", 24), ("protect_end", 24), ("table_only", 1)]
 OP_RUN, OP_LOAD = 0, 1
 LOAD_BEATS = 513 + 512
 
@@ -109,6 +109,7 @@ class BonsaiSiluScratchpad(LiteXModule):
             clear.eq(self.cancel | ((state != RUN) & (state != LOAD))),
             pairs.reset.eq(clear),
             kernel.reset.eq(clear),
+            kernel.table_only.eq(cap["table_only"]),
             can_issue.eq((issued < beats) & ((pairs.level + in_flight) < 2)),
         ]
 

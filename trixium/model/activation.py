@@ -38,7 +38,7 @@ def scratchpad_requantize_descriptor(*, src, dst, exponents, maxima, result_expo
 
 
 def scratchpad_silu_descriptor(*, src_g, src_m=0, dst=0, fixmap=0, elements=0, load=False,
-                               unit_m=False, seg_beats=0, perm_a=0, perm_b=0):
+                               unit_m=False, seg_beats=0, perm_a=0, perm_b=0, table_only=False):
     """Encode optional unit 11; check seq.silu_abi major 1 first.
 
     RUN: dst[i] = m[i] * silu(g[i]) bit-exact with the firmware, fixup elements keep g in
@@ -58,14 +58,15 @@ def scratchpad_silu_descriptor(*, src_g, src_m=0, dst=0, fixmap=0, elements=0, l
             raise ValueError('a table load has no elements')
     elif not isinstance(elements, int) or not 1 <= elements < 65536:
         raise ValueError('elements must be in [1, 65535]')
-    if load and (unit_m or seg_beats or perm_a or perm_b):
+    if load and (unit_m or seg_beats or perm_a or perm_b or table_only):
         raise ValueError('a table load takes no run options')
     for name, value, bits in (('seg_beats', seg_beats, 16), ('perm_a', perm_a, 8), ('perm_b', perm_b, 8)):
         if not isinstance(value, int) or not 0 <= value < 1 << bits:
             raise ValueError(name + ' out of range')
     if perm_a > 1 and seg_beats*perm_a*perm_b*8 != elements:
         raise ValueError('a permuted output needs elements == seg_beats*8*perm_a*perm_b')
-    return [11, src_g, src_m, dst, fixmap, elements, int(load) | int(bool(unit_m)) << 1,
+    return [11, src_g, src_m, dst, fixmap, elements,
+            int(load) | int(bool(unit_m)) << 1 | int(bool(table_only)) << 2,
             seg_beats | perm_a << 16 | perm_b << 24] + [0]*8
 
 

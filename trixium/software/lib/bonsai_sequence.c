@@ -121,6 +121,13 @@ int bns_seq_desc_silu_ex(struct bns_seq_descriptor *out, uint32_t src_g, uint32_
     d.word[5]=elements; d.word[6]=unit_m << 1; d.word[7]=seg_beats | perm_a << 16 | perm_b << 24;
     *out=d; return BNS_SEQ_DESC_OK;
 }
+int bns_seq_desc_silu_table(struct bns_seq_descriptor *out, uint32_t src_g, uint32_t src_m,
+                           uint32_t dst, uint32_t fixmap, uint32_t elements)
+{
+    int rc = bns_seq_desc_silu_ex(out, src_g, src_m, dst, fixmap, elements, 0, 0, 0, 0);
+    if (rc == BNS_SEQ_DESC_OK) out->word[6] |= 1u << 2;
+    return rc;
+}
 int bns_seq_desc_norm(struct bns_seq_descriptor *out, uint32_t l2, uint32_t src, uint32_t dst,
                      uint32_t weight, uint32_t n, uint32_t nseg, uint32_t eps_bits)
 {

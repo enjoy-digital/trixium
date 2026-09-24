@@ -39,6 +39,17 @@ static inline float bonsai_expf_bounded(float x)
     return p*scale.f;
 }
 
+// Canonical softmax exp (docs/canonical-reductions.md, "softmax"): the bounded exp above
+// on [-80, 0], +0 below (a term under 2^-115 of the maximum's 1.0, below every FP32 sum
+// that holds the maximum), a NaN argument returned (s - max: already the canonical NaN).
+// Softmax arguments are s - max <= 0, exactly +0 at the maximum (exp(+0) = 1 here too).
+static inline float bonsai_softmax_exp(float x)
+{
+    if (x != x) return x;
+    if (x < -80.0f) return 0.0f;
+    return bonsai_expf_bounded(x);
+}
+
 static inline float bonsai_siluf(float x)
 {
     // These tails avoid overflow and keep the range-reduction exponent normal.  At 16,

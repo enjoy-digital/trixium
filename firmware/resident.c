@@ -71,6 +71,8 @@
 void resident_listprof_reset(void);
 static uint8_t initialized;   // The window struct is not BSS: zero it once, here.
 
+_Static_assert(sizeof(struct resident_state) <= 256, "resident_state window is 256 bytes");
+
 struct resident_state *resident_state(void)
 {
     struct resident_state *R = (struct resident_state *)BONSAI_RESIDENT_STATE_ADDR;
@@ -736,6 +738,7 @@ int resident_silu_init(const float *lut, uint32_t *stage)
         return -1;
     }
     R->silu_ready = 1;
+    R->silu_image = stage;          // kept: rl_gate restores the SiLU table from it
     return 0;
 }
 
@@ -743,6 +746,83 @@ int resident_silu_active(void)
 {
     struct resident_state *R = resident_state();
     return resident_active() && R->silu_ready && R->silu_enabled;
+}
+
+int resident_gate_init(const float *sig_lut, uint32_t *image)
+{
+    struct resident_state *R = resident_state();
+    R->gate_ready = 0;
+    if (!R->silu_ready || !R->silu_image || !sig_lut || !image || ((uintptr_t)image & 31) ||
+        (seq_silu_abi_read() >> 16) != 1 || (seq_silu_abi_read() & 0xffff) < 2)
+        return -1;
+    // The SiLU image's layout (resident_silu_init) on the canonical sigmoid table.
+    union { float f; uint32_t u; } v;
+    for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++) image[i] = 0;
+    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) { v.f = sig_lut[i]; image[i] = v.u; }
+    for (int i = 0; i < BONSAI_SILU_LUT_N; i++) { v.f = sig_lut[i + 1] - sig_lut[i]; image[513*8 + i] = v.u; }
+    clean_cpu_dcache_range(image, SILU_IMAGE_WORDS*4);
+    R->sig_image = image;
+    R->sig_lut = sig_lut;
+    R->gate_ready = 1;
+    return 0;
+}
+
+int resident_silu_restore(void)
+{
+    // After a failed gated list the unit may still hold the sigmoid table.
+    struct resident_state *R = resident_state();
+    struct bns_seq_descriptor d;
+    uint32_t n = 0;
+    if (!R->silu_ready || !R->silu_image)
+        return -1;
+    desc_fetch(n++, eng_addr(R->silu_image), SILU_IMAGE_WORDS/8, RS_F);
+    bns_seq_desc_silu_load(&d, RS_F);
+    desc_words(n++, &d);
+    seq_desc_stop(n++);
+    if (run_list(n, "silu table restore")) {
+        R->silu_enabled = 0;
+        puts("resident: the SiLU table could not be restored - unit 11 off");
+        return -1;
+    }
+    return 0;
+}
+
+int resident_gate_active(void)
+{
+    return resident_silu_active() && resident_state()->gate_ready;
+}
+
+void rl_gate(uint32_t g_sp, uint32_t m_sp, uint32_t fixmap_sp, uint32_t img_sp, uint32_t n)
+{
+    struct resident_state *R = resident_state();
+    struct bns_seq_descriptor d;
+    if (!resident_gate_active() || !rl_room(6)) { RL.bad = 1; return; }
+    desc_fetch(RL.n++, eng_addr(R->sig_image), SILU_IMAGE_WORDS/8, img_sp);
+    bns_seq_desc_silu_load(&d, img_sp);                          desc_words(RL.n++, &d);
+    if (bns_seq_desc_silu_table(&d, g_sp, m_sp, g_sp, fixmap_sp, n)) { RL.bad = 1; return; }
+    desc_words(RL.n++, &d);
+    desc_fetch(RL.n++, eng_addr(R->silu_image), SILU_IMAGE_WORDS/8, img_sp);
+    bns_seq_desc_silu_load(&d, img_sp);                          desc_words(RL.n++, &d);
+}
+
+uint32_t resident_gate_patch(uint32_t fixmap_sp, const float *g, uint32_t m_sp, float *dst,
+                             uint32_t n)
+{
+    struct resident_state *R = resident_state();
+    const volatile uint32_t *bits = (const volatile uint32_t *)(SCRATCHPAD_BASE + fixmap_sp);
+    const volatile float *m = (const volatile float *)(SCRATCHPAD_BASE + m_sp);
+    uint32_t patched = 0;
+    for (uint32_t w = 0; w < (n + 31)/32; w++) {
+        uint32_t word = bits[w];
+        while (word) {
+            uint32_t i = 32*w + (uint32_t)__builtin_ctz(word);
+            word &= word - 1;
+            dst[i] = m[i]*bonsai_sigmoid_lookup(g[i], R->sig_lut);
+            patched++;
+        }
+    }
+    R->gate_fixups += patched;
+    return patched;
 }
 
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
@@ -810,6 +890,21 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     resident_state()->fallbacks++;
     return -1;
 }
+int resident_gate_init(const float *sig_lut, uint32_t *image)
+{
+    (void)sig_lut; (void)image; resident_state()->gate_ready = 0; return -1;
+}
+int resident_gate_active(void) { return 0; }
+int resident_silu_restore(void) { return -1; }
+void rl_gate(uint32_t g_sp, uint32_t m_sp, uint32_t fixmap_sp, uint32_t img_sp, uint32_t n)
+{
+    (void)g_sp; (void)m_sp; (void)fixmap_sp; (void)img_sp; (void)n;
+}
+uint32_t resident_gate_patch(uint32_t fixmap_sp, const float *g, uint32_t m_sp, float *dst,
+                             uint32_t n)
+{
+    (void)fixmap_sp; (void)g; (void)m_sp; (void)dst; (void)n; return 0;
+}
 
 #endif
 
@@ -855,6 +950,21 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     (void)gate; (void)up; (void)act; (void)gate_out; (void)up_out;
     resident_state()->fallbacks++;
     return -1;
+}
+int resident_gate_init(const float *sig_lut, uint32_t *image)
+{
+    (void)sig_lut; (void)image; resident_state()->gate_ready = 0; return -1;
+}
+int resident_gate_active(void) { return 0; }
+int resident_silu_restore(void) { return -1; }
+void rl_gate(uint32_t g_sp, uint32_t m_sp, uint32_t fixmap_sp, uint32_t img_sp, uint32_t n)
+{
+    (void)g_sp; (void)m_sp; (void)fixmap_sp; (void)img_sp; (void)n;
+}
+uint32_t resident_gate_patch(uint32_t fixmap_sp, const float *g, uint32_t m_sp, float *dst,
+                             uint32_t n)
+{
+    (void)fixmap_sp; (void)g; (void)m_sp; (void)dst; (void)n; return 0;
 }
 
 #endif

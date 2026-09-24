@@ -182,6 +182,9 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     else:
         def silu(x): return (x/(f32(1.0) + np.exp(-x, dtype=f32))).astype(f32)
     def softplus(x): return np.where(x > 20, x, np.log1p(np.exp(x, dtype=f32), dtype=f32)).astype(f32)
+    def softmax_exp(x): return np.exp(x, dtype=f32)
+    if silu_mode == "rv32f":
+        from trixium.model.rv32_math import softmax_exp_rv32 as softmax_exp   # canonical
 
     # Tables.
     norm_attn = [f32_rows(layout.ROLE_ATTN_NORM, l).reshape(-1) for l in range(n_layer)]
@@ -422,7 +425,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
             kvh = hh//n_rep
             sc = np.array([f32(_fsum32(q[hh]*kc[l][t][kvh])*scale_at) for t in range(T)], dtype=f32)
             mx = sc.max()
-            ex = np.exp((sc - mx).astype(f32), dtype=f32)
+            ex = softmax_exp((sc - mx).astype(f32))
             s = _fsum32(ex)
             o = np.zeros(hd, dtype=f32)
             for t in range(T):

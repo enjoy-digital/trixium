@@ -68,6 +68,7 @@ static int      dn_hw;
 static uint32_t at_hbm_base, at_slots, at_rowbeats;
 static int at_geom_ok;
 static float *at_buf;
+static float *at_gates;               // [n_head][head_dim]: the output gates, compacted
 #endif
 
 static uint32_t dn_hbm_base;
@@ -679,6 +680,7 @@ int hybrid_init(void)
 #ifdef BONSAI_HAS_ATTNSTREAM
     // Scores, then p, for every head: [n_head][ctx_cap rounded to 8].
     at_buf = at_geom_ok ? infer_halloc((uint64_t)n_head*((ctx_cap + 7) & ~7)*4, 1) : NULL;
+    at_gates = at_geom_ok && H->attn_gated ? infer_halloc((uint64_t)q_dim*4, 0) : NULL;
     if (!at_buf) at_geom_ok = 0;
 #endif
     logits = infer_halloc((uint64_t)H->vocab*4 + 64*n_ch*4, 1);
@@ -732,8 +734,14 @@ int hybrid_init(void)
         if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
             uint32_t *stage = infer_halloc(1025*32, 0);   // Table image for the DMA.
-            if (resident_silu_init(silu_lut, stage) == 0)
+            if (resident_silu_init(silu_lut, stage) == 0) {
                 puts("hybrid: resident FFN activation (unit 11 SiLU-multiply) on");
+#ifdef BONSAI_HAS_ATTNSTREAM
+                uint32_t *sig_image = n_attn && H->attn_gated ? infer_halloc(1025*32, 0) : NULL;
+                if (sig_image && resident_gate_init(sigmoid_lut, sig_image) == 0)
+                    puts("hybrid: attention output gate on unit 11 (sigmoid table, ABI 1.2)");
+#endif
+            }
 #ifdef DNRES_BUILT
             HP->dnres_enabled = 1;
             HP->xres_enabled = 1;
@@ -1406,9 +1414,11 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 
 // Appends this token's K/V row to engine DDR (every token while the stream is on), then runs
 // the two passes around the firmware's own softmax. 0: attnb holds the ungated outputs;
-// -1: the CPU loop runs on main RAM's copy (a long context, or a list failure, which also
-// turns the stream off until the next reset).
-static int attn_stream(int a, int T, float scale)
+// 1: the gated outputs (unit 11 applied the gate, the CPU patched its fixups); -1: the CPU
+// loop runs on main RAM's copy (a long context, or a list failure, which also turns the
+// stream off until the next reset).
+#define AT_G    AT_SP                  // after the values: the gates, gated in place
+static int attn_stream(int a, int T, float scale, int gated)
 {
     uint32_t hd = (uint32_t)head_dim, nq = (uint32_t)n_head, nkv = (uint32_t)n_kv_head;
     uint32_t Tp = ((uint32_t)T + 7u) & ~7u, rb = at_rowbeats, rowbytes = rb*32u;
@@ -1449,19 +1459,35 @@ static int attn_stream(int a, int T, float scale)
     for (uint32_t hh = 0; hh < nq; hh++) {
         float *sc = at_buf + hh*Tp, mx = -1e30f, sum = 0;
         for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
-        for (int t = 0; t < T; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+        for (int t = 0; t < T; t++) { sc[t] = bonsai_softmax_exp(sc[t] - mx); sum += sc[t]; }
         for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
     }
+    // The gate on unit 11 when it can: gates in place (m, the outputs, stays for the fixups),
+    // its fixup map and the table image behind them in RS_F.
+    uint32_t fx = AT_G + nq*hd*4u, img = AT_SP + 0x8000u;
+    int unit_gate = gated && at_gates && resident_gate_active() && fx + 1024u <= img;
     rl_begin();
     rl_fetch(at_buf, nq*Tp*4u, AT_SP);
     o.wbase = vspan; o.xsrc = AT_REC + 32u;
     rl_engine(&o);
-    rl_store(attnb, nq*hd*4u, AT_QO);
-    if (rl_run("attention values")) {
+    if (unit_gate) {
+        rl_fetch(at_gates, nq*hd*4u, AT_G);
+        rl_gate(AT_G, AT_QO, fx, img, nq*hd);
+        rl_store(attnb, nq*hd*4u, AT_G);
+    } else {
+        rl_store(attnb, nq*hd*4u, AT_QO);
+    }
+    if (rl_run(unit_gate ? "attention values+gate" : "attention values")) {
         HP->attnstream_active = 0;
+        if (unit_gate)
+            resident_silu_restore();
         return -1;
     }
-    return 0;
+#ifdef CSR_SEQ_SILU_FIXUPS_ADDR
+    if (unit_gate && seq_silu_fixups_read())
+        resident_gate_patch(fx, at_gates, AT_QO, attnb, nq*hd);
+#endif
+    return unit_gate ? 1 : 0;
 }
 #endif
 
@@ -1517,9 +1543,15 @@ static void attention_layer(int l, const float *h, float *out)
     matvec_q(model_entry(ROLE_ATTN_V, l), e8, vb);
     t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
     }
-    if (gated)   // [q | gate] per head
+    if (gated) { // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
+#ifdef BONSAI_HAS_ATTNSTREAM
+        if (at_gates && HP->attnstream_active)
+            for (int hh = 0; hh < n_head; hh++)
+                memcpy(at_gates + hh*head_dim, qfull + hh*2*head_dim + head_dim, (size_t)head_dim*4);
+#endif
+    }
     rope_prepare(pos);
     for (int hh = 0; hh < n_head; hh++) {
         if (!normed)
@@ -1536,10 +1568,12 @@ static void attention_layer(int l, const float *h, float *out)
     memcpy(V + (uint64_t)pos*kv_dim, vb, (size_t)kv_dim*4);
     int   T = pos + 1;
     float scale = 1.0f/sqrtf((float)head_dim);
-    int streamed = 0;
+    int streamed = 0;                  // 1: attnb holds the outputs, 2: gated too
 #ifdef BONSAI_HAS_ATTNSTREAM
-    if (HP->attnstream_active)
-        streamed = attn_stream(a, T, scale) == 0;
+    if (HP->attnstream_active) {
+        int rc = attn_stream(a, T, scale, gated);
+        streamed = rc < 0 ? 0 : 1 + rc;
+    }
 #endif
     for (int hh = 0; hh < n_head; hh++) {
         float *oh = attnb + hh*head_dim;
@@ -1561,7 +1595,7 @@ static void attention_layer(int l, const float *h, float *out)
             if (scores[t] > mx) mx = scores[t];
         }
         float sum = 0;
-        for (int t = 0; t < T; t++) { scores[t] = expf(scores[t] - mx); sum += scores[t]; }
+        for (int t = 0; t < T; t++) { scores[t] = bonsai_softmax_exp(scores[t] - mx); sum += scores[t]; }
         for (int i = 0; i < head_dim; i++) oh[i] = 0;
         for (int t = 0; t < T; t++) {
             const float *vt = V + (uint64_t)t*kv_dim + kvh*head_dim;
@@ -1574,7 +1608,7 @@ static void attention_layer(int l, const float *h, float *out)
             for (; i < head_dim; i++) oh[i] += p*vt[i];
         }
         }
-        if (gated) {
+        if (gated && streamed != 2) {
             const float *g = qfull + hh*2*head_dim + head_dim;
             int i = 0;
             for (; i + 3 < head_dim; i += 4) {

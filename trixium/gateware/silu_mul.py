@@ -54,6 +54,8 @@ class SiluMulKernel(LiteXModule):
         self.sink = sink = stream.Endpoint(IN_LAYOUT)
         self.source = source = stream.Endpoint(OUT_LAYOUT)
         self.lut_we, self.lut_adr, self.lut_dat = Signal(), Signal(13), Signal(32)
+        # Held for a whole run: the pass-through and -0 kinds are fixups instead (any table).
+        self.table_only = Signal()
         self.dlut_we, self.dlut_adr, self.dlut_dat = Signal(), Signal(12), Signal(32)
 
         lut = Memory(32, LUT_N + 1, init=list(tables[0]) if tables else None)
@@ -112,8 +114,8 @@ class SiluMulKernel(LiteXModule):
             k_negzero.eq(gs & (mag > 0x42A00000)),
             If(bad, kind0.eq(KIND_FIXUP)
             ).Elif(k_table, kind0.eq(KIND_TABLE)
-            ).Elif(k_pass, kind0.eq(KIND_PASS)
-            ).Elif(k_negzero, kind0.eq(KIND_NEGZERO)
+            ).Elif(k_pass & ~self.table_only, kind0.eq(KIND_PASS)
+            ).Elif(k_negzero & ~self.table_only, kind0.eq(KIND_NEGZERO)
             ).Else(kind0.eq(KIND_FIXUP)),
         ]
         kind = carry("kind", 2, kind0)

@@ -159,6 +159,22 @@ def sigmoid_tail(x):
     return f32(e/f32(f32(1) + e))
 
 
+def softmax_exp_rv32(values):
+    """Canonical softmax exp (firmware/fastmath.h bonsai_softmax_exp): the bounded exp on
+    [-80, 0], +0 below, NaN through as the canonical NaN."""
+    values = np.asarray(values, dtype=f32)
+    out = np.empty_like(values)
+    for index in np.ndindex(values.shape):
+        x = values[index]
+        if np.isnan(x):
+            out[index] = _word(0x7FC00000)
+        elif x < -80:
+            out[index] = f32(0)
+        else:
+            out[index] = expf_bounded(x)
+    return out
+
+
 @lru_cache(maxsize=1)
 def sigmoid_table():
     table = np.empty(4097, dtype=f32)

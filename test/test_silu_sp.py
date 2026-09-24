@@ -26,18 +26,18 @@ from test_silu_mul_rtl import stress_vectors
 SENTINEL = 0xDEADBEEF
 
 
-def table_image():
+def table_image(pair=None):
     """The LOAD layout: lut[0..4096] in beats 0..512 (lut[4096] alone in beat 512), dlut after."""
-    lut, dlut = tables()
+    lut, dlut = pair or tables()
     words = np.full(LOAD_BEATS*8, SENTINEL, dtype=np.uint32)
     words[:LUT_N + 1] = lut
     words[513*8:513*8 + LUT_N] = dlut
     return words
 
 
-def reference(mem, cmd):
+def reference(mem, cmd, pair=None):
     """Apply a RUN command to a uint32 word array; returns the fixup count."""
-    lut, dlut = tables()
+    lut, dlut = pair or tables()
     n, g0, m0, d0, f0 = cmd["elements"], cmd["src_g"]//4, cmd["src_m"]//4, cmd["dst"]//4, cmd["fixmap"]//4
     gates = [int(x) for x in mem[g0:g0 + n]]
     mults = [0x3F800000]*n if cmd.get("unit_m") else [int(x) for x in mem[m0:m0 + n]]
@@ -50,7 +50,7 @@ def reference(mem, cmd):
         return ((seg % a)*b + seg//a)*8*sb + within
     out = {}
     for i, (g, m) in enumerate(zip(gates, mults)):
-        r, fix = silu_mul_fixed(g, m, lut, dlut)
+        r, fix = silu_mul_fixed(g, m, lut, dlut, table_only=bool(cmd.get("table_only")))
         out[d0 + dst_index(i)] = g if fix else r
         bits[i//32] |= int(fix) << (i % 32)
     for k, v in out.items():
@@ -298,3 +298,45 @@ def test_compiled_full_scratchpad_image(tmp_path):
     assert int(run1.split(" cycles ")[1].split()[0]) < 1.2*n1, run1
     unit = next(l for l in lines if l.startswith("cmd 3 "))
     assert int(unit.split(" reads ")[1].split()[0]) == 2048//8        # g beats only
+
+
+def sigmoid_tables():
+    """The canonical sigmoid table (firmware/fastmath.h) in the unit's lut/dlut form."""
+    from trixium.model.rv32_math import sigmoid_table
+    lut = np.asarray(sigmoid_table(), dtype=np.float32)
+    dlut = (lut[1:] - lut[:-1]).astype(np.float32)
+    return [int(x) for x in lut.view(np.uint32)], [int(x) for x in dlut.view(np.uint32)]
+
+
+def test_compiled_table_only_sigmoid(tmp_path):
+    """ABI 1.2: a sigmoid table, table only - the attention output gate o *= sigmoid(g).
+    Every non-fixup element equals the firmware's m * bonsai_sigmoid_lookup(g)."""
+    from rtl_client import build_client, run_client
+    from trixium.model.rv32_math import sigmoid_rv32
+    size = 256*1024
+    binary = build_client(BonsaiSiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
+    rng = np.random.default_rng(21)
+    mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
+    tab, pair = 0x37000, sigmoid_tables()
+    mem[tab//4:tab//4 + LOAD_BEATS*8] = table_image(pair)
+    n = 6144
+    g = rng.normal(0, 4, n).astype(np.float32)
+    g[:12] = [16, -16, 17.5, 90, -85, -100, 15.999999, -15.999999, 0, -0.0, 79, -79]
+    m = rng.normal(0, 1, n).astype(np.float32)
+    mem[0:n] = g.view(np.uint32)
+    mem[0x10000//4:0x10000//4 + n] = m.view(np.uint32)
+    cmds = [(run_cmd(op=OP_LOAD, src_g=tab), 0),
+            # In place over the gates: m (the attention outputs) stays for the CPU's fixups.
+            (run_cmd(src_g=0x0, src_m=0x10000, dst=0x0, fixmap=0x2F000, elements=n, table_only=1), 0)]
+    want = mem.copy()
+    fixups = reference(want, cmds[1][0], pair)
+    got, lines = run_client(binary, SILU_COMMAND, mem, cmds, tmp_path)
+    bad = np.nonzero(got != want)[0]
+    assert not len(bad), [(hex(4*i), hex(int(got[i])), hex(int(want[i]))) for i in bad[:10]]
+    bits = got[0x2F000//4:0x2F000//4 + (n + 31)//32]
+    fix = np.array([(int(bits[i//32]) >> (i % 32)) & 1 for i in range(n)], bool)
+    assert fix.sum() == fixups and fix[[0, 1, 2, 3, 4, 5]].all()      # |g| >= 16: CPU
+    ok = ~fix
+    firmware = (m*sigmoid_rv32(g)).astype(np.float32)
+    out = got[0:n].view(np.float32)
+    assert np.array_equal(out[ok].view(np.uint32), firmware[ok].view(np.uint32))

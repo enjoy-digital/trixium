@@ -10,6 +10,7 @@ import pytest
 
 from trixium.model.rv32_math import (
     expf_rv32, expf_bounded, fma32, sigmoid_rv32, sigmoid_table, silu_polynomial, silu_rv32,
+    softmax_exp_rv32,
     silu_table,
 )
 
@@ -79,12 +80,14 @@ def test_profile_against_target_libm(tmp_path):
                         rng.uniform(-80, 80, 8192).astype(f32), bits, near_edges])
     output = subprocess.run([qemu, str(exe)], input=x.astype('<f4').tobytes(),
                             check=True, capture_output=True, timeout=60).stdout
-    assert len(output) == len(x)*4*4
-    target = np.frombuffer(output, dtype='<u4').reshape(-1, 4)
+    assert len(output) == len(x)*5*4
+    target = np.frombuffer(output, dtype='<u4').reshape(-1, 5)
     for column, fn in enumerate((expf_rv32, silu_polynomial, silu_rv32, sigmoid_rv32)):
         mask = (x >= -80) & (x <= 80) if column == 0 else np.ones(len(x), dtype=bool)
         actual = np.array([fn(v) for v in x[mask]], dtype=f32).view('u4')
         np.testing.assert_array_equal(actual, target[mask, column], err_msg=fn.__name__)
+    neg = np.where(x < 0, x, -x).astype(f32)
+    np.testing.assert_array_equal(softmax_exp_rv32(neg).view('u4'), target[:, 4], err_msg='softmax_exp')
 
 
 def test_silu_endpoint_has_no_out_of_bounds_read(tmp_path):
