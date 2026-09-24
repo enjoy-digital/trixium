@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 
 from trixium.model.rv32_math import (
-    expf_rv32, expf_bounded, fma32, silu_polynomial, silu_rv32, silu_table,
+    expf_rv32, expf_bounded, fma32, sigmoid_rv32, sigmoid_table, silu_polynomial, silu_rv32,
+    silu_table,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,7 +70,7 @@ def test_profile_against_target_libm(tmp_path):
                     str(ROOT / 'test/rv32_math_oracle.c'), '-lm', '-lgcc', '-o', str(exe)],
                    check=True, capture_output=True, timeout=60)
     rng = np.random.default_rng(2701525)
-    edges = np.array([-80, -16, -1, -0.0, 0, 1, 16, 80], dtype=f32)
+    edges = np.array([-100, -80, -16, -1, -0.0, 0, 1, 16, 80, 100, 1e30, -1e30], dtype=f32)
     near_edges = np.concatenate([edges, np.nextafter(edges, f32(-np.inf)),
                                  np.nextafter(edges, f32(np.inf))])
     bits = rng.integers(0, 2**32, 8192, dtype=np.uint32).view(f32)
@@ -78,9 +79,9 @@ def test_profile_against_target_libm(tmp_path):
                         rng.uniform(-80, 80, 8192).astype(f32), bits, near_edges])
     output = subprocess.run([qemu, str(exe)], input=x.astype('<f4').tobytes(),
                             check=True, capture_output=True, timeout=60).stdout
-    assert len(output) == len(x)*3*4
-    target = np.frombuffer(output, dtype='<u4').reshape(-1, 3)
-    for column, fn in enumerate((expf_rv32, silu_polynomial, silu_rv32)):
+    assert len(output) == len(x)*4*4
+    target = np.frombuffer(output, dtype='<u4').reshape(-1, 4)
+    for column, fn in enumerate((expf_rv32, silu_polynomial, silu_rv32, sigmoid_rv32)):
         mask = (x >= -80) & (x <= 80) if column == 0 else np.ones(len(x), dtype=bool)
         actual = np.array([fn(v) for v in x[mask]], dtype=f32).view('u4')
         np.testing.assert_array_equal(actual, target[mask, column], err_msg=fn.__name__)
@@ -109,3 +110,16 @@ int main(void) {
     # inside a ptrace-based sandbox). Keep address/undefined checks enabled.
     subprocess.run([str(exe)], check=True, capture_output=True, timeout=60,
                    env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0'})
+
+
+def test_sigmoid_grid_and_tails():
+    table = sigmoid_table()
+    grid = np.arange(-2047, 2048, dtype=f32)/f32(128)
+    assert np.array_equal(sigmoid_rv32(grid).view('u4'), table[1:-1].view('u4'))
+    assert sigmoid_rv32(f32(0)) == f32(0.5)
+    assert sigmoid_rv32(f32(81)) == f32(1) and sigmoid_rv32(f32(-81)) == f32(0)
+    s = sigmoid_rv32(np.linspace(-90, 90, 2001, dtype=f32))
+    assert np.all(np.diff(s.astype(np.float64)) >= 0)          # monotone across the seams
+    ref = 1/(1 + np.exp(-np.linspace(-20, 20, 4001)))
+    got = sigmoid_rv32(np.linspace(-20, 20, 4001).astype(f32)).astype(np.float64)
+    assert np.max(np.abs(got - ref)) < 2e-6

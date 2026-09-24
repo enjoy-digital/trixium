@@ -139,3 +139,51 @@ def silu_rv32(values):
             f = f32(u - f32(i))
             result[index] = fma32(f, f32(table[i + 1] - table[i]), table[i])
     return result
+
+
+# Canonical sigmoid (firmware/fastmath.h bonsai_sigmoid_*): the SiLU lookup's form on a
+# sigmoid table; table and tails from the bounded exp, never libm expf.
+def sigmoid_point(x):
+    return f32(f32(1)/f32(f32(1) + expf_bounded(-f32(x))))
+
+
+def sigmoid_tail(x):
+    x = f32(x)
+    if x > 80:
+        return f32(1)
+    if x >= 16:
+        return sigmoid_point(x)
+    if x < -80:
+        return f32(0)
+    e = expf_bounded(x)
+    return f32(e/f32(f32(1) + e))
+
+
+@lru_cache(maxsize=1)
+def sigmoid_table():
+    table = np.empty(4097, dtype=f32)
+    for i in range(len(table)):
+        table[i] = sigmoid_point(f32(-16 + i/128))
+    table.flags.writeable = False
+    return table
+
+
+def sigmoid_rv32(values):
+    values = np.asarray(values, dtype=f32)
+    table = sigmoid_table()
+    result = np.empty_like(values)
+    for index in np.ndindex(values.shape):
+        x = values[index]
+        if not np.isfinite(x):
+            raise ValueError("sigmoid reference requires finite input")
+        if x >= 16 or x <= -16:
+            result[index] = sigmoid_tail(x)
+            continue
+        u = f32(f32(x + f32(16))*f32(128))
+        i = int(u)
+        if i >= 4096:
+            result[index] = table[4096]
+            continue
+        f = f32(u - f32(i))
+        result[index] = fma32(f, f32(table[i + 1] - table[i]), table[i])
+    return result
