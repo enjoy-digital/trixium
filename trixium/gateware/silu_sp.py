@@ -27,7 +27,8 @@ from litex.soc.interconnect import stream
 from trixium.gateware.silu_mul import SiluMulKernel, LUT_N
 
 SILU_COMMAND = [("op", 1), ("src_g", 24), ("src_m", 24), ("dst", 24), ("fixmap", 24),
-                ("elements", 16), ("protect_start", 24), ("protect_end", 24)]
+                ("elements", 16), ("unit_m", 1), ("seg_beats", 16), ("perm_a", 8), ("perm_b", 8),
+                ("protect_start", 24), ("protect_end", 24)]
 OP_RUN, OP_LOAD = 0, 1
 LOAD_BEATS = 513 + 512
 
@@ -64,21 +65,29 @@ class BonsaiSiluScratchpad(LiteXModule):
                     (cap[a] < cap["protect_end"]) & (cap["protect_start"] < ends[a]))
 
         load = cap["op"] == OP_LOAD
+        unit_m = cap["unit_m"]
+        perm = cap["perm_a"] > 1
+        perm_elems = Signal(40)
+        step_a = Signal(24)
+        self.comb += perm_elems.eq(cap["seg_beats"]*cap["perm_a"]*cap["perm_b"]*8)
         self.comb += [
             ends["src_g"].eq(cap["src_g"] + Mux(load, C(LOAD_BEATS*32, 17), beats << 5)),
             ends["src_m"].eq(cap["src_m"] + (beats << 5)),
             ends["dst"].eq(cap["dst"] + (beats << 5)),
             ends["fixmap"].eq(cap["fixmap"] + (fix_beats << 5)),
             geometry_bad.eq((cap["src_g"][:5] != 0) | (cap["protect_start"] > cap["protect_end"]) |
-                (~load & ((cap["elements"] == 0) | (cap["src_m"][:5] != 0) |
-                          (cap["dst"][:5] != 0) | (cap["fixmap"][:5] != 0)))),
+                (~load & ((cap["elements"] == 0) | (~unit_m & (cap["src_m"][:5] != 0)) |
+                          (cap["dst"][:5] != 0) | (cap["fixmap"][:5] != 0) |
+                          # A permuted output: whole segments of whole beats, a full grid.
+                          (perm & ((cap["seg_beats"] == 0) | (cap["perm_b"] == 0) |
+                                   (perm_elems != cap["elements"])))))),
             bounds_bad.eq((ends["src_g"] > scratchpad_size) | (cap["protect_end"] > scratchpad_size) |
-                (~load & ((ends["src_m"] > scratchpad_size) | (ends["dst"] > scratchpad_size) |
+                (~load & ((~unit_m & (ends["src_m"] > scratchpad_size)) | (ends["dst"] > scratchpad_size) |
                           (ends["fixmap"] > scratchpad_size)))),
             overlap_bad.eq(~load & (
-                (overlap("dst", "src_g") & (cap["dst"] != cap["src_g"])) |
-                overlap("dst", "src_m") | overlap("fixmap", "src_g") |
-                overlap("fixmap", "src_m") | overlap("fixmap", "dst"))),
+                (overlap("dst", "src_g") & ((cap["dst"] != cap["src_g"]) | perm)) |
+                (~unit_m & overlap("dst", "src_m")) | overlap("fixmap", "src_g") |
+                (~unit_m & overlap("fixmap", "src_m")) | overlap("fixmap", "dst"))),
             protected_bad.eq(~load & (protected("dst") | protected("fixmap"))),
         ]
 
@@ -113,11 +122,13 @@ class BonsaiSiluScratchpad(LiteXModule):
 
         self.comb += [
             self.sp_rd_req.eq(~self.cancel & (ld_req | (run_active & (rd_second | can_issue)))),
+            # unit_m: the pair is the g beat and eight 1.0s; no m read.
             self.sp_rd_adr.eq(Mux(state == LOAD, (cap["src_g"] >> 5) + ld_beat,
                                    Mux(rd_second, (cap["src_m"] >> 5) + issued,
                                        (cap["src_g"] >> 5) + issued))),
-            pairs.we.eq(rd_pending & rd_was_m & run_active),
-            pairs.din.eq(Cat(g_hold, self.sp_rd_dat)),
+            pairs.we.eq(rd_pending & (rd_was_m | unit_m) & run_active),
+            pairs.din.eq(Mux(unit_m, Cat(self.sp_rd_dat, Replicate(C(0x3F800000, 32), 8)),
+                             Cat(g_hold, self.sp_rd_dat))),
         ]
         self.sync += If(clear,
             rd_pending.eq(0), rd_second.eq(0), in_flight.eq(0),
@@ -127,10 +138,10 @@ class BonsaiSiluScratchpad(LiteXModule):
             If(rd_pending & ~rd_was_m & run_active, g_hold.eq(self.sp_rd_dat)),
             If(self.sp_rd_req & run_active,
                 If(rd_second, rd_second.eq(0), issued.eq(issued + 1)
+                ).Elif(unit_m, issued.eq(issued + 1)
                 ).Else(rd_second.eq(1)),
             ),
-            in_flight.eq(in_flight + (self.sp_rd_req & run_active & ~rd_second)
-                         - (rd_pending & rd_was_m & run_active)),
+            in_flight.eq(in_flight + (self.sp_rd_req & run_active & ~rd_second) - pairs.we),
         )
 
         # LOAD writes into the kernel's tables. One read is outstanding at most and ld_beat
@@ -206,6 +217,29 @@ class BonsaiSiluScratchpad(LiteXModule):
             close_beat.eq(take & ends_beat),
             close_word.eq(take & ends_word),
         ]
+        # Output beat offset. Without a permutation it is the beat count; with one, source
+        # segment s (seg_beats beats) goes to destination segment (s % a)*b + s // a, tracked
+        # incrementally: `seg_off` is the destination segment's first beat, `div_off` the
+        # offset of segment s // a, `in_seg` the beat within the segment, `s_mod` = s % a.
+        in_seg = Signal(16)
+        s_mod = Signal(8)
+        seg_off, div_off = Signal(24), Signal(24)
+        out_off = Signal(24)
+        self.comb += out_off.eq(Mux(perm, seg_off + in_seg, closed_beats))
+        self.sync += If(clear,
+            in_seg.eq(0), s_mod.eq(0), seg_off.eq(0), div_off.eq(0),
+        ).Elif(take & close_beat & perm,
+            If(in_seg + 1 == cap["seg_beats"],
+                in_seg.eq(0),
+                If(s_mod + 1 == cap["perm_a"],
+                    s_mod.eq(0), div_off.eq(div_off + cap["seg_beats"]),
+                    seg_off.eq(div_off + cap["seg_beats"]),
+                ).Else(
+                    s_mod.eq(s_mod + 1), seg_off.eq(seg_off + step_a),
+                ),
+            ).Else(in_seg.eq(in_seg + 1)),
+        )
+        self.sync += If(state == VALIDATE, step_a.eq(cap["perm_b"]*cap["seg_beats"]))
         self.sync += If(clear,
             out_lane.eq(0), got.eq(0), acc.eq(0), acc_we.eq(0), bits.eq(0),
             closed_beats.eq(0), closed_words.eq(0),
@@ -213,7 +247,7 @@ class BonsaiSiluScratchpad(LiteXModule):
             got.eq(got + 1),
             out_lane.eq(Mux(close_beat, 0, out_lane + 1)),
             If(close_beat,
-                beat_adr.eq((cap["dst"] >> 5) + closed_beats),
+                beat_adr.eq((cap["dst"] >> 5) + out_off),
                 beat_dat.eq(acc_next), beat_we.eq(acc_we_next),
                 closed_beats.eq(closed_beats + 1),
                 acc.eq(0), acc_we.eq(0),

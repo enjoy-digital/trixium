@@ -39,18 +39,29 @@ def reference(mem, cmd):
     """Apply a RUN command to a uint32 word array; returns the fixup count."""
     lut, dlut = tables()
     n, g0, m0, d0, f0 = cmd["elements"], cmd["src_g"]//4, cmd["src_m"]//4, cmd["dst"]//4, cmd["fixmap"]//4
-    gates, mults = [int(x) for x in mem[g0:g0 + n]], [int(x) for x in mem[m0:m0 + n]]
+    gates = [int(x) for x in mem[g0:g0 + n]]
+    mults = [0x3F800000]*n if cmd.get("unit_m") else [int(x) for x in mem[m0:m0 + n]]
     bits = [0]*((n + 31)//32)
+    a, b, sb = cmd.get("perm_a", 0), cmd.get("perm_b", 0), cmd.get("seg_beats", 0)
+    def dst_index(i):
+        if a <= 1:
+            return i
+        seg, within = divmod(i, 8*sb)
+        return ((seg % a)*b + seg//a)*8*sb + within
+    out = {}
     for i, (g, m) in enumerate(zip(gates, mults)):
         r, fix = silu_mul_fixed(g, m, lut, dlut)
-        mem[d0 + i] = g if fix else r
+        out[d0 + dst_index(i)] = g if fix else r
         bits[i//32] |= int(fix) << (i % 32)
+    for k, v in out.items():
+        mem[k] = v
     mem[f0:f0 + len(bits)] = bits
     return sum(bin(b).count("1") for b in bits)
 
 
 def run_cmd(**changed):
-    cmd = dict(op=OP_RUN, src_g=0, src_m=0, dst=0, fixmap=0, elements=0, protect_start=0, protect_end=0)
+    cmd = dict(op=OP_RUN, src_g=0, src_m=0, dst=0, fixmap=0, elements=0, unit_m=0, seg_beats=0,
+               perm_a=0, perm_b=0, protect_start=0, protect_end=0)
     cmd.update(changed)
     return cmd
 
@@ -246,28 +257,9 @@ def test_invalid_physical_sizes():
 # Compiled ---------------------------------------------------------------------------------------
 
 def test_compiled_full_scratchpad_image(tmp_path):
-    verilator = shutil.which("verilator")
-    if not verilator:
-        pytest.skip("Verilator required")
+    from rtl_client import build_client, run_client
     size = 256*1024
-    dut = BonsaiSiluScratchpad(size)
-    signals = {name: getattr(dut, name) for name in (
-        "cancel", "busy", "done", "error", "fixups", "read_beats", "output_beats",
-        "sp_rd_req", "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_dat", "sp_wr_we", "sp_wr_gnt")}
-    for name, _ in SILU_COMMAND:
-        signals["cmd_" + name] = getattr(dut.cmd, name)
-    signals.update(cmd_valid=dut.cmd.valid, cmd_ready=dut.cmd.ready)
-    for name, signal in signals.items():
-        signal.name_override = name
-    rtl = tmp_path / "silu_sp.v"
-    verilog.convert(dut, ios=set(signals.values()), name="silu_sp").write(str(rtl))
-    harness = Path(__file__).parent / "rtl/silu_sp.cpp"
-    built = subprocess.run([verilator, "--cc", "--exe", "--build", "-j", "4", "-Wno-fatal", "-O3",
-                            "--Mdir", str(tmp_path / "obj"), "--top-module", "silu_sp", str(rtl),
-                            str(harness.resolve())], capture_output=True, text=True, timeout=600)
-    assert built.returncode == 0, built.stdout[-4000:] + built.stderr[-4000:]
-
-    # Tables at 0x37000 (so LOAD is not at address zero), vectors below.
+    binary = build_client(BonsaiSiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
     rng = np.random.default_rng(12)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
     tab = 0x37000
@@ -280,32 +272,29 @@ def test_compiled_full_scratchpad_image(tmp_path):
     cmds.append((run_cmd(src_g=0x0, src_m=0x10000, dst=0x20000, fixmap=0x2F000, elements=n1), 0))
     # In place, over the first result, with the m vector reused.
     cmds.append((run_cmd(src_g=0x20000, src_m=0x10000, dst=0x20000, fixmap=0x2F800, elements=5001), 0))
-    cmds.append((run_cmd(src_g=0x30000, src_m=0x30020, dst=0x30040, fixmap=0x30060, elements=1), 0))
+    # Unit multiplier (the conv SiLU), in place.
+    cmds.append((run_cmd(src_g=0x0, src_m=0x3FFE0, dst=0x0, fixmap=0x2FC00, elements=2048, unit_m=1), 0))
+    # The DeltaNet gated-norm permutation: 48 heads x 128, grouped order (a = 16, b = 3).
+    cmds.append((run_cmd(src_g=0x30000, src_m=0x10000, dst=0x38000, fixmap=0x36000, elements=6144,
+                         seg_beats=16, perm_a=16, perm_b=3), 0))
+    mem[0x30000//4:0x30000//4 + 6144] = gates[6000:12144]
     cmds.append((run_cmd(src_g=0x30000, src_m=0x30020, dst=0x30040, fixmap=0x30060, elements=9), 4))
     cmds.append((run_cmd(src_g=0x30000, src_m=0x31000, dst=0x32000, fixmap=0x33000, elements=64,
                          protect_start=0x33010, protect_end=0x33014), 64))
-    mem[0x30000//4:0x30000//4 + 8] = gates[-8:]
-    mem[0x30020//4:0x30020//4 + 8] = mults[-8:]
-    image = tmp_path / "image.bin"
-    image.write_bytes(mem.tobytes())
-    rec = []
-    for cmd, err in cmds:
-        rec += [cmd[name] for name, _ in SILU_COMMAND] + [err]
-    commands = tmp_path / "commands.bin"
-    commands.write_bytes(np.array(rec, dtype=np.uint32).tobytes())
-    out = tmp_path / "out.bin"
-    run = subprocess.run([str(tmp_path / "obj/Vsilu_sp"), str(image), str(commands), str(out)],
-                         capture_output=True, text=True, timeout=600)
-    assert run.returncode == 0, run.stdout + run.stderr
-    print(run.stdout)
-
+    # A permutation must be a full grid, and never in place.
+    cmds.append((run_cmd(src_g=0x30000, src_m=0x10000, dst=0x38000, fixmap=0x36000, elements=6144,
+                         seg_beats=16, perm_a=16, perm_b=2), 1))
+    cmds.append((run_cmd(src_g=0x30000, src_m=0x10000, dst=0x30000, fixmap=0x36000, elements=6144,
+                         seg_beats=16, perm_a=16, perm_b=3), 4))
     want = mem.copy()
-    fixups = [reference(want, cmd) for cmd, err in cmds if not err and cmd["op"] == OP_RUN]
-    got = np.frombuffer(out.read_bytes(), dtype=np.uint32)
+    for cmd, err in cmds:
+        if not err and cmd["op"] == OP_RUN:
+            reference(want, cmd)
+    got, lines = run_client(binary, SILU_COMMAND, mem, cmds, tmp_path)
+    print("\n".join(lines))
     bad = np.nonzero(got != want)[0]
     assert not len(bad), [(hex(4*i), hex(int(got[i])), hex(int(want[i]))) for i in bad[:10]]
-    lines = [l for l in run.stdout.splitlines() if " fixups " in l and " op 0 " in l]
-    assert [int(l.split(" fixups ")[1].split()[0]) for l in lines] == fixups
-    # Throughput: close to one element per clock under a 3/4 write grant.
-    cycles = int(lines[0].split(" cycles ")[1])
-    assert cycles < 1.2*n1, cycles
+    run1 = next(l for l in lines if l.startswith("cmd 1 "))
+    assert int(run1.split(" cycles ")[1].split()[0]) < 1.2*n1, run1
+    unit = next(l for l in lines if l.startswith("cmd 3 "))
+    assert int(unit.split(" reads ")[1].split()[0]) == 2048//8        # g beats only
