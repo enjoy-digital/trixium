@@ -69,6 +69,8 @@ class BonsaiClusterConfig:
     with_silu: bool = False
     with_norm: bool = False
     with_conv: bool = False
+    with_dnstream: bool = False  # Engine op 5: the DeltaNet stream unit on every channel.
+    dnstream_options: tuple = () # (name, value) overrides of the unit's arguments (tests).
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -251,7 +253,11 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         sp_client = soc.sparb
     soc.engine = ClockDomainsRenamer("eng")(
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
-                          seq=seq, dual=config.with_dual, **placement, **native))
+                          seq=seq, dual=config.with_dual, **placement, **native,
+                          dnstream=config.with_dnstream and (config.dnstream_options or True)))
+    if config.with_dnstream:
+        soc.add_constant("BONSAI_HAS_DNSTREAM")
+        soc.add_constant("BONSAI_DNSTREAM_LANES", len(axis))
     soc.engine_csr = BonsaiEngineCSR(soc.engine, seq=seq)
     for name, unit in extensions:
         from migen import Signal
@@ -295,7 +301,8 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
                           endpoints=config.native_endpoints)
                      if any(r.access & Access.WRITE for r in config.native_regions) else {})
     soc.loader = ClockDomainsRenamer("eng")(
-        BonsaiHBMLoader(axis, data_width=config.loader_data_width, **placement, **region_upload))
+        BonsaiHBMLoader(axis, data_width=config.loader_data_width, **placement, **region_upload,
+                        with_mstore=config.with_dnstream))
     if region_upload:
         from trixium.gateware.region_csr import BonsaiRegionUploadCSR
         soc.zzregion = BonsaiRegionUploadCSR(soc.loader, soc.engine_csr)
@@ -305,6 +312,9 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         soc.engine.store_data.connect(soc.loader.store_data),
         soc.engine.store_busy.eq(soc.loader.store_busy),
     ]
+    if config.with_dnstream:
+        soc.comb += soc.engine.mstore_cmd.connect(soc.loader.mstore_cmd)
+        soc.comb += [d.connect(w) for d, w in zip(soc.engine.mstore_data, soc.loader.mstore_data)]
     units_idle = ~soc.engine.sp_busy
     if sp_client is not None:
         units_idle = units_idle & ~sp_client.busy

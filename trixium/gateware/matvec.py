@@ -144,7 +144,8 @@ class _ResultPacker(Module):
 class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  dual=True, chan_stride=0, chan_mod=0, chan_skew=0,
-                 native_regions=None, native_reservations=(), native_endpoints=None):
+                 native_regions=None, native_reservations=(), native_endpoints=None,
+                 dnstream=False):
         with_native = native_regions is not None
         if with_native:
             from trixium.gateware.native_reader import NativeRegionReader, NativeReadTransport
@@ -222,7 +223,10 @@ class BonsaiMatVecEngine(LiteXModule):
 
         self.cmd = stream.Endpoint([
             ("kind",   3),   # 0: ternary, 1: q8, 2: fetch (HBM -> SP), 3: store (SP -> HBM),
-                             # 4: axpy (weighted-V: per-lane accumulate, cols results/chan).
+                             # 4: axpy (weighted-V: per-lane accumulate, cols results/chan),
+                             # 5: DeltaNet stream (dnstream only: rows = heads, xsrc = the
+                             # head record table, wbase/wlen = every channel's state span,
+                             # read and rewritten in place through the loader's writers).
             ("rows",   16),  # Rows per channel.
             ("cols",   17 if with_native else 14),  # K; legacy CSR remains 14 bits.
             ("wbase",  32),  # Per-channel weight byte address (beat-aligned).
@@ -325,6 +329,20 @@ class BonsaiMatVecEngine(LiteXModule):
         self.store_data = stream.Endpoint([("data", 256)])
         self.store_busy = Signal() # From the loader: executing our store (incl. B drain).
 
+        # DeltaNet stream (kind 5): channel i's reader feeds lane i of the unit and lane i's
+        # updated state goes to channel i's writer through the loader's multi-channel store
+        # (same wbase/wlen on every channel, the readers' per-channel offsets).
+        self.with_dnstream = dnstream
+        if dnstream:
+            from trixium.gateware.deltanet_stream import BonsaiDeltaNetStream
+            # dnstream=True: the 27B geometry on the exact operators; a dict overrides the
+            # unit's arguments (tests: a small geometry on integer operators).
+            opts = dict(dnstream) if isinstance(dnstream, (dict, tuple)) else {}
+            self.submodules.dnstream = dn = BonsaiDeltaNetStream(
+                lanes=len(hbm_axis), adr_bits=len(scratchpad.fill.adr), **opts)
+            self.mstore_cmd  = stream.Endpoint([("addr", 33), ("len", 24)])
+            self.mstore_data = dn.sources
+
         # # #
 
         # Channels ----------------------------------------------------------------------------
@@ -345,6 +363,7 @@ class BonsaiMatVecEngine(LiteXModule):
 
         fetch_valids = []
         fetch_datas  = []
+        dn_mode = Signal() # kind == 5 for the latched command.
         for i, axi in enumerate(hbm_axis):
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
             # per round trip - 33.7 cycles/beat measured); round-robin ARIDs let it pipeline.
@@ -397,14 +416,23 @@ class BonsaiMatVecEngine(LiteXModule):
             # from the cycle after START; the reader is commanded later than that.
             is_fetch = Signal(name=f"is_fetch{i}")
             self.sync += is_fetch.eq(fetch_mode & (fetch_chan == i))
+            is_dn = C(0, 1)
+            if dnstream:
+                is_dn = Signal(name=f"is_dn{i}")
+                self.sync += is_dn.eq(dn_mode)
+                self.comb += [
+                    dn.sinks[i].valid.eq(rsrc.valid & is_dn),
+                    dn.sinks[i].data.eq(rsrc.data),
+                ]
             self.comb += [
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
-                pipe.sink.valid.eq(rsrc.valid & ~is_fetch),
+                pipe.sink.valid.eq(rsrc.valid & ~is_fetch & ~is_dn),
                 pipe.sink.data.eq(rsrc.data),
                 # Fetch beats honor the gather-FIFO headroom (a vec store can steal the
                 # W port for a cycle); compute beats honor the pipe's result-FIFO
                 # backpressure (drops results past N=2 otherwise - N/row_beats > 1 gather/cycle).
-                rsrc.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & pipe.sink.ready)),
+                rsrc.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & ~is_dn & pipe.sink.ready)
+                              | (is_dn & (dn.sinks[i].ready if dnstream else 0))),
             ]
             fetch_valids.append(rsrc.valid & is_fetch)
             fetch_datas.append(rsrc.data)
@@ -442,6 +470,7 @@ class BonsaiMatVecEngine(LiteXModule):
             fetch_mode.eq(cmd_r["kind"] == 2),
             store_mode.eq(cmd_r["kind"] == 3),
             axpy_mode.eq(cmd_r["kind"] == 4),
+            dn_mode.eq(cmd_r["kind"] == 5 if dnstream else 0),
             fetch_chan.eq(cmd_r["chan"]),
         ]
         if with_native:
@@ -525,7 +554,6 @@ class BonsaiMatVecEngine(LiteXModule):
         fill_active_d = Signal()
         fill_beat_d   = Signal(fill_width)
         st_cnt        = Signal(13) # STORE beat counter (address holds until accepted).
-        st_rdv        = Signal()   # fill.dat_r valid for the STORE stream.
         # Multi-packet STORE state: packet index, running HBM address, running source
         # beat offset (all reset on accept; advanced between packets).
         st_rep        = Signal(5)
@@ -541,9 +569,23 @@ class BonsaiMatVecEngine(LiteXModule):
         eng_fill_adr = Signal(len(scratchpad.fill.adr))
         xsrc_w = Signal(len(scratchpad.fill.adr))
         self.comb += xsrc_w.eq(cmd_r["xsrc"] >> 5)
+        # STORE stream through a 4-deep prefetch FIFO: reads are issued ahead (whenever the
+        # R port is ours and credit remains), so the stream runs at one beat per clock. It
+        # used to hold each address until its beat was accepted and then wait a cycle for the
+        # next read: one beat every two clocks for every STORE (2026-09-24).
+        self.submodules.st_fifo = st_fifo = ResetInserter()(stream.SyncFIFO([("data", 256)], 4))
+        st_run   = Signal()    # fsm.ongoing("ST_RUN"), assigned once the FSM exists
+        st_iss   = Signal(13)  # beats read in the current packet
+        st_pend  = Signal()    # a read issued last cycle: its data is on fill.dat_r now
+        st_issue = Signal()
         self.comb += [
-            self.store_data.valid.eq(st_rdv),
-            self.store_data.data.eq(scratchpad.fill.dat_r),
+            st_issue.eq(st_run & rd_free & (st_iss < cmd_r["wlen"]) &
+                        ((st_fifo.level + st_pend) < 3)),
+            st_fifo.sink.valid.eq(st_pend),
+            st_fifo.sink.data.eq(scratchpad.fill.dat_r),
+            self.store_data.valid.eq(st_fifo.source.valid),
+            self.store_data.data.eq(st_fifo.source.data),
+            st_fifo.source.ready.eq(self.store_data.ready),
         ]
         st_advance = Signal()
         self.comb += st_advance.eq(self.store_data.valid & self.store_data.ready)
@@ -885,8 +927,20 @@ class BonsaiMatVecEngine(LiteXModule):
             xred_all_d.eq(xred_all),
             xred_slot_d.eq(slot[3:]),
         ]
+        dn_wr_take = Signal()
+        if dnstream:
+            self.comb += [
+                dn_wr_take.eq(dn_mode & dn.sp_wr_req & fetch_rdy),
+                dn.sp_wr_gnt.eq(dn_wr_take),
+            ]
         self.comb += [
-            If(fetch_mode,
+            If(dn_mode,
+                # The unit's output beats: granted when the gather FIFO has headroom, the
+                # fetch rule (the payload is its FIFO head, held until then).
+                eng_gw_adr_c.eq(dn.sp_wr_adr if dnstream else 0),
+                eng_gw_dat_c.eq(dn.sp_wr_dat if dnstream else 0),
+                eng_gw_we_c.eq(Mux(dn_wr_take, 0xFF, 0)),
+            ).Elif(fetch_mode,
                 eng_gw_adr_c.eq((cmd_r["dst"] >> 5) + fetch_wcnt),
                 eng_gw_dat_c.eq(fetch_data),
                 eng_gw_we_c.eq(Mux(fetch_take, 0xFF, 0)),
@@ -957,7 +1011,7 @@ class BonsaiMatVecEngine(LiteXModule):
         self.sync += [
             If(command_accept,
                 self.absmax.eq(0),
-            ).Elif(~fetch_mode & (wr_absmax > self.absmax),
+            ).Elif(~fetch_mode & ~dn_mode & (wr_absmax > self.absmax),
                 self.absmax.eq(wr_absmax),
             )
         ]
@@ -974,7 +1028,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 scratchpad.sbw_gnt.eq(scratchpad.sbw_pending & (sp_gw_we == 0)),
                 scratchpad.sbr_allow.eq(1), # No vec/seq in this configuration.
                 # gw_pending stays 0: writes hit the RAM directly, done needs no drain.
-                scratchpad.fill.adr.eq(eng_fill_adr),
+                scratchpad.fill.adr.eq(Mux(dn_mode, dn.sp_rd_adr, eng_fill_adr) if dnstream else eng_fill_adr),
                 scratchpad.gather.adr.eq(eng_gw_adr),
                 scratchpad.gather.dat_w.eq(eng_gw_dat),
                 scratchpad.gather.we.eq(sp_gw_we),
@@ -1054,7 +1108,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 ).Elif(grant_seq,
                     scratchpad.fill.adr.eq(0 if seq is None else seq.sp_adr),
                 ).Else(
-                    scratchpad.fill.adr.eq(eng_fill_adr),
+                    scratchpad.fill.adr.eq(Mux(dn_mode, dn.sp_rd_adr, eng_fill_adr) if dnstream else eng_fill_adr),
                 ),
                 If(vec_wr,
                     scratchpad.gather.adr.eq(vecunit.sp_wr_adr),
@@ -1073,10 +1127,22 @@ class BonsaiMatVecEngine(LiteXModule):
 
         # Control FSM -------------------------------------------------------------------------
         self.fsm = fsm = FSM(reset_state="IDLE")
+        self.comb += st_run.eq(fsm.ongoing("ST_RUN"))
         start_pulse = Signal()
+        self.comb += st_fifo.reset.eq(start_pulse | st_next)
         for i, pipe in enumerate(self.pipes):
-            self.sync += pipe.start.eq(start_pulse & ~raw_mode
+            self.sync += pipe.start.eq(start_pulse & ~raw_mode & ~dn_mode
                                       & (~native_mode | (cmd_r['rows'] != 0) | (i < cmd_r['rem'])))
+        dn_fin = Signal() # The unit reported done for this op (sticky until the next).
+        if dnstream:
+            self.comb += [
+                dn.start.eq(start_pulse & dn_mode),
+                dn.heads.eq(cmd_r["rows"]),
+                dn.table.eq(cmd_r["xsrc"] >> 5),
+                dn.sp_rd_ok.eq(dn_mode & rd_free),
+                dn.sp_rd_dat.eq(scratchpad.fill.dat_r),
+            ]
+            self.sync += If(start_pulse, dn_fin.eq(0)).Elif(dn.done, dn_fin.eq(1))
         for pk in packs:
             self.comb += pk.clear.eq(start_pulse)   # No partial beat survives an op boundary.
         if with_native:
@@ -1146,6 +1212,8 @@ class BonsaiMatVecEngine(LiteXModule):
                 NextState("ISSUE"), # No x-fill for fetches.
             ).Elif(store_mode,
                 NextState("ST_CMD"),
+            ).Elif(dn_mode,
+                NextState("DN_CMD" if dnstream else "IDLE"),
             ).Else(
                 NextState("FILL"),
             )
@@ -1186,6 +1254,16 @@ class BonsaiMatVecEngine(LiteXModule):
                 NextState("IDLE"),
             )
         )
+        if dnstream:
+            # The writers take the command first (they only accept data once commanded),
+            # then every reader gets the same span; RUN waits for the unit and the writers.
+            fsm.act("DN_CMD",
+                self.busy.eq(1),
+                self.mstore_cmd.valid.eq(1),
+                self.mstore_cmd.addr.eq(cmd_r["wbase"]),
+                self.mstore_cmd.len.eq(cmd_r["wlen"]),
+                If(self.mstore_cmd.ready, NextState("ISSUE")),
+            )
         fsm.act("FILL",
             self.busy.eq(1),
             # Advance only when the R port is ours this cycle (a vec load may claim it).
@@ -1244,12 +1322,12 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             If((native_mode | raw_mode) & self.error,
                 NextState('N_FAILED') if with_native else NextState('IDLE'),
-            ).Elif(Mux(fetch_mode,
+            ).Elif(Mux(dn_mode, dn_fin & ~self.store_busy, Mux(fetch_mode,
                    fetch_cnt == cmd_r["wlen"],
                    # Dual-Q ops retire two heads' results per stream.
                    result_cnt == Mux(cmd_r["qn"],
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
-                       Mux(axpy_mode, ax_total, mv_total)))
+                       Mux(axpy_mode, ax_total, mv_total))))
                & ~gw_pending  # Queued writes must be in RAM before done.
                & ~am_busy & (~native_mode | native_complete) & (~raw_mode | raw_complete),
                 self.done.eq(1),
@@ -1261,10 +1339,9 @@ class BonsaiMatVecEngine(LiteXModule):
         self.sync += [
             fill_active_d.eq(fsm.ongoing("FILL") & rd_free),
             fill_beat_d.eq(fill_beat),
-            # STORE stream: the read address holds until the beat is accepted; dat_r is
-            # valid one stable-address cycle later (one dead cycle after each advance).
-            # rd_free: dat_r next cycle is ours only if our address was on the port.
-            st_rdv.eq(fsm.ongoing("ST_RUN") & ~st_advance & rd_free),
+            # STORE prefetch: a read issued this cycle (the R port was ours) has its data on
+            # fill.dat_r next cycle, when it enters the FIFO.
+            st_pend.eq(st_issue & ~(start_pulse | st_next)),
             # Fill/STORE read address counter (see eng_fill_adr above).
             If(start_pulse,
                 eng_fill_adr.eq(xsrc_w),
@@ -1272,9 +1349,10 @@ class BonsaiMatVecEngine(LiteXModule):
                 eng_fill_adr.eq(xsrc_w + st_src_off + cmd_r["sstride"]),
             ).Elif(fsm.ongoing("FILL") & rd_free,
                 eng_fill_adr.eq(eng_fill_adr + 1),
-            ).Elif(st_advance,
+            ).Elif(st_issue,
                 eng_fill_adr.eq(eng_fill_adr + 1),
             ),
+            If(start_pulse | st_next, st_iss.eq(0)).Elif(st_issue, st_iss.eq(st_iss + 1)),
             If(start_pulse,
                 st_cnt.eq(0),
                 st_rep.eq(0),

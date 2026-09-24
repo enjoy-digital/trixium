@@ -2,7 +2,7 @@
 """BonsaiDeltaNetStream against the firmware's recurrence loop, compiled (Verilator).
 
 Every lane's state stream is fed with random gaps, every output stream drained with
-random back-pressure, the scratchpad write grant is random: the state, the outputs and the
+random back-pressure, the scratchpad read and write grants are random: the state, the outputs and the
 cycle count come back from the compiled netlist and must equal the float32 reference bit
 for bit.
 """
@@ -56,6 +56,7 @@ int main(int argc, char **argv) {{
             *orr[l] = (rnd() % 100) < out_pct;
         }}
         d.sp_wr_gnt = (rnd() % 100) < grant_pct;
+        d.sp_rd_ok = (rnd() % 100) < grant_pct;
         d.sys_clk = 0; d.eval();
         for (uint32_t l = 0; l < L; l++) {{
             took[l] = *sv[l] && *sr[l];
@@ -70,7 +71,7 @@ int main(int argc, char **argv) {{
             require(d.sp_wr_adr < beats, "write out of range");
             for (int w = 0; w < 8; w++) if (d.sp_wr_we >> w & 1) mem[8*d.sp_wr_adr + w] = d.sp_wr_dat[w];
         }}
-        bool rd = d.sp_rd_req;
+        bool rd = d.sp_rd_req && d.sp_rd_ok;
         if (rd) {{ require(d.sp_rd_adr < beats, "read out of range"); for (int w = 0; w < 8; w++) pending[w] = mem[8*d.sp_rd_adr + w]; }}
         d.sys_clk = 1; d.eval();
         for (uint32_t l = 0; l < L; l++) if (took[l]) *sv[l] = 0;
@@ -110,6 +111,7 @@ def build(tmp_path, lanes, rows, cols):
         s.name_override = n if n != "table" else "table_adr"
     top = f"dns_{lanes}_{rows}_{cols}"
     rtl = tmp_path / f"{top}.v"
+    dut.sp_rd_ok.name_override = "sp_rd_ok"
     verilog.convert(dut, ios=set(sig.values()) | {dut.sp_rd_ok}, name=top).write(str(rtl))
     j = lambda fmt: ", ".join(fmt.format(l) for l in range(lanes))
     cpp = tmp_path / f"{top}.cpp"
@@ -118,10 +120,6 @@ def build(tmp_path, lanes, rows, cols):
         src_valid=j("&d.source{}_valid"), src_ready=j("&d.source{}_ready"), src_data=j("&d.source{}_data[0]"),
         progress=" ".join(["%u"]*len(dut.progress)),
         progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress)))))
-    # sp_rd_ok is an input left at its reset value 1 by the driver (Verilator zero-inits, so
-    # the harness drives it explicitly below).
-    text = cpp.read_text().replace("d.sys_rst = 1;", "d.sp_rd_ok = 1; d.sys_rst = 1;", 1)
-    cpp.write_text(text)
     built = subprocess.run([verilator, "--cc", "--exe", "--build", "-j", "8", "-Wno-fatal", "-O3",
                             "--x-assign", "fast", "--x-initial", "fast",
                             "--Mdir", str(tmp_path / "obj"), "--top-module", top, str(rtl), str(cpp)],

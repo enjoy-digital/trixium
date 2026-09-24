@@ -190,7 +190,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  ddr_fast_clock_buffer="bufgce",
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False,
+                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
                  with_region_fetch=False,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
@@ -348,7 +348,8 @@ class BonsaiXCU1525SoC(SoCCore):
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
                 with_activation_quantize=with_activation_quantize, with_projection_restore=with_projection_restore,
                 with_embedding_restore=with_embedding_restore, with_region_fetch=with_region_fetch,
-                with_silu=with_silu, with_norm=with_norm, with_conv=with_conv, **native)
+                with_silu=with_silu, with_norm=with_norm, with_conv=with_conv,
+                with_dnstream=with_dnstream, **native)
             add_bonsai_cluster(self, engine_axis, config)
             if with_memory_traffic:
                 from trixium.gateware.traffic import add_memory_traffic
@@ -418,6 +419,7 @@ def main():
     parser.add_target_argument("--with-silu", action="store_true", help="Exact FP32 SiLU-multiply scratchpad unit (sequencer unit 11).")
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
+    parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
     parser.add_target_argument("--with-region-fetch", action="store_true", help="Experimental sequenced 64-bit checked region reads; requires --with-native.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
@@ -446,6 +448,7 @@ def main():
         with_silu              = args.with_silu,
         with_norm              = args.with_norm,
         with_conv              = args.with_conv,
+        with_dnstream          = args.with_dnstream,
         with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)
 

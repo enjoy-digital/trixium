@@ -89,6 +89,8 @@ struct hyb_prof {
     uint32_t dn_state_sp;
     uint8_t dnres_enabled;           // console `dnres on|off`: the resident DeltaNet layer
     uint8_t xres_enabled;            // console `xres on|off`: the resident residual stream
+    uint8_t dnstream_enabled;        // console `dnstream on|off` (taken at the next reset)
+    uint8_t dnstream_active;         // the layout in engine DDR since the last reset
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -115,6 +117,14 @@ int dn_pipe_use = 1;
 #define DN_HW_COLS  128u
 #define DN_HEAD_BYTES (DN_HW_ROWS*DN_HW_COLS*4u)
 #define DN_HEAD_BEATS (DN_HEAD_BYTES/32u)
+
+// DeltaNet stream (engine op 5, BONSAI_HAS_DNSTREAM): every head of a layer in one op, the
+// state striped over the channels - channel c holds rows c, c+n_ch, ... of every head, in
+// the unit's column-group-major order (gateware/deltanet_stream.py), heads in processing
+// order. The same per-channel span as the per-head layout, so one reset clears both; the
+// layout is chosen at hybrid_reset (HP->dnstream_active) and only the resident layer runs
+// it.
+#define DN_STREAM_BEATS (DN_HEAD_BEATS/(uint32_t)n_ch)   // per channel per head
 
 static uint32_t f32_bits(float x)
 {
@@ -161,6 +171,13 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
                        const float *vh, float decay, float beta, float scale, float *oh,
                        int load_qk, int next_head)
 {
+    if (HP->dnstream_active) {
+        // The state is in the stream layout; only the resident layer's op 5 may touch it.
+        if (!engine_wedged)
+            puts("DNSTALL: per-head recurrence with the stream layout (dnres changed without a reset?)");
+        engine_wedged = 1;
+        return;
+    }
     uint8_t chan = global_head % (uint32_t)n_ch;
     uint64_t t0 = perf_now64();
     if (dn_pipe_prefetched == (int)global_head) {
@@ -237,7 +254,9 @@ static void dn_hw_reset(void)
     for (uint32_t i = 0; i < DN_HEAD_BYTES/4; i++) z[i] = 0;
     uint32_t total = (uint32_t)n_dn*(uint32_t)nv;
     for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
-        uint32_t count = (total + (uint32_t)n_ch - 1u - c)/(uint32_t)n_ch;
+        // Every channel's full span: the per-head layout uses ceil((total - c)/n_ch) slots
+        // of channel c, the stream layout total*DN_STREAM_BEATS beats of each.
+        uint32_t count = (total + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
         uint32_t slot = 0;
         while (slot < count) {
             uint32_t batch = count - slot;
@@ -260,6 +279,15 @@ static void dn_hw_reset(void)
 #endif
 
 void hybrid_dnres_enable(int on) { HP->dnres_enabled = on ? 1 : 0; }
+void hybrid_dnstream_enable(int on)
+{
+#ifdef BONSAI_HAS_DNSTREAM
+    HP->dnstream_enabled = on ? 1 : 0;
+#else
+    (void)on;
+#endif
+}
+int hybrid_dnstream_enabled(void) { return HP->dnstream_enabled; }
 void hybrid_xres_enable(int on) { HP->xres_enabled = on ? 1 : 0; }
 int hybrid_xres_enabled(void) { return HP->xres_enabled && resident_active(); }
 int hybrid_dnres_enabled(void)
@@ -632,6 +660,12 @@ int hybrid_init(void)
     for (int i = 0; i < rope_n/2; i++)
         rope_freq[i] = powf((float)H->rope_theta, -2.0f*i/rope_n);
     rope_pos_cached = -1;
+    HP->dnstream_active = 0;
+#ifdef BONSAI_HAS_DNSTREAM
+    HP->dnstream_enabled = 1;
+#else
+    HP->dnstream_enabled = 0;
+#endif
     hybrid_reset();
     HP->dnres_enabled = 0;
     HP->xres_enabled = 0;
@@ -646,6 +680,10 @@ int hybrid_init(void)
             HP->xres_enabled = 1;
             if (n_dn && resident_silu_active())
                 puts("hybrid: resident DeltaNet layer (conv/norm/SiLU units, lists) on");
+#ifdef BONSAI_HAS_DNSTREAM
+            if (n_dn && dn_hw && BONSAI_DNSTREAM_LANES == n_ch)
+                printf("hybrid: DeltaNet stream (engine op 5, %d lanes) on from the next reset\n", n_ch);
+#endif
 #endif
         }
     }
@@ -685,6 +723,10 @@ void hybrid_reset(void)
     if (dn_hw) {
 #ifdef BONSAI_HAS_DNREC
         dn_hw_reset();
+#endif
+#ifdef BONSAI_HAS_DNSTREAM
+        HP->dnstream_active = HP->dnstream_enabled && hybrid_dnres_enabled()
+                            && BONSAI_DNSTREAM_LANES == n_ch && DN_HEAD_BEATS % (uint32_t)n_ch == 0;
 #endif
     } else if (dn_state) {
         memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
@@ -1091,6 +1133,38 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     t0 = perf_now64();
     float scale = 1.0f/sqrtf((float)hk);
     int rep = nv/nk;
+#ifdef BONSAI_HAS_DNSTREAM
+    if (dn_hw && HP->dnstream_active) {
+        // Every head in one engine op: a record per head in processing order at SLOT0
+        // (q, k, v, out byte addresses; decay, beta, scale), the state streamed from and
+        // back to every channel. The read-back fences the CPU's posted scratchpad writes.
+        volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + SLOT0);
+        for (int hi = 0; hi < nv; hi++) {
+            int kh = hi/rep, hh = (hi - kh*rep)*nk + kh;
+            volatile uint32_t *w = rec + 8*hi;
+            w[0] = DNR_QKV + 4u*(uint32_t)(kh*hk);
+            w[1] = DNR_QKV + 4u*(uint32_t)(nq + kh*hk);
+            w[2] = DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv);
+            w[3] = HO + 4u*(uint32_t)(hh*hv);
+            w[4] = f32_bits(expf(gb[hh]));
+            w[5] = f32_bits(betab[hh]);
+            w[6] = f32_bits(scale);
+            w[7] = 0;
+        }
+        (void)rec[8*nv - 1];
+        struct engine_op o = {0};
+        o.kind  = ENGINE_KIND_DNSTREAM;
+        o.rows  = (uint16_t)nv;
+        o.wbase = dn_hbm_base + (uint32_t)s*(uint32_t)nv*DN_STREAM_BEATS*32u;
+        o.wlen  = (uint32_t)nv*DN_STREAM_BEATS;
+        o.xsrc  = SLOT0;
+        engine_run(&o);
+        if (engine_wedged) {
+            puts("DNSTALL: DeltaNet stream op");
+            goto fatal;
+        }
+    } else
+#endif
     if (dn_hw) {
 #ifdef BONSAI_HAS_DNREC
         // Two state slots: the FETCH of head i+1 runs on the engine while the unit

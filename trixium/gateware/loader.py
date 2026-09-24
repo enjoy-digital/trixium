@@ -12,6 +12,9 @@ length, arm `start`, then DMA exactly length*32 bytes; poll `done`. Upload verif
 the engine's FETCH op (HBM -> scratchpad) + software CRC - no readback datapath needed here.
 A CPU fallback path also exists (channel windows / scratchpad), PCIe-less bring-up only."""
 
+from functools import reduce
+from operator import and_, or_
+
 from migen import *
 
 from litex.gen import *
@@ -30,7 +33,7 @@ SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 
 class BonsaiHBMLoader(LiteXModule):
     def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0,
-                 *, regions=None, reservations=(), endpoints=None):
+                 *, regions=None, reservations=(), endpoints=None, with_mstore=False):
         with_regions = regions is not None
         if with_regions:
             from trixium.capabilities import Access
@@ -94,6 +97,12 @@ class BonsaiHBMLoader(LiteXModule):
         self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 33), ("len", 24)])
         self.store_data = stream.Endpoint([("data", 256)])
         self.store_busy = Signal()
+        # Multi-channel store (the DeltaNet stream): every writer takes the same span at its
+        # own channel offset - the address the engine's reader of that channel uses - and
+        # writer i drains mstore_data[i]. Granted from IDLE like the single store.
+        if with_mstore:
+            self.mstore_cmd  = stream.Endpoint([("addr", 33), ("len", 24)])
+            self.mstore_data = [stream.Endpoint([("data", 256)]) for _ in hbm_axis]
 
         # # #
 
@@ -158,6 +167,8 @@ class BonsaiHBMLoader(LiteXModule):
         st_addr  = Signal(33)
         st_len  = Signal(24)
         st_cnt  = Signal(24)
+        mst_addr = Signal(33)
+        mst_len  = Signal(24)
 
         # Stream resynchronisation.
         #
@@ -197,7 +208,8 @@ class BonsaiHBMLoader(LiteXModule):
                 self.region_failed.eq(fsm.ongoing('REGION_FAILED')),
                 self.region_error.eq(region_fault | Mux(self.region_busy, writer_error << 3, 0)),
                 self.region_cmd.ready.eq(fsm.ongoing('IDLE') & ~(self.start.re & self.start.storage)
-                                         & ~self.store_cmd.valid & ~self.region_abort),
+                                         & ~self.store_cmd.valid & ~self.region_abort
+                                         & (~self.mstore_cmd.valid if with_mstore else 1)),
             ]
             region_idle = [If(self.region_cmd.valid & self.region_cmd.ready,
                 NextValue(region_port, validator.port), NextValue(region_address, validator.address),
@@ -265,8 +277,58 @@ class BonsaiHBMLoader(LiteXModule):
                 NextValue(st_len,  self.store_cmd.len),
                 NextValue(st_cnt,  0),
                 NextState("EST_CMD"),
+            ).Elif(self.mstore_cmd.valid if with_mstore else 0,
+                *([self.mstore_cmd.ready.eq(1),
+                   NextValue(mst_addr, self.mstore_cmd.addr),
+                   NextValue(mst_len, self.mstore_cmd.len),
+                   NextState("MST_CMD")] if with_mstore else []),
             ).Else(*region_idle)
         )
+        mst_states = []
+        if with_mstore:
+            def chan_off(i): # The engine's per-reader constant (matvec.py _chan_off).
+                local = (i % chan_mod) if chan_mod else i
+                return local*chan_stride + local*chan_skew
+            mst_cmd_done = Signal(n)
+            mst_cnt = [Signal(24, name=f"mst_cnt{i}") for i in range(n)]
+            mst_left = [Signal(name=f"mst_left{i}") for i in range(n)]
+            all_cmd = Signal()
+            self.comb += all_cmd.eq(reduce(and_, [mst_cmd_done[i] | (w.sink_cmd.valid & w.sink_cmd.ready)
+                                                  for i, w in enumerate(self.writers)]))
+            for i in range(n):
+                self.comb += mst_left[i].eq(mst_cnt[i] != mst_len)
+            fsm.act("MST_CMD",
+                *[w.sink_cmd.valid.eq(~mst_cmd_done[i]) for i, w in enumerate(self.writers)],
+                *[w.sink_cmd.addr.eq(mst_addr + chan_off(i)) for i, w in enumerate(self.writers)],
+                *[w.sink_cmd.len.eq(mst_len) for w in self.writers],
+                If(all_cmd, NextState("MST_DATA")),
+            )
+            fsm.act("MST_DATA",
+                *[w.sink.valid.eq(d.valid & mst_left[i])
+                  for i, (w, d) in enumerate(zip(self.wbufs, self.mstore_data))],
+                *[w.sink.data.eq(d.data) for w, d in zip(self.wbufs, self.mstore_data)],
+                *[d.ready.eq(w.sink.ready & mst_left[i])
+                  for i, (w, d) in enumerate(zip(self.wbufs, self.mstore_data))],
+                If(~reduce(or_, mst_left), NextState("MST_DRAIN")),
+            )
+            fsm.act("MST_DRAIN",
+                If(reduce(and_, [w.idle for w in self.writers]), NextState("IDLE")),
+            )
+            self.sync += [
+                If(fsm.ongoing("IDLE"),
+                    mst_cmd_done.eq(0),
+                    *[c.eq(0) for c in mst_cnt],
+                ),
+                If(fsm.ongoing("MST_CMD"),
+                    *[If(w.sink_cmd.valid & w.sink_cmd.ready, mst_cmd_done[i].eq(1))
+                      for i, w in enumerate(self.writers)],
+                ),
+                If(fsm.ongoing("MST_DATA"),
+                    *[If(d.valid & d.ready, mst_cnt[i].eq(mst_cnt[i] + 1))
+                      for i, d in enumerate(self.mstore_data)],
+                ),
+            ]
+            mst_states = [fsm.ongoing(n_) for n_ in ("MST_CMD", "MST_DATA", "MST_DRAIN")]
         fsm.act("EST_CMD",
             *[w.sink_cmd.valid.eq(st_chan == i) for i, w in enumerate(self.writers)],
             *[w.sink_cmd.addr.eq(st_addr) for w in self.writers],
@@ -293,7 +355,7 @@ class BonsaiHBMLoader(LiteXModule):
             )
         )
         self.comb += self.store_busy.eq(fsm.ongoing("EST_CMD") | fsm.ongoing("EST_DATA")
-                                        | fsm.ongoing("EST_DRAIN"))
+                                        | fsm.ongoing("EST_DRAIN") | reduce(or_, mst_states, 0))
         # Built term by term so that chan_skew=0 emits exactly the expression it always did.
         _upload_addr = self.base.storage + ((chan_sel(chan) << chan_shift) if chan_stride else 0)
         if chan_skew:

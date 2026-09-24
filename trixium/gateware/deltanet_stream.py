@@ -116,8 +116,9 @@ class BonsaiDeltaNetStream(LiteXModule):
         self.done  = Signal()           # Pulse: every head's outputs and state written.
         self.sinks   = [stream.Endpoint([("data", 256)], name=f"dns_sink{l}") for l in range(L)]
         self.sources = [stream.Endpoint([("data", 256)], name=f"dns_source{l}") for l in range(L)]
-        # Scratchpad client ports: reads answered one clock later (issued only while
-        # sp_rd_ok), writes held until granted.
+        # Scratchpad client ports. Reads: sp_rd_req/sp_rd_adr come from flops and hold until
+        # a cycle with sp_rd_ok (the grant); the data is on sp_rd_dat one clock later.
+        # Writes: held until granted.
         self.sp_rd_ok  = Signal(reset=1)
         self.sp_rd_req = Signal()
         self.sp_rd_adr = Signal(adr_bits)
@@ -173,56 +174,66 @@ class BonsaiDeltaNetStream(LiteXModule):
         retired  = Signal(16)   # Heads whose outputs are in the scratchpad.
         em_cnt   = Signal(16)   # State groups emitted to the sources (all lanes).
 
-        # Loader ------------------------------------------------------------------------------
+        # Loader: one registered read request (address from a flop, granted by sp_rd_ok),
+        # a record then q, k, v beats per head; responses one clock after the grant.
         nvec = 2*G + VB
         ld_idx = Signal(max=nvec + 1)
         ld_qb, ld_kb, ld_vb = Signal(adr_bits), Signal(adr_bits), Signal(adr_bits)
+        ld_st = Signal(2)       # 0 idle, 1 record in flight, 2 vectors, 3 last vector in flight
         ld_slot = Signal(sb)
         self.comb += ld_slot.eq(ld_head[:sb])
         vk, voff = Signal(2), Signal(max(gb, vbb))
         self.comb += If(ld_idx < G, vk.eq(0), voff.eq(ld_idx)
             ).Elif(ld_idx < 2*G, vk.eq(1), voff.eq(ld_idx - G)
             ).Else(vk.eq(2), voff.eq(ld_idx - 2*G))
-        rsp_v, rsp_kind, rsp_off = Signal(), Signal(2), Signal(max(gb, vbb))
-        vec_issue = Signal()
-        ldfsm = FSM(reset_state="IDLE")
-        self.submodules.ldfsm = ldfsm
-        ldfsm.act("IDLE",
-            If(run & (ld_head < heads) & (ld_head < retired + slots),
-                self.sp_rd_req.eq(self.sp_rd_ok),
-                self.sp_rd_adr.eq(table + ld_head),
-                If(self.sp_rd_ok, NextState("REC")),
-            )
-        )
-        rec_take = Signal()
-        ldfsm.act("REC",
-            rec_take.eq(1),
-            NextValue(ld_idx, 0),
-            NextState("VEC"),
-        )
-        self.sync += If(rec_take,
-            ld_qb.eq(dat[5:5 + adr_bits]),
-            ld_kb.eq(dat[32 + 5:32 + 5 + adr_bits]),
-            ld_vb.eq(dat[64 + 5:64 + 5 + adr_bits]),
-            oad[ld_slot].eq(dat[96 + 5:96 + 5 + adr_bits]),
-            dec[ld_slot].eq(dat[128:160]),
-            bet[ld_slot].eq(dat[160:192]),
-            scl[ld_slot].eq(dat[192:224]),
-        )
-        ldfsm.act("VEC",
-            If(ld_idx == nvec,
-                # The last response is written at this edge.
-                NextValue(ld_head, ld_head + 1),
-                NextState("IDLE"),
-            ).Else(
-                vec_issue.eq(self.sp_rd_ok),
-                self.sp_rd_req.eq(self.sp_rd_ok),
-                self.sp_rd_adr.eq(Mux(vk == 0, ld_qb, Mux(vk == 1, ld_kb, ld_vb)) + voff),
-                If(self.sp_rd_ok, NextValue(ld_idx, ld_idx + 1)),
-            )
-        )
+        rq_v, rq_adr, rq_kind, rq_off, rq_last = (Signal(), Signal(adr_bits), Signal(2),
+                                                  Signal(max(gb, vbb)), Signal())
+        rsp_v, rsp_kind, rsp_off, rsp_last = Signal(), Signal(2), Signal(max(gb, vbb)), Signal()
+        taken, free = Signal(), Signal()
+        self.comb += [
+            taken.eq(rq_v & self.sp_rd_ok),
+            free.eq(~rq_v | taken),
+            self.sp_rd_req.eq(rq_v),
+            self.sp_rd_adr.eq(rq_adr),
+        ]
         self.sync += [
-            rsp_v.eq(vec_issue), rsp_kind.eq(vk), rsp_off.eq(voff),
+            rsp_v.eq(taken), rsp_kind.eq(rq_kind), rsp_off.eq(rq_off), rsp_last.eq(rq_last),
+            If(self.start,
+                ld_st.eq(0), rq_v.eq(0), ld_head.eq(0),
+            ).Else(
+                If(taken, rq_v.eq(0)),
+                Case(ld_st, {
+                    0: If(run & (ld_head < heads) & (ld_head < retired + slots) & free,
+                        rq_v.eq(1), rq_adr.eq(table + ld_head), rq_kind.eq(3), rq_last.eq(0),
+                        ld_st.eq(1),
+                    ),
+                    1: If(rsp_v & (rsp_kind == 3),
+                        ld_qb.eq(dat[5:5 + adr_bits]),
+                        ld_kb.eq(dat[32 + 5:32 + 5 + adr_bits]),
+                        ld_vb.eq(dat[64 + 5:64 + 5 + adr_bits]),
+                        oad[ld_slot].eq(dat[96 + 5:96 + 5 + adr_bits]),
+                        dec[ld_slot].eq(dat[128:160]),
+                        bet[ld_slot].eq(dat[160:192]),
+                        scl[ld_slot].eq(dat[192:224]),
+                        ld_idx.eq(0),
+                        ld_st.eq(2),
+                    ),
+                    2: If(free,
+                        If(ld_idx == nvec,
+                            ld_st.eq(3),
+                        ).Else(
+                            rq_v.eq(1),
+                            rq_adr.eq(Mux(vk == 0, ld_qb, Mux(vk == 1, ld_kb, ld_vb)) + voff),
+                            rq_kind.eq(vk), rq_off.eq(voff), rq_last.eq(ld_idx == nvec - 1),
+                            ld_idx.eq(ld_idx + 1),
+                        )
+                    ),
+                    3: If(rsp_v & rsp_last,     # Written at this edge.
+                        ld_head.eq(ld_head + 1),
+                        ld_st.eq(0),
+                    ),
+                })
+            )
         ]
         self.comb += [
             q_w.adr.eq(Cat(rsp_off[:gb], ld_slot)), q_w.dat_w.eq(dat),
@@ -316,8 +327,12 @@ class BonsaiDeltaNetStream(LiteXModule):
             s1_k.eq(fsel(k_r1.dat_r, p1_jj)),
             s1_dec.eq(dec[p1_slot]),
         ]
-        t2_v, t2_mda, t2_k = dly(s1_v, Lm, "t2v"), dly(s1_mda, Lm, "t2mda"), dly(s1_k, Lm, "t2k")
-        t2_first, t2_last, t2_r = dly(s1_first, Lm, "t2f"), dly(s1_last, Lm, "t2l"), dly(s1_r, Lm, "t2r")
+        # u: one register after the input buffer's float select (memory -> 8:1 mux ->
+        # multiplier is not one clock at speed).
+        u_v, u_dec = dly(s1_v, 1, "uv"), dly(s1_dec, 1, "udec")
+        t2_v, t2_mda, t2_k = dly(s1_v, Lm + 1, "t2v"), dly(s1_mda, Lm + 1, "t2mda"), dly(s1_k, Lm + 1, "t2k")
+        t2_first, t2_last, t2_r = (dly(s1_first, Lm + 1, "t2f"), dly(s1_last, Lm + 1, "t2l"),
+                                   dly(s1_r, Lm + 1, "t2r"))
         t3_v, t3_first = dly(t2_v, Lm, "t3v"), dly(t2_first, Lm, "t3f")
         t3_last, t3_r = dly(t2_last, Lm, "t3l"), dly(t2_r, Lm, "t3r")
         t4_v, t4_last, t4_r = dly(t3_v, La, "t4v"), dly(t3_last, La, "t4l"), dly(t3_r, La, "t4r")
@@ -339,10 +354,12 @@ class BonsaiDeltaNetStream(LiteXModule):
             self.specials += md, md_w, md_r
             mdmems.append(md_r)
             da = Array(dacc[l])
+            u_m = Signal(32, name=f"dns_um{l}")
+            self.sync += u_m.eq(fsel(inbufs[l].dat_r, s1_jj))
             self.comb += [
-                mul_dec[l].a.eq(fsel(inbufs[l].dat_r, s1_jj)),
-                mul_dec[l].b.eq(s1_dec),
-                mul_dec[l].valid.eq(s1_v),
+                mul_dec[l].a.eq(u_m),
+                mul_dec[l].b.eq(u_dec),
+                mul_dec[l].valid.eq(u_v),
                 md_w.adr.eq(t2_mda), md_w.dat_w.eq(mul_dec[l].result), md_w.we.eq(t2_v),
                 mul_k[l].a.eq(mul_dec[l].result),
                 mul_k[l].b.eq(t2_k),
@@ -608,7 +625,6 @@ class BonsaiDeltaNetStream(LiteXModule):
                          sc_head, retired, em_cnt]
         self.sync += If(self.start,
             run.eq(1), heads.eq(self.heads), table.eq(self.table),
-            ld_head.eq(0),
         ).Elif(finish,
             run.eq(0),
         )
