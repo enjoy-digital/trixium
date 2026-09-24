@@ -289,7 +289,7 @@ class FP32DivSqrt(LiteXModule):
         rad = Signal(52)
         cnt = Signal(5)
         l0 = Signal((12, True))
-        IDLE, RUN, PACK = range(3)
+        IDLE, RUN, PACK, PACK2 = range(4)
         state = Signal(2)
         self.comb += self.busy.eq(state != IDLE)
 
@@ -332,7 +332,10 @@ class FP32DivSqrt(LiteXModule):
         )
         shift_used = Signal((12, True))
         self.comb += shift_used.eq(Mux(s_sel < 0, s_sel, rsh))
-        self.submodules.pack = pack = _RoundPack(sign, pk_q, pk_g, pk_st, l0, shift_used, bias=150)
+        # The count/shift and the round/pack are split over two clocks (PACK, PACK2): as
+        # one they were the norm unit's critical path (26 levels, +0.2 ns synthesis-only).
+        r_q, r_g, r_st, r_s = Signal(24), Signal(), Signal(), Signal((12, True))
+        self.submodules.pack = pack = _RoundPack(sign, r_q, r_g, r_st, l0, r_s, bias=150)
 
         self.sync += [
             self.done.eq(0),
@@ -381,6 +384,10 @@ class FP32DivSqrt(LiteXModule):
                     ),
                 ],
                 PACK: [
+                    r_q.eq(pk_q), r_g.eq(pk_g), r_st.eq(pk_st), r_s.eq(shift_used),
+                    state.eq(PACK2),
+                ],
+                PACK2: [
                     self.r.eq(Mux(special, sval, pack.word)),
                     self.done.eq(1), state.eq(IDLE),
                 ],
