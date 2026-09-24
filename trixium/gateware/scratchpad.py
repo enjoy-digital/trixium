@@ -35,7 +35,7 @@ class _Facade:
     pass
 
 class BonsaiScratchpad(LiteXModule):
-    def __init__(self, size=256*1024, init=None):
+    def __init__(self, size=256*1024, init=None, xpm=False):
         self.size = size
         depth     = size//32
         # The raw Memory must not be auto-exported over the CSR bus (AutoCSR scans Memory
@@ -69,12 +69,38 @@ class BonsaiScratchpad(LiteXModule):
 
         # # #
 
-        # Named for the block-RAM style constraint (xilinx_constraints.py).
-        self.mem = mem = Memory(256, depth, init=init, name="bonsai_scratchpad")
-        self.specials += mem
-        port_r = mem.get_port()
-        port_w = mem.get_port(write_capable=True, we_granularity=8)
-        self.specials += port_r, port_w
+        if xpm:
+            # Xilinx builds: an explicit simple dual-port block RAM. Inference turned the
+            # same two ports into 8,192 RAM256X1D LUT-RAM cells inside the full SoC
+            # ("Infeasible attribute ram_style = block", v15/v16), though the identical
+            # memory alone infers 64 BRAM tiles - so the Vivado build no longer depends on
+            # it. read_first: a read of the address being written returns the old data, as
+            # the Memory below does in simulation.
+            assert init is None
+            aw = (depth - 1).bit_length()
+            port_r, port_w = _Facade(), _Facade()
+            port_r.adr, port_r.dat_r = Signal(aw), Signal(256)
+            port_w.adr, port_w.dat_w, port_w.we = Signal(aw), Signal(256), Signal(32)
+            self.mem = None
+            self.specials += Instance("xpm_memory_sdpram",
+                p_ADDR_WIDTH_A=aw, p_ADDR_WIDTH_B=aw, p_BYTE_WRITE_WIDTH_A=8,
+                p_CLOCKING_MODE="common_clock", p_ECC_MODE="no_ecc",
+                p_MEMORY_INIT_FILE="none", p_MEMORY_INIT_PARAM="0", p_USE_MEM_INIT=0,
+                p_MEMORY_PRIMITIVE="block", p_MEMORY_SIZE=depth*256,
+                p_MESSAGE_CONTROL=0, p_AUTO_SLEEP_TIME=0, p_WAKEUP_TIME="disable_sleep",
+                p_READ_DATA_WIDTH_B=256, p_READ_LATENCY_B=1, p_READ_RESET_VALUE_B="0",
+                p_RST_MODE_A="SYNC", p_RST_MODE_B="SYNC", p_WRITE_DATA_WIDTH_A=256,
+                p_WRITE_MODE_B="read_first",
+                i_clka=ClockSignal("sys"), i_clkb=ClockSignal("sys"),
+                i_ena=1, i_wea=port_w.we, i_addra=port_w.adr, i_dina=port_w.dat_w,
+                i_enb=1, i_addrb=port_r.adr, o_doutb=port_r.dat_r, i_rstb=0, i_regceb=1,
+                i_sleep=0, i_injectsbiterra=0, i_injectdbiterra=0)
+        else:
+            self.mem = mem = Memory(256, depth, init=init, name="bonsai_scratchpad")
+            self.specials += mem
+            port_r = mem.get_port()
+            port_w = mem.get_port(write_capable=True, we_granularity=8)
+            self.specials += port_r, port_w
 
         # Engine-facing facades (attribute-compatible with the old Memory ports).
         self.fill = _Facade()

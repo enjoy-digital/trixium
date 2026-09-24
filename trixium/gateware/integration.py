@@ -69,8 +69,11 @@ class BonsaiClusterConfig:
     with_silu: bool = False
     with_norm: bool = False
     with_conv: bool = False
+    scratchpad_xpm: bool = False # Xilinx: the scratchpad as an explicit XPM block RAM.
     with_dnstream: bool = False  # Engine op 5: the DeltaNet stream unit on every channel.
     dnstream_options: tuple = () # (name, value) overrides of the unit's arguments (tests).
+    with_attnstream: bool = False  # Engine op 6: the attention passes (scores, weighted V).
+    attnstream_options: tuple = () # (name, value) overrides of the unit's arguments.
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -128,7 +131,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
-    soc.scratchpad = BonsaiScratchpad(size=config.scratchpad_size)
+    soc.scratchpad = BonsaiScratchpad(size=config.scratchpad_size, xpm=config.scratchpad_xpm)
     sp_csr = None
     if config.with_sp_csr:
         sp_csr = soc.scratchpad.add_csr_port(with_read_status=bool(config.native_regions))
@@ -254,7 +257,15 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     soc.engine = ClockDomainsRenamer("eng")(
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
                           seq=seq, dual=config.with_dual, **placement, **native,
-                          dnstream=config.with_dnstream and (config.dnstream_options or True)))
+                          dnstream=config.with_dnstream and (config.dnstream_options or True),
+                          attnstream=config.with_attnstream and (config.attnstream_options or True)))
+    if config.with_attnstream:
+        at = soc.engine.attnstream
+        soc.add_constant("BONSAI_HAS_ATTNSTREAM")
+        soc.add_constant("BONSAI_ATTN_LANES", at.lanes)
+        soc.add_constant("BONSAI_ATTN_GROUPS", at.groups)
+        soc.add_constant("BONSAI_ATTN_HD_MAX", 8*at.hb_max)
+        soc.add_constant("BONSAI_ATTN_T_MAX", at.t_max)
     if config.with_dnstream:
         soc.add_constant("BONSAI_HAS_DNSTREAM")
         soc.add_constant("BONSAI_DNSTREAM_LANES", len(axis))

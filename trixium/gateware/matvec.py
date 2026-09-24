@@ -145,7 +145,7 @@ class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  dual=True, chan_stride=0, chan_mod=0, chan_skew=0,
                  native_regions=None, native_reservations=(), native_endpoints=None,
-                 dnstream=False):
+                 dnstream=False, attnstream=False):
         with_native = native_regions is not None
         if with_native:
             from trixium.gateware.native_reader import NativeRegionReader, NativeReadTransport
@@ -226,7 +226,10 @@ class BonsaiMatVecEngine(LiteXModule):
                              # 4: axpy (weighted-V: per-lane accumulate, cols results/chan),
                              # 5: DeltaNet stream (dnstream only: rows = heads, xsrc = the
                              # head record table, wbase/wlen = every channel's state span,
-                             # read and rewritten in place through the loader's writers).
+                             # read and rewritten in place through the loader's writers),
+                             # 6: attention stream (attnstream only: xsrc = the unit's record;
+                             # K or V rows position-striped: rows/rem/wbase/wlen as the KV ops,
+                             # sbeats + cbeats = beats per row, merged in position order).
             ("rows",   16),  # Rows per channel.
             ("cols",   17 if with_native else 14),  # K; legacy CSR remains 14 bits.
             ("wbase",  32),  # Per-channel weight byte address (beat-aligned).
@@ -343,6 +346,12 @@ class BonsaiMatVecEngine(LiteXModule):
             self.mstore_cmd  = stream.Endpoint([("addr", 33), ("len", 24)])
             self.mstore_data = dn.sources
 
+        self.with_attnstream = attnstream
+        if attnstream:
+            from trixium.gateware.attn_stream import BonsaiAttnStream
+            opts = dict(attnstream) if isinstance(attnstream, (dict, tuple)) else {}
+            self.submodules.attnstream = at = BonsaiAttnStream(adr_bits=len(scratchpad.fill.adr), **opts)
+
         # # #
 
         # Channels ----------------------------------------------------------------------------
@@ -364,6 +373,10 @@ class BonsaiMatVecEngine(LiteXModule):
         fetch_valids = []
         fetch_datas  = []
         dn_mode = Signal() # kind == 5 for the latched command.
+        at_mode = Signal() # kind == 6 for the latched command.
+        at_chan = Signal(max=max(2, len(hbm_axis))) # The merge's current channel.
+        at_take = Signal() # The merged beat is accepted this cycle.
+        rsrc_valids, rsrc_datas = [], []
         for i, axi in enumerate(hbm_axis):
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
             # per round trip - 33.7 cycles/beat measured); round-robin ARIDs let it pipeline.
@@ -424,16 +437,23 @@ class BonsaiMatVecEngine(LiteXModule):
                     dn.sinks[i].valid.eq(rsrc.valid & is_dn),
                     dn.sinks[i].data.eq(rsrc.data),
                 ]
+            is_at = C(0, 1)
+            if attnstream:
+                is_at = Signal(name=f"is_at{i}")
+                self.sync += is_at.eq(at_mode)
             self.comb += [
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
-                pipe.sink.valid.eq(rsrc.valid & ~is_fetch & ~is_dn),
+                pipe.sink.valid.eq(rsrc.valid & ~is_fetch & ~is_dn & ~is_at),
                 pipe.sink.data.eq(rsrc.data),
                 # Fetch beats honor the gather-FIFO headroom (a vec store can steal the
                 # W port for a cycle); compute beats honor the pipe's result-FIFO
                 # backpressure (drops results past N=2 otherwise - N/row_beats > 1 gather/cycle).
-                rsrc.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & ~is_dn & pipe.sink.ready)
-                              | (is_dn & (dn.sinks[i].ready if dnstream else 0))),
+                rsrc.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & ~is_dn & ~is_at & pipe.sink.ready)
+                              | (is_dn & (dn.sinks[i].ready if dnstream else 0))
+                              | (is_at & at_take & (at_chan == i))),
             ]
+            rsrc_valids.append(rsrc.valid)
+            rsrc_datas.append(rsrc.data)
             fetch_valids.append(rsrc.valid & is_fetch)
             fetch_datas.append(rsrc.data)
             self.readers.append(reader)
@@ -471,6 +491,7 @@ class BonsaiMatVecEngine(LiteXModule):
             store_mode.eq(cmd_r["kind"] == 3),
             axpy_mode.eq(cmd_r["kind"] == 4),
             dn_mode.eq(cmd_r["kind"] == 5 if dnstream else 0),
+            at_mode.eq(cmd_r["kind"] == 6 if attnstream else 0),
             fetch_chan.eq(cmd_r["chan"]),
         ]
         if with_native:
@@ -536,6 +557,7 @@ class BonsaiMatVecEngine(LiteXModule):
         pipe_errors = [(p.error | p.overflow) & (~native_mode | (p.rows != 0)) for p in self.pipes]
         backend_error = (reduce_or([r.error != 0 for r in self.native_readers]) if with_native else C(0, 1))
         self.comb += self.error.eq(reduce_or(pipe_errors) | (native_mode & (native_config_error | backend_error))
+                                  | ((at_mode & at.error) if attnstream else 0)
                                   | (raw_mode & (raw_error != 0)))
 
         # x-fill ------------------------------------------------------------------------------
@@ -933,8 +955,18 @@ class BonsaiMatVecEngine(LiteXModule):
                 dn_wr_take.eq(dn_mode & dn.sp_wr_req & fetch_rdy),
                 dn.sp_wr_gnt.eq(dn_wr_take),
             ]
+        at_wr_take = Signal()
+        if attnstream:
+            self.comb += [
+                at_wr_take.eq(at_mode & at.sp_wr_req & fetch_rdy),
+                at.sp_wr_gnt.eq(at_wr_take),
+            ]
         self.comb += [
-            If(dn_mode,
+            If(at_mode,
+                eng_gw_adr_c.eq(at.sp_wr_adr if attnstream else 0),
+                eng_gw_dat_c.eq(at.sp_wr_dat if attnstream else 0),
+                eng_gw_we_c.eq(Mux(at_wr_take, 0xFF, 0)),
+            ).Elif(dn_mode,
                 # The unit's output beats: granted when the gather FIFO has headroom, the
                 # fetch rule (the payload is its FIFO head, held until then).
                 eng_gw_adr_c.eq(dn.sp_wr_adr if dnstream else 0),
@@ -1011,10 +1043,19 @@ class BonsaiMatVecEngine(LiteXModule):
         self.sync += [
             If(command_accept,
                 self.absmax.eq(0),
-            ).Elif(~fetch_mode & ~dn_mode & (wr_absmax > self.absmax),
+            ).Elif(~fetch_mode & ~dn_mode & ~at_mode & (wr_absmax > self.absmax),
                 self.absmax.eq(wr_absmax),
             )
         ]
+
+        # The engine's R-port address: the fill/STORE counter, or a stream unit's registered
+        # request while its op runs.
+        eng_rd_adr = Signal(len(scratchpad.fill.adr))
+        self.comb += eng_rd_adr.eq(eng_fill_adr)
+        if dnstream:
+            self.comb += If(dn_mode, eng_rd_adr.eq(dn.sp_rd_adr))
+        if attnstream:
+            self.comb += If(at_mode, eng_rd_adr.eq(at.sp_rd_adr))
 
         # Scratchpad port wiring (direct, or muxed with the vector unit). supw masks only
         # the memory-facing enables - result counting still runs on eng_gw_we.
@@ -1028,7 +1069,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 scratchpad.sbw_gnt.eq(scratchpad.sbw_pending & (sp_gw_we == 0)),
                 scratchpad.sbr_allow.eq(1), # No vec/seq in this configuration.
                 # gw_pending stays 0: writes hit the RAM directly, done needs no drain.
-                scratchpad.fill.adr.eq(Mux(dn_mode, dn.sp_rd_adr, eng_fill_adr) if dnstream else eng_fill_adr),
+                scratchpad.fill.adr.eq(eng_rd_adr),
                 scratchpad.gather.adr.eq(eng_gw_adr),
                 scratchpad.gather.dat_w.eq(eng_gw_dat),
                 scratchpad.gather.we.eq(sp_gw_we),
@@ -1108,7 +1149,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 ).Elif(grant_seq,
                     scratchpad.fill.adr.eq(0 if seq is None else seq.sp_adr),
                 ).Else(
-                    scratchpad.fill.adr.eq(Mux(dn_mode, dn.sp_rd_adr, eng_fill_adr) if dnstream else eng_fill_adr),
+                    scratchpad.fill.adr.eq(eng_rd_adr),
                 ),
                 If(vec_wr,
                     scratchpad.gather.adr.eq(vecunit.sp_wr_adr),
@@ -1131,7 +1172,7 @@ class BonsaiMatVecEngine(LiteXModule):
         start_pulse = Signal()
         self.comb += st_fifo.reset.eq(start_pulse | st_next)
         for i, pipe in enumerate(self.pipes):
-            self.sync += pipe.start.eq(start_pulse & ~raw_mode & ~dn_mode
+            self.sync += pipe.start.eq(start_pulse & ~raw_mode & ~dn_mode & ~at_mode
                                       & (~native_mode | (cmd_r['rows'] != 0) | (i < cmd_r['rem'])))
         dn_fin = Signal() # The unit reported done for this op (sticky until the next).
         if dnstream:
@@ -1143,6 +1184,34 @@ class BonsaiMatVecEngine(LiteXModule):
                 dn.sp_rd_dat.eq(scratchpad.fill.dat_r),
             ]
             self.sync += If(start_pulse, dn_fin.eq(0)).Elif(dn.done, dn_fin.eq(1))
+        at_fin = Signal()
+        if attnstream:
+            # The merge: position t is channel t % n's next row, sbeats + cbeats beats each.
+            at_rowbeats = Signal(9)
+            at_beat = Signal(9)
+            self.comb += [
+                at_rowbeats.eq(cmd_r["sbeats"] + cmd_r["cbeats"]),
+                at.start.eq(start_pulse & at_mode),
+                at.rec.eq(cmd_r["xsrc"] >> 5),
+                at.sp_rd_ok.eq(at_mode & rd_free),
+                at.sp_rd_dat.eq(scratchpad.fill.dat_r),
+                at.sink.valid.eq(at_mode & Array(rsrc_valids)[at_chan]),
+                at.sink.data.eq(Array(rsrc_datas)[at_chan]),
+                at_take.eq(at.sink.valid & at.sink.ready),
+            ]
+            self.sync += [
+                If(start_pulse, at_fin.eq(0)).Elif(at.done, at_fin.eq(1)),
+                If(start_pulse,
+                    at_chan.eq(0), at_beat.eq(0),
+                ).Elif(at_take,
+                    If(at_beat == at_rowbeats - 1,
+                        at_beat.eq(0),
+                        at_chan.eq(Mux(at_chan == n - 1, 0, at_chan + 1)),
+                    ).Else(
+                        at_beat.eq(at_beat + 1),
+                    )
+                ),
+            ]
         for pk in packs:
             self.comb += pk.clear.eq(start_pulse)   # No partial beat survives an op boundary.
         if with_native:
@@ -1214,6 +1283,8 @@ class BonsaiMatVecEngine(LiteXModule):
                 NextState("ST_CMD"),
             ).Elif(dn_mode,
                 NextState("DN_CMD" if dnstream else "IDLE"),
+            ).Elif(at_mode,
+                NextState("ISSUE" if attnstream else "IDLE"),
             ).Else(
                 NextState("FILL"),
             )
@@ -1322,12 +1393,12 @@ class BonsaiMatVecEngine(LiteXModule):
             self.busy.eq(1),
             If((native_mode | raw_mode) & self.error,
                 NextState('N_FAILED') if with_native else NextState('IDLE'),
-            ).Elif(Mux(dn_mode, dn_fin & ~self.store_busy, Mux(fetch_mode,
+            ).Elif(Mux(at_mode, at_fin, Mux(dn_mode, dn_fin & ~self.store_busy, Mux(fetch_mode,
                    fetch_cnt == cmd_r["wlen"],
                    # Dual-Q ops retire two heads' results per stream.
                    result_cnt == Mux(cmd_r["qn"],
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
-                       Mux(axpy_mode, ax_total, mv_total))))
+                       Mux(axpy_mode, ax_total, mv_total)))))
                & ~gw_pending  # Queued writes must be in RAM before done.
                & ~am_busy & (~native_mode | native_complete) & (~raw_mode | raw_complete),
                 self.done.eq(1),
