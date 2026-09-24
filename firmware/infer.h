@@ -28,6 +28,7 @@ const struct infer_prefill_profile *infer_last_prefill(void);
 // (the chat tools pass <|im_end|>; the tokenizer lives on the host). n = 0 clears it.
 #define INFER_STOP_MAX 4
 void infer_set_stop(const int *ids, int n);
+void infer_static_init(void);   // Clear the main_ram static-window state infer.c keeps (boot).
 // Sampling: temperature (0 = greedy), top-p, repetition penalty (1 = none), PRNG seed
 // (0 = keep). infer_set_recent names the token buffer the penalty looks back into.
 void infer_set_sampling(float temp, float top_p, float rep, uint32_t seed);

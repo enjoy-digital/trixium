@@ -1831,11 +1831,17 @@ static void seq_build_qkr(void)
     seq_qkr_count = di;
 }
 
-static int32_t eps_memo[128]; // seq_eps_int cache, index es+64; 0 = not computed yet.
-                              // int32 and [-64, 63] since the qkvx LUT fill (2026-09-09)
-                              // asks for 32 es values per norm per layer - a miss is
-                              // ~500 cycles of soft-float, and the old int16 memo could
-                              // not hold the big-eps (very negative es) entries at all.
+// seq_eps_int cache, index es+64; 0 = not computed yet. int32 and [-64, 63] since the qkvx
+// LUT fill (2026-09-09) asks for 32 es values per norm per layer - a miss is ~500 cycles of
+// soft-float, and the old int16 memo could not hold the big-eps (very negative es) entries
+// at all. In the main_ram static window (not SRAM .bss: v17's headers left the 8 KiB SRAM
+// under its 4 KiB stack floor), so NOT zero-initialized: infer_static_init() clears it.
+#define eps_memo ((int32_t *)BONSAI_EPS_MEMO_ADDR)
+
+void infer_static_init(void)
+{
+    for (int i = 0; i < 128; i++) eps_memo[i] = 0;
+}
 
 static int seq_eps_int(int es)
 {
@@ -4557,7 +4563,7 @@ int infer_init(void)
         int r = 0;
         while ((bound >> r) >= (1ull << 31)) r++;
         kv_br_r = r;
-        for (int i = 0; i < 64; i++) eps_memo[i] = 0; // New image: new rms_eps.
+        for (int i = 0; i < 128; i++) eps_memo[i] = 0; // New image: new rms_eps.
     }
     int kv_dim = n_kv_head*head_dim;
     int q_dim  = n_head*head_dim;

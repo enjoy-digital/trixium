@@ -919,6 +919,7 @@ int main(void)
 #endif
     uart_init();
     perf_init();
+    infer_static_init();
 #ifdef CSR_VECUNIT_BASE
     vec_init();
 #endif
