@@ -14,9 +14,12 @@ or disjoint. Segments may be strided (src_stride / dst_stride in beats, 0 = cont
 the attention's q heads sit between their gates in the Q projection output.
 
 Per segment: pass 1 streams the segment through 8 multipliers and 8 adders into the 64
-partials (each revisited every 8 beats, past the adder's latency), the tree and the
-scalar chain run on one adder and the sequential divide/sqrt, pass 2 streams it again
-through two multipliers per lane into a credit-counted output FIFO.
+partials (each revisited every 8 beats, past the adder's latency), the tree reuses those
+8 adders (8 of a level's independent pairs per clock), the scalar chain runs on its own
+adder and the sequential divide/sqrt, pass 2 streams the segment again through two
+multipliers per lane into a credit-counted output FIFO. Two stages overlap consecutive
+segments: pass 1 and the tree of segment i+1 run under the scalar chain and pass 2 of
+segment i (short segments were ~85% fixed cost: 226 cycles for 32 beats at n = 128).
 
 Contract with the integrator as for the other resident clients (one-cycle reads, writes
 on sp_wr_req & sp_wr_gnt with the payload held). error bits: 0 geometry, 1 bounds,
@@ -122,46 +125,57 @@ class BonsaiNormScratchpad(LiteXModule):
         inflight = Signal(max=FIFO_DEPTH + 1)
 
         # Control ---------------------------------------------------------------------------
-        states = ["IDLE", "VALIDATE", "WLOAD", "P1", "P1_DRAIN", "TREE", "SCALAR", "P2", "P2_DRAIN",
-                  "FINISH", "FAILED"]
+        # Top level: IDLE -> VALIDATE -> WLOAD (RMS) -> RUN -> FINISH. In RUN two stages
+        # work on consecutive segments: A (pass 1, tree) on segment i+1 while B (scalar
+        # chain, pass 2) finishes segment i. A hands B the sum of squares and the segment
+        # addresses once B is waiting; B changes `scale` and the output base only after
+        # its previous segment's writes drained.
+        states = ["IDLE", "VALIDATE", "WLOAD", "RUN", "FINISH", "FAILED"]
         S = {name: i for i, name in enumerate(states)}
-        state = Signal(4)
-        seg = Signal(16)
-        beat = Signal(13)                            # reads issued in the current phase
+        A = {name: i for i, name in enumerate(["P1", "DRAIN", "TREE", "HAND", "DONE"])}
+        B = {name: i for i, name in enumerate(["WAIT", "SCALAR", "P2"])}
+        state, a_st, b_st = Signal(3), Signal(3), Signal(2)
+        run = Signal()
+        seg_a, seg_b = Signal(16), Signal(16)        # segments handed off / issued by B
+        beat = Signal(13)                            # weight reads issued
+        beat_a, beat_b = Signal(13), Signal(13)      # pass-1 / pass-2 reads issued
         rd_pending = Signal()
         rd_kind = Signal(2)                          # 0 weight, 1 pass-1 x, 2 pass-2 x
         rd_beat = Signal(13)
         clear = Signal()
         self.comb += [
             clear.eq(self.cancel | (state == S["IDLE"])),
+            run.eq((state == S["RUN"]) & ~self.cancel),
             ofifo.reset.eq(clear),
             self.cmd.ready.eq((state == S["IDLE"]) & ~self.cancel),
             self.busy.eq(state != S["IDLE"]),
         ]
         # Segment bases, advanced by one stride per segment (a seg*stride product fed the
         # read address every clock: the unit's critical path, +0.35 ns synthesis-only).
-        seg_src = Signal(24)
-        seg_dst = Signal(24)
+        src_a, dst_a = Signal(24), Signal(24)        # stage A's segment
+        src_b, dst_b = Signal(24), Signal(24)        # stage B's segment
 
-        # Read issue per phase.
-        issue = Signal()
+        # Read issue: one scratchpad read per clock; pass 2 (it frees output credits and
+        # ends a segment) before pass 1.
+        issue_w, issue_a, issue_b, issue = Signal(), Signal(), Signal(), Signal()
         can_p2 = Signal()
         self.comb += can_p2.eq((ofifo.level + inflight) < FIFO_DEPTH)
         self.comb += [
-            issue.eq(~self.cancel & (
-                ((state == S["WLOAD"]) & (beat < nbeats)) |
-                ((state == S["P1"]) & (beat < nbeats)) |
-                ((state == S["P2"]) & (beat < nbeats) & can_p2))),
+            issue_w.eq(~self.cancel & (state == S["WLOAD"]) & (beat < nbeats)),
+            issue_b.eq(run & (b_st == B["P2"]) & (beat_b < nbeats) & can_p2),
+            issue_a.eq(run & (a_st == A["P1"]) & (beat_a < nbeats) & ~issue_b),
+            issue.eq(issue_w | issue_a | issue_b),
             self.sp_rd_req.eq(issue),
-            self.sp_rd_adr.eq(Mux(state == S["WLOAD"], (cap["weight"] >> 5) + beat,
-                                  (seg_src >> 5) + beat)),
-            rd_port.adr.eq(beat),
+            self.sp_rd_adr.eq(Mux(issue_w, (cap["weight"] >> 5) + beat,
+                              Mux(issue_b, (src_b >> 5) + beat_b, (src_a >> 5) + beat_a))),
+            rd_port.adr.eq(beat_b),
         ]
         self.sync += [
             rd_pending.eq(issue & ~clear),
-            rd_kind.eq(Mux(state == S["WLOAD"], 0, Mux(state == S["P1"], 1, 2))),
-            rd_beat.eq(beat),
-            If(issue, beat.eq(beat + 1), self.read_beats.eq(self.read_beats + 1)),
+            rd_kind.eq(Mux(issue_w, 0, Mux(issue_b, 2, 1))),
+            rd_beat.eq(Mux(issue_w, beat, Mux(issue_b, beat_b, beat_a))),
+            If(issue, self.read_beats.eq(self.read_beats + 1)),
+            If(issue_w, beat.eq(beat + 1)),
         ]
         # Weight load writes.
         self.comb += [
@@ -170,33 +184,52 @@ class BonsaiNormScratchpad(LiteXModule):
             wr_port.dat_w.eq(self.sp_rd_dat),
         ]
 
-        # Pass 1: squares, then accumulation into the partials of this beat's slot.
+        # The eight accumulate adders: pass 1 (partial + x*x), then the tree.
         p1_valid = Signal()
         self.comb += p1_valid.eq(rd_pending & (rd_kind == 1))
         slot_sq = _delay(self, rd_beat[:3], L_MUL, "slot_sq")
         valid_sq = _delay(self, p1_valid, L_MUL, "valid_sq")
-        for lane in range(8):
-            x = self.sp_rd_dat[32*lane:32*lane + 32]
-            self.comb += [sq[lane].a.eq(x), sq[lane].b.eq(x),
-                          acc[lane].a.eq(Array(P[8*s + lane] for s in range(8))[slot_sq]),
-                          acc[lane].b.eq(sq[lane].r)]
         slot_acc = _delay(self, slot_sq, L_ADD, "slot_acc")
         valid_acc = _delay(self, valid_sq, L_ADD, "valid_acc")
         p1_inflight = Signal(8)
         self.sync += If(clear, p1_inflight.eq(0)).Else(
             p1_inflight.eq(p1_inflight + p1_valid - valid_acc))
 
-        # Tree: level w (32..1), j in [0, w): P[j] = P[j] + P[j + w], one add per clock.
-        level = Signal(3)                            # 0..5 -> w = 32 >> level
+        # Tree: level w = 32 >> level (0..5), P[j] = P[j] + P[j + w] for j < w, eight j per
+        # clock (j = tj + lane, tj a multiple of 8; lanes >= w idle below w = 8). The same
+        # pairs as one add per clock, so the same bits.
+        level = Signal(3)
         w_cur = Signal(7)
         self.comb += w_cur.eq(Array([C(32 >> i, 7) for i in range(6)] + [C(0, 7)]*2)[level])
         tj = Signal(7)
+        tree_mode = Signal()
         tree_issue = Signal()
+        lane_mask = Signal(8)
+        self.comb += [
+            tree_mode.eq(a_st == A["TREE"]),
+            tree_issue.eq(run & tree_mode & (tj < w_cur)),
+            lane_mask.eq(Array([C(0xFF, 8)]*3 + [C(0x0F, 8), C(0x03, 8), C(0x01, 8), C(0, 8), C(0, 8)])[level]),
+        ]
         tree_valid = _delay(self, tree_issue, L_ADD, "tree_valid")
-        tree_dst = _delay(self, tj[:6], L_ADD, "tree_dst")
+        tree_slot = _delay(self, tj[3:5], L_ADD, "tree_slot")
+        tree_mask = _delay(self, lane_mask, L_ADD, "tree_mask")
         tree_inflight = Signal(4)
-        self.comb += tree_issue.eq((state == S["TREE"]) & (tj < w_cur) & ~self.cancel)
-        # Scalar chain: the tree adder also does ss/n + eps.
+        self.sync += If(clear, tree_inflight.eq(0)).Else(
+            tree_inflight.eq(tree_inflight + tree_issue - tree_valid))
+        # Operand b's index: 0..3 = lane + 32 + 8*s, 4..5 = lane + 16 + 8*s, 6..9 = lane + 8,
+        # 4, 2, 1 (s = tj >> 3).
+        s_tj = tj[3:5]
+        b_sel = Signal(4)
+        self.comb += b_sel.eq(Mux(level == 0, s_tj, Mux(level == 1, 4 + s_tj[0], 4 + level)))
+        for lane in range(8):
+            x = self.sp_rd_dat[32*lane:32*lane + 32]
+            a_tree = Array(P[8*s + lane] for s in range(4))[s_tj]
+            b_tree = Array([P[lane + 32 + 8*s] for s in range(4)] + [P[lane + 16 + 8*s] for s in range(2)] +
+                           [P[lane + d] for d in (8, 4, 2, 1)])[b_sel]
+            self.comb += [sq[lane].a.eq(x), sq[lane].b.eq(x),
+                          acc[lane].a.eq(Mux(tree_mode, a_tree, Array(P[8*s + lane] for s in range(8))[slot_sq])),
+                          acc[lane].b.eq(Mux(tree_mode, b_tree, sq[lane].r))]
+        # Scalar chain on its own adder: ss/n + eps.
         sc_add = Signal()
         sc_step = Signal(3)
         sc_wait = Signal()
@@ -207,29 +240,19 @@ class BonsaiNormScratchpad(LiteXModule):
         self.comb += nlz_s
         nman, nman_c = _shift_left(cap["n"], nlz, 15, 16)
         self.comb += [nman_c, n_f32.eq(Cat(C(0, 8), nman[:15], (127 + 15) - nlz, C(0, 1)))]
-        tree_a, tree_b = Signal(32), Signal(32)
-        self.comb += [
-            tree.a.eq(tree_a), tree.b.eq(tree_b),
-            If(state == S["TREE"],
-                tree_a.eq(Pa[tj[:6]]), tree_b.eq(Pa[tj[:6] + w_cur]),
-            ).Else(
-                tree_a.eq(tmp), tree_b.eq(cap["eps"]),
-            ),
-        ]
+        self.comb += [tree.a.eq(tmp), tree.b.eq(cap["eps"])]
         partial_writes = []
         for k in range(64):
             lane, s = k % 8, k // 8
             partial_writes.append(
-                If(clear | ((state == S["P1"]) & (beat == 0) & ~rd_pending),
+                If(clear | (run & (a_st == A["P1"]) & (beat_a == 0)),
                     P[k].eq(0),
                 ).Elif(valid_acc & (slot_acc == s),
                     P[k].eq(acc[lane].r),
-                ).Elif(tree_valid & (tree_dst == k),
-                    P[k].eq(tree.r),
+                ).Elif(tree_valid & (tree_slot == s) & tree_mask[lane],
+                    P[k].eq(acc[lane].r),
                 ))
         self.sync += partial_writes
-        self.sync += If(clear, tree_inflight.eq(0)).Else(
-            tree_inflight.eq(tree_inflight + tree_issue - tree_valid))
 
         # Pass 2: m1 = x*scale, m2 = m1*w; w = 1.0 for L2.
         p2_valid = Signal()
@@ -243,23 +266,24 @@ class BonsaiNormScratchpad(LiteXModule):
                 m2[lane].a.eq(m1[lane].r), m2[lane].b.eq(w_hold[32*lane:32*lane + 32]),
             ]
         out_valid = _delay(self, p2_valid, 2*L_MUL, "out_valid")
-        out_beat = _delay(self, rd_beat, 2*L_MUL, "out_beat")
         self.comb += [
             ofifo.we.eq(out_valid & ~clear),
             ofifo.din.eq(Cat(*[m2[lane].r for lane in range(8)])),
         ]
         self.sync += If(clear, inflight.eq(0)).Else(
-            inflight.eq(inflight + (issue & (state == S["P2"])) - out_valid))
+            inflight.eq(inflight + issue_b - out_valid))
         # Output beats carry their own address: dst + segment offset + beat. The FIFO holds
         # only data; addresses follow the write counter within the segment.
         wr_beat = Signal(13)
         wr_seg_base = Signal(13)
+        drained = Signal()                           # every pass-2 beat issued so far written
         self.comb += [
             self.sp_wr_req.eq(ofifo.readable & ~self.cancel),
             self.sp_wr_adr.eq(wr_seg_base + wr_beat),
             self.sp_wr_dat.eq(ofifo.dout),
             self.sp_wr_we.eq(0xFF),
             ofifo.re.eq(self.sp_wr_req & self.sp_wr_gnt),
+            drained.eq((inflight == 0) & ~ofifo.readable & ~(rd_pending & (rd_kind == 2))),
         ]
         self.sync += If(clear, wr_beat.eq(0)).Elif(ofifo.re,
             wr_beat.eq(wr_beat + 1), self.output_beats.eq(self.output_beats + 1))
@@ -267,6 +291,51 @@ class BonsaiNormScratchpad(LiteXModule):
         # Sequencing ------------------------------------------------------------------------
         ds_start = Signal()
         self.comb += ds.start.eq(ds_start)
+        stage_a = Case(a_st, {
+            A["P1"]: If(issue_a, beat_a.eq(beat_a + 1)).Elif(beat_a == nbeats, a_st.eq(A["DRAIN"])),
+            A["DRAIN"]: If((p1_inflight == 0) & ~p1_valid,
+                level.eq(0), tj.eq(0), a_st.eq(A["TREE"])),
+            A["TREE"]: If(tree_issue,
+                tj.eq(tj + 8),
+            ).Elif(tree_inflight == 0,
+                If(level == 5, a_st.eq(A["HAND"])).Else(level.eq(level + 1), tj.eq(0)),
+            ),
+            A["HAND"]: If(b_st == B["WAIT"],
+                ss.eq(P[0]), src_b.eq(src_a), dst_b.eq(dst_a),
+                sc_step.eq(0), sc_wait.eq(0), b_st.eq(B["SCALAR"]),
+                If(seg_a + 1 == cap["nseg"], a_st.eq(A["DONE"])).Else(
+                    seg_a.eq(seg_a + 1), beat_a.eq(0),
+                    src_a.eq(src_a + (s_stride << 5)), dst_a.eq(dst_a + (d_stride << 5)),
+                    a_st.eq(A["P1"]))),
+        })
+        stage_b = Case(b_st, {
+            # RMS: ss/n -> +eps -> sqrt -> 1/x.  L2: sqrt(ss) -> max(eps) -> 1/x.
+            B["SCALAR"]: If(~sc_wait,
+                Case(sc_step, {
+                    0: If(rms, ds.a.eq(ss), ds.b.eq(n_f32), ds.op.eq(0), ds_start.eq(1), sc_wait.eq(1),
+                        ).Else(ds.a.eq(ss), ds.op.eq(1), ds_start.eq(1), sc_wait.eq(1), sc_step.eq(2)),
+                    1: [sc_add.eq(1), sc_wait.eq(1)],                       # tmp + eps
+                    2: [ds.a.eq(tmp), ds.op.eq(1), ds_start.eq(1), sc_wait.eq(1)],   # sqrt
+                    3: [ds.a.eq(C(F32_ONE, 32)), ds.b.eq(tmp), ds.op.eq(0), ds_start.eq(1), sc_wait.eq(1)],
+                    # The previous segment's pass 2 still reads `scale` and the output base.
+                    4: If(drained, scale.eq(tmp), beat_b.eq(0), wr_beat.eq(0),
+                          wr_seg_base.eq(dst_b >> 5), b_st.eq(B["P2"])),
+                }),
+            ).Else(
+                If(ds.done,
+                    sc_wait.eq(0),
+                    # L2 after the sqrt: nrm = max(sqrt, eps) (bit order = value order for
+                    # the non-negative results; a NaN stays).
+                    If(~rms & (sc_step == 2) & (ds.r < cap["eps"]),
+                        tmp.eq(cap["eps"])).Else(tmp.eq(ds.r)),
+                    sc_step.eq(Mux(~rms & (sc_step == 2), 3, sc_step + 1)),
+                ).Elif(sc_add_valid,
+                    sc_wait.eq(0), tmp.eq(tree.r), sc_step.eq(sc_step + 1),
+                ),
+            ),
+            B["P2"]: If(issue_b, beat_b.eq(beat_b + 1)).Elif(beat_b == nbeats,
+                seg_b.eq(seg_b + 1), b_st.eq(B["WAIT"])),
+        })
         self.sync += [
             self.done.eq(0), ds_start.eq(0), sc_add.eq(0),
             If(self.cancel, state.eq(S["IDLE"]), self.error.eq(0)).Else(
@@ -274,55 +343,17 @@ class BonsaiNormScratchpad(LiteXModule):
                 S["IDLE"]: If(self.cmd.valid & self.cmd.ready,
                     *[v.eq(getattr(self.cmd, k)) for k, v in cap.items()],
                     self.error.eq(0), self.read_beats.eq(0), self.output_beats.eq(0),
-                    seg.eq(0), beat.eq(0),
+                    beat.eq(0),
                     state.eq(S["VALIDATE"])),
                 S["VALIDATE"]: If(geometry_bad | bounds_bad | overlap_bad | protected_bad,
                     self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
                     state.eq(S["FAILED"]),
-                ).Else(beat.eq(0), seg_src.eq(cap["src"]), seg_dst.eq(cap["dst"]),
-                       state.eq(Mux(rms, S["WLOAD"], S["P1"]))),
-                S["WLOAD"]: If((beat == nbeats) & ~rd_pending, beat.eq(0), state.eq(S["P1"])),
-                S["P1"]: If(beat == nbeats, state.eq(S["P1_DRAIN"])),
-                S["P1_DRAIN"]: If((p1_inflight == 0) & ~rd_pending,
-                    level.eq(0), tj.eq(0), state.eq(S["TREE"])),
-                S["TREE"]: If(tree_issue,
-                    tj.eq(tj + 1),
-                ).Elif(tree_inflight == 0,
-                    If(level == 5,
-                        sc_step.eq(0), sc_wait.eq(0), state.eq(S["SCALAR"]),
-                    ).Else(level.eq(level + 1), tj.eq(0)),
-                ),
-                # RMS: ss/n -> +eps -> sqrt -> 1/x.  L2: sqrt(ss) -> max(eps) -> 1/x.
-                S["SCALAR"]: If(~sc_wait,
-                    Case(sc_step, {
-                        0: [ss.eq(P[0]),
-                            If(rms, ds.a.eq(P[0]), ds.b.eq(n_f32), ds.op.eq(0), ds_start.eq(1), sc_wait.eq(1),
-                            ).Else(ds.a.eq(P[0]), ds.op.eq(1), ds_start.eq(1), sc_wait.eq(1), sc_step.eq(2))],
-                        1: [sc_add.eq(1), sc_wait.eq(1)],                       # tmp + eps
-                        2: [ds.a.eq(tmp), ds.op.eq(1), ds_start.eq(1), sc_wait.eq(1)],   # sqrt
-                        3: [ds.a.eq(C(F32_ONE, 32)), ds.b.eq(tmp), ds.op.eq(0), ds_start.eq(1), sc_wait.eq(1)],
-                        4: [scale.eq(tmp), beat.eq(0), wr_beat.eq(0),
-                            wr_seg_base.eq(seg_dst >> 5), state.eq(S["P2"])],
-                    }),
-                ).Else(
-                    If(ds.done,
-                        sc_wait.eq(0),
-                        # L2 after the sqrt: nrm = max(sqrt, eps) (bit order = value order for
-                        # the non-negative results; a NaN stays).
-                        If(~rms & (sc_step == 2) & (ds.r < cap["eps"]),
-                            tmp.eq(cap["eps"])).Else(tmp.eq(ds.r)),
-                        sc_step.eq(Mux(~rms & (sc_step == 2), 3, sc_step + 1)),
-                    ).Elif(sc_add_valid,
-                        sc_wait.eq(0), tmp.eq(tree.r), sc_step.eq(sc_step + 1),
-                    ),
-                ),
-                S["P2"]: If(beat == nbeats, state.eq(S["P2_DRAIN"])),
-                S["P2_DRAIN"]: If((inflight == 0) & ~ofifo.readable & ~rd_pending,
-                    If(seg + 1 == cap["nseg"],
-                        state.eq(S["FINISH"]),
-                    ).Else(seg.eq(seg + 1), beat.eq(0),
-                           seg_src.eq(seg_src + (s_stride << 5)), seg_dst.eq(seg_dst + (d_stride << 5)),
-                           state.eq(S["P1"]))),
+                ).Else(beat.eq(0), src_a.eq(cap["src"]), dst_a.eq(cap["dst"]),
+                       seg_a.eq(0), seg_b.eq(0), beat_a.eq(0), a_st.eq(A["P1"]), b_st.eq(B["WAIT"]),
+                       state.eq(Mux(rms, S["WLOAD"], S["RUN"]))),
+                S["WLOAD"]: If((beat == nbeats) & ~rd_pending, state.eq(S["RUN"])),
+                S["RUN"]: [stage_a, stage_b,
+                    If((seg_b == cap["nseg"]) & drained, state.eq(S["FINISH"]))],
                 S["FINISH"]: [self.done.eq(1), state.eq(S["IDLE"])],
             })),
         ]
