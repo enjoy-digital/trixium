@@ -139,10 +139,11 @@ def wait_list(dut, limit, error):
 def preload(dut):
     """Kernel tables straight into the memories (LOAD is covered by test_silu_sp.py)."""
     lut, dlut = tables()
-    for i, v in enumerate(lut):
-        yield dut.silu.kernel.lut_mem[i].eq(v)
-    for i, v in enumerate(dlut):
-        yield dut.silu.kernel.dlut_mem[i].eq(v)
+    for kernel in dut.silu.kernels:          # every way has its own table copy
+        for i, v in enumerate(lut):
+            yield kernel.lut_mem[i].eq(v)
+        for i, v in enumerate(dlut):
+            yield kernel.dlut_mem[i].eq(v)
 
 
 def test_cluster_runs_through_the_shared_arbiter():

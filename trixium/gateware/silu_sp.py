@@ -34,7 +34,7 @@ LOAD_BEATS = 513 + 512
 
 
 class BonsaiSiluScratchpad(LiteXModule):
-    def __init__(self, scratchpad_size=256*1024, tables=None, sets=2):
+    def __init__(self, scratchpad_size=256*1024, tables=None, sets=2, ways=4):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")
         self.cmd = stream.Endpoint(SILU_COMMAND)
@@ -46,8 +46,16 @@ class BonsaiSiluScratchpad(LiteXModule):
         self.sp_rd_adr, self.sp_wr_adr = Signal(13), Signal(13)
         self.sp_rd_dat, self.sp_wr_dat = Signal(256), Signal(256)
         self.sp_wr_we = Signal(8)
-        self.kernel = kernel = ResetInserter()(SiluMulKernel(tables, sets=sets))
-        self.sets = sets
+        # ways kernels in lockstep (same valid, same ready, their own table copies loaded
+        # together): `ways` elements per clock. 4 = the read port's pace (a g and an m beat
+        # per 8 elements); 1 element per clock was ~1.9M cycles per 27B forward (v17).
+        assert ways in (1, 2, 4)
+        W = ways
+        self.kernels = kernels = [ResetInserter()(SiluMulKernel(tables, sets=sets)) for _ in range(W)]
+        self.kernel = kernel = kernels[0]             # (LiteXModule registers it)
+        for k, kern in enumerate(kernels[1:], 1):
+            setattr(self.submodules, f"kernel{k}", kern)
+        self.sets, self.ways = sets, ways
 
         IDLE, VALIDATE, LOAD, RUN, FINISH, FAILED = range(6)
         state = Signal(3, reset=IDLE)
@@ -96,13 +104,13 @@ class BonsaiSiluScratchpad(LiteXModule):
         # Read side: pairs of beats (g, m) for RUN, single beats for LOAD --------------------
         # One read per cycle at most; the response is captured a cycle later. `rd_second`
         # says the next request is the m beat of the current pair.
-        pairs = ResetInserter()(SyncFIFO(width=512, depth=2))
+        pairs = ResetInserter()(SyncFIFO(width=512, depth=4))
         self.pairs = pairs
         issued = Signal(14)                        # beats (pairs) requested
         rd_second = Signal()
         rd_pending, rd_was_m = Signal(), Signal()
         g_hold = Signal(256)
-        in_flight = Signal(2)                      # pairs requested but not yet in the FIFO
+        in_flight = Signal(3)                      # pairs requested but not yet in the FIFO
         can_issue = Signal()
         run_active = Signal()
         clear = Signal()
@@ -110,11 +118,11 @@ class BonsaiSiluScratchpad(LiteXModule):
             run_active.eq(state == RUN),
             clear.eq(self.cancel | ((state != RUN) & (state != LOAD))),
             pairs.reset.eq(clear),
-            kernel.reset.eq(clear),
-            kernel.table_only.eq(cap["table_only"]),
-            kernel.table_sel.eq(cap["table_set"] if sets > 1 else 0),
-            kernel.lut_set.eq(cap["table_set"] if sets > 1 else 0),
-            can_issue.eq((issued < beats) & ((pairs.level + in_flight) < 2)),
+            *[[kern.reset.eq(clear),
+               kern.table_only.eq(cap["table_only"]),
+               kern.table_sel.eq(cap["table_set"] if sets > 1 else 0),
+               kern.lut_set.eq(cap["table_set"] if sets > 1 else 0)] for kern in kernels],
+            can_issue.eq((issued < beats) & ((pairs.level + in_flight) < 4)),
         ]
 
         # LOAD: one beat at a time, eight table words out of it, then the next beat.
@@ -160,29 +168,35 @@ class BonsaiSiluScratchpad(LiteXModule):
             dcur.eq(cur - 513),
             unpacking.eq((state == LOAD) & ld_have),
             word.eq(Array(ld_data[32*j:32*j + 32] for j in range(8))[ld_lane[:3]]),
-            kernel.lut_we.eq(unpacking & ((cur < 512) | ((cur == 512) & (ld_lane == 0)))),
-            kernel.lut_adr.eq(Cat(ld_lane[:3], cur[:10])),
-            kernel.lut_dat.eq(word),
-            kernel.dlut_we.eq(unpacking & (cur >= 513)),
-            kernel.dlut_adr.eq(Cat(ld_lane[:3], dcur[:9])),
-            kernel.dlut_dat.eq(word),
+            *[[kern.lut_we.eq(unpacking & ((cur < 512) | ((cur == 512) & (ld_lane == 0)))),
+               kern.lut_adr.eq(Cat(ld_lane[:3], cur[:10])),
+               kern.lut_dat.eq(word),
+               kern.dlut_we.eq(unpacking & (cur >= 513)),
+               kern.dlut_adr.eq(Cat(ld_lane[:3], dcur[:9])),
+               kern.dlut_dat.eq(word)] for kern in kernels],
         ]
 
-        # Unpack pairs into the kernel, one lane per cycle ----------------------------------
+        # Unpack pairs into the kernels, `ways` lanes per cycle (a multiple of ways: lanes past
+        # the vector's end are fed and their results dropped) ------------------------------
         lane = Signal(3)
         fed = Signal(17)                           # elements fed
         head_g, head_m = Signal(256), Signal(256)
         last_lane = Signal()
+        feed = Signal()
         self.comb += [
             head_g.eq(pairs.dout[0:256]), head_m.eq(pairs.dout[256:512]),
-            last_lane.eq((lane == 7) | (fed + 1 == cap["elements"])),
-            kernel.sink.valid.eq(run_active & pairs.readable & ~self.cancel),
-            kernel.sink.g.eq(Array(head_g[32*j:32*j + 32] for j in range(8))[lane]),
-            kernel.sink.m.eq(Array(head_m[32*j:32*j + 32] for j in range(8))[lane]),
-            pairs.re.eq(kernel.sink.valid & kernel.sink.ready & last_lane),
+            last_lane.eq((lane == 8 - W) | (fed + W >= cap["elements"])),
+            feed.eq(kernel.sink.valid & kernel.sink.ready),
+            pairs.re.eq(feed & last_lane),
         ]
-        self.sync += If(clear, lane.eq(0), fed.eq(0)).Elif(kernel.sink.valid & kernel.sink.ready,
-            fed.eq(fed + 1), lane.eq(Mux(last_lane, 0, lane + 1)))
+        for k, kern in enumerate(kernels):
+            self.comb += [
+                kern.sink.valid.eq(run_active & pairs.readable & ~self.cancel),
+                kern.sink.g.eq(Array(head_g[32*j:32*j + 32] for j in range(8))[lane + k]),
+                kern.sink.m.eq(Array(head_m[32*j:32*j + 32] for j in range(8))[lane + k]),
+            ]
+        self.sync += If(clear, lane.eq(0), fed.eq(0)).Elif(feed,
+            fed.eq(fed + W), lane.eq(Mux(last_lane, 0, lane + W)))
 
         # Collect results into output beats and bitmap words --------------------------------
         out_lane = Signal(3)
@@ -206,22 +220,34 @@ class BonsaiSiluScratchpad(LiteXModule):
         closed_words = Signal(12)
         # Lane inserts by decode, not by variable shift (see the Verilog width pitfall).
         acc_next, acc_we_next, bits_next = Signal(256), Signal(8), Signal(32)
+        live = [Signal(name=f"silu_live{k}") for k in range(W)]      # element got + k exists
+        ress = [Signal(32, name=f"silu_res{k}") for k in range(W)]
+        fixes = [Signal(name=f"silu_fix{k}") for k in range(W)]
+        out_ready = Signal()
         self.comb += [
-            res.eq(Mux(kernel.source.fixup, kernel.source.g, kernel.source.r)),
             acc_next.eq(acc), acc_we_next.eq(acc_we), bits_next.eq(bits),
-            [If(out_lane == j, acc_next[32*j:32*j + 32].eq(res), acc_we_next[j].eq(1))
-             for j in range(8)],
-            [If(got[0:5] == j, bits_next[j].eq(kernel.source.fixup)) for j in range(32)],
-            ends_beat.eq((out_lane == 7) | (got + 1 == cap["elements"])),
-            ends_word.eq((got[0:5] == 31) | (got + 1 == cap["elements"])),
+            ends_beat.eq((out_lane == 8 - W) | (got + W >= cap["elements"])),
+            ends_word.eq((got[0:5] == 32 - W) | (got + W >= cap["elements"])),
             # The accumulators keep filling while the previous beat/word waits for the
             # write port; a result that would close a second one waits instead.
-            kernel.source.ready.eq(run_active & ~self.cancel &
-                                   ~(beat_full & ends_beat) & ~(word_full & ends_word)),
-            take.eq(kernel.source.valid & kernel.source.ready),
+            out_ready.eq(run_active & ~self.cancel &
+                         ~(beat_full & ends_beat) & ~(word_full & ends_word)),
+            take.eq(kernel.source.valid & out_ready),
             close_beat.eq(take & ends_beat),
             close_word.eq(take & ends_word),
         ]
+        for k, kern in enumerate(kernels):
+            self.comb += [
+                kern.source.ready.eq(out_ready),
+                live[k].eq(got + k < cap["elements"]),
+                fixes[k].eq(kern.source.fixup & live[k]),
+                ress[k].eq(Mux(kern.source.fixup, kern.source.g, kern.source.r)),
+                [If(live[k] & (out_lane + k == j), acc_next[32*j:32*j + 32].eq(ress[k]),
+                    acc_we_next[j].eq(1)) for j in range(8)],
+                [If(live[k] & (got[0:5] + k == j), bits_next[j].eq(kern.source.fixup))
+                 for j in range(32)],
+            ]
+        self.comb += res.eq(ress[0])
         # Output beat offset. Without a permutation it is the beat count; with one, source
         # segment s (seg_beats beats) goes to destination segment (s % a)*b + s // a, tracked
         # incrementally: `seg_off` is the destination segment's first beat, `div_off` the
@@ -249,8 +275,8 @@ class BonsaiSiluScratchpad(LiteXModule):
             out_lane.eq(0), got.eq(0), acc.eq(0), acc_we.eq(0), bits.eq(0),
             closed_beats.eq(0), closed_words.eq(0),
         ).Elif(take,
-            got.eq(got + 1),
-            out_lane.eq(Mux(close_beat, 0, out_lane + 1)),
+            got.eq(got + W),
+            out_lane.eq(Mux(close_beat, 0, out_lane + W)),
             If(close_beat,
                 beat_adr.eq((cap["dst"] >> 5) + out_off),
                 beat_dat.eq(acc_next), beat_we.eq(acc_we_next),
@@ -285,7 +311,7 @@ class BonsaiSiluScratchpad(LiteXModule):
             If(wrote & ~write_word, written_beats.eq(written_beats + 1),
                self.output_beats.eq(self.output_beats + 1)),
         )
-        self.sync += If(~clear & take & kernel.source.fixup, self.fixups.eq(self.fixups + 1))
+        self.sync += If(~clear & take, self.fixups.eq(self.fixups + sum(fixes)))
 
         # Control ---------------------------------------------------------------------------
         all_written = Signal()
@@ -324,7 +350,7 @@ class BonsaiSiluScratchpad(LiteXModule):
                         ).Else(ld_lane.eq(ld_lane + 1)),
                     ),
                 ],
-                RUN: If(all_written & (got == cap["elements"]), state.eq(FINISH)),
+                RUN: If(all_written & (got >= cap["elements"]), state.eq(FINISH)),   # got: whole groups
                 FINISH: [self.done.eq(1), state.eq(IDLE)],
             }),
         )

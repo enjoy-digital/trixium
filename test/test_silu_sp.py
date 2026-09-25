@@ -295,7 +295,7 @@ def test_compiled_full_scratchpad_image(tmp_path):
     bad = np.nonzero(got != want)[0]
     assert not len(bad), [(hex(4*i), hex(int(got[i])), hex(int(want[i]))) for i in bad[:10]]
     run1 = next(l for l in lines if l.startswith("cmd 1 "))
-    assert int(run1.split(" cycles ")[1].split()[0]) < 1.2*n1, run1
+    assert int(run1.split(" cycles ")[1].split()[0]) < 0.4*n1, run1   # 4 ways: ~3 elements/clock
     unit = next(l for l in lines if l.startswith("cmd 3 "))
     assert int(unit.split(" reads ")[1].split()[0]) == 2048//8        # g beats only
 
