@@ -99,6 +99,8 @@ struct hyb_prof {
     uint8_t dnstream_active;         // the layout in engine DDR since the last reset
     uint8_t attnstream_enabled;      // console `attnstream on|off` (taken at the next reset)
     uint8_t attnstream_active;       // K/V rows also appended to engine DDR since the reset
+    uint8_t hwargmax;                // console `hwargmax on|off`: the LM head list's argmax
+    uint32_t lm_chunk;               // console `lmchunk <rows>`: cap the LM head chunks (0 auto)
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -305,6 +307,9 @@ void hybrid_attnstream_enable(int on)
 #endif
 }
 int hybrid_attnstream_enabled(void) { return HP->attnstream_enabled; }
+void hybrid_hwargmax_enable(int on) { HP->hwargmax = on ? 1 : 0; }
+void hybrid_lm_chunk(uint32_t rows) { HP->lm_chunk = rows; }
+int hybrid_hwargmax_enabled(void) { return HP->hwargmax; }
 void hybrid_xres_enable(int on) { HP->xres_enabled = on ? 1 : 0; }
 int hybrid_xres_enabled(void) { return HP->xres_enabled && resident_active(); }
 int hybrid_dnres_enabled(void)
@@ -715,6 +720,8 @@ int hybrid_init(void)
     rope_pos_cached = -1;
     HP->dnstream_active = 0;
     HP->attnstream_active = 0;
+    HP->hwargmax = 1;
+    HP->lm_chunk = 0;
 #ifdef BONSAI_HAS_ATTNSTREAM
     HP->attnstream_enabled = 1;
 #else
@@ -1638,6 +1645,68 @@ static void attention_layer(int l, const float *h, float *out)
     HP->at_out += perf_now64() - t0;
 }
 
+// LM head chunk: the rows that fit RS_F (restored FP32) and the int32 staging below it, a
+// multiple of 8*n_ch; `lmchunk` caps it (the tiny simulation model's head is one chunk
+// otherwise, and the multi-chunk path is where the 27B's v17 logits went wrong).
+static uint32_t lm_chunk_rows(void)
+{
+    uint32_t unit = 8u*(uint32_t)n_ch, room = (0x32000u - RS_F_ADDR)/4;
+    uint32_t chunk = (room < 24576u ? room : 24576u)/unit*unit;
+    if (HP->lm_chunk && HP->lm_chunk/unit*unit && HP->lm_chunk/unit*unit < chunk)
+        chunk = HP->lm_chunk/unit*unit;
+    return chunk;
+}
+
+// The LM head as ONE list: the rotated input once, then row chunks, each stored into dst.
+// 0 = done.
+static int lm_head_list(const struct bons_entry *head, float *dst)
+{
+    if (!(H->hadamard_block && resident_active() && head &&
+          (head->kind == KIND_TERNARY || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)))
+        return -1;
+    uint32_t unit = 8u*(uint32_t)n_ch, chunk = lm_chunk_rows();
+    uint32_t nch = (uint32_t)n_ch, per = head->rows/nch;
+    if (head->rows % unit || chunk/nch*4u > 8160u)
+        return -1;
+    rl_begin();
+    rl_prepare(hb, (uint32_t)n_embd, 1);
+    for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
+        uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
+        rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
+        // Channel-major result: channel c's rpc rows are model rows c*per + r0/nch + j.
+        rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u,
+                         r0 ? NULL : dst, head->rows*4u);
+    }
+    return rl_run("lm head");
+}
+
+// Console `lmcheck` (debug): the LM head of the last forward's hb through the list and
+// through proj_f, compared chunk by chunk.
+void hybrid_lm_check(void)
+{
+    static float *ref;
+    const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
+    if (!head) head = model_entry(ROLE_TOK_EMB, 0);
+    if (!head || !logits) { puts("lmcheck: no model"); return; }
+    if (!ref) ref = infer_halloc((uint64_t)head->rows*4 + 64, 1);
+    if (!ref) { puts("lmcheck: no room"); return; }
+    proj_f(head, hb, ref);
+    if (lm_head_list(head, logits)) { puts("lmcheck: the list failed"); return; }
+    uint32_t chunk = lm_chunk_rows();
+    printf("lmcheck: %lu rows, chunks of %lu\n", (unsigned long)head->rows, (unsigned long)chunk);
+    for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
+        uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, bad = 0, first = 0;
+        const uint32_t *a = (const uint32_t *)(ref + r0), *b = (const uint32_t *)(logits + r0);
+        for (uint32_t i = 0; i < rows; i++)
+            if (a[i] != b[i] && !bad++) first = i;
+        printf("  chunk %lu: %lu differ", (unsigned long)(r0/chunk), (unsigned long)bad);
+        if (bad)
+            printf(", first row %lu: ref %08lx list %08lx", (unsigned long)(r0 + first),
+                   (unsigned long)a[first], (unsigned long)b[first]);
+        puts("");
+    }
+}
+
 int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
@@ -1761,22 +1830,11 @@ int hybrid_forward(int token, int want_logits)
     infer_dbg_f32("out_norm", -1, hb, n_embd);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head) head = model_entry(ROLE_TOK_EMB, 0);
-    int head_done = 0;
-    if (H->hadamard_block && resident_active() && head &&
-        (head->kind == KIND_TERNARY || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)) {
-        // The LM head as ONE list: the rotated input once, then row chunks that fit RS_F
-        // (restored FP32) and the int32 staging below it, each stored into logits.
-        uint32_t unit = 8u*(uint32_t)n_ch, room = (0x32000u - RS_F_ADDR)/4;
-        uint32_t chunk = (room < 24576u ? room : 24576u)/unit*unit;
-        rl_begin();
-        rl_prepare(hb, (uint32_t)n_embd, 1);
-        for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
-            uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk;
-            rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
-            rl_store(logits + r0, (rows*4 + 31u) & ~31u, RS_F_ADDR);
-        }
-        head_done = rl_run("lm head") == 0;
-    }
+    int head_done = lm_head_list(head, logits) == 0;
+    // The restore unit's argmax indexes the list's (channel-major) order: the model's row
+    // order only when the head is one chunk. Several chunks: the CPU loop below, until the
+    // tracker reports model rows and breaks ties by row.
+    int one_chunk = head && head->rows <= lm_chunk_rows();
     if (!head_done)
         proj_f(head, hb, logits);
     infer_dbg_f32("logits", -1, logits, H->vocab);
@@ -1784,7 +1842,7 @@ int hybrid_forward(int token, int want_logits)
 #ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
     // The restore unit tracked the firmware loop's greedy argmax over everything the LM
     // head list restored; rows past the vocabulary (padding) winning means: loop instead.
-    if (head_done) {
+    if (head_done && HP->hwargmax && one_chunk) {
         uint32_t i = seq_restore_argmax_idx_read();
         if (i < H->vocab) best = (int)i;
     }

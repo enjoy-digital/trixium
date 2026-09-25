@@ -866,6 +866,20 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) hybrid_xres_enable(0);
         printf("XRES %s (the residual stream and its norms resident)\n", hybrid_xres_enabled() ? "on" : "off");
     }
+    else if (strcmp(token, "lmcheck") == 0) {
+        hybrid_lm_check();
+    }
+    else if (strcmp(token, "lmchunk") == 0) {
+        uint32_t rows = (uint32_t)strtoul(str, NULL, 0);
+        hybrid_lm_chunk(rows);
+        printf("LMCHUNK %lu (LM head list chunk cap in rows, 0 = automatic)\n", (unsigned long)rows);
+    }
+    else if (strcmp(token, "hwargmax") == 0) {
+        if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
+        if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);
+        printf("HWARGMAX %s (the LM head list's restore-unit argmax; off: the CPU loop over the logits)\n",
+               hybrid_hwargmax_enabled() ? "on" : "off");
+    }
     else if (strcmp(token, "attnstream") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_attnstream_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_attnstream_enable(0);

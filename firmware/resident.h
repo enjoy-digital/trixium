@@ -61,8 +61,18 @@ void rl_begin(void);
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store(void *dst, uint32_t bytes, uint32_t sp);
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
+// Rows [row0, row0 + rows) of each channel's block of e, row0 and rows multiples of 8*n_ch:
+// the image shards rows in blocks (channel c holds model rows [c*R/n_ch, (c+1)*R/n_ch)), so
+// channel c computes its local rows row0/n_ch .. and the result is channel-major - model
+// rows c*R/n_ch + row0/n_ch + j at slot c*rows/n_ch + j. Contiguous in the model only when
+// the call covers the whole tensor; otherwise store it with rl_store_packets.
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage,
                     uint32_t dst_sp);
+// One engine STORE of `packets` runs of packet_bytes: run r from sp + r*sp_stride to
+// dst + r*dst_stride (bytes, 32-byte multiples; <= 31 runs, sp_stride <= 8160). inv/inv_bytes:
+// the main-RAM span to clean now and invalidate after the list (NULL: the caller does it).
+void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32_t dst_stride,
+                      uint32_t sp, uint32_t sp_stride, void *inv, uint32_t inv_bytes);
 void rl_prepare(const float *src, uint32_t width, int rotate);   // src NULL: already in RS_F
 void rl_desc(const struct bns_seq_descriptor *d);
 struct engine_op;

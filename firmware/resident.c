@@ -369,10 +369,10 @@ static int build_matvec(uint32_t *n, const struct bons_entry *e, uint32_t dst_sp
     return build_matvec_at(n, e, RS_Y, dst_sp);
 }
 
-// Rows [row0, row0 + rows) of e (row0 and rows multiples of the channel count: channel c
-// holds rows c, c + n_ch, ...). ystage: where the int32 segment partials go (RS_Y, or
-// another region the caller keeps clear of RS_F and the persistent map); dst_sp: RS_F, or
-// ystage itself (restore in place).
+// Local rows [row0/n_ch, (row0 + rows)/n_ch) of every channel's block of e (the image shards
+// rows in blocks - layout.shard_rows - so the result is channel-major, see resident.h).
+// ystage: where the int32 segment partials go (RS_Y, or another region the caller keeps
+// clear of RS_F and the persistent map); dst_sp: RS_F, or ystage itself (restore in place).
 static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t row0,
                              uint32_t rows, uint32_t ystage, uint32_t dst_sp)
 {
@@ -484,6 +484,22 @@ void rl_store(void *dst, uint32_t bytes, uint32_t sp)
     flush_cpu_dcache_range(dst, bytes);
     desc_store(RL.n++, eng_addr(dst), bytes/32, sp);
     RL.inv[RL.ninv] = dst; RL.inv_bytes[RL.ninv++] = bytes;
+}
+
+void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32_t dst_stride,
+                      uint32_t sp, uint32_t sp_stride, void *inv, uint32_t inv_bytes)
+{
+    struct engine_op op = {0};
+    if (!rl_room(1) || ((uintptr_t)dst & 31) || packet_bytes % 32 || dst_stride % 32 ||
+        sp % 32 || sp_stride % 32 || packets < 1 || packets > 31 || sp_stride/32 > 255 ||
+        dst_stride/32 >= (1u << 24) || (inv && RL.ninv >= 16)) { RL.bad = 1; return; }
+    if (inv)
+        flush_cpu_dcache_range(inv, inv_bytes);
+    op.kind = ENGINE_KIND_STORE; op.wbase = eng_addr(dst); op.wlen = packet_bytes/32;
+    op.xsrc = sp; op.rep = (uint8_t)packets; op.dstride = dst_stride/32;
+    op.sstride = (uint8_t)(sp_stride/32);
+    seq_desc_engine(RL.n++, &op);
+    if (inv) { RL.inv[RL.ninv] = inv; RL.inv_bytes[RL.ninv++] = inv_bytes; }
 }
 
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
@@ -948,6 +964,12 @@ void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, ui
 void rl_prepare(const float *src, uint32_t width, int rotate) { (void)src; (void)width; (void)rotate; }
 void rl_desc(const struct bns_seq_descriptor *d) { (void)d; }
 void rl_engine(const struct engine_op *op) { (void)op; }
+void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32_t dst_stride,
+                      uint32_t sp, uint32_t sp_stride, void *inv, uint32_t inv_bytes)
+{
+    (void)dst; (void)packet_bytes; (void)packets; (void)dst_stride; (void)sp; (void)sp_stride;
+    (void)inv; (void)inv_bytes;
+}
 int  rl_run(const char *what) { (void)what; return -1; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
