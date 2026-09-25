@@ -24,11 +24,17 @@ class BonsaiHadamardScratchpad(LiteXModule):
     before accepting a command. Failure/cancel invalidates the entire output,
     including already-written prefixes. Only done publishes successful results.
     """
-    def __init__(self, scratchpad_size=256*1024, block_size=1024):
+    def __init__(self, scratchpad_size=256*1024, block_size=1024, lanes=32):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be 32-byte aligned and within the 13-bit client address space")
         if block_size < 256 or block_size > 32768 or block_size & (block_size - 1):
             raise ValueError("block_size must be a power of two in [256, 32768]")
+        # lanes: core butterflies per clock and values per core word. 32 = one scratchpad
+        # input beat per word: ~10*(block/64 + 1) stage clocks against 10*(block/16 + 1) at
+        # 8 lanes, the output then bound by the write port (8 int32 per beat, L/8 beats
+        # per word). 27B prepares: ~1.5k -> ~0.4k clocks per 1,024-block.
+        if lanes not in (8, 16, 32):
+            raise ValueError("lanes must be 8, 16 or 32")
         self.cmd = stream.Endpoint(HADAMARD_COMMAND)
         self.cancel = Signal()
         self.busy = Signal()
@@ -44,14 +50,18 @@ class BonsaiHadamardScratchpad(LiteXModule):
         self.sp_wr_we = Signal(8)
         self.sp_wr_dat = Signal(256)
         self.sp_wr_gnt = Signal()
-        self.core = core = IntegerHadamard(block_size=block_size)
+        self.core = core = IntegerHadamard(block_size=block_size, lanes=lanes)
+        L = lanes
+        wpb, wps = 32//L, 256//L      # core words per data beat, per sign beat
+        bpw = L//8                    # output beats per core word
 
         IDLE, START, SIGN_REQ, SIGN_CAP, DATA_REQ, DATA_CAP, SEND, OUTPUT, STATS, NEXT, FINISH, FAILED = range(12)
         state = Signal(4, reset=IDLE)
         captured = {name: Signal(width) for name, width in HADAMARD_COMMAND}
         block = Signal(16)
-        in_word = Signal(max=block_size//8)
-        out_word = Signal(max=block_size//8)
+        in_word = Signal(max=block_size//L)
+        out_word = Signal(max=block_size//8)   # output beat
+        out_sub = Signal(max=max(2, bpw))      # beat within the core word
         inputs, signs = Signal(256), Signal(256)
         ends = {name: Signal(64) for name in ("src", "signs", "dst", "stats")}
         stats_bytes = Signal(64)
@@ -82,13 +92,14 @@ class BonsaiHadamardScratchpad(LiteXModule):
             core.cmd.valid.eq((state == START) & ~self.cancel),
             core.cmd.inverse.eq(captured["inverse"]),
             core.sink.valid.eq((state == SEND) & ~self.cancel),
-            core.sink.data.eq(inputs[:64]), core.sink.negate.eq(signs[:8]),
-            core.sink.last.eq(in_word == block_size//8 - 1),
-            core.source.ready.eq((state == OUTPUT) & self.sp_wr_gnt & ~self.cancel),
+            core.sink.data.eq(inputs[:8*L]), core.sink.negate.eq(signs[:L]),
+            core.sink.last.eq(in_word == block_size//L - 1),
+            core.source.ready.eq((state == OUTPUT) & self.sp_wr_gnt & (out_sub == bpw - 1) &
+                                 ~self.cancel),
             self.sp_rd_req.eq(((state == SIGN_REQ) | (state == DATA_REQ)) & ~self.cancel),
             self.sp_rd_adr.eq(Mux(state == SIGN_REQ,
-                (captured["signs"] >> 5) + block*(block_size//256) + (in_word >> 5),
-                (captured["src"] >> 5) + block*(block_size//32) + (in_word >> 2))),
+                (captured["signs"] >> 5) + block*(block_size//256) + (in_word >> (wps.bit_length() - 1)),
+                (captured["src"] >> 5) + block*(block_size//32) + (in_word >> (wpb.bit_length() - 1)))),
             self.sp_wr_req.eq(((state == OUTPUT) & core.source.valid | (state == STATS)) & ~self.cancel),
             self.sp_wr_adr.eq(Mux(state == STATS,
                 (captured["stats"] >> 5) + (block >> 3),
@@ -98,7 +109,10 @@ class BonsaiHadamardScratchpad(LiteXModule):
         for lane in range(8):
             value = Signal((core.output_width, True))
             wide = Signal((32, True))
-            self.comb += [value.eq(core.source.data[lane*core.output_width:(lane+1)*core.output_width]),
+            ow = core.output_width
+            self.comb += [value.eq(Array(core.source.data[(8*sub + lane)*ow:(8*sub + lane + 1)*ow]
+                                         for sub in range(bpw))[out_sub] if bpw > 1 else
+                                   core.source.data[lane*ow:(lane + 1)*ow]),
                           wide.eq(value),
                           self.sp_wr_dat[32*lane:32*(lane+1)].eq(Mux(state == STATS, core.absmax, wide))]
         self.sync += If(self.cancel,
@@ -111,7 +125,7 @@ class BonsaiHadamardScratchpad(LiteXModule):
             ).Else(Case(state, {
                 IDLE: If(self.cmd.valid & self.cmd.ready,
                     *[value.eq(getattr(self.cmd, name)) for name, value in captured.items()],
-                    block.eq(0), in_word.eq(0), out_word.eq(0),
+                    block.eq(0), in_word.eq(0), out_word.eq(0), out_sub.eq(0),
                     self.blocks_done.eq(0), self.output_beats.eq(0),
                     self.error.eq(Cat(config_bad, bounds_bad, overlap_bad)),
                     If(config_bad | bounds_bad | overlap_bad, state.eq(FAILED)).Else(state.eq(START)),
@@ -122,22 +136,25 @@ class BonsaiHadamardScratchpad(LiteXModule):
                 DATA_REQ: state.eq(DATA_CAP),
                 DATA_CAP: [inputs.eq(self.sp_rd_dat), state.eq(SEND)],
                 SEND: If(core.sink.ready,
-                    inputs.eq(inputs >> 64), signs.eq(signs >> 8),
-                    If(in_word == block_size//8 - 1, state.eq(OUTPUT)).Else(
+                    inputs.eq(inputs >> 8*L), signs.eq(signs >> L),
+                    If(in_word == block_size//L - 1, state.eq(OUTPUT)).Else(
                         in_word.eq(in_word + 1),
-                        If(in_word[:5] == 31, state.eq(SIGN_REQ)).Elif(in_word[:2] == 3, state.eq(DATA_REQ)),
+                        If((in_word & (wps - 1)) == wps - 1, state.eq(SIGN_REQ)
+                        ).Elif((in_word & (wpb - 1)) == wpb - 1, state.eq(DATA_REQ)),
                     ),
                 ),
                 OUTPUT: [
                     If(core.source.valid & self.sp_wr_gnt,
-                        out_word.eq(out_word + 1), self.output_beats.eq(self.output_beats + 1)),
+                        out_word.eq(out_word + 1), self.output_beats.eq(self.output_beats + 1),
+                        out_sub.eq(Mux(out_sub == bpw - 1, 0, out_sub + 1))),
                     If(core.done, state.eq(STATS)),
                 ],
                 STATS: If(self.sp_wr_gnt,
                     self.blocks_done.eq(self.blocks_done + 1), state.eq(NEXT)),
                 NEXT: If(block == captured["blocks"] - 1,
                     state.eq(FINISH),
-                ).Else(block.eq(block + 1), in_word.eq(0), out_word.eq(0), state.eq(START)),
+                ).Else(block.eq(block + 1), in_word.eq(0), out_word.eq(0), out_sub.eq(0),
+                       state.eq(START)),
                 FINISH: [self.done.eq(1), state.eq(IDLE)],
             })),
         )
