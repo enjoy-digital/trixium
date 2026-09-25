@@ -1180,6 +1180,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 dn.start.eq(start_pulse & dn_mode),
                 dn.heads.eq(cmd_r["rows"]),
                 dn.table.eq(cmd_r["xsrc"] >> 5),
+                dn.zero.eq(cmd_r["bias"][0]),      # op 5: the incoming state is +0.0
                 dn.sp_rd_ok.eq(dn_mode & rd_free),
                 dn.sp_rd_dat.eq(scratchpad.fill.dat_r),
             ]

@@ -34,7 +34,7 @@ static std::vector<uint32_t> load(const char *path) {{
     std::vector<uint32_t> w(b.size()/4); std::memcpy(w.data(), b.data(), b.size()); return w;
 }}
 int main(int argc, char **argv) {{
-    require(argc == 10, "usage: sp lanes sp_out lanes_out heads table in_pct out_pct grant_pct");
+    require(argc == 10 || argc == 11, "usage: sp lanes sp_out lanes_out heads table in_pct out_pct grant_pct [zero]");
     std::vector<uint32_t> mem = load(argv[1]), in = load(argv[2]);
     const uint32_t heads = std::atoi(argv[5]), table = std::atoi(argv[6]);
     const uint32_t in_pct = std::atoi(argv[7]), out_pct = std::atoi(argv[8]), grant_pct = std::atoi(argv[9]);
@@ -79,7 +79,8 @@ int main(int argc, char **argv) {{
         cycle++;
     }};
     d.sys_rst = 1; tick(); tick(); d.sys_rst = 0;
-    d.heads = heads; d.table_adr = table; d.start = 1; tick(); d.start = 0;
+    d.heads = heads; d.table_adr = table; d.zero = argc == 11 && std::atoi(argv[10]);
+    d.start = 1; tick(); d.start = 0; d.zero = 0;
     const uint64_t t0 = cycle;
     bool done = false;
     for (uint64_t n = 0; n < 50000000 && !done; n++) {{ tick(); done = d.done; }}
@@ -99,7 +100,7 @@ def build(tmp_path, lanes, rows, cols):
     if not verilator:
         pytest.skip("Verilator required")
     dut = BonsaiDeltaNetStream(lanes=lanes, rows=rows, cols=cols)
-    sig = {n: getattr(dut, n) for n in ("start", "heads", "table", "busy", "done", "sp_rd_req",
+    sig = {n: getattr(dut, n) for n in ("start", "heads", "table", "zero", "busy", "done", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
     for l in range(lanes):
         for kind, ep in (("sink", dut.sinks[l]), ("source", dut.sources[l])):
@@ -128,7 +129,7 @@ def build(tmp_path, lanes, rows, cols):
     return tmp_path / f"obj/V{top}"
 
 
-def scenario(rng, heads, rows, cols, nk):
+def scenario(rng, heads, rows, cols, nk, zero=False):
     """A layer's worth of heads: GQA q/k shared by head pairs, a few special values."""
     SP = 256*1024
     mem = rng.integers(0, 1 << 32, SP//4, dtype=np.uint64).astype(np.uint32)
@@ -156,18 +157,18 @@ def scenario(rng, heads, rows, cols, nk):
     mem[table//4:table//4 + 8*heads] = np.concatenate(recs)
     want_mem, want_states = mem.copy(), np.empty_like(states)
     for h in range(heads):
-        m, o = reference(states[h], q[h % nk], k[h % nk], v[h], decay[h], beta[h], scale)
+        m, o = reference(np.zeros_like(states[h]) if zero else states[h], q[h % nk], k[h % nk], v[h], decay[h], beta[h], scale)
         want_states[h] = m
         want_mem[(out_base + 4*rows*h)//4:(out_base + 4*rows*(h + 1))//4] = o.view(np.uint32)
     return mem, states, table, want_mem, want_states
 
 
-def run(binary, tmp_path, mem, states, lanes, heads, table, pcts):
+def run(binary, tmp_path, mem, states, lanes, heads, table, pcts, zero=False):
     sp, ln, spo, lno = (tmp_path / n for n in ("sp.bin", "lanes.bin", "sp_out.bin", "lanes_out.bin"))
     mem.astype("<u4").tofile(sp)
     state_to_lanes(states, lanes).astype("<u4").tofile(ln)
     r = subprocess.run([str(binary), str(sp), str(ln), str(spo), str(lno), str(heads), str(table//32),
-                        *[str(p) for p in pcts]], capture_output=True, text=True, timeout=1800)
+                        *[str(p) for p in pcts], *(["1"] if zero else [])], capture_output=True, text=True, timeout=1800)
     assert r.returncode == 0, r.stdout + r.stderr[-4000:]
     cycles = int(r.stdout.split("cycles ")[1].split()[0])
     return np.fromfile(spo, dtype="<u4"), np.fromfile(lno, dtype="<u4"), cycles
@@ -217,4 +218,23 @@ def test_27b_geometry_under_backpressure(tmp_path, binary27):
     lanes, rows, cols, heads = 16, 128, 128, 5
     mem, states, table, want_mem, want_states = scenario(np.random.default_rng(8), heads, rows, cols, 5)
     got_mem, got_lanes, cycles = run(binary27, tmp_path, mem, states, lanes, heads, table, (30, 50, 40))
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+
+
+@pytest.mark.parametrize("pcts", [(100, 100, 100), (40, 60, 50)])
+def test_zero_flag_ignores_the_incoming_state(tmp_path_factory, pcts):
+    """`zero`: the first token's state is +0.0 whatever the DDR holds (NaN, Inf included);
+    the streams are still consumed; with the flag low the same netlist reads the state."""
+    tmp = tmp_path_factory.mktemp("dns_zero")
+    lanes, rows, cols, heads = 2, 16, 16, 9
+    binary = build(tmp, lanes, rows, cols)
+    rng = np.random.default_rng(5)
+    mem, states, table, want_mem, want_states = scenario(rng, heads, rows, cols, 3, zero=True)
+    garbage = rng.integers(0, 1 << 32, states.size, dtype=np.uint64).astype(np.uint32).reshape(states.shape)
+    garbage[0, 0, :4] = [0x7FC00000, 0x7F800000, 0xFF800000, 0x80000000]    # NaN, +-Inf, -0
+    got_mem, got_lanes, _ = run(binary, tmp, mem, garbage.view(f32), lanes, heads, table, pcts, zero=True)
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+    # Same netlist, flag low: the incoming stream is the state.
+    mem, states, table, want_mem, want_states = scenario(np.random.default_rng(3), heads, rows, cols, 3)
+    got_mem, got_lanes, _ = run(binary, tmp, mem, states, lanes, heads, table, pcts)
     check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)

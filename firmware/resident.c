@@ -601,6 +601,21 @@ int rl_start(const char *what)
     return run_list_start(RL.n, what);
 }
 
+uint32_t rl_count(void) { return RL.n; }
+
+// The first k descriptors of the started list have completed (the sequencer's dcount; the
+// serialized units advance it only once done), or the list stopped: 0; -1 on a timeout.
+// Errors are rl_wait's to report.
+int rl_wait_desc(uint32_t k)
+{
+    for (uint32_t spins = 0; spins < 20000000u; spins++) {
+        uint32_t st = seq_status_read();
+        if (((st >> 8) & 0xFFFFu) >= k || !(st & 1))
+            return 0;
+    }
+    return -1;
+}
+
 int rl_wait(void)
 {
     int rc = run_list_wait();
@@ -1030,6 +1045,8 @@ void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32
 int  rl_run(const char *what) { (void)what; return -1; }
 int  rl_start(const char *what) { (void)what; return -1; }
 int  rl_wait(void) { return -1; }
+uint32_t rl_count(void) { return 0; }
+int  rl_wait_desc(uint32_t k) { (void)k; return -1; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
 int resident_prepare(const float *src, uint32_t width, int rotate)

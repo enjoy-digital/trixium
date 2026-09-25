@@ -41,6 +41,8 @@ the per-row accumulators. Buffer ownership, each a head-count comparison:
 Parameters come from the scratchpad: ``table`` points at one 256-bit record per head,
 ``[q, k, v, out byte addresses, decay, beta, scale, 0]``, and each vector is read in
 beats (q/k: cols floats, v and out: rows floats). Records may alias (GQA heads share q/k).
+With ``zero`` set at start every incoming state value is replaced by +0.0 (the same bits as
+a cleared state: +0 * decay = +0); the state streams are still consumed.
 """
 
 from functools import reduce
@@ -112,6 +114,9 @@ class BonsaiDeltaNetStream(LiteXModule):
         self.start = Signal()
         self.heads = Signal(16)
         self.table = Signal(adr_bits)   # Scratchpad beat address of the head records.
+        # Sampled with start: the incoming state is taken as +0.0 (the stream is still read and
+        # discarded), so a generation's first token needs no 144 MiB clear of the DDR state.
+        self.zero  = Signal()
         self.busy  = Signal()
         self.done  = Signal()           # Pulse: every head's outputs and state written.
         self.sinks   = [stream.Endpoint([("data", 256)], name=f"dns_sink{l}") for l in range(L)]
@@ -173,6 +178,9 @@ class BonsaiDeltaNetStream(LiteXModule):
         sc_head  = Signal(16)   # Heads whose scale issue finished (their o bank is free).
         retired  = Signal(16)   # Heads whose outputs are in the scratchpad.
         em_cnt   = Signal(16)   # State groups emitted to the sources (all lanes).
+
+        zero_r = Signal()
+        self.sync += If(self.start, zero_r.eq(self.zero))
 
         # Loader: one registered read request (address from a flop, granted by sp_rd_ok),
         # a record then q, k, v beats per head; responses one clock after the grant.
@@ -355,7 +363,7 @@ class BonsaiDeltaNetStream(LiteXModule):
             mdmems.append(md_r)
             da = Array(dacc[l])
             u_m = Signal(32, name=f"dns_um{l}")
-            self.sync += u_m.eq(fsel(inbufs[l].dat_r, s1_jj))
+            self.sync += u_m.eq(Mux(zero_r, 0, fsel(inbufs[l].dat_r, s1_jj)))
             self.comb += [
                 mul_dec[l].a.eq(u_m),
                 mul_dec[l].b.eq(u_dec),

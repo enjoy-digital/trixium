@@ -72,6 +72,10 @@ static float *at_buf;
 #endif
 
 static uint32_t dn_hbm_base;
+// DeltaNet slots whose state is still the reset's zero (bit s): with the stream layout the
+// layer's op 5 takes it as +0.0 (BONSAI_DNSTREAM_ZERO) instead of hybrid_reset clearing the
+// 144 MiB in engine DDR (34 M cycles of every generation's first token on the 27B).
+static uint64_t dn_state_zero;
 
 // The first board run needs to distinguish a compute limit from a DDR/scratchpad/dispatch
 // limit. rdcycle is cheap enough to bracket every head without perturbing the datapath;
@@ -805,13 +809,25 @@ void hybrid_reset(void)
     HP->attnstream_active = HP->attnstream_enabled && at_geom_ok && resident_active();
 #endif
     if (dn_hw) {
-#ifdef BONSAI_HAS_DNREC
-        dn_hw_reset();
-#endif
+        int cleared = 0;
+        dn_state_zero = 0;
 #ifdef BONSAI_HAS_DNSTREAM
         HP->dnstream_active = HP->dnstream_enabled && hybrid_dnres_enabled()
                             && BONSAI_DNSTREAM_LANES == n_ch && DN_HEAD_BEATS % (uint32_t)n_ch == 0;
+#ifdef BONSAI_DNSTREAM_ZERO
+        // Only op 5 touches the stream layout (every other path stops with DNSTALL), so the
+        // first op of each layer can take its state as zero instead of the clear.
+        if (HP->dnstream_active && n_dn <= 64) {
+            dn_state_zero = n_dn == 64 ? ~0ull : (1ull << n_dn) - 1u;
+            cleared = 1;
+        }
 #endif
+#endif
+#ifdef BONSAI_HAS_DNREC
+        if (!cleared)
+            dn_hw_reset();
+#endif
+        (void)cleared;
     } else if (dn_state) {
         memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
     }
@@ -1140,6 +1156,27 @@ static uint32_t f32_bits_any(float x)
 #define XRES_SP   0x36600u        // the resident residual stream (above the persistent map)
 static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 
+#ifdef BONSAI_HAS_DNSTREAM
+// The stream op's records: one per head in processing order at slot0 (q, k, v, out byte
+// addresses; decay, beta, scale), from betab/gb.
+static void dn_stream_records(uint32_t slot0, uint32_t ho, float scale, int rep)
+{
+    volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + slot0);
+    for (int hi = 0; hi < nv; hi++) {
+        int kh = hi/rep, hh = (hi - kh*rep)*nk + kh;
+        volatile uint32_t *w = rec + 8*hi;
+        w[0] = DNR_QKV + 4u*(uint32_t)(kh*hk);
+        w[1] = DNR_QKV + 4u*(uint32_t)(nq + kh*hk);
+        w[2] = DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv);
+        w[3] = ho + 4u*(uint32_t)(hh*hv);
+        w[4] = f32_bits(bonsai_decay_exp(gb[hh]));
+        w[5] = f32_bits(betab[hh]);
+        w[6] = f32_bits(scale);
+        w[7] = 0;
+    }
+}
+#endif
+
 static int deltanet_layer_resident(int l, const float *h, float *out)
 {
     int s = dn_slot[l];
@@ -1179,21 +1216,59 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     struct bns_seq_descriptor d;
 
     // A: projections. qkv and z restored in place where they will be used.
-    uint64_t t0 = perf_now64();
+    // With the stream op, beta/alpha go first and the CPU computes the per-head scalars and
+    // the op's records from the scratchpad while qkv and z stream (~42k cycles per 27B
+    // layer, hidden). Needs qkv and z in one K-segment each: several would stage partials
+    // above their regions, over BA/AL and the records.
+    const struct bons_entry *e_qkv = model_entry(ROLE_ATTN_QKV, l), *e_z = model_entry(ROLE_ATTN_ZGATE, l);
+    int early = 0;
+#ifdef BONSAI_HAS_DNSTREAM
+    early = dn_hw && HP->dnstream_active && z_stays && e_qkv && e_z &&
+            !(e_qkv->flags & FLAG_KSEG) && !(e_z->flags & FLAG_KSEG);
+#endif
+    float scale = 1.0f/sqrtf((float)hk);
+    int rep = nv/nk;
+    uint64_t t0 = perf_now64(), act_dt = 0;
     rl_begin();
-    rl_prepare(h, (uint32_t)n_embd, 1);
-    rl_matvec(model_entry(ROLE_ATTN_QKV, l), DNR_QKV, DNR_QKV);
-    rl_matvec(model_entry(ROLE_ATTN_ZGATE, l), Z, Z);
-    rl_prepare(h, (uint32_t)n_embd, 0);                              // beta/alpha are not folded
-    rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
-    rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
-    rl_store(betab, dnr_align(4*(uint32_t)nv), BA);
-    rl_store(alphab, dnr_align(4*(uint32_t)nv), AL);
-    if (!z_stays)
-        rl_store(zb, dnr_align(4*(uint32_t)nvh), Z);
-    if (rl_run("deltanet projections"))
-        return -1;                     // nothing of the layer's state has moved yet
-    dn_cyc_inproj += perf_now64() - t0;
+    if (early) {
+        rl_prepare(h, (uint32_t)n_embd, 0);                          // beta/alpha are not folded
+        rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
+        rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
+        uint32_t k_ba = rl_count();
+        rl_prepare(h, (uint32_t)n_embd, 1);
+        rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
+        rl_matvec(e_z, Z, Z);
+        if (rl_start("deltanet projections"))
+            return -1;
+        if (rl_wait_desc(k_ba) == 0) {
+            uint64_t ta = perf_now64();
+            const volatile float *bsp = (const volatile float *)(SCRATCHPAD_BASE + BA);
+            const volatile float *asp = (const volatile float *)(SCRATCHPAD_BASE + AL);
+            for (int hh = 0; hh < nv; hh++) {
+                betab[hh] = sigmoidf(bsp[hh]);
+                gb[hh]    = softplusf(asp[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
+            }
+            dn_stream_records(SLOT0, HO, scale, rep);
+            act_dt = perf_now64() - ta;
+        }
+        if (rl_wait())
+            return -1;                 // nothing of the layer's state has moved yet
+    } else {
+        rl_prepare(h, (uint32_t)n_embd, 1);
+        rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
+        rl_matvec(e_z, Z, Z);
+        rl_prepare(h, (uint32_t)n_embd, 0);                          // beta/alpha are not folded
+        rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
+        rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
+        rl_store(betab, dnr_align(4*(uint32_t)nv), BA);
+        rl_store(alphab, dnr_align(4*(uint32_t)nv), AL);
+        if (!z_stays)
+            rl_store(zb, dnr_align(4*(uint32_t)nvh), Z);
+        if (rl_run("deltanet projections"))
+            return -1;                 // nothing of the layer's state has moved yet
+    }
+    dn_cyc_act += act_dt;
+    dn_cyc_inproj += perf_now64() - t0 - act_dt;
 
     // B: causal conv in chunks (window slots oldest to newest p0, p1, p2; the new input
     // replaces p0 after its chunk was read), then SiLU in place with a unit multiplier.
@@ -1220,32 +1295,17 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     if (rl_start("deltanet conv"))
         goto fatal;
     uint64_t ta = perf_now64();
-    for (int hh = 0; hh < nv; hh++) {
-        betab[hh] = sigmoidf(betab[hh]);
-        gb[hh]    = softplusf(alphab[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
-    }
-    float scale = 1.0f/sqrtf((float)hk);
-    int rep = nv/nk;
-#ifdef BONSAI_HAS_DNSTREAM
-    if (dn_hw && HP->dnstream_active) {
-        // Every head in one engine op (below): a record per head in processing order at
-        // SLOT0 (q, k, v, out byte addresses; decay, beta, scale).
-        volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + SLOT0);
-        for (int hi = 0; hi < nv; hi++) {
-            int kh = hi/rep, hh = (hi - kh*rep)*nk + kh;
-            volatile uint32_t *w = rec + 8*hi;
-            w[0] = DNR_QKV + 4u*(uint32_t)(kh*hk);
-            w[1] = DNR_QKV + 4u*(uint32_t)(nq + kh*hk);
-            w[2] = DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv);
-            w[3] = HO + 4u*(uint32_t)(hh*hv);
-            w[4] = f32_bits(bonsai_decay_exp(gb[hh]));
-            w[5] = f32_bits(betab[hh]);
-            w[6] = f32_bits(scale);
-            w[7] = 0;
+    if (!early) {
+        for (int hh = 0; hh < nv; hh++) {
+            betab[hh] = sigmoidf(betab[hh]);
+            gb[hh]    = softplusf(alphab[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
         }
-    }
+#ifdef BONSAI_HAS_DNSTREAM
+        if (dn_hw && HP->dnstream_active)
+            dn_stream_records(SLOT0, HO, scale, rep);
 #endif
-    uint64_t act_dt = perf_now64() - ta;
+    }
+    act_dt = perf_now64() - ta;
     dn_cyc_act += act_dt;
     if (rl_wait())
         goto fatal;
@@ -1276,11 +1336,13 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         o.wbase = dn_hbm_base + (uint32_t)s*(uint32_t)nv*DN_STREAM_BEATS*32u;
         o.wlen  = (uint32_t)nv*DN_STREAM_BEATS;
         o.xsrc  = SLOT0;
+        o.bias  = (uint8_t)(dn_state_zero >> s & 1u);    // the state is still the reset's zero
         engine_run(&o);
         if (engine_wedged) {
             puts("DNSTALL: DeltaNet stream op");
             goto fatal;
         }
+        dn_state_zero &= ~(1ull << s);
     } else
 #endif
     if (dn_hw) {

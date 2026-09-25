@@ -269,6 +269,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     if config.with_dnstream:
         soc.add_constant("BONSAI_HAS_DNSTREAM")
         soc.add_constant("BONSAI_DNSTREAM_LANES", len(axis))
+        soc.add_constant("BONSAI_DNSTREAM_ZERO")     # op 5 bias bit 0: state taken as +0.0
     soc.engine_csr = BonsaiEngineCSR(soc.engine, seq=seq)
     for name, unit in extensions:
         from migen import Signal

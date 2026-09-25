@@ -102,6 +102,10 @@ int  rl_run(const char *what);
 // needs no rl_wait.
 int  rl_start(const char *what);
 int  rl_wait(void);
+// Descriptors built so far (an index for rl_wait_desc), and a wait inside a started list
+// until the first k have completed: the CPU may then read their scratchpad outputs.
+uint32_t rl_count(void);
+int  rl_wait_desc(uint32_t k);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
                              uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b);
