@@ -635,7 +635,8 @@ uint32_t infer_matvec_cols(const struct bons_entry *e)   // K of the whole matve
     if (!(e->flags & FLAG_KSEG))
         return e->cols;
     uint32_t cols = 0;
-    for (int k = 0; k < model_entry_nkseg(e); k++)
+    int nseg = model_entry_nkseg(e);   // once: it used to be re-counted every iteration
+    for (int k = 0; k < nseg; k++)
         cols += model_entry_kseg(e, k)->cols;
     return cols;
 }

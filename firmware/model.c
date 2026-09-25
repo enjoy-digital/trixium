@@ -46,6 +46,15 @@ _Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every 
 #define ecache_any ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE))
 #define ecache_n16 ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE + \
                         ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))
+// K-segments: the first FLAG_KSEG entry of each (role, layer, kseg < 4), 16 KB more. Every
+// K-segmented lookup used to scan the whole table (~1,100 entries on the 27B), and
+// infer_matvec_cols re-counted the segments in its loop condition: ~11 scans per FFN down
+// lookup, ~330k cycles per layer outside the FFN lists on the v17 board (2026-09-25).
+#define ECACHE_KSEG 4
+#define ecache_kseg ((int16_t (*)[ECACHE_LAYERS][ECACHE_KSEG])(ECACHE_BASE + \
+                        2*ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))
+_Static_assert(2*ECACHE_ROLES*ECACHE_LAYERS*2 + ECACHE_ROLES*ECACHE_LAYERS*ECACHE_KSEG*2 <= 0x10000,
+               "entry cache window is 64 KB");
 static int ecache_ok;
 
 void model_cache_reset(void)
@@ -58,8 +67,10 @@ static void ecache_build(void)
     const struct bons_header *h = model_header();
     const struct bons_entry  *t = model_table();
     for (int r = 0; r < ECACHE_ROLES; r++)
-        for (int l = 0; l < ECACHE_LAYERS; l++)
+        for (int l = 0; l < ECACHE_LAYERS; l++) {
             ecache_any[r][l] = ecache_n16[r][l] = -1;
+            for (int k = 0; k < ECACHE_KSEG; k++) ecache_kseg[r][l][k] = -1;
+        }
     for (uint32_t i = 0; i < h->n_tensors && i < 32767; i++) {
         int r = t[i].role, l = t[i].layer;
         if (r < 0 || r >= ECACHE_ROLES || l < 0 || l >= ECACHE_LAYERS)
@@ -68,6 +79,8 @@ static void ecache_build(void)
             ecache_any[r][l] = (int16_t)i;
         if (t[i].kind == KIND_NORM16 && ecache_n16[r][l] < 0)
             ecache_n16[r][l] = (int16_t)i;
+        if ((t[i].flags & FLAG_KSEG) && t[i].kseg < ECACHE_KSEG && ecache_kseg[r][l][t[i].kseg] < 0)
+            ecache_kseg[r][l][t[i].kseg] = (int16_t)i;
     }
     ecache_ok = 1;
 }
@@ -117,6 +130,16 @@ const struct bons_entry *model_entry_kseg(const struct bons_entry *e0, int k)
     const struct bons_entry  *t = model_table();
     if (!(e0->flags & FLAG_KSEG))
         return k == 0 ? e0 : 0;
+    if (h->magic == BONS_MAGIC && e0->role < ECACHE_ROLES && e0->layer < ECACHE_LAYERS &&
+        k >= 0 && k < ECACHE_KSEG) {
+        if (!ecache_ok)
+            ecache_build();
+        int16_t i = ecache_kseg[e0->role][e0->layer][k];
+        if (i < 0)
+            return 0;                  // No entry of this (role, layer) has segment k.
+        if (t[i].kind == e0->kind)
+            return &t[i];              // The scan's first match (a different kind: scan).
+    }
     for (uint32_t i = 0; i < h->n_tensors; i++)
         if (t[i].role == e0->role && t[i].layer == e0->layer && t[i].kind == e0->kind
             && (t[i].flags & FLAG_KSEG) && t[i].kseg == k)
