@@ -97,6 +97,11 @@ int  resident_silu_restore(void);    // reload the SiLU table (after a failed ga
 uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, float *dst,
                              uint32_t n);
 int  rl_run(const char *what);
+// rl_run in two halves: the CPU may work between them on anything but the descriptor slots
+// (no other list is built), the list's scratchpad regions and the engine. A failed start
+// needs no rl_wait.
+int  rl_start(const char *what);
+int  rl_wait(void);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
                              uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b);

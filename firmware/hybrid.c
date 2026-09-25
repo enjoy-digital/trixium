@@ -695,11 +695,15 @@ int hybrid_init(void)
     norm_ssm = infer_halloc(n_layer*sizeof(float *), 0);  ssm_a = infer_halloc(n_layer*sizeof(float *), 0);
     ssm_dt = infer_halloc(n_layer*sizeof(float *), 0);    conv_w = infer_halloc(n_layer*sizeof(float *), 0);
     for (int l = 0; l < n_layer; l++) {
+        // Norm weights are constants the lists fetch raw (rl_fetch_raw): cleaned once here.
         norm_attn[l] = fetch_f32(model_entry_kind(ROLE_ATTN_NORM, l, KIND_F32));
         norm_ffn[l]  = fetch_f32(model_entry_kind(ROLE_FFN_NORM, l, KIND_F32));
+        if (norm_attn[l]) clean_cpu_dcache_range(norm_attn[l], (size_t)n_embd*4);
+        if (norm_ffn[l])  clean_cpu_dcache_range(norm_ffn[l], (size_t)n_embd*4);
         if (!norm_attn[l] || !norm_ffn[l]) { printf("hybrid: layer %d norms missing\n", l); return -2; }
         if (dn_slot[l] >= 0) {
             norm_ssm[l] = fetch_f32(model_entry_kind(ROLE_SSM_NORM, l, KIND_F32));
+            if (norm_ssm[l]) clean_cpu_dcache_range(norm_ssm[l], (size_t)hv*4);
             ssm_a[l]    = fetch_f32(model_entry_kind(ROLE_SSM_A, l, KIND_F32));
             ssm_dt[l]   = fetch_f32(model_entry_kind(ROLE_SSM_DT, l, KIND_F32));
             conv_w[l]   = fetch_f32(model_entry_kind(ROLE_SSM_CONV, l, KIND_F32));
@@ -711,6 +715,8 @@ int hybrid_init(void)
         } else {
             norm_q[l] = fetch_f32(model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_F32));
             norm_k[l] = fetch_f32(model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_F32));
+            if (norm_q[l]) clean_cpu_dcache_range(norm_q[l], (size_t)head_dim*4);
+            if (norm_k[l]) clean_cpu_dcache_range(norm_k[l], (size_t)head_dim*4);
             if (!norm_q[l] || !norm_k[l]) { printf("hybrid: layer %d q/k norms missing\n", l); return -2; }
         }
     }
@@ -1146,6 +1152,18 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     uint32_t AL = BA + dnr_align(4*(uint32_t)nv), FIX = AL + dnr_align(4*(uint32_t)nv);
     uint32_t NW = dnr_align(FIX + 4*((C > (uint32_t)nvh ? C : (uint32_t)nvh) + 31)/32);
     uint32_t SLOT0 = (NW + dnr_align(4*(uint32_t)hv) + 1023u) & ~1023u, Z2 = SLOT0;
+    // The stream op needs no head-state slots: its records sit at SLOT0 and the heads'
+    // outputs right above them, so z stays at Z for the gated norm (no park in main RAM,
+    // no fetch back - ~6k cycles per 27B layer).
+    int z_stays = 0;
+#ifdef BONSAI_HAS_DNSTREAM
+    if (dn_hw && HP->dnstream_active &&
+        SLOT0 + 0x800u + 4u*(uint32_t)nvh <= RS_F_ADDR && 32u*(uint32_t)nv <= 0x800u) {
+        HO = SLOT0 + 0x800u;
+        Z2 = Z;
+        z_stays = 1;
+    }
+#endif
     const uint32_t CH = 2048, W = RS_F_ADDR, X = RS_F_ADDR + 16*CH;
     uint32_t eps = f32_bits_any(rms_eps);
     if (!HP->dnres_enabled || !resident_silu_active() || !H->hadamard_block || conv_k != 4 ||
@@ -1171,7 +1189,8 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
     rl_store(betab, dnr_align(4*(uint32_t)nv), BA);
     rl_store(alphab, dnr_align(4*(uint32_t)nv), AL);
-    rl_store(zb, dnr_align(4*(uint32_t)nvh), Z);
+    if (!z_stays)
+        rl_store(zb, dnr_align(4*(uint32_t)nvh), Z);
     if (rl_run("deltanet projections"))
         return -1;                     // nothing of the layer's state has moved yet
     dn_cyc_inproj += perf_now64() - t0;
@@ -1357,8 +1376,9 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // C: gated RMSNorm over the heads, x SiLU(z), into the grouped order at RS_F (og).
     t0 = perf_now64();
     rl_begin();
-    rl_fetch(norm_ssm[l], dnr_align(4*(uint32_t)hv), NW);
-    rl_fetch(zb, dnr_align(4*(uint32_t)nvh), Z2);
+    rl_fetch_raw(norm_ssm[l], dnr_align(4*(uint32_t)hv), NW);
+    if (!z_stays)
+        rl_fetch(zb, dnr_align(4*(uint32_t)nvh), Z2);
     bns_seq_desc_norm(&d, 0, HO, HO, NW, (uint32_t)hv, (uint32_t)nv, eps);
     rl_desc(&d);
     bns_seq_desc_silu_ex(&d, Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, 0, (uint32_t)hv/8, (uint32_t)nk,
@@ -1368,21 +1388,32 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         goto fatal;
     if (seq_silu_fixups_read())
         resident_silu_patch(Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, (uint32_t)hv, (uint32_t)nk, (uint32_t)rep);
-    // The CPU fallback of the out projection reads og from main RAM.
-    rl_begin();
-    rl_store(og, dnr_align(4*(uint32_t)nvh), RS_F_ADDR);
-    if (rl_run("deltanet og out"))
-        goto fatal;
+    // og stays in RS_F for the out projection's prepare (its store was a list of its own,
+    // ~6k cycles per layer): a failure past this point invalidates the token anyway - the
+    // layer's window and state have moved.
+    int og_stored = 0;
+    if (og_stored) {
+        rl_begin();
+        rl_store(og, dnr_align(4*(uint32_t)nvh), RS_F_ADDR);
+        if (rl_run("deltanet og out"))
+            goto fatal;
+    }
     dn_cyc_gate += perf_now64() - t0;
 
     t0 = perf_now64();
     struct resident_state *R = resident_state();
     R->prep_src = og; R->prep_width = nvh; R->prep_rotate = 1;
     resident_mark_act();
-    if (resident_prepare(NULL, (uint32_t)nvh, 1) == 0)
-        matvec_q(model_entry(ROLE_SSM_OUT, l), E8_RESIDENT, out);
-    else
+    if (resident_prepare(NULL, (uint32_t)nvh, 1) == 0) {
+        if (og_stored)
+            matvec_q(model_entry(ROLE_SSM_OUT, l), E8_RESIDENT, out);
+        else if (resident_matvec(model_entry(ROLE_SSM_OUT, l), out))
+            goto fatal;
+    } else {
+        if (!og_stored)
+            goto fatal;
         proj_f(model_entry(ROLE_SSM_OUT, l), og, out);
+    }
     dn_cyc_outproj += perf_now64() - t0;
     return 0;
 fatal:
@@ -1421,7 +1452,7 @@ static int xres_list(const float *y, const float *w, int load, int sync)
     if (sync)
         rl_store(xb, bytes, XRES_SP);
     if (w) {
-        rl_fetch(w, bytes, wsp);
+        rl_fetch_raw(w, bytes, wsp);                  // a norm weight: cleaned at load
         bns_seq_desc_norm(&d, 0, XRES_SP, RS_F_ADDR, wsp, n, 1, f32_bits_any(rms_eps));
         rl_desc(&d);
         rl_store(hb, bytes, RS_F_ADDR);
@@ -1554,8 +1585,8 @@ static void attention_layer(int l, const float *h, float *out)
         rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
         rl_matvec(model_entry(ROLE_ATTN_K, l), KS, KS);
         rl_matvec(model_entry(ROLE_ATTN_V, l), VS, VS);
-        rl_fetch(norm_q[l], 4*(uint32_t)head_dim, NQ);
-        rl_fetch(norm_k[l], 4*(uint32_t)head_dim, NK);
+        rl_fetch_raw(norm_q[l], 4*(uint32_t)head_dim, NQ);
+        rl_fetch_raw(norm_k[l], 4*(uint32_t)head_dim, NK);
         bns_seq_desc_norm_strided(&d, 0, QS, QS, NQ, (uint32_t)head_dim, (uint32_t)n_head, eps,
                                   gated ? 2*hb8 : hb8, gated ? 2*hb8 : hb8);
         rl_desc(&d);
@@ -1857,25 +1888,44 @@ int hybrid_forward(int token, int want_logits)
         // Resident FFN: gate, up and act = up*silu(gate) in one scratchpad list, the act
         // then prepared for the down projection where it already is (no FETCH). The gate
         // and up projections reach main RAM only when traced.
-        int fused = 0;
+        // The activation stays in RS_F for the down projection's prepare (its store to main
+        // RAM was ~13k cycles per 27B layer on v17): the trace reads it there, and a failed
+        // down projection recomputes it on the CPU path.
+        int fused = 0, act_stored = 0;
         if (e8 == E8_RESIDENT && H->hadamard_block && resident_silu_active() &&
             infer_matvec_cols(down) == (uint32_t)ffn_dim) {
             int traced = infer_dbg_armed();
             fused = resident_ffn_act(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l),
-                                     actb, traced ? gateb : NULL, traced ? upb : NULL) == 0;
+                                     act_stored ? actb : NULL, traced ? gateb : NULL,
+                                     traced ? upb : NULL) == 0;
         }
         if (fused) {
             hyb_cyc_fproj += perf_now64() - t0;
             infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
             infer_dbg_f32("ffn_up", l, upb, ffn_dim);
-            infer_dbg_f32("ffn_act", l, actb, ffn_dim);
+            infer_dbg_f32("ffn_act", l, act_stored ? actb :
+                          (const float *)(SCRATCHPAD_BASE + RS_F_ADDR), ffn_dim);
             t0 = perf_now64();
             struct resident_state *R = resident_state();
             R->prep_src = actb; R->prep_width = ffn_dim; R->prep_rotate = 1;
-            if (resident_prepare(NULL, (uint32_t)ffn_dim, 1) == 0)
-                matvec_q(down, E8_RESIDENT, tmp_h);
-            else
+            int down_done = 0;
+            if (resident_prepare(NULL, (uint32_t)ffn_dim, 1) == 0) {
+                if (act_stored) {
+                    matvec_q(down, E8_RESIDENT, tmp_h);
+                    down_done = 1;
+                } else {
+                    down_done = resident_matvec(down, tmp_h) == 0;
+                }
+            }
+            if (!down_done) {
+                if (!act_stored) {
+                    int e8c = rotate_quantize_legacy(hb, n_embd);
+                    matvec_q(model_entry(ROLE_FFN_GATE, l), e8c, gateb);
+                    matvec_q(model_entry(ROLE_FFN_UP, l), e8c, upb);
+                    silu_mul_fv(gateb, upb, actb, ffn_dim);
+                }
                 proj_f(down, actb, tmp_h);
+            }
             hyb_cyc_fdown += perf_now64() - t0;
         } else {
             matvec_q(model_entry(ROLE_FFN_GATE, l), e8, gateb);

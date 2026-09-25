@@ -187,18 +187,39 @@ static struct list_prof *listprof_slot(const char *what)
     return 0;
 }
 
-static int run_list(uint32_t count, const char *what)
+// A list in flight (run_list_start .. run_list_wait): the CPU may work in between, on
+// anything but the descriptor slots, the list's scratchpad regions and the engine.
+static struct {
+    struct list_prof *prof;
+    const char *what;
+    uint32_t count, last_d;
+    uint64_t last_t;
+} LF;
+
+static int run_list_start(uint32_t count, const char *what)
 {
     struct resident_state *R = resident_state();
-    struct list_prof *prof = listprof_slot(what);
-    uint32_t last_d = 0;
-    uint64_t last_t = perf_now64();
+    LF.prof = listprof_slot(what);
+    LF.what = what;
+    LF.count = count;
+    LF.last_d = 0;
+    LF.last_t = perf_now64();
     if (seq_wedged) {
         R->disabled = 1;
         return -1;
     }
     R->act_resident = 0;   // Every list may rewrite RS_F; resident_ffn_act re-arms it.
     seq_list_start(RS_DESC0, count);
+    return 0;
+}
+
+static int run_list_wait(void)
+{
+    struct resident_state *R = resident_state();
+    struct list_prof *prof = LF.prof;
+    const char *what = LF.what;
+    uint32_t count = LF.count, last_d = LF.last_d;
+    uint64_t last_t = LF.last_t;
     uint32_t spins = 0;
     for (;;) {
         uint32_t st = seq_status_read();
@@ -241,6 +262,13 @@ static int run_list(uint32_t count, const char *what)
         }
     }
     return 0;
+}
+
+static int run_list(uint32_t count, const char *what)
+{
+    if (run_list_start(count, what))
+        return -1;
+    return run_list_wait();
 }
 
 static int width_index(const struct bons_header *H, uint32_t width)
@@ -560,10 +588,22 @@ void rl_prepare(const float *src, uint32_t width, int rotate)
 
 int rl_run(const char *what)
 {
+    if (rl_start(what))
+        return -1;
+    return rl_wait();
+}
+
+int rl_start(const char *what)
+{
     if (RL.bad || !resident_active())
         return -1;
     seq_desc_stop(RL.n++);
-    int rc = run_list(RL.n, what);
+    return run_list_start(RL.n, what);
+}
+
+int rl_wait(void)
+{
+    int rc = run_list_wait();
     if (!rc)
         for (uint32_t i = 0; i < RL.ninv; i++)
             invd_cpu_dcache_range(RL.inv[i], RL.inv_bytes[i]);
@@ -897,13 +937,16 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     if (up_out) store_out(&n, up_out, rows, RS_Y);
     bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, rows);
     desc_words(n++, &d);
-    // The activation also goes to main RAM: the down projection's CPU fallback and the
-    // traces read it there. Fixup lanes are patched in both copies below.
-    store_out(&n, act, rows, RS_F);
+    // act != NULL: the activation also goes to main RAM (the traces, and a caller that wants
+    // the CPU fallback's input); fixup lanes are patched in both copies below. NULL: it
+    // stays in RS_F only - the store (70 KB: a cache flush and invalidate plus the DMA) was
+    // ~13k cycles per 27B layer on v17.
+    if (act)
+        store_out(&n, act, rows, RS_F);
     seq_desc_stop(n++);
     int rc = run_list(n, "ffn activation");
     if (!rc) {
-        invd_cpu_dcache_range(act, rows*4);
+        if (act) invd_cpu_dcache_range(act, rows*4);
         if (gate_out) invd_cpu_dcache_range(gate_out, rows*4);
         if (up_out) invd_cpu_dcache_range(up_out, rows*4);
         // Elements outside the unit's exact range (|gate| tails, specials, non-normal
@@ -985,6 +1028,8 @@ void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32
     (void)inv; (void)inv_bytes;
 }
 int  rl_run(const char *what) { (void)what; return -1; }
+int  rl_start(const char *what) { (void)what; return -1; }
+int  rl_wait(void) { return -1; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
 int resident_prepare(const float *src, uint32_t width, int rotate)
