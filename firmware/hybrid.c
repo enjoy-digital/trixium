@@ -1175,15 +1175,11 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     if (rl_run("deltanet projections"))
         return -1;                     // nothing of the layer's state has moved yet
     dn_cyc_inproj += perf_now64() - t0;
-    t0 = perf_now64();
-    for (int hh = 0; hh < nv; hh++) {
-        betab[hh] = sigmoidf(betab[hh]);
-        gb[hh]    = softplusf(alphab[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
-    }
-    dn_cyc_act += perf_now64() - t0;
 
     // B: causal conv in chunks (window slots oldest to newest p0, p1, p2; the new input
     // replaces p0 after its chunk was read), then SiLU in place with a unit multiplier.
+    // The list runs while the CPU computes the per-head scalars and the stream op's records
+    // (none of it touches the list's regions or the descriptor slots).
     t0 = perf_now64();
     int p0 = dn_conv_pos[s], p1 = p0 == 2 ? 0 : p0 + 1, p2 = p1 == 2 ? 0 : p1 + 1;
     float *x0 = win + (uint64_t)p0*C, *x1 = win + (uint64_t)p1*C, *x2 = win + (uint64_t)p2*C;
@@ -1202,29 +1198,19 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     }
     bns_seq_desc_silu_ex(&d, DNR_QKV, DNR_QKV, DNR_QKV, FIX, C, 1, 0, 0, 0);
     rl_desc(&d);
-    if (rl_run("deltanet conv"))
+    if (rl_start("deltanet conv"))
         goto fatal;
-    dn_conv_pos[s] = (uint8_t)p1;
-    if (seq_silu_fixups_read())
-        resident_silu_patch(DNR_QKV, 0, DNR_QKV, FIX, C, 0, 0, 0);
-    dn_cyc_conv += perf_now64() - t0;
-    t0 = perf_now64();
-    rl_begin();
-    bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
-    rl_desc(&d);
-    if (rl_run("deltanet q/k l2"))
-        goto fatal;
-    dn_cyc_prep += perf_now64() - t0;
-
-    // Heads: outputs in natural head order at HO.
-    t0 = perf_now64();
+    uint64_t ta = perf_now64();
+    for (int hh = 0; hh < nv; hh++) {
+        betab[hh] = sigmoidf(betab[hh]);
+        gb[hh]    = softplusf(alphab[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
+    }
     float scale = 1.0f/sqrtf((float)hk);
     int rep = nv/nk;
 #ifdef BONSAI_HAS_DNSTREAM
     if (dn_hw && HP->dnstream_active) {
-        // Every head in one engine op: a record per head in processing order at SLOT0
-        // (q, k, v, out byte addresses; decay, beta, scale), the state streamed from and
-        // back to every channel. The read-back fences the CPU's posted scratchpad writes.
+        // Every head in one engine op (below): a record per head in processing order at
+        // SLOT0 (q, k, v, out byte addresses; decay, beta, scale).
         volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + SLOT0);
         for (int hi = 0; hi < nv; hi++) {
             int kh = hi/rep, hh = (hi - kh*rep)*nk + kh;
@@ -1238,6 +1224,32 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             w[6] = f32_bits(scale);
             w[7] = 0;
         }
+    }
+#endif
+    uint64_t act_dt = perf_now64() - ta;
+    dn_cyc_act += act_dt;
+    if (rl_wait())
+        goto fatal;
+    dn_conv_pos[s] = (uint8_t)p1;
+    if (seq_silu_fixups_read())
+        resident_silu_patch(DNR_QKV, 0, DNR_QKV, FIX, C, 0, 0, 0);
+    dn_cyc_conv += perf_now64() - t0 - act_dt;
+    t0 = perf_now64();
+    rl_begin();
+    bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
+    rl_desc(&d);
+    if (rl_run("deltanet q/k l2"))
+        goto fatal;
+    dn_cyc_prep += perf_now64() - t0;
+
+    // Heads: outputs in natural head order at HO.
+    t0 = perf_now64();
+#ifdef BONSAI_HAS_DNSTREAM
+    if (dn_hw && HP->dnstream_active) {
+        // Every head in one engine op, the records written during the conv list; the
+        // state streamed from and back to every channel. The read-back fences the CPU's
+        // posted scratchpad writes.
+        volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + SLOT0);
         (void)rec[8*nv - 1];
         struct engine_op o = {0};
         o.kind  = ENGINE_KIND_DNSTREAM;
