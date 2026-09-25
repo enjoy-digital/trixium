@@ -60,6 +60,12 @@ struct bns_seq_descriptor;
 void rl_begin(void);
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store(void *dst, uint32_t bytes, uint32_t sp);
+// No cache maintenance, for main-RAM spans the CPU holds no dirty line of (constants cleaned
+// once, device-owned buffers): rl_fetch cleans its source and rl_store flushes and then
+// invalidates its destination, ~5 cycles per line - the DeltaNet conv's 320 KB per layer
+// cost 1.5M cycles per 27B forward (v17 board, 2026-09-25).
+void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp);
+void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp);
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
 // Rows [row0, row0 + rows) of each channel's block of e, row0 and rows multiples of 8*n_ch:
 // the image shards rows in blocks (channel c holds model rows [c*R/n_ch, (c+1)*R/n_ch)), so

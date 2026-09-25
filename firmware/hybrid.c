@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <system.h>
 
 #include "bons.h"
 #include "model.h"
@@ -702,6 +703,8 @@ int hybrid_init(void)
             ssm_a[l]    = fetch_f32(model_entry_kind(ROLE_SSM_A, l, KIND_F32));
             ssm_dt[l]   = fetch_f32(model_entry_kind(ROLE_SSM_DT, l, KIND_F32));
             conv_w[l]   = fetch_f32(model_entry_kind(ROLE_SSM_CONV, l, KIND_F32));
+            if (conv_w[l])             // the resident conv fetches the taps raw
+                clean_cpu_dcache_range(conv_w[l], (size_t)(2*nq + nvh)*conv_k*4);
             if (!norm_ssm[l] || !ssm_a[l] || !ssm_dt[l] || !conv_w[l]) {
                 printf("hybrid: layer %d DeltaNet tables missing\n", l); return -2; }
             norm_q[l] = norm_k[l] = NULL;
@@ -806,7 +809,10 @@ void hybrid_reset(void)
     } else if (dn_state) {
         memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
     }
-    if (dn_conv)  memset(dn_conv, 0, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);
+    if (dn_conv) {
+        memset(dn_conv, 0, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);
+        flush_cpu_dcache_range(dn_conv, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);   // device-owned
+    }
     if (dn_conv_pos) memset(dn_conv_pos, 0, (size_t)n_dn);
     hybrid_stats_reset();
 }
@@ -983,6 +989,9 @@ static void deltanet_layer(int l, const float *h, float *out)
     // Causal conv over the last conv_k inputs of every channel, then SiLU.
     t0 = perf_now64();
     const float *w = conv_w[l];   // tap i of channel c at c*conv_k + i
+    // The window is device-owned while the resident layer runs (raw engine transfers):
+    // take it back before reading, hand it back after writing.
+    flush_cpu_dcache_range(win, (size_t)(conv_k - 1)*C*4);
     if (conv_k == 4) {
         // The 27B's fixed four-tap kernel.  A circular history removes three 40 KiB
         // memcpys per layer, and spelling out the taps removes the runtime inner loop.
@@ -1030,6 +1039,7 @@ static void deltanet_layer(int l, const float *h, float *out)
             memcpy(win + i*C, win + (i + 1)*C, (size_t)C*4);
         memcpy(win + (conv_k - 2)*C, qkv, (size_t)C*4);
     }
+    flush_cpu_dcache_range(win, (size_t)(conv_k - 1)*C*4);
     dn_cyc_conv += perf_now64() - t0;
     // q, k (per key head, L2-normalised), v.
     t0 = perf_now64();
@@ -1180,11 +1190,13 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     rl_begin();
     for (uint32_t c0 = 0; c0 < C; c0 += CH) {
         uint32_t ch = C - c0 < CH ? C - c0 : CH;
-        rl_fetch(conv_w[l] + 4*c0, 16*ch, W);
-        rl_fetch(x0 + c0, 4*ch, X);
-        rl_fetch(x1 + c0, 4*ch, X + 4*CH);
-        rl_fetch(x2 + c0, 4*ch, X + 8*CH);
-        rl_store(x0 + c0, 4*ch, DNR_QKV + 4*c0);
+        // Raw transfers: the taps were cleaned once at load, and the window is device-owned
+        // (the CPU path flushes it around its own use, hybrid_reset after its memset).
+        rl_fetch_raw(conv_w[l] + 4*c0, 16*ch, W);
+        rl_fetch_raw(x0 + c0, 4*ch, X);
+        rl_fetch_raw(x1 + c0, 4*ch, X + 4*CH);
+        rl_fetch_raw(x2 + c0, 4*ch, X + 8*CH);
+        rl_store_raw(x0 + c0, 4*ch, DNR_QKV + 4*c0);
         bns_seq_desc_conv(&d, X, X + 4*CH, X + 8*CH, DNR_QKV + 4*c0, W, DNR_QKV + 4*c0, ch);
         rl_desc(&d);
     }
@@ -1680,6 +1692,66 @@ static int lm_head_list(const struct bons_entry *head, float *dst)
     return rl_run("lm head");
 }
 
+#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+// The greedy argmax of the LM head without the CPU's pass over ~250k logits: one list per
+// chunk, the restore unit's tracker read after each. Within a chunk the list order
+// (channel-major) is increasing model row, so the tracker's first-occurrence tie-break is
+// the firmware loop's; across chunks the smaller model row wins a tie. A chunk the tracker
+// cannot answer for (a NaN that is not the model's first logit, padding rows past the
+// vocabulary winning) is scanned on the CPU. Same result as the loop in hybrid_forward, bit
+// for bit, including its NaN semantics (a NaN first logit freezes it at row 0). Returns the
+// row, or -1 when the lists failed (dst is then incomplete).
+static int lm_head_argmax(const struct bons_entry *head, float *dst)
+{
+    if (!(H->hadamard_block && resident_active() && head &&
+          (head->kind == KIND_TERNARY || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)))
+        return -1;
+    uint32_t unit = 8u*(uint32_t)n_ch, chunk = lm_chunk_rows();
+    uint32_t nch = (uint32_t)n_ch, per = head->rows/nch, vocab = (uint32_t)H->vocab;
+    if (head->rows % unit || chunk/nch*4u > 8160u)
+        return -1;
+    int have = 0, frozen = 0;
+    float bv = 0.0f;
+    uint32_t brow = 0;
+    for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
+        uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
+        rl_begin();
+        if (!r0)
+            rl_prepare(hb, (uint32_t)n_embd, 1);
+        rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
+        rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u, dst + r0/nch,
+                         ((nch - 1u)*per + rpc)*4u);
+        if (rl_run("lm head"))
+            return -1;
+        uint32_t idx = seq_restore_argmax_idx_read();
+        union { uint32_t u; float f; } v = { seq_restore_argmax_val_read() };
+        uint32_t row = idx < rows ? (idx/rpc)*per + r0/nch + idx % rpc : 0xFFFFFFFFu;
+        if (frozen)
+            continue;
+        if (!r0 && row == 0 && v.f != v.f) {       // the model's first logit is NaN
+            frozen = 1; have = 1; brow = 0;
+            continue;
+        }
+        float cv = v.f;
+        if (row >= vocab || cv != cv) {
+            // Scan this chunk's rows (< vocab) in model order: NaN never wins.
+            int chave = 0;
+            for (uint32_t c = 0; c < nch; c++)
+                for (uint32_t j = 0; j < rpc; j++) {
+                    uint32_t r = c*per + r0/nch + j;
+                    float x = dst[r];
+                    if (r >= vocab || x != x) continue;
+                    if (!chave || x > cv) { cv = x; row = r; chave = 1; }
+                }
+            if (!chave)
+                continue;
+        }
+        if (!have || cv > bv || (cv == bv && row < brow)) { bv = cv; brow = row; have = 1; }
+    }
+    return have ? (int)brow : 0;
+}
+#endif
+
 // Console `lmcheck` (debug): the LM head of the last forward's hb through the list and
 // through proj_f, compared chunk by chunk.
 void hybrid_lm_check(void)
@@ -1830,15 +1902,25 @@ int hybrid_forward(int token, int want_logits)
     infer_dbg_f32("out_norm", -1, hb, n_embd);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head) head = model_entry(ROLE_TOK_EMB, 0);
+    int best = -1;
+#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+    // Several chunks and the hardware argmax on: one list per chunk (lm_head_argmax).
+    if (HP->hwargmax && head && head->rows > lm_chunk_rows()) {
+        best = lm_head_argmax(head, logits);
+        if (best >= 0) {
+            infer_dbg_f32("logits", -1, logits, H->vocab);
+            hyb_cyc_logits += perf_now64() - t0;
+            return best;
+        }
+    }
+#endif
     int head_done = lm_head_list(head, logits) == 0;
     // The restore unit's argmax indexes the list's (channel-major) order: the model's row
-    // order only when the head is one chunk. Several chunks: the CPU loop below, until the
-    // tracker reports model rows and breaks ties by row.
+    // order only when the head is one chunk (several: lm_head_argmax above, or the loop).
     int one_chunk = head && head->rows <= lm_chunk_rows();
     if (!head_done)
         proj_f(head, hb, logits);
     infer_dbg_f32("logits", -1, logits, H->vocab);
-    int best = -1;
 #ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
     // The restore unit tracked the firmware loop's greedy argmax over everything the LM
     // head list restored; rows past the vocabulary (padding) winning means: loop instead.

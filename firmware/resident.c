@@ -478,6 +478,18 @@ void rl_fetch(const void *src, uint32_t bytes, uint32_t sp)
     desc_fetch(RL.n++, eng_addr(src), bytes/32, sp);
 }
 
+void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp)
+{
+    if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
+    desc_fetch(RL.n++, eng_addr(src), bytes/32, sp);
+}
+
+void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp)
+{
+    if (!rl_room(1) || ((uintptr_t)dst & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
+    desc_store(RL.n++, eng_addr(dst), bytes/32, sp);
+}
+
 void rl_store(void *dst, uint32_t bytes, uint32_t sp)
 {
     if (!rl_room(1) || ((uintptr_t)dst & 31) || bytes % 32 || sp % 32 || RL.ninv >= 16) { RL.bad = 1; return; }
@@ -964,6 +976,8 @@ void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, ui
 void rl_prepare(const float *src, uint32_t width, int rotate) { (void)src; (void)width; (void)rotate; }
 void rl_desc(const struct bns_seq_descriptor *d) { (void)d; }
 void rl_engine(const struct engine_op *op) { (void)op; }
+void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp) { (void)src; (void)bytes; (void)sp; }
+void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp) { (void)dst; (void)bytes; (void)sp; }
 void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32_t dst_stride,
                       uint32_t sp, uint32_t sp_stride, void *inv, uint32_t inv_bytes)
 {
