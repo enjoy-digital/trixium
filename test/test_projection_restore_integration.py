@@ -64,7 +64,7 @@ def test_restoration_only_profile_list_bounds_before_fetch(base, count):
     run_simulation(dut, run())
 
 
-@pytest.mark.parametrize('field,value', [(0, 8 | 1 << 9), (0, 8 | 1 << 4), (0, 9), (0, 7),
+@pytest.mark.parametrize('field,value', [(0, 8 | 1 << 10), (0, 8 | 1 << 4), (0, 9), (0, 7),
     (1, 1 << 24), (2, 1 << 24), (3, 1 << 24), (4, 65536)] + [(field, 1) for field in range(6, 16)])
 def test_restoration_reserved_fields_rejected_before_dispatch(field, value):
     words = descriptor()

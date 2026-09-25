@@ -156,3 +156,62 @@ def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone(tmp_p
     assert '$readmem file not found' not in result.stdout
     assert 'HADAMARD_CLUSTER_PASS' in result.stdout
     print(result.stdout)
+
+
+def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
+    """w0[9] on a unit (OVERLAP): the rotation dispatches while the NOWAIT fetch is still
+    streaming into another region; both results exact, the list end drains the fetch."""
+    dut = SoC(BonsaiClusterConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
+    rng = random.Random(942)
+    values = [rng.randrange(-128, 128) for _ in range(1024)]
+    signs = [rng.choice([-1, 1]) for _ in values]
+    expected = dense(values, signs)
+    stream = [rng.randrange(1 << 256) for _ in range(160)]
+    fetch = [1 | (1 << 9), 2, 0, 0, 0x100, len(stream), 0, 0, 0, 0x4000, 0] + [0]*5
+    rotation = scratchpad_rotation_descriptor(src=0x800, signs=0x600, dst=0x2000, stats=0x700, blocks=1)
+    rotation[0] |= 1 << 9
+
+    def run():
+        for beat, word in enumerate(stream):
+            yield dut.models[0].mem[0x100//32 + beat].eq(word)
+        for beat in range(32):
+            yield dut.scratchpad.mem[0x800//32 + beat].eq(packed(values[beat*32:(beat+1)*32], 8))
+        for beat in range(4):
+            yield dut.scratchpad.mem[0x600//32 + beat].eq(sum((s < 0) << i for i, s in enumerate(signs[beat*256:(beat+1)*256])))
+        yield from install_list(dut, [fetch, rotation])
+        overlapped = False
+        for cycle in range(20000):
+            if (yield dut.hadamard.busy) and (yield dut.engine.sp_busy):
+                overlapped = True
+            assert not (yield dut.seq.hadamard_error.status)
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError('overlapped list did not complete')
+        assert overlapped
+        assert (yield dut.seq.status.fields.dcount) == 2
+        assert (yield dut.engine_csr.done_count.status) == 1
+        for beat in range(128):
+            word = yield dut.scratchpad.mem[0x2000//32 + beat]
+            assert unpacked(word, 32, 8) == expected[beat*8:(beat+1)*8]
+        for beat, word in enumerate(stream):
+            assert (yield dut.scratchpad.mem[0x4000//32 + beat]) == word, beat
+    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+
+
+def test_without_overlap_the_rotation_waits_for_the_nowait_fetch():
+    dut = SoC(BonsaiClusterConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
+    fetch = [1 | (1 << 9), 2, 0, 0, 0x100, 160, 0, 0, 0, 0x4000, 0] + [0]*5
+    rotation = scratchpad_rotation_descriptor(src=0x800, signs=0x600, dst=0x2000, stats=0x700, blocks=1)
+
+    def run():
+        yield from install_list(dut, [fetch, rotation])
+        for cycle in range(20000):
+            assert not ((yield dut.hadamard.busy) and (yield dut.engine.sp_busy))
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError('list did not complete')
+    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})

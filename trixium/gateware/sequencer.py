@@ -21,6 +21,12 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
            ENGINE descriptor waits in DISPATCH (engine ready = idle), a VEC descriptor
            whose args read engine state (KABS source, S7-from-absmax w0[4], any kreg-add)
            stalls until the in-flight op completes, and list end drains before idle.
+       [9] (units 3/4/5/8/11/12/13) OVERLAP: the unit dispatches even while a NOWAIT engine
+           op is in flight (by default these units wait for it). Units and the op then share
+           the scratchpad per cycle (unit reads outrank the engine, whose fill/store address
+           holds; unit writes are granted while the gather FIFO has headroom). The list
+           author asserts the unit touches nothing the op reads or writes. Below, "w0
+           exactly N" means N with or without this bit.
        [10] WAIT-ENGINE barrier: this descriptor does not dispatch until any in-flight
            NOWAIT engine op has completed. For data dependences the arg-source interlock
            cannot see (e.g. softmax reading the scores buffer the engine is filling).
@@ -327,6 +333,14 @@ class BonsaiSequencer(LiteXModule):
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
 
         list_ok = C(1, 1)
+        # OVERLAP (w0[9] on units 3/4/5/8/11/12/13): dispatch even while a NOWAIT engine op
+        # is in flight - the per-cycle scratchpad arbitration (matvec.py) lets the unit and
+        # the op share the ports. The list author asserts independence, as for NOWAIT; w0[10]
+        # (WAIT-ENGINE) is not needed on these units, which wait for the engine by default.
+        ovl = Signal()
+        w0u = Signal(32)
+        self.overlap = Signal()   # To the integrator's unit guard: this dispatch may overlap.
+        self.comb += [ovl.eq(w(0, 0)[9]), w0u.eq(w(0, 0) & ~(1 << 9)), self.overlap.eq(self.busy & ovl)]
         had_dispatch, quant_dispatch, restore_dispatch, embedding_dispatch, bad_list = [], [], [], [], []
         region_fetch_dispatch, silu_dispatch, norm_dispatch, conv_dispatch = [], [], [], []
         unknown_unit = [NextState("IDLE")]
@@ -346,7 +360,7 @@ class BonsaiSequencer(LiteXModule):
             self.comb += [
                 dst_end.eq(w(0, 3) + (w(0, 4) << 12)),
                 stats_end.eq(w(0, 5) + (((w(0, 4) + C(7, 33)) >> 3) << 5)),
-                malformed.eq((w(0, 0) != 3) | (w(0, 1)[24:] != 0) |
+                malformed.eq((w0u != 3) | (w(0, 1)[24:] != 0) |
                     (w(0, 2)[24:] != 0) | (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
                     (w(0, 5)[24:] != 0) | (w(0, 6)[1:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
                 list_overlap.eq(((w(0, 3) < list_end) & (list_base < dst_end)) |
@@ -365,7 +379,7 @@ class BonsaiSequencer(LiteXModule):
             command = self.activation_quantize_cmd
             self.comb += [
                 requantize.eq(w(0, 0)[0:4] == 5),
-                malformed.eq((w(0, 0) != Mux(requantize, 5, 4)) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                malformed.eq((w0u != Mux(requantize, 5, 4)) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 7) != 0) | (d1 != 0) |
                     Mux(requantize, (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) | (w(0, 6)[16:] != 0),
                         (w(0, 4)[16:] != 0) | (w(0, 5)[16:] != 0) | (w(0, 6) != 0))),
@@ -383,7 +397,7 @@ class BonsaiSequencer(LiteXModule):
             malformed = Signal()
             command = self.projection_restore_cmd
             self.comb += [
-                malformed.eq((w(0, 0) != 8) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                malformed.eq((w0u != 8) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
                     (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
                 command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
@@ -418,7 +432,7 @@ class BonsaiSequencer(LiteXModule):
             malformed = Signal()
             command = self.silu_cmd
             self.comb += [
-                malformed.eq((w(0, 0) != 11) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                malformed.eq((w0u != 11) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 4)[24:] != 0) | (w(0, 5)[16:] != 0) |
                     (w(0, 6)[4:] != 0) | (d1 != 0)),
                 command.src_g.eq(w(0, 1)[:24]), command.src_m.eq(w(0, 2)[:24]),
@@ -439,7 +453,7 @@ class BonsaiSequencer(LiteXModule):
             malformed = Signal()
             command = self.norm_cmd
             self.comb += [
-                malformed.eq((w(0, 0) != 12) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
+                malformed.eq((w0u != 12) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 6)[1:] != 0) | (d1 != 0)),
                 command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
                 command.weight.eq(w(0, 3)[:24]), command.n.eq(w(0, 4)[:16]),
@@ -454,7 +468,7 @@ class BonsaiSequencer(LiteXModule):
             malformed = Signal()
             command = self.conv_cmd
             self.comb += [
-                malformed.eq((w(0, 0) != 13) | reduce(or_, [w(0, i)[24:] != 0 for i in range(1, 7)]) |
+                malformed.eq((w0u != 13) | reduce(or_, [w(0, i)[24:] != 0 for i in range(1, 7)]) |
                     (w(0, 7)[17:] != 0) | (d1 != 0)),
                 command.x0.eq(w(0, 1)[:24]), command.x1.eq(w(0, 2)[:24]), command.x2.eq(w(0, 3)[:24]),
                 command.x3.eq(w(0, 4)[:24]), command.w.eq(w(0, 5)[:24]), command.dst.eq(w(0, 6)[:24]),
@@ -863,8 +877,8 @@ class BonsaiSequencer(LiteXModule):
         if with_hadamard:
             fsm.act("DISPATCH_HAD",
                 self.busy.eq(1),
-                # Always serialize, irrespective of an earlier engine's NOWAIT.
-                If(~eng_inflight,
+                # Serialized behind an earlier engine's NOWAIT unless OVERLAP.
+                If(~eng_inflight | ovl,
                     self.hadamard_cmd.valid.eq(1),
                     If(self.hadamard_cmd.ready, NextState("WAIT_HAD")),
                 ),
@@ -878,7 +892,7 @@ class BonsaiSequencer(LiteXModule):
             )
         if with_activation_quantize:
             fsm.act("DISPATCH_QUANT", self.busy.eq(1),
-                If(~eng_inflight, self.activation_quantize_cmd.valid.eq(1),
+                If(~eng_inflight | ovl, self.activation_quantize_cmd.valid.eq(1),
                     If(self.activation_quantize_cmd.ready, NextState("WAIT_QUANT"))))
             fsm.act("WAIT_QUANT", self.busy.eq(1),
                 If(self.activation_quantize_failed != 0,
@@ -889,7 +903,7 @@ class BonsaiSequencer(LiteXModule):
             fsm.act("EXT_FAILED", self.busy.eq(1))
         if with_projection_restore:
             fsm.act('DISPATCH_RESTORE', self.busy.eq(1),
-                If(~eng_inflight, self.projection_restore_cmd.valid.eq(1),
+                If(~eng_inflight | ovl, self.projection_restore_cmd.valid.eq(1),
                     If(self.projection_restore_cmd.ready, NextState('WAIT_RESTORE'))))
             fsm.act('WAIT_RESTORE', self.busy.eq(1),
                 If(self.projection_restore_failed != 0,
@@ -907,7 +921,7 @@ class BonsaiSequencer(LiteXModule):
                 ).Elif(self.embedding_restore_done, NextState('NEXT')))
         if with_silu:
             fsm.act('DISPATCH_SILU', self.busy.eq(1),
-                If(~eng_inflight, self.silu_cmd.valid.eq(1),
+                If(~eng_inflight | ovl, self.silu_cmd.valid.eq(1),
                     If(self.silu_cmd.ready, NextState('WAIT_SILU'))))
             fsm.act('WAIT_SILU', self.busy.eq(1),
                 If(self.silu_failed != 0,
@@ -923,7 +937,7 @@ class BonsaiSequencer(LiteXModule):
                                  getattr(self, name + "_done"))
             error = getattr(self, name + "_error")
             fsm.act('DISPATCH_' + name.upper(), self.busy.eq(1),
-                If(~eng_inflight, cmd.valid.eq(1), If(cmd.ready, NextState('WAIT_' + name.upper()))))
+                If(~eng_inflight | ovl, cmd.valid.eq(1), If(cmd.ready, NextState('WAIT_' + name.upper()))))
             fsm.act('WAIT_' + name.upper(), self.busy.eq(1),
                 If(failed != 0,
                     NextValue(error.status, failed << 8), NextState('EXT_FAILED'),

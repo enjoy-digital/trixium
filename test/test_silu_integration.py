@@ -50,7 +50,7 @@ def fixture(descriptors):
     return dut
 
 
-@pytest.mark.parametrize('field,value', [(0, 11 | 1 << 9), (0, 12), (1, 1 << 24), (2, 1 << 24),
+@pytest.mark.parametrize("field,value", [(0, 11 | 1 << 10), (0, 12), (1, 1 << 24), (2, 1 << 24),
     (3, 1 << 24), (4, 1 << 24), (5, 65536), (6, 16)] + [(field, 1) for field in range(8, 16)])
 def test_reserved_fields_rejected_before_dispatch(field, value):
     words = descriptor()

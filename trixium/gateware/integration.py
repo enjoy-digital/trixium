@@ -161,7 +161,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         ]
         soc.comb += [vecunit.seq_args[i].eq(seq.vec_args[i]) for i in range(8)]
         for name in ("BONSAI_HAS_VECUNIT", "BONSAI_HAS_VECUNIT2", "BONSAI_VEC_LOOPS2",
-                     "BONSAI_SEQ_LUT", "BONSAI_HAS_SEQ"):
+                     "BONSAI_SEQ_LUT", "BONSAI_HAS_SEQ", "BONSAI_SEQ_OVERLAP"):
             soc.add_constant(name)
         soc.add_constant("BONSAI_VEC_VREGS", vecunit.vregs)
 
@@ -280,7 +280,9 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
                 other_idle = other_idle & ~other.busy
         command = getattr(seq, name + "_cmd")
         soc.comb += [
-            available.eq(~soc.engine.sp_busy & other_idle &
+            # An engine op in flight blocks a unit unless the sequencer dispatches it with
+            # OVERLAP (sequencer.py w0[9]): the per-cycle arbitration shares the ports.
+            available.eq((~soc.engine.sp_busy | seq.overlap) & other_idle &
                          ~soc.scratchpad.sbw_pending & ~soc.engine_csr.rst_busy &
                          ~soc.engine_csr.rst_trigger),
             command.connect(unit.cmd, omit={"valid", "ready"}),

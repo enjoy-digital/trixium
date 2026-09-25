@@ -290,7 +290,7 @@ int main() {
         std::array<uint32_t,16> words={8,0xe800,0xe860,0xa00,3,0,0,0,0,0,0,0,0,0,0,0};
         for (unsigned i=0; i<8; i++) access(d,0xe800+i*4,true,0);
         access(d,0xa00,true,0); access(d,0xe860,true,0xdeadbeef);
-        if (mode==0) words[0] |= 1u<<9;
+        if (mode==0) words[0] |= 1u<<10;   // bit 9 is OVERLAP (legal); 10 is reserved on units
         if (mode>=1 && mode<=3) words[mode] |= 1u<<24;
         if (mode==4) words[4]=65536;
         if (mode==5) words[6]=1;
@@ -321,7 +321,7 @@ int main() {
     for (unsigned mode=0; mode<15; mode++) {
         auto words=quant(1024,1);
         for (unsigned i=0; i<1024; i++) access(d,0x10000+i*4,true,bits(1.0f));
-        if (mode==0) words[0] |= 1u<<9;
+        if (mode==0) words[0] |= 1u<<10;   // bit 9 is OVERLAP (legal); 10 is reserved on units
         if (mode==1) words[1] |= 1u<<24;
         if (mode==2) words[4]=65536;
         if (mode==3) words[5]=65536;
@@ -352,7 +352,7 @@ int main() {
         access(d,0x800,true,0); access(d,0x900,true,128); access(d,0xa00,true,0xdeadbeef);
         access(d,0xa000,true,0xdeadbeef);
         for (unsigned i=0; i<1024; i++) access(d,0x22000+i*4,true,128);
-        if (mode==0) words[0] |= 1u<<9;
+        if (mode==0) words[0] |= 1u<<10;   // bit 9 is OVERLAP (legal); 10 is reserved on units
         if (mode>=1 && mode<=5) words[mode] |= 1u<<24;
         if (mode==6) words[6]=65536;
         if (mode==7) words[7]=1;
