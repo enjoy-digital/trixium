@@ -880,6 +880,14 @@ static void console_service(void)
         printf("HWARGMAX %s (the LM head list's restore-unit argmax; off: the CPU loop over the logits)\n",
                hybrid_hwargmax_enabled() ? "on" : "off");
     }
+    else if (strcmp(token, "descbench") == 0) {
+        resident_desc_bench();
+    }
+    else if (strcmp(token, "attnfail") == 0) {
+        int p = (int)strtoul(str, NULL, 0);
+        hybrid_attn_fail_at(p);
+        printf("attnfail: the attention stream fails at position %d (0 = never)\n", p);
+    }
     else if (strcmp(token, "attnstream") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_attnstream_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_attnstream_enable(0);

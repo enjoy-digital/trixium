@@ -27,6 +27,7 @@
 #include "engine.h"
 #include "model.h"
 #include "perf.h"
+#include "infer.h"
 #include "seq.h"
 #include "bonsai_sequence.h"
 #include "progs.h"
@@ -131,6 +132,34 @@ static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d)
     for (int i = 0; i < 16; i++) w[i] = d->word[i];
 }
 
+// Console `descbench` (debug): the cost of building descriptors. 64 descriptors into slots
+// 128..191 (no hybrid list runs from there) written word by word over the bus, versus built
+// in cached main RAM, cleaned, and copied by one engine FETCH.
+void resident_desc_bench(void)
+{
+    static uint32_t *buf;              // 4 KB: main RAM, never SRAM (.bss is at its floor)
+    if (!buf) buf = infer_halloc(64*16*4, 0);
+    if (!buf) return;
+    struct bns_seq_descriptor d;
+    for (int i = 0; i < 16; i++) d.word[i] = 0x1000u + (uint32_t)i;
+    uint64_t t0 = perf_now64();
+    for (uint32_t k = 0; k < 64; k++) desc_words(128 + k, &d);
+    uint64_t t1 = perf_now64();
+    for (uint32_t k = 0; k < 64; k++)
+        for (int i = 0; i < 16; i++) buf[k*16 + i] = d.word[i] + k;
+    clean_cpu_dcache_range(buf, 64*16*4);
+    struct engine_op op = {0};
+    op.kind = ENGINE_KIND_FETCH; op.wbase = eng_addr(buf); op.wlen = 64*16*4/32;
+    op.dst = SP_DESC + 128u*64u;
+    engine_run(&op);
+    uint64_t t2 = perf_now64();
+    volatile uint32_t *w = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + 128u*64u);
+    uint32_t bad = 0;
+    for (uint32_t k = 0; k < 64; k++) if (w[k*16 + 3] != 0x1003u + k) bad++;
+    printf("descbench: 64 descriptors direct %lu cycles, via main RAM + FETCH %lu cycles, %lu bad\n",
+           (unsigned long)(t1 - t0), (unsigned long)(t2 - t1), (unsigned long)bad);
+}
+
 static void desc_fetch(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_dst)
 {
     struct engine_op op = {0};
@@ -209,6 +238,7 @@ static int run_list_start(uint32_t count, const char *what)
         return -1;
     }
     R->act_resident = 0;   // Every list may rewrite RS_F; resident_ffn_act re-arms it.
+    R->rsf_src = 0;
     seq_list_start(RS_DESC0, count);
     return 0;
 }
@@ -356,12 +386,13 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     uint64_t t0 = perf_now64();
     struct bns_seq_descriptor d;
     uint32_t n = 0;
-    if (src) {
+    if (src && src != R->rsf_src) {
         // The CPU wrote src through its write-back L1: make it visible to the engine's
         // FETCH. Clean, not flush: a clean line cannot clobber what the engine reads back.
         clean_cpu_dcache_range((void *)src, width*4);
         desc_fetch(n++, eng_addr(src), width*4/32, RS_F);
     }
+    // src == rsf_src: the list that produced src left it in RS_F (resident_rsf_set).
     // src == NULL: the FP32 source is already in RS_F (resident_ffn_act) - consumed here.
     R->act_resident = 0;
     if (rotate) {
@@ -475,8 +506,10 @@ int resident_matvec(const struct bons_entry *e, float *dst)
     store_out(&n, dst, e->rows, RS_F);
     seq_desc_stop(n++);
     int rc = run_list(n, "matvec");
-    if (!rc)
+    if (!rc) {
         invd_cpu_dcache_range(dst, e->rows*4);
+        R->rsf_src = dst;                 // the FP32 result stays in RS_F (natural order)
+    }
     R->matvec_cycles += perf_now64() - t0;
     R->matvecs++;
     return rc;
@@ -491,7 +524,11 @@ static struct {
     uint32_t inv_bytes[16];
 } RL;
 
-void rl_begin(void) { RL.n = RL.ninv = RL.bad = 0; }
+void rl_begin(void) { RL.n = RL.ninv = RL.bad = 0; resident_state()->rsf_list = resident_state()->rsf_src; }
+void resident_rsf_set(const void *src) { resident_state()->rsf_src = src; }
+int rl_rsf_is(const void *src) { return src && resident_state()->rsf_list == src; }
+// A descriptor that may write RS_F: the list no longer holds rsf_src there.
+static void rl_rsf_lost(void) { resident_state()->rsf_list = 0; }
 
 static int rl_room(uint32_t k)
 {
@@ -504,12 +541,14 @@ void rl_fetch(const void *src, uint32_t bytes, uint32_t sp)
     if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
     clean_cpu_dcache_range((void *)src, bytes);
     desc_fetch(RL.n++, eng_addr(src), bytes/32, sp);
+    if (sp < RS_SP_END && sp + bytes > RS_F) rl_rsf_lost();
 }
 
 void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp)
 {
     if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
     desc_fetch(RL.n++, eng_addr(src), bytes/32, sp);
+    if (sp < RS_SP_END && sp + bytes > RS_F) rl_rsf_lost();
 }
 
 void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp)
@@ -545,24 +584,28 @@ void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
 {
     if (!rl_room(9) || build_matvec_at(&RL.n, e, ystage, dst_sp)) RL.bad = 1;
+    if (dst_sp == RS_F) rl_rsf_lost();   // partials stay below RS_F (build_matvec_rows)
 }
 
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage,
                     uint32_t dst_sp)
 {
     if (!rl_room(9) || build_matvec_rows(&RL.n, e, row0, rows, ystage, dst_sp)) RL.bad = 1;
+    if (dst_sp == RS_F) rl_rsf_lost();
 }
 
 void rl_desc(const struct bns_seq_descriptor *d)
 {
     if (!rl_room(1)) return;
     desc_words(RL.n++, d);
+    rl_rsf_lost();                        // any unit may write RS_F
 }
 
 void rl_engine(const struct engine_op *op)
 {
     if (!rl_room(1)) return;
     seq_desc_engine(RL.n++, op);
+    rl_rsf_lost();
 }
 
 void rl_prepare(const float *src, uint32_t width, int rotate)
@@ -572,6 +615,9 @@ void rl_prepare(const float *src, uint32_t width, int rotate)
     uint32_t B = (uint32_t)H->hadamard_block;
     struct bns_seq_descriptor d;
     if (!rl_room(4) || width > RS_WIDTH_MAX || width % 32) { RL.bad = 1; return; }
+    const float *vec = src ? src : (const float *)R->rsf_list;
+    if (src && src == R->rsf_list)
+        src = 0;                          // already in RS_F: resident_rsf_set, nothing since
     if (src)
         rl_fetch(src, width*4, RS_F);
     if (rotate) {
@@ -581,8 +627,10 @@ void rl_prepare(const float *src, uint32_t width, int rotate)
         bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RL.n++, &d);
         bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(RL.n++, &d);
         bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks); desc_words(RL.n++, &d);
+        rl_rsf_lost();                    // the Hadamard wrote RS_F
     } else {
         bns_seq_desc_quantize(&d, RS_F, RS_XW, RS_E8, width, 1);              desc_words(RL.n++, &d);
+        R->rsf_list = vec;                // a plain quantize leaves the source in RS_F
     }
 }
 
@@ -1047,6 +1095,9 @@ int  rl_start(const char *what) { (void)what; return -1; }
 int  rl_wait(void) { return -1; }
 uint32_t rl_count(void) { return 0; }
 int  rl_wait_desc(uint32_t k) { (void)k; return -1; }
+void resident_rsf_set(const void *src) { (void)src; }
+void resident_desc_bench(void) {}
+int  rl_rsf_is(const void *src) { (void)src; return 0; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
 int resident_prepare(const float *src, uint32_t width, int rotate)

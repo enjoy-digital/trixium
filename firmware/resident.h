@@ -105,6 +105,9 @@ int  rl_wait(void);
 // Descriptors built so far (an index for rl_wait_desc), and a wait inside a started list
 // until the first k have completed: the CPU may then read their scratchpad outputs.
 uint32_t rl_count(void);
+void resident_rsf_set(const void *src);   // RS_F now holds src (FP32), after a list
+int  rl_rsf_is(const void *src);          // the list being built still has src in RS_F
+void resident_desc_bench(void);       // console `descbench` (debug)
 int  rl_wait_desc(uint32_t k);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
@@ -124,6 +127,10 @@ struct resident_state {
     uint32_t silu_lists, silu_fixups;
     const float *silu_lut;
     uint8_t silu_enabled, silu_ready, act_resident;
+    // The FP32 vector RS_F holds after the last list (resident_rsf_set; every list start
+    // forgets it), and the same for the list being built until a descriptor may write RS_F:
+    // a prepare of that vector skips its FETCH (~2.4k cycles for a 27B width).
+    const void *rsf_src, *rsf_list;
     // Attention output gate on unit 11 (table only, ABI >= 1.2): both table images stay in
     // main RAM and a gated list swaps the sigmoid's in and the SiLU's back.
     const uint32_t *silu_image, *sig_image;

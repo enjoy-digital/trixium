@@ -59,6 +59,10 @@ static float *dn_state;              // [n_dn][nv][hv][hk]  (row j = value index
 static float *dn_conv;               // [n_dn][conv_k - 1][C]
 static uint8_t *dn_conv_pos;         // Oldest causal-convolution plane per DeltaNet layer.
 static float *kc, *vc;               // [n_attn][ctx_cap][kv_dim]
+// Rows [0, kc_rows[a]) of attention slot a are in kc/vc. With the attention stream the rows
+// live in engine DDR and main RAM's copy (~77k cycles per 27B layer: both sides miss the
+// cache) is skipped; the CPU loop restores the missing rows before it runs (attn_kv_main).
+static uint16_t *kc_rows;
 static float *rope_c, *rope_s, *rope_freq;
 static int    rope_pos_cached;
 
@@ -96,6 +100,8 @@ static uint64_t hyb_cyc_fdown, hyb_cyc_logits;
 // window: the 8 KiB SRAM's .bss is at its 4 KiB stack floor (48 more bytes broke the link).
 struct hyb_prof {
     uint64_t at_prep, at_qkv, at_rope, at_core, at_out;
+    uint64_t at_sub[6];              // inside at_core: kv copy, list 1 build+run, softmax,
+                                     // list 2 build+run, fixups, the rest
     uint64_t fwd_weight_beats;
     uint32_t dn_state_sp;
     uint8_t dnres_enabled;           // console `dnres on|off`: the resident DeltaNet layer
@@ -106,6 +112,7 @@ struct hyb_prof {
     uint8_t attnstream_active;       // K/V rows also appended to engine DDR since the reset
     uint8_t hwargmax;                // console `hwargmax on|off`: the LM head list's argmax
     uint32_t lm_chunk;               // console `lmchunk <rows>`: cap the LM head chunks (0 auto)
+    uint16_t at_fail;                // console `attnfail <pos>` (debug): the stream fails at pos-1
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -312,6 +319,9 @@ void hybrid_attnstream_enable(int on)
 #endif
 }
 int hybrid_attnstream_enabled(void) { return HP->attnstream_enabled; }
+// Debug: the attention stream fails at position p (as a list failure would) and the CPU loop
+// takes over, restoring the K/V rows main RAM skipped. 0 = never.
+void hybrid_attn_fail_at(int p) { HP->at_fail = p > 0 ? (uint16_t)p : 0; }
 void hybrid_hwargmax_enable(int on) { HP->hwargmax = on ? 1 : 0; }
 void hybrid_lm_chunk(uint32_t rows) { HP->lm_chunk = rows; }
 int hybrid_hwargmax_enabled(void) { return HP->hwargmax; }
@@ -662,6 +672,7 @@ int hybrid_init(void)
     dn_conv_pos = n_dn ? infer_halloc(n_dn, 0) : NULL;
     kc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
+    kc_rows = n_attn ? infer_halloc(((uint64_t)n_attn*2 + 31) & ~31ull, 0) : NULL;
     silu_lut = infer_halloc(sizeof(float)*(BONSAI_SILU_LUT_N + 1), 0);
     silu_lut_init();
     sigmoid_lut = infer_halloc(sizeof(float)*(BONSAI_SILU_LUT_N + 1), 0);
@@ -735,6 +746,7 @@ int hybrid_init(void)
     HP->attnstream_active = 0;
     HP->hwargmax = 1;
     HP->lm_chunk = 0;
+    HP->at_fail = 0;
 #ifdef BONSAI_HAS_ATTNSTREAM
     HP->attnstream_enabled = 1;
 #else
@@ -836,6 +848,7 @@ void hybrid_reset(void)
         flush_cpu_dcache_range(dn_conv, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);   // device-owned
     }
     if (dn_conv_pos) memset(dn_conv_pos, 0, (size_t)n_dn);
+    if (kc_rows) memset(kc_rows, 0, (size_t)n_attn*2);
     hybrid_stats_reset();
 }
 
@@ -849,6 +862,7 @@ void hybrid_stats_reset(void)
     hyb_cyc_resid = hyb_cyc_fprep = hyb_cyc_fproj = hyb_cyc_fact = 0;
     hyb_cyc_fdown = hyb_cyc_logits = 0;
     HP->at_prep = HP->at_qkv = HP->at_rope = HP->at_core = HP->at_out = 0;
+    memset(HP->at_sub, 0, sizeof HP->at_sub);
     hyb_forwards_profiled = 0;
     resident_stats_reset();
 }
@@ -902,6 +916,15 @@ void hybrid_stats_print(void)
                    (unsigned long)(HP->at_rope/hyb_forwards_profiled),
                    (unsigned long)(HP->at_core/hyb_forwards_profiled),
                    (unsigned long)(HP->at_out/hyb_forwards_profiled));
+        if (hyb_cyc_attn && HP->at_core)
+            printf("attnprof core: avg cycles/fwd kvcopy %lu scores-build %lu scores-run %lu softmax %lu "
+                   "values-build %lu values-run %lu\n",
+                   (unsigned long)(HP->at_sub[0]/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_sub[1]/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_sub[2]/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_sub[3]/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_sub[4]/hyb_forwards_profiled),
+                   (unsigned long)(HP->at_sub[5]/hyb_forwards_profiled));
         if (HP->fwd_weight_beats) {
             // Floor: every channel streams its share of every tensor at one beat per clock.
             uint64_t fwd = ht/hyb_forwards_profiled;
@@ -1507,8 +1530,13 @@ static int xres_list(const float *y, const float *w, int load, int sync)
     if (load)
         rl_fetch(xb, bytes, XRES_SP);
     if (y) {
-        rl_fetch(y, bytes, RS_Y_ADDR);
-        bns_seq_desc_add(&d, XRES_SP, RS_Y_ADDR, XRES_SP, n);
+        // The mixer or FFN output: still in RS_F when its list restored it there (no FETCH).
+        uint32_t ysp = RS_F_ADDR;
+        if (!rl_rsf_is(y)) {
+            rl_fetch(y, bytes, RS_Y_ADDR);
+            ysp = RS_Y_ADDR;
+        }
+        bns_seq_desc_add(&d, XRES_SP, ysp, XRES_SP, n);
         rl_desc(&d);
     }
     if (sync)
@@ -1519,7 +1547,11 @@ static int xres_list(const float *y, const float *w, int load, int sync)
         rl_desc(&d);
         rl_store(hb, bytes, RS_F_ADDR);
     }
-    return rl_run("residual stream");
+    if (rl_run("residual stream"))
+        return -1;
+    if (w)
+        resident_rsf_set(hb);         // the next list's prepare of hb reads RS_F, no FETCH
+    return 0;
 }
 #endif
 
@@ -1556,6 +1588,8 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
                nq*hd*4u <= AT_O_END - AT_O && nq*Tp*4u <= AT_SP_END - AT_SP &&
                T <= BONSAI_ATTN_T_MAX;
     struct engine_op o;
+    uint64_t ts = perf_now64(), tn;
+#define AT_SUB(i) do { tn = perf_now64(); HP->at_sub[i] += tn - ts; ts = tn; } while (0)
     rl_begin();
     rl_fetch(kb, (uint32_t)kv_dim*4u, AT_KST);
     rl_fetch(vb, (uint32_t)kv_dim*4u, AT_VST);
@@ -1577,10 +1611,12 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
         rl_engine(&o);
         rl_store(at_buf, nq*Tp*4u, AT_SP);
     }
-    if (rl_run("attention scores")) {
+    AT_SUB(1);
+    if (rl_run("attention scores") || (HP->at_fail && (uint32_t)HP->at_fail == p)) {
         HP->attnstream_active = 0;
         return -1;
     }
+    AT_SUB(2);
     if (!fits)
         return -1;
     // The softmax exactly as the CPU loop computes it.
@@ -1590,6 +1626,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
         for (int t = 0; t < T; t++) { sc[t] = bonsai_softmax_exp(sc[t] - mx); sum += sc[t]; }
         for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
     }
+    AT_SUB(3);
     // The gate on unit 11 when it can: one run per head over the gates in AT_Q, into AT_D
     // (disjoint: the outputs in AT_O and the gates stay for the fixups).
     int unit_gate = gated && qstride == 2u*hd && resident_gate_active() && hd <= 256u &&
@@ -1608,6 +1645,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     } else {
         rl_store(attnb, nq*hd*4u, AT_O);
     }
+    AT_SUB(4);
     if (rl_run(unit_gate ? "attention values+gate" : "attention values")) {
         HP->attnstream_active = 0;
         if (unit_gate)
@@ -1620,9 +1658,54 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
             resident_gate_patch(AT_FX + hh*32u, AT_Q + (hh*qstride + hd)*4u, AT_O + hh*hd*4u,
                                 attnb + hh*hd, hd);
 #endif
+    AT_SUB(5);
+#undef AT_SUB
     return unit_gate ? 1 : 0;
 }
 #endif
+
+// Rows [0, T) of slot a in kc/vc for the CPU loop: rows [kc_rows[a], T - 1) come back from
+// the stream's copy in engine DDR (position t on channel t % n_ch), row T - 1 from kb/vb.
+// -1 when a row cannot be brought back (the loop must not run on stale rows).
+static int attn_kv_main(int a, int T, float *K, float *V)
+{
+    uint32_t have = kc_rows ? kc_rows[a] : 0, last = (uint32_t)T - 1u;
+    if (kc_rows && have < last) {
+#ifdef BONSAI_HAS_ATTNSTREAM
+        uint32_t rb = at_rowbeats, rowbytes = rb*32u, nch = (uint32_t)n_ch;
+        uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes, vspan = kspan + at_slots*rowbytes;
+        uint32_t bytes = (uint32_t)kv_dim*4u, per = 8;          // 8 rows of K and V per list: 64 KB of RS_F
+        if (!at_geom_ok || bytes != rowbytes || 2u*per*bytes > 0x32000u - RS_F_ADDR)
+            return -1;
+        for (uint32_t t0 = have; t0 < last; t0 += per) {
+            uint32_t n = last - t0 < per ? last - t0 : per;
+            rl_begin();
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t t = t0 + i, spk = RS_F_ADDR + 2u*i*bytes, spv = spk + bytes;
+                struct engine_op o = {0};
+                o.kind = ENGINE_KIND_FETCH; o.chan = (uint8_t)(t % nch); o.wlen = rb;
+                o.wbase = kspan + t/nch*rowbytes; o.dst = spk; rl_engine(&o);
+                o.wbase = vspan + t/nch*rowbytes; o.dst = spv; rl_engine(&o);
+                rl_store(K + (uint64_t)t*kv_dim, bytes, spk);
+                rl_store(V + (uint64_t)t*kv_dim, bytes, spv);
+            }
+            if (rl_run("attention kv restore"))
+                return -1;
+        }
+        printf("hybrid: attention slot %d: K/V rows %lu..%lu restored from engine DDR\n", a,
+               (unsigned long)have, (unsigned long)(last - 1u));
+        have = last;
+#else
+        return -1;
+#endif
+    }
+    if (kc_rows && have < last)
+        return -1;
+    memcpy(K + (uint64_t)last*kv_dim, kb, (size_t)kv_dim*4);
+    memcpy(V + (uint64_t)last*kv_dim, vb, (size_t)kv_dim*4);
+    if (kc_rows) kc_rows[a] = (uint16_t)T;
+    return 0;
+}
 
 static void attention_layer(int l, const float *h, float *out)
 {
@@ -1700,9 +1783,17 @@ static void attention_layer(int l, const float *h, float *out)
         rope_apply_partial(kb + hh*head_dim);
     }
     t1 = perf_now64(); HP->at_rope += t1 - t0; t0 = t1;
-    memcpy(K + (uint64_t)pos*kv_dim, kb, (size_t)kv_dim*4);
-    memcpy(V + (uint64_t)pos*kv_dim, vb, (size_t)kv_dim*4);
     int   T = pos + 1;
+    int stream_on = 0;
+#ifdef BONSAI_HAS_ATTNSTREAM
+    stream_on = HP->attnstream_active && kc_rows;
+#endif
+    if (!stream_on && attn_kv_main(a, T, K, V)) {
+        puts("hybrid: attention K/V rows could not be restored");
+        engine_wedged = 1;
+        return;
+    }
+    HP->at_sub[0] += perf_now64() - t0;
     float scale = 1.0f/sqrtf((float)head_dim);
     int streamed = 0;                  // 1: attnb holds the outputs, 2: gated too
 #ifdef BONSAI_HAS_ATTNSTREAM
@@ -1711,6 +1802,11 @@ static void attention_layer(int l, const float *h, float *out)
         streamed = rc < 0 ? 0 : 1 + rc;
     }
 #endif
+    if (!streamed && stream_on && attn_kv_main(a, T, K, V)) {   // the CPU loop after all
+        puts("hybrid: attention K/V rows could not be restored");
+        engine_wedged = 1;
+        return;
+    }
     if (!streamed && q_in_place)           // the CPU loop after all: its contiguous q
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
