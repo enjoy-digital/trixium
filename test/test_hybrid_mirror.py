@@ -371,7 +371,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         for hh in range(nv):
             kh = hh % nk
             qh, kk, vh = q[kh*hk:(kh + 1)*hk], k[kh*hk:(kh + 1)*hk], v[hh*hv:(hh + 1)*hv]
-            decay = f32(np.exp(g[hh], dtype=f32))
+            decay = f32(softmax_exp(np.array([g[hh]], dtype=f32))[0])   # canonical exp (<= 0)
             if fast:
                 oh = recurrence_fast(l, hh, qh, kk, vh, decay, beta[hh])
             else:

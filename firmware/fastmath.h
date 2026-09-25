@@ -50,6 +50,11 @@ static inline float bonsai_softmax_exp(float x)
     return bonsai_expf_bounded(x);
 }
 
+// The DeltaNet decay exp(g), g = softplus(a + dt)*A <= 0 (A = -exp(A_log)): the same
+// canonical exp (docs/canonical-reductions.md) - ~40 cycles against libm's ~250, 2,304
+// times per 27B forward.
+static inline float bonsai_decay_exp(float g) { return bonsai_softmax_exp(g); }
+
 static inline float bonsai_siluf(float x)
 {
     // These tails avoid overflow and keep the range-reduction exponent normal.  At 16,

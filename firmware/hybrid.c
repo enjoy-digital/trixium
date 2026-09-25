@@ -1072,7 +1072,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         const float *qh = dn_q + kh*hk, *kk = dn_k + kh*hk, *vh = dn_v + hh*hv;
         float *M = dn_hw ? NULL : S + (uint64_t)hh*hv*hk;
         t0 = perf_now64();
-        float decay = expf(gb[hh]);
+        float decay = bonsai_decay_exp(gb[hh]);
         float *oh = ob + hh*hv;
         if (dn_hw) {
 #ifdef BONSAI_HAS_DNREC
@@ -1219,7 +1219,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             w[1] = DNR_QKV + 4u*(uint32_t)(nq + kh*hk);
             w[2] = DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv);
             w[3] = HO + 4u*(uint32_t)(hh*hv);
-            w[4] = f32_bits(expf(gb[hh]));
+            w[4] = f32_bits(bonsai_decay_exp(gb[hh]));
             w[5] = f32_bits(betab[hh]);
             w[6] = f32_bits(scale);
             w[7] = 0;
@@ -1299,7 +1299,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             dnunit_k_base_write(DNR_QKV + 4u*(uint32_t)(nq + kh*hk));
             dnunit_v_base_write(DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv));
             dnunit_out_base_write(HO + 4u*(uint32_t)(hh*hv));
-            dnunit_decay_write(f32_bits(expf(gb[hh])));
+            dnunit_decay_write(f32_bits(bonsai_decay_exp(gb[hh])));
             dnunit_beta_write(f32_bits(betab[hh]));
             dnunit_scale_write(f32_bits(scale));
             uint32_t udone = dnunit_done_count_read();
@@ -1334,7 +1334,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             int kh = hh % nk;
             const float *qh = dn_q + kh*hk, *kk = dn_k + kh*hk, *vh = dn_v + hh*hv;
             float *M = dn_state + ((uint64_t)s*nv + hh)*hv*hk, *oh = ob + hh*hv;
-            float decay = expf(gb[hh]);
+            float decay = bonsai_decay_exp(gb[hh]);
             int j = 0;
             for (; j + 3 < hv; j += 4)
                 deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
