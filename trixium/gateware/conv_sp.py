@@ -143,14 +143,19 @@ class BonsaiConvScratchpad(LiteXModule):
             out_room.eq((ofifo.level + groups_in_flight) < FIFO_DEPTH),
             feed.eq((state == S["RUN"]) & bank_full[cbank] & ~self.cancel & (out_room | (lane != 0))),
         ]
+        # ADD takes a whole group (beat) per clock through eight adders of its own - reads
+        # then pace it (x0 and x3, two beats per group): the residual adds were ~4.2k clocks
+        # per 5,120 floats one lane at a time (v17 board).
+        last_lane = Signal()
+        self.comb += last_lane.eq(add | (lane == 7))
         # A bank is full once its 8th beat has landed; it empties when its last lane is fed.
         for b in range(2):
             self.sync += If(clear, bank_full[b].eq(0)).Else(
                 If(rd_pending & (rd_bank == b) & (rd_sub == Mux(add, 3, 7)), bank_full[b].eq(1)),
-                If(feed & (cbank == b) & (lane == 7), bank_full[b].eq(0)))
+                If(feed & (cbank == b) & last_lane, bank_full[b].eq(0)))
         self.sync += If(clear, cbank.eq(0), lane.eq(0), cgrp.eq(0)).Elif(feed,
-            lane.eq(lane + 1),
-            If(lane == 7, cbank.eq(~cbank), cgrp.eq(cgrp + 1)))
+            lane.eq(Mux(add, 0, lane + 1)),
+            If(last_lane, cbank.eq(~cbank), cgrp.eq(cgrp + 1)))
 
         bank_sel = [Array([banks[0][i], banks[1][i]])[cbank] for i in range(8)]
         def lane_word(beat, idx):
@@ -175,24 +180,27 @@ class BonsaiConvScratchpad(LiteXModule):
         p1 = muls[1].r
         p2 = _delay(self, muls[2].r, L_A, "p2d")
         p3 = _delay(self, muls[3].r, 2*L_A, "p3d")
-        # ADD: x0 + x3 on adds[0], aligned with the conv path by a delay before it.
-        x0d = _delay(self, xs[0], L_M, "x0d")
-        x3d = _delay(self, xs[3], L_M, "x3d")
-        addr_r = _delay(self, adds[0].r, 2*L_A, "addr")
         self.comb += [
-            adds[0].a.eq(Mux(add, x0d, a1)), adds[0].b.eq(Mux(add, x3d, p1)),
+            adds[0].a.eq(a1), adds[0].b.eq(p1),
             adds[1].a.eq(adds[0].r), adds[1].b.eq(p2),
             adds[2].a.eq(adds[1].r), adds[2].b.eq(p3),
         ]
         LAT = L_M + 3*L_A
-        y_valid = _delay(self, feed, LAT, "yv")
+        y_valid = _delay(self, feed & ~add, LAT, "yv")
         y_lane = _delay(self, lane, LAT, "yl")
         acc = [Signal(32, name=f"yacc{j}") for j in range(7)]
         for j in range(7):
-            self.sync += If(y_valid & (y_lane == j), acc[j].eq(Mux(add, addr_r, adds[2].r)))
+            self.sync += If(y_valid & (y_lane == j), acc[j].eq(adds[2].r))
+        # ADD: x0 + x3, eight lanes at once.
+        vadds = [FP32Add() for _ in range(8)]
+        self.submodules += vadds
+        for j in range(8):
+            self.comb += [vadds[j].a.eq(bank_sel[0][32*j:32*j + 32]),
+                          vadds[j].b.eq(bank_sel[3][32*j:32*j + 32])]
+        v_valid = _delay(self, feed & add, L_A, "vv")
         self.comb += [
-            ofifo.we.eq(y_valid & (y_lane == 7) & ~clear),
-            ofifo.din.eq(Cat(*acc, Mux(add, addr_r, adds[2].r))),
+            ofifo.we.eq(((y_valid & (y_lane == 7)) | v_valid) & ~clear),
+            ofifo.din.eq(Mux(add, Cat(*[v.r for v in vadds]), Cat(*acc, adds[2].r))),
         ]
         self.sync += If(clear, groups_in_flight.eq(0)).Else(
             groups_in_flight.eq(groups_in_flight + (feed & (lane == 0)) - ofifo.we))
