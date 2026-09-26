@@ -114,6 +114,7 @@ struct hyb_prof {
     uint32_t lm_chunk;               // console `lmchunk <rows>`: cap the LM head chunks (0 auto)
     uint16_t at_fail;                // console `attnfail <pos>` (debug): the stream fails at pos-1
     uint8_t logits_clean;            // the CPU holds no dirty line of `logits` (lm_head_argmax)
+    uint64_t fd_prep, fd_mv;         // inside hyb_cyc_fdown: the down prepare, the down matvec
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -897,6 +898,7 @@ void hybrid_stats_reset(void)
     hyb_cyc_embed = hyb_cyc_anorm = hyb_cyc_dn = hyb_cyc_attn = 0;
     hyb_cyc_resid = hyb_cyc_fprep = hyb_cyc_fproj = hyb_cyc_fact = 0;
     hyb_cyc_fdown = hyb_cyc_logits = 0;
+    HP->fd_prep = HP->fd_mv = 0;
     HP->at_prep = HP->at_qkv = HP->at_rope = HP->at_core = HP->at_out = 0;
     memset(HP->at_sub, 0, sizeof HP->at_sub);
     hyb_forwards_profiled = 0;
@@ -952,6 +954,10 @@ void hybrid_stats_print(void)
                    (unsigned long)(HP->at_rope/hyb_forwards_profiled),
                    (unsigned long)(HP->at_core/hyb_forwards_profiled),
                    (unsigned long)(HP->at_out/hyb_forwards_profiled));
+        if (hyb_cyc_fdown)
+            printf("hybprof fdown: avg cycles/fwd prepare %lu matvec %lu\n",
+                   (unsigned long)(HP->fd_prep/hyb_forwards_profiled),
+                   (unsigned long)(HP->fd_mv/hyb_forwards_profiled));
         if (hyb_cyc_attn && HP->at_core)
             printf("attnprof core: avg cycles/fwd kvcopy %lu scores-build %lu scores-run %lu softmax %lu "
                    "values-build %lu values-run %lu\n",
@@ -2172,13 +2178,17 @@ int hybrid_forward(int token, int want_logits)
             struct resident_state *R = resident_state();
             R->prep_src = actb; R->prep_width = ffn_dim; R->prep_rotate = 1;
             int down_done = 0;
+            uint64_t tf = perf_now64();
             if (resident_prepare(NULL, (uint32_t)ffn_dim, 1) == 0) {
+                uint64_t tm = perf_now64();
+                HP->fd_prep += tm - tf;
                 if (act_stored) {
                     matvec_q(down, E8_RESIDENT, tmp_h);
                     down_done = 1;
                 } else {
                     down_done = resident_matvec(down, tmp_h) == 0;
                 }
+                HP->fd_mv += perf_now64() - tm;
             }
             if (!down_done) {
                 if (!act_stored) {
