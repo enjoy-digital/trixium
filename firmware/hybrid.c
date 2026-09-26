@@ -113,6 +113,7 @@ struct hyb_prof {
     uint8_t hwargmax;                // console `hwargmax on|off`: the LM head list's argmax
     uint32_t lm_chunk;               // console `lmchunk <rows>`: cap the LM head chunks (0 auto)
     uint16_t at_fail;                // console `attnfail <pos>` (debug): the stream fails at pos-1
+    uint8_t logits_clean;            // the CPU holds no dirty line of `logits` (lm_head_argmax)
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -747,6 +748,7 @@ int hybrid_init(void)
     HP->hwargmax = 1;
     HP->lm_chunk = 0;
     HP->at_fail = 0;
+    HP->logits_clean = 0;
 #ifdef BONSAI_HAS_ATTNSTREAM
     HP->attnstream_enabled = 1;
 #else
@@ -814,6 +816,40 @@ int hybrid_init(void)
     return 0;
 }
 
+// The conv window (5.9 MB on the 27B) zeroed by the engine: 31-packet STOREs of one zeroed
+// 4 KB scratchpad block. The CPU memset through cold lines plus the flush was 28 M cycles of
+// every generation's first token. The window is device-owned (the CPU path flushes around
+// its own use), so no cache maintenance. 0 = done; -1: the caller's memset.
+static int dn_conv_zero(void)
+{
+#ifdef DNRES_BUILT
+    uint64_t bytes = (uint64_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4;
+    const uint32_t blk = 4096u, per = 31u*blk;
+    if (!resident_active() || ((uintptr_t)dn_conv & 31) || bytes % 32 ||
+        (bytes + per - 1)/per + 1 > 60u)
+        return -1;
+    volatile uint32_t *z = (volatile uint32_t *)(SCRATCHPAD_BASE + RS_F_ADDR);
+    for (uint32_t i = 0; i < blk/4; i++) z[i] = 0;
+    (void)z[blk/4 - 1];                // the posted writes land before the list starts
+    rl_begin();
+    uint8_t *p = (uint8_t *)dn_conv;
+    for (uint64_t off = 0; off < bytes; ) {
+        uint64_t left = bytes - off;
+        if (left >= blk) {
+            uint32_t n = left/blk > 31u ? 31u : (uint32_t)(left/blk);
+            rl_store_packets(p + off, blk, n, blk, RS_F_ADDR, 0, NULL, 0);
+            off += (uint64_t)n*blk;
+        } else {
+            rl_store_raw(p + off, (uint32_t)left, RS_F_ADDR);
+            off += left;
+        }
+    }
+    return rl_run("conv window reset") ? -1 : 0;
+#else
+    return -1;
+#endif
+}
+
 void hybrid_reset(void)
 {
     pos = 0;
@@ -843,7 +879,7 @@ void hybrid_reset(void)
     } else if (dn_state) {
         memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
     }
-    if (dn_conv) {
+    if (dn_conv && dn_conv_zero()) {
         memset(dn_conv, 0, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);
         flush_cpu_dcache_range(dn_conv, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);   // device-owned
     }
@@ -1182,12 +1218,23 @@ static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 #ifdef BONSAI_HAS_DNSTREAM
 // The stream op's records: one per head in processing order at slot0 (q, k, v, out byte
 // addresses; decay, beta, scale), from betab/gb.
+// Record slot of processing index hi: with two units (BONSAI_DNSTREAM_PAIR) the even
+// indices go to unit 0's table, the odd ones behind them to unit 1's.
+static int dn_rec_slot(int hi)
+{
+#ifdef BONSAI_DNSTREAM_PAIR
+    return hi % 2 ? (nv + 1)/2 + hi/2 : hi/2;
+#else
+    return hi;
+#endif
+}
+
 static void dn_stream_records(uint32_t slot0, uint32_t ho, float scale, int rep)
 {
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + slot0);
     for (int hi = 0; hi < nv; hi++) {
         int kh = hi/rep, hh = (hi - kh*rep)*nk + kh;
-        volatile uint32_t *w = rec + 8*hi;
+        volatile uint32_t *w = rec + 8*dn_rec_slot(hi);
         w[0] = DNR_QKV + 4u*(uint32_t)(kh*hk);
         w[1] = DNR_QKV + 4u*(uint32_t)(nq + kh*hk);
         w[2] = DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv);
@@ -1352,7 +1399,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         // state streamed from and back to every channel. The read-back fences the CPU's
         // posted scratchpad writes.
         volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + SLOT0);
-        (void)rec[8*nv - 1];
+        (void)rec[8*dn_rec_slot(nv - 1) + 7];   // the last record written
         struct engine_op o = {0};
         o.kind  = ENGINE_KIND_DNSTREAM;
         o.rows  = (uint16_t)nv;
@@ -1914,14 +1961,21 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
     int have = 0, frozen = 0;
     float bv = 0.0f;
     uint32_t brow = 0;
+    // The chunks' stores carry no cache maintenance (a flush and an invalidate over ~1 MB
+    // per chunk: ~175k cycles, 2.1 M per 27B token): the buffer is flushed once while the
+    // CPU has written it, and only what the CPU reads is invalidated first (the rare scan
+    // below; the trace, hybrid_forward).
+    if (!HP->logits_clean) {
+        flush_cpu_dcache_range(dst, (size_t)H->vocab*4 + 64u*nch*4u);
+        HP->logits_clean = 1;
+    }
     for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
         uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
         rl_begin();
         if (!r0)
             rl_prepare(hb, (uint32_t)n_embd, 1);
         rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
-        rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u, dst + r0/nch,
-                         ((nch - 1u)*per + rpc)*4u);
+        rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u, NULL, 0);
         if (rl_run("lm head"))
             return -1;
         uint32_t idx = seq_restore_argmax_idx_read();
@@ -1936,6 +1990,8 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
         float cv = v.f;
         if (row >= vocab || cv != cv) {
             // Scan this chunk's rows (< vocab) in model order: NaN never wins.
+            for (uint32_t c = 0; c < nch; c++)
+                invd_cpu_dcache_range(dst + c*per + r0/nch, rpc*4u);
             int chave = 0;
             for (uint32_t c = 0; c < nch; c++)
                 for (uint32_t j = 0; j < rpc; j++) {
@@ -2128,6 +2184,8 @@ int hybrid_forward(int token, int want_logits)
     if (HP->hwargmax && head && head->rows > lm_chunk_rows()) {
         best = lm_head_argmax(head, logits);
         if (best >= 0) {
+            if (infer_dbg_armed())
+                invd_cpu_dcache_range(logits, (size_t)H->vocab*4);
             infer_dbg_f32("logits", -1, logits, H->vocab);
             hyb_cyc_logits += perf_now64() - t0;
             return best;
@@ -2138,8 +2196,10 @@ int hybrid_forward(int token, int want_logits)
     // The restore unit's argmax indexes the list's (channel-major) order: the model's row
     // order only when the head is one chunk (several: lm_head_argmax above, or the loop).
     int one_chunk = head && head->rows <= lm_chunk_rows();
-    if (!head_done)
+    if (!head_done) {
         proj_f(head, hb, logits);
+        HP->logits_clean = 0;            // CPU-written: lm_head_argmax flushes it first
+    }
     infer_dbg_f32("logits", -1, logits, H->vocab);
 #ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
     // The restore unit tracked the firmware loop's greedy argmax over everything the LM
