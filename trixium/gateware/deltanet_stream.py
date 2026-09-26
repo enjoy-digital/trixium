@@ -636,3 +636,149 @@ class BonsaiDeltaNetStream(LiteXModule):
         ).Elif(finish,
             run.eq(0),
         )
+
+
+def pair_order(heads):
+    """Unit of each head in processing order for BonsaiDeltaNetStreamPair: head i goes to
+    unit i % 2 (records: unit 0's heads first, then unit 1's) - the list of (unit, index)."""
+    return [(i % 2, i//2) for i in range(heads)]
+
+
+def pair_state_to_lanes(states, lanes):
+    """The pair's DDR layout: per lane, heads 2p and 2p+1 beat-interleaved, an odd last
+    head alone at the end."""
+    single = state_to_lanes(states, lanes)
+    h = len(states)
+    per = single.shape[1]//h//8                                # beats per head per lane
+    beats = single.reshape(lanes, h, per, 8)
+    out = [np.stack([beats[:, 2*p], beats[:, 2*p + 1]], axis=2).reshape(lanes, 2*per, 8)
+           for p in range(h//2)]
+    if h % 2:
+        out.append(beats[:, h - 1])
+    return np.ascontiguousarray(np.concatenate(out, axis=1).reshape(lanes, -1))
+
+
+def pair_lanes_to_state(words, lanes, rows, cols, heads):
+    words = np.asarray(words, dtype=np.uint32).reshape(lanes, -1, 8)
+    per = (rows//lanes)*(cols//8)
+    out = []
+    for p in range(heads//2):
+        blk = words[:, 2*per*p:2*per*(p + 1)].reshape(lanes, per, 2, 8)
+        out += [blk[:, :, 0], blk[:, :, 1]]
+    if heads % 2:
+        out.append(words[:, 2*per*(heads//2):])
+    single = np.stack(out, axis=1).reshape(lanes, -1)
+    return lanes_to_state(single, lanes, rows, cols)
+
+
+class BonsaiDeltaNetStreamPair(LiteXModule):
+    """Two BonsaiDeltaNetStream units on the same lanes, twice the heads per clock.
+
+    Heads alternate between the units (processing order i -> unit i % 2): the records are
+    unit 0's heads at ``table``, then unit 1's; every lane's state stream carries heads 2p
+    and 2p+1 beat-interleaved (an odd last head alone), so each unit takes every other
+    beat at its own pace and the write-back re-interleaves them in the same order. Each
+    unit keeps its exact per-head arithmetic: the results are the single unit's bits.
+    The scratchpad ports are shared round-robin (records and vectors: ~48 beats per head
+    per ~1k clocks each). Same interface as BonsaiDeltaNetStream.
+    """
+    def __init__(self, lanes=16, adr_bits=13, **kwargs):
+        u = [BonsaiDeltaNetStream(lanes=lanes, adr_bits=adr_bits, **kwargs) for _ in range(2)]
+        self.submodules.u0, self.submodules.u1 = u
+        L = lanes
+        self.lanes, self.rows, self.cols = L, u[0].rows, u[0].cols
+        self.rows_per_lane, self.beats_per_head = u[0].rows_per_lane, u[0].beats_per_head
+        BPH = u[0].beats_per_head
+
+        self.start = Signal()
+        self.heads = Signal(16)
+        self.table = Signal(adr_bits)
+        self.zero  = Signal()
+        self.busy  = Signal()
+        self.done  = Signal()
+        self.sinks   = [stream.Endpoint([("data", 256)], name=f"dnp_sink{l}") for l in range(L)]
+        self.sources = [stream.Endpoint([("data", 256)], name=f"dnp_source{l}") for l in range(L)]
+        self.sp_rd_ok  = Signal(reset=1)
+        self.sp_rd_req = Signal()
+        self.sp_rd_adr = Signal(adr_bits)
+        self.sp_rd_dat = Signal(256)
+        self.sp_wr_req = Signal()
+        self.sp_wr_adr = Signal(adr_bits)
+        self.sp_wr_we  = Signal(8)
+        self.sp_wr_dat = Signal(256)
+        self.sp_wr_gnt = Signal()
+        self.heads_done = Signal(16)
+
+        # # #
+
+        h0 = Signal(16)
+        h1 = Signal(16)
+        self.comb += [
+            h1.eq(self.heads[1:]),
+            h0.eq(self.heads - h1),
+        ]
+        for i, x in enumerate(u):
+            self.comb += [x.start.eq(self.start), x.zero.eq(self.zero),
+                          x.heads.eq(h0 if i == 0 else h1),
+                          x.sp_rd_dat.eq(self.sp_rd_dat)]
+        self.comb += [
+            u[0].table.eq(self.table),
+            u[1].table.eq(self.table + h0),
+        ]
+        # Interleaved region: 2*BPH*h1 beats per lane; beyond it (odd last head) all unit 0.
+        span = Signal(32)
+        self.sync += If(self.start, span.eq((self.heads[1:]*BPH) << 1))
+        for l in range(L):
+            ci, co = Signal(32, name=f"dnp_ci{l}"), Signal(32, name=f"dnp_co{l}")
+            si, so = Signal(name=f"dnp_si{l}"), Signal(name=f"dnp_so{l}")
+            sink, src = self.sinks[l], self.sources[l]
+            self.comb += [
+                si.eq((ci < span) & ci[0]),
+                so.eq((co < span) & co[0]),
+                u[0].sinks[l].valid.eq(sink.valid & ~si), u[1].sinks[l].valid.eq(sink.valid & si),
+                u[0].sinks[l].data.eq(sink.data), u[1].sinks[l].data.eq(sink.data),
+                sink.ready.eq(Mux(si, u[1].sinks[l].ready, u[0].sinks[l].ready)),
+                src.valid.eq(Mux(so, u[1].sources[l].valid, u[0].sources[l].valid)),
+                src.data.eq(Mux(so, u[1].sources[l].data, u[0].sources[l].data)),
+                u[0].sources[l].ready.eq(src.ready & ~so), u[1].sources[l].ready.eq(src.ready & so),
+            ]
+            self.sync += If(self.start, ci.eq(0), co.eq(0)).Else(
+                If(sink.valid & sink.ready, ci.eq(ci + 1)),
+                If(src.valid & src.ready, co.eq(co + 1)),
+            )
+        # Scratchpad reads: a held request per unit, round-robin grants; the data comes back
+        # one clock after the grant to whoever was granted (each unit's own contract).
+        rr, pick = Signal(), Signal()
+        self.comb += [
+            pick.eq(u[1].sp_rd_req & (~u[0].sp_rd_req | rr)),
+            u[0].sp_rd_ok.eq(self.sp_rd_ok & ~pick),
+            u[1].sp_rd_ok.eq(self.sp_rd_ok & pick),
+            self.sp_rd_req.eq(u[0].sp_rd_req | u[1].sp_rd_req),
+            self.sp_rd_adr.eq(Mux(pick, u[1].sp_rd_adr, u[0].sp_rd_adr)),
+        ]
+        self.sync += If(self.sp_rd_ok & (u[0].sp_rd_req | u[1].sp_rd_req), rr.eq(~pick))
+        # Scratchpad writes: held until granted, round-robin.
+        wrr, wpick = Signal(), Signal()
+        self.comb += [
+            wpick.eq(u[1].sp_wr_req & (~u[0].sp_wr_req | wrr)),
+            u[0].sp_wr_gnt.eq(self.sp_wr_gnt & ~wpick),
+            u[1].sp_wr_gnt.eq(self.sp_wr_gnt & wpick),
+            self.sp_wr_req.eq(u[0].sp_wr_req | u[1].sp_wr_req),
+            self.sp_wr_adr.eq(Mux(wpick, u[1].sp_wr_adr, u[0].sp_wr_adr)),
+            self.sp_wr_we.eq(Mux(wpick, u[1].sp_wr_we, u[0].sp_wr_we)),
+            self.sp_wr_dat.eq(Mux(wpick, u[1].sp_wr_dat, u[0].sp_wr_dat)),
+        ]
+        self.sync += If(self.sp_wr_gnt & self.sp_wr_req, wrr.eq(~wpick))
+        # Done once both finished (each pulses once; a unit with no heads finishes at once).
+        f0, f1 = Signal(), Signal()
+        self.sync += If(self.start, f0.eq(0), f1.eq(0)).Else(
+            If(u[0].done, f0.eq(1)), If(u[1].done, f1.eq(1)))
+        run, fin = Signal(), Signal()
+        self.comb += [
+            fin.eq(run & (f0 | u[0].done) & (f1 | u[1].done)),
+            self.done.eq(fin),
+            self.busy.eq(run),
+            self.heads_done.eq(u[0].heads_done + u[1].heads_done),
+        ]
+        self.sync += If(self.start, run.eq(1)).Elif(fin, run.eq(0))
+        self.progress = u[0].progress + u[1].progress

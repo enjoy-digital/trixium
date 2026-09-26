@@ -337,11 +337,13 @@ class BonsaiMatVecEngine(LiteXModule):
         # (same wbase/wlen on every channel, the readers' per-channel offsets).
         self.with_dnstream = dnstream
         if dnstream:
-            from trixium.gateware.deltanet_stream import BonsaiDeltaNetStream
+            from trixium.gateware.deltanet_stream import BonsaiDeltaNetStream, BonsaiDeltaNetStreamPair
             # dnstream=True: the 27B geometry on the exact operators; a dict overrides the
-            # unit's arguments (tests: a small geometry on integer operators).
+            # unit's arguments (tests: a small geometry on integer operators); pair=True
+            # puts two units on the lanes (BonsaiDeltaNetStreamPair: twice the heads/clock).
             opts = dict(dnstream) if isinstance(dnstream, (dict, tuple)) else {}
-            self.submodules.dnstream = dn = BonsaiDeltaNetStream(
+            cls = BonsaiDeltaNetStreamPair if opts.pop("pair", False) else BonsaiDeltaNetStream
+            self.submodules.dnstream = dn = cls(
                 lanes=len(hbm_axis), adr_bits=len(scratchpad.fill.adr), **opts)
             self.mstore_cmd  = stream.Endpoint([("addr", 33), ("len", 24)])
             self.mstore_data = dn.sources

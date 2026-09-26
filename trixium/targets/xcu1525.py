@@ -350,7 +350,8 @@ class BonsaiXCU1525SoC(SoCCore):
                 with_activation_quantize=with_activation_quantize, with_projection_restore=with_projection_restore,
                 with_embedding_restore=with_embedding_restore, with_region_fetch=with_region_fetch,
                 with_silu=with_silu, with_norm=with_norm, with_conv=with_conv,
-                with_dnstream=with_dnstream,
+                with_dnstream=bool(with_dnstream),
+                dnstream_options=(("pair", True),) if with_dnstream == "pair" else (),
                 with_attnstream=attn_geometry is not None,
                 attnstream_options=tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                     (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
@@ -426,6 +427,7 @@ def main():
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
+    parser.add_target_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
                                help="Attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
     parser.add_target_argument("--with-region-fetch", action="store_true", help="Experimental sequenced 64-bit checked region reads; requires --with-native.")
@@ -456,7 +458,7 @@ def main():
         with_silu              = args.with_silu,
         with_norm              = args.with_norm,
         with_conv              = args.with_conv,
-        with_dnstream          = args.with_dnstream,
+        with_dnstream          = ("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
         with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)

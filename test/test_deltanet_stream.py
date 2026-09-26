@@ -14,7 +14,8 @@ import pytest
 from migen.fhdl import verilog
 
 from trixium.gateware.deltanet_stream import (
-    BonsaiDeltaNetStream, lanes_to_state, reference, state_to_lanes)
+    BonsaiDeltaNetStream, BonsaiDeltaNetStreamPair, lanes_to_state, pair_lanes_to_state,
+    pair_state_to_lanes, reference, state_to_lanes)
 
 f32 = np.float32
 
@@ -95,11 +96,11 @@ int main(int argc, char **argv) {{
 '''
 
 
-def build(tmp_path, lanes, rows, cols):
+def build(tmp_path, lanes, rows, cols, pair=False):
     verilator = shutil.which("verilator")
     if not verilator:
         pytest.skip("Verilator required")
-    dut = BonsaiDeltaNetStream(lanes=lanes, rows=rows, cols=cols)
+    dut = (BonsaiDeltaNetStreamPair if pair else BonsaiDeltaNetStream)(lanes=lanes, rows=rows, cols=cols)
     sig = {n: getattr(dut, n) for n in ("start", "heads", "table", "zero", "busy", "done", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
     for l in range(lanes):
@@ -110,7 +111,7 @@ def build(tmp_path, lanes, rows, cols):
         sig[f"progress{i}"] = s
     for n, s in sig.items():
         s.name_override = n if n != "table" else "table_adr"
-    top = f"dns_{lanes}_{rows}_{cols}"
+    top = f"dns{'p' if pair else ''}_{lanes}_{rows}_{cols}"
     rtl = tmp_path / f"{top}.v"
     dut.sp_rd_ok.name_override = "sp_rd_ok"
     verilog.convert(dut, ios=set(sig.values()) | {dut.sp_rd_ok}, name=top).write(str(rtl))
@@ -129,7 +130,7 @@ def build(tmp_path, lanes, rows, cols):
     return tmp_path / f"obj/V{top}"
 
 
-def scenario(rng, heads, rows, cols, nk, zero=False):
+def scenario(rng, heads, rows, cols, nk, zero=False, pair=False):
     """A layer's worth of heads: GQA q/k shared by head pairs, a few special values."""
     SP = 256*1024
     mem = rng.integers(0, 1 << 32, SP//4, dtype=np.uint64).astype(np.uint32)
@@ -137,7 +138,7 @@ def scenario(rng, heads, rows, cols, nk, zero=False):
     qk_base, v_base, out_base, table = 0x00000, 0x10000, 0x20000, 0x30000
     states = rng.normal(0, 0.5, (heads, rows, cols)).astype(f32)
     states[0, 3, :] = 0                                    # a zero row
-    states[1, 5, :7] = [1e-40, -1e-41, 0, -0.0, 3e-39, 1e30, -1e30]
+    if heads > 1: states[1, 5, :7] = [1e-40, -1e-41, 0, -0.0, 3e-39, 1e30, -1e30]
     q = rng.normal(0, 1, (nk, cols)).astype(f32); q /= np.linalg.norm(q, axis=1, keepdims=True)
     k = rng.normal(0, 1, (nk, cols)).astype(f32); k /= np.linalg.norm(k, axis=1, keepdims=True)
     v = rng.normal(0, 1, (heads, rows)).astype(f32)
@@ -154,6 +155,8 @@ def scenario(rng, heads, rows, cols, nk, zero=False):
                         out_base + 4*rows*h, 0, 0, 0, 0], np.uint32)
         rec[4:7] = np.array([decay[h], beta[h], scale], f32).view(np.uint32)
         recs.append(rec)
+    if pair:   # unit 0's heads (even processing order), then unit 1's
+        recs = recs[0::2] + recs[1::2]
     mem[table//4:table//4 + 8*heads] = np.concatenate(recs)
     want_mem, want_states = mem.copy(), np.empty_like(states)
     for h in range(heads):
@@ -163,10 +166,10 @@ def scenario(rng, heads, rows, cols, nk, zero=False):
     return mem, states, table, want_mem, want_states
 
 
-def run(binary, tmp_path, mem, states, lanes, heads, table, pcts, zero=False):
+def run(binary, tmp_path, mem, states, lanes, heads, table, pcts, zero=False, pair=False):
     sp, ln, spo, lno = (tmp_path / n for n in ("sp.bin", "lanes.bin", "sp_out.bin", "lanes_out.bin"))
     mem.astype("<u4").tofile(sp)
-    state_to_lanes(states, lanes).astype("<u4").tofile(ln)
+    (pair_state_to_lanes if pair else state_to_lanes)(states, lanes).astype("<u4").tofile(ln)
     r = subprocess.run([str(binary), str(sp), str(ln), str(spo), str(lno), str(heads), str(table//32),
                         *[str(p) for p in pcts], *(["1"] if zero else [])], capture_output=True, text=True, timeout=1800)
     assert r.returncode == 0, r.stdout + r.stderr[-4000:]
@@ -174,8 +177,9 @@ def run(binary, tmp_path, mem, states, lanes, heads, table, pcts, zero=False):
     return np.fromfile(spo, dtype="<u4"), np.fromfile(lno, dtype="<u4"), cycles
 
 
-def check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols):
-    got_states = lanes_to_state(got_lanes, lanes, rows, cols).view(np.uint32)
+def check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols, pair=False):
+    got_states = (pair_lanes_to_state(got_lanes, lanes, rows, cols, len(want_states)) if pair else
+                  lanes_to_state(got_lanes, lanes, rows, cols)).view(np.uint32)
     want = want_states.view(np.uint32)
     bad = np.argwhere(got_states != want)
     assert not len(bad), [(tuple(i), hex(int(got_states[tuple(i)])), hex(int(want[tuple(i)]))) for i in bad[:8]]
@@ -238,3 +242,28 @@ def test_zero_flag_ignores_the_incoming_state(tmp_path_factory, pcts):
     mem, states, table, want_mem, want_states = scenario(np.random.default_rng(3), heads, rows, cols, 3)
     got_mem, got_lanes, _ = run(binary, tmp, mem, states, lanes, heads, table, pcts)
     check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+
+
+@pytest.mark.parametrize("heads", [9, 8, 1])
+@pytest.mark.parametrize("pcts", [(100, 100, 100), (40, 60, 50)])
+def test_pair_equals_the_reference(tmp_path_factory, heads, pcts):
+    """Two units, heads alternating, the streams beat-interleaved per head pair (an odd
+    last head alone; one head leaves unit 1 idle): the single unit's bits."""
+    tmp = tmp_path_factory.mktemp("dnsp_small")
+    lanes, rows, cols = 2, 16, 16
+    binary = build(tmp, lanes, rows, cols, pair=True)
+    mem, states, table, want_mem, want_states = scenario(np.random.default_rng(heads), heads, rows, cols,
+                                                         3 if heads % 3 == 0 else 1, pair=True)
+    got_mem, got_lanes, cycles = run(binary, tmp, mem, states, lanes, heads, table, pcts, pair=True)
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols, pair=True)
+
+
+def test_pair_27b_geometry_streams_two_heads_per_1024_clocks(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("dnsp27")
+    lanes, rows, cols, heads = 16, 128, 128, 6
+    binary = build(tmp, lanes, rows, cols, pair=True)
+    mem, states, table, want_mem, want_states = scenario(np.random.default_rng(81), heads, rows, cols, 3, pair=True)
+    got_mem, got_lanes, cycles = run(binary, tmp, mem, states, lanes, heads, table, (100, 100, 100), pair=True)
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols, pair=True)
+    print("pair cycles", cycles, "per head", cycles/heads)
+    assert cycles < heads/2*1025 + 1500, cycles
