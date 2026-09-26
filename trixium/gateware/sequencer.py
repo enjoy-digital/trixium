@@ -84,9 +84,11 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           | table_set << 3 (ABI 1.3: the resident table pair a LOAD writes and a RUN reads),
           w7 seg_beats | perm_a << 16 | perm_b << 24 (permuted output segments, 0 = none),
           w8..w15 zero. seq.silu_fixups sums the flagged elements of the list.
-  norm:   Optional unit 12 (ABI 1.1), serialized; w0 exactly 12, w1 src, w2 dst, w3 weight,
-          w4 n | nseg << 16, w5 FP32 eps, w6 op (0 RMS, 1 L2), w7 src_stride | dst_stride
-          << 16 (beats between segments, 0 = contiguous), w8..w15 zero. norm_sp.py.
+  norm:   Optional unit 12 (ABI 1.2), serialized; w0 exactly 12, w1 src, w2 dst, w3 weight,
+          w4 n | nseg << 16, w5 FP32 eps, w6 op (0 RMS, 1 L2) | rope_hb << 8 (1.2: RoPE over
+          the first 16*rope_hb values of each segment, 0 = none) | rope_tab << 16 (its cos
+          then sin beats, a beat index), w7 src_stride | dst_stride << 16 (beats between
+          segments, 0 = contiguous), w8..w15 zero. norm_sp.py.
   conv:   Optional unit 13, serialized; w0 exactly 13, w1..w3 window slots x0..x2, w4 new
           input x3, w5 taps, w6 dst, w7 channels | op << 16 (op 1: dst = x0 + x3, the
           residual add), w8..w15 zero. gateware/conv_sp.py.
@@ -229,7 +231,7 @@ class BonsaiSequencer(LiteXModule):
             from trixium.gateware.norm_sp import NORM_COMMAND
             self.norm_cmd = stream.Endpoint(NORM_COMMAND)
             self.norm_done, self.norm_failed = Signal(), Signal(8)
-            self.norm_abi = CSRStatus(32, reset=0x00010001)
+            self.norm_abi = CSRStatus(32, reset=0x00010002)
             self.norm_error = CSRStatus(32, description=
                 'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
                 'bits8..15 norm-client error (bit14 protects the full descriptor list).')
@@ -454,11 +456,13 @@ class BonsaiSequencer(LiteXModule):
             command = self.norm_cmd
             self.comb += [
                 malformed.eq((w0u != 12) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
-                    (w(0, 3)[24:] != 0) | (w(0, 6)[1:] != 0) | (d1 != 0)),
+                    (w(0, 3)[24:] != 0) | (w(0, 6)[1:8] != 0) | (w(0, 6)[13:16] != 0) |
+                    (w(0, 6)[29:] != 0) | (d1 != 0)),
                 command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
                 command.weight.eq(w(0, 3)[:24]), command.n.eq(w(0, 4)[:16]),
                 command.nseg.eq(w(0, 4)[16:32]), command.eps.eq(w(0, 5)), command.op.eq(w(0, 6)[0]),
                 command.src_stride.eq(w(0, 7)[:16]), command.dst_stride.eq(w(0, 7)[16:32]),
+                command.rope_hb.eq(w(0, 6)[8:13]), command.rope_tab.eq(w(0, 6)[16:29]),
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             norm_dispatch = [If(malformed,

@@ -163,6 +163,17 @@ int bns_seq_desc_norm_strided(struct bns_seq_descriptor *out, uint32_t l2, uint3
     d.word[7] = src_stride | dst_stride << 16;
     *out=d; return BNS_SEQ_DESC_OK;
 }
+int bns_seq_desc_norm_rope(struct bns_seq_descriptor *d, uint32_t rope_n, uint32_t tab)
+{
+    uint32_t n;
+    if (!d || d->word[0] != 12 || rope_n < 16 || rope_n > 256 || rope_n % 16 || !sp_address(tab, 32)
+        || tab >= 1u << 18)                     /* a 13-bit beat index: the 256 KB scratchpad */
+        return BNS_SEQ_DESC_INVALID;
+    n = d->word[4] & 0xFFFF;
+    if (rope_n > n || (d->word[6] & ~1u)) return BNS_SEQ_DESC_INVALID;
+    d->word[6] |= (rope_n/16) << 8 | (tab/32) << 16;
+    return BNS_SEQ_DESC_OK;
+}
 int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, uint32_t x2,
                      uint32_t x3, uint32_t w, uint32_t dst, uint32_t channels)
 {

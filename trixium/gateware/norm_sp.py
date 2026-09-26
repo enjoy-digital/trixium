@@ -34,9 +34,11 @@ from trixium.gateware.fp32_exact import FP32Add, FP32DivSqrt, FP32Mul, _lzc, _sh
 
 NORM_COMMAND = [("op", 1), ("src", 24), ("dst", 24), ("weight", 24), ("n", 16), ("nseg", 16),
                 ("eps", 32), ("src_stride", 16), ("dst_stride", 16),
-                ("protect_start", 24), ("protect_end", 24)]
+                ("protect_start", 24), ("protect_end", 24),
+                ("rope_hb", 5), ("rope_tab", 13)]
 OP_RMS, OP_L2 = 0, 1
 WMAX = 8192                     # largest n (27B: n_embd 5120)
+HB_MAX = 16                     # RoPE: half the rotated dims, in beats (<= 128 elements)
 F32_ONE = 0x3F800000
 
 
@@ -83,13 +85,16 @@ class BonsaiNormScratchpad(LiteXModule):
             ends["dst"].eq(cap["dst"] + d_span),
             ends["weight"].eq(cap["weight"] + seg_bytes),
             geometry_bad.eq((cap["n"][:3] != 0) | (cap["n"] == 0) | (cap["n"] > WMAX) |
+                            (cap["rope_hb"] > HB_MAX) | ((cap["rope_hb"] << 1) > nbeats) |
                             (s_stride < nbeats) | (d_stride < nbeats) |
                             (cap["nseg"] == 0) | (cap["src"][:5] != 0) | (cap["dst"][:5] != 0) |
                             (rms & (cap["weight"][:5] != 0)) |
                             (cap["protect_start"] > cap["protect_end"])),
             bounds_bad.eq((ends["src"] > scratchpad_size) | (ends["dst"] > scratchpad_size) |
                           (rms & (ends["weight"] > scratchpad_size)) |
-                          (cap["protect_end"] > scratchpad_size)),
+                          (cap["protect_end"] > scratchpad_size) |
+                          ((cap["rope_hb"] != 0) &
+                           (((cap["rope_tab"] + (cap["rope_hb"] << 1)) << 5) > scratchpad_size))),
             overlap_bad.eq(
                 (((cap["dst"] != cap["src"]) | (s_stride != d_stride)) &
                  (cap["dst"] < ends["src"]) & (cap["src"] < ends["dst"])) |
@@ -120,7 +125,7 @@ class BonsaiNormScratchpad(LiteXModule):
 
         # Output FIFO (pass 2) with credits for the in-flight beats.
         FIFO_DEPTH = 32
-        self.submodules.ofifo = ofifo = ResetInserter()(SyncFIFO(width=256, depth=FIFO_DEPTH))
+        self.submodules.ofifo = ofifo = ResetInserter()(SyncFIFO(width=256 + 13, depth=FIFO_DEPTH))
         P2_LAT = 1 + L_MUL + L_MUL                   # read -> m1 -> m2
         inflight = Signal(max=FIFO_DEPTH + 1)
 
@@ -130,7 +135,7 @@ class BonsaiNormScratchpad(LiteXModule):
         # chain, pass 2) finishes segment i. A hands B the sum of squares and the segment
         # addresses once B is waiting; B changes `scale` and the output base only after
         # its previous segment's writes drained.
-        states = ["IDLE", "VALIDATE", "WLOAD", "RUN", "FINISH", "FAILED"]
+        states = ["IDLE", "VALIDATE", "WLOAD", "TLOAD", "RUN", "FINISH", "FAILED"]
         S = {name: i for i, name in enumerate(states)}
         A = {name: i for i, name in enumerate(["P1", "DRAIN", "TREE", "HAND", "DONE"])}
         B = {name: i for i, name in enumerate(["WAIT", "SCALAR", "P2"])}
@@ -157,25 +162,45 @@ class BonsaiNormScratchpad(LiteXModule):
 
         # Read issue: one scratchpad read per clock; pass 2 (it frees output credits and
         # ends a segment) before pass 1.
-        issue_w, issue_a, issue_b, issue = Signal(), Signal(), Signal(), Signal()
+        issue_w, issue_t, issue_a, issue_b, issue = Signal(), Signal(), Signal(), Signal(), Signal()
         can_p2 = Signal()
+        hb = cap["rope_hb"]
+        rope = Signal()
+        after2 = Signal()        # a RoPE second-half beat issued last clock: it writes two beats
         self.comb += can_p2.eq((ofifo.level + inflight) < FIFO_DEPTH)
         self.comb += [
+            rope.eq(hb != 0),
             issue_w.eq(~self.cancel & (state == S["WLOAD"]) & (beat < nbeats)),
-            issue_b.eq(run & (b_st == B["P2"]) & (beat_b < nbeats) & can_p2),
+            issue_t.eq(~self.cancel & (state == S["TLOAD"]) & (beat < (hb << 1))),
+            issue_b.eq(run & (b_st == B["P2"]) & (beat_b < nbeats) & can_p2 & ~after2),
             issue_a.eq(run & (a_st == A["P1"]) & (beat_a < nbeats) & ~issue_b),
-            issue.eq(issue_w | issue_a | issue_b),
+            issue.eq(issue_w | issue_t | issue_a | issue_b),
             self.sp_rd_req.eq(issue),
             self.sp_rd_adr.eq(Mux(issue_w, (cap["weight"] >> 5) + beat,
-                              Mux(issue_b, (src_b >> 5) + beat_b, (src_a >> 5) + beat_a))),
+                              Mux(issue_t, cap["rope_tab"] + beat,
+                              Mux(issue_b, (src_b >> 5) + beat_b, (src_a >> 5) + beat_a)))),
             rd_port.adr.eq(beat_b),
         ]
         self.sync += [
             rd_pending.eq(issue & ~clear),
-            rd_kind.eq(Mux(issue_w, 0, Mux(issue_b, 2, 1))),
-            rd_beat.eq(Mux(issue_w, beat, Mux(issue_b, beat_b, beat_a))),
+            rd_kind.eq(Mux(issue_w, 0, Mux(issue_t, 3, Mux(issue_b, 2, 1)))),
+            rd_beat.eq(Mux(issue_w | issue_t, beat, Mux(issue_b, beat_b, beat_a))),
             If(issue, self.read_beats.eq(self.read_beats + 1)),
-            If(issue_w, beat.eq(beat + 1)),
+            If(issue_w | issue_t, beat.eq(beat + 1)),
+            after2.eq(issue_b & rope & (beat_b >= hb) & (beat_b < (hb << 1)) & ~clear),
+        ]
+        # RoPE tables (cos beats, then sin beats) and the held first-half beats.
+        ctab, stab, rbuf = (Memory(256, HB_MAX, name=f"norm_{n}") for n in ("ctab", "stab", "rbuf"))
+        ctab_w, stab_w, rbuf_w = (m.get_port(write_capable=True) for m in (ctab, stab, rbuf))
+        ctab_r, stab_r, rbuf_r = (m.get_port(async_read=True) for m in (ctab, stab, rbuf))
+        self.specials += ctab, stab, rbuf, ctab_w, stab_w, rbuf_w, ctab_r, stab_r, rbuf_r
+        t_valid = Signal()
+        self.comb += [
+            t_valid.eq(rd_pending & (rd_kind == 3)),
+            ctab_w.we.eq(t_valid & (rd_beat < hb)), ctab_w.adr.eq(rd_beat[:4]),
+            ctab_w.dat_w.eq(self.sp_rd_dat),
+            stab_w.we.eq(t_valid & (rd_beat >= hb)), stab_w.adr.eq((rd_beat - hb)[:4]),
+            stab_w.dat_w.eq(self.sp_rd_dat),
         ]
         # Weight load writes.
         self.comb += [
@@ -266,12 +291,61 @@ class BonsaiNormScratchpad(LiteXModule):
                 m2[lane].a.eq(m1[lane].r), m2[lane].b.eq(w_hold[32*lane:32*lane + 32]),
             ]
         out_valid = _delay(self, p2_valid, 2*L_MUL, "out_valid")
+        out_beat = _delay(self, rd_beat, 2*L_MUL, "out_beat")
+        y = Signal(256)
+        self.comb += y.eq(Cat(*[m2[lane].r for lane in range(8)]))
+        # RoPE (neox pairs over the first 2*hb beats of each segment, the firmware's
+        # rope_apply_partial): a first-half beat waits in rbuf; its second-half partner
+        # produces both, o0 = y0*c - y1*s at the first beat's place, o1 = y0*s + y1*c at its
+        # own. Every beat takes the same L_MUL + L_ADD path so the writes keep their order;
+        # the second of a pair's two writes goes one clock later (issue skips that clock).
+        first, second, pas = Signal(), Signal(), Signal()
+        ridx = Signal(4)
         self.comb += [
-            ofifo.we.eq(out_valid & ~clear),
-            ofifo.din.eq(Cat(*[m2[lane].r for lane in range(8)])),
+            first.eq(out_valid & rope & (out_beat < hb)),
+            second.eq(out_valid & rope & (out_beat >= hb) & (out_beat < (hb << 1))),
+            pas.eq(out_valid & ~first & ~second),
+            ridx.eq((out_beat - hb)[:4]),
+            rbuf_w.we.eq(first & ~clear), rbuf_w.adr.eq(out_beat[:4]), rbuf_w.dat_w.eq(y),
+            rbuf_r.adr.eq(ridx), ctab_r.adr.eq(ridx), stab_r.adr.eq(ridx),
+        ]
+        rmul = [[FP32Mul() for _ in range(8)] for _ in range(4)]     # y0*c, y1*s, y0*s, y1*c
+        radd = [[FP32Add() for _ in range(8)] for _ in range(2)]     # o0, o1
+        self.submodules += [m for row in rmul for m in row] + [a for row in radd for a in row]
+        for lane in range(8):
+            sl = slice(32*lane, 32*lane + 32)
+            y0, y1 = rbuf_r.dat_r[sl], y[sl]
+            c, sn = ctab_r.dat_r[sl], stab_r.dat_r[sl]
+            self.comb += [
+                rmul[0][lane].a.eq(y0), rmul[0][lane].b.eq(c),
+                rmul[1][lane].a.eq(y1), rmul[1][lane].b.eq(sn),
+                rmul[2][lane].a.eq(y0), rmul[2][lane].b.eq(sn),
+                rmul[3][lane].a.eq(y1), rmul[3][lane].b.eq(c),
+                radd[0][lane].a.eq(rmul[0][lane].r), radd[0][lane].b.eq(rmul[1][lane].r ^ 0x80000000),
+                radd[1][lane].a.eq(rmul[2][lane].r), radd[1][lane].b.eq(rmul[3][lane].r),
+            ]
+        LR = L_MUL + L_ADD
+        pas_d, second_d = _delay(self, pas, LR, "rope_pas"), _delay(self, second, LR, "rope_second")
+        beat_d, y_d = _delay(self, out_beat, LR, "rope_beat"), _delay(self, y, LR, "rope_y")
+        o0 = Cat(*[radd[0][lane].r for lane in range(8)])
+        o1 = Cat(*[radd[1][lane].r for lane in range(8)])
+        pend_v, pend_adr, pend_dat = Signal(), Signal(13), Signal(256)
+        self.sync += If(clear, pend_v.eq(0)).Else(
+            pend_v.eq(second_d), pend_adr.eq(beat_d), pend_dat.eq(o1))
+        wr_now = Signal()
+        self.comb += [
+            wr_now.eq((pas_d | second_d | pend_v) & ~clear),
+            ofifo.we.eq(wr_now),
+            If(pend_v,
+                ofifo.din.eq(Cat(pend_dat, pend_adr)),
+            ).Elif(second_d,
+                ofifo.din.eq(Cat(o0, beat_d - hb)),
+            ).Else(
+                ofifo.din.eq(Cat(y_d, beat_d)),
+            ),
         ]
         self.sync += If(clear, inflight.eq(0)).Else(
-            inflight.eq(inflight + issue_b - out_valid))
+            inflight.eq(inflight + issue_b - wr_now))
         # Output beats carry their own address: dst + segment offset + beat. The FIFO holds
         # only data; addresses follow the write counter within the segment.
         wr_beat = Signal(13)
@@ -279,11 +353,11 @@ class BonsaiNormScratchpad(LiteXModule):
         drained = Signal()                           # every pass-2 beat issued so far written
         self.comb += [
             self.sp_wr_req.eq(ofifo.readable & ~self.cancel),
-            self.sp_wr_adr.eq(wr_seg_base + wr_beat),
-            self.sp_wr_dat.eq(ofifo.dout),
+            self.sp_wr_adr.eq(wr_seg_base + ofifo.dout[256:]),
+            self.sp_wr_dat.eq(ofifo.dout[:256]),
             self.sp_wr_we.eq(0xFF),
             ofifo.re.eq(self.sp_wr_req & self.sp_wr_gnt),
-            drained.eq((inflight == 0) & ~ofifo.readable & ~(rd_pending & (rd_kind == 2))),
+            drained.eq((inflight == 0) & ~ofifo.readable & ~(rd_pending & (rd_kind == 2)) & ~pend_v),
         ]
         self.sync += If(clear, wr_beat.eq(0)).Elif(ofifo.re,
             wr_beat.eq(wr_beat + 1), self.output_beats.eq(self.output_beats + 1))
@@ -350,8 +424,10 @@ class BonsaiNormScratchpad(LiteXModule):
                     state.eq(S["FAILED"]),
                 ).Else(beat.eq(0), src_a.eq(cap["src"]), dst_a.eq(cap["dst"]),
                        seg_a.eq(0), seg_b.eq(0), beat_a.eq(0), a_st.eq(A["P1"]), b_st.eq(B["WAIT"]),
-                       state.eq(Mux(rms, S["WLOAD"], S["RUN"]))),
-                S["WLOAD"]: If((beat == nbeats) & ~rd_pending, state.eq(S["RUN"])),
+                       state.eq(Mux(rms, S["WLOAD"], Mux(cap["rope_hb"] != 0, S["TLOAD"], S["RUN"])))),
+                S["WLOAD"]: If((beat == nbeats) & ~rd_pending,
+                    beat.eq(0), state.eq(Mux(cap["rope_hb"] != 0, S["TLOAD"], S["RUN"]))),
+                S["TLOAD"]: If((beat == (cap["rope_hb"] << 1)) & ~rd_pending, state.eq(S["RUN"])),
                 S["RUN"]: [stage_a, stage_b,
                     If((seg_b == cap["nseg"]) & drained, state.eq(S["FINISH"]))],
                 S["FINISH"]: [self.done.eq(1), state.eq(S["IDLE"])],

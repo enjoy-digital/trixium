@@ -247,3 +247,27 @@ def test_descriptor_library_cross_compiles_without_target_headers(tmp_path, targ
     result = subprocess.run([cc, *flags, '-O2', '-Wall', '-Wextra', '-Werror', '-c',
         str(LIB / 'bonsai_sequence.c'), '-o', str(tmp_path / 'sequence.o')], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout+result.stderr
+
+
+def test_norm_rope_encoder(encoder):
+    """ABI 1.2: RoPE added to a built norm descriptor; invalid arguments leave it as it was."""
+    encoder.bns_seq_desc_norm.argtypes = [ct.POINTER(Descriptor)] + [ct.c_uint32]*7
+    encoder.bns_seq_desc_norm_rope.argtypes = [ct.POINTER(Descriptor), ct.c_uint32, ct.c_uint32]
+    out = Descriptor()
+    for rope_n, tab in ((64, 0x3E000), (256, 32), (16, (1 << 18) - 32)):
+        assert encoder.bns_seq_desc_norm(ct.byref(out), 0, 32, 64, 96, 256, 24, 0x358637bd) == 0
+        assert encoder.bns_seq_desc_norm_rope(ct.byref(out), rope_n, tab) == 0
+        assert list(out.word) == scratchpad_norm_descriptor(src=32, dst=64, weight=96, n=256, nseg=24,
+                                                            eps=0x358637bd, rope_n=rope_n, rope_tab=tab)
+    for rope_n, tab in ((8, 32), (272, 32), (24, 32), (64, 33), (64, 1 << 18)):
+        assert encoder.bns_seq_desc_norm(ct.byref(out), 0, 32, 64, 96, 256, 24, 0x358637bd) == 0
+        saved = bytes(out)
+        assert encoder.bns_seq_desc_norm_rope(ct.byref(out), rope_n, tab) == -1
+        assert bytes(out) == saved
+        if rope_n <= 256:
+            with pytest.raises(ValueError):
+                scratchpad_norm_descriptor(src=32, dst=64, weight=96, n=256, nseg=24, eps=0x358637bd,
+                                           rope_n=rope_n, rope_tab=tab)
+    # rope_n past the segment
+    assert encoder.bns_seq_desc_norm(ct.byref(out), 0, 32, 64, 96, 128, 1, 0x358637bd) == 0
+    assert encoder.bns_seq_desc_norm_rope(ct.byref(out), 256, 32) == -1

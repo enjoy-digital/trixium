@@ -1624,34 +1624,43 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 // the gates behind each head). 0: attnb holds the ungated outputs; 1: the gated outputs;
 // -1: the CPU loop runs on main RAM's copy (a long context, or a list failure, which also
 // turns the stream off until the next reset).
-static int attn_stream(int a, int T, float scale, int gated, const float *q, uint32_t qstride)
+static int attn_stream(int a, int T, float scale, int gated, const float *q, uint32_t qstride,
+                       uint32_t qsp, uint32_t ksp, uint32_t vsp)
 {
+    // qsp/ksp/vsp != 0: q (in [q | gate] at qstride), this token's K and V rows are already in
+    // the scratchpad there (the q/k/v list with RoPE on unit 12): no FETCH from main RAM.
+    uint32_t QB = qsp ? qsp : AT_Q, KB = ksp ? ksp : AT_KST, VB = vsp ? vsp : AT_VST;
     uint32_t hd = (uint32_t)head_dim, nq = (uint32_t)n_head, nkv = (uint32_t)n_kv_head;
     uint32_t Tp = ((uint32_t)T + 7u) & ~7u, rb = at_rowbeats, rowbytes = rb*32u;
     uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes;
     uint32_t vspan = kspan + at_slots*rowbytes;
     uint32_t p = (uint32_t)T - 1u, nch = (uint32_t)n_ch;
-    int fits = nq*qstride*4u <= AT_KST - AT_Q && (uint32_t)kv_dim*4u <= AT_VST - AT_KST &&
+    int fits = (qsp ? QB + nq*qstride*4u <= AT_REC : nq*qstride*4u <= AT_KST - AT_Q) &&
+               (ksp ? KB + (uint32_t)kv_dim*4u <= AT_REC && VB + (uint32_t)kv_dim*4u <= AT_REC
+                    : (uint32_t)kv_dim*4u <= AT_VST - AT_KST) &&
                nq*hd*4u <= AT_O_END - AT_O && nq*Tp*4u <= AT_SP_END - AT_SP &&
                T <= BONSAI_ATTN_T_MAX;
     struct engine_op o;
     uint64_t ts = perf_now64(), tn;
 #define AT_SUB(i) do { tn = perf_now64(); HP->at_sub[i] += tn - ts; ts = tn; } while (0)
     rl_begin();
-    rl_fetch(kb, (uint32_t)kv_dim*4u, AT_KST);
-    rl_fetch(vb, (uint32_t)kv_dim*4u, AT_VST);
+    if (!ksp) {
+        rl_fetch(kb, (uint32_t)kv_dim*4u, AT_KST);
+        rl_fetch(vb, (uint32_t)kv_dim*4u, AT_VST);
+    }
     memset(&o, 0, sizeof o);
     o.kind = ENGINE_KIND_STORE; o.chan = (uint8_t)(p % nch); o.wlen = rb;
-    o.wbase = kspan + p/nch*rowbytes; o.xsrc = AT_KST; rl_engine(&o);
-    o.wbase = vspan + p/nch*rowbytes; o.xsrc = AT_VST; rl_engine(&o);
+    o.wbase = kspan + p/nch*rowbytes; o.xsrc = KB; rl_engine(&o);
+    o.wbase = vspan + p/nch*rowbytes; o.xsrc = VB; rl_engine(&o);
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + AT_REC);
     if (fits) {
         uint32_t w0 = nq << 8 | (nq/nkv) << 16 | nkv << 24;
-        rec[0] = w0 | 0;  rec[1] = (uint32_t)T; rec[2] = hd; rec[3] = AT_Q; rec[4] = qstride*4u;
+        rec[0] = w0 | 0;  rec[1] = (uint32_t)T; rec[2] = hd; rec[3] = QB; rec[4] = qstride*4u;
         rec[5] = AT_SP;   rec[6] = Tp*4u; rec[7] = f32_bits_any(scale);
         rec[8] = w0 | 1;  rec[9] = (uint32_t)T; rec[10] = hd; rec[11] = AT_SP; rec[12] = Tp*4u;
         rec[13] = AT_O;   rec[14] = hd*4u; rec[15] = 0;
-        rl_fetch(q, nq*qstride*4u, AT_Q);
+        if (!qsp)
+            rl_fetch(q, nq*qstride*4u, AT_Q);
         memset(&o, 0, sizeof o);
         o.kind = ENGINE_KIND_ATTN; o.rows = (uint16_t)((uint32_t)T/nch); o.rem = (uint8_t)((uint32_t)T % nch);
         o.wbase = kspan; o.wlen = (uint32_t)o.rows*rb; o.cbeats = (uint8_t)rb; o.xsrc = AT_REC;
@@ -1685,7 +1694,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     if (unit_gate) {
         rl_gate_begin(AT_IMG);
         for (uint32_t hh = 0; hh < nq; hh++)
-            rl_gate_seg(AT_Q + (hh*qstride + hd)*4u, AT_O + hh*hd*4u, AT_D + hh*hd*4u,
+            rl_gate_seg(QB + (hh*qstride + hd)*4u, AT_O + hh*hd*4u, AT_D + hh*hd*4u,
                         AT_FX + hh*32u, hd);
         rl_gate_end(AT_IMG);
         rl_store(attnb, nq*hd*4u, AT_D);
@@ -1702,7 +1711,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
 #ifdef CSR_SEQ_SILU_FIXUPS_ADDR
     if (unit_gate && seq_silu_fixups_read())
         for (uint32_t hh = 0; hh < nq; hh++)
-            resident_gate_patch(AT_FX + hh*32u, AT_Q + (hh*qstride + hd)*4u, AT_O + hh*hd*4u,
+            resident_gate_patch(AT_FX + hh*32u, QB + (hh*qstride + hd)*4u, AT_O + hh*hd*4u,
                                 attnb + hh*hd, hd);
 #endif
     AT_SUB(5);
@@ -1761,7 +1770,8 @@ static void attention_layer(int l, const float *h, float *out)
     int gated = H->attn_gated;
     int e8;
     uint64_t t0 = perf_now64(), t1;
-    int normed = 0;
+    int normed = 0, rope_hw = 0;
+    uint32_t r_q = 0, r_k = 0, r_v = 0, r_qbytes = 0;   // rope_hw: q/k/v resident there
 #ifdef DNRES_BUILT
     // Resident: Q/K/V in one list with the per-head q/k RMSNorms on unit 12 (the q heads
     // strided between their gates), everything stored for the CPU's RoPE and scores.
@@ -1772,6 +1782,24 @@ static void attention_layer(int l, const float *h, float *out)
         NK + 4u*(uint32_t)head_dim <= RS_F_ADDR && (seq_norm_abi_read() & 0xffff) >= 1) {
         struct bns_seq_descriptor d;
         uint32_t eps = f32_bits_any(rms_eps), hb8 = (uint32_t)head_dim/8;
+        // With the attention stream and norm ABI 1.2 the RoPE runs on unit 12 too and q, k
+        // and v stay in the scratchpad for op 6 (no stores, no CPU RoPE, no fetches back):
+        // the cos/sin of this position go behind the k norm weight.
+        uint32_t RT = (NK + 4u*(uint32_t)head_dim + 31u) & ~31u;
+        int want_rope = 0;
+#ifdef BONSAI_HAS_ATTNSTREAM
+        want_rope = HP->attnstream_active && kc_rows && (seq_norm_abi_read() & 0xffff) >= 2 &&
+                    rope_n % 16 == 0 && rope_n <= 256 && rope_n <= head_dim &&
+                    RT + 4u*(uint32_t)rope_n <= RS_F_ADDR && VS + 4u*(uint32_t)kv_dim <= AT_REC;
+#endif
+        if (want_rope) {
+            rope_prepare(pos);
+            volatile uint32_t *tab = (volatile uint32_t *)(SCRATCHPAD_BASE + RT);
+            for (int i = 0; i < rope_n/2; i++) {
+                tab[i] = f32_bits_any(rope_c[i]);
+                tab[rope_n/2 + i] = f32_bits_any(rope_s[i]);
+            }
+        }
         rl_begin();
         rl_prepare(h, (uint32_t)n_embd, 1);
         rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
@@ -1781,13 +1809,20 @@ static void attention_layer(int l, const float *h, float *out)
         rl_fetch_raw(norm_k[l], 4*(uint32_t)head_dim, NK);
         bns_seq_desc_norm_strided(&d, 0, QS, QS, NQ, (uint32_t)head_dim, (uint32_t)n_head, eps,
                                   gated ? 2*hb8 : hb8, gated ? 2*hb8 : hb8);
+        if (want_rope && bns_seq_desc_norm_rope(&d, (uint32_t)rope_n, RT)) want_rope = 0;
         rl_desc(&d);
         bns_seq_desc_norm(&d, 0, KS, KS, NK, (uint32_t)head_dim, (uint32_t)n_kv_head, eps);
+        if (want_rope)       // same n and table as q's, which the encoder accepted
+            (void)bns_seq_desc_norm_rope(&d, (uint32_t)rope_n, RT);
         rl_desc(&d);
-        rl_store(gated ? qfull : qb, 4*qrows, QS);
-        rl_store(kb, 4*(uint32_t)kv_dim, KS);
-        rl_store(vb, 4*(uint32_t)kv_dim, VS);
-        normed = rl_run("attention q/k/v") == 0;
+        if (!want_rope) {
+            rl_store(gated ? qfull : qb, 4*qrows, QS);
+            rl_store(kb, 4*(uint32_t)kv_dim, KS);
+            rl_store(vb, 4*(uint32_t)kv_dim, VS);
+        }
+        normed = rl_run(want_rope ? "attention q/k/v+rope" : "attention q/k/v") == 0;
+        rope_hw = normed && want_rope;
+        if (rope_hw) { r_q = QS; r_k = KS; r_v = VS; r_qbytes = 4*qrows; }
     }
 #endif
     if (normed) {
@@ -1814,6 +1849,7 @@ static void attention_layer(int l, const float *h, float *out)
 #endif
     float *qheads = q_in_place ? qfull : qb;
     int qstride = q_in_place ? 2*head_dim : head_dim;
+    if (!rope_hw) {                        // else normed and rotated on unit 12, resident
     if (gated && !q_in_place) // [q | gate] per head
         for (int hh = 0; hh < n_head; hh++)
             memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
@@ -1828,6 +1864,7 @@ static void attention_layer(int l, const float *h, float *out)
         if (!normed)
             rmsnorm_fv(kb + hh*head_dim, kb + hh*head_dim, norm_k[l], head_dim);
         rope_apply_partial(kb + hh*head_dim);
+    }
     }
     t1 = perf_now64(); HP->at_rope += t1 - t0; t0 = t1;
     int   T = pos + 1;
@@ -1845,10 +1882,22 @@ static void attention_layer(int l, const float *h, float *out)
     int streamed = 0;                  // 1: attnb holds the outputs, 2: gated too
 #ifdef BONSAI_HAS_ATTNSTREAM
     if (HP->attnstream_active) {
-        int rc = attn_stream(a, T, scale, gated, qheads, (uint32_t)qstride);
+        int rc = attn_stream(a, T, scale, gated, qheads, (uint32_t)qstride, r_q, r_k, r_v);
         streamed = rc < 0 ? 0 : 1 + rc;
     }
 #endif
+    if (!streamed && rope_hw) {
+        // The CPU loop after all: the rotated q, k and v are only in the scratchpad.
+        rl_begin();
+        rl_store(gated ? qfull : qb, r_qbytes, r_q);
+        rl_store(kb, 4*(uint32_t)kv_dim, r_k);
+        rl_store(vb, 4*(uint32_t)kv_dim, r_v);
+        if (rl_run("attention q/k/v store")) {
+            puts("hybrid: attention q/k/v could not be stored for the CPU loop");
+            engine_wedged = 1;
+            return;
+        }
+    }
     if (!streamed && stream_on && attn_kv_main(a, T, K, V)) {   // the CPU loop after all
         puts("hybrid: attention K/V rows could not be restored");
         engine_wedged = 1;

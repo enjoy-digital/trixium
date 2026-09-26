@@ -77,7 +77,7 @@ def _sp_address(name, value):
 
 
 def scratchpad_norm_descriptor(*, src, dst, n, nseg=1, eps, weight=0, l2=False, src_stride=0,
-                               dst_stride=0):
+                               dst_stride=0, rope_n=0, rope_tab=0):
     """Encode optional unit 12 (seq.norm_abi major 1): RMSNorm (weight) or L2 over nseg
     segments of n FP32 values; eps as FP32 bits. docs/canonical-reductions.md."""
     for name, value in (('src', src), ('dst', dst), ('weight', weight)):
@@ -93,7 +93,15 @@ def scratchpad_norm_descriptor(*, src, dst, n, nseg=1, eps, weight=0, l2=False, 
     for name, value in (('src_stride', src_stride), ('dst_stride', dst_stride)):
         if not isinstance(value, int) or not (value == 0 or n//8 <= value < 65536):
             raise ValueError(name + ' must be 0 or at least n/8 beats')
-    return [12, src, dst, weight, n | nseg << 16, eps, int(l2), src_stride | dst_stride << 16] + [0]*8
+    w6 = int(l2)
+    if rope_n:  # ABI 1.2: RoPE (neox pairs) over the first rope_n values, cos then sin at rope_tab
+        if not isinstance(rope_n, int) or not 16 <= rope_n <= min(256, n) or rope_n % 16:
+            raise ValueError('rope_n must be a multiple of 16 in [16, min(256, n)]')
+        _sp_address('rope_tab', rope_tab)
+        if rope_tab >= 1 << 18:
+            raise ValueError('rope_tab must be inside the 256 KB scratchpad (a 13-bit beat index)')
+        w6 |= (rope_n//16) << 8 | (rope_tab//32) << 16
+    return [12, src, dst, weight, n | nseg << 16, eps, w6, src_stride | dst_stride << 16] + [0]*8
 
 
 def scratchpad_conv_descriptor(*, x0, x1, x2, x3, w, dst, channels):
