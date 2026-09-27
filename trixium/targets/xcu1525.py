@@ -190,7 +190,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  ddr_fast_clock_buffer="bufgce",
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
+                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True,
                  attn_geometry=None,
                  with_region_fetch=False,
                  **kwargs):
@@ -322,7 +322,9 @@ class BonsaiXCU1525SoC(SoCCore):
         # (chan_mod-1)*skew = 96 KB (the converter's --window-reserve).
         cluster_chan_skew      = chan_skew
         cluster_weight_base    = HBM_WEIGHT_BASE
-        cluster_with_dnrec     = True  # Exact FP32 recurrence for the 27B fast path.
+        # The per-head exact FP32 recurrence unit (~30k LUTs): the 27B's heads before the
+        # stream op (--with-dnstream); --without-dnrec drops it when the stream carries them.
+        cluster_with_dnrec     = with_dnrec
         # One portable wiring implementation; board policy stays here.
         if with_bonsai:
             from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
@@ -427,6 +429,7 @@ def main():
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
+    parser.add_target_argument("--without-dnrec", action="store_true", help="Drop the per-head DeltaNet recurrence unit (the heads then run only on --with-dnstream).")
     parser.add_target_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
                                help="Attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
@@ -459,6 +462,7 @@ def main():
         with_norm              = args.with_norm,
         with_conv              = args.with_conv,
         with_dnstream          = ("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
+        with_dnrec             = not args.without_dnrec,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
         with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)
