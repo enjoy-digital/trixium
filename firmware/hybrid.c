@@ -38,6 +38,12 @@
 #if defined(BONSAI_HAS_NORM) && defined(BONSAI_HAS_CONV) && defined(BONSAI_HAS_SILU)
 #define DNRES_BUILT 1
 #endif
+// The DeltaNet state in engine DDR: the per-head recurrence unit (BONSAI_HAS_DNREC) or the
+// stream op (BONSAI_HAS_DNSTREAM). A bitstream without the per-head unit runs the heads
+// only on the stream (`dnstream off` then stops with DNSTALL).
+#if defined(BONSAI_HAS_DNREC) || defined(BONSAI_HAS_DNSTREAM)
+#define DN_STATE_HW 1
+#endif
 #include "perf.h"
 #include "fastmath.h"
 #include "resident.h"
@@ -131,7 +137,7 @@ static float *silu_lut;
 // 23,709 -> 17,231 cycles per head (docs/measurements/v12-2026-09-23.md).
 int dn_pipe_use = 1;
 
-#ifdef BONSAI_HAS_DNREC
+#ifdef DN_STATE_HW
 #define DN_SP_STATE 0x00000u
 #define DN_SP_Q     0x10000u
 #define DN_SP_K     0x10200u
@@ -195,6 +201,14 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
                        const float *vh, float decay, float beta, float scale, float *oh,
                        int load_qk, int next_head)
 {
+#ifndef BONSAI_HAS_DNREC
+    (void)global_head; (void)qh; (void)kh; (void)vh; (void)decay; (void)beta; (void)scale;
+    (void)oh; (void)load_qk; (void)next_head;
+    if (!engine_wedged)
+        puts("DNSTALL: no per-head recurrence unit in this bitstream");
+    engine_wedged = 1;
+    return;
+#else
     if (HP->dnstream_active) {
         // The state is in the stream layout; only the resident layer's op 5 may touch it.
         if (!engine_wedged)
@@ -267,6 +281,7 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
         for (uint32_t i = 0; i < DN_HW_ROWS; i++) oh[i] = so[i];
     dn_cyc_output += perf_now64() - t0;
     dn_heads_profiled++;
+#endif
 }
 
 static void dn_hw_reset(void)
@@ -582,7 +597,7 @@ int hybrid_init(void)
         else                              { attn_slot[l] = n_attn++; dn_slot[l] = -1; }
     }
     dn_hw = 0;
-#ifdef BONSAI_HAS_DNREC
+#ifdef DN_STATE_HW
     dn_hw = n_dn && hv == DN_HW_ROWS && hk == DN_HW_COLS;
     if (dn_hw) {
         // Keep the same conservative KV reservation as the image converter, then place
@@ -610,11 +625,13 @@ int hybrid_init(void)
         }
         HP->dn_state_sp = DN_SP_STATE;
         HP->dnres_enabled = 1;
+#ifdef BONSAI_HAS_DNREC
         dnunit_state_base_write(DN_SP_STATE);
         dnunit_q_base_write(DN_SP_Q);
         dnunit_k_base_write(DN_SP_K);
         dnunit_v_base_write(DN_SP_V);
         dnunit_out_base_write(DN_SP_OUT);
+#endif
     }
 #endif
 #ifdef BONSAI_HAS_ATTNSTREAM
@@ -627,7 +644,7 @@ int hybrid_init(void)
         uint32_t kv_rb = 1u + (uint32_t)head_dim/32u;
         uint32_t kv_region = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch*kv_rb;
         uint64_t base = (uint64_t)kv_base + (uint64_t)n_layer*n_kv_head*2u*kv_region*32u;
-#ifdef BONSAI_HAS_DNREC
+#ifdef DN_STATE_HW
         if (dn_hw)
             base = (uint64_t)dn_hbm_base + ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
 #endif
@@ -872,7 +889,7 @@ void hybrid_reset(void)
         }
 #endif
 #endif
-#ifdef BONSAI_HAS_DNREC
+#ifdef DN_STATE_HW
         if (!cleared)
             dn_hw_reset();
 #endif
@@ -1162,7 +1179,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         float decay = bonsai_decay_exp(gb[hh]);
         float *oh = ob + hh*hv;
         if (dn_hw) {
-#ifdef BONSAI_HAS_DNREC
+#ifdef DN_STATE_HW
             // The next head in visiting order (hi+1 -> its hh), for the state prefetch.
             int next_head = -1;
             if (dn_pipe_use && hi + 1 < nv) {
@@ -1199,7 +1216,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         silu_mul_fv(dst, delta, z, hv);
         dn_cyc_gate += perf_now64() - t0;
     }
-#ifdef BONSAI_HAS_DNREC
+#ifdef DN_STATE_HW
     dn_pipe_join();                 // The last head's state must be in DDR before any other op.
 #endif
     t0 = perf_now64();
@@ -1284,7 +1301,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         (seq_silu_abi_read() & 0xffff) < 1 || (seq_norm_abi_read() >> 16) != 1 ||
         (seq_conv_abi_read() >> 16) != 1)
         return -1;
-#ifdef BONSAI_HAS_DNREC
+#ifdef DN_STATE_HW
     if (dn_hw && (SLOT0 + 2u*DN_HEAD_BYTES > XRES_SP || nv > 64))
         return -1;                     // the two head-state slots must fit below x
 #endif
@@ -1478,6 +1495,10 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         dnunit_v_base_write(DN_SP_V); dnunit_out_base_write(DN_SP_OUT);
         if (engine_wedged)
             goto fatal;
+#else
+        puts("DNSTALL: no per-head recurrence unit in this bitstream (dnstream off?)");
+        engine_wedged = 1;
+        goto fatal;
 #endif
     } else {
         // No recurrence unit (a simulation without --with-dnrec): the CPU recurrence on
