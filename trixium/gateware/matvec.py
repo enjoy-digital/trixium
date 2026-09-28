@@ -145,8 +145,10 @@ class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  dual=True, chan_stride=0, chan_mod=0, chan_skew=0,
                  native_regions=None, native_reservations=(), native_endpoints=None,
-                 dnstream=False, attnstream=False):
+                 dnstream=False, attnstream=False, prefetch=False):
         with_native = native_regions is not None
+        if prefetch and with_native:
+            raise ValueError("the weight prefetch wraps the legacy reader path only")
         if with_native:
             from trixium.gateware.native_reader import NativeRegionReader, NativeReadTransport
             from trixium.gateware.native_weights import GROUP_LAYOUT, PTQ1_0, Q8_0
@@ -379,6 +381,14 @@ class BonsaiMatVecEngine(LiteXModule):
         at_chan = Signal(max=max(2, len(hbm_axis))) # The merge's current channel.
         at_take = Signal() # The merged beat is accepted this cycle.
         rsrc_valids, rsrc_datas = [], []
+        # Run-ahead weight prefetch (gateware/prefetch.py): one per channel between the
+        # engine's read command and the reader. mode/start broadcast (BonsaiEngineCSR).
+        self.prefetch_units = []
+        pf_weight = Signal()              # the latched op reads matvec weights (kinds 0/1)
+        if prefetch:
+            from trixium.gateware.prefetch import BonsaiWeightPrefetch
+            pf_opts = dict(prefetch) if isinstance(prefetch, (dict, tuple)) else {}
+            self.pf_mode, self.pf_start = Signal(2), Signal()
         for i, axi in enumerate(hbm_axis):
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
             # per round trip - 33.7 cycles/beat measured); round-robin ARIDs let it pipeline.
@@ -422,6 +432,18 @@ class BonsaiMatVecEngine(LiteXModule):
                 nbuf = stream.Buffer(GROUP_LAYOUT)
                 setattr(self.submodules, f'native_rbuf{i}', nbuf)
                 self.comb += [nreader.source.connect(nbuf.sink), nbuf.source.connect(pipe.native_sink)]
+            elif prefetch:
+                pf = BonsaiWeightPrefetch(addr_width=axi.address_width, **pf_opts)
+                setattr(self.submodules, f"prefetch{i}", pf)
+                self.prefetch_units.append(pf)
+                self.comb += [
+                    pf.rd_cmd.connect(reader.sink),
+                    reader.source.connect(pf.rd_data),
+                    pf.source.connect(rbuf.sink),
+                    pf.mode.eq(self.pf_mode), pf.start.eq(self.pf_start),
+                    pf.cmd_weight.eq(pf_weight),
+                ]
+                read_cmds.append(pf.cmd)
             else:
                 self.comb += reader.source.connect(rbuf.sink)
                 read_cmds.append(reader.sink)
@@ -496,6 +518,9 @@ class BonsaiMatVecEngine(LiteXModule):
             at_mode.eq(cmd_r["kind"] == 6 if attnstream else 0),
             fetch_chan.eq(cmd_r["chan"]),
         ]
+        # Registered like is_fetch: stable from the cycle after START, before the readers
+        # are commanded.
+        self.sync += pf_weight.eq((cmd_r["kind"] <= 1) & ~raw_mode)
         if with_native:
             self.comb += native_mode.eq(cmd_r['native'])
             total_rows = Signal(24)

@@ -190,7 +190,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  ddr_fast_clock_buffer="bufgce",
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True,
+                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0,
                  attn_geometry=None,
                  with_region_fetch=False,
                  **kwargs):
@@ -347,6 +347,8 @@ class BonsaiXCU1525SoC(SoCCore):
                        [c//chan_mod for c in range(engine_channels)], write=True) if with_native else {})
             config = BonsaiClusterConfig(scratchpad_xpm=True,
                 with_vecunit=with_vecunit, with_dual=with_dual,
+                with_prefetch=bool(prefetch),
+                prefetch_options=(("depth", prefetch), ("chunk", 64), ("sched_depth", 1024)) if prefetch else (),
                 with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
                 with_activation_quantize=with_activation_quantize, with_projection_restore=with_projection_restore,
@@ -429,6 +431,8 @@ def main():
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
+    parser.add_target_argument("--with-prefetch", nargs="?", const=32768, default=0, type=int,
+        help="Run-ahead weight prefetch: FIFO depth in beats per channel (UltraRAM; default 32768 = 1 MB).")
     parser.add_target_argument("--without-dnrec", action="store_true", help="Drop the per-head DeltaNet recurrence unit (the heads then run only on --with-dnstream).")
     parser.add_target_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
@@ -463,6 +467,7 @@ def main():
         with_conv              = args.with_conv,
         with_dnstream          = ("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
         with_dnrec             = not args.without_dnrec,
+        prefetch               = args.with_prefetch,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
         with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)

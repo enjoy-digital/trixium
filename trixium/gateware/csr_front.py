@@ -142,6 +142,26 @@ class BonsaiEngineCSR(LiteXModule):
                 self.done_count.status.eq(self.done_count.status + 1),
             ),
         ]
+        units = getattr(engine, "prefetch_units", [])
+        if units:
+            # Run-ahead weight prefetch: mode 0 off, 1 record (one forward's weight reads),
+            # 2 replay; a write to pf_start marks a forward's start (resynchronize, rewind).
+            self.pf_mode    = CSRStorage(2, description="Weight prefetch: 0 off, 1 record, 2 replay.")
+            self.pf_start   = CSRStorage(1, description="Write: a forward starts (between ops).")
+            self.pf_hits    = CSRStatus(32, description="Channel 0: weight reads served from the FIFO.")
+            self.pf_served  = CSRStatus(32, description="Channel 0: beats served from the FIFO.")
+            self.pf_misses  = CSRStatus(32, description="Channel 0: desynchronizations.")
+            self.pf_recorded = CSRStatus(16, description="Channel 0: recorded schedule entries.")
+            self.pf_synced  = CSRStatus(32, description="Per channel: still synchronized.")
+            self.comb += [
+                engine.pf_mode.eq(self.pf_mode.storage),
+                engine.pf_start.eq(self.pf_start.re),
+                self.pf_hits.status.eq(units[0].hits),
+                self.pf_served.status.eq(units[0].served),
+                self.pf_misses.status.eq(units[0].misses),
+                self.pf_recorded.status.eq(units[0].recorded),
+                self.pf_synced.status.eq(Cat(*[u.synced for u in units])),
+            ]
         # `submit.re` fires on CSR write; latch as cmd.valid until accepted. While the
         # sequencer runs it owns the command interface (firmware never mixes the two).
         seq_own = Signal()

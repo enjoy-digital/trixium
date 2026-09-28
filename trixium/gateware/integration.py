@@ -74,6 +74,8 @@ class BonsaiClusterConfig:
     dnstream_options: tuple = () # (name, value) overrides of the unit's arguments (tests).
     with_attnstream: bool = False  # Engine op 6: the attention passes (scores, weighted V).
     attnstream_options: tuple = () # (name, value) overrides of the unit's arguments.
+    with_prefetch: bool = False    # Run-ahead weight prefetch per channel (gateware/prefetch.py).
+    prefetch_options: tuple = ()   # (name, value): depth, chunk, sched_depth.
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -258,7 +260,13 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
                           seq=seq, dual=config.with_dual, **placement, **native,
                           dnstream=config.with_dnstream and (config.dnstream_options or True),
-                          attnstream=config.with_attnstream and (config.attnstream_options or True)))
+                          attnstream=config.with_attnstream and (config.attnstream_options or True),
+                          prefetch=config.with_prefetch and (config.prefetch_options or True)))
+    if config.with_prefetch:
+        pf = soc.engine.prefetch_units[0]
+        soc.add_constant("BONSAI_HAS_PREFETCH")
+        soc.add_constant("BONSAI_PREFETCH_SCHED", pf.sched_depth)
+        soc.add_constant("BONSAI_PREFETCH_DEPTH", pf.depth)
     if config.with_attnstream:
         at = soc.engine.attnstream
         soc.add_constant("BONSAI_HAS_ATTNSTREAM")
