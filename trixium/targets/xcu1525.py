@@ -509,6 +509,17 @@ class BonsaiXCU1525SoC(SoCCore):
                 add_memory_traffic(self, engine_axis,
                     [core.controller.interface for core in self.sdrams])
             add_cluster_constraints(platform, with_vecunit=with_vecunit)
+            if prefetch:
+                # The prefetch units and their FIFO URAMs with the channel pipes in SLR0: left
+                # free, v24 packed all 256 URAMs into the DDR PHYs' SLR1 (85% of its URAM,
+                # CLBs 86%), the pipes stayed in SLR0 and every channel's data and the
+                # engine's pipe controls crossed the boundary (-1.14 ns, 58k endpoints; the
+                # reader <-> prefetch crossing has a register stage each way, matvec.py).
+                platform.add_platform_command("create_pblock pb_prefetch")
+                platform.add_platform_command("resize_pblock pb_prefetch -add SLR0")
+                platform.add_platform_command(
+                    "add_cells_to_pblock pb_prefetch [get_cells -quiet -hierarchical -filter "
+                    "{{NAME =~ *weightprefetch* || NAME =~ pf_fifo*}}]")
             if cluster_with_dnrec and not config.dnrec_exact:
                 # Vendor implementations are target-owned, not portable-core sources.
                 platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))

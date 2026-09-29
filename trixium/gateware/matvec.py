@@ -436,9 +436,18 @@ class BonsaiMatVecEngine(LiteXModule):
                 pf = BonsaiWeightPrefetch(addr_width=axi.address_width, **pf_opts)
                 setattr(self.submodules, f"prefetch{i}", pf)
                 self.prefetch_units.append(pf)
+                # A register stage each way between the reader (at the DDR PHY's SLR) and the
+                # prefetch (placed with the pipes, xilinx_constraints.py): v24 put all 256
+                # FIFO URAMs in the PHYs' SLR1 with the pipes in SLR0 and failed at -1.1 ns.
+                pf_cmd_buf = stream.Buffer([("addr", axi.address_width), ("len", 24)])
+                pf_dat_buf = stream.Buffer([("data", 256)])
+                setattr(self.submodules, f"pf_cmd_buf{i}", pf_cmd_buf)
+                setattr(self.submodules, f"pf_dat_buf{i}", pf_dat_buf)
                 self.comb += [
-                    pf.rd_cmd.connect(reader.sink),
-                    reader.source.connect(pf.rd_data),
+                    pf.rd_cmd.connect(pf_cmd_buf.sink),
+                    pf_cmd_buf.source.connect(reader.sink),
+                    reader.source.connect(pf_dat_buf.sink),
+                    pf_dat_buf.source.connect(pf.rd_data),
                     pf.source.connect(rbuf.sink),
                     pf.mode.eq(self.pf_mode), pf.start.eq(self.pf_start),
                     pf.cmd_weight.eq(pf_weight),
