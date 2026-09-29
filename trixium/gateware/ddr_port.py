@@ -23,12 +23,15 @@ from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter
 from litedram.frontend.axi import LiteDRAMAXI2Native
 
 
-def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64, r_buffer_depth=256):
+def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64, r_buffer_depth=256,
+                    clock_domain="sys"):
     """Returns the list of modules (to register as submodules) that connect `axi` (the
     engine channel's 256-bit AXI) to a crossbar port of `core` of `port_width` bits.
     merge: on a wider port, merge the read bursts two beats per word (axi_merge.AXIWide)
-    instead of one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic)."""
-    port = core.crossbar.get_port(data_width=port_width)
+    instead of one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic).
+    clock_domain: the port's side when the controller runs in its own domain (the crossbar
+    inserts the native-port CDC; see the XCU1525 target's --ddr-clk-freq)."""
+    port = core.crossbar.get_port(data_width=port_width, clock_domain=clock_domain)
     if port_width == len(axi.r.data):
         return [LiteDRAMAXI2Native(axi, port, w_buffer_depth=w_buffer_depth,
                                    r_buffer_depth=r_buffer_depth)]
