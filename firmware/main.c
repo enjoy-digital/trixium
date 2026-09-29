@@ -874,6 +874,12 @@ static void console_service(void)
         hybrid_lm_chunk(rows);
         printf("LMCHUNK %lu (LM head list chunk cap in rows, 0 = automatic)\n", (unsigned long)rows);
     }
+    else if (strcmp(token, "prefetch") == 0) {
+        if (strncmp(str, "on", 2) == 0)  hybrid_prefetch_enable(1);
+        if (strncmp(str, "off", 3) == 0) hybrid_prefetch_enable(0);
+        printf("PREFETCH %s (run-ahead weight reads: recorded on the next forward with logits)\n",
+               hybrid_prefetch_enabled() ? "on" : "off");
+    }
     else if (strcmp(token, "hwargmax") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);

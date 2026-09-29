@@ -121,6 +121,8 @@ struct hyb_prof {
     uint16_t at_fail;                // console `attnfail <pos>` (debug): the stream fails at pos-1
     uint8_t logits_clean;            // the CPU holds no dirty line of `logits` (lm_head_argmax)
     uint64_t fd_prep, fd_mv;         // inside hyb_cyc_fdown: the down prepare, the down matvec
+    uint8_t pf_enabled;              // console `prefetch on|off`: the run-ahead weight prefetch
+    uint8_t pf_state;                // 0 schedule to record, 1 recording, 2 replaying
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -340,6 +342,38 @@ int hybrid_attnstream_enabled(void) { return HP->attnstream_enabled; }
 // takes over, restoring the K/V rows main RAM skipped. 0 = never.
 void hybrid_attn_fail_at(int p) { HP->at_fail = p > 0 ? (uint16_t)p : 0; }
 void hybrid_hwargmax_enable(int on) { HP->hwargmax = on ? 1 : 0; }
+void hybrid_prefetch_enable(int on)
+{
+    HP->pf_enabled = on ? 1 : 0;
+    HP->pf_state = 0;
+#ifdef BONSAI_HAS_PREFETCH
+    engine_csr_pf_mode_write(0);
+#endif
+}
+int hybrid_prefetch_enabled(void) { return HP->pf_enabled; }
+
+// Run-ahead weight prefetch (gateware/prefetch.py): the channels record one forward's weight
+// reads - a forward with logits, so the LM head is in the schedule - and replay them ahead of
+// the engine on every later forward. The start marks a forward boundary (no op in flight);
+// a forward that reads differently only costs the prefetch until the next start.
+static void prefetch_forward_start(int want_logits)
+{
+#ifdef BONSAI_HAS_PREFETCH
+    if (!HP->pf_enabled)
+        return;
+    if (HP->pf_state == 1)
+        HP->pf_state = 2;                      // the recorded forward is over
+    if (HP->pf_state == 0 && want_logits) {
+        engine_csr_pf_mode_write(1);
+        HP->pf_state = 1;
+    } else if (HP->pf_state == 2) {
+        engine_csr_pf_mode_write(2);
+    }
+    engine_csr_pf_start_write(1);
+#else
+    (void)want_logits;
+#endif
+}
 void hybrid_lm_chunk(uint32_t rows) { HP->lm_chunk = rows; }
 int hybrid_hwargmax_enabled(void) { return HP->hwargmax; }
 void hybrid_xres_enable(int on) { HP->xres_enabled = on ? 1 : 0; }
@@ -764,6 +798,11 @@ int hybrid_init(void)
     HP->dnstream_active = 0;
     HP->attnstream_active = 0;
     HP->hwargmax = 1;
+    HP->pf_enabled = 1;
+    HP->pf_state = 0;              // a new image: the schedule is recorded again
+#ifdef BONSAI_HAS_PREFETCH
+    engine_csr_pf_mode_write(0);
+#endif
     HP->lm_chunk = 0;
     HP->at_fail = 0;
     HP->logits_clean = 0;
@@ -971,6 +1010,13 @@ void hybrid_stats_print(void)
                    (unsigned long)(HP->at_rope/hyb_forwards_profiled),
                    (unsigned long)(HP->at_core/hyb_forwards_profiled),
                    (unsigned long)(HP->at_out/hyb_forwards_profiled));
+#ifdef BONSAI_HAS_PREFETCH
+        printf("hybprof prefetch: %s state %d recorded %lu hits %lu served %lu misses %lu synced %08lx\n",
+               HP->pf_enabled ? "on" : "off", HP->pf_state,
+               (unsigned long)engine_csr_pf_recorded_read(), (unsigned long)engine_csr_pf_hits_read(),
+               (unsigned long)engine_csr_pf_served_read(), (unsigned long)engine_csr_pf_misses_read(),
+               (unsigned long)engine_csr_pf_synced_read());
+#endif
         if (hyb_cyc_fdown)
             printf("hybprof fdown: avg cycles/fwd prepare %lu matvec %lu\n",
                    (unsigned long)(HP->fd_prep/hyb_forwards_profiled),
@@ -2115,6 +2161,7 @@ void hybrid_lm_check(void)
 int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
+    prefetch_forward_start(want_logits);
     uint64_t t0 = perf_now64();
     if (infer_embed_f(token, xb) < 0) return -1;
     hyb_cyc_embed += perf_now64() - t0;
