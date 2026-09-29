@@ -93,11 +93,11 @@ def run(forwards, rate=0.5, gaps=0, ready_p=1.0, seed=1, depth=1024, chunk=16):
     return dut, stats, cycles[0]
 
 
-def forward(rng, n, weight_every=3):
+def forward(rng, n, weight_every=3, lens=(8, 90)):
     """A forward: weight reads (the same every time) and a few direct ones."""
     cmds, a = [], 1000
     for k in range(n):
-        ln = rng.randrange(8, 90)
+        ln = rng.randrange(*lens)
         cmds.append((a, ln, 1))
         a += ln + rng.randrange(0, 40)
         if k % weight_every == 2:
@@ -151,9 +151,9 @@ def test_replay_counters_and_deviation(tmp_path=None):
 def test_prefetch_hides_the_gaps():
     """With idle gaps between the commands (the units' work), the replayed forward runs at
     the consumer's pace: fewer cycles than the recorded one."""
-    f = forward(random.Random(6), 12)
-    _, _, direct = run([(MODE_OFF, f)], rate=0.45, gaps=150)
-    _, _, both = run([(MODE_RECORD, f), (MODE_REPLAY, f)], rate=0.45, gaps=150)
+    f = forward(random.Random(6), 12, lens=(100, 300))   # weight reads of a few hundred beats
+    _, _, direct = run([(MODE_OFF, f)], rate=0.45, gaps=150, depth=4096)
+    _, _, both = run([(MODE_RECORD, f), (MODE_REPLAY, f)], rate=0.45, gaps=150, depth=4096)
     replay = both - direct
     print("direct", direct, "replayed", replay)
     assert replay < 0.8*direct

@@ -24,7 +24,7 @@ def add_cluster_constraints(platform, with_vecunit=True):
         platform.add_platform_command(
             "set_property RAM_STYLE block [get_cells -quiet -hierarchical -filter "
             "{{NAME =~ *" + name + "*_reg*}}]")
-    # The run-ahead weight prefetch FIFOs (gateware/prefetch.py): 32k x 256 bits per channel,
+    # The run-ahead weight prefetch FIFOs (gateware/prefetch.py): 16k x 256 bits per channel,
     # UltraRAM (the block RAM could not hold 16 of them). -quiet: absent without prefetch.
     platform.add_platform_command(
         "set_property RAM_STYLE ultra [get_cells -quiet -hierarchical -filter "

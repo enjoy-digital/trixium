@@ -431,8 +431,8 @@ def main():
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
-    parser.add_target_argument("--with-prefetch", nargs="?", const=32768, default=0, type=int,
-        help="Run-ahead weight prefetch: FIFO depth in beats per channel (UltraRAM; default 32768 = 1 MB).")
+    parser.add_target_argument("--with-prefetch", nargs="?", const=16384, default=0, type=int,
+        help="Run-ahead weight prefetch: FIFO depth in beats per channel (UltraRAM; default 16384 = 512 KB).")
     parser.add_target_argument("--without-dnrec", action="store_true", help="Drop the per-head DeltaNet recurrence unit (the heads then run only on --with-dnstream).")
     parser.add_target_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,

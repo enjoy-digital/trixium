@@ -29,41 +29,60 @@ MODE_OFF, MODE_RECORD, MODE_REPLAY = 0, 1, 2
 
 
 class _PrefetchFifo(Module):
-    """migen's SyncFIFOBuffered (registered read, first word fall through) with its memory
-    named `pf_fifo`: the Xilinx target puts it in UltraRAM by that name (32k beats x 256 bits
-    per channel would not fit the block RAM)."""
-    def __init__(self, width, depth):
+    """First-word-fall-through FIFO over a memory named `pf_fifo` (the Xilinx target puts it in
+    UltraRAM by that name), read through a `latency`-cycle pipeline: the read address and
+    enable are registered on the way in and the data passes `latency - 1` registers after
+    the memory's own - registers Vivado can absorb into the URAMs' output and cascade stages.
+    v23's single-cycle read of 8-deep cascades failed at -3.3 ns into CAS_IN_EN. The pipeline
+    drains into a small output FIFO sized so reads can issue every clock."""
+    def __init__(self, width, depth, latency=4):
+        assert latency >= 2
         self.din, self.we, self.writable = Signal(width), Signal(), Signal()
         self.dout, self.re, self.readable = Signal(width), Signal(), Signal()
-        self.level = Signal(max=depth + 2)
+        self.level = Signal(max=depth + latency + 4)
         produce, consume = Signal(max=depth), Signal(max=depth)
-        inner = Signal(max=depth + 1)
+        inner = Signal(max=depth + 1)                  # written, not yet read from the memory
         storage = Memory(width, depth, name="pf_fifo")
-        wp = storage.get_port(write_capable=True, mode=READ_FIRST)
-        rp = storage.get_port(has_re=True, mode=READ_FIRST)
+        wp = storage.get_port(write_capable=True)
+        rp = storage.get_port(has_re=True)
         self.specials += storage, wp, rp
-        do_write, do_read = Signal(), Signal()
         inc = lambda v: If(v == depth - 1, v.eq(0)).Else(v.eq(v + 1))
+
+        obuf_depth = 2*latency + 4        # room for every read in flight plus slack: 1 beat/clock
+        self.submodules.obuf = obuf = SyncFIFO(width, obuf_depth)        # fwft, small
+        inflight = Signal(max=latency + 2)
+        do_write, do_read = Signal(), Signal()
         self.comb += [
             self.writable.eq(inner != depth),
             do_write.eq(self.we & self.writable),
             wp.adr.eq(produce), wp.dat_w.eq(self.din), wp.we.eq(do_write),
-            # the inner FIFO's read feeds the output register
-            do_read.eq((inner != 0) & (~self.readable | self.re)),
-            rp.adr.eq(consume), rp.re.eq(do_read),
-            self.dout.eq(rp.dat_r),
-            self.level.eq(inner + self.readable),
+            do_read.eq((inner != 0) & (obuf.level + inflight < obuf_depth)),
+            self.readable.eq(obuf.readable), self.dout.eq(obuf.dout), obuf.re.eq(self.re),
+            self.level.eq(inner + inflight + obuf.level),
         ]
+        # In: the read registered (address, enable), then the memory's registered read
+        # (its data lines up with v[0]), then latency - 1 more data registers.
+        r_adr, r_en = Signal(max=depth), Signal()
+        self.sync += [r_adr.eq(consume), r_en.eq(do_read)]
+        self.comb += [rp.adr.eq(r_adr), rp.re.eq(r_en)]
+        v = [Signal() for _ in range(latency)]         # v[0]: the read at the memory
+        d = [Signal(width) for _ in range(latency - 1)]
+        self.sync += [v[0].eq(r_en)] + [v[i].eq(v[i - 1]) for i in range(1, latency)]
+        prev = rp.dat_r
+        for r in d:
+            self.sync += r.eq(prev)
+            prev = r
+        self.comb += [obuf.din.eq(prev), obuf.we.eq(v[latency - 1])]
         self.sync += [
             If(do_write, inc(produce)),
             If(do_read, inc(consume)),
             If(do_write & ~do_read, inner.eq(inner + 1)).Elif(do_read & ~do_write, inner.eq(inner - 1)),
-            If(do_read, self.readable.eq(1)).Elif(self.re, self.readable.eq(0)),
+            inflight.eq(inflight + do_read - v[latency - 1]),
         ]
 
 
 class BonsaiWeightPrefetch(LiteXModule):
-    def __init__(self, addr_width=33, depth=32768, sched_depth=1024, chunk=64):
+    def __init__(self, addr_width=33, depth=16384, sched_depth=1024, chunk=64, latency=4):
         assert depth & (depth - 1) == 0 and 8 <= chunk <= depth//4
         self.depth, self.sched_depth, self.chunk = depth, sched_depth, chunk
         self.cmd        = stream.Endpoint([("addr", addr_width), ("len", 24)])   # from the engine
@@ -113,7 +132,7 @@ class BonsaiWeightPrefetch(LiteXModule):
 
         # Deep FIFO (first-word-fall-through); flushed by a desync or a start.
         flush = Signal()
-        self.submodules.fifo = fifo = ResetInserter()(_PrefetchFifo(256, depth))
+        self.submodules.fifo = fifo = ResetInserter()(_PrefetchFifo(256, depth, latency))
         self.comb += fifo.reset.eq(flush)
         reserved = Signal(max=depth + chunk + 1)          # prefetch beats issued, not written
 
