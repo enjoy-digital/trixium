@@ -302,6 +302,7 @@ static void emit_token(int tok)
 // Copy the BONS header+table from the HBM staging area (engine channel 0, uploaded there by
 // bonsai_load) into the CPU-visible header location, then re-init inference.
 #define HDR_STAGING (BONSAI_CHAN_WEIGHT_BASE - 0x100000)
+#define BONS_STAGING_CLEARED 0x44524c43u // "CLRD": bonsai_loader.c loader_clear_staging()
 // The staged copy (channel 0, uploaded with every image by bonsai_load) is the truth about
 // what is in HBM; the main_ram copy is derived from it. The boot used to trust main_ram: a
 // CPU reset after `bonsai_load` of a DIFFERENT model then ran the boot demo with the
@@ -319,12 +320,13 @@ static int hdrload_staged(int quiet)
         if (!quiet)
             printf("hdrload: no BONS header at staging (magic %08lx)\n",
                    (unsigned long)sh->magic);
-        // Nothing staged (the board session clears it before a boot): a header left in
-        // main_ram by an earlier session describes weights that are not there - the boot
-        // demo then streamed them from controllers not yet trained and the engine stalled
-        // (v22 restore, 2026-10-02). No staged image = no model.
+        // Staging cleared by the host (bonsai_chat -C writes this marker before a board
+        // boot): a header left in main_ram by an earlier session describes weights that are
+        // not there - the boot demo then streamed them from controllers not yet trained and
+        // the engine stalled (v22 restore, 2026-10-02). The simulation stages nothing and
+        // keeps the header it preloaded into main_ram.
         struct bons_header *mh = (struct bons_header *)BONSAI_HDR_ADDR;
-        if (mh->magic == BONS_MAGIC) {
+        if (sh->magic == BONS_STAGING_CLEARED && mh->magic == BONS_MAGIC) {
             mh->magic = 0;
             model_cache_reset();
         }
