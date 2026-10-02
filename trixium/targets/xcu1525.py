@@ -245,7 +245,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  ddr_fast_clock_buffer="bufgce",
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0, prefetch_pblock=False, cpu_slr=None,
+                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0, prefetch_pblock=False, cpu_slr=None, units_slr=None,
                  ddr_clk_freq=None,
                  attn_geometry=None,
                  with_region_fetch=False,
@@ -353,6 +353,18 @@ class BonsaiXCU1525SoC(SoCCore):
             from trixium.gateware.cpu_monitor import CPUBusMonitor
             self.cpumon = CPUBusMonitor(self.cpu)
             self.csr.add("cpumon", 31)  # pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console)
+        if units_slr is not None:
+            # v28a (-1.146 ns, 29k endpoints): the scratchpad's memory and part of its client
+            # logic sat in SLR1 (87% CLB) while most of its units were in SLR2, and every
+            # scratchpad port path crossed the boundary at ~7 ns. The scratchpad and all its
+            # units together (the DeltaNet stream stays with the readers it streams from).
+            platform.add_platform_command("create_pblock pb_units")
+            platform.add_platform_command(f"resize_pblock pb_units -add SLR{units_slr}")
+            platform.add_platform_command(
+                "add_cells_to_pblock pb_units [get_cells -quiet -hierarchical -filter "
+                "{{(NAME =~ xpm_memory_sdpram* || NAME =~ *scratchpad* || NAME =~ *hadamard* || "
+                "NAME =~ attn_* || NAME =~ *attnstream* || NAME =~ *vectorunit* || NAME =~ vrf_* || "
+                "NAME =~ *silu* || NAME =~ norm_*) && NAME !~ *dnstream*}}]")
         if cpu_slr is not None:
             # v27 spread the CPU over SLR1 (8k cells) and SLR2 (14k): its memory-bus return
             # crossed the boundary at 8 logic levels (-0.50 ns). Keep it in one SLR.
@@ -523,6 +535,8 @@ def main():
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
+    parser.add_target_argument("--units-slr", type=int, default=None,
+        help="Constrain the scratchpad and its units to this SLR (pblock).")
     parser.add_target_argument("--cpu-slr", type=int, default=None,
         help="Constrain the CPU to this SLR (pblock).")
     parser.add_target_argument("--prefetch-pblock", action="store_true",
@@ -569,6 +583,7 @@ def main():
         prefetch               = args.with_prefetch,
         prefetch_pblock        = args.prefetch_pblock,
         cpu_slr                = args.cpu_slr,
+        units_slr              = args.units_slr,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
         with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)
