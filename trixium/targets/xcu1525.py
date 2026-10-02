@@ -245,7 +245,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  ddr_fast_clock_buffer="bufgce",
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0, prefetch_pblock=False,
+                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0, prefetch_pblock=False, cpu_slr=None,
                  ddr_clk_freq=None,
                  attn_geometry=None,
                  with_region_fetch=False,
@@ -347,6 +347,19 @@ class BonsaiXCU1525SoC(SoCCore):
             # 0x20000): BAR0 covers it for the host-side DDR trainer.
             bar0_size  = 0x40000 if ddr_split else 0x20000)
         self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
+
+        # CPU bus monitor (split builds: v27's CPU never printed; tools/cpumon.py reads it).
+        if ddr_split:
+            from trixium.gateware.cpu_monitor import CPUBusMonitor
+            self.cpumon = CPUBusMonitor(self.cpu)
+        if cpu_slr is not None:
+            # v27 spread the CPU over SLR1 (8k cells) and SLR2 (14k): its memory-bus return
+            # crossed the boundary at 8 logic levels (-0.50 ns). Keep it in one SLR.
+            platform.add_platform_command("create_pblock pb_cpu")
+            platform.add_platform_command(f"resize_pblock pb_cpu -add SLR{cpu_slr}")
+            platform.add_platform_command(
+                "add_cells_to_pblock pb_cpu [get_cells -quiet -hierarchical -filter "
+                "{{NAME =~ VexiiRiscvLitex_*}}]")
 
         # Leds -------------------------------------------------------------------------------------
         self.leds = LedChaser(
@@ -509,6 +522,8 @@ def main():
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
+    parser.add_target_argument("--cpu-slr", type=int, default=None,
+        help="Constrain the CPU to this SLR (pblock).")
     parser.add_target_argument("--prefetch-pblock", action="store_true",
         help="With --with-prefetch: constrain the prefetch units and URAMs to SLR0 (v26).")
     parser.add_target_argument("--with-prefetch", nargs="?", const=16384, default=0, type=int,
@@ -552,6 +567,7 @@ def main():
         ddr_clk_freq           = args.ddr_clk_freq,
         prefetch               = args.with_prefetch,
         prefetch_pblock        = args.prefetch_pblock,
+        cpu_slr                = args.cpu_slr,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
         with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)
