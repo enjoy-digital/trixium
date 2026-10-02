@@ -319,6 +319,15 @@ static int hdrload_staged(int quiet)
         if (!quiet)
             printf("hdrload: no BONS header at staging (magic %08lx)\n",
                    (unsigned long)sh->magic);
+        // Nothing staged (the board session clears it before a boot): a header left in
+        // main_ram by an earlier session describes weights that are not there - the boot
+        // demo then streamed them from controllers not yet trained and the engine stalled
+        // (v22 restore, 2026-10-02). No staged image = no model.
+        struct bons_header *mh = (struct bons_header *)BONSAI_HDR_ADDR;
+        if (mh->magic == BONS_MAGIC) {
+            mh->magic = 0;
+            model_cache_reset();
+        }
         return -1;
     }
     if (sh->version < BONS_VERSION_MIN || sh->version > BONS_VERSION) {
