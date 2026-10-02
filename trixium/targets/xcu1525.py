@@ -25,8 +25,6 @@
 # See docs/vcu-clock-qualification.md before changing clocks or deploying a build.
 
 import os
-from functools import reduce
-from operator import or_
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
@@ -222,139 +220,24 @@ DDR_CSR_STRIDE = 0x1000
 DDR_CSR_WINDOW = 0xF0020000
 
 
-class _PipelinedDDRCSR(Module):
-    """Wishbone -> the ddr-domain CSR banks, one registered bus copy per controller.
-
-    v27 (ddr at 200 MHz): the shared CSR bus decoded straight into the PHYs' IDELAY/ODELAY CE
-    pins of four controllers over three SLRs (worst -0.801 ns, 5.1 ns of route). Here each
-    controller's banks get their own registered adr/we/re/dat_w and a registered dat_r, so
-    every hop is one register to the next: an access takes 4 cycles instead of 2 (the
-    controllers' CSRs are only touched by calibration and the BIOS)."""
-    def __init__(self, wb, groups, address_width, data_width):
-        from litex.soc.interconnect import csr_bus
-        adr, dat_w = Signal(address_width), Signal(data_width)
-        we, re = Signal(), Signal()
-        rdats = []
-        for buses in groups:
-            s = csr_bus.Interface(address_width=address_width, data_width=data_width)
-            rd = Signal(data_width)
-            self.sync += [s.adr.eq(adr), s.dat_w.eq(dat_w), s.we.eq(we), s.re.eq(re)]
-            self.sync += rd.eq(reduce(or_, [b.dat_r for b in buses]))
-            for b in buses:
-                self.comb += [b.adr.eq(s.adr), b.dat_w.eq(s.dat_w), b.we.eq(s.we), b.re.eq(s.re)]
-            rdats.append(rd)
-        rdat = Signal(data_width)
-        self.comb += rdat.eq(reduce(or_, rdats))
-        assert wb.data_width == data_width and wb.addressing == "word"
-        self.submodules.fsm = fsm = FSM(reset_state="IDLE")
-        fsm.act("IDLE",
-            If(wb.cyc & wb.stb,
-                NextValue(adr, wb.adr),
-                NextValue(dat_w, wb.dat_w),
-                NextValue(we, wb.we & (wb.sel != 0)),
-                NextValue(re, ~wb.we & (wb.sel != 0)),
-                NextState("S0")))
-        fsm.act("S0", NextValue(we, 0), NextValue(re, 0), NextState("S1"))
-        fsm.act("S1", NextState("S2"))
-        fsm.act("S2", NextState("ACK"))
-        fsm.act("ACK", wb.ack.eq(1), wb.dat_r.eq(rdat), NextState("IDLE"))
-
-
-class _DDRCSRHolder(Module):
-    """A plain Module: the SoC's CSR scan does not look inside it, the ddr-domain
-    CSRBankArray does (its attributes sdram, ddrphy, sdram1, ... are the bank names)."""
-
 class BonsaiXCU1525SoC(SoCCore):
     def _add_ddr_domain_controllers(self, platform, module_cls, n, ddr_clk_freq, main_ram_size,
                                     l2_size, memory_sizes):
-        """The four controllers and PHYs in the ddr domain (the SoC's add_sdram, by hand).
-
-        Each core is renamed {sys: ddr, sys_port: sys}: its crossbar ports, requested with
-        clock_domain="sys_port", get LiteDRAM's native-port CDC between the two. Controller 0
-        also carries main_ram (the CPU's direct memory buses and the L2 + wishbone bridge,
-        as add_sdram connects them). The cores' and PHYs' CSRs live on their own bank array
-        in the ddr domain, reached through a wishbone crossing at DDR_CSR_WINDOW; its
-        regions are registered under the usual names (the BIOS, firmware/ddr.c and the host
-        trainer find sdram*/ddrphy* where csr.h / csr.csv say)."""
-        import math
-        from types import SimpleNamespace
-        from litedram.core import LiteDRAMCore
-        from litedram.frontend.axi import LiteDRAMAXI2Native
-        from litedram.frontend.wishbone import LiteDRAMWishbone2Native
-        from litex.soc.interconnect import csr_bus, wishbone, axi
-        from litex.soc.integration.soc import SoCRegion, SoCCSRRegion
-        from migen.fhdl.simplify import FullMemoryWE
-        holder = _DDRCSRHolder()
+        """The four controllers and PHYs in the ddr domain: trixium/gateware/ddr_domain.py
+        (shared with the simulation's --ddr-split)."""
+        from trixium.gateware.ddr_domain import add_ddr_domain_controllers
+        phys, modules = [], []
         for i in range(n):
-            sfx = "" if i == 0 else str(i)
             phy = usddrphy.USPDDRPHY(
                 pads             = platform.request("ddram", i),
                 memtype          = "DDR4",
                 sys_clk_freq     = ddr_clk_freq,
                 iodelay_clk_freq = self.crg.idelay_freq)
             phy.settings.write_dq_dqs_training = True
-            module = module_cls(ddr_clk_freq, "1:4")
-            g = module.geom_settings
-            memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits))*phy.settings.nranks*phy.settings.databits//8)
-            core = LiteDRAMCore(phy=phy, geom_settings=module.geom_settings,
-                                timing_settings=module.timing_settings, clk_freq=ddr_clk_freq)
-            setattr(holder, f"ddrphy{sfx}", phy)
-            setattr(holder, f"sdram{sfx}", core)
-            self.submodules += ClockDomainsRenamer({"sys": "ddr", "sys4x": "ddr4x"})(phy)
-            self.submodules += ClockDomainsRenamer({"sys": "ddr", "sys_port": "sys"})(core)
-            self.sdrams.append(core)
-        self.submodules += holder
-        core0, phy0 = self.sdrams[0], holder.ddrphy
-        # The builder writes sdram_phy.h from soc.sdram.controller.settings; the CSR bridge's
-        # with_register follows hasattr(soc, "sdram"). A stand-in, invisible to the CSR scan.
-        self.sdram = SimpleNamespace(controller=core0.controller, crossbar=core0.crossbar)
-
-        # main_ram on controller 0 (add_sdram's connection, the ports crossing into sys).
-        sdram_size = min(memory_sizes[0], main_ram_size)
-        self.bus.add_region("main_ram", SoCRegion(origin=self.mem_map["main_ram"], size=sdram_size, mode="rwx"))
-        base = self.bus.regions["main_ram"].origin
-        if hasattr(self.cpu, "add_memory_buses"):
-            self.cpu.add_memory_buses(address_width=32, data_width=core0.crossbar.controller.data_width)
-        for mem_bus in self.cpu.memory_buses:
-            port = core0.crossbar.get_port(clock_domain="sys_port")
-            assert isinstance(mem_bus, axi.AXIInterface) and mem_bus.data_width == port.data_width, \
-                "the ddr-domain main_ram expects the CPU's AXI memory bus at the controller's width"
-            self.submodules += LiteDRAMAXI2Native(axi=mem_bus, port=port, base_address=base)
-        if (not len(self.cpu.memory_buses)) or not hasattr(self.cpu, "dma_bus"):
-            port = core0.crossbar.get_port(clock_domain="sys_port")
-            wb_sdram = wishbone.Interface(data_width=self.bus.data_width, address_width=32, addressing="word")
-            self.bus.add_slave(name="main_ram", slave=wb_sdram)
-            l2_size = 2**int(math.log2(max(l2_size, int(2*port.data_width/8))))
-            l2 = wishbone.Cache(cachesize=l2_size//4, master=wb_sdram,
-                slave=wishbone.Interface(data_width=max(port.data_width, 128), address_width=32, addressing="word"))
-            self.l2_cache = FullMemoryWE()(l2)
-            self.add_config("L2_SIZE", l2_size)
-            self.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=self.l2_cache.slave, port=port, base_address=base)
-
-        # The ddr-domain CSR bus: sdram{k} on page 2k, ddrphy{k} on 2k + 1.
-        pages = {}
-        for i in range(n):
-            sfx = "" if i == 0 else str(i)
-            pages[f"sdram{sfx}"], pages[f"ddrphy{sfx}"] = 2*i, 2*i + 1
-        bank = csr_bus.CSRBankArray(holder, lambda name, memory: pages[name],
-            data_width=self.csr.data_width, address_width=self.csr.address_width,
-            alignment=self.csr.alignment, paging=self.csr.paging, ordering=self.csr.ordering)
-        wb = wishbone.Interface(data_width=self.bus.data_width, address_width=32, addressing="word")
-        assert not bank.srams
-        by_page = {mapaddr: b for (_, _, mapaddr, b) in bank.banks}
-        groups = [[by_page[2*i].bus, by_page[2*i + 1].bus] for i in range(n)]
-        bridge = _PipelinedDDRCSR(wb, groups, self.csr.address_width, self.csr.data_width)
-        self.submodules += ClockDomainsRenamer("ddr")(bank)
-        self.submodules += ClockDomainsRenamer("ddr")(bridge)
-        window = self.csr.paging*2*n
-        self.bus.add_slave(name="ddrcsr", slave=wb,
-            region=SoCRegion(origin=DDR_CSR_WINDOW, size=max(window, 0x10000), cached=False),
-            clock_domain="ddr")
-        for name, csrs, mapaddr, rmap in bank.banks:
-            self.csr.add_region(name, SoCCSRRegion(origin=DDR_CSR_WINDOW + self.csr.paging*mapaddr,
-                                                   busword=self.csr.data_width, obj=csrs))
-        for name, constant in bank.constants:
-            self.add_constant(name + "_" + constant.name, constant.value.value)
+            phys.append(phy)
+            modules.append(module_cls(ddr_clk_freq, "1:4"))
+        memory_sizes += add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size,
+            l2_size, DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
 
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
@@ -362,7 +245,7 @@ class BonsaiXCU1525SoC(SoCCore):
                  port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
                  ddr_fast_clock_buffer="bufgce",
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0,
+                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0, prefetch_pblock=False,
                  ddr_clk_freq=None,
                  attn_geometry=None,
                  with_region_fetch=False,
@@ -549,7 +432,8 @@ class BonsaiXCU1525SoC(SoCCore):
                 add_memory_traffic(self, engine_axis,
                     [core.controller.interface for core in self.sdrams])
             add_cluster_constraints(platform, with_vecunit=with_vecunit)
-            if prefetch:
+            if prefetch and prefetch_pblock:
+                # Opt-in (--prefetch-pblock; v26 with it: -2.1 ns, worse than v24's -1.14).
                 # The prefetch units and their FIFO URAMs with the channel pipes in SLR0: left
                 # free, v24 packed all 256 URAMs into the DDR PHYs' SLR1 (85% of its URAM,
                 # CLBs 86%), the pipes stayed in SLR0 and every channel's data and the
@@ -625,6 +509,8 @@ def main():
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
+    parser.add_target_argument("--prefetch-pblock", action="store_true",
+        help="With --with-prefetch: constrain the prefetch units and URAMs to SLR0 (v26).")
     parser.add_target_argument("--with-prefetch", nargs="?", const=16384, default=0, type=int,
         help="Run-ahead weight prefetch: FIFO depth in beats per channel (UltraRAM; default 16384 = 512 KB).")
     parser.add_target_argument("--ddr-clk-freq", default=None, type=float,
@@ -665,6 +551,7 @@ def main():
         with_dnrec             = not args.without_dnrec,
         ddr_clk_freq           = args.ddr_clk_freq,
         prefetch               = args.with_prefetch,
+        prefetch_pblock        = args.prefetch_pblock,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
         with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)

@@ -68,6 +68,8 @@ DDR4_SIM_CHAN_STRIDE = 0x0020_0000  # 2 MB.
 DDR4_SIM_CHAN_SKEW   = 0xA000       # 40 KB: a bank skew IN THE SIM'S GEOMETRY (ncols 128 puts the
                                     # bank bits at byte bits 10..13, so the board's 32 KB would be
                                     # a row bit here); the address arithmetic is what the gate checks.
+DDR4_SIM_CSR_WINDOW  = 0xF0020000   # --ddr-split: the target's DDR_CSR_WINDOW.
+DDR_SPLIT_CLK_RATIO  = 2            # --ddr-split: ddr clock / sys clock in the simulation.
 DDR4_SIM_CSR_PAGE0   = 8            # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
 
@@ -78,8 +80,10 @@ class BonsaiSimSoC(SoCCore):
                  with_capabilities=True, with_native=False, with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_embedding_restore=False, with_region_fetch=False,
                  with_silu=False, with_norm=False, with_conv=False, with_dnrec=False,
-                 with_dnstream=False, attn_geometry=None, prefetch=0):
+                 with_dnstream=False, attn_geometry=None, prefetch=0, ddr_split=False):
         assert mem in ("hbm", "ddr4")
+        assert not ddr_split or mem == "ddr4"
+        self.ddr_split = ddr_split
         platform = Platform()
         self.comb += platform.trace.eq(1)
 
@@ -146,6 +150,15 @@ class BonsaiSimSoC(SoCCore):
             integrated_main_ram_init = ram_words if mem == "hbm" else [],
             uart_name                = "sim")
         self.crg = CRG(platform.request("sys_clk"))
+        if ddr_split:
+            # --ddr-split: the controllers in their own `ddr` domain on a second sim clock
+            # (DDR_SPLIT_CLK_RATIO x sys), as the XCU1525's --ddr-clk-freq builds them.
+            from litex.build.generic_platform import Pins
+            from migen.genlib.resetsync import AsyncResetSynchronizer
+            platform.add_extension([("ddr_clk", 0, Pins(1))])
+            self.cd_ddr = ClockDomain()
+            self.comb += self.cd_ddr.clk.eq(platform.request("ddr_clk"))
+            self.specials += AsyncResetSynchronizer(self.cd_ddr, ResetSignal("sys"))
 
         # Profiler pad: unit busy bits as TOP-LEVEL sim ports (prof_eng_busy, prof_vec_busy,
         # prof_seq_busy on the Vsim). The C++ profiler traces their edges into an event file
@@ -228,7 +241,7 @@ class BonsaiSimSoC(SoCCore):
         add_bonsai_cluster(self, axis, config)
         if with_memory_traffic:
             from trixium.gateware.traffic import add_memory_traffic
-            controllers = [getattr(self, 'sdram' + (str(i) if i else '')).controller.interface
+            controllers = [self.sdrams[i].controller.interface
                            for i in range(n_memctrl)] if mem == 'ddr4' else []
             add_memory_traffic(self, axis, controllers)
         if with_capabilities:
@@ -290,6 +303,7 @@ class BonsaiSimSoC(SoCCore):
         # Controller k's contents: controller 0 carries main_ram (firmware + header) at 0
         # and, like the others, its channels' payloads at their windows.
         span = DDR4_SIM_WEIGHT_BASE + chan_mod*DDR4_SIM_CHAN_STRIDE
+        self.sdrams, split_phys, split_modules = [], [], []
         for k in range(n_memctrl):
             content = bytearray(span)
             if k == 0:
@@ -304,10 +318,13 @@ class BonsaiSimSoC(SoCCore):
                     content[base:base + len(payload)] = payload
             words = [int.from_bytes(content[i:i+4], "little") for i in range(0, len(content), 4)]
             sfx = "" if k == 0 else str(k)
-            self.csr.add(f"sdram{sfx}",  DDR4_SIM_CSR_PAGE0 + 2*k)
-            self.csr.add(f"ddrphy{sfx}", DDR4_SIM_CSR_PAGE0 + 2*k + 1)
             module = _SimDDR4(int(100e6), "1:4") # 100 MHz timings, as litex_sim does.
             phy = SDRAMPHYModel(module=module, data_width=64, clk_freq=int(100e6), init=words)
+            if self.ddr_split:
+                split_phys.append(phy); split_modules.append(module)
+                continue
+            self.csr.add(f"sdram{sfx}",  DDR4_SIM_CSR_PAGE0 + 2*k)
+            self.csr.add(f"ddrphy{sfx}", DDR4_SIM_CSR_PAGE0 + 2*k + 1)
             setattr(self, f"ddrphy{sfx}", phy)
             if k == 0:
                 self.add_sdram("sdram", phy=phy, module=module, size=MAIN_RAM_SIZE,
@@ -315,12 +332,19 @@ class BonsaiSimSoC(SoCCore):
             else:
                 self.add_sdram(f"sdram{sfx}", phy=phy, module=module,
                                with_soc_interconnect=False)
-            core = getattr(self, f"sdram{sfx}")
-            from trixium.gateware.ddr_port import engine_ddr_port
+            self.sdrams.append(getattr(self, f"sdram{sfx}"))
+        if self.ddr_split:
+            from trixium.gateware.ddr_domain import add_ddr_domain_controllers
+            add_ddr_domain_controllers(self, split_phys, split_modules, int(100e6), MAIN_RAM_SIZE,
+                                       8192, DDR4_SIM_CSR_WINDOW)
+        from trixium.gateware.ddr_port import engine_ddr_port
+        for k in range(n_memctrl):
+            core = self.sdrams[k]
             for j in range(chan_mod):
                 c = k*chan_mod + j
                 axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
-                for jj, m in enumerate(engine_ddr_port(core, axi)):   # the target's default port
+                for jj, m in enumerate(engine_ddr_port(core, axi,   # the target's default port
+                        clock_domain="sys_port" if self.ddr_split else "sys")):
                     setattr(self, f"engport{c}_{jj}", m)
                 axis.append(axi)
         # VexiiRiscv enforces execute permission from region.mode (the FK33 target's lesson).
@@ -371,6 +395,8 @@ def main():
              "default). ddr4: the XCU1525's memory system on LiteDRAM's PHY model - N "
              "controllers, main_ram on controller 0, chan_mod channels per controller; "
              "builds in build/sim_ddr4 (the firmware must be built against that tree).")
+    parser.add_argument("--ddr-split",      action="store_true",
+        help="--mem ddr4: the controllers in their own ddr clock domain (the XCU1525's --ddr-clk-freq).")
     parser.add_argument("--n-memctrl",      default=4, type=int, help="--mem ddr4: controllers.")
     parser.add_argument("--with-memory-traffic", action="store_true", help="Enable coherent memory traffic counters.")
     parser.add_argument("--with-native", action="store_true", help="Enable the experimental shared native projection engine.")
@@ -391,10 +417,12 @@ def main():
     parser.add_argument("--with-region-fetch", action="store_true", help="Enable sequenced checked region reads; requires --with-native.")
     parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
-    out_dir = "build/sim" if args.mem == "hbm" else "build/sim_ddr4"
+    out_dir = "build/sim" if args.mem == "hbm" else ("build/sim_ddr4_split" if args.ddr_split else "build/sim_ddr4")
 
     sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
+    if args.ddr_split:
+        sim_config.add_clocker("ddr_clk", int(1e6)*DDR_SPLIT_CLK_RATIO)
 
     if args.build_software:
         soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=args.dual,
@@ -407,7 +435,8 @@ def main():
             with_embedding_restore=args.with_embedding_restore, with_region_fetch=args.with_region_fetch,
             with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
             with_dnrec=args.with_dnrec, with_dnstream=("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
-            attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch)
+            attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch,
+            ddr_split=args.ddr_split)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -425,7 +454,8 @@ def main():
         with_embedding_restore=args.with_embedding_restore, with_region_fetch=args.with_region_fetch,
             with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
             with_dnrec=args.with_dnrec, with_dnstream=("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
-            attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch)
+            attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch,
+            ddr_split=args.ddr_split)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the
