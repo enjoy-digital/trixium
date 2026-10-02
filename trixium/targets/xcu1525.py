@@ -25,6 +25,8 @@
 # See docs/vcu-clock-qualification.md before changing clocks or deploying a build.
 
 import os
+from functools import reduce
+from operator import or_
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
@@ -220,6 +222,44 @@ DDR_CSR_STRIDE = 0x1000
 DDR_CSR_WINDOW = 0xF0020000
 
 
+class _PipelinedDDRCSR(Module):
+    """Wishbone -> the ddr-domain CSR banks, one registered bus copy per controller.
+
+    v27 (ddr at 200 MHz): the shared CSR bus decoded straight into the PHYs' IDELAY/ODELAY CE
+    pins of four controllers over three SLRs (worst -0.801 ns, 5.1 ns of route). Here each
+    controller's banks get their own registered adr/we/re/dat_w and a registered dat_r, so
+    every hop is one register to the next: an access takes 4 cycles instead of 2 (the
+    controllers' CSRs are only touched by calibration and the BIOS)."""
+    def __init__(self, wb, groups, address_width, data_width):
+        from litex.soc.interconnect import csr_bus
+        adr, dat_w = Signal(address_width), Signal(data_width)
+        we, re = Signal(), Signal()
+        rdats = []
+        for buses in groups:
+            s = csr_bus.Interface(address_width=address_width, data_width=data_width)
+            rd = Signal(data_width)
+            self.sync += [s.adr.eq(adr), s.dat_w.eq(dat_w), s.we.eq(we), s.re.eq(re)]
+            self.sync += rd.eq(reduce(or_, [b.dat_r for b in buses]))
+            for b in buses:
+                self.comb += [b.adr.eq(s.adr), b.dat_w.eq(s.dat_w), b.we.eq(s.we), b.re.eq(s.re)]
+            rdats.append(rd)
+        rdat = Signal(data_width)
+        self.comb += rdat.eq(reduce(or_, rdats))
+        assert wb.data_width == data_width and wb.addressing == "word"
+        self.submodules.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            If(wb.cyc & wb.stb,
+                NextValue(adr, wb.adr),
+                NextValue(dat_w, wb.dat_w),
+                NextValue(we, wb.we & (wb.sel != 0)),
+                NextValue(re, ~wb.we & (wb.sel != 0)),
+                NextState("S0")))
+        fsm.act("S0", NextValue(we, 0), NextValue(re, 0), NextState("S1"))
+        fsm.act("S1", NextState("S2"))
+        fsm.act("S2", NextState("ACK"))
+        fsm.act("ACK", wb.ack.eq(1), wb.dat_r.eq(rdat), NextState("IDLE"))
+
+
 class _DDRCSRHolder(Module):
     """A plain Module: the SoC's CSR scan does not look inside it, the ddr-domain
     CSRBankArray does (its attributes sdram, ddrphy, sdram1, ... are the bank names)."""
@@ -300,12 +340,12 @@ class BonsaiXCU1525SoC(SoCCore):
             data_width=self.csr.data_width, address_width=self.csr.address_width,
             alignment=self.csr.alignment, paging=self.csr.paging, ordering=self.csr.ordering)
         wb = wishbone.Interface(data_width=self.bus.data_width, address_width=32, addressing="word")
-        bridge = wishbone.Wishbone2CSR(bus_wishbone=wb,
-            bus_csr=csr_bus.Interface(address_width=self.csr.address_width, data_width=self.csr.data_width))
-        icon = csr_bus.InterconnectShared(masters=[bridge.csr], slaves=bank.get_buses())
+        assert not bank.srams
+        by_page = {mapaddr: b for (_, _, mapaddr, b) in bank.banks}
+        groups = [[by_page[2*i].bus, by_page[2*i + 1].bus] for i in range(n)]
+        bridge = _PipelinedDDRCSR(wb, groups, self.csr.address_width, self.csr.data_width)
         self.submodules += ClockDomainsRenamer("ddr")(bank)
         self.submodules += ClockDomainsRenamer("ddr")(bridge)
-        self.submodules += ClockDomainsRenamer("ddr")(icon)
         window = self.csr.paging*2*n
         self.bus.add_slave(name="ddrcsr", slave=wb,
             region=SoCRegion(origin=DDR_CSR_WINDOW, size=max(window, 0x10000), cached=False),

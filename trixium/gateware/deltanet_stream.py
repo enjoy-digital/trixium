@@ -486,11 +486,17 @@ class BonsaiDeltaNetStream(LiteXModule):
         g3_half, g3_glast = dly(f1_half, Lm + La, "g3h"), dly(f1_glast, Lm + La, "g3gl")
         g3_q = dly(f1_q, Lm + La, "g3q")
         g4_v, g4_first, g4_r = dly(g3_v, Lm, "g4v"), dly(f1_first, 2*Lm + La, "g4f"), dly(g3_r, Lm, "g4r")
-        g5_v, g5_r = dly(g4_v, La, "g5v"), dly(g4_r, La, "g5r")
-        g5_last = dly(f1_last, 2*Lm + 2*La, "g5l")
-        g5_bank = dly(f1_bank, 2*Lm + 2*La, "g5b")
+        assert La >= 1
+        g5_ve, g5_r = dly(g4_v, La - 1, "g5ve"), dly(g4_r, La, "g5r")
+        g5_laste = dly(f1_last, 2*Lm + 2*La - 1, "g5le")
+        g5_banke = dly(f1_bank, 2*Lm + 2*La - 1, "g5be")
+        g5_v, g5_last, g5_bank = dly(g5_ve, 1, "g5v"), dly(g5_laste, 1, "g5l"), dly(g5_banke, 1, "g5b")
         p2_capture = Signal()
         self.comb += p2_capture.eq(g5_v & g5_last)
+        # The snapshot capture enables 2 x rows x 32 flops spread over the unit (v27: an 8.8 ns
+        # route from g5l): one register per bank, decided a stage early, replicated by Vivado.
+        cap = [Signal(name=f"dns_cap{b}", attr={("max_fanout", 128)}) for b in range(2)]
+        self.sync += [cap[b].eq(g5_ve & g5_laste & (g5_banke == b)) for b in range(2)]
 
         outbufs = []
         for l in range(L):
@@ -574,7 +580,7 @@ class BonsaiDeltaNetStream(LiteXModule):
         sc_issue = Signal()
         self.comb += sc_issue.eq(sc_run & (ofifo.level < 12))
         for b in range(2):
-            self.sync += If(p2_capture & (g5_bank == b),
+            self.sync += If(cap[b],
                 *[osnap[b][i].eq(snap_o[i]) for i in range(rows)],
             ).Elif(sc_issue & (sc_head[0] == b),
                 *[osnap[b][i].eq(osnap[b][i + 1]) for i in range(rows - 1)],
