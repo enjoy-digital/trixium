@@ -352,6 +352,7 @@ class BonsaiXCU1525SoC(SoCCore):
         if ddr_split:
             from trixium.gateware.cpu_monitor import CPUBusMonitor
             self.cpumon = CPUBusMonitor(self.cpu)
+            self.csr.add("cpumon", 31)  # pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console)
         if cpu_slr is not None:
             # v27 spread the CPU over SLR1 (8k cells) and SLR2 (14k): its memory-bus return
             # crossed the boundary at 8 logic levels (-0.50 ns). Keep it in one SLR.
