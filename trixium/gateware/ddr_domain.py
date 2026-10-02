@@ -108,10 +108,16 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
     if hasattr(soc.cpu, "add_memory_buses"):
         soc.cpu.add_memory_buses(address_width=32, data_width=core0.crossbar.controller.data_width)
     for mem_bus in soc.cpu.memory_buses:
-        port = core0.crossbar.get_port(clock_domain="sys_port")
+        # The AXI crosses (ddr_port.AXICrossing: the R channel has backpressure, the native
+        # port CDC's read data has none); the bridge sits on a native port in ddr.
+        from trixium.gateware.ddr_port import AXICrossing
+        port = core0.crossbar.get_port()
         assert isinstance(mem_bus, axi.AXIInterface) and mem_bus.data_width == port.data_width, \
             "the ddr-domain main_ram expects the CPU's AXI memory bus at the controller's width"
-        soc.submodules += LiteDRAMAXI2Native(axi=mem_bus, port=port, base_address=base)
+        far = axi.AXIInterface(data_width=mem_bus.data_width, address_width=mem_bus.address_width,
+                               id_width=mem_bus.id_width, version=mem_bus.version)
+        soc.submodules += AXICrossing(mem_bus, far, "sys", "ddr")
+        soc.submodules += ClockDomainsRenamer("ddr")(LiteDRAMAXI2Native(axi=far, port=port, base_address=base))
     if (not len(soc.cpu.memory_buses)) or not hasattr(soc.cpu, "dma_bus"):
         port = core0.crossbar.get_port(clock_domain="sys_port")
         wb_sdram = wishbone.Interface(data_width=soc.bus.data_width, address_width=32, addressing="word")
