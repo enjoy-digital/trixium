@@ -327,7 +327,7 @@ void loader_clear_staging(void)
        header main_ram kept from an earlier session (it would stream weights that are not
        there). The simulation stages nothing and keeps its preloaded header. */
     static uint8_t zeros[4096];
-    const uint32_t cleared = 0x44524c43u; /* "CLRD", firmware/main.c BONS_STAGING_CLEARED */
+    const uint32_t cleared = 0x44524c43u; /* "CLRD", firmware/bons.h BONS_STAGING_CLEARED */
     memcpy(zeros, &cleared, 4);
     loader_transfer(0, HDR_STAGING, zeros, BEATS(sizeof(zeros)));
 }

@@ -61,7 +61,7 @@ def _lroundf(x):
 
 
 def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None, fast_cfg=None,
-                      trace=None, silu_mode=None):
+                      trace=None, silu_mode=None, mtp_k=0, mtp_stats=None, mtp_hook=None):
     """exact=True: fp32 weights and no activation quantization (the golden's arithmetic),
     which tests the mirror's structure against the golden independently of the int8 noise.
     fast=True: the DeltaNet recurrence in the fast path's arithmetic (docs/xcu1525.md) -
@@ -72,7 +72,14 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     as in the CPU path. fast_stats (a dict) collects the state exponents seen. fast_cfg
     picks the precisions: qk_bits (8 = one int8 plane, 16 = two), wq_extra (extra fraction
     bits on the rank-1 weight, applied as a shift after the product), state_bits (the
-    ratchet's limit), decay_q (the decay's fixed point, None = fp32)."""
+    ratchet's limit), decay_q (the decay's fixed point, None = fp32).
+    mtp_k > 0: speculative decoding with the image's MTP head (header mtp_layers): after each
+    main forward the head drafts mtp_k tokens (chained on its own hidden state) and the main
+    model verifies them one forward at a time - the output is the greedy one by
+    construction; mtp_stats (a dict) collects passes/drafted/accepted. The head's attention
+    keeps its own KV cache (one entry per position, the speculative ones overwritten).
+    mtp_hook(position, draft) -> draft: a test's override of each draft (an oracle exercises
+    the accept path, which a random head never takes)."""
     silu_mode = silu_mode or ("mathematical" if exact else "rv32f")
     if silu_mode not in ("mathematical", "rv32f"):
         raise ValueError("unknown SiLU numerical profile: " + silu_mode)
@@ -440,6 +447,41 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         if trace is not None:
             trace(pos, layer, tag, dtype, np.asarray(values).copy())
 
+    last_h = [None]
+
+    def lm_head(hn):
+        logits = proj(layout.ROLE_LM_HEAD if entry(layout.ROLE_LM_HEAD, 0) else layout.ROLE_TOK_EMB, 0, hn)
+        return int(np.argmax(logits[:h["vocab"]]))
+
+    LM = n_layer                                   # the MTP block's layer index
+    if mtp_k:
+        assert h.get("mtp_layers", 0) >= 1, "mtp_k needs an image with an MTP head"
+        m_enorm = f32_rows(layout.ROLE_MTP_ENORM, LM).reshape(-1)
+        m_hnorm = f32_rows(layout.ROLE_MTP_HNORM, LM).reshape(-1)
+        m_head  = f32_rows(layout.ROLE_MTP_HEAD_NORM, LM).reshape(-1)
+        norm_q[LM] = f32_rows(layout.ROLE_ATTN_Q_NORM, LM).reshape(-1)
+        norm_k[LM] = f32_rows(layout.ROLE_ATTN_K_NORM, LM).reshape(-1)
+        m_anorm = f32_rows(layout.ROLE_ATTN_NORM, LM).reshape(-1)
+        m_fnorm = f32_rows(layout.ROLE_FFN_NORM, LM).reshape(-1)
+        kc[LM], vc[LM] = [], []
+
+    def mtp(hprev, tok, pos):
+        """The head at position pos: embed(tok) (the token at pos) and the hidden state that
+        predicted it -> the draft for pos + 1 and the head's own normed hidden state."""
+        del kc[LM][pos - 1:], vc[LM][pos - 1:]     # entry i <-> position i + 1
+        e = (mant[tok].astype(f32)*f32(np.exp2(f32(exps[tok])))).astype(f32)
+        cat = np.concatenate([rmsnorm(e, m_enorm), rmsnorm(hprev, m_hnorm)]).astype(f32)
+        x = matvec_f(entry(layout.ROLE_MTP_EH, LM), cat)          # plain basis: no rotation
+        y = attention(LM, rmsnorm(x, m_anorm), pos)
+        x = (x + y).astype(f32)
+        hn = rmsnorm(x, m_fnorm)
+        r = rotate(hn, n_embd) if B else hn
+        act = (silu(matvec_f(entry(layout.ROLE_FFN_GATE, LM), r))*
+               matvec_f(entry(layout.ROLE_FFN_UP, LM), r)).astype(f32)
+        x = (x + proj(layout.ROLE_FFN_DOWN, LM, act)).astype(f32)
+        hm = rmsnorm(x, m_head)
+        return lm_head(hm), hm
+
     def forward(tok, pos, want_logits=True):
         x = (mant[tok].astype(f32)*f32(np.exp2(f32(exps[tok])))).astype(f32)
         checkpoint(pos, -1, "emb", x)
@@ -466,6 +508,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         if not want_logits:
             return None
         hn = rmsnorm(x, out_norm)
+        last_h[0] = hn
         checkpoint(pos, -1, "out_norm", hn)
         logits = proj(layout.ROLE_LM_HEAD if entry(layout.ROLE_LM_HEAD, 0) else layout.ROLE_TOK_EMB, 0, hn)
         checkpoint(pos, -1, "logits", logits[:h["vocab"]])
@@ -475,13 +518,47 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
 
     out, pos = [], 0
     tok = None
+    if not mtp_k:
+        for i, t in enumerate(prompt):
+            tok = forward(t, pos, i == len(prompt) - 1); pos += 1
+        for i in range(n_new):
+            out.append(tok)
+            if i + 1 < n_new:  # Match firmware: no unused forward after the final output.
+                tok = forward(tok, pos); pos += 1
+        return out
+
+    # Speculative: the head runs after every main forward (its KV needs every position).
+    st = mtp_stats if mtp_stats is not None else {}
+    for k in ("passes", "drafted", "accepted"): st.setdefault(k, 0)
     for i, t in enumerate(prompt):
-        tok = forward(t, pos, i == len(prompt) - 1); pos += 1
-    for i in range(n_new):
+        tok = forward(t, pos, True); pos += 1
+        if i + 1 < len(prompt):
+            mtp(last_h[0], prompt[i + 1], pos)    # fills the head's KV over the prompt
+    while True:
+        # tok: the next output, at position pos, predicted by the forward at pos - 1.
         out.append(tok)
-        if i + 1 < n_new:  # Match firmware: no unused forward after the final output.
+        if len(out) == n_new:
+            return out
+        drafts, hh, t = [], last_h[0], tok
+        for j in range(mtp_k):                    # draft j: the token at pos + 1 + j
+            d, hh = mtp(hh, t, pos + j)
+            if mtp_hook is not None:
+                d = mtp_hook(pos + 1 + j, d)
+            drafts.append(d); t = d
+        st["passes"] += 1; st["drafted"] += len(drafts)
+        # Verify one forward at a time (a batched pass gives the same tokens). An accepted
+        # draft's head KV entry is recomputed from the main model's hidden state.
+        for d in drafts:
             tok = forward(tok, pos); pos += 1
-    return out
+            if tok != d:
+                break                             # tok: the correction, next round's output
+            st["accepted"] += 1
+            out.append(tok)
+            if len(out) == n_new:
+                return out
+            mtp(last_h[0], tok, pos)
+        else:
+            tok = forward(tok, pos); pos += 1     # all accepted: the pass's bonus token
 
 
 def test_mirror_agrees_with_the_fp32_golden_on_the_tiny_hybrid():
@@ -556,3 +633,32 @@ def test_rv32_profile_closes_archived_fpu_trace(tmp_path):
         assert actual_order == order
         same = sum(actual[k].signature == expected[k].signature for k in order)
         assert (same == len(order)) == full, (mode, same, len(order))
+
+
+def test_mtp_speculative_decode_is_the_greedy_output(tmp_path):
+    """The MTP head (convert --mtp / tinygen --mtp) drafts, the main model verifies: whatever
+    the drafts - the random head's (never accepted), an oracle's (always), half right - the
+    tokens are the plain greedy ones, and the accepted counts are the drafts that match."""
+    from trixium.model.bons import BONSReader
+    from trixium.model.configs import BONSAI_TINY_HYBRID_1K
+    from trixium.model.tinygen import generate
+    path, _, _ = generate(str(tmp_path), 2, cfg=BONSAI_TINY_HYBRID_1K, mtp="q8")
+    img = BONSReader(path)
+    assert img.header["mtp_layers"] == 1
+    prompt, n = [1, 5, 9, 2], 12
+    cfg = dict(mode="vecunit")
+    ref = hybrid27_generate(img, prompt, n, fast=True, fast_cfg=cfg)
+    def at(p):
+        return ref[p - len(prompt)] if p - len(prompt) < len(ref) else None
+    for k in (1, 3):
+        for hook, accepted in ((None, None),
+                               (lambda p, d: at(p) if at(p) is not None else d, n - 1),
+                               (lambda p, d: at(p) if p % 2 and at(p) is not None else -1, None)):
+            st = {}
+            out = hybrid27_generate(img, prompt, n, fast=True, fast_cfg=cfg, mtp_k=k,
+                                    mtp_stats=st, mtp_hook=hook)
+            assert out == ref, (k, out, ref)
+            assert st["accepted"] <= st["drafted"]
+            if accepted is not None:
+                # Every output after the first comes from an accepted draft or a bonus token.
+                assert st["accepted"] + st["passes"] >= n - 1, st

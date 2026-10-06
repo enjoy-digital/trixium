@@ -65,7 +65,33 @@ def make_tiny_tensors(cfg, seed=1234):
     # Tied embeddings: the LM head matvec streams token_embd.weight.
     return t
 
-def make_tiny_hybrid_tensors(cfg, seed=1234):
+def make_tiny_mtp_tensors(cfg, rng, kind="q8"):
+    """An MTP head at layer n_layer, as convert --mtp puts the Qwen3.5 nextn block in: a gated
+    attention block (the attention-layer roles), eh_proj [enorm(e) | hnorm(h)] -> n_embd in
+    the plain basis, and the three norms. kind: the matrices' kind (q8 or ternary)."""
+    from trixium.layout import ROLE_MTP_EH, ROLE_MTP_ENORM, ROLE_MTP_HNORM, ROLE_MTP_HEAD_NORM
+    mk = _q8 if kind == "q8" else _ternary
+    L = cfg.n_layer
+    p = f"blk.{L}."
+    return [
+        _norm(rng, p+"attn_norm.weight",   ROLE_ATTN_NORM,   L, cfg.n_embd),
+        mk   (rng, p+"attn_q.weight",      ROLE_ATTN_Q,      L, 2*cfg.q_dim, cfg.n_embd),
+        mk   (rng, p+"attn_k.weight",      ROLE_ATTN_K,      L, cfg.kv_dim,  cfg.n_embd),
+        mk   (rng, p+"attn_v.weight",      ROLE_ATTN_V,      L, cfg.kv_dim,  cfg.n_embd),
+        _norm(rng, p+"attn_q_norm.weight", ROLE_ATTN_Q_NORM, L, cfg.head_dim),
+        _norm(rng, p+"attn_k_norm.weight", ROLE_ATTN_K_NORM, L, cfg.head_dim),
+        mk   (rng, p+"attn_output.weight", ROLE_ATTN_OUT,    L, cfg.n_embd,  cfg.q_dim),
+        _norm(rng, p+"post_attention_norm.weight", ROLE_FFN_NORM, L, cfg.n_embd),
+        mk   (rng, p+"ffn_gate.weight",    ROLE_FFN_GATE,    L, cfg.ffn_dim, cfg.n_embd),
+        mk   (rng, p+"ffn_up.weight",      ROLE_FFN_UP,      L, cfg.ffn_dim, cfg.n_embd),
+        mk   (rng, p+"ffn_down.weight",    ROLE_FFN_DOWN,    L, cfg.n_embd,  cfg.ffn_dim),
+        mk   (rng, p+"nextn.eh_proj.weight", ROLE_MTP_EH,    L, cfg.n_embd,  2*cfg.n_embd),
+        _norm(rng, p+"nextn.enorm.weight", ROLE_MTP_ENORM,   L, cfg.n_embd),
+        _norm(rng, p+"nextn.hnorm.weight", ROLE_MTP_HNORM,   L, cfg.n_embd),
+        _norm(rng, p+"nextn.shared_head_norm.weight", ROLE_MTP_HEAD_NORM, L, cfg.n_embd),
+    ]
+
+def make_tiny_hybrid_tensors(cfg, seed=1234, mtp=None):
     """The 27B's tensor inventory at sim size (convert.py's names and kinds): DeltaNet layers
     with the fused qkv, the z gate, Q8 beta/alpha head projections, F32 conv taps (rows of
     1024), A, dt bias and the head norm; gated attention layers with [q | gate]; the
@@ -114,21 +140,31 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
     # The rotation tensors, exactly as convert._hadamard_specs builds them.
     from trixium.model.convert import _hadamard_specs
     t += _hadamard_specs(cfg)
-    return t
+    if mtp:
+        t += make_tiny_mtp_tensors(cfg, rng, mtp)     # after everything: the main tensors
+    return t                                          # stay those of the image without
 
-def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
+def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None, mtp=None):
     """kseg_max: split matvecs wider than this into K-segments (the 27B's FFN down projection
-    path, exercised on the tiny model with e.g. 256); the image is named `-kseg`."""
+    path, exercised on the tiny model with e.g. 256); the image is named `-kseg`.
+    mtp: add an MTP head of that kind ("q8"/"ternary", hybrid configs); the image is named
+    `-mtp`."""
+    import dataclasses
     os.makedirs(out_dir, exist_ok=True)
+    suffix = ""
+    if mtp:
+        assert cfg.layer_types, "the MTP head is a Qwen3.5 (hybrid) feature"
+        cfg = dataclasses.replace(cfg)
+        cfg.mtp_layers = 1
+        suffix = "-mtp"
     if cfg.layer_types:
-        tensors = make_tiny_hybrid_tensors(cfg, seed)
+        tensors = make_tiny_hybrid_tensors(cfg, seed, mtp)
     else:
         tensors = make_tiny_tensors(cfg, seed)
-    suffix = ""
     if kseg_max is not None:
         from trixium.model.bons import split_wide
         tensors = [seg for t in tensors for seg in split_wide(t, kseg_max)]
-        suffix = "-kseg"
+        suffix += "-kseg"
     img_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.img")
     man_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.json")
     manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path)
@@ -143,10 +179,12 @@ def main():
     parser.add_argument("--hybrid-1k", action="store_true",
                         help="bonsai-tiny-hybrid-1k: 1,024-wide rotation blocks (the resident path).")
     parser.add_argument("--kseg-max", default=None, type=int, help="Split matvecs wider than this (K-segments).")
+    parser.add_argument("--mtp", default=None, choices=["q8", "ternary"],
+                        help="Add an MTP head (speculative decoding) with matrices of this kind.")
     args = parser.parse_args()
     from trixium.model.configs import BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K
     cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
-    img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max)
+    img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max, mtp=args.mtp)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")
     print(f"manifest : {man}")
     print(f"payload  : {manifest['payload_beats']} beats/channel "

@@ -96,6 +96,12 @@ KSEG_MAX        = 16384 # The widest K one engine op takes.
 (ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
  ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM,
  ROLE_HADAMARD) = range(17, 27)
+# The MTP (multi-token prediction) head, appended at layer = n_layer (BONS header byte 160
+# mtp_layers): its decoder block uses the attention-layer roles above at that layer index;
+# these are its own tensors. eh_proj: [enorm(embed(t+1)) | hnorm(h_t)] -> n_embd, in the
+# plain (unrotated) basis; enorm/hnorm/head_norm: F32 rows. The head shares the model's
+# embedding and LM head (2026-10-06, docs/measurements/speculative-2026-10-05.md).
+(ROLE_MTP_EH, ROLE_MTP_ENORM, ROLE_MTP_HNORM, ROLE_MTP_HEAD_NORM) = range(27, 31)
 
 def hadamard_layer(width_index, block_index):
     """The entry `layer` of a ROLE_HADAMARD block tensor (u16: width index in the header's
@@ -120,6 +126,8 @@ ROLE_NAMES = {
     ROLE_SSM_BETA    : "ssm_beta",    ROLE_SSM_ALPHA : "ssm_alpha",  ROLE_SSM_CONV: "ssm_conv",
     ROLE_SSM_A       : "ssm_a",       ROLE_SSM_DT    : "ssm_dt",     ROLE_SSM_NORM: "ssm_norm",
     ROLE_HADAMARD    : "hadamard",
+    ROLE_MTP_EH      : "mtp_eh",      ROLE_MTP_ENORM : "mtp_enorm",  ROLE_MTP_HNORM: "mtp_hnorm",
+    ROLE_MTP_HEAD_NORM: "mtp_head_norm",
 }
 
 # Row packet math ----------------------------------------------------------------------------------
@@ -210,7 +218,8 @@ BONS_NAME_BYTES  = 24  # Entry name field; longer names are stored truncated.
 # 128: u16 dn_v_heads 130: u16 dn_k_heads 132: u16 dn_k_dim 134: u16 dn_v_dim 136: u16 dn_conv
 # 138: u16 rope_dims (0 = whole head)     140: u16 hadamard_block (0 = plain basis)
 # 142: u8 attn_gated  143: u8 hyb_flags (bit 0: the emb16 rows are un-rotated)
-# 144: 4 x u32 hadamard_widths (the ROLE_HADAMARD tensors, by layer index)   160: pad to 4096.
+# 144: 4 x u32 hadamard_widths (the ROLE_HADAMARD tensors, by layer index)
+# 160: u8 mtp_layers (MTP head blocks at layer n_layer..; 0 = none)            161: pad to 4096.
 _HEADER_FMT = "<IIIIIIIIIIfIIIIIQII32s"
 _HEADER_V3_FMT = "<QQHHHHHHHBBIIII"
 _HEADER_V3_OFF = 112
@@ -241,6 +250,7 @@ def pack_header(cfg, n_channels, n_tensors, payload_beats, table_crc32, tokenize
         cfg.dn_conv_kernel, cfg.rope_dims, cfg.hadamard_block,
         1 if cfg.attn_gated else 0, HYB_EMB16_RESTORED if cfg.hadamard_block else 0,
         *(widths + [0]*(4 - len(widths))))
+    hdr += struct.pack("<B", getattr(cfg, "mtp_layers", 0))
     return hdr.ljust(BONS_HEADER_SIZE, b"\x00")
 
 def unpack_header(data):
@@ -260,6 +270,7 @@ def unpack_header(data):
         hdr["dn_conv_kernel"], hdr["rope_dims"], hdr["hadamard_block"] = v3[2:9]
     hdr["attn_gated"], hdr["hyb_flags"] = v3[9], v3[10]
     hdr["hadamard_widths"] = tuple(w for w in v3[11:15] if w)
+    hdr["mtp_layers"]      = data[_HEADER_V3_OFF + struct.calcsize(_HEADER_V3_FMT)] if hdr["version"] >= 3 else 0
     return hdr
 
 # Tensor table entry (64 B):

@@ -302,7 +302,6 @@ static void emit_token(int tok)
 // Copy the BONS header+table from the HBM staging area (engine channel 0, uploaded there by
 // bonsai_load) into the CPU-visible header location, then re-init inference.
 #define HDR_STAGING (BONSAI_CHAN_WEIGHT_BASE - 0x100000)
-#define BONS_STAGING_CLEARED 0x44524c43u // "CLRD": bonsai_loader.c loader_clear_staging()
 // The staged copy (channel 0, uploaded with every image by bonsai_load) is the truth about
 // what is in HBM; the main_ram copy is derived from it. The boot used to trust main_ram: a
 // CPU reset after `bonsai_load` of a DIFFERENT model then ran the boot demo with the
