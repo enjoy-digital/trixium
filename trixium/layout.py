@@ -77,6 +77,8 @@ FLAG_KSEG       = 0x02 # One K-segment of a matvec too wide for one engine op: t
                        # (the 27B's FFN down projection: K = 17408 > the op's 14-bit cols and
                        # the 16 KB int8 input buffer).
 KSEG_MAX        = 16384 # The widest K one engine op takes.
+KSEG_MAX_Q8     = 255*32 # Q8: one code beat per 32 columns, 8-bit cbeats (the MTP head's
+                         # eh_proj, K = 10240 on the 27B, failed as one op on the board).
 
 # Tensor roles -------------------------------------------------------------------------------------
 

@@ -83,6 +83,8 @@ def split_wide(spec, kseg_max=layout.KSEG_MAX):
     """A matvec spec wider than kseg_max as K-segments: equal column ranges (a multiple of the
     scale group each), the tensor's own bias/rshift for every segment so their int32 results
     add up, FLAG_KSEG with the segment index. Anything narrower comes back as [spec]."""
+    if spec.kind == layout.KIND_Q8:
+        kseg_max = min(kseg_max, layout.KSEG_MAX_Q8)
     if spec.kind not in (layout.KIND_TERNARY, layout.KIND_Q8) or spec.cols <= kseg_max:
         return [spec]
     group = layout.KIND_GROUP[spec.kind]
