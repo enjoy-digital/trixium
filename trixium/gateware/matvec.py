@@ -1365,10 +1365,16 @@ class BonsaiMatVecEngine(LiteXModule):
         if dnstream:
             # The writers take the command first (they only accept data once commanded),
             # then every reader gets the same span; RUN waits for the unit and the writers.
+            # The state is written dstride beats (signed 24-bit) away from where it is read:
+            # 0 updates in place; another version keeps the old state for a speculative
+            # rollback. 32-bit wrap: the sum is assigned to a 32-bit signal.
+            dn_wr_addr = Signal(32)
+            self.comb += dn_wr_addr.eq(cmd_r["wbase"] + Cat(Constant(0, 5), cmd_r["dstride"],
+                                                             Replicate(cmd_r["dstride"][23], 3)))
             fsm.act("DN_CMD",
                 self.busy.eq(1),
                 self.mstore_cmd.valid.eq(1),
-                self.mstore_cmd.addr.eq(cmd_r["wbase"]),
+                self.mstore_cmd.addr.eq(dn_wr_addr),
                 self.mstore_cmd.len.eq(cmd_r["wlen"]),
                 If(self.mstore_cmd.ready, NextState("ISSUE")),
             )

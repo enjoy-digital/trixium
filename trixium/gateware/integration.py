@@ -278,6 +278,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         soc.add_constant("BONSAI_HAS_DNSTREAM")
         soc.add_constant("BONSAI_DNSTREAM_LANES", len(axis))
         soc.add_constant("BONSAI_DNSTREAM_ZERO")     # op 5 bias bit 0: state taken as +0.0
+        soc.add_constant("BONSAI_DNSTREAM_WSHIFT")   # op 5 writes at wbase + signed dstride beats
         if dict(config.dnstream_options or ()).get("pair"):
             soc.add_constant("BONSAI_DNSTREAM_PAIR")  # records: even heads, then odd
     soc.engine_csr = BonsaiEngineCSR(soc.engine, seq=seq)
