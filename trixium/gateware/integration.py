@@ -76,6 +76,7 @@ class BonsaiClusterConfig:
     attnstream_options: tuple = () # (name, value) overrides of the unit's arguments.
     with_prefetch: bool = False    # Run-ahead weight prefetch per channel (gateware/prefetch.py).
     prefetch_options: tuple = ()   # (name, value): depth, chunk, sched_depth.
+    nbatch: int = 1                # Batched matvec: token vectors per weight stream (1..4).
 
     def __post_init__(self):
         for name in ('native_regions', 'native_reservations', 'native_endpoints'):
@@ -261,7 +262,14 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
                           seq=seq, dual=config.with_dual, **placement, **native,
                           dnstream=config.with_dnstream and (config.dnstream_options or True),
                           attnstream=config.with_attnstream and (config.attnstream_options or True),
-                          prefetch=config.with_prefetch and (config.prefetch_options or True)))
+                          prefetch=config.with_prefetch and (config.prefetch_options or True),
+                          nbatch=config.nbatch,
+                          # Batched: nb vectors share the x-buffer. Deeper is free up to 512
+                          # words (1024-bit rows: 15 RAMB36 either way); the 27B's widest
+                          # segment (FFN down, 68 words) x 4 still fits 384.
+                          **({"xbuf_groups": 96*config.nbatch} if config.nbatch > 1 else {})))
+    if config.nbatch > 1:
+        soc.add_constant("BONSAI_HAS_NBATCH", config.nbatch)
     if config.with_prefetch:
         pf = soc.engine.prefetch_units[0]
         soc.add_constant("BONSAI_HAS_PREFETCH")

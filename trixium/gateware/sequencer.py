@@ -50,7 +50,9 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
                    reduce_acc absmax result).
   engine: w1 = kind | ilv<<8 | supw<<9 | rshift_rpre<<10 (rshift taken from
           rpre(prev vec res6) instead of w7) | qn<<11 (dual-Q GQA)
-          | xred<<12 (AXPY: sum the per-channel partials in hardware);
+          | xred<<12 (AXPY: sum the per-channel partials in hardware)
+          | nb<<13 (2 bits, batched matvec: vectors - 1; x of vector b at
+          xsrc + b*dstride beats, results at dst + b*qstride words);
           w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;  w5 = wlen;
           w6 = sbeats | cbeats<<8 | qstride<<16 (head-B result offset, words);
           w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
@@ -281,6 +283,7 @@ class BonsaiSequencer(LiteXModule):
         self.eng_rep     = Signal(5)   # Multi-packet STORE (words 11-13).
         self.eng_dstride = Signal(24)
         self.eng_sstride = Signal(8)
+        self.eng_nb      = Signal(2)   # Batched matvec (w1[14:13]), nbatch engines.
         self.eng_done   = Signal()   # From the engine (pulse).
         self.absmax     = Signal(32) # From the engine tracker.
 
@@ -735,6 +738,7 @@ class BonsaiSequencer(LiteXModule):
             self.eng_rshift.eq(Mux(w(0, 1)[10], rpre_v[0:6], w(0, 7)[16:22])),
             self.eng_qn.eq(w(0, 1)[11]),
             self.eng_xred.eq(w(0, 1)[12]),
+            self.eng_nb.eq(w(0, 1)[13:15]),
             self.eng_qstride.eq(w(0, 6)[16:32]),
             self.eng_rshift2.eq(w(0, 7)[22:28]),
             self.eng_xsrc.eq(w(1, 8)[0:24]),

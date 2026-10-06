@@ -63,19 +63,20 @@ class _ResultPacker(Module):
     as soon as it is full. Byte-exact: the memory sees the same lanes with the same data,
     only in fewer, wider writes."""
     def __init__(self):
-        layout = [("row", 16), ("data", 256), ("wide", 1), ("head", 1), ("slot", 24)]
+        layout = [("row", 16), ("data", 256), ("wide", 1), ("head", 2), ("slot", 24)]
         self.sink   = stream.Endpoint(layout)
         self.source = stream.Endpoint(layout + [("lanes", 8)])
         self.enable    = Signal()   # Plain-matvec mode: pack. Otherwise a plain relay.
         self.clear     = Signal()   # Op start.
         self.rows_last = Signal(16) # This pipe's last row index (static per op).
         self.qn        = Signal()   # Dual-Q: the last result is (rows_last, head 1).
+        self.last_head = Signal(2)  # The head of the last result (dual-Q 1, batched nb-1).
 
         p_v     = Signal()
         p_row   = Signal(16)
         p_dat   = Signal(256)
         p_wide  = Signal()
-        p_head  = Signal()
+        p_head  = Signal(2)
         p_slot  = Signal(24)
         p_lanes = Signal(8)
         last_seen = Signal()        # The pipe's final result has been consumed.
@@ -93,7 +94,7 @@ class _ResultPacker(Module):
             merge.eq(self.enable & p_v & (p_slot[3:] == self.sink.slot[3:])),
             displace.eq(in_v & p_v & ~merge),
             full.eq(p_lanes == 0xFF),
-            is_last.eq((self.sink.row == self.rows_last) & (~self.qn | self.sink.head)),
+            is_last.eq((self.sink.row == self.rows_last) & (self.sink.head == self.last_head)),
             # Emit: as a plain relay whenever something is held; packing, when the beat is
             # full, when a new beat needs the slot, or when the pipe is done and this is
             # its partial tail.
@@ -145,8 +146,16 @@ class BonsaiMatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  dual=True, chan_stride=0, chan_mod=0, chan_skew=0,
                  native_regions=None, native_reservations=(), native_endpoints=None,
-                 dnstream=False, attnstream=False, prefetch=False):
+                 dnstream=False, attnstream=False, prefetch=False, nbatch=1):
         with_native = native_regions is not None
+        # nbatch > 1: batched matvec (cmd.nb, docs/speculative-verify-design.md step 2):
+        # one weight stream serves nb = cmd.nb+1 token vectors, time-multiplexed in the
+        # pipes. Vector b's x is read from xsrc + b*dstride beats, its results land at
+        # dst + b*qstride words. Ternary/Q8 matvec only (not ilv, qn, AXPY or native).
+        # absmax and the argmax tap span all nb vectors.
+        assert 1 <= nbatch <= 4
+        assert nbatch == 1 or not native_regions
+        self.nbatch = nbatch
         if prefetch and with_native:
             raise ValueError("the weight prefetch wraps the legacy reader path only")
         if with_native:
@@ -265,6 +274,7 @@ class BonsaiMatVecEngine(LiteXModule):
                              # 16 per-layer KV packets in ONE op (F1-1, 2026-08-29).
             ("dstride", 24), # STORE: HBM beats between consecutive packets.
             ("sstride", 8),  # STORE: scratchpad beats between consecutive source slots.
+            ("nb",     2),   # Batched matvec: token vectors - 1 (nbatch builds).
         ] + ([("native", 1)] if with_native else []))
         native_mode = C(0, 1)
         native_config_error = C(0, 1)
@@ -394,7 +404,7 @@ class BonsaiMatVecEngine(LiteXModule):
             # per round trip - 33.7 cycles/beat measured); round-robin ARIDs let it pipeline.
             reader = BonsaiAXIReader(axi, n_ids=4)
             pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n,
-                                       dual=dual, with_native=with_native)
+                                       dual=dual, with_native=with_native, nbatch=nbatch)
             setattr(self.submodules, f"reader{i}", reader)
             setattr(self.submodules, f"pipe{i}",   pipe)
             # Relay register between the reader (its FIFO sits at the HBM port, bottom of
@@ -497,7 +507,7 @@ class BonsaiMatVecEngine(LiteXModule):
         for name in (("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
                      "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
                      "rep", "dstride", "sstride",
-                     "qn", "qstride", "rshift2", "xred") + (("native",) if with_native else ())):
+                     "qn", "qstride", "rshift2", "xred", "nb") + (("native",) if with_native else ())):
             cmd_r[name] = Signal.like(getattr(self.cmd, name))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
@@ -585,6 +595,9 @@ class BonsaiMatVecEngine(LiteXModule):
                 pipe.qn.eq(cmd_r["qn"]),
                 pipe.rshift2.eq(cmd_r["rshift2"]),
             ]
+            if nbatch > 1:
+                pipe.nb.attr.add(("dont_touch", "true"))
+                self.sync += pipe.nb.eq(cmd_r["nb"])
             if with_native:
                 pipe.native_mode.attr.add(('dont_touch', 'true'))
                 self.sync += pipe.native_mode.eq(native_mode)
@@ -592,7 +605,13 @@ class BonsaiMatVecEngine(LiteXModule):
         # instead of dropping results and hanging the op.
         pipe_errors = [(p.error | p.overflow) & (~native_mode | (p.rows != 0)) for p in self.pipes]
         backend_error = (reduce_or([r.error != 0 for r in self.native_readers]) if with_native else C(0, 1))
-        self.comb += self.error.eq(reduce_or(pipe_errors) | (native_mode & (native_config_error | backend_error))
+        # Batched matvec is ternary/Q8 channel-major only: anything else fails loud.
+        nb_error = C(0, 1)
+        if nbatch > 1:
+            nb_error = Signal()
+            self.comb += nb_error.eq((cmd_r["nb"] != 0) & ((cmd_r["kind"] == 4)
+                                     | ((cmd_r["kind"] <= 1) & (cmd_r["qn"] | cmd_r["ilv"]))))
+        self.comb += self.error.eq(reduce_or(pipe_errors) | nb_error | (native_mode & (native_config_error | backend_error))
                                   | ((at_mode & at.error) if attnstream else 0)
                                   | (raw_mode & (raw_error != 0)))
 
@@ -605,7 +624,8 @@ class BonsaiMatVecEngine(LiteXModule):
             fill_half.eq(Mux(axpy_mode,
                 (cmd_r["rows"]*self.n_channels + cmd_r["rem"] + 31) >> 5,
                 cmd_r["cols"] >> 5)),
-            fill_total.eq(Mux(cmd_r["qn"], fill_half << 1, fill_half)),
+            fill_total.eq(Mux(cmd_r["qn"], fill_half << 1,
+                              fill_half*(cmd_r["nb"] + 1) if nbatch > 1 else fill_half)),
         ]
 
         # Registered fill pipeline: address at T, data+write at T+1.
@@ -650,9 +670,26 @@ class BonsaiMatVecEngine(LiteXModule):
         # Dual-Q fill: source beats stay contiguous (head A then head B at xsrc), the
         # x-buffer position interleaves them at 32B granularity (pos = 2g + head) so one
         # xbuf read serves both heads in the pipes.
+        pos_w      = max(10, (4*xbuf_groups - 1).bit_length())
         fill_headb = Signal()
         fill_g     = Signal(10)
-        fill_pos   = Signal(10)
+        fill_pos   = Signal(pos_w)
+        # Batched fill: vector b's beats come from xsrc + b*dstride and land at x-buffer
+        # beat b*4*xw (xw words per vector, as the pipes compute it); counters, so the
+        # scratchpad address stays a register (+1 or a precomputed next-vector base).
+        fill_vwrap = C(0, 1)
+        if nbatch > 1:
+            fill_vb    = Signal(fill_width)                 # Beat within the vector.
+            fill_vwrap = Signal()
+            fill_xpos  = Signal(pos_w)                      # x-buffer beat of fill_beat.
+            fill_xpos_d = Signal(pos_w)
+            fill_xnext = Signal(pos_w)
+            fill_vnext = Signal(len(scratchpad.fill.adr))
+            fill_xwb   = Signal(pos_w)                      # 4*xw.
+            self.comb += [
+                fill_vwrap.eq(fill_vb == fill_half - 1),
+                fill_xwb.eq(Mux(cmd_r["kind"] == 1, ((cmd_r["cbeats"] + 3) >> 2) << 2, cmd_r["cbeats"] << 2)),
+            ]
         self.comb += [
             fill_headb.eq(cmd_r["qn"] & (fill_beat_d >= fill_half)),
             fill_g.eq(Mux(fill_headb, fill_beat_d - fill_half, fill_beat_d)),
@@ -663,7 +700,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 Mux(cmd_r["kind"] == 0,
                     Cat(fill_g[0:2], fill_headb, fill_g[2:9]),
                     Cat(fill_headb, fill_g[:9])),
-                fill_beat_d)),
+                fill_xpos_d if nbatch > 1 else fill_beat_d)),
         ]
         # Second fill stage: the 256-bit scratchpad read data was broadcast COMB from
         # the BRAM output to every pipe's x-buffer write port (the v11 worst path).
@@ -677,7 +714,7 @@ class BonsaiMatVecEngine(LiteXModule):
         # per-pipe copies off a flop the tool may replicate. Adds a cycle to the fill; the
         # last writes still land during ISSUE.
         fill_act1 = Signal()
-        fill_pos1 = Signal(10)
+        fill_pos1 = Signal(pos_w)
         fill_dat1 = Signal(256)
         self.sync += [
             fill_act1.eq(fill_active_d),
@@ -686,7 +723,7 @@ class BonsaiMatVecEngine(LiteXModule):
         ]
         for i, pipe in enumerate(self.pipes):
             fa2 = Signal(name=f"fill_act2_{i}")
-            fp2 = Signal(10, name=f"fill_pos2_{i}")
+            fp2 = Signal(pos_w, name=f"fill_pos2_{i}")
             fd2 = Signal(256, name=f"fill_dat2_{i}")
             for sig in (fa2, fp2, fd2):
                 sig.attr.add(("dont_touch", "true"))
@@ -734,13 +771,23 @@ class BonsaiMatVecEngine(LiteXModule):
         # (_ResultPacker above). pack_en excludes every mode with its own retirement path.
         pack_en = Signal()
         self.comb += pack_en.eq(~fetch_mode & ~store_mode & ~axpy_mode & ~ilv_mode)
+        # Result offset of head h: h*qstride (dual-Q head B, or batched vector h). The
+        # multiples are op-static registers (loaded at START, used from RUN on).
+        if nbatch > 1:
+            qoffs = [Signal(24, name=f"qoff{h}") for h in range(1, nbatch)]
+            self.sync += [qoffs[h - 1].eq(cmd_r["qstride"]*h) for h in range(1, nbatch)]
+            def head_off(head):
+                return Array([C(0, 24)] + qoffs + [C(0, 24)]*(4 - nbatch))[head]
+        else:
+            def head_off(head):
+                return Mux(head[0], cmd_r["qstride"], 0)
         gsrc = []
         packs = []
         for i, pipe in enumerate(self.pipes):
             # Registered input stage: the slot arithmetic below is computed from the pipe
             # FIFO's asynchronous read and lands in flops here, so the packer's merge
             # compare starts from registers (n16 #3c, kept).
-            ib = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
+            ib = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 2),
                                 ("slot", 24)])
             setattr(self.submodules, f"gin{i}", ib)
             pk = _ResultPacker()
@@ -754,7 +801,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 ib.sink.data.eq(pipe.source.data),
                 ib.sink.wide.eq(pipe.source.wide),
                 ib.sink.head.eq(pipe.source.head),
-                ib.sink.slot.eq(dstw + Mux(pipe.source.head, cmd_r["qstride"], 0)
+                ib.sink.slot.eq(dstw + head_off(pipe.source.head)
                     + Mux(ilv_mode, pipe.source.row*n + i,
                       Mux(xred_mode, pipe.source.row,
                           pipe.source.row + Mux(axpy_mode, i*cmd_r["cols"], i*cmd_r["rows"]
@@ -764,6 +811,7 @@ class BonsaiMatVecEngine(LiteXModule):
                 pk.enable.eq(pack_en),
                 pk.rows_last.eq(rows_last_i),
                 pk.qn.eq(cmd_r["qn"]),
+                pk.last_head.eq(Mux(cmd_r["qn"], 1, cmd_r["nb"] if nbatch > 1 else 0)),
             ]
             gsrc.append(pk.source)
             packs.append(pk)
@@ -1417,6 +1465,10 @@ class BonsaiMatVecEngine(LiteXModule):
         )
         mv_total = Signal(24)
         ax_total = Signal(24)
+        mv_total_nb = mv_total
+        if nbatch > 1: # Batched: nb vectors' results; registered (RUN is far from START).
+            mv_total_nb = Signal(26)
+            self.sync += mv_total_nb.eq(mv_total*(cmd_r["nb"] + 1))
         # Test-visible aliases (no hardware: same signals under a name a testbench can find).
         # A stall in RUN is either "results never produced" or "produced but never retired",
         # and result_cnt against the expected total is what separates the two.
@@ -1441,7 +1493,7 @@ class BonsaiMatVecEngine(LiteXModule):
                    # Dual-Q ops retire two heads' results per stream.
                    result_cnt == Mux(cmd_r["qn"],
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
-                       Mux(axpy_mode, ax_total, mv_total)))))
+                       Mux(axpy_mode, ax_total, mv_total_nb)))))
                & ~gw_pending  # Queued writes must be in RAM before done.
                & ~am_busy & (~native_mode | native_complete) & (~raw_mode | raw_complete),
                 self.done.eq(1),
@@ -1462,11 +1514,24 @@ class BonsaiMatVecEngine(LiteXModule):
             ).Elif(st_next,
                 eng_fill_adr.eq(xsrc_w + st_src_off + cmd_r["sstride"]),
             ).Elif(fsm.ongoing("FILL") & rd_free,
-                eng_fill_adr.eq(eng_fill_adr + 1),
+                eng_fill_adr.eq(Mux(fill_vwrap, fill_vnext, eng_fill_adr + 1) if nbatch > 1
+                                else eng_fill_adr + 1),
             ).Elif(st_issue,
                 eng_fill_adr.eq(eng_fill_adr + 1),
             ),
             If(start_pulse | st_next, st_iss.eq(0)).Elif(st_issue, st_iss.eq(st_iss + 1)),
+            *([fill_xpos_d.eq(fill_xpos),
+               If(start_pulse,
+                   fill_vb.eq(0), fill_xpos.eq(0), fill_xnext.eq(fill_xwb),
+                   fill_vnext.eq(xsrc_w + cmd_r["dstride"]),
+               ).Elif(fsm.ongoing("FILL") & rd_free,
+                   If(fill_vwrap,
+                       fill_vb.eq(0), fill_xpos.eq(fill_xnext), fill_xnext.eq(fill_xnext + fill_xwb),
+                       fill_vnext.eq(fill_vnext + cmd_r["dstride"]),
+                   ).Else(
+                       fill_vb.eq(fill_vb + 1), fill_xpos.eq(fill_xpos + 1),
+                   ),
+               )] if nbatch > 1 else []),
             If(start_pulse,
                 st_cnt.eq(0),
                 st_rep.eq(0),

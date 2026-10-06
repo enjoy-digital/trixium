@@ -81,7 +81,8 @@ class BonsaiSimSoC(SoCCore):
                  with_capabilities=True, with_native=False, with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_embedding_restore=False, with_region_fetch=False,
                  with_silu=False, with_norm=False, with_conv=False, with_dnrec=False,
-                 with_dnstream=False, attn_geometry=None, prefetch=0, ddr_split=False):
+                 with_dnstream=False, attn_geometry=None, prefetch=0, ddr_split=False,
+                 nbatch=1):
         assert mem in ("hbm", "ddr4")
         assert not ddr_split or mem == "ddr4"
         self.ddr_split = ddr_split
@@ -231,6 +232,7 @@ class BonsaiSimSoC(SoCCore):
             with_region_fetch=with_region_fetch, with_silu=with_silu,
             with_norm=with_norm, with_conv=with_conv, with_dnrec=with_dnrec,
             with_prefetch=bool(prefetch),
+            nbatch=nbatch,
             prefetch_options=(("depth", prefetch), ("chunk", 64), ("sched_depth", 1024)) if prefetch else (),
             with_dnstream=bool(with_dnstream),
             dnstream_options=(("pair", True),) if with_dnstream == "pair" else (),
@@ -412,6 +414,8 @@ def main():
     parser.add_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_argument("--with-prefetch", nargs="?", const=4096, default=0, type=int,
                         help="Run-ahead weight prefetch: FIFO depth in beats per channel (default 4096).")
+    parser.add_argument("--nbatch", default=1, type=int,
+                        help="Batched matvec: token vectors per weight stream (1..4, engine cmd.nb).")
     parser.add_argument("--with-attnstream", nargs="?", const="8,2,128,256", default=None,
                         help="Enable the attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
     parser.add_argument("--with-dnrec", action="store_true", help="DeltaNet recurrence unit on the exact FP32 operators (the board's hardware path).")
@@ -437,7 +441,7 @@ def main():
             with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
             with_dnrec=args.with_dnrec, with_dnstream=("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
             attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch,
-            ddr_split=args.ddr_split)
+            ddr_split=args.ddr_split, nbatch=args.nbatch)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -456,7 +460,7 @@ def main():
             with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
             with_dnrec=args.with_dnrec, with_dnstream=("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
             attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch,
-            ddr_split=args.ddr_split)
+            ddr_split=args.ddr_split, nbatch=args.nbatch)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the
