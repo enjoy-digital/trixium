@@ -5029,6 +5029,32 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
     return infer_generate_from(prompt, n_prompt, 0, max_new, emit);
 }
 
+// Speculative decoding with the image's MTP head (console `mtpgen`): a fresh generation,
+// the hybrid's loop (hybrid_mtp_generate). stats: passes, drafted, accepted, head cycles.
+int infer_mtp_generate(const int *prompt, int n_prompt, int max_new, int k,
+                       void (*emit)(int tok), uint64_t *stats)
+{
+    if (!H || H->magic != BONS_MAGIC || n_layer == 0 || !hybrid_present() || !hybrid_mtp_present()) {
+        printf(" [no model with an MTP head]");
+        return -1;
+    }
+    for (int i = 0; i < n_prompt; i++)
+        if (prompt[i] < 0 || (uint32_t)prompt[i] >= H->vocab) {
+            printf(" [bad token id %d at %d]", prompt[i], i);
+            return -1;
+        }
+    if (n_prompt + max_new + k > max_ctx) {
+        printf(" [%d tokens exceed the KV budget of %d]", n_prompt + max_new + k, max_ctx);
+        return -1;
+    }
+    gen_serial++;
+    n_pos = 0;
+    hybrid_reset();
+    int r = hybrid_mtp_generate(prompt, n_prompt, max_new, k, emit, stats);
+    n_pos = hybrid_pos();
+    return r;
+}
+
 // buf[0..resident) are already in the KV cache from the previous call (n_pos == resident:
 // every forwarded token, i.e. all but the last one emitted), buf[resident..n) are new.
 // resident == 0 is a fresh generation. Byte-identical to re-forwarding the whole buffer

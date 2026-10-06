@@ -62,9 +62,10 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 # controllers 1..N-1 (firmware/ddr.c) - all on the tiny model, tokens against the same
 # reference as the HBM-model sim. Sizes: main_ram is 8 MB (0..8 MB of controller 0), the
 # windows start at 12 MB so the header staging area (window - 1 MB) and the round-trip test
-# (window - 2 MB) stay above main_ram; 2 MB per window holds the tiny payload and its KV.
+# (window - 2 MB) stay above main_ram; 4 MB per window holds the tiny payload and its KV
+# (2 MB until the tiny model's MTP head, 2026-10-06: 2.6 MB per channel at 8 channels).
 DDR4_SIM_WEIGHT_BASE = 0x00C0_0000  # 12 MB.
-DDR4_SIM_CHAN_STRIDE = 0x0020_0000  # 2 MB.
+DDR4_SIM_CHAN_STRIDE = 0x0040_0000  # 4 MB.
 DDR4_SIM_CHAN_SKEW   = 0xA000       # 40 KB: a bank skew IN THE SIM'S GEOMETRY (ncols 128 puts the
                                     # bank bits at byte bits 10..13, so the board's 32 KB would be
                                     # a row bit here); the address arithmetic is what the gate checks.

@@ -40,6 +40,8 @@ enum {
     ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
     ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM,
     ROLE_HADAMARD,
+    // The MTP head (layout.py): its block at layer n_layer uses the attention-layer roles.
+    ROLE_MTP_EH, ROLE_MTP_ENORM, ROLE_MTP_HNORM, ROLE_MTP_HEAD_NORM,
 };
 
 #define HYB_EMB16_RESTORED 0x01   // hyb_flags: the emb16 rows are in the plain basis.
@@ -77,10 +79,12 @@ struct __attribute__((packed)) bons_header {
     uint8_t  attn_gated;
     uint8_t  hyb_flags;
     uint32_t hadamard_widths[4];  // ROLE_HADAMARD tensors by layer index.
+    uint8_t  mtp_layers;          // MTP head blocks at layer n_layer.. (0: none).
 };
 
 _Static_assert(__builtin_offsetof(struct bons_header, layer_types) == 112, "BONS v3 fields at 112");
 _Static_assert(__builtin_offsetof(struct bons_header, hadamard_widths) == 144, "BONS v3 widths at 144");
+_Static_assert(__builtin_offsetof(struct bons_header, mtp_layers) == 160, "BONS v3 mtp_layers at 160");
 
 // ROLE_HADAMARD block tensors: entry layer = width index (header list) * 256 + block.
 #define HADAMARD_LAYER(wi, b) ((int)((wi)*256 + (b)))

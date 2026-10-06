@@ -544,6 +544,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
             d, hh = mtp(hh, t, pos + j)
             if mtp_hook is not None:
                 d = mtp_hook(pos + 1 + j, d)
+            st.setdefault("drafts", []).append(d)
             drafts.append(d); t = d
         st["passes"] += 1; st["drafted"] += len(drafts)
         # Verify one forward at a time (a batched pass gives the same tokens). An accepted

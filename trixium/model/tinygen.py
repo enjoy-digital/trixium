@@ -68,9 +68,11 @@ def make_tiny_tensors(cfg, seed=1234):
 def make_tiny_mtp_tensors(cfg, rng, kind="q8"):
     """An MTP head at layer n_layer, as convert --mtp puts the Qwen3.5 nextn block in: a gated
     attention block (the attention-layer roles), eh_proj [enorm(e) | hnorm(h)] -> n_embd in
-    the plain basis, and the three norms. kind: the matrices' kind (q8 or ternary)."""
+    the plain basis, and the three norms. kind: the matrices' kind (q8 or ternary), or q8eh:
+    eh_proj Q8 and the block ternary (the Q8 block does not fit the simulation's windows)."""
     from trixium.layout import ROLE_MTP_EH, ROLE_MTP_ENORM, ROLE_MTP_HNORM, ROLE_MTP_HEAD_NORM
     mk = _q8 if kind == "q8" else _ternary
+    mk_eh = _q8 if kind in ("q8", "q8eh") else _ternary
     L = cfg.n_layer
     p = f"blk.{L}."
     return [
@@ -85,7 +87,7 @@ def make_tiny_mtp_tensors(cfg, rng, kind="q8"):
         mk   (rng, p+"ffn_gate.weight",    ROLE_FFN_GATE,    L, cfg.ffn_dim, cfg.n_embd),
         mk   (rng, p+"ffn_up.weight",      ROLE_FFN_UP,      L, cfg.ffn_dim, cfg.n_embd),
         mk   (rng, p+"ffn_down.weight",    ROLE_FFN_DOWN,    L, cfg.n_embd,  cfg.ffn_dim),
-        mk   (rng, p+"nextn.eh_proj.weight", ROLE_MTP_EH,    L, cfg.n_embd,  2*cfg.n_embd),
+        mk_eh(rng, p+"nextn.eh_proj.weight", ROLE_MTP_EH,    L, cfg.n_embd,  2*cfg.n_embd),
         _norm(rng, p+"nextn.enorm.weight", ROLE_MTP_ENORM,   L, cfg.n_embd),
         _norm(rng, p+"nextn.hnorm.weight", ROLE_MTP_HNORM,   L, cfg.n_embd),
         _norm(rng, p+"nextn.shared_head_norm.weight", ROLE_MTP_HEAD_NORM, L, cfg.n_embd),
@@ -179,7 +181,7 @@ def main():
     parser.add_argument("--hybrid-1k", action="store_true",
                         help="bonsai-tiny-hybrid-1k: 1,024-wide rotation blocks (the resident path).")
     parser.add_argument("--kseg-max", default=None, type=int, help="Split matvecs wider than this (K-segments).")
-    parser.add_argument("--mtp", default=None, choices=["q8", "ternary"],
+    parser.add_argument("--mtp", default=None, choices=["q8", "ternary", "q8eh"],
                         help="Add an MTP head (speculative decoding) with matrices of this kind.")
     args = parser.parse_args()
     from trixium.model.configs import BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K

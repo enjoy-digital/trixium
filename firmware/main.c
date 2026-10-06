@@ -159,6 +159,7 @@ static void help(void)
     puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
     puts("seq [on|off]    - sequencer attention lists (on by default; off: CPU-dispatched)");
     puts("tokclr/tok/genb - chunked prompt buffer + generate [stop ids] (host chat tools)");
+    puts("mtpgen n k ids  - speculative decoding with the image's MTP head (k drafts)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
@@ -545,6 +546,41 @@ static void gen_cmd(char *args)
         engine_recover();
 }
 
+// mtpgen <n> <k> <ids...>: speculative decoding with the image's MTP head, k drafts per
+// pass, verified by the main model one forward at a time. The tokens are the greedy ones;
+// MTPSTATS: passes, drafted, accepted (the mirror's counts, bit-exact), the head's cycles.
+static void mtpgen_cmd(char *args)
+{
+    int *const prompt = (int *)BONSAI_CONSOLE_PROMPT_ADDR;
+    int n = parse_int(get_token(&args));
+    int k = parse_int(get_token(&args));
+    int np = 0;
+    while (np < 64) {
+        char *tok = get_token(&args);
+        if (*tok == 0)
+            break;
+        prompt[np++] = parse_int(tok);
+    }
+    if (n <= 0 || k <= 0 || np == 0) {
+        puts("usage: mtpgen n k id id ...");
+        return;
+    }
+    uint64_t st[4] = {0, 0, 0, 0};
+    uint64_t t0 = perf_now64();
+    printf("GEN:");
+    int r = infer_mtp_generate(prompt, np, n, k, emit_token, st);
+    uint64_t dt = perf_now64() - t0;
+    puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
+    printf("MTPSTATS k=%d passes=%lu drafted=%lu accepted=%lu head_cycles=%lu total_cycles=%lu\n", k,
+           (unsigned long)st[0], (unsigned long)st[1], (unsigned long)st[2],
+           (unsigned long)st[3], (unsigned long)dt);
+    printf("MTPDRAFTS");
+    for (int i = 0; i < hybrid_mtp_ndrafts; i++) printf(" %d", hybrid_mtp_drafts[i]);
+    puts("");
+    if (engine_wedged)
+        engine_recover();
+}
+
 static void sptest(void)
 {
     volatile uint32_t *sp = (volatile uint32_t *)SCRATCHPAD_BASE;
@@ -630,6 +666,8 @@ static void console_service(void)
         tok_cmd(str);
     else if (strcmp(token, "tokclr") == 0)
         tokclr_cmd();
+    else if (strcmp(token, "mtpgen") == 0)
+        mtpgen_cmd(str);
     else if (strcmp(token, "genb") == 0)
         genb_cmd(str);
     else if (strcmp(token, "hwops") == 0)

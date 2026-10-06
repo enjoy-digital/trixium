@@ -53,6 +53,10 @@ static const struct bons_header *H;
 static int n_ch, n_embd, n_head, n_kv_head, head_dim, ffn_dim, n_layer, q_dim, kv_dim, n_rep;
 static int nk, hk, nv, hv, nq, nvh, conv_k, rope_n;
 static int n_dn, n_attn, ctx_cap, pos;
+// The MTP head (header mtp_layers, layer n_layer): an attention block with its own KV slot,
+// eh_proj and three norms, sharing the embedding and the LM head (hybrid_mtp).
+static int n_mtp;
+static float *mtp_e, *mtp_cat, *mtp_enorm, *mtp_hnorm, *mtp_head_norm;
 static float rms_eps;
 
 // Float work buffers (main_ram).
@@ -624,9 +628,11 @@ int hybrid_init(void)
         return -1;
     }
     n_dn = n_attn = 0;
-    dn_slot = infer_halloc(n_layer*sizeof(int), 0);
-    attn_slot = infer_halloc(n_layer*sizeof(int), 0);
-    for (int l = 0; l < n_layer; l++) {
+    n_mtp = (H->mtp_layers && model_entry(ROLE_MTP_EH, n_layer)) ? 1 : 0;
+    int n_lay = n_layer + n_mtp;          // the head's block is an attention layer at n_layer
+    dn_slot = infer_halloc(n_lay*sizeof(int), 0);
+    attn_slot = infer_halloc(n_lay*sizeof(int), 0);
+    for (int l = 0; l < n_lay; l++) {
         if (bons_layer_is_deltanet(H, l)) { dn_slot[l] = n_dn++; attn_slot[l] = -1; }
         else                              { attn_slot[l] = n_attn++; dn_slot[l] = -1; }
     }
@@ -643,7 +649,7 @@ int hybrid_init(void)
         uint32_t kv_region = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)
                            /(uint32_t)n_ch*kv_rb;
         uint64_t base = (uint64_t)kv_base
-                      + (uint64_t)n_layer*n_kv_head*2u*kv_region*32u;
+                      + (uint64_t)n_lay*n_kv_head*2u*kv_region*32u;
         dn_hbm_base = (uint32_t)((base + 0xFFFu) & ~0xFFFull);
         uint64_t state_per_channel = ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
         uint32_t skew_count = BONSAI_CHAN_MOD ? BONSAI_CHAN_MOD - 1u : 0u;
@@ -677,7 +683,7 @@ int hybrid_init(void)
         uint32_t kv_base = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFFu) & ~0xFFFu);
         uint32_t kv_rb = 1u + (uint32_t)head_dim/32u;
         uint32_t kv_region = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch*kv_rb;
-        uint64_t base = (uint64_t)kv_base + (uint64_t)n_layer*n_kv_head*2u*kv_region*32u;
+        uint64_t base = (uint64_t)kv_base + (uint64_t)n_lay*n_kv_head*2u*kv_region*32u;
 #ifdef DN_STATE_HW
         if (dn_hw)
             base = (uint64_t)dn_hbm_base + ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
@@ -758,11 +764,11 @@ int hybrid_init(void)
     logits = infer_halloc((uint64_t)H->vocab*4 + 64*n_ch*4, 1);
     if (!logits) { printf("hybrid: no room for the logits\n"); return -1; }
 
-    norm_attn = infer_halloc(n_layer*sizeof(float *), 0); norm_ffn = infer_halloc(n_layer*sizeof(float *), 0);
-    norm_q = infer_halloc(n_layer*sizeof(float *), 0);    norm_k = infer_halloc(n_layer*sizeof(float *), 0);
-    norm_ssm = infer_halloc(n_layer*sizeof(float *), 0);  ssm_a = infer_halloc(n_layer*sizeof(float *), 0);
-    ssm_dt = infer_halloc(n_layer*sizeof(float *), 0);    conv_w = infer_halloc(n_layer*sizeof(float *), 0);
-    for (int l = 0; l < n_layer; l++) {
+    norm_attn = infer_halloc(n_lay*sizeof(float *), 0); norm_ffn = infer_halloc(n_lay*sizeof(float *), 0);
+    norm_q = infer_halloc(n_lay*sizeof(float *), 0);    norm_k = infer_halloc(n_lay*sizeof(float *), 0);
+    norm_ssm = infer_halloc(n_lay*sizeof(float *), 0);  ssm_a = infer_halloc(n_lay*sizeof(float *), 0);
+    ssm_dt = infer_halloc(n_lay*sizeof(float *), 0);    conv_w = infer_halloc(n_lay*sizeof(float *), 0);
+    for (int l = 0; l < n_lay; l++) {
         // Norm weights are constants the lists fetch raw (rl_fetch_raw): cleaned once here.
         norm_attn[l] = fetch_f32(model_entry_kind(ROLE_ATTN_NORM, l, KIND_F32));
         norm_ffn[l]  = fetch_f32(model_entry_kind(ROLE_FFN_NORM, l, KIND_F32));
@@ -786,6 +792,16 @@ int hybrid_init(void)
             if (norm_q[l]) clean_cpu_dcache_range(norm_q[l], (size_t)head_dim*4);
             if (norm_k[l]) clean_cpu_dcache_range(norm_k[l], (size_t)head_dim*4);
             if (!norm_q[l] || !norm_k[l]) { printf("hybrid: layer %d q/k norms missing\n", l); return -2; }
+        }
+    }
+    if (n_mtp) {
+        mtp_e = infer_halloc(n_embd*4, 0); mtp_cat = infer_halloc(2*n_embd*4, 0);
+        mtp_enorm = fetch_f32(model_entry_kind(ROLE_MTP_ENORM, n_layer, KIND_F32));
+        mtp_hnorm = fetch_f32(model_entry_kind(ROLE_MTP_HNORM, n_layer, KIND_F32));
+        mtp_head_norm = fetch_f32(model_entry_kind(ROLE_MTP_HEAD_NORM, n_layer, KIND_F32));
+        if (!mtp_e || !mtp_cat || !mtp_enorm || !mtp_hnorm || !mtp_head_norm) {
+            puts("hybrid: MTP head tables missing - head off");
+            n_mtp = 0;
         }
     }
     // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; v3 images carry the
@@ -2158,6 +2174,52 @@ void hybrid_lm_check(void)
     }
 }
 
+// The LM head on hb (the normed hidden state) and its argmax: the main forward's and the
+// MTP head's (which shares the model's head). t0: the logits phase's start.
+static int head_argmax(uint64_t t0)
+{
+    const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
+    if (!head) head = model_entry(ROLE_TOK_EMB, 0);
+    int best = -1;
+#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+    // Several chunks and the hardware argmax on: one list per chunk (lm_head_argmax).
+    if (HP->hwargmax && head && head->rows > lm_chunk_rows()) {
+        best = lm_head_argmax(head, logits);
+        if (best >= 0) {
+            if (infer_dbg_armed())
+                invd_cpu_dcache_range(logits, (size_t)H->vocab*4);
+            infer_dbg_f32("logits", -1, logits, H->vocab);
+            hyb_cyc_logits += perf_now64() - t0;
+            return best;
+        }
+    }
+#endif
+    int head_done = lm_head_list(head, logits) == 0;
+    // The restore unit's argmax indexes the list's (channel-major) order: the model's row
+    // order only when the head is one chunk (several: lm_head_argmax above, or the loop).
+    int one_chunk = head && head->rows <= lm_chunk_rows();
+    if (!head_done) {
+        proj_f(head, hb, logits);
+        HP->logits_clean = 0;            // CPU-written: lm_head_argmax flushes it first
+    }
+    infer_dbg_f32("logits", -1, logits, H->vocab);
+#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+    // The restore unit tracked the firmware loop's greedy argmax over everything the LM
+    // head list restored; rows past the vocabulary (padding) winning means: loop instead.
+    if (head_done && HP->hwargmax && one_chunk) {
+        uint32_t i = seq_restore_argmax_idx_read();
+        if (i < H->vocab) best = (int)i;
+    }
+#endif
+    if (best < 0) {
+        float bv = logits[0];
+        best = 0;
+        for (uint32_t i = 1; i < H->vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = (int)i; }
+    }
+    hyb_cyc_logits += perf_now64() - t0;
+    return best;
+}
+
 int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
@@ -2303,44 +2365,107 @@ int hybrid_forward(int token, int want_logits)
     static float *out_norm; if (!out_norm) out_norm = fetch_f32(on);
     rmsnorm_fv(hb, xb, out_norm, n_embd);
     infer_dbg_f32("out_norm", -1, hb, n_embd);
-    const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
-    if (!head) head = model_entry(ROLE_TOK_EMB, 0);
-    int best = -1;
-#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
-    // Several chunks and the hardware argmax on: one list per chunk (lm_head_argmax).
-    if (HP->hwargmax && head && head->rows > lm_chunk_rows()) {
-        best = lm_head_argmax(head, logits);
-        if (best >= 0) {
-            if (infer_dbg_armed())
-                invd_cpu_dcache_range(logits, (size_t)H->vocab*4);
-            infer_dbg_f32("logits", -1, logits, H->vocab);
-            hyb_cyc_logits += perf_now64() - t0;
-            return best;
+    return head_argmax(t0);
+}
+
+// The MTP head at position p: embed(token) (the token at p) and hprev (the normed hidden
+// state that predicted it) -> the draft for p + 1, its normed hidden state in hout (the next
+// draft's hprev). The block is the attention layer at n_layer with its own KV slot (row p
+// overwritten: speculative rows are rewritten when the real tokens get there), the plain
+// CPU residual (the main forward's xb is free once its LM head ran). As the mirror's mtp()
+// (test/test_hybrid_mirror.py), op for op.
+int hybrid_mtp(int token, int p, const float *hprev, float *hout)
+{
+    if (!n_mtp) return -1;
+    const int L = n_layer;
+    if (infer_embed_f(token, mtp_e) < 0) return -1;
+    rmsnorm_fv(mtp_cat, mtp_e, mtp_enorm, n_embd);
+    rmsnorm_fv(mtp_cat + n_embd, hprev, mtp_hnorm, n_embd);
+    int e8 = quantize_f(mtp_cat, 2*n_embd);             // eh_proj: the plain basis
+    matvec_q(model_entry(ROLE_MTP_EH, L), e8, xb);
+    rmsnorm_fv(hb, xb, norm_attn[L], n_embd);
+    int save = pos;
+    pos = p;
+    attention_layer(L, hb, tmp_h);
+    pos = save;
+    if (engine_wedged) return -1;
+    add_fv(xb, tmp_h, n_embd);
+    rmsnorm_fv(hb, xb, norm_ffn[L], n_embd);
+    e8 = H->hadamard_block ? rotate_quantize_f(hb, n_embd) : quantize_f(hb, n_embd);
+    matvec_q(model_entry(ROLE_FFN_GATE, L), e8, gateb);
+    matvec_q(model_entry(ROLE_FFN_UP, L), e8, upb);
+    silu_mul_fv(gateb, upb, gateb, ffn_dim);
+    proj_f(model_entry(ROLE_FFN_DOWN, L), gateb, tmp_h);
+    add_fv(xb, tmp_h, n_embd);
+    rmsnorm_fv(hb, xb, mtp_head_norm, n_embd);
+    if (hout) memcpy(hout, hb, (size_t)n_embd*4);
+    return head_argmax(perf_now64());
+}
+
+int hybrid_mtp_present(void) { return n_mtp; }
+
+// The first drafts of the last hybrid_mtp_generate, for the simulation gate (the mirror
+// logs the same list: a random tiny head is never accepted, its drafts still compare).
+int hybrid_mtp_drafts[64];
+int hybrid_mtp_ndrafts;
+
+// Speculative decoding, the mirror's loop (hybrid27_generate mtp_k): after every main
+// forward the head drafts k tokens chained on its own hidden state; the main model verifies
+// them one forward at a time (the output is the greedy one by construction; a batched
+// verify pass is the hardware's job). The head runs once per verified position so its KV
+// holds the real tokens. stats: passes, drafted, accepted, head cycles.
+int hybrid_mtp_generate(const int *prompt, int n_prompt, int n_new, int k,
+                        void (*emit)(int tok), uint64_t *stats)
+{
+    static float *ha, *hh;
+    int drafts[8];
+    if (!n_mtp || k < 1 || k > 8 || n_prompt < 1) return -1;
+    if (!ha) { ha = infer_halloc(n_embd*4, 0); hh = infer_halloc(n_embd*4, 0); }
+    if (!ha || !hh) return -1;
+    uint64_t tm;
+    int tok = -1, nout = 0;
+    hybrid_mtp_ndrafts = 0;
+    for (int i = 0; i < n_prompt; i++) {
+        tok = hybrid_forward(prompt[i], 1);
+        if (tok < 0 || engine_wedged) return -1;
+        memcpy(ha, hb, (size_t)n_embd*4);
+        if (i + 1 < n_prompt) {
+            tm = perf_now64();
+            if (hybrid_mtp(prompt[i + 1], pos, ha, NULL) < 0) return -1;   // the head's KV
+            stats[3] += perf_now64() - tm;
         }
     }
-#endif
-    int head_done = lm_head_list(head, logits) == 0;
-    // The restore unit's argmax indexes the list's (channel-major) order: the model's row
-    // order only when the head is one chunk (several: lm_head_argmax above, or the loop).
-    int one_chunk = head && head->rows <= lm_chunk_rows();
-    if (!head_done) {
-        proj_f(head, hb, logits);
-        HP->logits_clean = 0;            // CPU-written: lm_head_argmax flushes it first
+    for (;;) {
+        emit(tok);
+        if (++nout == n_new) return 0;
+        tm = perf_now64();
+        const float *hp = ha;
+        int t = tok;
+        for (int j = 0; j < k; j++) {
+            t = drafts[j] = hybrid_mtp(t, pos + j, hp, hh);
+            if (t < 0) return -1;
+            if (hybrid_mtp_ndrafts < 64) hybrid_mtp_drafts[hybrid_mtp_ndrafts++] = t;
+            hp = hh;
+        }
+        stats[3] += perf_now64() - tm;
+        stats[0]++; stats[1] += (uint64_t)k;
+        int j;
+        for (j = 0; j < k; j++) {
+            tok = hybrid_forward(tok, 1);
+            if (tok < 0 || engine_wedged) return -1;
+            memcpy(ha, hb, (size_t)n_embd*4);
+            if (tok != drafts[j]) break;                // tok: the correction
+            stats[2]++;
+            emit(tok);
+            if (++nout == n_new) return 0;
+            tm = perf_now64();
+            if (hybrid_mtp(tok, pos, ha, NULL) < 0) return -1;
+            stats[3] += perf_now64() - tm;
+        }
+        if (j == k) {                                   // all accepted: the bonus token
+            tok = hybrid_forward(tok, 1);
+            if (tok < 0 || engine_wedged) return -1;
+            memcpy(ha, hb, (size_t)n_embd*4);
+        }
     }
-    infer_dbg_f32("logits", -1, logits, H->vocab);
-#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
-    // The restore unit tracked the firmware loop's greedy argmax over everything the LM
-    // head list restored; rows past the vocabulary (padding) winning means: loop instead.
-    if (head_done && HP->hwargmax && one_chunk) {
-        uint32_t i = seq_restore_argmax_idx_read();
-        if (i < H->vocab) best = (int)i;
-    }
-#endif
-    if (best < 0) {
-        float bv = logits[0];
-        best = 0;
-        for (uint32_t i = 1; i < H->vocab; i++) if (logits[i] > bv) { bv = logits[i]; best = (int)i; }
-    }
-    hyb_cyc_logits += perf_now64() - t0;
-    return best;
 }

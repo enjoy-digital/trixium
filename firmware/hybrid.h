@@ -30,4 +30,12 @@ int  hybrid_xres_enabled(void);
 int  hybrid_pos(void);                      // Positions processed since the reset.
 int  hybrid_context_capacity(void);         // Actual KV allocation after heap-fit reduction.
 int  hybrid_forward(int token, int want_logits); // Next token (argmax) or -1.
+// The MTP head (speculative decoding): one draft at position p from the token there and the
+// hidden state that predicted it; the loop with sequential verification (stats: passes,
+// drafted, accepted, head cycles).
+int  hybrid_mtp_present(void);
+int  hybrid_mtp(int token, int p, const float *hprev, float *hout);
+int  hybrid_mtp_generate(const int *prompt, int n_prompt, int n_new, int k,
+                         void (*emit)(int tok), uint64_t *stats);
+extern int hybrid_mtp_drafts[64], hybrid_mtp_ndrafts;  // the last generation's first drafts
 #endif
