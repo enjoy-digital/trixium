@@ -5031,7 +5031,7 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
 
 // Speculative decoding with the image's MTP head (console `mtpgen`): a fresh generation,
 // the hybrid's loop (hybrid_mtp_generate). stats: passes, drafted, accepted, head cycles.
-int infer_mtp_generate(const int *prompt, int n_prompt, int max_new, int k,
+int infer_mtp_generate(const int *prompt, int n_prompt, int max_new, int k, int batched,
                        void (*emit)(int tok), uint64_t *stats)
 {
     if (!H || H->magic != BONS_MAGIC || n_layer == 0 || !hybrid_present() || !hybrid_mtp_present()) {
@@ -5050,7 +5050,7 @@ int infer_mtp_generate(const int *prompt, int n_prompt, int max_new, int k,
     gen_serial++;
     n_pos = 0;
     hybrid_reset();
-    int r = hybrid_mtp_generate(prompt, n_prompt, max_new, k, emit, stats);
+    int r = hybrid_mtp_generate(prompt, n_prompt, max_new, k, batched, emit, stats);
     n_pos = hybrid_pos();
     return r;
 }

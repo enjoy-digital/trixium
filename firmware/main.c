@@ -160,6 +160,9 @@ static void help(void)
     puts("seq [on|off]    - sequencer attention lists (on by default; off: CPU-dispatched)");
     puts("tokclr/tok/genb - chunked prompt buffer + generate [stop ids] (host chat tools)");
     puts("mtpgen n k ids  - speculative decoding with the image's MTP head (k drafts)");
+    puts("mtpspec n k ids - the same, passes as speculative forwards with state rollback");
+    puts("mtporacle ids   - override drafts by position (- = the head's), none clears");
+    puts("nbatch [on|off] - mtpspec k=1 passes as one batched forward (engine cmd.nb)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
@@ -547,9 +550,11 @@ static void gen_cmd(char *args)
 }
 
 // mtpgen <n> <k> <ids...>: speculative decoding with the image's MTP head, k drafts per
-// pass, verified by the main model one forward at a time. The tokens are the greedy ones;
-// MTPSTATS: passes, drafted, accepted (the mirror's counts, bit-exact), the head's cycles.
-static void mtpgen_cmd(char *args)
+// pass, verified by the main model one forward at a time. mtpspec: the same with each pass
+// run as speculative forwards (all k + 1, the state rolled back past the accepted ones -
+// the batched verify's state handling). The tokens are the greedy ones; MTPSTATS: passes,
+// drafted, accepted (the mirror's counts, bit-exact), the head's cycles.
+static void mtpgen_cmd(char *args, int batched)
 {
     int *const prompt = (int *)BONSAI_CONSOLE_PROMPT_ADDR;
     int n = parse_int(get_token(&args));
@@ -562,15 +567,22 @@ static void mtpgen_cmd(char *args)
         prompt[np++] = parse_int(tok);
     }
     if (n <= 0 || k <= 0 || np == 0) {
-        puts("usage: mtpgen n k id id ...");
+        puts("usage: mtpgen|mtpspec n k id id ...");
         return;
     }
     uint64_t st[4] = {0, 0, 0, 0};
     uint64_t t0 = perf_now64();
     printf("GEN:");
-    int r = infer_mtp_generate(prompt, np, n, k, emit_token, st);
+    int r = infer_mtp_generate(prompt, np, n, k, batched, emit_token, st);
     uint64_t dt = perf_now64() - t0;
     puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
+    if (batched)
+    {
+        uint32_t fb, fd;
+        hybrid_nbatch_stats(&fb, &fd);
+        printf("MTPSPEC versions=%d nbatch=%d ffn_batched=%lu ffn_declined=%lu\n", hybrid_spec_max() + 1,
+               hybrid_nbatch_enabled(), (unsigned long)fb, (unsigned long)fd);
+    }
     printf("MTPSTATS k=%d passes=%lu drafted=%lu accepted=%lu head_cycles=%lu total_cycles=%lu\n", k,
            (unsigned long)st[0], (unsigned long)st[1], (unsigned long)st[2],
            (unsigned long)st[3], (unsigned long)dt);
@@ -579,6 +591,21 @@ static void mtpgen_cmd(char *args)
     puts("");
     if (engine_wedged)
         engine_recover();
+}
+
+// mtporacle [ids...]: the draft of the token at position p becomes ids[p] ("-": the head's
+// own); no ids clears it. A test's way through the accept path (the mirror's mtp_hook).
+static void mtporacle_cmd(char *args)
+{
+    int n = 0;
+    while (n < 256) {
+        char *tok = get_token(&args);
+        if (*tok == 0)
+            break;
+        hybrid_mtp_oracle[n++] = *tok == '-' ? -1 : parse_int(tok);
+    }
+    hybrid_mtp_noracle = n;
+    printf("MTPORACLE %d\n", n);
 }
 
 static void sptest(void)
@@ -667,7 +694,18 @@ static void console_service(void)
     else if (strcmp(token, "tokclr") == 0)
         tokclr_cmd();
     else if (strcmp(token, "mtpgen") == 0)
-        mtpgen_cmd(str);
+        mtpgen_cmd(str, 0);
+    else if (strcmp(token, "mtpspec") == 0)
+        mtpgen_cmd(str, 1);
+    else if (strcmp(token, "mtporacle") == 0)
+        mtporacle_cmd(str);
+    else if (strcmp(token, "mtpdbg") == 0)
+        hybrid_mtpdbg_enable(strcmp(get_token(&str), "on") == 0);
+    else if (strcmp(token, "nbatch") == 0) {
+        char *v = get_token(&str);
+        if (*v) hybrid_nbatch_enable(strcmp(v, "on") == 0);
+        printf("NBATCH %s\n", hybrid_nbatch_enabled() ? "on" : "off");
+    }
     else if (strcmp(token, "genb") == 0)
         genb_cmd(str);
     else if (strcmp(token, "hwops") == 0)

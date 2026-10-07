@@ -113,6 +113,9 @@ uint32_t engine_submit(const struct engine_op *op)
     ENG_WR(qstride);
     ENG_WR(rshift2);
 #endif
+#ifdef CSR_ENGINE_CSR_NB_ADDR
+    ENG_WR(nb);
+#endif
 #ifdef CSR_ENGINE_CSR_REP_ADDR
     ENG_WR(rep);
     ENG_WR(dstride);

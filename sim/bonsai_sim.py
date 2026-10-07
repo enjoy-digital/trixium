@@ -414,6 +414,8 @@ def main():
     parser.add_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_argument("--with-prefetch", nargs="?", const=4096, default=0, type=int,
                         help="Run-ahead weight prefetch: FIFO depth in beats per channel (default 4096).")
+    parser.add_argument("--out-dir", default=None,
+                        help="Build directory (default: build/sim, build/sim_ddr4 or build/sim_ddr4_split).")
     parser.add_argument("--nbatch", default=1, type=int,
                         help="Batched matvec: token vectors per weight stream (1..4, engine cmd.nb).")
     parser.add_argument("--with-attnstream", nargs="?", const="8,2,128,256", default=None,
@@ -422,7 +424,8 @@ def main():
     parser.add_argument("--with-region-fetch", action="store_true", help="Enable sequenced checked region reads; requires --with-native.")
     parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
-    out_dir = "build/sim" if args.mem == "hbm" else ("build/sim_ddr4_split" if args.ddr_split else "build/sim_ddr4")
+    out_dir = args.out_dir or ("build/sim" if args.mem == "hbm" else
+                               ("build/sim_ddr4_split" if args.ddr_split else "build/sim_ddr4"))
 
     sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")

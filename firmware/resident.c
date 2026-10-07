@@ -608,7 +608,14 @@ void rl_engine(const struct engine_op *op)
     rl_rsf_lost();
 }
 
+static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t xw, uint32_t e8);
 void rl_prepare(const float *src, uint32_t width, int rotate)
+{
+    rl_prepare_to(src, width, rotate, RS_XW, RS_E8);
+}
+
+// rl_prepare with the Q8 vector at xw and its exponent beat at e8 (a batched op's slot b).
+static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t xw, uint32_t e8)
 {
     struct resident_state *R = resident_state();
     const struct bons_header *H = model_header();
@@ -626,10 +633,10 @@ void rl_prepare(const float *src, uint32_t width, int rotate)
         uint32_t blocks = width/B;
         bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RL.n++, &d);
         bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(RL.n++, &d);
-        bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks); desc_words(RL.n++, &d);
+        bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks); desc_words(RL.n++, &d);
         rl_rsf_lost();                    // the Hadamard wrote RS_F
     } else {
-        bns_seq_desc_quantize(&d, RS_F, RS_XW, RS_E8, width, 1);              desc_words(RL.n++, &d);
+        bns_seq_desc_quantize(&d, RS_F, xw, e8, width, 1);              desc_words(RL.n++, &d);
         R->rsf_list = vec;                // a plain quantize leaves the source in RS_F
     }
 }
@@ -1028,6 +1035,174 @@ decline:
     return -1;
 }
 
+#ifdef BONSAI_HAS_NBATCH
+// Batched slots (docs/speculative-verify-design.md): vector b's Q8 at RS_XWB(b), its exponent
+// beat at RS_E8B(b). Slot 1 sits in the hybrid path's free span above RS_MAX, below RS_SIGN.
+#define RS_XW1   0x36800u
+#define RS_XWB(b) ((b) ? RS_XW1 : RS_XW)
+#define RS_E8B(b) ((b) ? RS_XW1 + RS_WIDTH_MAX : RS_E8)
+#define RS_NB_MAX 2
+
+// build_matvec_rows for nb vectors in ONE weight stream (engine cmd.nb): x of vector b at
+// RS_XWB(b), segment k's partials at ystage + (k*nb + b)*ystride, summed into vector b's
+// first-segment stream, restored with its exponent into dst[b] (ystage + b*ystride: in place).
+static int build_matvec_nb(uint32_t *n, const struct bons_entry *e, uint32_t row0, uint32_t rows,
+                           uint32_t ystage, int nb, const uint32_t *dst)
+{
+    struct resident_state *R = resident_state();
+    if (!e || nb < 1 || nb > RS_NB_MAX || rows % 8 || rows % (uint32_t)R->n_ch || row0 % (uint32_t)R->n_ch ||
+        row0 + rows > e->rows || (e->kind != KIND_TERNARY && e->kind != KIND_Q8))
+        return -1;
+    int nseg = (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
+    uint32_t ystride = ((rows*4 + 31) & ~31u);
+    if (nseg < 1 || nseg > 4 || ystride/4 > 0xFFFFu || ystage % 32 ||
+        ystage + (uint64_t)nseg*nb*ystride > RS_F || *n + (uint32_t)(nseg*(1 + nb) + nb) > RS_DESC_MAX - 1u)
+        return -1;
+    for (int b = 0; b < nb; b++)
+        if (dst[b] != ystage + (uint32_t)b*ystride && (dst[b] < RS_F || dst[b] + rows*4 > RS_SP_END))
+            return -1;
+    uint32_t rpc = rows/(uint32_t)R->n_ch;
+    uint32_t xoff = 0;
+    for (int k = 0; k < nseg; k++) {
+        const struct bons_entry *seg = nseg > 1 ? model_entry_kseg(e, k) : e;
+        uint32_t rb = bons_row_beats(seg->cols, seg->kind, seg->group);
+        struct engine_op op = {0};
+        op.kind    = (seg->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
+        op.rows    = rpc;
+        op.cols    = seg->cols;
+        op.wbase   = BONSAI_CHAN_WEIGHT_BASE + (seg->chan_base_beats + (row0/(uint32_t)R->n_ch)*rb)*32;
+        op.wlen    = rpc*rb;
+        op.sbeats  = bons_scale_beats(seg->cols, seg->group);
+        op.cbeats  = bons_code_beats(seg->cols, seg->kind);
+        op.bias    = seg->bias;
+        op.rshift  = seg->rshift;
+        op.xsrc    = RS_XW + xoff;
+        op.dst     = ystage + (uint32_t)k*nb*ystride;
+        op.nb      = (uint8_t)(nb - 1);
+        op.qstride = (uint16_t)(ystride/4);
+        op.dstride = (RS_XWB(1) - RS_XWB(0))/32;
+        seq_desc_engine((*n)++, &op);
+        for (int b = 0; k && b < nb; b++) {
+            uint32_t y0 = ystage + (uint32_t)b*ystride;
+            int32_t a[4] = {(int32_t)y0, (int32_t)(ystage + (uint32_t)(k*nb + b)*ystride),
+                            (int32_t)y0, (int32_t)((rows + 7)/8)};
+            seq_desc_vec((*n)++, PROG_REDUCE_ACC, a, 4, 0);
+        }
+        xoff += seg->cols;
+    }
+    for (int b = 0; b < nb; b++) {
+        struct bns_seq_descriptor d;
+        if (bns_seq_desc_restore(&d, ystage + (uint32_t)b*ystride, dst[b], RS_E8B(b), rows,
+                                 (int32_t)e->rshift - (int32_t)e->bias))
+            return -1;
+        desc_words((*n)++, &d);
+    }
+    return 0;
+}
+
+// The unit left g in the flagged lanes of a gate/up chunk (channel-major, rows of row0..):
+// act[model row] = m * silu(g), the firmware's own expression.
+static uint32_t silu_patch_chunk(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, uint32_t rows,
+                                 uint32_t row0, uint32_t total, float *act)
+{
+    struct resident_state *R = resident_state();
+    const volatile uint32_t *bits = (const volatile uint32_t *)(SCRATCHPAD_BASE + fixmap_sp);
+    const volatile float *g = (const volatile float *)(SCRATCHPAD_BASE + g_sp);
+    const volatile float *m = (const volatile float *)(SCRATCHPAD_BASE + m_sp);
+    uint32_t rpc = rows/(uint32_t)R->n_ch, tpc = total/(uint32_t)R->n_ch, patched = 0;
+    for (uint32_t w = 0; w < (rows + 31)/32; w++) {
+        uint32_t word = bits[w];
+        while (word) {
+            uint32_t i = 32*w + (uint32_t)__builtin_ctz(word);
+            word &= word - 1;
+            uint32_t c = i/rpc, j = i - c*rpc;
+            act[c*tpc + row0/(uint32_t)R->n_ch + j] = m[i]*bonsai_silu_lookup(g[i], R->silu_lut);
+            patched++;
+        }
+    }
+    return patched;
+}
+
+// nb tokens' FFN, every projection's weights streamed once (engine cmd.nb). in[b]: the
+// FFN-normed FP32 input, act[b]: ffn_dim FP32 scratch, out[b]: the n_embd result - all main
+// RAM, 32-byte aligned. The same arithmetic per token as resident_ffn_act + the down
+// projection's resident_prepare/resident_matvec, so the results are bit-identical.
+// Gate/up run in row chunks (two vectors' int32 and FP32 rows must fit RS_Y and RS_F).
+int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
+                       const struct bons_entry *down, int nb, const float *const *in,
+                       float *const *act, float *const *out)
+{
+    struct resident_state *R = resident_state();
+    const struct bons_header *H = model_header();
+    if (!resident_silu_active() || !gate || !up || !down || nb < 1 || nb > RS_NB_MAX ||
+        gate->rows != up->rows || gate->rows > RS_WIDTH_MAX || !H->hadamard_block)
+        goto decline;
+    uint32_t rows = gate->rows, width = (uint32_t)H->n_embd, nch = (uint32_t)R->n_ch;
+    uint32_t nchunk = 1;
+    while ((uint64_t)nb*(rows/nchunk)*4 > RS_SP_END - RS_F || (rows/nchunk) % (8*nch) || rows % nchunk)
+        if (++nchunk > 8) goto decline;
+    uint32_t cr = rows/nchunk, cstride = (cr*4 + 31) & ~31u;
+    for (int b = 0; b < nb; b++)
+        if (((uintptr_t)in[b] & 31) || ((uintptr_t)act[b] & 31) || ((uintptr_t)out[b] & 31))
+            goto decline;
+    uint64_t t0 = perf_now64();
+    struct bns_seq_descriptor d;
+    rl_begin();
+    for (int b = 0; b < nb; b++)
+        rl_prepare_to(in[b], width, 1, RS_XWB(b), RS_E8B(b));
+    if (rl_run("ffn batch prepare")) goto fail;
+    for (uint32_t c = 0; c < nchunk; c++) {
+        uint32_t row0 = c*cr, fdst[RS_NB_MAX], ydst[RS_NB_MAX];
+        for (int b = 0; b < nb; b++) {
+            fdst[b] = RS_F + (uint32_t)b*cstride;
+            ydst[b] = RS_Y + (uint32_t)b*cstride;
+        }
+        rl_begin();
+        if (!rl_room(4u + 4u*(uint32_t)nb) || build_matvec_nb(&RL.n, gate, row0, cr, RS_Y, nb, fdst) ||
+            build_matvec_nb(&RL.n, up, row0, cr, RS_Y, nb, ydst)) goto fail;
+        rl_rsf_lost();
+        for (int b = 0; b < nb; b++) {
+            bns_seq_desc_silu(&d, fdst[b], ydst[b], fdst[b], RS_FIXMAP + (uint32_t)b*1024u*4u, cr);
+            desc_words(RL.n++, &d);
+            // Channel-major chunk -> model order: channel ch's cr/nch rows at row0/nch.
+            rl_store_packets(act[b] + row0/nch, cr/nch*4, nch, rows/nch*4, fdst[b], cr/nch*4,
+                             act[b], rows*4);
+        }
+        if (rl_run("ffn batch gate/up")) goto fail;
+        for (int b = 0; b < nb; b++)
+            R->silu_fixups += silu_patch_chunk(RS_FIXMAP + (uint32_t)b*1024u*4u, fdst[b], ydst[b],
+                                               cr, row0, rows, act[b]);
+    }
+    rl_begin();
+    uint32_t ddst[RS_NB_MAX];
+    for (int b = 0; b < nb; b++) {
+        rl_prepare_to(act[b], rows, 1, RS_XWB(b), RS_E8B(b));
+        ddst[b] = RS_F + (uint32_t)b*((width*4 + 31) & ~31u);
+    }
+    if (!rl_room(16) || build_matvec_nb(&RL.n, down, 0, width, RS_Y, nb, ddst)) goto fail;
+    for (int b = 0; b < nb; b++)
+        rl_store(out[b], width*4, ddst[b]);
+    if (rl_run("ffn batch down")) goto fail;
+    R->rsf_src = 0;
+    R->silu_cycles += perf_now64() - t0;
+    R->silu_lists++;
+    return 0;
+fail:
+    R->rsf_src = 0;
+decline:
+    R->fallbacks++;
+    return -1;
+}
+#else
+int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
+                       const struct bons_entry *down, int nb, const float *const *in,
+                       float *const *act, float *const *out)
+{
+    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
+    return -1;
+}
+#endif
+
 #else
 
 int resident_silu_init(const float *lut, uint32_t *stage)
@@ -1040,6 +1215,13 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
 {
     (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
     return 0;
+}
+int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
+                       const struct bons_entry *down, int nb, const float *const *in,
+                       float *const *act, float *const *out)
+{
+    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
+    return -1;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)
@@ -1118,6 +1300,13 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
 {
     (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
     return 0;
+}
+int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
+                       const struct bons_entry *down, int nb, const float *const *in,
+                       float *const *act, float *const *out)
+{
+    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
+    return -1;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)

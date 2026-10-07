@@ -472,7 +472,10 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         e = (mant[tok].astype(f32)*f32(np.exp2(f32(exps[tok])))).astype(f32)
         cat = np.concatenate([rmsnorm(e, m_enorm), rmsnorm(hprev, m_hnorm)]).astype(f32)
         x = matvec_f(entry(layout.ROLE_MTP_EH, LM), cat)          # plain basis: no rotation
-        y = attention(LM, rmsnorm(x, m_anorm), pos)
+        # One position lower for RoPE (scores depend on position differences only): the
+        # firmware stores entry i at KV row i, so its row 0 is a real entry - at position
+        # pos it would read a row 0 nothing ever wrote (stale DDR on the board, 2026-10-06).
+        y = attention(LM, rmsnorm(x, m_anorm), pos - 1)
         x = (x + y).astype(f32)
         hn = rmsnorm(x, m_fnorm)
         r = rotate(hn, n_embd) if B else hn
