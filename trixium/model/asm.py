@@ -7,11 +7,11 @@
 """VectorUnit microcode: ISA, assembler, golden interpreter and stock programs.
 
 The vector unit is a microcoded 16-lane SIMD engine working on the scratchpad:
-- 8 vector registers V0..V7, 16 lanes x int32 (LDV sign-extends int16 beats, LDW loads
-  8 x int32 into lanes 0..7).
+- 8 or 16 vector registers (VREGS, see below), 16 lanes x int32 (LDV sign-extends int16
+  beats, LDW loads 8 x int32 into lanes 0..7).
 - 8 scalar registers S0..S7, 48-bit signed (reduction accumulators need > 32 bits).
 - 8 argument registers A0..A7 written via CSR before VECRUN (addresses, lengths, shifts).
-- One hardware loop (LOOPS count / LOOPE).
+- Two hardware loop levels (LOOPS/LOOPE, and LOOPS2/LOOPE2 around them).
 - Q15 LUT ops (EXP2F/RSQRT/RECIP) with linear interpolation, tables from
   trixium.model.bitexact (identical ROM contents in RTL, interpreter and firmware).
 
@@ -33,11 +33,13 @@ imm is signed. Vector ops' immediates are shift counts (fit 8 bits). Memory ops 
 addresses in scalar regs, post-incremented by 32 (one 256-bit beat).
 """
 
-import sys
+import argparse
 
 import numpy as np
 
 from trixium.model import bitexact as bx
+
+# Constants ----------------------------------------------------------------------------------------
 
 LANES = 16
 
@@ -47,10 +49,17 @@ LANES = 16
 # this, so keep it in step with the RTL.
 IMEM_DEPTH = 1024 # 1024 x 32 distributed RAM, 4 KB (the x2 unrolls cost ~30 words each).
 
+MASK32 = 0xFFFFFFFF
+MASK48 = 0xFFFFFFFFFFFF
+
+C_LOG2E = 739 # round(log2(e) * 2^9): fits the 11-bit immediate; the shift arg folds the 2^9.
+
+# Encoding -----------------------------------------------------------------------------------------
+
 # Vector register count = encoding (see the module docstring). set_vregs() switches the
 # assembler, the interpreter and emit_c() together; the firmware Makefile passes the
 # build tree's TRIXIUM_VEC_VREGS so progs.h always matches the bitstream it links against.
-VREGS = 16
+VREGS     = 16
 IMM11_OPS = ("MOVSI", "ARG", "SADDI", "LOOPS", "LOOPS2")
 
 def set_vregs(n):
@@ -68,23 +77,23 @@ def encode_fields(op, vd, va, vb, sd, sa, imm):
     assert -128 <= imm <= 127, f"{op}: imm {imm} does not fit 8 bits (VREGS=16 encoding)"
     return w | (vd << 22) | (va << 18) | (vb << 14) | (imm & 0xFF)
 
+def _sext(v, bits):
+    return v - (1 << bits) if v & (1 << (bits - 1)) else v
+
 def decode_fields(w):
     """-> (op, vd, va, vb, sd, sa, imm) under the current VREGS encoding."""
     op = OPCODES[(w >> 26) & 0x3F]
     if VREGS == 8:
         vd, va, vb = (w >> 23) & 7, (w >> 20) & 7, (w >> 17) & 7
-        sd, sa = (w >> 14) & 7, (w >> 11) & 7
-        imm = w & 0x7FF
-        if imm & 0x400: imm -= 0x800
+        sd, sa     = (w >> 14) & 7, (w >> 11) & 7
+        imm        = _sext(w & 0x7FF, 11)
         return op, vd, va, vb, sd, sa, imm
     vd, va, vb = (w >> 22) & 15, (w >> 18) & 15, (w >> 14) & 15
-    sd, sa = (w >> 11) & 7, (w >> 8) & 7
+    sd, sa     = (w >> 11) & 7, (w >> 8) & 7
     if op in IMM11_OPS:
-        imm = (w >> 15) & 0x7FF
-        if imm & 0x400: imm -= 0x800
+        imm = _sext((w >> 15) & 0x7FF, 11)
     else:
-        imm = w & 0xFF
-        if imm & 0x80: imm -= 0x100
+        imm = _sext(w & 0xFF, 8)
     return op, vd, va, vb, sd, sa, imm
 
 # Opcodes ------------------------------------------------------------------------------------------
@@ -126,32 +135,28 @@ OPCODES = [
     "LUTE2",    # vd = exp2f(va & 0x7FFF)   : 2^f, f in [0,1) Q15 -> Q15 result [2^15, 2^16).
     "LUTRECIP", # vd = recip(va)            : va Q15 mantissa in [2^14, 2^15) meaning [0.5,1) -> Q15 of 1/m in (2^15, 2^16].
     "LUTRSQRT", # vd = rsqrt(va)            : va Q30-normalized in [2^30, 2^32) meaning [1,4) -> Q15 of 1/sqrt.
-    # Scalar (48-bit) ops added for rmsnorm (M4).
+    # Scalar (48-bit) ops.
     "SADD",     # sd += S[sa].
     "SSHLV",    # sd shifted by S[sa] (left if >= 0, arith right if < 0; clamped +-47; wraps to 48 bits).
     "SNORME",   # sd = EVEN shift e such that (S[sa] << e) lands in [2^30, 2^32); 0 for S[sa] <= 0.
                 # (Even so the shift splits cleanly into the rsqrt exponent half; the caller
-                #  guarantees S[sa] > 0 - firmware clamps the eps term to >= 1.)
+                # guarantees S[sa] > 0 - firmware clamps the eps term to >= 1.)
     # Softmax/reduce programs.
     "REDSMAX",  # sd = max(sd, max(lanes)) SIGNED (REDMAX is an abs-max).
     "STW",      # store lanes 0..7 as 8 x int32 (32 bytes; S[sa] += 32).
-    # Scalar-B ALU forms: b comes from S[sa] instead of a vector register. The BCAST+V<op>
-    # idiom costs 1-3 body instructions per use to materialise a per-iteration-constant
-    # vector; at 4 cycles/instruction on a non-overlapped FSM that idiom costs 8 of a
-    # 36-instruction silu_mul body. RTL cost: one 2:1 mux on the shared b-lane feed.
+    # Scalar-B ALU forms: b comes from S[sa] instead of a vector register, saving the BCAST
+    # that would materialise a per-iteration-constant vector in loop bodies. RTL cost: one
+    # 2:1 mux on the shared b-lane feed.
     "VSHLS",  # vd = va shifted lanewise by S[sa]: left if >= 0, arith right if < 0 (+-31).
     "VMULS",  # vd = low 32 bits of va * S[sa].
-    # Second (outer) loop level: independent count/start registers, so a
-    # per-head body (LOOPS..LOOPE over beats) can be wrapped in LOOPS2..LOOPE2 over heads
-    # and the 24+16 per-head descriptors of the qk-norm/rope/KV-pack lists become one
-    # program each. Same encoding rules as LOOPS/LOOPE.
+    # Second (outer) loop level: independent count/start registers, so a per-head body
+    # (LOOPS..LOOPE over beats) can be wrapped in LOOPS2..LOOPE2 over heads and the per-head
+    # descriptors of the qk-norm/rope/KV-pack lists become one program each. Same encoding
+    # rules as LOOPS/LOOPE.
     "LOOPS2", # loop2 count = S[sa] if imm == 0 else imm; body starts at the next instr.
     "LOOPE2", # if --count2 > 0: pc = loop2 start.
 ]
 OP = {name: i for i, name in enumerate(OPCODES)}
-
-MASK32 = 0xFFFFFFFF
-MASK48 = 0xFFFFFFFFFFFF
 
 def _s32(v):
     v = int(v) & MASK32
@@ -175,18 +180,22 @@ def assemble(program):
     for ins in program:
         op = ins[0].upper()
         vd = va = vb = sd = sa = 0
-        imm = 0
+        imm  = 0
         args = list(ins[1:])
-        def take_v():  return _reg(args.pop(0), "v")
-        def take_s():  return _reg(args.pop(0), "s")
-        def take_i():  return int(args.pop(0))
+        def take_v():
+            return _reg(args.pop(0), "v")
+        def take_s():
+            return _reg(args.pop(0), "s")
+        def take_i():
+            return int(args.pop(0))
         if op in ("NOP", "DONE"):
             pass
         elif op in ("MOVSI", "ARG", "SADDI"):
             sd  = take_s()
             imm = take_i()
         elif op in ("SMOV", "SADD", "SSHLV", "SNORME"):
-            sd = take_s(); sa = take_s()
+            sd = take_s()
+            sa = take_s()
         elif op in ("LOOPS", "LOOPS2"):
             if isinstance(args[0], str):
                 sa = take_s()
@@ -194,36 +203,42 @@ def assemble(program):
                 imm = take_i()
         elif op in ("LOOPE", "LOOPE2"):
             pass
-        elif op in ("LDV", "LDW"):
-            vd = take_v(); sa = take_s()
+        elif op in ("LDV", "LDW", "BCAST"):
+            vd = take_v()
+            sa = take_s()
         elif op in ("STV", "STB", "STW"):
-            va = take_v(); sa = take_s()
-        elif op == "BCAST":
-            vd = take_v(); sa = take_s()
+            va = take_v()
+            sa = take_s()
         elif op in ("VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK"):
-            vd = take_v(); va = take_v(); vb = take_v()
+            vd = take_v()
+            va = take_v()
+            vb = take_v()
         elif op in ("VSHRI", "VSHLI", "VRNE"):
-            vd = take_v(); va = take_v(); imm = take_i()
+            vd  = take_v()
+            va  = take_v()
+            imm = take_i()
         elif op in ("VSHLS", "VMULS"):
-            vd = take_v(); va = take_v(); sa = take_s()
+            vd = take_v()
+            va = take_v()
+            sa = take_s()
         elif op in ("VCLAMP8", "VCLAMP16", "VABS", "VCLZN", "LUTE2", "LUTRECIP", "LUTRSQRT"):
-            vd = take_v(); va = take_v()
+            vd = take_v()
+            va = take_v()
         elif op in ("REDSUM", "REDSSQ", "REDMAX", "REDSMAX"):
-            sd = take_s(); va = take_v()
+            sd = take_s()
+            va = take_v()
         else:
             raise ValueError(op)
         assert not args, f"extra operands in {ins}"
-        assert -1024 <= imm <= 1023 or op in ("MOVSI", "LOOPS", "LOOPS2"), f"imm out of range in {ins}"
-        if op in ("MOVSI", "LOOPS", "LOOPS2"):
-            assert -1024 <= imm <= 1023, f"imm out of range in {ins} (11-bit)"
+        assert -1024 <= imm <= 1023, f"imm out of range in {ins} (11-bit)"
         words.append(encode_fields(op, vd, va, vb, sd, sa, imm))
     return words
 
 # Interpreter (the golden model) -------------------------------------------------------------------
 
-_EXP2  = bx.exp2_lut()   # 256 x Q15 for f in [0,1).
-_RECIP = bx.recip_lut()  # 256 x Q15 for m in [1,2).
-_RSQRT = bx.rsqrt_lut()  # 256 x Q15 for x in [1,4).
+_EXP2  = bx.exp2_lut()  # 256 x Q15 for f in [0,1).
+_RECIP = bx.recip_lut() # 256 x Q15 for m in [1,2).
+_RSQRT = bx.rsqrt_lut() # 256 x Q15 for x in [1,4).
 
 def _lut_interp(table, idx8, frac, next_edge):
     """Linear interpolation: table[idx8] + ((next - table[idx8]) * frac) >> shift, where
@@ -240,11 +255,11 @@ def exp2f_q15(x):
 def recip_q15(m):
     """1/m for Q15 mantissa m in [2^14, 2^15) (value [0.5, 1)) -> Q15 of (1/value)/2 in [2^14, 2^15].
     Table is indexed over [1,2): m14 in [0.5,1) maps as m*2 in [1,2)."""
-    m = int(m) & 0x7FFF
-    idx = (m - (1 << 14)) >> 6          # 8-bit index over [2^14, 2^15).
+    m    = int(m) & 0x7FFF
+    idx  = (m - (1 << 14)) >> 6         # 8-bit index over [2^14, 2^15).
     frac = (m - (1 << 14)) & 0x3F
-    a = int(_RECIP[idx])
-    b = int(_RECIP[idx + 1]) if idx < 255 else (1 << 14)
+    a    = int(_RECIP[idx])
+    b    = int(_RECIP[idx + 1]) if idx < 255 else (1 << 14)
     return a + (((b - a)*frac) >> 6)
 
 def rsqrt_q15(x32):
@@ -269,9 +284,9 @@ class VecInterp:
     def run(self, words, args, max_steps=1_000_000, s7_seed=0):
         # s7_seed models the sequencer's res6-chaining (S7 starts as the previous
         # program's res6 under direct drive; 0 for CSR dispatch).
-        V = [np.zeros(LANES, dtype=np.int64) for _ in range(VREGS)]
-        S = [0]*7 + [_s48(s7_seed)]
-        A = list(args) + [0]*(8 - len(args))
+        V  = [np.zeros(LANES, dtype=np.int64) for _ in range(VREGS)]
+        S  = [0]*7 + [_s48(s7_seed)]
+        A  = list(args) + [0]*(8 - len(args))
         pc = 0
         loop_start = loop_cnt = 0
         loop_start2 = loop_cnt2 = 0
@@ -377,8 +392,7 @@ class VecInterp:
                 V[vd] = np.clip(V[va], -32767, 32767)
             elif op == "VABS":
                 # Wraps like the 32-bit lane does: |INT_MIN| = 2^31 does not fit, so the
-                # result is INT_MIN again, as in the RTL (the random hazard stress checks
-                # it).
+                # result is INT_MIN again, as in the RTL.
                 V[vd] = np.asarray([_s32(abs(_s32(x))) for x in V[va]], dtype=np.int64)
             elif op == "VCLZN":
                 r = []
@@ -411,7 +425,50 @@ class VecInterp:
             pc = npc
         raise RuntimeError("max_steps exceeded")
 
-# Stock programs -----------------------------------------------------------------------------------
+# Program Helpers ----------------------------------------------------------------------------------
+
+def _zip2(a, b):
+    """Interleave two instruction chains (the x2 unrolls)."""
+    out = []
+    for i in range(max(len(a), len(b))):
+        if i < len(a):
+            out.append(a[i])
+        if i < len(b):
+            out.append(b[i])
+    return out
+
+def _silu_consts():
+    """The SiLU programs' loop constants, kept live across the loop."""
+    return [
+        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # v2 = 2^15
+        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10), # v1 = -15*2^15
+        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10), # v7 = 14*2^15
+    ]
+
+def _rmsnorm_scale():
+    """The rmsnorm programs' scale setup, from S7 = sum of squares, A4 = -log2(n) in s4, eps_int
+    in s5 and A6 in s6: v7 = r_q15 in every lane, v6 = K lanes (K = A6 + e/2) and
+    v4 = rounding bias 1 << (-K-1) (0 if K >= 0)."""
+    return [
+        ("SSHLV", "s7", "s4"),        # ss / n (A4 negative).
+        ("SADD",  "s7", "s5"),        # + eps_int.
+        ("SNORME", "s4", "s7"),       # e (even).
+        ("SSHLV", "s7", "s4"),        # Normalize into [2^30, 2^32).
+        ("BCAST", "v7", "s7"),
+        ("LUTRSQRT", "v7", "v7"),     # r_q15 in every lane.
+        ("MOVSI", "s5", -1),
+        ("SSHLV", "s4", "s5"),        # e/2 (e even: arith halving is exact).
+        ("SADD",  "s4", "s6"),        # K = A6 + e/2.
+        ("BCAST", "v6", "s4"),        # K lanes.
+        ("VSUB",  "v5", "v5", "v5"),
+        ("VSUB",  "v5", "v5", "v6"),  # -K.
+        ("MOVSI", "s5", 1),
+        ("BCAST", "v4", "s5"),        # Ones.
+        ("VSUB",  "v3", "v5", "v4"),  # -K - 1.
+        ("VSHLV", "v4", "v4", "v3"),  # bias = 1 << (-K-1) (0 if K >= 0).
+    ]
+
+# Stock Programs -----------------------------------------------------------------------------------
 #
 # Calling convention (args A0..A7 set via CSR):
 #   A0/A1/A2 = source/source2/destination byte addresses, A3 = beat count,
@@ -469,9 +526,9 @@ def prog_quant8():
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("MOVSI", "s6", 0),
-        # x2 unroll: both passes are pure chains, so two interleaved chains
-        # hide the load-use stalls. A3 still arrives as beats (call sites unchanged, all
-        # even - batched q8 128, kvpack 8, FFN 384, VECCRC 8); the program halves it.
+        # x2 unroll: both passes are pure chains, so two interleaved chains hide the
+        # load-use stalls. A3 arrives as beats (always even at the call sites); the program
+        # halves it.
         ("MOVSI", "s5", -1),
         ("SSHLV", "s3", "s5"),         # iterations = beats / 2
         ("LOOPS", "s3"),               # Pass 1: absmax.
@@ -524,9 +581,8 @@ def prog_norm_i32():
         ("VSUB",  "v2", "v3", "v2"),    # -k
         # x2 unroll: two independent LDW->VPACK->VSHLV->STV chains interleave, so the
         # load-use and pack-use stalls of one chain (2 per output beat) fill under the
-        # other. A3 still arrives as output beats
-        # (call sites unchanged, all even - q/kv/ffn/embd widths and head_dim/16 = 8);
-        # the program halves it itself.
+        # other. A3 arrives as output beats (always even at the call sites); the program
+        # halves it.
         ("MOVSI", "s5", -1),
         ("SSHLV", "s3", "s5"),          # iterations = output beats / 2
         ("LOOPS", "s3"),
@@ -556,14 +612,11 @@ def prog_silu_mul():
     after LUTE2). Same arithmetic, instruction for instruction, as the pinned pre-hoist
     program in test_asm_hoist.
     """
-    C_LOG2E = 739 # round(log2(e) * 2^9) - fits the 11-bit immediate; A4 folds the 2^9 scale.
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("ARG",   "s4", 4), ("ARG", "s6", 6),
         ("MOVSI", "s5", C_LOG2E),
-        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # v2 = 2^15
-        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10), # -15*2^15
-        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10), # 14*2^15
+    ] + _silu_consts() + [
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),          # mg
         ("VMULS", "v3", "v0", "s5"),    # mg * C_LOG2E
@@ -571,9 +624,9 @@ def prog_silu_mul():
         ("VMAX",  "v3", "v3", "v1"),    # clamp low at -15*2^15
         ("VMIN",  "v3", "v3", "v7"),    # clamp high at 14*2^15 (e2 <= 2^29: int32-safe)
         ("LUTE2", "v5", "v3"),          # 2^r (LUTE2 masks to low 15 bits itself)
-        # The next two are independent of the LUT result and fill its latency (4 since the
-        # E2/E3 split): i from the clamped f (unchanged by LUTE2), and mu early - f is dead
-        # once LUTE2 and VSHRI have read it. Bit-identical, order only.
+        # The next two are independent of the LUT result and fill its latency: i from the
+        # clamped f (unchanged by LUTE2), and mu early - f is dead once LUTE2 and VSHRI have
+        # read it. Bit-identical, order only.
         ("VSHRI", "v4", "v3", 15),      # i = floor(f)
         ("LDV",   "v3", "s1"),          # mu
         ("VSHLV", "v5", "v5", "v4"),    # e2 = 2^f (Q15 integer-scaled); i dead from here
@@ -616,22 +669,7 @@ def prog_rmsnorm():
         ("LDV",   "v0", "s0"),
         ("REDSSQ", "s7", "v0"),
         ("LOOPE",),
-        ("SSHLV", "s7", "s4"),      # ss / n (A4 negative).
-        ("SADD",  "s7", "s5"),      # + eps_int.
-        ("SNORME", "s4", "s7"),     # e (even).
-        ("SSHLV", "s7", "s4"),      # normalize into [2^30, 2^32).
-        ("BCAST", "v7", "s7"),
-        ("LUTRSQRT", "v7", "v7"),   # r_q15 in every lane.
-        ("MOVSI", "s5", -1),
-        ("SSHLV", "s4", "s5"),      # e/2 (e even: arith halving is exact).
-        ("SADD",  "s4", "s6"),      # K = A6 + e/2.
-        ("BCAST", "v6", "s4"),      # K lanes.
-        ("VSUB",  "v5", "v5", "v5"),
-        ("VSUB",  "v5", "v5", "v6"),  # -K.
-        ("MOVSI", "s5", 1),
-        ("BCAST", "v4", "s5"),        # ones.
-        ("VSUB",  "v3", "v5", "v4"),  # -K - 1.
-        ("VSHLV", "v4", "v4", "v3"),  # bias = 1 << (-K-1) (0 if K >= 0).
+    ] + _rmsnorm_scale() + [
         ("ARG",   "s0", 0),           # rewind src.
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),        # m.
@@ -703,9 +741,8 @@ def prog_softmax8():
         ("VMUL",  "v0", "v0", "v5"),    # d'*739.
         ("VSHLV", "v0", "v0", "v6"),    # f (Q15).
         ("VMAX",  "v0", "v0", "v4"),    # clamp at -15*2^15.
-        # Same as silu_mul: LUTE2 masks to the low 15 bits, so r = f - ((f>>15)<<15) was
-        # two instructions per iteration computing what the LUT already does. The VSHRI is
-        # independent of the LUT result and fills one slot of its latency.
+        # As in silu_mul: LUTE2 masks to the low 15 bits itself (no r = f - ((f>>15)<<15)).
+        # The VSHRI is independent of the LUT result and fills one slot of its latency.
         ("LUTE2", "v2", "v0"),
         ("VSHRI", "v1", "v0", 15),      # i = floor(f) in [-15, 0].
         ("VSHLV", "v2", "v2", "v1"),    # 2^f, Q15.
@@ -714,7 +751,7 @@ def prog_softmax8():
         ("REDSUM", "s6", "v2"),         # Exact sum of emitted p8.
         ("STB",   "v2", "s2"),
         ("LOOPE",),
-        ("ARG",   "s1", 6),             # Self-spill: 8 copies of S6 at A6 (was PROG_SPILL).
+        ("ARG",   "s1", 6),             # Self-spill: 8 copies of S6 at A6.
         ("BCAST", "v0", "s6"),
         ("STW",   "v0", "s1"),
         ("DONE",),
@@ -739,22 +776,7 @@ def prog_rmsnorm_h():
         ("LDV",   "v0", "s0"),
         ("REDSSQ", "s7", "v0"),
         ("LOOPE",),
-        ("SSHLV", "s7", "s4"),      # ss / n (A4 negative).
-        ("SADD",  "s7", "s5"),      # + eps_int.
-        ("SNORME", "s4", "s7"),     # e (even).
-        ("SSHLV", "s7", "s4"),      # normalize into [2^30, 2^32).
-        ("BCAST", "v7", "s7"),
-        ("LUTRSQRT", "v7", "v7"),   # r_q15 in every lane.
-        ("MOVSI", "s5", -1),
-        ("SSHLV", "s4", "s5"),      # e/2 (e even: arith halving is exact).
-        ("SADD",  "s4", "s6"),      # K = A6 + e/2.
-        ("BCAST", "v6", "s4"),      # K lanes.
-        ("VSUB",  "v5", "v5", "v5"),
-        ("VSUB",  "v5", "v5", "v6"),  # -K.
-        ("MOVSI", "s5", 1),
-        ("BCAST", "v4", "s5"),        # ones.
-        ("VSUB",  "v3", "v5", "v4"),  # -K - 1.
-        ("VSHLV", "v4", "v4", "v3"),  # bias = 1 << (-K-1) (0 if K >= 0).
+    ] + _rmsnorm_scale() + [
         ("SMOV",  "s6", "s2"),        # pass-2 read pointer = this head's dst (in place).
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s6"),        # m.
@@ -845,22 +867,7 @@ def prog_rmsnorm_q8():
         ("LDV",   "v0", "s0"),
         ("REDSSQ", "s7", "v0"),
         ("LOOPE",),
-        ("SSHLV", "s7", "s4"),
-        ("SADD",  "s7", "s5"),
-        ("SNORME", "s4", "s7"),
-        ("SSHLV", "s7", "s4"),
-        ("BCAST", "v7", "s7"),
-        ("LUTRSQRT", "v7", "v7"),
-        ("MOVSI", "s5", -1),
-        ("SSHLV", "s4", "s5"),
-        ("SADD",  "s4", "s6"),
-        ("BCAST", "v6", "s4"),
-        ("VSUB",  "v5", "v5", "v5"),
-        ("VSUB",  "v5", "v5", "v6"),
-        ("MOVSI", "s5", 1),
-        ("BCAST", "v4", "s5"),
-        ("VSUB",  "v3", "v5", "v4"),
-        ("VSHLV", "v4", "v4", "v3"),
+    ] + _rmsnorm_scale() + [
         ("ARG",   "s0", 0),
         ("MOVSI", "s6", 0),             # absmax of the int16 output (quant8's pass 1).
         ("LOOPS", "s3"),
@@ -899,14 +906,11 @@ def prog_silu_q8():
     REDMAXes the clamped output it stores (quant8's first pass), then quant8's rescale
     pass runs over the int16 output. S6 = the absmax (firmware: s = quant8_shift(S6)).
       A0..A6 as prog_silu_mul, A7 = int8 dst."""
-    C_LOG2E = 739
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("ARG",   "s4", 4), ("ARG", "s6", 6),
         ("MOVSI", "s5", C_LOG2E),
-        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # v2 = 2^15
-        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10), # -15*2^15
-        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10), # 14*2^15
+    ] + _silu_consts() + [
         ("MOVSI", "s7", 0),             # absmax accumulator (quant8's pass 1).
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),
@@ -961,13 +965,10 @@ def prog_silu_gate():
     """x*sigmoid(x) of the normalized gate, int16 in place: the gate-only half of
     prog_silu_q8. A0 = gate src, A2 = dst (may equal A0), A3 = beats, A4 = shift
     (firmware: imm + kreg0, VSHLS convention). Leaves S6 = 0; nothing downstream reads it."""
-    C_LOG2E = 739
     return [
         ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
         ("MOVSI", "s5", C_LOG2E),
-        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15), # 2^15
-        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10), # -15*2^15
-        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10), # 14*2^15
+    ] + _silu_consts() + [
         ("LOOPS", "s3"),
         ("LDV",   "v0", "s0"),
         ("VMULS", "v3", "v0", "s5"),
@@ -1103,8 +1104,9 @@ def prog_spill():
         ("DONE",),
     ]
 
-
-# ISA rev 2 unrolls: two interleaved chains per iteration, chain B in v8..
+# ISA rev 2 Unrolls --------------------------------------------------------------------------------
+#
+# Two interleaved chains per iteration, chain B in v8.. (sixteen vector registers).
 # The interpreter proves them byte-identical to the single-chain programs (in place too);
 # the win is RTL-only - the second chain fills the LUT/load-use/mul stalls the first one
 # exposes at 1 IPC. emit_c() substitutes them under the same PROG_ name when VREGS == 16.
@@ -1113,10 +1115,9 @@ def prog_spill():
 # TRIXIUM_PROGS_VREGS == 16 (INT32_MIN entries emit p8 = 0: sum and AXPY unchanged).
 
 def prog_silu_q8_x2():
-    C_LOG2E = 739
     A = dict(x="v0", g="v3", sh="v4", p="v5", r="v6")
     B = dict(x="v8", g="v9", sh="v10", p="v11", r="v12")
-    def chain_pre(c):   # up to and including the LUT issue
+    def chain_pre(c):   # Up to and including the LUT issue.
         return [
             ("LDV",   c["x"], "s0"),
             ("VMULS", c["g"], c["x"], "s5"),
@@ -1127,7 +1128,7 @@ def prog_silu_q8_x2():
             ("VSHRI", c["sh"], c["g"], 15),
             ("LDV",   c["g"], "s1"),
         ]
-    def chain_mid(c):   # LUT result -> reciprocal LUT issue
+    def chain_mid(c):   # LUT result -> reciprocal LUT issue.
         return [
             ("VSHLV", c["p"], c["p"], c["sh"]),
             ("VADD",  c["r"], c["p"], "v2"),
@@ -1135,7 +1136,7 @@ def prog_silu_q8_x2():
             ("VSHLV", c["r"], c["r"], c["sh"]),
             ("LUTRECIP", c["r"], c["r"]),
         ]
-    def chain_post(c):  # reciprocal -> product -> store
+    def chain_post(c):  # Reciprocal -> product -> store.
         return [
             ("VMULH15", c["p"], c["p"], c["r"]),
             ("VSHLV",   c["p"], c["p"], c["sh"]),
@@ -1147,22 +1148,14 @@ def prog_silu_q8_x2():
             ("REDMAX",  "s7", c["x"]),
             ("STV",     c["x"], "s2"),
         ]
-    def zip2(a, b):
-        out = []
-        for i in range(max(len(a), len(b))):
-            if i < len(a): out.append(a[i])
-            if i < len(b): out.append(b[i])
-        return out
-    body = (zip2(chain_pre(A), chain_pre(B))
-            + zip2(chain_mid(A), chain_mid(B))
-            + zip2(chain_post(A), chain_post(B)))
+    body = (_zip2(chain_pre(A), chain_pre(B))
+            + _zip2(chain_mid(A), chain_mid(B))
+            + _zip2(chain_post(A), chain_post(B)))
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("ARG",   "s4", 4), ("ARG", "s6", 6),
         ("MOVSI", "s5", C_LOG2E),
-        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15),
-        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10),
-        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10),
+    ] + _silu_consts() + [
         ("MOVSI", "s7", 0),
         ("MOVSI", "s5", -1), ("SSHLV", "s3", "s5"),   # A3 /= 2 (even beat counts).
         ("MOVSI", "s5", C_LOG2E),
@@ -1191,7 +1184,6 @@ def prog_silu_q8_x2():
 
 def prog_silu_gate_x2():
     """prog_silu_gate, two interleaved chains (even beat count: ffn_dim/16 always is)."""
-    C_LOG2E = 739
     A = dict(x="v0", g="v3", sh="v4", p="v5", r="v6")
     B = dict(x="v8", g="v9", sh="v10", p="v11", r="v12")
     def chain_pre(c):
@@ -1220,20 +1212,12 @@ def prog_silu_gate_x2():
             ("VMULH15", c["x"], c["x"], c["p"]),
             ("STV",     c["x"], "s2"),
         ]
-    def zip2(a, b):
-        out = []
-        for i in range(max(len(a), len(b))):
-            if i < len(a): out.append(a[i])
-            if i < len(b): out.append(b[i])
-        return out
-    body = (zip2(chain_pre(A), chain_pre(B))
-            + zip2(chain_mid(A), chain_mid(B))
-            + zip2(chain_post(A), chain_post(B)))
+    body = (_zip2(chain_pre(A), chain_pre(B))
+            + _zip2(chain_mid(A), chain_mid(B))
+            + _zip2(chain_post(A), chain_post(B)))
     return [
         ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
-        ("MOVSI", "s7", 1),    ("BCAST", "v2", "s7"), ("VSHLI", "v2", "v2", 15),
-        ("MOVSI", "s7", -480), ("BCAST", "v1", "s7"), ("VSHLI", "v1", "v1", 10),
-        ("MOVSI", "s7", 448),  ("BCAST", "v7", "s7"), ("VSHLI", "v7", "v7", 10),
+    ] + _silu_consts() + [
         ("MOVSI", "s5", -1), ("SSHLV", "s3", "s5"),   # A3 /= 2 (even beat counts).
         ("MOVSI", "s5", C_LOG2E),
         ("LOOPS", "s3"),
@@ -1312,12 +1296,6 @@ def prog_softmax8_x2():
             ("REDSUM", "s6", c["p"]),
             ("STB",   c["p"], "s2"),
         ]
-    def zip2(a, b):
-        out = []
-        for i in range(max(len(a), len(b))):
-            if i < len(a): out.append(a[i])
-            if i < len(b): out.append(b[i])
-        return out
     return [
         ("ARG",   "s0", 0), ("ARG", "s3", 3),
         ("MOVSI", "s5", 47),
@@ -1325,7 +1303,7 @@ def prog_softmax8_x2():
         ("SSHLV", "s7", "s5"),          # smax accumulator = -2^47.
         ("MOVSI", "s5", -1), ("SSHLV", "s3", "s5"),   # blocks / 2 (even by contract).
         ("LOOPS", "s3"),
-    ] + pass1(A)[:2] + pass1(B)[:2] + zip2(pass1(A)[2:], pass1(B)[2:]) + [
+    ] + pass1(A)[:2] + pass1(B)[:2] + _zip2(pass1(A)[2:], pass1(B)[2:]) + [
         ("LOOPE",),
         ("ARG",   "s0", 0), ("ARG", "s2", 2),         # s3 still holds blocks/2.
         ("ARG",   "s4", 4), ("ARG", "s5", 5),
@@ -1341,7 +1319,7 @@ def prog_softmax8_x2():
         ("BCAST", "v3", "s4"),
         ("BCAST", "v6", "s5"),
         ("LOOPS", "s3"),
-    ] + pre(A)[:2] + pre(B)[:2] + zip2(pre(A)[2:], pre(B)[2:]) + zip2(post(A), post(B)) + [
+    ] + pre(A)[:2] + pre(B)[:2] + _zip2(pre(A)[2:], pre(B)[2:]) + _zip2(post(A), post(B)) + [
         ("LOOPE",),
         ("ARG",   "s1", 6),
         ("BCAST", "v0", "s6"),
@@ -1350,12 +1328,6 @@ def prog_softmax8_x2():
     ]
 
 def prog_rmsnorm_q8_x2():
-    def zip2(a, b):
-        out = []
-        for i in range(max(len(a), len(b))):
-            if i < len(a): out.append(a[i])
-            if i < len(b): out.append(b[i])
-        return out
     A = dict(x="v0", w="v1", y="v2"); B = dict(x="v8", w="v9", y="v10")
     def main(c):
         return [
@@ -1380,26 +1352,11 @@ def prog_rmsnorm_q8_x2():
         ("REDSSQ", "s7", "v0"),
         ("REDSSQ", "s7", "v8"),
         ("LOOPE",),
-        ("SSHLV", "s7", "s4"),
-        ("SADD",  "s7", "s5"),
-        ("SNORME", "s4", "s7"),
-        ("SSHLV", "s7", "s4"),
-        ("BCAST", "v7", "s7"),
-        ("LUTRSQRT", "v7", "v7"),
-        ("MOVSI", "s5", -1),
-        ("SSHLV", "s4", "s5"),
-        ("SADD",  "s4", "s6"),
-        ("BCAST", "v6", "s4"),
-        ("VSUB",  "v5", "v5", "v5"),
-        ("VSUB",  "v5", "v5", "v6"),
-        ("MOVSI", "s5", 1),
-        ("BCAST", "v4", "s5"),
-        ("VSUB",  "v3", "v5", "v4"),
-        ("VSHLV", "v4", "v4", "v3"),
+    ] + _rmsnorm_scale() + [
         ("ARG",   "s0", 0),
         ("MOVSI", "s6", 0),
         ("LOOPS", "s3"),
-    ] + main(A)[:2] + main(B)[:2] + zip2(main(A)[2:], main(B)[2:]) + [
+    ] + main(A)[:2] + main(B)[:2] + _zip2(main(A)[2:], main(B)[2:]) + [
         ("LOOPE",),
         ("BCAST", "v1", "s6"),
         ("VCLZN", "v1", "v1"),
@@ -1421,12 +1378,6 @@ def prog_rmsnorm_q8_x2():
     ]
 
 def prog_rmsnorm_h_x2():
-    def zip2(a, b):
-        out = []
-        for i in range(max(len(a), len(b))):
-            if i < len(a): out.append(a[i])
-            if i < len(b): out.append(b[i])
-        return out
     A = dict(m="v0", w="v1", o="v2"); B = dict(m="v8", w="v9", o="v10")
     def p2(c):
         return [
@@ -1451,36 +1402,14 @@ def prog_rmsnorm_h_x2():
         ("REDSSQ", "s7", "v0"),
         ("REDSSQ", "s7", "v8"),
         ("LOOPE",),
-        ("SSHLV", "s7", "s4"),
-        ("SADD",  "s7", "s5"),
-        ("SNORME", "s4", "s7"),
-        ("SSHLV", "s7", "s4"),
-        ("BCAST", "v7", "s7"),
-        ("LUTRSQRT", "v7", "v7"),
-        ("MOVSI", "s5", -1),
-        ("SSHLV", "s4", "s5"),
-        ("SADD",  "s4", "s6"),
-        ("BCAST", "v6", "s4"),
-        ("VSUB",  "v5", "v5", "v5"),
-        ("VSUB",  "v5", "v5", "v6"),
-        ("MOVSI", "s5", 1),
-        ("BCAST", "v4", "s5"),
-        ("VSUB",  "v3", "v5", "v4"),
-        ("VSHLV", "v4", "v4", "v3"),
+    ] + _rmsnorm_scale() + [
         ("SMOV",  "s6", "s2"),
         ("LOOPS", "s3"),
-    ] + p2(A)[:2] + p2(B)[:2] + zip2(p2(A)[2:], p2(B)[2:]) + [
+    ] + p2(A)[:2] + p2(B)[:2] + _zip2(p2(A)[2:], p2(B)[2:]) + [
         ("LOOPE",),
         ("LOOPE2",),
         ("DONE",),
     ]
-
-def _zip2(a, b):
-    out = []
-    for i in range(max(len(a), len(b))):
-        if i < len(a): out.append(a[i])
-        if i < len(b): out.append(b[i])
-    return out
 
 def prog_rope_h_x2():
     A = dict(x0="v0", x1="v1", c="v2", s="v3", t0="v4", t1="v5", t2="v6")
@@ -1540,10 +1469,18 @@ def prog_kvpack_h_x2():
         ("DONE",),
     ]
 
-UNROLL16 = {"silu_q8": prog_silu_q8_x2, "softmax8": prog_softmax8_x2,
-            "rmsnorm_q8": prog_rmsnorm_q8_x2, "rmsnorm_h": prog_rmsnorm_h_x2,
-            "rope_h": prog_rope_h_x2, "kvpack_h": prog_kvpack_h_x2,
-            "silu_gate": prog_silu_gate_x2, "mul_q8": prog_mul_q8_x2}
+UNROLL16 = {
+    "silu_q8"    : prog_silu_q8_x2,
+    "softmax8"   : prog_softmax8_x2,
+    "rmsnorm_q8" : prog_rmsnorm_q8_x2,
+    "rmsnorm_h"  : prog_rmsnorm_h_x2,
+    "rope_h"     : prog_rope_h_x2,
+    "kvpack_h"   : prog_kvpack_h_x2,
+    "silu_gate"  : prog_silu_gate_x2,
+    "mul_q8"     : prog_mul_q8_x2,
+}
+
+# Gated DeltaNet Programs --------------------------------------------------------------------------
 
 def prog_dn_a():
     """Gated DeltaNet, pass A of a value head (trixium/model/deltanet.py): per row the
@@ -1639,35 +1576,40 @@ def prog_dn_b():
         ("DONE",),
     ]
 
+# Program Table ------------------------------------------------------------------------------------
+
+# Order is the firmware ABI: emit_c() places the programs in this order (PROG_<NAME> offsets).
 PROGRAMS = {
-    "resid_add":  prog_resid_add,
-    "quant8":     prog_quant8,
-    "norm_i32":   prog_norm_i32,
-    "silu_mul":   prog_silu_mul,
-    "rmsnorm":    prog_rmsnorm,
-    "softmax8":   prog_softmax8,
-    "reduce_acc": prog_reduce_acc,
-    "rope":       prog_rope,
-    "scale8":     prog_scale8,
-    "spill":      prog_spill,
-    "rmsnorm_h":  prog_rmsnorm_h,
-    "rope_h":     prog_rope_h,
-    "kvpack_h":   prog_kvpack_h,
-    "rmsnorm_q8": prog_rmsnorm_q8,
-    "silu_q8":    prog_silu_q8,
-    "silu_gate":  prog_silu_gate,   # FFN split: gate half, runs under the up stream.
-    "mul_q8":     prog_mul_q8,      # FFN split: up-dependent tail (silu_q8's tail).
-    "nopd": prog_nopd,
-    "dn_a": prog_dn_a,              # Gated DeltaNet recurrence, pass A (deltanet.py).
-    "dn_b": prog_dn_b,              # pass B.
+    "resid_add"  : prog_resid_add,
+    "quant8"     : prog_quant8,
+    "norm_i32"   : prog_norm_i32,
+    "silu_mul"   : prog_silu_mul,
+    "rmsnorm"    : prog_rmsnorm,
+    "softmax8"   : prog_softmax8,
+    "reduce_acc" : prog_reduce_acc,
+    "rope"       : prog_rope,
+    "scale8"     : prog_scale8,
+    "spill"      : prog_spill,
+    "rmsnorm_h"  : prog_rmsnorm_h,
+    "rope_h"     : prog_rope_h,
+    "kvpack_h"   : prog_kvpack_h,
+    "rmsnorm_q8" : prog_rmsnorm_q8,
+    "silu_q8"    : prog_silu_q8,
+    "silu_gate"  : prog_silu_gate, # FFN split: gate half, runs under the up stream.
+    "mul_q8"     : prog_mul_q8,    # FFN split: up-dependent tail (silu_q8's tail).
+    "nopd"       : prog_nopd,
+    "dn_a"       : prog_dn_a,      # Gated DeltaNet recurrence, pass A (deltanet.py).
+    "dn_b"       : prog_dn_b,      # Pass B.
 }
+
+# Emit ---------------------------------------------------------------------------------------------
 
 def emit_c(out):
     """Emit firmware/progs.h with assembled program words + entry offsets."""
     lines = ["// Generated by trixium.model.asm - do not edit.", "#pragma once",
              "#include <stdint.h>", ""]
     all_words = []
-    offsets = {}
+    offsets   = {}
     lines.append(f"#define TRIXIUM_PROGS_VREGS {VREGS}")
     for name, fn in PROGRAMS.items():
         offsets[name] = len(all_words)
@@ -1684,12 +1626,21 @@ def emit_c(out):
     for name, off in offsets.items():
         lines.append(f"#define PROG_{name.upper()} {off}")
     lines.append("")
-    with open(out, "w") as f:
+    with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-if __name__ == "__main__":
-    argv = sys.argv[1:]
-    if "--vregs" in argv:                       # python -m ... progs.h --vregs 8|16
-        i = argv.index("--vregs"); set_vregs(int(argv[i + 1])); del argv[i:i + 2]
-    emit_c(argv[0] if argv else "firmware/progs.h")
+# Run ----------------------------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Assemble the vector unit programs into a C header.")
+    parser.add_argument("out",     nargs="?", default="firmware/progs.h", help="Output header.")
+    parser.add_argument("--vregs", type=int,  default=None, choices=(8, 16), help="Vector register count (encoding).")
+    args = parser.parse_args()
+
+    if args.vregs is not None:
+        set_vregs(args.vregs)
+    emit_c(args.out)
     print(f"emitted (VREGS={VREGS})")
+
+if __name__ == "__main__":
+    main()

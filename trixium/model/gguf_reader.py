@@ -40,8 +40,8 @@ GGML_TYPE_NAMES = {
      8: "Q8_0",    9: "Q8_1",   10: "Q2_K",  11: "Q3_K",  12: "Q4_K", 13: "Q5_K",
     14: "Q6_K",   15: "Q8_K",   24: "I8",    25: "I16",   26: "I32",  27: "I64",
     28: "F64",    30: "BF16",   34: "TQ1_0", 35: "TQ2_0",
-    # PrismML fork (prism branch): 41/42 the original 1-bit/2-bit g128 blocks (42 became
-    # upstream's g64 Q2_0 in 2026-06), 142/143 the g128 2-bit and dense-trit blocks.
+    # PrismML fork (prism branch): 41/42 the original 1-bit/2-bit g128 blocks (42 is now
+    # upstream's g64 Q2_0), 142/143 the g128 2-bit and dense-trit blocks.
     41: "Q1_0",   42: "Q2_0",    142: "PQ2_0", 143: "PTQ1_0",
 }
 
@@ -129,7 +129,7 @@ class GGUFReader:
 
     def _parse(self):
         self._pos = 0
-        magic     = self._u32()
+        magic = self._u32()
         assert magic == GGUF_MAGIC, f"not a GGUF file: magic {magic:#x}"
         version = self._u32()
         assert version >= 2, f"unsupported GGUF version {version}"
@@ -141,7 +141,7 @@ class GGUFReader:
             key   = self._string()
             vtype = self._u32()
             if key in self.metadata:
-                raise ValueError(f'duplicate GGUF metadata key: {key}')
+                raise ValueError(f"duplicate GGUF metadata key: {key}")
             self.metadata[key] = self._value(vtype)
 
         # Tensor infos.
@@ -169,7 +169,7 @@ class GGUFReader:
                 end = file_size
             nbytes = end - (self.data_start + offset)
             if name in self.tensors:
-                raise ValueError(f'duplicate GGUF tensor name: {name}')
+                raise ValueError(f"duplicate GGUF tensor name: {name}")
             self.tensors[name] = GGUFTensor(name, shape, type_id, self.data_start + offset, nbytes)
 
     def tensor_bytes(self, name):
@@ -177,7 +177,7 @@ class GGUFReader:
         t = self.tensors[name]
         return self._data[t.file_offset:t.file_offset+t.nbytes]
 
-# Inspect CLI --------------------------------------------------------------------------------------
+# Inspect ------------------------------------------------------------------------------------------
 
 def inspect(path, show_metadata=True):
     r = GGUFReader(path)
@@ -194,7 +194,8 @@ def inspect(path, show_metadata=True):
     print(f"  {'tensor':44s} {'type':8s} {'shape':20s} {'bytes':>12s} {'bpw':>6s}")
     types = {}
     for t in r.tensors.values():
-        print(f"  {t.name:44s} {t.type_name:8s} {str(t.shape):20s} {t.nbytes:12d} {t.bits_per_weight:6.3f}")
+        print(f"  {t.name:44s} {t.type_name:8s} {str(t.shape):20s} {t.nbytes:12d} "
+              f"{t.bits_per_weight:6.3f}")
         types.setdefault(t.type_name, [0, 0])
         types[t.type_name][0] += 1
         types[t.type_name][1] += t.nbytes
@@ -203,6 +204,11 @@ def inspect(path, show_metadata=True):
         print(f"  {name:10s} {count:4d} tensors {nbytes/1e6:10.1f} MB")
     return r
 
-if __name__ == "__main__":
+# Run ----------------------------------------------------------------------------------------------
+
+def main():
     for f in sys.argv[1:]:
         inspect(f)
+
+if __name__ == "__main__":
+    main()

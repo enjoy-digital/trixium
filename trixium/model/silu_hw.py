@@ -32,17 +32,19 @@ no host floating point on the checked path. `silu_mul_fast` is what the RTL impl
 stage for stage; `silu_mul_firmware` is what the CPU computes; the contract, tested in
 test/test_silu_hw.py, is that they agree on every element the fast path does not flag.
 """
+
 from functools import lru_cache
 
 import numpy as np
 
 from trixium.model import rv32_math
 
-F32_ONE = 0x3F800000
-F32_16 = 0x41800000
-F32_NEG_ZERO = 0x80000000
-LUT_N = 4096          # 2 * 16 * 128 intervals, 4,097 points
+# Constants ----------------------------------------------------------------------------------------
 
+F32_16       = 0x41800000
+F32_80       = 0x42A00000
+F32_NEG_ZERO = 0x80000000
+LUT_N        = 4096 # 2 * 16 * 128 intervals, 4,097 points.
 
 # Exact binary32 <-> (sign, integer significand, power of two) -------------------------------------
 
@@ -55,7 +57,6 @@ def decode(bits):
     if exp == 0:
         return sign, frac, -149, "zero" if frac == 0 else "subnormal"
     return sign, frac | 0x800000, exp - 150, "normal"
-
 
 def round_to_f32(sign, n, e):
     """RNE rounding of the exact value (-1)**sign * n * 2**e (n >= 0) to binary32 bits.
@@ -74,23 +75,21 @@ def round_to_f32(sign, n, e):
             q += 1
     else:
         q = n << (-shift)
-    if q >= 1 << 24:                    # the rounding carried into a new binade
+    if q >= 1 << 24:                    # The rounding carried into a new binade.
         q >>= 1
         ulp_e += 1
-    if q < 1 << 23:                     # subnormal (only possible at ulp_e == -149)
+    if q < 1 << 23:                     # Subnormal (only possible at ulp_e == -149).
         return (sign << 31) | q
     biased = ulp_e + 150
     if biased >= 0xFF:
         return (sign << 31) | 0x7F800000
     return (sign << 31) | (biased << 23) | (q & 0x7FFFFF)
 
-
 def _exact(bits):
     sign, n, e, kind = decode(bits)
     if kind in ("nan", "inf"):
         raise ValueError("exact arithmetic needs finite operands")
     return sign, n, e
-
 
 def _sum(terms):
     """Exact signed sum of (sign, n, e) terms -> (sign, magnitude, e); zero sign by RNE rules."""
@@ -102,20 +101,16 @@ def _sum(terms):
         return (1 if signs == {1} else 0), 0, base
     return (1 if total < 0 else 0), abs(total), base
 
-
 def f32_add(a, b):
     return round_to_f32(*_sum([_exact(a), _exact(b)]))
 
-
 def f32_sub(a, b):
     return f32_add(a, b ^ 0x80000000)
-
 
 def f32_mul(a, b):
     sa, na, ea = _exact(a)
     sb, nb, eb = _exact(b)
     return round_to_f32(sa ^ sb, na * nb, ea + eb)
-
 
 def f32_fma(a, b, c):
     """a*b + c with a single rounding."""
@@ -123,14 +118,11 @@ def f32_fma(a, b, c):
     sb, nb, eb = _exact(b)
     return round_to_f32(*_sum([(sa ^ sb, na * nb, ea + eb), _exact(c)]))
 
-
 def f32_bits(x):
     return int(np.float32(x).view(np.uint32))
 
-
 def bits_f32(b):
     return np.uint32(b).view(np.float32)
-
 
 # Tables -------------------------------------------------------------------------------------------
 
@@ -138,10 +130,9 @@ def bits_f32(b):
 def tables():
     """(lut, dlut) as tuples of bits. lut is the firmware's table (rv32_math.silu_table,
     checked against the target libm); dlut[i] = lut[i+1] - lut[i] for i < 4096."""
-    lut = tuple(f32_bits(v) for v in rv32_math.silu_table())
+    lut  = tuple(f32_bits(v) for v in rv32_math.silu_table())
     dlut = tuple(f32_sub(lut[i + 1], lut[i]) for i in range(LUT_N))
     return lut, dlut
-
 
 # The two sides of the contract --------------------------------------------------------------------
 
@@ -149,7 +140,6 @@ def silu_mul_firmware(g, m):
     """What hybrid.c computes for finite inputs: mul * siluf(gate), as bits."""
     s = f32_bits(rv32_math.silu_rv32([bits_f32(g)])[0])
     return f32_mul(m, s)
-
 
 def silu_mul_fast(g, m, lut=None, dlut=None):
     """The hardware fast path: (result bits, fixup). The result is meaningless when fixup."""
@@ -163,7 +153,7 @@ def silu_mul_fast(g, m, lut=None, dlut=None):
     if mag >= F32_16:                               # |g| >= 16
         if not gs and mag > F32_16:
             s = g                                   # g > 16: siluf returns g itself
-        elif gs and mag > 0x42A00000:               # g < -80: siluf returns -0.0
+        elif gs and mag > F32_80:                   # g < -80: siluf returns -0.0
             s = F32_NEG_ZERO
         else:
             return 0, True                          # -80 <= g <= -16 or g == 16: polynomial
@@ -194,7 +184,6 @@ def silu_mul_fast(g, m, lut=None, dlut=None):
         return 0, True                              # underflow of a nonzero product
     return r, False
 
-
 # The RTL's arithmetic structure -------------------------------------------------------------------
 #
 # In the table range the FP32 sum a = RNE(g + 16) is always a multiple of 2**-20: on
@@ -216,7 +205,6 @@ def rne_scale(n, k):
     q, rem, half = n >> s, n & ((1 << s) - 1), 1 << (s - 1)
     return q + (1 if rem > half or (rem == half and q & 1) else 0)
 
-
 def add16_fixed(g):
     """a20 = RNE_f32(g + 16) * 2**20 for |g| < 16 (finite)."""
     sign, n, e, kind = decode(g)
@@ -226,13 +214,11 @@ def add16_fixed(g):
         return ((1 << 23) + rne_scale(n, e + 19)) << 1
     return (1 << 24) - rne_scale(n, e + 20)        # a in (0, 16]: grid 2**-20 (exact below 8)
 
-
 def fma_fixed(F, d, c):
     """RNE_f32(F * 2**-13 * d + c) for a 13-bit F and table words d, c (normal or zero)."""
     ds, dn, de, _ = decode(d)
     cs, cn, ce, _ = decode(c)
     return round_to_f32(*_sum([(ds, F * dn, de - 13), (cs, cn, ce)]))
-
 
 def classify(g, m):
     """The kernel's first stage: 'table', 'pass' (s = g), 'negzero' (s = -0.0) or 'fixup'."""
@@ -245,10 +231,9 @@ def classify(g, m):
         return "table"
     if not neg and mag > F32_16:
         return "pass"
-    if neg and mag > 0x42A00000:
+    if neg and mag > F32_80:
         return "negzero"
     return "fixup"
-
 
 def silu_mul_fixed(g, m, lut=None, dlut=None, table_only=False):
     """silu_mul_fast restructured as the RTL computes it: (result bits, fixup).

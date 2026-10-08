@@ -13,6 +13,7 @@ actual target archive under QEMU, and against compiled full-SoC checkpoints.
 Other target libms/ABIs must be qualified separately. Only finite exp inputs in
 [-80, 80] are modeled; SiLU accepts all finite FP32 inputs.
 """
+
 import ctypes
 import ctypes.util
 from functools import lru_cache
@@ -21,29 +22,39 @@ import numpy as np
 
 f32 = np.float32
 
+# FP32 Helpers -------------------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def _host_fmaf():
-    # FMA must round ONCE to FP32. float64 a*b+c followed by float32 can double
-    # round. IEEE libm fmaf supplies the primitive, not the target exp algorithm.
+    # FMA must round ONCE to FP32: float64 a*b+c followed by float32 can double round.
+    # The host libm fmaf supplies the primitive, not the target exp algorithm.
     library = ctypes.util.find_library("m")
     fn = ctypes.CDLL(library).fmaf
     fn.argtypes = (ctypes.c_float, ctypes.c_float, ctypes.c_float)
     fn.restype = ctypes.c_float
     return fn
 
-
 def fma32(a, b, c):
     return f32(_host_fmaf()(float(a), float(b), float(c)))
-
 
 def _bits(x):
     return int(f32(x).view(np.uint32))
 
-
 def _word(x):
     return np.uint32(x).view(f32)
 
+def _table_interp(table, x):
+    """Fused linear interpolation of a 4,097-point table over [-16, 16] (step 1/128)."""
+    u = f32(f32(x + f32(16))*f32(128))
+    i = int(u)
+    # The final finite interior x can round u to the endpoint. Match the firmware's bounds
+    # fix, without accessing table[4097].
+    if i >= 4096:
+        return table[4096]
+    f = f32(u - f32(i))
+    return fma32(f, f32(table[i + 1] - table[i]), table[i])
+
+# Exp ----------------------------------------------------------------------------------------------
 
 # expf's approximation/reduction is adapted from SunPro fdlibm/newlib ef_exp.c,
 # with fusion and the small-input cutoff following the actual target archive.
@@ -82,7 +93,6 @@ def expf_rv32(x):
     # The bounded domain above keeps this a normal result, as in the target.
     return _word(_bits(y) + (k << 23))
 
-
 def expf_bounded(x):
     """firmware/fastmath.h, with explicit fused polynomial stages only."""
     x = f32(x)
@@ -98,6 +108,7 @@ def expf_bounded(x):
         p = fma32(p, r, f32(float.fromhex(c)))
     return f32(p*_word((n + 127) << 23))
 
+# SiLU ---------------------------------------------------------------------------------------------
 
 def silu_polynomial(x):
     x = f32(x)
@@ -111,7 +122,6 @@ def silu_polynomial(x):
         return f32(x*expf_bounded(x))
     return f32(x/f32(f32(1) + expf_bounded(-x)))
 
-
 @lru_cache(maxsize=1)
 def silu_table():
     table = np.empty(4097, dtype=f32)
@@ -121,11 +131,10 @@ def silu_table():
     table.flags.writeable = False
     return table
 
-
 def silu_rv32(values):
     """The baseline hybrid.c LUT, fused interpolation, and polynomial tails."""
     values = np.asarray(values, dtype=f32)
-    table = silu_table()
+    table  = silu_table()
     result = np.empty_like(values)
     for index in np.ndindex(values.shape):
         x = values[index]
@@ -134,23 +143,16 @@ def silu_rv32(values):
         if x >= 16 or x <= -16:
             result[index] = silu_polynomial(x)
         else:
-            u = f32(f32(x + f32(16))*f32(128))
-            i = int(u)
-            # The final finite interior x can round u to the endpoint. Match the
-            # firmware's bounds fix, without accessing table[4097].
-            if i >= 4096:
-                result[index] = table[4096]
-                continue
-            f = f32(u - f32(i))
-            result[index] = fma32(f, f32(table[i + 1] - table[i]), table[i])
+            result[index] = _table_interp(table, x)
     return result
 
+# Sigmoid ------------------------------------------------------------------------------------------
 
 # Canonical sigmoid (firmware/fastmath.h trixium_sigmoid_*): the SiLU lookup's form on a
 # sigmoid table; table and tails from the bounded exp, never libm expf.
+
 def sigmoid_point(x):
     return f32(f32(1)/f32(f32(1) + expf_bounded(-f32(x))))
-
 
 def sigmoid_tail(x):
     x = f32(x)
@@ -163,6 +165,29 @@ def sigmoid_tail(x):
     e = expf_bounded(x)
     return f32(e/f32(f32(1) + e))
 
+@lru_cache(maxsize=1)
+def sigmoid_table():
+    table = np.empty(4097, dtype=f32)
+    for i in range(len(table)):
+        table[i] = sigmoid_point(f32(-16 + i/128))
+    table.flags.writeable = False
+    return table
+
+def sigmoid_rv32(values):
+    values = np.asarray(values, dtype=f32)
+    table  = sigmoid_table()
+    result = np.empty_like(values)
+    for index in np.ndindex(values.shape):
+        x = values[index]
+        if not np.isfinite(x):
+            raise ValueError("sigmoid reference requires finite input")
+        if x >= 16 or x <= -16:
+            result[index] = sigmoid_tail(x)
+        else:
+            result[index] = _table_interp(table, x)
+    return result
+
+# Softmax ------------------------------------------------------------------------------------------
 
 def softmax_exp_rv32(values):
     """Canonical softmax exp (firmware/fastmath.h trixium_softmax_exp): the bounded exp on
@@ -178,33 +203,3 @@ def softmax_exp_rv32(values):
         else:
             out[index] = expf_bounded(x)
     return out
-
-
-@lru_cache(maxsize=1)
-def sigmoid_table():
-    table = np.empty(4097, dtype=f32)
-    for i in range(len(table)):
-        table[i] = sigmoid_point(f32(-16 + i/128))
-    table.flags.writeable = False
-    return table
-
-
-def sigmoid_rv32(values):
-    values = np.asarray(values, dtype=f32)
-    table = sigmoid_table()
-    result = np.empty_like(values)
-    for index in np.ndindex(values.shape):
-        x = values[index]
-        if not np.isfinite(x):
-            raise ValueError("sigmoid reference requires finite input")
-        if x >= 16 or x <= -16:
-            result[index] = sigmoid_tail(x)
-            continue
-        u = f32(f32(x + f32(16))*f32(128))
-        i = int(u)
-        if i >= 4096:
-            result[index] = table[4096]
-            continue
-        f = f32(u - f32(i))
-        result[index] = fma32(f, f32(table[i + 1] - table[i]), table[i])
-    return result

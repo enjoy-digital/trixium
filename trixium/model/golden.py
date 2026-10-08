@@ -12,7 +12,7 @@ Two references live here:
   llama.cpp fork's semantics (neox RoPE with YaRN, per-head Q/K RMSNorm, GQA, SwiGLU). Used to
   validate GGUF/BONS parsing and as the quality baseline.
 
-- BitExactModel (see bitexact.py): the integer/fixed-point specification the RTL implements,
+- The bit-exact model (bitexact.py): the integer/fixed-point specification the RTL implements,
   validated against FloatModel.
 
 CLI smoke test:
@@ -25,11 +25,11 @@ import argparse
 
 import numpy as np
 
-from trixium.model.gguf_reader import GGUFReader
-from trixium.model.configs import ModelConfig, CONFIGS
 from trixium.model import qformats
+from trixium.model.configs import ModelConfig
+from trixium.model.gguf_reader import GGUFReader
 
-# GGUF loading -------------------------------------------------------------------------------------
+# GGUF Config --------------------------------------------------------------------------------------
 
 # The GGUF architectures the geometry reader understands. qwen3: the Ternary-Bonsai 1.7B and
 # 8B. qwen35 (llama.cpp's name for Qwen3.5; qwen3next is the same family): Bonsai 2, the 27B -
@@ -47,10 +47,12 @@ def config_from_gguf(reader):
     md   = reader.metadata
     arch = md["general.architecture"]
     assert arch in GGUF_ARCHS, f"unsupported architecture {arch} (known: {GGUF_ARCHS})"
-    g = lambda k, default=None: md.get(f"{arch}.{k}", default)
+    def g(k, default=None):
+        return md.get(f"{arch}.{k}", default)
     vocab = reader.tensors["token_embd.weight"].shape[0]
-    name = md.get("general.basename", arch).lower()
-    if name in ("folded", "hf", "") and md.get("general.size_label"):   # the 27B file says "folded"
+    name  = md.get("general.basename", arch).lower()
+    # The 27B file's basename is "folded": name it from its size label.
+    if name in ("folded", "hf", "") and md.get("general.size_label"):
         name = f"bonsai-{md['general.size_label'].lower()}"
     cfg = ModelConfig(
         name           = name,
@@ -80,17 +82,21 @@ def config_from_gguf(reader):
         # The attention layers' q projection is [q | gate] (2 x n_head x head_dim rows):
         # the file says so through its shape, so read it from the first attention layer.
         first_attn = next((l for l in range(cfg.n_layer) if cfg.layer_types[l] == "attn"), None)
-        if first_attn is not None and f"blk.{first_attn}.attn_q.weight" in reader.tensors:
-            cfg.attn_gated = reader.tensors[f"blk.{first_attn}.attn_q.weight"].shape[0] == 2*cfg.q_dim
+        attn_q     = f"blk.{first_attn}.attn_q.weight"
+        if first_attn is not None and attn_q in reader.tensors:
+            cfg.attn_gated = reader.tensors[attn_q].shape[0] == 2*cfg.q_dim
     if md.get("prism.hadamard.block_size"):
         assert md.get("prism.hadamard.transform") == "normalized-sylvester-walsh-hadamard", \
             md.get("prism.hadamard.transform")
         assert md.get("prism.hadamard.axis") == "input-last-dimension"
         cfg.hadamard_block = int(md["prism.hadamard.block_size"])
-        widths, signs, pos = md["prism.hadamard.sign_widths"], md["prism.hadamard.sign_values"], 0
+        widths = md["prism.hadamard.sign_widths"]
+        signs  = md["prism.hadamard.sign_values"]
+        pos    = 0
         cfg.hadamard_signs = {}
         for w in widths:
-            cfg.hadamard_signs[int(w)] = tuple(int(s) for s in signs[pos:pos + int(w)]); pos += int(w)
+            cfg.hadamard_signs[int(w)] = tuple(int(s) for s in signs[pos:pos + int(w)])
+            pos += int(w)
         assert pos == len(signs), (pos, len(signs))
     return cfg
 
@@ -100,6 +106,8 @@ def check_engine_support(cfg):
         if dim % 128:
             raise SystemExit(f"{cfg.name}: {name} = {dim} is not a multiple of the 128-wide "
                              f"ternary group")
+
+# Lazy Ternary Matrices ----------------------------------------------------------------------------
 
 class LazyTernary:
     """A ternary matrix kept as its int8 codes and fp16 scales (1 byte per weight instead of
@@ -112,28 +120,32 @@ class LazyTernary:
         self.codes  = codes.reshape(shape[0], shape[1])                     # uint8 {0,1,2}
         self.T      = _LazyT(self)
 
-    def __getitem__(self, idx):        # embedding lookup: rows -> fp32
+    def __getitem__(self, idx):        # Embedding lookup: rows -> fp32.
         rows = np.atleast_1d(np.asarray(idx))
         c = self.codes[rows].astype(np.float32).reshape(len(rows), -1, 128) - 1.0
         out = (c*self.scales[rows][:, :, None]).reshape(len(rows), self.shape[1])
         return out if np.ndim(idx) else out[0]
 
 class _LazyT:
-    __array_ufunc__ = None            # so ndarray @ this defers to __rmatmul__
+    __array_ufunc__ = None # So ndarray @ this defers to __rmatmul__.
+
     def __init__(self, m):
         self.m = m
+
     def __rmatmul__(self, x):          # x @ W.T  ->  (.., rows)
         m = self.m
         x = np.asarray(x, dtype=np.float32)
         xs = x.reshape(-1, m.shape[1])                                     # (P, cols)
         out = np.empty((xs.shape[0], m.shape[0]), dtype=np.float32)
-        step = max(1, (64 << 20)//(m.shape[1]*4))                          # 64 MB of fp32 rows
+        step = max(1, (64 << 20)//(m.shape[1]*4))                          # 64 MB of fp32 rows.
         for r0 in range(0, m.shape[0], step):
             r1 = min(m.shape[0], r0 + step)
             w = (m.codes[r0:r1].astype(np.float32).reshape(r1 - r0, -1, 128) - 1.0) \
                 * m.scales[r0:r1][:, :, None]
             out[:, r0:r1] = xs @ w.reshape(r1 - r0, m.shape[1]).T
         return out.reshape(*x.shape[:-1], m.shape[0])
+
+# GGUF Loading (fp32) ------------------------------------------------------------------------------
 
 def load_gguf_f32(path, lazy=False):
     """Load a GGUF file -> (config, dict name -> fp32 ndarray with GGUF logical shape).
@@ -145,13 +157,17 @@ def load_gguf_f32(path, lazy=False):
         dequant = qformats.DEQUANT.get(t.type_id)
         assert dequant is not None, f"no dequant for {name} type {t.type_id}"
         raw = reader.tensor_bytes(name)
-        if t.type_id == qformats.GGML_Q2_0 and qformats.q2_0_group(raw, int(np.prod(t.shape))) != 128:
+        is_q2_0 = t.type_id == qformats.GGML_Q2_0
+        if is_q2_0 and qformats.q2_0_group(raw, int(np.prod(t.shape))) != 128:
             raise NotImplementedError(f"{name}: a group-64 Q2_0 file - use the PQ2_0 (g128) file")
         if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_PQ2_0, qformats.GGML_PTQ1_0):
             # In place: the generic dequant's float temporaries (codes - 1, times the
             # broadcast scales) double the 8B's 2.5 GB embedding table three times over, and
             # the whole 33 GB model would not fit in memory.
-            unpack = qformats.ptq1_0_unpack if t.type_id == qformats.GGML_PTQ1_0 else qformats.q2_0_unpack
+            if t.type_id == qformats.GGML_PTQ1_0:
+                unpack = qformats.ptq1_0_unpack
+            else:
+                unpack = qformats.q2_0_unpack
             scales, codes = unpack(raw)
             if lazy:
                 tensors[name] = LazyTernary(scales, codes, t.shape)
@@ -183,8 +199,10 @@ def rope_tables(cfg, positions, dtype=np.float32):
     theta_extrap = p*np.power(cfg.rope_theta, -2.0*d/n_dims)
     theta_interp = freq_scale*theta_extrap
     if ext_factor != 0.0:
-        low  = max(0.0, math.floor(_yarn_corr_dim(n_dims, cfg.yarn_orig_ctx, 32.0, cfg.rope_theta)))
-        high = min(n_dims - 1.0, math.ceil(_yarn_corr_dim(n_dims, cfg.yarn_orig_ctx, 1.0, cfg.rope_theta)))
+        corr_fast = _yarn_corr_dim(n_dims, cfg.yarn_orig_ctx, 32.0, cfg.rope_theta)
+        corr_slow = _yarn_corr_dim(n_dims, cfg.yarn_orig_ctx,  1.0, cfg.rope_theta)
+        low  = max(0.0, math.floor(corr_fast))
+        high = min(n_dims - 1.0, math.ceil(corr_slow))
         # ggml's ramp is indexed by pair index (i0/2 with i0 stepping by 2).
         y        = (d - low)/max(0.001, high - low)
         ramp     = (1.0 - np.minimum(1.0, np.maximum(0.0, y)))*ext_factor
@@ -203,7 +221,7 @@ def apply_rope_neox(x, cos, sin):
     s  = sin[:, None, :]
     return np.concatenate([x0*c - x1*s, x0*s + x1*c], axis=-1)
 
-# Float model --------------------------------------------------------------------------------------
+# Float Ops ----------------------------------------------------------------------------------------
 
 def rmsnorm(x, w, eps):
     return x/np.sqrt(np.mean(x*x, axis=-1, keepdims=True) + eps)*w
@@ -227,14 +245,17 @@ def l2norm(x, eps):
     n = np.sqrt(np.sum(x*x, axis=-1, keepdims=True))
     return x/np.maximum(n, eps)
 
+# Hadamard Rotation --------------------------------------------------------------------------------
+
 # PrismML's rotated weight basis (the 27B). R is the natural-order Sylvester Walsh-Hadamard
 # matrix of the block, R[i][j] = (-1)^popcount(i & j) / sqrt(block) - symmetric and its own
 # inverse. A folded weight W' = W R diag(s) is applied as y = W' (R (s * x)), blockwise on
 # the input dimension; a folded embedding table stores z = R diag(s) e... and is restored as
 # e = s * (R z) after the lookup. Exactly llama.cpp's fork (llama-graph.cpp).
+
 def hadamard_matrix(block):
-    i = np.arange(block)
-    par = np.bitwise_and(i[:, None], i[None, :])
+    i    = np.arange(block)
+    par  = np.bitwise_and(i[:, None], i[None, :])
     bits = np.zeros_like(par)
     while par.any():
         bits ^= par & 1
@@ -243,15 +264,17 @@ def hadamard_matrix(block):
 
 def hadamard_rotate(x, signs, block):
     """x' = R (s * x) per block over the last axis (the projection-input transform)."""
-    R = hadamard_matrix(block)
+    R  = hadamard_matrix(block)
     xs = (x*np.asarray(signs, dtype=np.float32)).reshape(*x.shape[:-1], -1, block)
     return (xs @ R.T).reshape(x.shape)
 
 def hadamard_restore(z, signs, block):
     """e = s * (R z) per block (the embedding table's inverse-after-lookup)."""
-    R = hadamard_matrix(block)
+    R  = hadamard_matrix(block)
     zr = z.reshape(*z.shape[:-1], -1, block) @ R.T
     return zr.reshape(z.shape)*np.asarray(signs, dtype=np.float32)
+
+# Float Model --------------------------------------------------------------------------------------
 
 class FloatModel:
     """fp32 forward pass of the Qwen3 models (the 1.7B/8B) and of the Qwen3.5 hybrid (the
@@ -259,10 +282,9 @@ class FloatModel:
     basis). Tensor dict uses GGUF names/shapes."""
 
     def __init__(self, cfg, tensors):
-        self.cfg = cfg
-        self.t   = tensors
+        self.cfg      = cfg
+        self.t        = tensors
         self.head_out = tensors.get("output.weight", tensors["token_embd.weight"])
-        # A lazy (codes + scales) embedding table: rows are dequantized on lookup.
         self.reset()
 
     def reset(self):
@@ -362,9 +384,9 @@ class FloatModel:
         nq = nk*hk
         qkv   = self._proj(h, p+"attn_qkv.weight")                    # (P, 2 nq + nv hv)
         z     = self._proj(h, p+"attn_gate.weight").reshape(P, nv, hv)
-        beta  = sigmoid(h @ self.t[p+"ssm_beta.weight"].T)             # (P, nv)  not folded
+        beta  = sigmoid(h @ self.t[p+"ssm_beta.weight"].T)             # (P, nv), not folded.
         alpha = h @ self.t[p+"ssm_alpha.weight"].T                     # (P, nv)
-        g     = softplus(alpha + self.t[p+"ssm_dt.bias"])*self.t[p+"ssm_a"]   # ssm_a = -exp(A_log)
+        g     = softplus(alpha + self.t[p+"ssm_dt.bias"])*self.t[p+"ssm_a"] # ssm_a = -exp(A_log).
         # Causal short conv over the token axis, per channel, kernel taps w[c, 0..K-1]
         # applied to inputs t-K+1..t (ggml_ssm_conv), then SiLU.
         w  = self.t[p+"ssm_conv1d.weight"]                              # (channels, K)
@@ -381,7 +403,7 @@ class FloatModel:
         scale = 1.0/math.sqrt(hk)
         for t in range(P):
             for hh in range(nv):
-                kh = hh % nk                                            # tiled head map
+                kh = hh % nk                                            # Tiled head map.
                 qt, kt, vt = q[t, kh], k[t, kh], v[t, hh]
                 M = S[hh]*np.exp(g[t, hh])                               # (hv, hk)
                 delta = (vt - M @ kt)*beta[t, hh]                       # (hv,)
@@ -406,8 +428,9 @@ class FloatModel:
                 x = x + self._deltanet(l, h, P)
             else:
                 x = x + self._attn(l, h, cos, sin, P)
-            ffn_norm = p + ("post_attention_norm.weight" if p+"post_attention_norm.weight" in self.t
-                            else "ffn_norm.weight")
+            ffn_norm = p+"post_attention_norm.weight"
+            if ffn_norm not in self.t:
+                ffn_norm = p+"ffn_norm.weight"
             h    = rmsnorm(x, self.t[ffn_norm], cfg.rms_eps)
             gate = self._proj(h, p+"ffn_gate.weight")
             up   = self._proj(h, p+"ffn_up.weight")
@@ -426,16 +449,16 @@ class FloatModel:
             logits = self.forward([nxt])
         return out
 
-# CLI ----------------------------------------------------------------------------------------------
+# Run ----------------------------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="TriXium float golden model.")
-    parser.add_argument("--gguf",      required=True)
-    parser.add_argument("--tokenizer", default=None)
-    parser.add_argument("--prompt",    default="The capital of France is")
-    parser.add_argument("--raw",       action="store_true", help="No chat template.")
-    parser.add_argument("-n",          default=8, type=int)
-    parser.add_argument("--lazy",      action="store_true", help="Keep ternary matrices as codes (the 27B).")
+    parser.add_argument("--gguf",      required=True,                       help="GGUF file.")
+    parser.add_argument("--tokenizer", default=None,                        help="tokenizer.json.")
+    parser.add_argument("--prompt",    default="The capital of France is",  help="Prompt.")
+    parser.add_argument("--raw",       action="store_true",                 help="No chat template.")
+    parser.add_argument("-n",          default=8, type=int,                 help="Tokens to generate.")
+    parser.add_argument("--lazy",      action="store_true",                 help="Keep ternary matrices as codes (the 27B).")
     args = parser.parse_args()
 
     print(f"loading {args.gguf}...")
@@ -443,7 +466,7 @@ def main():
     print(f"config: {cfg}")
     model = FloatModel(cfg, tensors)
 
-    from tokenizers import Tokenizer
+    from tokenizers import Tokenizer # Optional dependency, only needed here.
     tok = Tokenizer.from_file(args.tokenizer)
     if args.raw:
         text = args.prompt
