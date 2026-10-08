@@ -329,7 +329,7 @@ def _head(title, first=False):
     return left + title + "─"*(WIDTH - 2 - len(title)) + right
 
 def _kv(name, *cells):
-    return _line(f"{name:<12}" + "".join(f"{c:<26}" for c in cells).rstrip())
+    return _line(f"{name:<12}" + "".join(f"{c:<24}  " for c in cells).rstrip())
 
 def _link(p):
     if not p or not p.get("speed"):
