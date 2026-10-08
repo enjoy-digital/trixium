@@ -5,8 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # SQRL Forest Kitten 33 platform (Xilinx VU33P + 8 GB HBM2), vendored from litex-boards with
-# two pin corrections validated by Vivado's package/site data (see docs/litex_boards_fk33_pins.patch
-# for the upstream fix):
+# two pin corrections validated by Vivado's package/site data (to upstream):
 # - clk200_n is BC27 (BC26's diff pair partner); AY23 is not a valid package pin.
 # - PCIe refclk polarity: AD9 is the positive (IOBM) site and AD8 the negative (IOBS) site,
 #   so clk_p = AD9 / clk_n = AD8 (matches the original 2020-2022 definition and the proven

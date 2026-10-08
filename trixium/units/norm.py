@@ -11,7 +11,7 @@ For each of `nseg` segments of `n` FP32 values at src + seg*n*4, bit-exact with 
   RMS (op 0):  ss = sum64(x*x); r = 1/sqrt(ss/n + eps);   dst[i] = (x[i]*r)*w[i]
   L2  (op 1):  ss = sum64(x*x); inv = 1/max(sqrt(ss), eps); dst[i] = (x[i]*inv)*1.0
 
-sum64 is the canonical reduction of docs/canonical-reductions.md (64 partials, i % 64 in
+sum64 is the canonical reduction (docs/units.md, Canonical reductions: 64 partials, i % 64 in
 index order, then a halving tree); every operation is an exact IEEE binary32 operation
 (trixium/units/fp32.py), so there are no fixups. `w` (RMS only, n values) is read once
 per command into an internal buffer and shared by every segment. dst == src (in place)

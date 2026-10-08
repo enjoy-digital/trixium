@@ -12,7 +12,7 @@
 # from controller c // 4 through its own crossbar port, at per-channel windows inside that
 # controller. The defaults are the configuration that runs the 27B (every scratchpad unit, the
 # DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz). Design
-# decisions and board notes: docs/xcu1525.md.
+# decisions and board notes: docs/boards.md.
 #
 # Build (from the repository root):
 #   tools/build_xcu1525.sh <name>                       # Vivado directives + timing gate.

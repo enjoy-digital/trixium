@@ -11,7 +11,7 @@
 # The TriXium core streams its weights from HBM: engine channel c is pseudo-channel c + 1
 # (channel 0 carries the CPU's main_ram). The defaults are the configuration that runs the
 # Bonsai 1.7B and 8B (16 channels, HBM at 800 MHz, sys = HBM AXI clock = 212.5 MHz). Board
-# bring-up and operation: docs/bringup.md.
+# bring-up and operation: docs/boards.md.
 #
 # Build:
 #   tools/build_fk33.sh <name>                      # Vivado directives + timing gate.
