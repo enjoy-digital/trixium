@@ -96,7 +96,7 @@ def silu_table_image(lut, dlut):
 def scratchpad_norm_descriptor(*, src, dst, n, nseg=1, eps, weight=0, l2=False, src_stride=0,
                                dst_stride=0, rope_n=0, rope_tab=0):
     """Encode optional unit 12 (seq.norm_abi major 1): RMSNorm (weight) or L2 over nseg
-    segments of n FP32 values; eps as FP32 bits. docs/canonical-reductions.md."""
+    segments of n FP32 values; eps as FP32 bits. docs/units.md (Canonical reductions)."""
     for name, value in (("src", src), ("dst", dst), ("weight", weight)):
         _sp_address(name, value)
     if not isinstance(n, int) or not 8 <= n <= 8192 or n % 8:
