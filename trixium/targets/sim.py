@@ -8,15 +8,17 @@
 
 """TriXium Verilator simulation SoC.
 
-VexRiscv + engine (N channels backed by BonsaiHBMChannelModels initialized from a BONS image)
-+ scratchpad + engine CSRs - the same firmware-visible contract as the hardware target. The
-firmware binary and the BONS header+table are baked into main_ram at elaboration; channel
-payloads into the HBM models (CHAN_WEIGHT_BASE = 0 in sim).
+The same TriXium core and firmware-visible contract as the boards, on simulated memories
+initialised from a BONS image: --board xcu1525 is the XCU1525's memory system (four
+LiteDRAM controllers on LiteDRAM's DDR4 PHY model, in their own ddr domain) with every unit,
+--board fk33 one HBM channel model per engine channel and no scratchpad units. The firmware
+binary and the BONS header+table are baked into main_ram at elaboration, the channel payloads
+into the memory models.
 
-Flow (from the repo root):
-  python3 trixium/targets/sim.py --build-software          # headers + BIOS (no gateware)
-  make -C firmware BUILD_DIR=../build/sim             # firmware/bonsai.bin
-  python3 trixium/targets/sim.py --run                     # elaborate + verilate + run
+Flow (from the repository root):
+  python3 -m trixium.targets.sim --build-software       # headers + BIOS (no gateware)
+  make -C firmware BUILD_DIR=../build/sim_xcu1525       # firmware/bonsai.bin
+  python3 -m trixium.targets.sim --run                  # elaborate + verilate + run
 """
 
 import argparse
@@ -73,16 +75,15 @@ DDR_SPLIT_CLK_RATIO  = 2            # --ddr-split: ddr clock / sys clock in the 
 DDR4_SIM_CSR_PAGE0   = 8            # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
 
-class BonsaiSimSoC(SoCCore):
+class TriXiumSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
                  cpu_type="vexriscv", icache_kb=0, vexii_extra="",
                  mem="hbm", n_memctrl=4, update_repo="no",
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
-                 with_dnstream=False, attn_geometry=None, ddr_split=False):
+                 with_dnstream=False, attn_geometry=None):
         assert mem in ("hbm", "ddr4")
-        assert not ddr_split or mem == "ddr4"
-        self.ddr_split = ddr_split
+        ddr_split = mem == "ddr4"
         platform = Platform()
         self.comb += platform.trace.eq(1)
 
@@ -150,8 +151,8 @@ class BonsaiSimSoC(SoCCore):
             uart_name                = "sim")
         self.crg = CRG(platform.request("sys_clk"))
         if ddr_split:
-            # --ddr-split: the controllers in their own `ddr` domain on a second sim clock
-            # (DDR_SPLIT_CLK_RATIO x sys), as the XCU1525's --ddr-clk-freq builds them.
+            # The controllers in their own `ddr` domain on a second sim clock
+            # (DDR_SPLIT_CLK_RATIO x sys), as on the XCU1525.
             from litex.build.generic_platform import Pins
             from migen.genlib.resetsync import AsyncResetSynchronizer
             platform.add_extension([("ddr_clk", 0, Pins(1))])
@@ -279,31 +280,17 @@ class BonsaiSimSoC(SoCCore):
             sfx = "" if k == 0 else str(k)
             module = _SimDDR4(int(100e6), "1:4") # 100 MHz timings, as litex_sim does.
             phy = SDRAMPHYModel(module=module, data_width=64, clk_freq=int(100e6), init=words)
-            if self.ddr_split:
-                split_phys.append(phy); split_modules.append(module)
-                continue
-            self.csr.add(f"sdram{sfx}",  DDR4_SIM_CSR_PAGE0 + 2*k)
-            self.csr.add(f"ddrphy{sfx}", DDR4_SIM_CSR_PAGE0 + 2*k + 1)
-            setattr(self, f"ddrphy{sfx}", phy)
-            if k == 0:
-                self.add_sdram("sdram", phy=phy, module=module, size=MAIN_RAM_SIZE,
-                               l2_cache_size=8192)
-            else:
-                self.add_sdram(f"sdram{sfx}", phy=phy, module=module,
-                               with_soc_interconnect=False)
-            self.sdrams.append(getattr(self, f"sdram{sfx}"))
-        if self.ddr_split:
-            from trixium.memory.ddr import add_ddr_domain_controllers
-            add_ddr_domain_controllers(self, split_phys, split_modules, int(100e6), MAIN_RAM_SIZE,
-                                       8192, DDR4_SIM_CSR_WINDOW)
+            split_phys.append(phy); split_modules.append(module)
+        from trixium.memory.ddr import add_ddr_domain_controllers
+        add_ddr_domain_controllers(self, split_phys, split_modules, int(100e6), MAIN_RAM_SIZE,
+                                   8192, DDR4_SIM_CSR_WINDOW)
         from trixium.memory.ddr import engine_ddr_port
         for k in range(n_memctrl):
             core = self.sdrams[k]
             for j in range(chan_mod):
                 c = k*chan_mod + j
                 axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
-                for jj, m in enumerate(engine_ddr_port(core, axi,   # the target's default port
-                        clock_domain="sys_port" if self.ddr_split else "sys")):
+                for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port")):
                     setattr(self, f"engport{c}_{jj}", m)
                 axis.append(axi)
         # VexiiRiscv enforces execute permission from region.mode (the FK33 target's lesson).
@@ -314,83 +301,58 @@ class BonsaiSimSoC(SoCCore):
 
 # Build --------------------------------------------------------------------------------------------
 
-def attn_geometry(text):
-    """--with-attnstream "lanes,groups,hd_max,t_max" -> a tuple of ints (None: off)."""
-    return tuple(int(v) for v in text.split(",")) if text else None
-
+# Board presets: the hardware the simulation mirrors.
+BOARDS = {
+    # The XCU1525's memory system and every unit (the 27B's hybrid model needs them), the
+    # attention stream at the tiny models' geometry.
+    "xcu1525": dict(mem="ddr4", n_memctrl=4, with_hadamard=True, with_activation_quantize=True,
+        with_projection_restore=True, with_silu=True, with_norm=True, with_conv=True,
+        with_dnstream=True, attn_geometry=(8, 2, 128, 256),
+        cpu_type="vexiiriscv", icache_kb=32, vexii_extra="--with-rvf --with-rvZcbm"),
+    # The FK33: HBM channels, the engine/sequencer/vector unit only (the Qwen3 path).
+    "fk33": dict(mem="hbm",
+        cpu_type="vexiiriscv", icache_kb=32, vexii_extra="--with-rvZcbm"),
+}
 
 def main():
     from trixium.migen_fast import install as install_migen_fast
     install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
-    parser.add_argument("--image",          default="models/tiny/bonsai-tiny-n2.img")
-    parser.add_argument("--firmware",       default="firmware/bonsai.bin")
-    parser.add_argument("--build-software", action="store_true", help="Generate headers + BIOS only.")
+    parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS), help="Hardware to mirror.")
+    parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img", help="BONS image to bake in.")
+    parser.add_argument("--firmware",       default="firmware/bonsai.bin", help="Firmware binary to bake in.")
+    parser.add_argument("--build-software", action="store_true", help="Generate headers + BIOS only (to build the firmware against).")
     parser.add_argument("--run",            action="store_true", help="Build and run the simulation.")
-    parser.add_argument("--cpu-type",  default="vexriscv",
-                        choices=["vexriscv", "vexiiriscv"],
-                        help="vexiiriscv is SpinalHDL-generated so its I-cache is sizable; "
-                             "vexriscv's is a fixed 4 KB in every variant")
-    parser.add_argument("--icache-kb", type=int, default=0,
-                        help="vexiiriscv only: I-cache size in KB (default 16)")
-    parser.add_argument("--vexii-extra", default="",
-                        help="vexiiriscv only: extra SocGen args, e.g. "
-                             "'--with-btb --with-ras --with-gshare'")
-    parser.add_argument("--update-repo", default="no", choices=["no", "recommended", "latest"],
-                        help="VexiiRiscv source update policy (default: no, for reproducible runs)")
-    parser.add_argument("--pc-profile",     action="store_true",
-                        help="compile the VexRiscv PC profiler in (trixium/targets/sim_pc_profiler.cpp); "
-                             "writes pcprof-*.txt into build/sim/gateware")
+    parser.add_argument("--out-dir",        default=None,  help="Build directory (default: build/sim_<board>).")
+    parser.add_argument("--cpu-type",       default=None,  choices=["vexriscv", "vexiiriscv"], help="Override the board's CPU (vexriscv: the PC profiler).")
+    parser.add_argument("--update-repo",    default="no",  choices=["no", "recommended", "latest"], help="VexiiRiscv source update policy.")
+    parser.add_argument("--pc-profile",     action="store_true", help="Compile the VexRiscv PC profiler in (sim_pc_profiler.cpp).")
     parser.add_argument("--trace",          action="store_true", help="Enable FST tracing.")
-    parser.add_argument("--hbm-latency",    default=16, type=int)
-    parser.add_argument("--hbm-stall-rate", default=0, type=int)
-    parser.add_argument("--threads",        default=4, type=int)
-    parser.add_argument("--mem",            default="hbm", choices=["hbm", "ddr4"],
-        help="hbm: one independent channel model per engine channel (the FK33's shape, the "
-             "default). ddr4: the XCU1525's memory system on LiteDRAM's PHY model - N "
-             "controllers, main_ram on controller 0, chan_mod channels per controller; "
-             "builds in build/sim_ddr4 (the firmware must be built against that tree).")
-    parser.add_argument("--ddr-split",      action="store_true",
-        help="--mem ddr4: the controllers in their own ddr clock domain (the XCU1525's --ddr-clk-freq).")
-    parser.add_argument("--n-memctrl",      default=4, type=int, help="--mem ddr4: controllers.")
-    parser.add_argument("--with-hadamard", action="store_true", help="Enable experimental sequenced scratchpad integer rotations.")
-    parser.add_argument("--with-activation-quantize", action="store_true", help="Enable experimental resident FP32 and post-rotation Q8 quantization.")
-    parser.add_argument("--with-projection-restore", action="store_true", help="Enable experimental resident int32 projection to FP32 restoration.")
-    parser.add_argument("--with-silu", action="store_true", help="Enable the exact FP32 SiLU-multiply scratchpad unit (sequencer unit 11).")
-    parser.add_argument("--with-norm", action="store_true", help="Enable the exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
-    parser.add_argument("--with-conv", action="store_true", help="Enable the exact DeltaNet conv scratchpad unit (sequencer unit 13).")
-    parser.add_argument("--with-dnstream", action="store_true", help="Enable the DeltaNet stream unit (engine op 5, one lane per channel).")
-    parser.add_argument("--out-dir", default=None,
-                        help="Build directory (default: build/sim, build/sim_ddr4 or build/sim_ddr4_split).")
-    parser.add_argument("--with-attnstream", nargs="?", const="8,2,128,256", default=None,
-                        help="Enable the attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
+    parser.add_argument("--hbm-latency",    default=16, type=int, help="--board fk33: HBM model read latency.")
+    parser.add_argument("--hbm-stall-rate", default=0,  type=int, help="--board fk33: HBM model stall rate.")
+    parser.add_argument("--threads",        default=4,  type=int, help="Verilator threads.")
     args = parser.parse_args()
-    out_dir = args.out_dir or ("build/sim" if args.mem == "hbm" else
-                               ("build/sim_ddr4_split" if args.ddr_split else "build/sim_ddr4"))
+    out_dir = args.out_dir or f"build/sim_{args.board}"
+    board   = dict(BOARDS[args.board])
+    if args.cpu_type is not None:
+        board.update(cpu_type=args.cpu_type, icache_kb=0, vexii_extra="")
 
     sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
-    if args.ddr_split:
+    if board["mem"] == "ddr4":
         sim_config.add_clocker("ddr_clk", int(1e6)*DDR_SPLIT_CLK_RATIO)
 
-    soc_kwargs = dict(cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
-        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
-        mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
-        with_hadamard=args.with_hadamard,
-        with_activation_quantize=args.with_activation_quantize,
-        with_projection_restore=args.with_projection_restore,
-        with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
-        with_dnstream=args.with_dnstream, attn_geometry=attn_geometry(args.with_attnstream),
-        ddr_split=args.ddr_split)
+    soc_kwargs = dict(board, update_repo=args.update_repo,
+        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
 
     if args.build_software:
-        soc     = BonsaiSimSoC(image=args.image, firmware=None, **soc_kwargs)
+        soc     = TriXiumSimSoC(image=args.image, firmware=None, **soc_kwargs)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
         return
 
-    soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, **soc_kwargs)
+    soc     = TriXiumSimSoC(image=args.image, firmware=args.firmware, **soc_kwargs)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles trixium/targets/sim_pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the
@@ -401,7 +363,7 @@ def main():
     # Note LiteX's build_sim.sh starts with `rm -rf obj_dir/`, so adding this triggers a full
     # re-verilate the first time.
     extra_sources = []
-    if args.pc_profile and args.cpu_type != "vexriscv":
+    if args.pc_profile and board["cpu_type"] != "vexriscv":
         # pc_profiler.cpp includes Vsim_VexRiscv.h and reads lastStagePc/lastStageIsFiring by
         # name. VexiiRiscv's generated module is VexiiRiscvLitex_<hash> with a different
         # internal structure, so the profiler would not compile, let alone sample. Refuse
@@ -411,7 +373,7 @@ def main():
                          "Compare CPUs on leg cycle counts instead.")
     if args.pc_profile:
         extra_sources.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "pc_profiler.cpp"))
+                                          "sim_pc_profiler.cpp"))
     builder.build(sim_config=sim_config, run=args.run, opt_level="O3",
         threads=args.threads, trace=args.trace, trace_fst=args.trace,
         verilator_extra_sources=extra_sources)

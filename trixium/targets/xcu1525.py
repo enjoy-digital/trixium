@@ -6,23 +6,17 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# TriXium on the SQRL XCU1525: XCVU9P, four DDR4 x64 channels, PCIe. The same engine
-# cluster as the FK33 (one shared integration module) over LiteDRAM: engine channel c
-# streams from DDR4 controller c // 4 through a 256-bit crossbar port, at the FK33's
-# per-channel window constants inside that controller (chan_mod = 4), so the images and the
-# firmware constants are the same on both boards. Design decisions, projection and status:
-# docs/xcu1525.md.
+# TriXium on the SQRL XCU1525 (XCVU9P, four DDR4 x64 channels, PCIe Gen3 x4).
 #
-# Build (from the repo root):
-#   tools/build_xcu1525.sh <name>          # the recipe that ships; or by hand:
-#   ./trixium/targets/xcu1525.py --engine-channels 16 --with-vecunit --build
+# The TriXium core streams its weights from the four DDR4 controllers: engine channel c reads
+# from controller c // 4 through its own crossbar port, at per-channel windows inside that
+# controller. The defaults are the configuration that runs the 27B (every scratchpad unit, the
+# DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz). Design
+# decisions and board notes: docs/xcu1525.md.
 #
-# The whole SoC - CPU, engine cluster, the four controllers - runs in one `sys` domain at
-# the DDR4 controller clock (125 MHz with the USPDDRPHY: 4:1, DDR4-1000). No clock-domain
-# crossing anywhere; the accelerator has 4.8 ns of margin from its 212.5 MHz closure on the
-# FK33. --sys-clk-freq=150e6 selects DDR4-1200; the current ISERDESE3 configuration
-# has a 1.600 ns minimum clock period, so >156.25 MHz is not a qualified option.
-# See docs/vcu-clock-qualification.md before changing clocks or deploying a build.
+# Build (from the repository root):
+#   tools/build_xcu1525.sh <name>                       # Vivado directives + timing gate.
+#   python3 -m trixium.targets.xcu1525 --build          # or by hand.
 
 import os
 
@@ -42,15 +36,19 @@ from litex.soc.interconnect.axi import AXIInterface
 
 import litedram.modules
 from litedram.phy import usddrphy
-from litedram.frontend.axi import LiteDRAMAXI2Native
 
 from litepcie.phy.usppciephy import USPPCIEPHY
 from litepcie.software import generate_litepcie_software
 
+from trixium.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
+from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
+from trixium.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
+from trixium.targets.common import add_cluster_constraints, CPUBusMonitor
+
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(LiteXModule):
-    def __init__(self, platform, sys_clk_freq, clk_channel=0, ddr_clk_freq=None):
+    def __init__(self, platform, sys_clk_freq, ddr_clk_freq, clk_channel=0):
         self.rst       = Signal()
         self.cd_sys    = ClockDomain()
         self.cd_sys4x  = ClockDomain()
@@ -59,41 +57,33 @@ class _CRG(LiteXModule):
 
         # # #
 
-        # One MMCM (on DDR channel 0's 300 MHz reference) for the whole SoC: sys and sys4x
-        # come from the same MMCM output through parallel global buffers (slow /4,
-        # fast /1). The four PHYs share them; the USPDDRPHY captures on sys4x
-        # through calibrated IDELAYs, so per-bank skew is absorbed by the read leveling.
-        # --ddr-clk-freq: the four controllers and PHYs in their own `ddr` domain (4:1: the
-        # DDR4 data rate is 8x it), the CPU and the cluster stay in `sys`. The DDR MMCM then
-        # makes ddr/ddr4x (the same BUFGCE_DIV / BUFGCE pair) and the IDELAY reference, a
-        # second MMCM on the same reference makes sys; the crossbar ports cross with
-        # LiteDRAM's native-port CDC, the controllers' CSRs behind a wishbone crossing.
-        split = ddr_clk_freq is not None and ddr_clk_freq != sys_clk_freq
-        self.split = split
-        cd_slow, cd_fast = self.cd_sys, self.cd_sys4x
-        dram_freq = sys_clk_freq
-        if split:
-            self.cd_ddr   = ClockDomain()
-            self.cd_ddr4x = ClockDomain()
-            cd_slow, cd_fast = self.cd_ddr, self.cd_ddr4x
-            dram_freq = ddr_clk_freq
+        # The four DDR4 controllers and PHYs run in their own `ddr` domain (4:1: the DDR4 data
+        # rate is 8x ddr_clk_freq); the CPU and the TriXium core in `sys`. The DDR MMCM (on
+        # channel 0's 300 MHz reference) makes ddr/ddr4x through parallel global buffers
+        # (BUFGCE_DIV /4 and BUFGCE /1 of one output) and the IDELAY reference; the PHYs
+        # capture on ddr4x through calibrated IDELAYs, so per-bank skew is absorbed by read
+        # leveling. A second MMCM on the same reference makes sys; the memory ports cross at
+        # the AXI level (memory/ddr.py), the controllers' CSRs behind a wishbone crossing.
+        assert ddr_clk_freq != sys_clk_freq
+        self.cd_ddr   = ClockDomain()
+        self.cd_ddr4x = ClockDomain()
+        cd_slow, cd_fast = self.cd_ddr, self.cd_ddr4x
+        dram_freq = ddr_clk_freq
         clk300 = platform.request("clk300", clk_channel)
         self.pll = pll = USPMMCM(speedgrade=-2)
         self.comb += pll.reset.eq(self.rst)
         pll.register_clkin(clk300, 300e6)
         pll.create_clkout(self.cd_pll4x, dram_freq*4, buf=None, with_reset=False)
-        # The IDELAY reference: 500 MHz with the controllers in sys; 400 MHz with a separate
-        # ddr domain (one MMCM cannot make 4*200 = 800 and 500 from 300 without a fractional
-        # divide; IDELAYCTRL takes 300-800 MHz and the PHY is told the frequency).
-        self.idelay_freq = 400e6 if split else 500e6
+        # The IDELAY reference: 400 MHz (one MMCM cannot make 4*200 = 800 and 500 from 300
+        # without a fractional divide; IDELAYCTRL takes 300-800 MHz and the PHY is told).
+        self.idelay_freq = 400e6
         pll.create_clkout(self.cd_idelay, self.idelay_freq)
         platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
-        if split:
-            self.syspll = syspll = USPMMCM(speedgrade=-2)
-            self.comb += syspll.reset.eq(self.rst)
-            syspll.register_clkin(pll.clkin, 300e6)
-            syspll.create_clkout(self.cd_sys, sys_clk_freq, with_reset=False)
-            platform.add_false_path_constraints(self.cd_sys.clk, self.cd_ddr.clk)
+        self.syspll = syspll = USPMMCM(speedgrade=-2)
+        self.comb += syspll.reset.eq(self.rst)
+        syspll.register_clkin(pll.clkin, 300e6)
+        syspll.create_clkout(self.cd_sys, sys_clk_freq, with_reset=False)
+        platform.add_false_path_constraints(self.cd_sys.clk, self.cd_ddr.clk)
 
         self.specials += Instance("BUFGCE_DIV",
             p_BUFGCE_DIVIDE=4,
@@ -111,14 +101,11 @@ class _CRG(LiteXModule):
             "[get_nets {{{slow} {fast}}}]",
             slow=cd_slow.clk, fast=cd_fast.clk)
 
-        locked = pll.locked
-        if split:
-            locked = Signal()
-            self.comb += locked.eq(pll.locked & self.syspll.locked)
+        locked = Signal()
+        self.comb += locked.eq(pll.locked & self.syspll.locked)
         self.idelayctrl = _IDELAYCTRL(platform, cd_ref=self.cd_idelay, cd_sys=self.cd_sys, locked=locked)
-        if split:
-            # ddr leaves reset with sys (after the IDELAYCTRL is ready), synchronized.
-            self.specials += AsyncResetSynchronizer(self.cd_ddr, self.cd_sys.rst)
+        # ddr leaves reset with sys (after the IDELAYCTRL is ready), synchronized.
+        self.specials += AsyncResetSynchronizer(self.cd_ddr, self.cd_sys.rst)
 
 # _IDELAYCTRL --------------------------------------------------------------------------------------
 
@@ -196,24 +183,17 @@ class _IDELAYCTRL(LiteXModule):
             # Test: no primitive; the test drives ic_ready and resets cd_ic itself.
             self.specials += AsyncResetSynchronizer(self.cd_ic, ic_reset)
 
-# BonsaiXCU1525SoC ---------------------------------------------------------------------------------
+# TriXiumXCU1525SoC -------------------------------------------------------------------------------
 
-# The (sdram, ddrphy) CSR pairs sit on pages 8/9, 10/11, 12/13, 14/15: controller k's
-# registers are controller 0's shifted by k*DDR_CSR_STRIDE, which is how the firmware
-# initialises 1-3 with the BIOS's own liblitedram (firmware/ddr.c).
-DDR_CSR_PAGE0  = 8
-DDR_CSR_STRIDE = 0x1000
-# With --ddr-clk-freq the pairs move to their own CSR bus in the ddr domain, behind a
-# wishbone crossing at this window (between the CLINT and the PLIC), same 0x1000 stride.
+# The (sdram, ddrphy) CSR pairs of the four controllers: their own CSR bus in the ddr domain,
+# behind a wishbone crossing at DDR_CSR_WINDOW (between the CLINT and the PLIC), controller k's
+# registers at controller 0's + k*DDR_CSR_STRIDE - which is how the firmware initialises 1-3
+# with the BIOS's own liblitedram (firmware/ddr.c).
 DDR_CSR_WINDOW = 0xF0020000
+DDR_CSR_STRIDE = 0x1000
 
-
-class BonsaiXCU1525SoC(SoCCore):
-    def _add_ddr_domain_controllers(self, platform, module_cls, n, ddr_clk_freq, main_ram_size,
-                                    l2_size, memory_sizes):
-        """The four controllers and PHYs in the ddr domain: trixium/gateware/ddr_domain.py
-        (shared with the simulation's --ddr-split)."""
-        from trixium.memory.ddr import add_ddr_domain_controllers
+class TriXiumXCU1525SoC(SoCCore):
+    def _add_ddr_domain_controllers(self, platform, n, ddr_clk_freq, main_ram_size, l2_size):
         phys, modules = [], []
         for i in range(n):
             phy = usddrphy.USPDDRPHY(
@@ -221,124 +201,73 @@ class BonsaiXCU1525SoC(SoCCore):
                 memtype          = "DDR4",
                 sys_clk_freq     = ddr_clk_freq,
                 iodelay_clk_freq = self.crg.idelay_freq)
+            # liblitedram's write DQ-DQS training (per-module centring of the DQ output delay
+            # against the DQS), which the US+ PHY does not declare by default: controller 0's
+            # byte lane 7 comes out of write leveling at the edge of its write eye without it.
             phy.settings.write_dq_dqs_training = True
             phys.append(phy)
-            modules.append(module_cls(ddr_clk_freq, "1:4"))
-        memory_sizes += add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size,
-            l2_size, DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
+            modules.append(litedram.modules.MT40A512M8(ddr_clk_freq, "1:4"))
+        add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
+            DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
 
-    def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
-                 ddram_module="MT40A512M8", ddram_channels=4, main_ram_size=0x1000_0000,
-                 chan_stride=0x4000_0000, chan_skew=0x8000, port_width=512,
-                 with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
-                 cpu_slr=None, ddr_clk_freq=None, attn_geometry=None,
-                 **kwargs):
-        assert 1 <= ddram_channels <= 4
-        assert engine_channels % ddram_channels == 0, \
-            "engine channels shard evenly over the DDR4 controllers"
+    def __init__(self, sys_clk_freq=125e6, ddr_clk_freq=187.5e6, engine_channels=16,
+        main_ram_size  = 0x1000_0000,
+        chan_stride    = 0x4000_0000,
+        chan_skew      = 0x8000,
+        attn_geometry  = (24, 4, 256, 1024),
+        cpu_slr        = 1,
+        **kwargs):
+        ddram_channels = 4
+        assert engine_channels % ddram_channels == 0, "engine channels shard evenly over the controllers"
         chan_mod = engine_channels//ddram_channels
         assert chan_mod & (chan_mod - 1) == 0, "channels per controller must be a power of two"
         platform = sqrl_xcu1525.Platform()
 
         # CRG --------------------------------------------------------------------------------------
         self.crg = _CRG(platform, sys_clk_freq, ddr_clk_freq=ddr_clk_freq)
-        ddr_split = self.crg.split
 
         # SoCCore ----------------------------------------------------------------------------------
         if kwargs.get("uart_name", "serial") == "serial":
-            kwargs["uart_name"] = "crossover" # Console over PCIe/JTAGBone, as on the FK33.
+            kwargs["uart_name"] = "crossover" # Console over PCIe/JTAGBone.
         kwargs["with_jtagbone"] = True
         SoCCore.__init__(self, platform, sys_clk_freq,
             ident = "TriXium on XCU1525", **kwargs)
         self.add_constant("BONSAI_VARIANT", ord("b"))
 
         # DDR4 x4 ----------------------------------------------------------------------------------
-        # Controller 0 is the BIOS's: main_ram (256 MB of it: the FK33's size, so the
-        # firmware's memory map is the same) through the L2 cache. Controllers 1-3 have
-        # crossbar ports only. All four on pinned CSR pages (see DDR_CSR_PAGE0).
-        module_cls = getattr(litedram.modules, ddram_module)
+        # Controller 0 also carries the CPU's main_ram (256 MB, through the L2 cache);
+        # controllers 1-3 have crossbar ports only.
         self.sdrams = []
-        memory_sizes = []
-        if ddr_split:
-            self._add_ddr_domain_controllers(platform, module_cls, ddram_channels, ddr_clk_freq,
-                                             main_ram_size, kwargs.get("l2_size", 8192), memory_sizes)
-        else:
-            for i in range(ddram_channels):
-                sfx = "" if i == 0 else str(i)
-                self.csr.add(f"sdram{sfx}",  DDR_CSR_PAGE0 + 2*i)
-                self.csr.add(f"ddrphy{sfx}", DDR_CSR_PAGE0 + 2*i + 1)
-        for i in range(ddram_channels if not ddr_split else 0):
-            sfx = "" if i == 0 else str(i)
-            phy = usddrphy.USPDDRPHY(
-                pads             = platform.request("ddram", i),
-                memtype          = "DDR4",
-                sys_clk_freq     = sys_clk_freq,
-                iodelay_clk_freq = 500e6)
-            # liblitedram's write DQ-DQS training (per-module centring of the DQ output delay
-            # against the DQS), which the US+ PHY does not declare by default. On this board
-            # controller 0's byte lane 7 came out of write leveling at the edge of its write
-            # eye (three DQ bits lost written 1s, read leveling then found no window at any
-            # bitslip, memtest KO); the same scan run from the host (tools/xcu1525_rdlevel.py)
-            # moved lane 7's DQ by ~50 taps and the 16 MB memtest passed (2026-09-19). The
-            # flag only adds the C define to sdram_phy.h: the BIOS in the ROM and the
-            # firmware's ddr.c both run the training, no gateware changes.
-            phy.settings.write_dq_dqs_training = True
-            setattr(self, f"ddrphy{sfx}", phy)
-            module = module_cls(sys_clk_freq, "1:4")
-            g = module.geom_settings
-            memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits))*phy.settings.nranks*phy.settings.databits//8)
-            if i == 0:
-                self.add_sdram("sdram",
-                    phy           = phy,
-                    module        = module,
-                    size          = main_ram_size,
-                    l2_cache_size = kwargs.get("l2_size", 8192))
-            else:
-                self.add_sdram(f"sdram{sfx}",
-                    phy                   = phy,
-                    module                = module,
-                    with_soc_interconnect = False)
-            self.sdrams.append(getattr(self, f"sdram{sfx}"))
-        # VexiiRiscv builds its memory map from region.mode and enforces execute
-        # permission: mark main_ram executable (the FK33 target's lesson).
+        self._add_ddr_domain_controllers(platform, ddram_channels, ddr_clk_freq, main_ram_size,
+            kwargs.get("l2_size", 8192))
+        # VexiiRiscv builds its memory map from region.mode and enforces execute permission.
         for _rn, _r in self.bus.regions.items():
             if _r.origin == 0x4000_0000 and not _r.linker:
                 _r.mode = "rwx"
         # Workaround for a Vivado DRC on the PHY's clocking (upstream target).
         platform.add_platform_command("set_property SEVERITY {{Warning}} [get_drc_checks PDCN-2736]")
-        # Engine ports: engine channel c = controller c // chan_mod, a 256-bit crossbar port
-        # (the controller is 512 bits wide at 4:1; four ports share its 8 GB/s at 125 MHz)
-        # behind an AXI bridge. The read buffer holds the readers' 8 outstanding 16-beat
-        # bursts (128 beats), so a channel is never throttled by the bridge.
-        # The port itself: trixium/gateware/ddr_port.py (512-bit ports by default since
-        # v6 - the 256-bit port's native up-converter costs ~5 cycles per controller word).
-        from trixium.memory.ddr import engine_ddr_port
-        engine_axis = []
+
+        # Memory ports: engine channel c -> controller c // chan_mod, a 512-bit crossbar port
+        # behind an AXI bridge, crossed into sys at the AXI level (memory/ddr.py).
+        memory_ports = []
         for c in range(engine_channels):
-            core = self.sdrams[c//chan_mod]
-            axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
-            for j, m in enumerate(engine_ddr_port(core, axi, port_width=port_width,
-                                                  clock_domain="sys_port" if ddr_split else "sys")):
+            axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+            for j, m in enumerate(engine_ddr_port(self.sdrams[c//chan_mod], axi, clock_domain="sys_port")):
                 setattr(self, f"engport{c}_{j}", m)
-            engine_axis.append(axi)
+            memory_ports.append(axi)
 
         # PCIe -------------------------------------------------------------------------------------
-        self.pcie_phy = USPPCIEPHY(platform, platform.request(f"pcie_x{pcie_lanes}"),
-            data_width = {2: 64, 4: 128, 8: 256, 16: 512}[pcie_lanes],
-            # With --ddr-clk-freq the controllers' CSRs sit at DDR_CSR_WINDOW (CSR region +
-            # 0x20000): BAR0 covers it for the host-side DDR trainer.
-            bar0_size  = 0x40000 if ddr_split else 0x20000)
+        self.pcie_phy = USPPCIEPHY(platform, platform.request("pcie_x4"),
+            data_width = 128,
+            bar0_size  = 0x40000) # Covers DDR_CSR_WINDOW (CSR region + 0x20000): host DDR trainer.
         self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
 
-        # CPU bus monitor (split builds: v27's CPU never printed; tools/cpumon.py reads it).
-        if ddr_split:
-            from trixium.targets.common import CPUBusMonitor
-            self.cpumon = CPUBusMonitor(self.cpu)
-            self.csr.add("cpumon", 31)  # pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console)
+        # CPU bus monitor (read over PCIe by tools/cpumon.py) -------------------------------------
+        self.cpumon = CPUBusMonitor(self.cpu)
+        self.csr.add("cpumon", 31)  # Pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console).
         if cpu_slr is not None:
-            # v27 spread the CPU over SLR1 (8k cells) and SLR2 (14k): its memory-bus return
-            # crossed the boundary at 8 logic levels (-0.50 ns). Keep it in one SLR.
+            # The CPU in one SLR: spread over two, its memory-bus return crossed the boundary
+            # at 8 logic levels (-0.50 ns).
             platform.add_platform_command("create_pblock pb_cpu")
             platform.add_platform_command(f"resize_pblock pb_cpu -add SLR{cpu_slr}")
             platform.add_platform_command(
@@ -350,79 +279,51 @@ class BonsaiXCU1525SoC(SoCCore):
             pads         = platform.request_all("user_led"),
             sys_clk_freq = sys_clk_freq)
 
-        # Bonsai -----------------------------------------------------------------------------------
-        # The window per engine channel: the FK33's base (320 MB) with a 1 GB stride, so
-        # channel c's window is controller c // chan_mod's local 320 MB + (c % chan_mod) GB,
-        # 704 MB usable (the stride minus the base's offset into it), the last of the four
-        # ending exactly at the channel's 4 GB. 704 MB holds the 27B (370 MB of ternary
-        # weights + its 159 MB int16 embedding table + KV and recurrent state per channel
-        # at N=16), where the FK33's 192 MB window holds only the 8B without its table. The
-        # 1.7B image is byte-identical to the FK33's; the 8B's gains its embedding table
-        # (convert with --chan-stride 0x40000000). main_ram is controller 0's local
-        # 0..256 MB, below every window; the BONS staging area is the megabyte below
-        # channel 0's window (319 MB) as on the FK33. BONSAI_MEM_CPU_OFFSET = 0: main_ram's
-        # origin is controller 0's local address 0 (the FK33's CPU window passes through
-        # 1:1 at 0x4000_0000).
-        from trixium.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
+        # TriXium ----------------------------------------------------------------------------------
+        # Per-channel windows: controller c // chan_mod's local HBM_WEIGHT_BASE (320 MB) +
+        # (c % chan_mod)*chan_stride + (c % chan_mod)*chan_skew: 704 MB per channel, the last
+        # ending at the controller's 4 GB (the 27B: 370 MB of ternary weights + its 159 MB int16
+        # embedding table + KV and recurrent state per channel). The skew starts the four
+        # windows of a controller in four different DDR4 bank groups, so the four streams
+        # never thrash one bank's row (nor meet tCCD_L); the last window loses
+        # (chan_mod-1)*skew = 96 KB (the converter's --window-reserve). main_ram is controller
+        # 0's 0..256 MB, below every window; the BONS staging area is the MB below channel
+        # 0's window.
         assert chan_stride & (chan_stride - 1) == 0 and HBM_WEIGHT_BASE < chan_stride
-        assert HBM_WEIGHT_BASE + chan_stride*chan_mod - (HBM_WEIGHT_BASE % chan_stride) \
-            <= 4 << 30, "the last window must end inside the channel's 4 GB"
+        assert HBM_WEIGHT_BASE + chan_stride*chan_mod - (HBM_WEIGHT_BASE % chan_stride) <= 4 << 30
         assert chan_skew % 0x1000 == 0 and (chan_mod - 1)*chan_skew < chan_stride // 64
-        assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000, "main_ram must end below the staging area"
-        with_bonsai            = True
-        cluster_chan_mod       = chan_mod
-        cluster_mem_cpu_offset = 0
-        cluster_n_memctrl      = ddram_channels
-        cluster_chan_stride    = chan_stride
-        # The four windows of a controller start in four different DDR4 banks: a
-        # power-of-two stride is a multiple of the bank period, so without this the four
-        # streams sharing a controller thrash one bank's row (the LiteDRAM sim: 6-7.6
-        # cycles/beat per port same-bank, 4.3 with a bank skew, 2026-09-19). In LiteDRAM's
-        # ROW_BANK_COL mapping the bank index is byte address bits 13..16 (colbits 10, 64 B
-        # words), DFI bank[1:0] = BA and bank[3:2] = BG: a 32 KB skew steps the bank GROUP,
-        # so the four streams also never meet DDR4's tCCD_L. The last window loses
-        # (chan_mod-1)*skew = 96 KB (the converter's --window-reserve).
-        cluster_chan_skew      = chan_skew
-        cluster_weight_base    = HBM_WEIGHT_BASE
-        # One portable wiring implementation; board policy stays here.
-        if with_bonsai:
-            from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
-            from trixium.targets.common import add_cluster_constraints
-            from litex.soc.integration.soc import SoCRegion
-            config = BonsaiClusterConfig(scratchpad_xpm=True,
-                chan_stride=cluster_chan_stride,
-                chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
-                with_activation_quantize=with_activation_quantize, with_projection_restore=with_projection_restore,
-                with_silu=with_silu, with_norm=with_norm, with_conv=with_conv,
-                with_dnstream=bool(with_dnstream),
-                with_attnstream=attn_geometry is not None,
-                attnstream_options=tuple(zip(("lanes", "groups", "hb_max", "t_max"),
-                    (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
-                    if attn_geometry else ())
-            add_bonsai_cluster(self, engine_axis, config)
-            add_cluster_constraints(platform)
-            self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
-                SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
-            self.comb += self.pcie_dma0.source.connect(
-                self.loader.sink, keep={"valid", "ready", "data"})
+        assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000
+        config = BonsaiClusterConfig(scratchpad_xpm=True,
+            chan_stride              = chan_stride,
+            chan_mod                 = chan_mod,
+            chan_skew                = chan_skew,
+            with_hadamard            = True,
+            with_activation_quantize = True,
+            with_projection_restore  = True,
+            with_silu                = True,
+            with_norm                = True,
+            with_conv                = True,
+            with_dnstream            = True,
+            with_attnstream          = True,
+            attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
+                (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3]))))
+        add_bonsai_cluster(self, memory_ports, config)
+        add_cluster_constraints(platform)
+        self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
+            SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
+        self.comb += self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"})
 
-            # Board memory map and host-upload convention (legacy v2/v3 images).
-            from trixium.layout import HDR_CPU_OFFSET
-            self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
-            self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
-            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", cluster_weight_base)
-            self.add_constant("BONSAI_CHAN_STRIDE",      cluster_chan_stride)
-            self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
-            if cluster_chan_mod:
-                self.add_constant("BONSAI_CHAN_MOD", cluster_chan_mod)
-            if cluster_chan_skew:
-                self.add_constant("BONSAI_CHAN_SKEW", cluster_chan_skew)
-            if cluster_mem_cpu_offset is not None:
-                self.add_constant("BONSAI_MEM_CPU_OFFSET", cluster_mem_cpu_offset)
-            if cluster_n_memctrl is not None:
-                self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
-
-        self.add_constant("BONSAI_DDR_CSR_STRIDE", DDR_CSR_STRIDE)
+        # Board memory map, for the firmware.
+        self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
+        self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
+        self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
+        self.add_constant("BONSAI_CHAN_STRIDE",      chan_stride)
+        self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
+        self.add_constant("BONSAI_CHAN_MOD",         chan_mod)
+        self.add_constant("BONSAI_CHAN_SKEW",        chan_skew)
+        self.add_constant("BONSAI_MEM_CPU_OFFSET",   0)
+        self.add_constant("BONSAI_N_MEMCTRL",        ddram_channels)
+        self.add_constant("BONSAI_DDR_CSR_STRIDE",   DDR_CSR_STRIDE)
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -430,57 +331,23 @@ def main():
     from trixium.migen_fast import install as install_migen_fast
     install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
-    parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform,
-                                 description="TriXium SoC on the SQRL XCU1525.")
-    parser.add_target_argument("--sys-clk-freq",    default=125e6, type=float, help="System clock = DDR4 controller clock (4:1).")
-    parser.add_target_argument("--pcie-lanes",      default=4, type=int,       choices=[2, 4, 8, 16], help="PCIe lane count.")
-    parser.add_target_argument("--driver",          action="store_true",       help="Generate LitePCIe driver headers.")
-    parser.add_target_argument("--engine-channels", default=16, type=int,      help="Engine channel count (a multiple of the DDR4 channel count).")
-    parser.add_target_argument("--ddram-channels",  default=4, type=int,       help="DDR4 channels to instantiate (1-4).")
-    parser.add_target_argument("--ddram-module",    default="MT40A512M8",      help="LiteDRAM module class of the DDR4 (upstream target: MT40A512M8).")
-    parser.add_target_argument("--main-ram-size",   default=0x1000_0000, type=lambda x: int(x, 0), help="CPU main_ram size on controller 0 (default 256 MB, the FK33's).")
-    parser.add_target_argument("--chan-stride",     default=0x4000_0000, type=lambda x: int(x, 0), help="Per-engine-channel stride inside a controller (default 1 GB: 704 MB windows, the 27B fits; 0x10000000 = the FK33's 256 MB).")
-    parser.add_target_argument("--chan-skew",       default=0x8000, type=lambda x: int(x, 0), help="Extra per-channel offset inside a controller so the windows start in different DDR4 bank groups (default 32 KB; 0 = none).")
-    parser.add_target_argument("--port-width",      default=512, type=int, help="Crossbar port width per engine channel: 512 (LiteX AXIUpConverter, default) or 256 (LiteDRAM's native up-converter).")
-    parser.add_target_argument("--with-hadamard", action="store_true", help="Experimental sequenced scratchpad integer rotations; not resident runtime qualification.")
-    parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 and post-rotation Q8 quantization; not resident runtime qualification.")
-    parser.add_target_argument("--with-projection-restore", action="store_true", help="Experimental resident int32 projection to FP32 restoration; not resident runtime qualification.")
-    parser.add_target_argument("--with-silu", action="store_true", help="Exact FP32 SiLU-multiply scratchpad unit (sequencer unit 11).")
-    parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
-    parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
-    parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
-    parser.add_target_argument("--cpu-slr", type=int, default=None,
-        help="Constrain the CPU to this SLR (pblock).")
-    parser.add_target_argument("--ddr-clk-freq", default=None, type=float,
-        help="The DDR4 controllers in their own clock domain at this frequency (4:1: DDR4 data rate 8x; 200e6 = DDR4-1600); default: in sys.")
-    parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
-                               help="Attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
+    parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform, description="TriXium on the SQRL XCU1525.")
+    parser.add_target_argument("--sys-clk-freq",    default=125e6,   type=float, help="System clock frequency (CPU and TriXium core).")
+    parser.add_target_argument("--ddr-clk-freq",    default=187.5e6, type=float, help="DDR4 controller clock (4:1: data rate 8x; 187.5e6 = DDR4-1500).")
+    parser.add_target_argument("--engine-channels", default=16,      type=int,   help="Engine channels (a multiple of 4: the DDR4 controllers).")
+    parser.add_target_argument("--cpu-slr",         default=1,       type=int,   help="SLR of the CPU pblock.")
+    parser.add_target_argument("--driver",          action="store_true",         help="Generate LitePCIe driver headers.")
     args = parser.parse_args()
 
-    soc = BonsaiXCU1525SoC(
+    soc = TriXiumXCU1525SoC(
         sys_clk_freq    = args.sys_clk_freq,
-        pcie_lanes      = args.pcie_lanes,
+        ddr_clk_freq    = args.ddr_clk_freq,
         engine_channels = args.engine_channels,
-        ddram_module    = args.ddram_module,
-        ddram_channels  = args.ddram_channels,
-        main_ram_size   = args.main_ram_size,
-        chan_stride     = args.chan_stride,
-        chan_skew       = args.chan_skew,
-        port_width      = args.port_width,
-        with_hadamard     = args.with_hadamard,
-        with_activation_quantize = args.with_activation_quantize,
-        with_projection_restore = args.with_projection_restore,
-        with_silu              = args.with_silu,
-        with_norm              = args.with_norm,
-        with_conv              = args.with_conv,
-        with_dnstream          = args.with_dnstream,
-        ddr_clk_freq           = args.ddr_clk_freq,
-        cpu_slr                = args.cpu_slr,
-        attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
+        cpu_slr         = args.cpu_slr,
         **parser.soc_argdict)
 
-    # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates
-    # the extension, so the firmware reaches clz through a .insn encoding behind this.
+    # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates the
+    # extension, so the firmware reaches clz through a .insn encoding behind this.
     if "--with-rvZbb" in (getattr(args, "vexii_args", "") or "") or \
        "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
         soc.add_constant("BONSAI_HAS_ZBB")
@@ -490,17 +357,14 @@ def main():
         builder_argd["output_dir"] = os.path.join("build", f"xcu1525_n{args.engine_channels}")
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = os.path.join(builder_argd["output_dir"], "csr.csv")
-
     builder = Builder(soc, **builder_argd)
     if args.build or args.driver:
         if not args.build:
             builder.compile_software = False
             builder.compile_gateware = False
         builder.build(**parser.toolchain_argdict)
-
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
-
     if args.load:
         prog = soc.platform.create_programmer()
         prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))

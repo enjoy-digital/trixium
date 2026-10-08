@@ -125,7 +125,7 @@ def test_targets_use_one_cluster_implementation():
                             "BonsaiEngineCSR", "BonsaiHBMLoader", "BonsaiEngineResetDomain"):
             assert constructor not in calls, (fname, constructor)
 
-    portable = (root / "trixium/gateware/integration.py").read_text()
+    portable = (root / "trixium/core/core.py").read_text()
     assert "vecunit.seq_seed7.eq(seq.vec_seed7)" in portable
     assert "platform.add_ip" not in portable
     assert "add_platform_command" not in portable
