@@ -41,9 +41,6 @@ void     seq_list_start(uint32_t idx0, uint32_t count);     // Start only; overl
 int      seq_run_trace(uint32_t idx0, uint32_t count,
                        uint32_t *ts, int max);              // C2-1a: per-dcount timestamps.
 void     seq_join(void);                                    // ...then wait (same wedge guard).
-void     seq_sbmode_set(int on);      // Posted-write ordering: 0 legacy, 1 drain-at-start.
-int      seq_sbmode_available(void);  // 1 if this bitstream carries the sbmode CSR.
-extern int seq_sbdrain_use;
 extern int seq_wedged; // Set once a list stalled: every later seq_run() is a no-op.
 
 #endif

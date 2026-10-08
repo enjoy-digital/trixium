@@ -10,7 +10,6 @@
 
 #include "perf.h"
 #include "hybrid.h"
-#include "traffic.h"
 
 uint64_t perf_cycles[OP_COUNT];
 uint64_t perf_calls[OP_COUNT];
@@ -97,7 +96,6 @@ void perf_reset(void)
     // the n8 sim is ~40M cycles against ~1.7M for a generation leg, so the token loop is
     // diluted to nothing and every share reads 0%.
     overlap_snapshot(&ovl0);
-    traffic_begin();
     perf_start = perf_now64();
     for (int i = 0; i < OP_COUNT; i++) {
         perf_cycles[i] = 0;
@@ -226,7 +224,6 @@ void perf_print(void)
     uint64_t overlap[4];
     overlap_snapshot(&end);
     int overlap_ok = overlap_delta(&ovl0, &end, overlap);
-    traffic_end(); // Freeze before console reporting introduces extra memory traffic.
     uint64_t total = 0;
     for (int i = 0; i < OP_COUNT; i++)
         if (i != OP_ENGINE_WAIT)
@@ -260,7 +257,6 @@ void perf_print(void)
     hybrid_stats_print();
     if (overlap_ok) overlap_print("overlap", overlap);
     else puts("overlap: unavailable (legacy 32-bit window too long, absent counters or reset)");
-    traffic_print();
 }
 
 void perf_ovl_mark(void)

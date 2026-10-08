@@ -29,7 +29,5 @@ void model_matvec(const struct bons_entry *e, uint32_t xsrc, uint32_t dst);
 struct engine_op; // engine.h; forward-declared so this header stays include-order free.
 void model_matvec_op(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
                      struct engine_op *op); // Fill without running (descriptor lists).
-void model_matvec2(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
-                   uint16_t qstride);
 
 #endif

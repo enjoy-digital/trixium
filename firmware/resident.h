@@ -49,12 +49,6 @@ void resident_silu_enable(int on);   // Console A/B.
 void resident_mark_act(void);      // RS_F holds the next prepare's FP32 source (a list left it)
 int  resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                       float *act, float *gate_out, float *up_out);
-// nb (<= 2) tokens' FFN with every projection's weights streamed once (engine cmd.nb,
-// BONSAI_HAS_NBATCH): in[b] FFN-normed FP32, act[b] ffn_dim scratch, out[b] the n_embd
-// result, main RAM, 32-byte aligned. Bit-identical per token to the resident FFN. -1: declined.
-int  resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
-                        const struct bons_entry *down, int nb, const float *const *in,
-                        float *const *act, float *const *out);
 
 // List builder (resident.c): compose one descriptor list from transfers, prepares, matvecs
 // and raw descriptors, then run it. Any invalid step marks the list bad: rl_run returns -1
@@ -113,7 +107,6 @@ int  rl_wait(void);
 uint32_t rl_count(void);
 void resident_rsf_set(const void *src);   // RS_F now holds src (FP32), after a list
 int  rl_rsf_is(const void *src);          // the list being built still has src in RS_F
-void resident_desc_bench(void);       // console `descbench` (debug)
 int  rl_wait_desc(uint32_t k);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,

@@ -129,34 +129,6 @@ static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d)
     for (int i = 0; i < 16; i++) w[i] = d->word[i];
 }
 
-// Console `descbench` (debug): the cost of building descriptors. 64 descriptors into slots
-// 128..191 (no hybrid list runs from there) written word by word over the bus, versus built
-// in cached main RAM, cleaned, and copied by one engine FETCH.
-void resident_desc_bench(void)
-{
-    static uint32_t *buf;              // 4 KB: main RAM, never SRAM (.bss is at its floor)
-    if (!buf) buf = infer_halloc(64*16*4, 0);
-    if (!buf) return;
-    struct bns_seq_descriptor d;
-    for (int i = 0; i < 16; i++) d.word[i] = 0x1000u + (uint32_t)i;
-    uint64_t t0 = perf_now64();
-    for (uint32_t k = 0; k < 64; k++) desc_words(128 + k, &d);
-    uint64_t t1 = perf_now64();
-    for (uint32_t k = 0; k < 64; k++)
-        for (int i = 0; i < 16; i++) buf[k*16 + i] = d.word[i] + k;
-    clean_cpu_dcache_range(buf, 64*16*4);
-    struct engine_op op = {0};
-    op.kind = ENGINE_KIND_FETCH; op.wbase = eng_addr(buf); op.wlen = 64*16*4/32;
-    op.dst = SP_DESC + 128u*64u;
-    engine_run(&op);
-    uint64_t t2 = perf_now64();
-    volatile uint32_t *w = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + 128u*64u);
-    uint32_t bad = 0;
-    for (uint32_t k = 0; k < 64; k++) if (w[k*16 + 3] != 0x1003u + k) bad++;
-    printf("descbench: 64 descriptors direct %lu cycles, via main RAM + FETCH %lu cycles, %lu bad\n",
-           (unsigned long)(t1 - t0), (unsigned long)(t2 - t1), (unsigned long)bad);
-}
-
 static void desc_fetch(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_dst)
 {
     struct engine_op op = {0};
@@ -1032,13 +1004,6 @@ decline:
     return -1;
 }
 
-int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
-                       const struct bons_entry *down, int nb, const float *const *in,
-                       float *const *act, float *const *out)
-{
-    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
-    return -1;
-}
 
 #else
 
@@ -1052,13 +1017,6 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
 {
     (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
     return 0;
-}
-int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
-                       const struct bons_entry *down, int nb, const float *const *in,
-                       float *const *act, float *const *out)
-{
-    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
-    return -1;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)
@@ -1115,7 +1073,6 @@ int  rl_wait(void) { return -1; }
 uint32_t rl_count(void) { return 0; }
 int  rl_wait_desc(uint32_t k) { (void)k; return -1; }
 void resident_rsf_set(const void *src) { (void)src; }
-void resident_desc_bench(void) {}
 int  rl_rsf_is(const void *src) { (void)src; return 0; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
@@ -1137,13 +1094,6 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
 {
     (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
     return 0;
-}
-int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
-                       const struct bons_entry *down, int nb, const float *const *in,
-                       float *const *act, float *const *out)
-{
-    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
-    return -1;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)

@@ -54,7 +54,7 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
     d[0]  = 1;
     d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9)
                      | ((uint32_t)op->rshift_rpre << 10) | ((uint32_t)op->qn << 11)
-                     | ((uint32_t)op->xred << 12) | ((uint32_t)(op->nb & 3) << 13);
+                     | ((uint32_t)op->xred << 12);
     d[2]  = op->rows | ((uint32_t)op->rem << 16);
     d[3]  = op->cols;
     d[4]  = op->wbase;
@@ -72,33 +72,6 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
 void seq_desc_stop(uint32_t idx)
 {
     desc_w(idx)[0] = 0;
-}
-
-// Posted-write ordering mode (bitstreams carrying the sbmode CSR only). 0 = legacy: the
-// descriptor fetch stalls while any CPU patch is still in the scratchpad's posted-write
-// FIFO. 1 = the sequencer drains that FIFO once at list START instead, so a patch burst
-// no longer starves a RUNNING list. Mode 1 is only correct while firmware keeps the
-// invariant recorded in gateware/sequencer.py: never patch a list's descriptors while
-// THAT list is running (patching other lists under a running one is the design's whole
-// point and is safe in both modes). Default legacy, so a bitstream boots into the
-// behaviour every existing measurement was taken under.
-int seq_sbdrain_use;
-
-void seq_sbmode_set(int on)
-{
-    seq_sbdrain_use = on ? 1 : 0;
-#ifdef CSR_SEQ_SBMODE_ADDR
-    seq_sbmode_write(seq_sbdrain_use);
-#endif
-}
-
-int seq_sbmode_available(void)
-{
-#ifdef CSR_SEQ_SBMODE_ADDR
-    return 1;
-#else
-    return 0;
-#endif
 }
 
 int seq_wedged; // Sticky: a list never finished, so the engine state is not trustworthy.

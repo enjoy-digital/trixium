@@ -38,9 +38,8 @@
 #if defined(BONSAI_HAS_NORM) && defined(BONSAI_HAS_CONV) && defined(BONSAI_HAS_SILU)
 #define DNRES_BUILT 1
 #endif
-// The DeltaNet state in engine DDR: the per-head recurrence unit (BONSAI_HAS_DNREC) or the
-// stream op (BONSAI_HAS_DNSTREAM). A bitstream without the per-head unit runs the heads
-// only on the stream (`dnstream off` then stops with DNSTALL).
+// The DeltaNet state in engine DDR, updated by the stream op (BONSAI_HAS_DNSTREAM): the
+// heads run only there (`dnstream off` then stops with DNSTALL).
 #if defined(BONSAI_HAS_DNSTREAM)
 #define DN_STATE_HW 1
 #endif
@@ -53,11 +52,8 @@ static const struct bons_header *H;
 static int n_ch, n_embd, n_head, n_kv_head, head_dim, ffn_dim, n_layer, q_dim, kv_dim, n_rep;
 static int nk, hk, nv, hv, nq, nvh, conv_k, rope_n;
 static int n_dn, n_attn, ctx_cap, pos;
-// The MTP head (header mtp_layers, layer n_layer): an attention block with its own KV slot,
-// eh_proj and three norms, sharing the embedding and the LM head (hybrid_mtp).
-static int n_mtp;
-static float *mtp_e, *mtp_cat, *mtp_enorm, *mtp_hnorm, *mtp_head_norm;
 static float rms_eps;
+static float *out_norm;              // fetched on the first forward with logits
 
 // Float work buffers (main_ram).
 static float *xb, *hb, *rot, *qkv, *zb, *betab, *alphab, *gb, *convb, *qb, *kb, *vb, *ob, *og,
@@ -68,7 +64,7 @@ static int   *dn_slot, *attn_slot;   // layer -> DeltaNet / attention index, -1 
 static float *dn_state;              // [n_dn][nv][hv][hk]  (row j = value index, as llama.cpp)
 static float *dn_conv;               // [dn_conv_w][n_dn][C], slot-major (dn_conv_slot)
 static uint8_t *dn_conv_pos;         // Oldest causal-convolution plane per DeltaNet layer.
-static int dn_conv_w;                // Window ring slots: conv_k - 1, + dn_nver - 1 speculative.
+static int dn_conv_w;                // Window ring slots: conv_k - 1.
 static float *kc, *vc;               // [n_attn][ctx_cap][kv_dim]
 // Rows [0, kc_rows[a]) of attention slot a are in kc/vc. With the attention stream the rows
 // live in engine DDR and main RAM's copy (~77k cycles per 27B layer: both sides miss the
@@ -77,12 +73,11 @@ static uint16_t *kc_rows;
 static float *rope_c, *rope_s, *rope_freq;
 static int    rope_pos_cached;
 
-// Exact-FP32 recurrence accelerator. The fixed gateware geometry is the 27B's 128x128
-// matrix; other hybrid test models keep using the scalar CPU implementation below.
+// The DeltaNet state in engine DDR (the stream op's fixed geometry: the 27B's 128x128
+// matrices); other hybrid test models keep it in main RAM for the scalar CPU recurrence.
 static int      dn_hw;
 #ifdef BONSAI_HAS_ATTNSTREAM
 static uint32_t at_hbm_base, at_slots, at_rowbeats;
-static uint64_t at_end;              // end of the stream's K/V span (speculative versions above)
 static int at_geom_ok;
 static float *at_buf;
 #endif
@@ -93,40 +88,14 @@ static uint32_t dn_hbm_base;
 // 144 MiB in engine DDR (34 M cycles of every generation's first token on the 27B).
 static uint64_t dn_state_zero;
 
-// Speculative decoding (hybrid_spec_begin/end): the DeltaNet state in dn_nver versions, version
-// v at dn_ver_base[v] on every channel (0 = dn_hbm_base, the others above the attention
-// stream's span). A forward reads version dn_ver_rd and writes dn_ver_wr - the same version
-// outside a speculative pass (in place, as always), the next one inside it, so a rejected
-// forward's state is dropped by moving a pointer. The conv window is a ring of dn_conv_w
-// slots: a forward's input goes into a new slot and never over the committed window.
-#define DN_NVER_MAX 10
-static int dn_nver = 1, dn_ver_rd, dn_ver_wr;
-// In the main_ram static window, not .bss: SRAM keeps >= 4 KB of stack (linker.ld).
-struct spec_state {
-    uint32_t ver_base[DN_NVER_MAX]; int on, n, c, pos; uint64_t zero[DN_NVER_MAX];
-    int nbatch;                       // console `nbatch on|off`: batched passes (hybrid_forward_batch)
-    float *bx[2], *bn[2], *ba[2], *bo[2];   // their per-token residual, FFN input, act, FFN output
-    float *out_norm;
-    uint32_t ffn_batched, ffn_declined;     // batched FFN layers, and those run per token
-    int mtpdbg;                             // console `mtpdbg on|off`: hybrid_mtp stage stats
-    uint64_t mtp_t0;                        // its stage timer
-};
-_Static_assert(sizeof(struct spec_state) <= 256, "BONSAI_SPEC_STATE_ADDR slot");
-#define SPEC ((struct spec_state *)BONSAI_SPEC_STATE_ADDR)
-#define dn_ver_base (SPEC->ver_base)
-#define spec (*SPEC)
-
 static inline float *dn_conv_slot(int s, int p, int C)
 {
     return dn_conv + ((uint64_t)p*(uint64_t)n_dn + (uint64_t)s)*(uint64_t)C;
 }
 
-// The first board run needs to distinguish a compute limit from a DDR/scratchpad/dispatch
-// limit. rdcycle is cheap enough to bracket every head without perturbing the datapath;
-// report per-head and per-forward averages so the 32-bit minimal printf remains sufficient
-// even for a long 27B benchmark.
-static uint64_t dn_cyc_fetch, dn_cyc_params, dn_cyc_core, dn_cyc_store, dn_cyc_output;
-static uint32_t dn_heads_profiled;
+// Stage cycle counters: rdcycle is cheap enough to bracket every stage without perturbing
+// the datapath; per-forward averages keep the 32-bit minimal printf sufficient even for a
+// long 27B benchmark.
 static uint64_t dn_cyc_inproj, dn_cyc_act, dn_cyc_conv, dn_cyc_prep;
 static uint64_t dn_cyc_heads, dn_cyc_gate, dn_cyc_outproj;
 static uint64_t hyb_cyc_embed, hyb_cyc_anorm, hyb_cyc_dn, hyb_cyc_attn;
@@ -143,20 +112,16 @@ struct hyb_prof {
     uint64_t at_sub[6];              // inside at_core: kv copy, list 1 build+run, softmax,
                                      // list 2 build+run, fixups, the rest
     uint64_t fwd_weight_beats;
-    uint32_t dn_state_sp;
     uint8_t dnres_enabled;           // console `dnres on|off`: the resident DeltaNet layer
-    uint8_t xres_enabled;            // console `xres on|off`: the resident residual stream
+    uint8_t xres_enabled;            // the resident residual stream (set at init)
     uint8_t dnstream_enabled;        // console `dnstream on|off` (taken at the next reset)
     uint8_t dnstream_active;         // the layout in engine DDR since the last reset
     uint8_t attnstream_enabled;      // console `attnstream on|off` (taken at the next reset)
     uint8_t attnstream_active;       // K/V rows also appended to engine DDR since the reset
     uint8_t hwargmax;                // console `hwargmax on|off`: the LM head list's argmax
     uint32_t lm_chunk;               // console `lmchunk <rows>`: cap the LM head chunks (0 auto)
-    uint16_t at_fail;                // console `attnfail <pos>` (debug): the stream fails at pos-1
     uint8_t logits_clean;            // the CPU holds no dirty line of `logits` (lm_head_argmax)
     uint64_t fd_prep, fd_mv;         // inside hyb_cyc_fdown: the down prepare, the down matvec
-    uint8_t pf_enabled;              // console `prefetch on|off`: the run-ahead weight prefetch
-    uint8_t pf_state;                // 0 schedule to record, 1 recording, 2 replaying
 };
 #define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -168,17 +133,8 @@ static uint32_t hyb_forwards_profiled;
 // 16 KiB table and the activations' much smaller hot interval fit the 32 KiB D-cache.
 static float *silu_lut;
 
-// Console `dnpipe`: DeltaNet head state store/fetch pipelining (DNREC only). Default on since
-// the v12 board run (2026-09-23): bit-exact in all four resident/dnpipe configurations,
-// 23,709 -> 17,231 cycles per head (docs/measurements/v12-2026-09-23.md).
-int dn_pipe_use = 1;
-
 #ifdef DN_STATE_HW
 #define DN_SP_STATE 0x00000u
-#define DN_SP_Q     0x10000u
-#define DN_SP_K     0x10200u
-#define DN_SP_V     0x10400u
-#define DN_SP_OUT   0x10600u
 #define DN_HW_ROWS  128u
 #define DN_HW_COLS  128u
 #define DN_HEAD_BYTES (DN_HW_ROWS*DN_HW_COLS*4u)
@@ -187,67 +143,14 @@ int dn_pipe_use = 1;
 // DeltaNet stream (engine op 5, BONSAI_HAS_DNSTREAM): every head of a layer in one op, the
 // state striped over the channels - channel c holds rows c, c+n_ch, ... of every head, in
 // the unit's column-group-major order (gateware/deltanet_stream.py), heads in processing
-// order. The same per-channel span as the per-head layout, so one reset clears both; the
-// layout is chosen at hybrid_reset (HP->dnstream_active) and only the resident layer runs
-// it.
+// order, n_dn*nv head matrices per layer set; the layout is chosen at hybrid_reset
+// (HP->dnstream_active) and only the resident layer runs it.
 #define DN_STREAM_BEATS (DN_HEAD_BEATS/(uint32_t)n_ch)   // per channel per head
 
 static uint32_t f32_bits(float x)
 {
     union { float f; uint32_t u; } v = { .f = x };
     return v.u;
-}
-
-// Scratchpad staging of the head state (HP->dn_sp_state): DN_SP_STATE for the CPU-side
-// layer, RS_F for the resident layer (whose q/k/v and outputs sit where DN_SP_STATE is).
-#define dn_sp_state (HP->dn_state_sp)
-
-static uint32_t dn_head_addr(uint32_t global_head)
-{
-    return dn_ver_base[dn_ver_rd] + (global_head/(uint32_t)n_ch)*DN_HEAD_BYTES;
-}
-
-static uint32_t dn_head_waddr(uint32_t global_head)   // where the updated state goes
-{
-    return dn_ver_base[dn_ver_wr] + (global_head/(uint32_t)n_ch)*DN_HEAD_BYTES;
-}
-
-// Head pipelining (console `dnpipe on|off`, default on since the v12 board run): the
-// state STORE of head i and the state FETCH of head i+1 are submitted back to back
-// without waiting (the CSR front holds one pending op behind the running one, and the
-// engine runs them in order, so the FETCH cannot overwrite the state before the STORE
-// has read it) and run under the CPU's output read and next-head parameter writes.
-// Measured v8: fetch 2650 + store 4915 cycles per head against 3114 + 4898 of CPU work
-// (build/v0-826f4ae-bench8.log), 2304 heads per 27B forward.
-static int dn_pipe_prefetched = -1;   // Global head whose state FETCH is in flight, or -1.
-static uint32_t dn_pipe_done0;        // done_count before the STORE: FETCH done at +2.
-static int dn_pipe_store_open;        // A STORE was submitted and never joined.
-
-static void dn_pipe_join(void)
-{
-    if (!dn_pipe_store_open)
-        return;
-    uint32_t need = dn_pipe_prefetched >= 0 ? 2u : 1u, spins = 0;
-    while ((uint32_t)(engine_csr_done_count_read() - dn_pipe_done0) < need) {
-        if (++spins > 4000000u) {
-            puts("DNSTALL: pipelined state store/fetch did not complete");
-            engine_wedged = 1;
-            break;
-        }
-    }
-    dn_pipe_store_open = 0;
-}
-
-static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
-                       const float *vh, float decay, float beta, float scale, float *oh,
-                       int load_qk, int next_head)
-{
-    (void)global_head; (void)qh; (void)kh; (void)vh; (void)decay; (void)beta; (void)scale;
-    (void)oh; (void)load_qk; (void)next_head;
-    if (!engine_wedged)
-        puts("DNSTALL: no per-head recurrence unit in this bitstream");
-    engine_wedged = 1;
-    return;
 }
 
 static void dn_hw_reset(void)
@@ -259,8 +162,8 @@ static void dn_hw_reset(void)
     for (uint32_t i = 0; i < DN_HEAD_BYTES/4; i++) z[i] = 0;
     uint32_t total = (uint32_t)n_dn*(uint32_t)nv;
     for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
-        // Every channel's full span: the per-head layout uses ceil((total - c)/n_ch) slots
-        // of channel c, the stream layout total*DN_STREAM_BEATS beats of each.
+        // Every channel's full span: the stream layout uses total*DN_STREAM_BEATS beats of
+        // each, i.e. at most ceil(total/n_ch) head-sized slots.
         uint32_t count = (total + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
         uint32_t slot = 0;
         while (slot < count) {
@@ -302,29 +205,9 @@ void hybrid_attnstream_enable(int on)
 #endif
 }
 int hybrid_attnstream_enabled(void) { return HP->attnstream_enabled; }
-// Debug: the attention stream fails at position p (as a list failure would) and the CPU loop
-// takes over, restoring the K/V rows main RAM skipped. 0 = never.
-void hybrid_attn_fail_at(int p) { HP->at_fail = p > 0 ? (uint16_t)p : 0; }
 void hybrid_hwargmax_enable(int on) { HP->hwargmax = on ? 1 : 0; }
-void hybrid_prefetch_enable(int on)
-{
-    HP->pf_enabled = on ? 1 : 0;
-    HP->pf_state = 0;
-}
-int hybrid_prefetch_enabled(void) { return HP->pf_enabled; }
-
-// Run-ahead weight prefetch (gateware/prefetch.py): the channels record one forward's weight
-// reads - a forward with logits, so the LM head is in the schedule - and replay them ahead of
-// the engine on every later forward. The start marks a forward boundary (no op in flight);
-// a forward that reads differently only costs the prefetch until the next start.
-static void prefetch_forward_start(int want_logits)
-{
-    (void)want_logits;
-}
 void hybrid_lm_chunk(uint32_t rows) { HP->lm_chunk = rows; }
 int hybrid_hwargmax_enabled(void) { return HP->hwargmax; }
-void hybrid_xres_enable(int on) { HP->xres_enabled = on ? 1 : 0; }
-int hybrid_xres_enabled(void) { return HP->xres_enabled && resident_active(); }
 int hybrid_dnres_enabled(void)
 {
 #ifdef DNRES_BUILT
@@ -555,8 +438,7 @@ static void rope_apply_partial(float *vh)   // one head: the first rope_n dims, 
 int hybrid_init(void)
 {
     H = model_header();
-    memset(SPEC, 0, sizeof(*SPEC));       // main_ram, not .bss: nothing initializes it but this
-    spec.nbatch = 1;
+    out_norm = NULL;
     n_ch = H->n_channels; n_layer = H->n_layer; n_embd = H->n_embd; n_head = H->n_head;
     n_kv_head = H->n_kv_head; head_dim = H->head_dim; ffn_dim = H->ffn_dim;
     q_dim = n_head*head_dim; kv_dim = n_kv_head*head_dim; n_rep = n_head/n_kv_head;
@@ -573,8 +455,7 @@ int hybrid_init(void)
         return -1;
     }
     n_dn = n_attn = 0;
-    n_mtp = (H->mtp_layers && model_entry(ROLE_MTP_EH, n_layer)) ? 1 : 0;
-    int n_lay = n_layer + n_mtp;          // the head's block is an attention layer at n_layer
+    int n_lay = n_layer;
     dn_slot = infer_halloc(n_lay*sizeof(int), 0);
     attn_slot = infer_halloc(n_lay*sizeof(int), 0);
     for (int l = 0; l < n_lay; l++) {
@@ -596,7 +477,6 @@ int hybrid_init(void)
         uint64_t base = (uint64_t)kv_base
                       + (uint64_t)n_lay*n_kv_head*2u*kv_region*32u;
         dn_hbm_base = (uint32_t)((base + 0xFFFu) & ~0xFFFull);
-        dn_ver_base[0] = dn_hbm_base;
         uint64_t state_per_channel = ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
         uint32_t skew_count = BONSAI_CHAN_MOD ? BONSAI_CHAN_MOD - 1u : 0u;
         uint64_t limit = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + BONSAI_CHAN_STRIDE
@@ -609,7 +489,6 @@ int hybrid_init(void)
                    (unsigned long)limit);
             return -1;
         }
-        HP->dn_state_sp = DN_SP_STATE;
         HP->dnres_enabled = 1;
     }
 #endif
@@ -636,7 +515,6 @@ int hybrid_init(void)
         at_slots = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
         uint64_t end = base + (uint64_t)n_attn*2u*at_slots*at_rowbeats*32u;
         at_hbm_base = (uint32_t)base;
-        at_end = end;
         at_geom_ok = n_attn && n_head <= BONSAI_ATTN_LANES && n_kv_head <= BONSAI_ATTN_GROUPS &&
                      head_dim >= 8 && head_dim <= BONSAI_ATTN_HD_MAX && !(head_dim & (head_dim - 1)) &&
                      n_head % n_kv_head == 0 && at_rowbeats <= 255 && end <= limit;
@@ -645,36 +523,9 @@ int hybrid_init(void)
                    (unsigned long)base, (unsigned long)end, (unsigned long)limit);
     }
 #endif
-    // Speculative state versions 1.. above everything else in the channel window, as many as
-    // fit (the 27B: 9 MiB per channel each).
-    dn_nver = 1;
-    dn_ver_rd = dn_ver_wr = 0;
-#ifdef DN_STATE_HW
-    int ver_ok = 1;
-#if defined(BONSAI_HAS_DNSTREAM) && !defined(BONSAI_DNSTREAM_WSHIFT)
-    ver_ok = 0;                        // this bitstream's op 5 updates the state in place only
-#endif
-    if (dn_hw && conv_k == 4 && ver_ok) {
-        uint64_t span = (((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES + 0xFFFu) & ~0xFFFull;
-        uint64_t b = (uint64_t)dn_hbm_base + span;
-#ifdef BONSAI_HAS_ATTNSTREAM
-        if (at_geom_ok && at_end > b) b = at_end;
-#endif
-        b = (b + 0xFFFu) & ~0xFFFull;
-        uint32_t skew_count = BONSAI_CHAN_MOD ? BONSAI_CHAN_MOD - 1u : 0u;
-        uint64_t limit = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + BONSAI_CHAN_STRIDE
-                       - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE) - 0x1000u
-                       - (uint64_t)skew_count*BONSAI_CHAN_SKEW;
-        // The stream op's write offset is a signed 24-bit beat count (+-256 MB).
-        while (dn_nver < DN_NVER_MAX && b + span <= limit && b + span - dn_hbm_base < (1ull << 28)) {
-            dn_ver_base[dn_nver++] = (uint32_t)b;
-            b += span;
-        }
-    }
-#endif
-    dn_conv_w = conv_k - 1 + dn_nver - 1;
-    // FP32 state. The matrix lives in engine DDR when the recurrence accelerator is
-    // available; the short causal-convolution history remains in main RAM either way.
+    dn_conv_w = conv_k - 1;
+    // FP32 state. The matrix lives in engine DDR when the stream op can update it; the
+    // short causal-convolution history remains in main RAM either way.
     uint64_t matrix_b = (uint64_t)n_dn*nv*hv*hk*4;
     uint64_t conv_b = (uint64_t)n_dn*dn_conv_w*(2*nq + nvh)*4;
     uint64_t state_b = (dn_hw ? 0 : matrix_b) + conv_b;
@@ -762,16 +613,6 @@ int hybrid_init(void)
             if (!norm_q[l] || !norm_k[l]) { printf("hybrid: layer %d q/k norms missing\n", l); return -2; }
         }
     }
-    if (n_mtp) {
-        mtp_e = infer_halloc(n_embd*4, 0); mtp_cat = infer_halloc(2*n_embd*4, 0);
-        mtp_enorm = fetch_f32(model_entry_kind(ROLE_MTP_ENORM, n_layer, KIND_F32));
-        mtp_hnorm = fetch_f32(model_entry_kind(ROLE_MTP_HNORM, n_layer, KIND_F32));
-        mtp_head_norm = fetch_f32(model_entry_kind(ROLE_MTP_HEAD_NORM, n_layer, KIND_F32));
-        if (!mtp_e || !mtp_cat || !mtp_enorm || !mtp_hnorm || !mtp_head_norm) {
-            puts("hybrid: MTP head tables missing - head off");
-            n_mtp = 0;
-        }
-    }
     // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; v3 images carry the
     // scaling fields when a model needs them - none does today).
     rope_c = infer_halloc((rope_n/2)*4, 0); rope_s = infer_halloc((rope_n/2)*4, 0);
@@ -782,10 +623,7 @@ int hybrid_init(void)
     HP->dnstream_active = 0;
     HP->attnstream_active = 0;
     HP->hwargmax = 1;
-    HP->pf_enabled = 1;
-    HP->pf_state = 0;              // a new image: the schedule is recorded again
     HP->lm_chunk = 0;
-    HP->at_fail = 0;
     HP->logits_clean = 0;
 #ifdef BONSAI_HAS_ATTNSTREAM
     HP->attnstream_enabled = 1;
@@ -922,16 +760,12 @@ void hybrid_reset(void)
         flush_cpu_dcache_range(dn_conv, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);   // device-owned
     }
     if (dn_conv_pos) memset(dn_conv_pos, 0, (size_t)n_dn);
-    dn_ver_rd = dn_ver_wr = 0;
-    spec.on = 0;
     if (kc_rows) memset(kc_rows, 0, (size_t)n_attn*2);
     hybrid_stats_reset();
 }
 
 void hybrid_stats_reset(void)
 {
-    dn_cyc_fetch = dn_cyc_params = dn_cyc_core = dn_cyc_store = dn_cyc_output = 0;
-    dn_heads_profiled = 0;
     dn_cyc_inproj = dn_cyc_act = dn_cyc_conv = dn_cyc_prep = 0;
     dn_cyc_heads = dn_cyc_gate = dn_cyc_outproj = 0;
     hyb_cyc_embed = hyb_cyc_anorm = hyb_cyc_dn = hyb_cyc_attn = 0;
@@ -946,27 +780,6 @@ void hybrid_stats_reset(void)
 
 void hybrid_stats_print(void)
 {
-    // The per-head recurrence line exists only with the hardware DeltaNet; the per-stage
-    // and resident profiles below do not depend on it (they used to sit behind the same
-    // early return, so a DNREC-less simulation printed neither).
-    if (dn_hw && dn_heads_profiled) {
-        uint32_t heads_per_forward = (uint32_t)n_dn*(uint32_t)nv;
-        uint32_t forwards = heads_per_forward ? dn_heads_profiled/heads_per_forward : 0;
-        uint64_t total = dn_cyc_fetch + dn_cyc_params + dn_cyc_core
-                       + dn_cyc_store + dn_cyc_output;
-        printf("dnhw: %lu heads/%lu forwards, avg cycles/head fetch %lu params %lu "
-               "core %lu store %lu output %lu total %lu",
-               (unsigned long)dn_heads_profiled, (unsigned long)forwards,
-               (unsigned long)(dn_cyc_fetch/dn_heads_profiled),
-               (unsigned long)(dn_cyc_params/dn_heads_profiled),
-               (unsigned long)(dn_cyc_core/dn_heads_profiled),
-               (unsigned long)(dn_cyc_store/dn_heads_profiled),
-               (unsigned long)(dn_cyc_output/dn_heads_profiled),
-               (unsigned long)(total/dn_heads_profiled));
-        if (forwards)
-            printf(", %lu cycles/forward", (unsigned long)(total/forwards));
-        puts("");
-    }
     if (hyb_forwards_profiled) {
         uint64_t ht = hyb_cyc_embed + hyb_cyc_anorm + hyb_cyc_dn + hyb_cyc_attn
                     + hyb_cyc_resid + hyb_cyc_fprep + hyb_cyc_fproj + hyb_cyc_fact
@@ -1157,7 +970,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         memcpy(dn_conv_slot(s, pn, C), qkv, (size_t)C*4);
         dn_conv_pos[s] = p1;
     } else {
-        // Other kernels: a shifted window, no speculative slots (dn_conv_w == conv_k - 1).
+        // Other kernels: a shifted window.
         for (int c = 0; c < C; c++) {
             float acc = 0;
             for (int i = 0; i < conv_k - 1; i++) acc += w[c*conv_k + i]*dn_conv_slot(s, i, C)[c];
@@ -1182,56 +995,37 @@ static void deltanet_layer(int l, const float *h, float *out)
         l2norm_fv(dn_k + hh*hk, hk);
     }
     dn_cyc_prep += perf_now64() - t0;
+    if (dn_hw) {
+        // The state is in engine DDR, which only the stream op of the resident layer updates.
+        if (!engine_wedged)
+            puts("DNSTALL: the DeltaNet state is in engine DDR, the CPU layer cannot run it");
+        engine_wedged = 1;
+        return;
+    }
     // The recurrence per value head (llama.cpp's autoregressive kernel): M = S[hh] rows j.
     float scale = 1.0f/sqrtf((float)hk);
     int rep = nv/nk;
-    for (int hi = 0; hi < nv; hi++) {
-        int hh = hi, kh, gpos, load_qk = 1;
-        if (dn_hw) {
-            // Heads r*nk+kh share q/k for each kh. Visit those `rep` heads together so
-            // q/k remain in the scratchpad, while their striped state matrices are also
-            // consecutive slots in one DDR channel. `og`'s grouped order is exactly hi.
-            kh = hi/rep;
-            int r = hi - kh*rep;
-            hh = r*nk + kh;
-            gpos = hi;
-            load_qk = (r == 0);
-        } else {
-            kh = hh % nk;
-            gpos = kh*rep + hh/nk;
-        }
+    for (int hh = 0; hh < nv; hh++) {
+        int kh = hh % nk, gpos = kh*rep + hh/nk;
         const float *qh = dn_q + kh*hk, *kk = dn_k + kh*hk, *vh = dn_v + hh*hv;
-        float *M = dn_hw ? NULL : S + (uint64_t)hh*hv*hk;
+        float *M = S + (uint64_t)hh*hv*hk;
         t0 = perf_now64();
         float decay = bonsai_decay_exp(gb[hh]);
         float *oh = ob + hh*hv;
-        if (dn_hw) {
-#ifdef DN_STATE_HW
-            // The next head in visiting order (hi+1 -> its hh), for the state prefetch.
-            int next_head = -1;
-            if (dn_pipe_use && hi + 1 < nv) {
-                int nkh = (hi + 1)/rep, nr = hi + 1 - nkh*rep;
-                next_head = (int)((uint32_t)s*nv) + nr*nk + nkh;
-            }
-            dn_hw_head((uint32_t)s*nv + (uint32_t)hh, qh, kk, vh, decay,
-                       betab[hh], scale, oh, load_qk, next_head);
-#endif
-        } else {
-            // One pass over the state: row j's delta depends on row j alone, so the decay,
-            // the k dot, the update and the q dot happen while the row (512 B) is in the
-            // D$ - the two-loop form streamed the 64 KB head twice through a 32 KB cache.
-            // Same operations in the same order per element: bit-identical results.
-            int j = 0;
-            for (; j + 3 < hv; j += 4)
-                deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
-            for (; j < hv; j++) {
-                float *Mj = M + j*hk, dot = 0;
-                for (int i = 0; i < hk; i++) { Mj[i] *= decay; dot += Mj[i]*kk[i]; }
-                float dj = (vh[j] - dot)*betab[hh];
-                dot = 0;
-                for (int i = 0; i < hk; i++) { Mj[i] += dj*kk[i]; dot += Mj[i]*qh[i]; }
-                oh[j] = dot*scale;
-            }
+        // One pass over the state: row j's delta depends on row j alone, so the decay,
+        // the k dot, the update and the q dot happen while the row (512 B) is in the
+        // D$ - the two-loop form streamed the 64 KB head twice through a 32 KB cache.
+        // Same operations in the same order per element: bit-identical results.
+        int j = 0;
+        for (; j + 3 < hv; j += 4)
+            deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
+        for (; j < hv; j++) {
+            float *Mj = M + j*hk, dot = 0;
+            for (int i = 0; i < hk; i++) { Mj[i] *= decay; dot += Mj[i]*kk[i]; }
+            float dj = (vh[j] - dot)*betab[hh];
+            dot = 0;
+            for (int i = 0; i < hk; i++) { Mj[i] += dj*kk[i]; dot += Mj[i]*qh[i]; }
+            oh[j] = dot*scale;
         }
         dn_cyc_heads += perf_now64() - t0;
         // Gated RMSNorm over the head with the shared head norm, times SiLU(z); written in
@@ -1243,9 +1037,6 @@ static void deltanet_layer(int l, const float *h, float *out)
         silu_mul_fv(dst, delta, z, hv);
         dn_cyc_gate += perf_now64() - t0;
     }
-#ifdef DN_STATE_HW
-    dn_pipe_join();                 // The last head's state must be in DDR before any other op.
-#endif
     t0 = perf_now64();
     proj_f(model_entry(ROLE_SSM_OUT, l), og, out);
     dn_cyc_outproj += perf_now64() - t0;
@@ -1258,7 +1049,7 @@ static uint32_t f32_bits_any(float x)
     return v.u;
 }
 // The resident DeltaNet layer: the whole layer in scratchpad lists (units 1/3/4/5/8 for the
-// projections, 13 conv, 11 SiLU, 12 norms, the recurrence unit per head), the CPU doing
+// projections, 13 conv, 11 SiLU, 12 norms, engine op 5 for the heads), the CPU doing
 // only the per-head scalars and the rare SiLU fixups. Bit-exact with deltanet_layer (the
 // sim gate compares them checkpoint by checkpoint). Scratchpad map for this layer:
 #define DNR_QKV   0x04800u        // qkv, then conv+SiLU output, q/k L2-normed in place (4C)
@@ -1268,19 +1059,13 @@ static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 #ifdef BONSAI_HAS_DNSTREAM
 // The stream op's records: one per head in processing order at slot0 (q, k, v, out byte
 // addresses; decay, beta, scale), from betab/gb.
-// Record slot of processing index hi: with two units (BONSAI_DNSTREAM_PAIR) the even
-// indices go to unit 0's table, the odd ones behind them to unit 1's.
-static int dn_rec_slot(int hi)
-{
-    return hi;
-}
 
 static void dn_stream_records(uint32_t slot0, uint32_t ho, float scale, int rep)
 {
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + slot0);
     for (int hi = 0; hi < nv; hi++) {
         int kh = hi/rep, hh = (hi - kh*rep)*nk + kh;
-        volatile uint32_t *w = rec + 8*dn_rec_slot(hi);
+        volatile uint32_t *w = rec + 8*hi;
         w[0] = DNR_QKV + 4u*(uint32_t)(kh*hk);
         w[1] = DNR_QKV + 4u*(uint32_t)(nq + kh*hk);
         w[2] = DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv);
@@ -1447,14 +1232,12 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         // state streamed from and back to every channel. The read-back fences the CPU's
         // posted scratchpad writes.
         volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + SLOT0);
-        (void)rec[8*dn_rec_slot(nv - 1) + 7];   // the last record written
+        (void)rec[8*(nv - 1) + 7];   // the last record written
         struct engine_op o = {0};
         o.kind  = ENGINE_KIND_DNSTREAM;
         o.rows  = (uint16_t)nv;
-        o.wbase = dn_ver_base[dn_ver_rd] + (uint32_t)s*(uint32_t)nv*DN_STREAM_BEATS*32u;
+        o.wbase = dn_hbm_base + (uint32_t)s*(uint32_t)nv*DN_STREAM_BEATS*32u;
         o.wlen  = (uint32_t)nv*DN_STREAM_BEATS;
-        // The update goes to version dn_ver_wr (0: in place): a signed beat offset.
-        o.dstride = (uint32_t)(((int32_t)(dn_ver_base[dn_ver_wr] - dn_ver_base[dn_ver_rd]) >> 5) & 0xFFFFFF);
         o.xsrc  = SLOT0;
         o.bias  = (uint8_t)(dn_state_zero >> s & 1u);    // the state is still the reset's zero
         engine_run(&o);
@@ -1466,12 +1249,12 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     } else
 #endif
     if (dn_hw) {
-        puts("DNSTALL: no per-head recurrence unit in this bitstream (dnstream off?)");
+        puts("DNSTALL: the DeltaNet state is in engine DDR and the stream is off (dnstream off?)");
         engine_wedged = 1;
         goto fatal;
     } else {
-        // No recurrence unit (a simulation without --with-dnrec): the CPU recurrence on
-        // the normalised q/k/v, then its outputs back into the scratchpad.
+        // The state in main RAM (a model without the stream's geometry): the CPU
+        // recurrence on the normalised q/k/v, then its outputs back into the scratchpad.
         rl_begin();
         rl_store(convb, dnr_align(4*C), DNR_QKV);
         if (rl_run("deltanet qkv out"))
@@ -1664,7 +1447,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
         rl_store(at_buf, nq*Tp*4u, AT_SP);
     }
     AT_SUB(1);
-    if (rl_run("attention scores") || (HP->at_fail && (uint32_t)HP->at_fail == p)) {
+    if (rl_run("attention scores")) {
         HP->attnstream_active = 0;
         return -1;
     }
@@ -2054,35 +1837,7 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
 }
 #endif
 
-// Console `lmcheck` (debug): the LM head of the last forward's hb through the list and
-// through proj_f, compared chunk by chunk.
-void hybrid_lm_check(void)
-{
-    static float *ref;
-    const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
-    if (!head) head = model_entry(ROLE_TOK_EMB, 0);
-    if (!head || !logits) { puts("lmcheck: no model"); return; }
-    if (!ref) ref = infer_halloc((uint64_t)head->rows*4 + 64, 1);
-    if (!ref) { puts("lmcheck: no room"); return; }
-    proj_f(head, hb, ref);
-    if (lm_head_list(head, logits)) { puts("lmcheck: the list failed"); return; }
-    uint32_t chunk = lm_chunk_rows();
-    printf("lmcheck: %lu rows, chunks of %lu\n", (unsigned long)head->rows, (unsigned long)chunk);
-    for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
-        uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, bad = 0, first = 0;
-        const uint32_t *a = (const uint32_t *)(ref + r0), *b = (const uint32_t *)(logits + r0);
-        for (uint32_t i = 0; i < rows; i++)
-            if (a[i] != b[i] && !bad++) first = i;
-        printf("  chunk %lu: %lu differ", (unsigned long)(r0/chunk), (unsigned long)bad);
-        if (bad)
-            printf(", first row %lu: ref %08lx list %08lx", (unsigned long)(r0 + first),
-                   (unsigned long)a[first], (unsigned long)b[first]);
-        puts("");
-    }
-}
-
-// The LM head on hb (the normed hidden state) and its argmax: the main forward's and the
-// MTP head's (which shares the model's head). t0: the logits phase's start.
+// The LM head on hb (the normed hidden state) and its argmax. t0: the logits phase's start.
 static int head_argmax(uint64_t t0)
 {
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
@@ -2203,18 +1958,6 @@ static void ffn_tok(int l, uint64_t t0)
 int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
-    if (spec.on) {
-        // The next DeltaNet state version; the committed one stays readable.
-        if (spec.n + 1 >= (n_dn ? dn_nver : DN_NVER_MAX)) {
-            puts("hybrid: speculative pass longer than the state versions");
-            return -1;
-        }
-        spec.zero[spec.n] = dn_state_zero;
-        dn_ver_rd = (spec.c + spec.n) % dn_nver;
-        dn_ver_wr = (spec.c + spec.n + 1) % dn_nver;
-        spec.n++;
-    }
-    prefetch_forward_start(want_logits);
     uint64_t t0 = perf_now64();
     if (infer_embed_f(token, xb) < 0) return -1;
     hyb_cyc_embed += perf_now64() - t0;
@@ -2286,324 +2029,8 @@ int hybrid_forward(int token, int want_logits)
     if (!want_logits) return -1;
     t0 = perf_now64();
     const struct bons_entry *on = model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32);
-    if (!spec.out_norm) spec.out_norm = fetch_f32(on);
-    rmsnorm_fv(hb, xb, spec.out_norm, n_embd);
+    if (!out_norm) out_norm = fetch_f32(on);
+    rmsnorm_fv(hb, xb, out_norm, n_embd);
     infer_dbg_f32("out_norm", -1, hb, n_embd);
     return head_argmax(t0);
-}
-
-// The MTP head at position p: embed(token) (the token at p) and hprev (the normed hidden
-// state that predicted it) -> the draft for p + 1, its normed hidden state in hout (the next
-// draft's hprev). The block is the attention layer at n_layer with its own KV slot (row p
-// overwritten: speculative rows are rewritten when the real tokens get there), the plain
-// CPU residual (the main forward's xb is free once its LM head ran). As the mirror's mtp()
-// (test/test_hybrid_mirror.py), op for op.
-// mtpdbg: one line per stage of the head - |max|, sum, non-finite count, first element.
-static void mtp_stat(const char *what, const float *v, int n)
-{
-    if (!spec.mtpdbg) return;
-    uint64_t now = perf_now64(), dt = now - spec.mtp_t0;
-    float amax = 0.0f, sum = 0.0f;
-    int bad = 0;
-    for (int i = 0; i < n; i++) {
-        float x = v[i];
-        if (x != x || x - x != 0.0f) { bad++; continue; }
-        float a = x < 0 ? -x : x;
-        if (a > amax) amax = a;
-        sum += x;
-    }
-    printf("MTPDBG %s amax %08lx sum %08lx nonfinite %d v0 %08lx cycles %lu\n", what, (unsigned long)f32_bits(amax),
-           (unsigned long)f32_bits(sum), bad, (unsigned long)f32_bits(v[0]), (unsigned long)dt);   // f32 bits: no %e
-    spec.mtp_t0 = perf_now64();               // the stat's own loop is not the next stage's
-}
-void hybrid_mtpdbg_enable(int on) { spec.mtpdbg = on ? 1 : 0; }
-
-int hybrid_mtp(int token, int p, const float *hprev, float *hout)
-{
-    if (!n_mtp) return -1;
-    const int L = n_layer;
-    spec.mtp_t0 = perf_now64();
-    if (infer_embed_f(token, mtp_e) < 0) return -1;
-    rmsnorm_fv(mtp_cat, mtp_e, mtp_enorm, n_embd);
-    rmsnorm_fv(mtp_cat + n_embd, hprev, mtp_hnorm, n_embd);
-    mtp_stat("hprev", hprev, n_embd);
-    mtp_stat("emb", mtp_e, n_embd);
-    mtp_stat("cat", mtp_cat, 2*n_embd);
-    const struct bons_entry *eh = model_entry(ROLE_MTP_EH, L);
-    // eh_proj, the plain basis. The 27B's is K-segmented (K = 10240 > one Q8 op): the
-    // resident list sums the segments' int32 (build_matvec_rows); the CPU path's fused
-    // K-segment form takes rotated inputs only, so without the resident vector it goes
-    // through infer_matvec_f (the same arithmetic, ~5x the cycles on the board).
-    int e8h = quantize_f(mtp_cat, 2*n_embd);
-    if (!(eh->flags & FLAG_KSEG) || e8h == E8_RESIDENT)
-        matvec_q(eh, e8h, xb);
-    else
-        infer_matvec_f(eh, mtp_cat, xb);
-    mtp_stat("eh", xb, n_embd);
-    rmsnorm_fv(hb, xb, norm_attn[L], n_embd);
-    // The head's entry for position p (p >= 1: it follows a main forward) goes to KV row
-    // p - 1 at RoPE position p - 1, so its rows start at 0. At p it read a row 0 nothing
-    // wrote: zero in the simulation, stale DDR on the board (attention out ~1e34, every
-    // draft token 0 - 2026-10-06). Scores depend on position differences only.
-    int save = pos;
-    pos = p - 1;
-    attention_layer(L, hb, tmp_h);
-    pos = save;
-    if (engine_wedged) return -1;
-    mtp_stat("attn", tmp_h, n_embd);
-    add_fv(xb, tmp_h, n_embd);
-    rmsnorm_fv(hb, xb, norm_ffn[L], n_embd);
-    // The main layers' FFN (resident SiLU unit + the down prepare in the scratchpad when
-    // available, bit-exact with the CPU form): the CPU's SiLU over 17,408 elements and the
-    // down projection's own prepare were 2.2M of the head's ~6M cycles on the board.
-    resident_rsf_set(NULL);               // hb is CPU-written
-    ffn_tok(L, perf_now64());
-    mtp_stat("ffn", tmp_h, n_embd);
-    add_fv(xb, tmp_h, n_embd);
-    rmsnorm_fv(hb, xb, mtp_head_norm, n_embd);
-    mtp_stat("out", hb, n_embd);
-    if (hout) memcpy(hout, hb, (size_t)n_embd*4);
-    return head_argmax(perf_now64());
-}
-
-int hybrid_mtp_present(void) { return n_mtp; }
-
-// Speculative forwards. hybrid_spec_begin marks the committed state; every hybrid_forward
-// after it reads the previous forward's DeltaNet version and writes the next, and puts its
-// conv input in a new window slot. hybrid_spec_end(m) keeps the first m forwards and drops
-// the rest: the state version, the conv windows, the zero-state flags, pos (attention rows
-// past it are rewritten by the next forwards) and main RAM's K/V row counts.
-int hybrid_spec_max(void) { return n_dn ? dn_nver - 1 : DN_NVER_MAX - 1; }
-
-void hybrid_nbatch_enable(int on) { spec.nbatch = on ? 1 : 0; }
-void hybrid_nbatch_stats(uint32_t *batched, uint32_t *declined)
-{
-    *batched = spec.ffn_batched; *declined = spec.ffn_declined;
-}
-int hybrid_nbatch_enabled(void)
-{
-    return 0;
-}
-
-// nb (<= 2) speculative forwards of tok[0..nb-1] at pos.., layer by layer: every token's
-// mixer in turn (its own DeltaNet state version, conv slot and position - the order nb
-// hybrid_forward calls touch them in per layer), then their FFN as one weight stream per
-// projection (resident_ffn_batch; per token when declined). Inside hybrid_spec_begin/end.
-// ys[b]: the greedy token after input b; hs: the final normed hidden states (nb*n_embd).
-// The residual takes the CPU path (no xres), which the mirror gates like the other.
-int hybrid_forward_batch(const int *tok, int nb, int *ys, float *hs)
-{
-    if (!spec.on || nb < 1 || nb > 2 || pos + nb > ctx_cap || spec.n + nb >= (n_dn ? dn_nver : DN_NVER_MAX))
-        return -1;
-    for (int b = 0; b < 2 && !spec.bx[1]; b++) {
-        spec.bx[b] = infer_halloc((uint64_t)n_embd*4, 0); spec.bn[b] = infer_halloc((uint64_t)n_embd*4, 0);
-        spec.ba[b] = infer_halloc((uint64_t)ffn_dim*4, 0); spec.bo[b] = infer_halloc((uint64_t)n_embd*4, 0);
-        if (!spec.bx[b] || !spec.bn[b] || !spec.ba[b] || !spec.bo[b]) { spec.bx[1] = NULL; return -1; }
-    }
-    if (!spec.out_norm) spec.out_norm = fetch_f32(model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32));
-    float *xsave = xb;
-    int p0 = pos, n0 = spec.n, rc = -1;
-    for (int b = 0; b < nb; b++) {
-        // A forward's zero-state flags: the first one's are the pass's; every DeltaNet layer
-        // has run once by the second.
-        spec.zero[n0 + b] = b ? 0 : dn_state_zero;
-        if (infer_embed_f(tok[b], spec.bx[b]) < 0) goto out;
-    }
-    spec.n += nb;
-    for (int l = 0; l < n_layer; l++) {
-        uint64_t t0 = perf_now64();
-        for (int b = 0; b < nb; b++) {
-            xb = spec.bx[b];
-            pos = p0 + b;
-            dn_ver_rd = (spec.c + n0 + b) % dn_nver;
-            dn_ver_wr = (spec.c + n0 + b + 1) % dn_nver;
-            rmsnorm_fv(hb, xb, norm_attn[l], n_embd);
-            resident_rsf_set(NULL);   // hb is CPU-written: no list's RS_F copy of it stands
-            if (dn_slot[l] >= 0) {
-                int r = -1;
-#ifdef DNRES_BUILT
-                r = deltanet_layer_resident(l, hb, tmp_h);
-                if (r == -2) goto out;
-#endif
-                if (r)
-                    deltanet_layer(l, hb, tmp_h);
-            } else {
-                attention_layer(l, hb, tmp_h);
-            }
-            if (engine_wedged) goto out;
-            add_fv(xb, tmp_h, n_embd);
-            rmsnorm_fv(spec.bn[b], xb, norm_ffn[l], n_embd);
-        }
-        hyb_cyc_dn += perf_now64() - t0;
-        t0 = perf_now64();
-        if (resident_ffn_batch(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l),
-                               model_entry(ROLE_FFN_DOWN, l), nb, (const float *const *)spec.bn,
-                               spec.ba, spec.bo) == 0) {
-            for (int b = 0; b < nb; b++)
-                add_fv(spec.bx[b], spec.bo[b], n_embd);
-            hyb_cyc_fproj += perf_now64() - t0;
-            spec.ffn_batched++;
-        } else {
-            if (engine_wedged) goto out;
-            spec.ffn_declined++;
-            for (int b = 0; b < nb; b++) {
-                xb = spec.bx[b];
-                memcpy(hb, spec.bn[b], (size_t)n_embd*4);
-                resident_rsf_set(NULL);
-                ffn_tok(l, perf_now64());
-                add_fv(xb, tmp_h, n_embd);
-            }
-        }
-        if (engine_wedged) goto out;
-    }
-    for (int b = 0; b < nb; b++) {
-        rmsnorm_fv(hb, spec.bx[b], spec.out_norm, n_embd);
-        resident_rsf_set(NULL);
-        ys[b] = head_argmax(perf_now64());
-        if (ys[b] < 0) goto out;
-        memcpy(hs + (uint64_t)b*n_embd, hb, (size_t)n_embd*4);
-    }
-    hyb_forwards_profiled += nb;
-    rc = 0;
-out:
-    xb = xsave;
-    pos = p0 + nb;
-    return rc;
-}
-
-int hybrid_spec_begin(void)
-{
-    if (spec.on || hybrid_spec_max() < 1) return -1;
-    spec.on = 1; spec.n = 0; spec.c = dn_ver_rd; spec.pos = pos;
-    return 0;
-}
-
-int hybrid_spec_end(int m)
-{
-    if (!spec.on || m < 0 || m > spec.n) return -1;
-    int drop = spec.n - m;
-    dn_ver_rd = dn_ver_wr = (spec.c + m) % dn_nver;
-    if (drop) {
-        dn_state_zero = spec.zero[m];
-        for (int s = 0; s < n_dn; s++)
-            dn_conv_pos[s] = (uint8_t)((dn_conv_pos[s] + dn_conv_w - drop % dn_conv_w) % dn_conv_w);
-    }
-    pos = spec.pos + m;
-    if (kc_rows)
-        for (int a = 0; a < n_attn; a++)
-            if (kc_rows[a] > pos) kc_rows[a] = (uint16_t)pos;
-    spec.on = 0;
-    return 0;
-}
-
-// The first drafts of the last hybrid_mtp_generate, for the simulation gate (the mirror
-// logs the same list: a random tiny head is never accepted, its drafts still compare).
-int hybrid_mtp_drafts[64];
-int hybrid_mtp_ndrafts;
-
-// Speculative decoding, the mirror's loop (hybrid27_generate mtp_k): after every main
-// forward the head drafts k tokens chained on its own hidden state. The verification is a
-// batched pass in its state handling: the main model forwards the pending token and all k
-// drafts as speculative forwards (hybrid_spec_begin), the longest agreeing prefix is
-// kept and the rest rolled back (hybrid_spec_end) - the order a batched-verify engine
-// runs them in, one forward at a time until it exists. The output is the greedy one by
-// construction. The head then runs once per accepted position so its KV holds the real
-// tokens. batched == 0 (or too few state versions: hybrid_spec_max() < k + 1): the main
-// model verifies one forward at a time, breaking at the first disagreement - the cheaper
-// order until the engine verifies several tokens per weight stream.
-// hybrid_mtp_oracle[p] >= 0 replaces the draft of the token at position p (the mirror's
-// mtp_hook): a test's way through the accept path, which a random head never takes.
-// stats: passes, drafted, accepted, head cycles.
-int hybrid_mtp_noracle;              // entries of hybrid_mtp_oracle (main_ram, BONSAI_MTP_ORACLE_ADDR)
-
-int hybrid_mtp_generate(const int *prompt, int n_prompt, int n_new, int k, int batched,
-                        void (*emit)(int tok), uint64_t *stats)
-{
-    static float *hs;                   // hidden state of each forward of a pass, then the head's
-    int drafts[9], ys[9];
-    if (!n_mtp || k < 1 || k > 8 || n_prompt < 1) return -1;
-    if (!hs) hs = infer_halloc((uint64_t)11*n_embd*4, 0);
-    if (!hs) return -1;
-    float *ha = hs + (uint64_t)9*n_embd, *hh = hs + (uint64_t)10*n_embd;
-    batched = batched && hybrid_spec_max() >= k + 1;
-    uint64_t tm;
-    int tok = -1, nout = 0;
-    hybrid_mtp_ndrafts = 0;
-    for (int i = 0; i < n_prompt; i++) {
-        tok = hybrid_forward(prompt[i], 1);
-        if (tok < 0 || engine_wedged) return -1;
-        memcpy(ha, hb, (size_t)n_embd*4);
-        if (i + 1 < n_prompt) {
-            tm = perf_now64();
-            if (hybrid_mtp(prompt[i + 1], pos, ha, NULL) < 0) return -1;   // the head's KV
-            stats[3] += perf_now64() - tm;
-        }
-    }
-    for (;;) {
-        emit(tok);
-        if (++nout == n_new) return 0;
-        tm = perf_now64();
-        const float *hp = ha;
-        int t = tok;
-        for (int j = 0; j < k; j++) {
-            t = hybrid_mtp(t, pos + j, hp, hh);
-            if (t < 0) return -1;
-            int q = pos + 1 + j;
-            if (q < hybrid_mtp_noracle && hybrid_mtp_oracle[q] >= 0) t = hybrid_mtp_oracle[q];
-            drafts[j] = t;
-            if (hybrid_mtp_ndrafts < 64) hybrid_mtp_drafts[hybrid_mtp_ndrafts++] = t;
-            hp = hh;
-        }
-        stats[3] += perf_now64() - tm;
-        stats[0]++; stats[1] += (uint64_t)k;
-        if (batched) {
-            // Forward tok, d1..dk (all of them, as the batched pass will); ys[j] is the
-            // model's token after input j.
-            int p0 = pos, n = k + 1, a = 0;
-            if (pos + n > ctx_cap) n = ctx_cap - pos;
-            if (n < 1 || hybrid_spec_begin()) return -1;
-            int j0 = 0;
-            if (n >= 2 && hybrid_nbatch_enabled()) {      // tok and d1 in one weight stream
-                int tk[2] = {tok, drafts[0]};
-                if (hybrid_forward_batch(tk, 2, ys, hs) || engine_wedged) { hybrid_spec_end(0); return -1; }
-                j0 = 2;
-            }
-            for (int j = j0; j < n; j++) {
-                ys[j] = hybrid_forward(j ? drafts[j - 1] : tok, 1);
-                if (ys[j] < 0 || engine_wedged) { hybrid_spec_end(0); return -1; }
-                memcpy(hs + (uint64_t)j*n_embd, hb, (size_t)n_embd*4);
-            }
-            while (a < n - 1 && a < k && ys[a] == drafts[a]) a++;
-            if (hybrid_spec_end(a + 1)) return -1;
-            for (int j = 0; j < a; j++) {
-                stats[2]++;
-                emit(drafts[j]);
-                if (++nout == n_new) return 0;
-                tm = perf_now64();
-                if (hybrid_mtp(drafts[j], p0 + j + 1, hs + (uint64_t)j*n_embd, NULL) < 0) return -1;
-                stats[3] += perf_now64() - tm;
-            }
-            tok = ys[a];
-            memcpy(ha, hs + (uint64_t)a*n_embd, (size_t)n_embd*4);
-            continue;
-        }
-        int j;
-        for (j = 0; j < k; j++) {
-            tok = hybrid_forward(tok, 1);
-            if (tok < 0 || engine_wedged) return -1;
-            memcpy(ha, hb, (size_t)n_embd*4);
-            if (tok != drafts[j]) break;                // tok: the correction
-            stats[2]++;
-            emit(tok);
-            if (++nout == n_new) return 0;
-            tm = perf_now64();
-            if (hybrid_mtp(tok, pos, ha, NULL) < 0) return -1;
-            stats[3] += perf_now64() - tm;
-        }
-        if (j == k) {                                   // all accepted: the bonus token
-            tok = hybrid_forward(tok, 1);
-            if (tok < 0 || engine_wedged) return -1;
-            memcpy(ha, hb, (size_t)n_embd*4);
-        }
-    }
 }
