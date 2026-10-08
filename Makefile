@@ -26,6 +26,8 @@ models:
 
 # The tiny random models the tests and the simulation use (seconds).
 tiny:
+	for n in 2 4 8 16; do $(PYTHON) -m trixium.model.tinygen --out models/tiny --channels $$n; done
+	for n in 2 8; do $(PYTHON) -m trixium.model.tinygen --out models/tiny --channels $$n --hybrid; done
 	$(PYTHON) -m trixium.model.tinygen --out models/tiny --channels 8 --hybrid-1k
 
 # GGUF -> BONS image + the chat tool's tokenizer. `make convert GGUF=... CHANNELS=16`.
