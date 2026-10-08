@@ -171,7 +171,7 @@ extern "C" void litex_sim_user_init(void *vsim) {
     if (const char *d = getenv("LITEX_PC_PROF_DIR"))          snprintf(g_dir, sizeof(g_dir), "%s", d);
     if (const char *c = getenv("LITEX_PC_PROF_CHECKPOINT_S")) g_ckpt_period_s = atof(c);
     static const char *defaults =
-        "SELFTEST DONE,GEN:,GEN DONE,GEN-HW:,GEN-HW DONE,GEN-SP:,GEN-SP DONE,BONSAI-READY";
+        "SELFTEST DONE,GEN:,GEN DONE,GEN-HW:,GEN-HW DONE,BONSAI-READY";
     const char *ms = getenv("LITEX_PC_PROF_MARKERS");
     char *buf = strdup(ms ? ms : defaults);   // intentionally leaked: lives for the run
     for (char *t = strtok(buf, ","); t && g_nmarkers < 32; t = strtok(nullptr, ","))

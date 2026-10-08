@@ -17,16 +17,12 @@ def test_static_scratch_windows(tmp_path):
     source.write_text('''
 #define BONSAI_HDR_ADDR 0x40400000u
 #include "static_memory.h"
-_Static_assert(BONSAI_TRAFFIC_BUFFER_ADDR >= BONSAI_HDR_ADDR + 0xa0000 + 2048*4,
-               "traffic overlaps prompt buffer");
-_Static_assert(BONSAI_TRAFFIC_BUFFER_ADDR + BONSAI_TRAFFIC_BUFFER_SIZE <= BONSAI_CONSOLE_LINE_ADDR,
-               "traffic overlaps console");
+_Static_assert(BONSAI_CONSOLE_LINE_ADDR >= BONSAI_HDR_ADDR + 0xa0000 + 2048*4,
+               "console overlaps prompt buffer");
 _Static_assert(BONSAI_CONSOLE_LINE_ADDR + BONSAI_CONSOLE_LINE_SIZE <= BONSAI_CONSOLE_PROMPT_ADDR,
                "line overlaps prompt");
-_Static_assert(BONSAI_CONSOLE_PROMPT_ADDR + 64*4 <= BONSAI_ATRACE_BUFFER_ADDR,
-               "prompt overlaps trace");
-_Static_assert(BONSAI_ATRACE_BUFFER_ADDR + 192*4 <= BONSAI_FPROF_BUFFER_ADDR,
-               "trace overlaps fprof");
+_Static_assert(BONSAI_CONSOLE_PROMPT_ADDR + 64*4 <= BONSAI_FPROF_BUFFER_ADDR,
+               "prompt overlaps fprof");
 _Static_assert(BONSAI_FPROF_BUFFER_ADDR + 160 <= BONSAI_HDR_ADDR + 0x100000,
                "fprof overlaps heap");
 _Static_assert(BONSAI_FPROF_BUFFER_ADDR % 8 == 0, "64-bit alignment");
