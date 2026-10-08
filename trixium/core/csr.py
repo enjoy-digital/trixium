@@ -4,15 +4,16 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""EngineCSR: CSR front-end for the matvec engine (hybrid CPU/host control).
+"""EngineCSR: CSR front-end of the matvec engine.
 
-The phase-1 sequencing model: software (VexRiscv firmware over the SoC bus, or the host over
-the PCIe BAR0 bridge - the exact same registers) programs one op at a time and polls `done`.
-Sequencing cost is ~10 CSR writes + a poll per op, ~500 ops/token: <0.5% of the weight
-streaming time, so a hardware descriptor sequencer is a phase-2 optimization, not a need.
+Software (the firmware over the SoC bus, or the host over the PCIe BAR0 bridge: the same
+registers) programs one op and submits it; while the sequencer runs a descriptor list it owns
+the command interface instead. Also exposes the soft engine reset, the op status, the result
+absmax/argmax and the per-channel/overlap performance counters.
 
-Ops: kind 0 = ternary matvec, 1 = q8 matvec, 2 = fetch (HBM row -> scratchpad; also the
-upload-verification readback path)."""
+Ops: kind 0 = ternary matvec, 1 = q8 matvec, 2 = fetch (memory row -> scratchpad), 3 = store,
+4 = axpy.
+"""
 
 from migen import *
 
@@ -20,11 +21,12 @@ from litex.gen import *
 
 from litex.soc.interconnect.csr import *
 
-# EngineCSR ----------------------------------------------------------------------------------
+# Engine CSR ---------------------------------------------------------------------------------------
 
 class EngineCSR(LiteXModule):
     def __init__(self, engine, seq=None):
-        self.kind    = CSRStorage(3,  description="Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
+        self.kind    = CSRStorage(3,  description=
+            "Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
         self.rows    = CSRStorage(16, description="Rows per channel.")
         self.cols    = CSRStorage(14, description="Columns (K).")
         self.wbase   = CSRStorage(32, description="Per-channel weight byte address.")
@@ -38,7 +40,8 @@ class EngineCSR(LiteXModule):
         self.chan    = CSRStorage(5,  description="Fetch source / store destination channel.")
         self.rem     = CSRStorage(5,  description="Channels < rem stream one extra row.")
         self.ilv     = CSRStorage(1,  description="Interleaved (position-major) gather.")
-        self.supw    = CSRStorage(1,  description="Suppress scratchpad result writes (argmax-only ops).")
+        self.supw    = CSRStorage(1,  description=
+            "Suppress scratchpad result writes (argmax-only ops).")
         self.qn      = CSRStorage(1,  description="Dual-Q GQA mode (2 heads per K/V stream).")
         self.xred    = CSRStorage(1,  description="AXPY: sum the per-channel partials in hardware.")
         self.qstride = CSRStorage(16, description="Head-B result offset in words.")
@@ -61,14 +64,14 @@ class EngineCSR(LiteXModule):
             CSRField("busy",     size=1),
             CSRField("error",    size=1, description="Sticky reserved-code error."),
             CSRField("pending",  size=1, description="Submitted op not yet accepted."),
-            # A wedged op is only diagnosable if it says where it is wedged. On hardware a KV
-            # store left the engine busy forever and all the CSRs could report was "busy": no
-            # way to tell ST_CMD (loader will not take the command) from ST_RUN (scratchpad is
-            # not delivering beats) from ST_DRAIN (writer's B responses never came), which are
-            # three different bugs. The FSM state costs four bits and settles it.
-            CSRField("st_cmd",   size=1, offset=4, description="STORE: loader has not taken the command."),
-            CSRField("st_run",   size=1, offset=5, description="STORE: streaming beats from the scratchpad."),
-            CSRField("st_drain", size=1, offset=6, description="STORE: waiting for the writer's B responses."),
+            # FSM state bits: a wedged op says where it is wedged (loader not taking the
+            # command, scratchpad not delivering beats, B responses never coming).
+            CSRField("st_cmd",   size=1, offset=4,
+                description="STORE: loader has not taken the command."),
+            CSRField("st_run",   size=1, offset=5,
+                description="STORE: streaming beats from the scratchpad."),
+            CSRField("st_drain", size=1, offset=6,
+                description="STORE: waiting for the writer's B responses."),
             CSRField("fill",     size=1, offset=7, description="Broadcasting x into the pipes."),
             CSRField("run",      size=1, offset=8, description="Streaming weights."),
             CSRField("sp_grant", size=1, offset=9, description="Engine holds the scratchpad."),
@@ -86,22 +89,22 @@ class EngineCSR(LiteXModule):
         self.perf_ar    = CSRStatus(32, description="AR stall cycles of selected reader.")
         self.perf_r     = CSRStatus(32, description="R stall cycles of selected reader.")
 
-        # Legacy low-word counters: retain their addresses for existing firmware/tools.
-        # Neither-busy also includes CPU arithmetic, not just serialization/dispatch.
+        # Free-running low-word counters (neither-busy time includes CPU arithmetic, not
+        # just dispatch).
         self.cyc_total  = CSRStatus(32, description="Free-running cycles.")
         self.cyc_eng    = CSRStatus(32, description="Cycles with the engine busy.")
         self.cyc_vec    = CSRStatus(32, description="Cycles with the vector unit busy.")
         self.cyc_both   = CSRStatus(32, description="Cycles with BOTH busy (overlap).")
 
-        # Append-only ABI: one strobe freezes ALL counters on the same sys edge. Reads
-        # of a 64-bit CSR take multiple bus transactions on RV32; do not expose live
-        # high/low words or capture each unit independently. Values remain stable until
-        # the next snapshot; software must serialize access to this shared snapshot bank.
-        self.perf_snapshot = CSRStorage(1, description="Write 1: atomically latch 64-bit overlap counters.")
-        self.snap_total = CSRStatus(64, description="Snapshot: total cycles.")
-        self.snap_eng = CSRStatus(64, description="Snapshot: engine-busy cycles.")
-        self.snap_vec = CSRStatus(64, description="Snapshot: vector/DeltaNet-client busy cycles.")
-        self.snap_both = CSRStatus(64, description="Snapshot: both clients busy.")
+        # 64-bit snapshot: one strobe freezes all counters on the same edge (a 64-bit CSR
+        # read takes several bus transactions on RV32). Stable until the next snapshot.
+        self.perf_snapshot = CSRStorage(1, description=
+            "Write 1: atomically latch 64-bit overlap counters.")
+        self.snap_total    = CSRStatus(64, description="Snapshot: total cycles.")
+        self.snap_eng      = CSRStatus(64, description="Snapshot: engine-busy cycles.")
+        self.snap_vec      = CSRStatus(64, description=
+            "Snapshot: vector/DeltaNet-client busy cycles.")
+        self.snap_both     = CSRStatus(64, description="Snapshot: both clients busy.")
         self.sync += If(self.perf_snapshot.re & self.perf_snapshot.storage,
             self.snap_total.status.eq(engine.cyc_total),
             self.snap_eng.status.eq(engine.cyc_eng),
@@ -113,11 +116,8 @@ class EngineCSR(LiteXModule):
 
         pending = Signal()
         manual_request = self.submit.re & self.submit.storage
-        # Accept beats submit: when the engine is idle it accepts the command on the submit
-        # cycle itself, and latching pending anyway would replay the op once the engine
-        # returns to idle (results are rewritten identically, but the replay's command
-        # accept resets the absmax tracker under the firmware's feet - and doubles the
-        # HBM stream time of every op).
+        # Accept beats submit: an idle engine accepts the command on the submit cycle itself;
+        # latching pending anyway would replay the op (resetting the absmax tracker).
         self.comb += [
             self.rst_trigger.eq(self.soft_reset.re & self.soft_reset.storage),
             self.rst_status.fields.busy.eq(self.rst_busy),
@@ -125,7 +125,7 @@ class EngineCSR(LiteXModule):
         ]
         self.sync += [
             If(self.rst_trigger | self.rst_busy,
-                pending.eq(0),                  # never replay the wedged op after the reset
+                pending.eq(0), # Never replay the wedged op after the reset.
             ).Elif(engine.cmd.valid & engine.cmd.ready,
                 pending.eq(0),
             ).Elif(manual_request,
@@ -135,7 +135,7 @@ class EngineCSR(LiteXModule):
                 self.done_count.status.eq(self.done_count.status + 1),
             ),
         ]
-        # `submit.re` fires on CSR write; latch as cmd.valid until accepted. While the
+        # `submit.re` fires on CSR write; latched as cmd.valid until accepted. While the
         # sequencer runs it owns the command interface (firmware never mixes the two).
         seq_own = Signal()
         if seq is not None:
@@ -171,29 +171,29 @@ class EngineCSR(LiteXModule):
                 engine.cmd.dstride.eq(0 if seq is None else seq.eng_dstride),
                 engine.cmd.sstride.eq(0 if seq is None else seq.eng_sstride),
             ).Else(
-            engine.cmd.valid.eq(pending | manual_request),
-            engine.cmd.kind.eq(self.kind.storage),
-            engine.cmd.rows.eq(self.rows.storage),
-            engine.cmd.cols.eq(self.cols.storage),
-            engine.cmd.wbase.eq(self.wbase.storage),
-            engine.cmd.wlen.eq(self.wlen.storage),
-            engine.cmd.sbeats.eq(self.sbeats.storage),
-            engine.cmd.cbeats.eq(self.cbeats.storage),
-            engine.cmd.bias.eq(self.bias.storage),
-            engine.cmd.rshift.eq(self.rshift.storage),
-            engine.cmd.xsrc.eq(self.xsrc.storage),
-            engine.cmd.dst.eq(self.dst.storage),
-            engine.cmd.chan.eq(self.chan.storage),
-            engine.cmd.rem.eq(self.rem.storage),
-            engine.cmd.ilv.eq(self.ilv.storage),
-            engine.cmd.supw.eq(self.supw.storage),
-            engine.cmd.qn.eq(self.qn.storage),
-            engine.cmd.xred.eq(self.xred.storage),
-            engine.cmd.qstride.eq(self.qstride.storage),
-            engine.cmd.rshift2.eq(self.rshift2.storage),
-            engine.cmd.rep.eq(self.rep.storage),
-            engine.cmd.dstride.eq(self.dstride.storage),
-            engine.cmd.sstride.eq(self.sstride.storage),
+                engine.cmd.valid.eq(pending | manual_request),
+                engine.cmd.kind.eq(self.kind.storage),
+                engine.cmd.rows.eq(self.rows.storage),
+                engine.cmd.cols.eq(self.cols.storage),
+                engine.cmd.wbase.eq(self.wbase.storage),
+                engine.cmd.wlen.eq(self.wlen.storage),
+                engine.cmd.sbeats.eq(self.sbeats.storage),
+                engine.cmd.cbeats.eq(self.cbeats.storage),
+                engine.cmd.bias.eq(self.bias.storage),
+                engine.cmd.rshift.eq(self.rshift.storage),
+                engine.cmd.xsrc.eq(self.xsrc.storage),
+                engine.cmd.dst.eq(self.dst.storage),
+                engine.cmd.chan.eq(self.chan.storage),
+                engine.cmd.rem.eq(self.rem.storage),
+                engine.cmd.ilv.eq(self.ilv.storage),
+                engine.cmd.supw.eq(self.supw.storage),
+                engine.cmd.qn.eq(self.qn.storage),
+                engine.cmd.xred.eq(self.xred.storage),
+                engine.cmd.qstride.eq(self.qstride.storage),
+                engine.cmd.rshift2.eq(self.rshift2.storage),
+                engine.cmd.rep.eq(self.rep.storage),
+                engine.cmd.dstride.eq(self.dstride.storage),
+                engine.cmd.sstride.eq(self.sstride.storage),
             ),
             self.cyc_total.status.eq(engine.cyc_total[:32]),
             self.cyc_eng.status.eq(engine.cyc_eng[:32]),

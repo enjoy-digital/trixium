@@ -4,38 +4,38 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""Scratchpad: on-chip activation memory (URAM class on hardware).
+"""Scratchpad: on-chip activation memory, and the arbiter of its unit-side client port.
 
-256-bit wide memory with exactly TWO physical ports (Vivado's BRAM inference limit -
-a 4-port Memory trips 'Unsupported RAM template', dissolves into FF+LUT emulation and
-blew the N=16 LUT budget):
-- port R: the engine's x-buffer fill reads (also vec/seq via the integrator's muxes),
-- port W: the engine's result gather writes (byte enables; the 32-bit lane enables the
-  engine drives are expanded to bytes here).
+256-bit wide memory with exactly two physical ports (more ports defeat Vivado's block RAM
+inference and fall back to FF+LUT emulation):
+- port R: the engine's x-buffer fill reads (also vec/seq through the integrator's muxes),
+- port W: the engine's result gather writes (the 32-bit lane enables the engine drives are
+  expanded to byte enables here).
 
-CPU/host access (wishbone slave, CSR peek/poke) rides a SIDEBAND that borrows both
-ports when `units_idle` is high (integrator: no engine/vec/seq activity). Wishbone
-masters tolerate the resulting wait-states natively; in resident mode the CPU only
-touches the scratchpad between hardware ops, so waits are boot/debug-path only.
+CPU/host access (wishbone slave, CSR peek/poke) rides a sideband: writes are posted through a
+small FIFO drained onto the W port when the integrator grants it, reads borrow the R port when
+it is free (`units_idle` or `sbr_allow`) and the FIFO is empty.
 
-Addresses are in 256-bit words; the gather facade addresses int32 slots."""
+Addresses are in 256-bit words; the gather facade addresses int32 slots.
+"""
 
 from functools import reduce
 from operator import or_
 
 from migen import *
+from migen.genlib.fifo import SyncFIFO
 
 from litex.gen import *
-
-from migen.genlib.fifo import SyncFIFO
 
 from litex.soc.interconnect import wishbone
 from litex.soc.interconnect.csr import *
 
-# Scratchpad ---------------------------------------------------------------------------------
+# Helpers ------------------------------------------------------------------------------------------
 
 class _Facade:
     pass
+
+# Scratchpad ---------------------------------------------------------------------------------------
 
 class Scratchpad(LiteXModule):
     def __init__(self, size=256*1024, init=None, xpm=False):
@@ -46,39 +46,26 @@ class Scratchpad(LiteXModule):
         self.autocsr_exclude = {"mem"}
 
         # Integrator input: no engine/vec/seq scratchpad activity this cycle (sideband
-        # borrow window). Left at 0 (never granted) when unwired - unit-test DUTs and
-        # configurations without a bus port need no changes.
+        # borrow window). Left at 0 (never granted) when unwired.
         self.units_idle = Signal()
-        # Posted sideband writes (2026-08-31, second form): the per-cycle both-port
-        # grant (#4/#4b) pulled CPU-region terms into the port cones and both builds
-        # blew up in congestion. Writes now land in a small FIFO - the wishbone ack
-        # fires on FIFO-accept - and the integrator drains it onto the W port with an
-        # ENGINE-LOCAL grant (sbw_gnt): no CPU-region signal in any port cone, and the
-        # R port arbitration is untouched. Reads keep the units_idle gate plus
-        # FIFO-empty (so a read always sees every posted write), and the integrator
-        # holds the sequencer's descriptor fetch while the FIFO is non-empty - a list
-        # can never read a stale descriptor, with no firmware ordering burden. The
-        # firmware overlap (patch-under-list) is write-only, so it keeps its win.
+        # Posted sideband writes: the wishbone ack fires on FIFO accept and the integrator
+        # drains the FIFO onto the W port with an engine-local grant (sbw_gnt), keeping
+        # CPU-side terms out of the port cones (congestion). Reads wait for FIFO-empty, so
+        # they always see every posted write, and the integrator holds the sequencer's
+        # descriptor fetch while the FIFO is non-empty (no stale descriptor).
         self.sbw_pending = Signal() # FIFO non-empty (integrator: drain + seq interlock).
         self.sbw_gnt     = Signal() # Integrator grant: drain one write this cycle.
-        # Read slot (C2-2): the integrator may raise sbr_allow on any cycle the R port is
-        # free (below vec loads and the seq fetch; the engine fill yields via rd_free), so
-        # CPU/host READS no longer wait for all units idle either. FIFO-empty still gates
-        # every read, so a read always sees every posted write. Reads only ever borrow the
-        # R port - with writes posted, the legacy both-port borrow was pointless and, if
-        # granted mid-activity, would have eaten a gather write's cycle.
+        # Read slot: the integrator may raise sbr_allow on any cycle the R port is free, so
+        # CPU/host reads need not wait for all units idle. Reads only borrow the R port.
         self.sbr_allow   = Signal()
         self.sbr_gnt_any = Signal() # For the integrator's rd_free gating.
 
         # # #
 
         if xpm:
-            # Xilinx builds: an explicit simple dual-port block RAM. Inference turned the
-            # same two ports into 8,192 RAM256X1D LUT-RAM cells inside the full SoC
-            # ("Infeasible attribute ram_style = block", v15/v16), though the identical
-            # memory alone infers 64 BRAM tiles - so the Vivado build no longer depends on
-            # it. read_first: a read of the address being written returns the old data, as
-            # the Memory below does in simulation.
+            # Xilinx builds: an explicit simple dual-port block RAM (inside the full SoC,
+            # inference turned this memory into LUT RAM). read_first: a read of the address
+            # being written returns the old data, as the Memory below does in simulation.
             assert init is None
             aw = (depth - 1).bit_length()
             port_r, port_w = _Facade(), _Facade()
@@ -105,7 +92,7 @@ class Scratchpad(LiteXModule):
             port_w = mem.get_port(write_capable=True, we_granularity=8)
             self.specials += port_r, port_w
 
-        # Engine-facing facades (attribute-compatible with the old Memory ports).
+        # Engine-facing facades (attribute-compatible with Memory ports).
         self.fill = _Facade()
         self.fill.adr   = Signal(max=depth)
         self.fill.dat_r = Signal(256)
@@ -115,7 +102,7 @@ class Scratchpad(LiteXModule):
         self.gather.we    = Signal(8)   # int32 lane enables (expanded to bytes below).
 
         # Sideband slots: 0 = wishbone (priority), 1 = CSR peek/poke. Each carries one
-        # 32-bit access; grant only while every unit is idle.
+        # 32-bit access.
         self._sb_req  = [Signal(name=f"sb{i}_req")  for i in range(2)]
         self._sb_we   = [Signal(name=f"sb{i}_we")   for i in range(2)]
         self._sb_adr  = [Signal(max=depth, name=f"sb{i}_adr") for i in range(2)]
@@ -161,8 +148,7 @@ class Scratchpad(LiteXModule):
             self.fill.dat_r.eq(port_r.dat_r),
             self._sb_rdat.eq(port_r.dat_r),
             # W port: a granted drain outranks everything (the integrator only grants
-            # when the vector store slot is free and the gather FIFO has headroom);
-            # granted reads still borrow both ports (units_idle: nothing else runs).
+            # when the vector store slot is free and the gather FIFO has headroom).
             If(self.sbw_gnt & sbw.readable,
                 port_w.adr.eq(dr_adr),
                 port_w.dat_w.eq(Replicate(dr_wdat, 8)),
@@ -185,23 +171,16 @@ class Scratchpad(LiteXModule):
 
     def add_csr_port(self):
         """CSR-based peek/poke (host access over the PCIe BAR0/JTAG CSR window). Write
-        `adr` to trigger a read; poll `data_r` (valid once the sideband was granted -
-        debug path, host pollers naturally retry). Write `data_w` to store 32 bits."""
+        `adr` to trigger a read; poll `data_r` (valid once the sideband was granted). Write
+        `data_w` to store 32 bits."""
         return _ScratchpadCSR(self)
 
     def add_wishbone_port(self):
-        """32-bit Wishbone slave onto the 256-bit memory (CPU/host/JTAG access) via the
-        sideband: accesses wait (wishbone-native stalls) while engine/vec/seq are active.
-
-        Declared with byte addressing (what the SoC bus hands slaves in current LiteX -
-        verified empirically in simulation: adr LSBs advance by 4 per 32-bit word)."""
+        """32-bit byte-addressed Wishbone slave onto the 256-bit memory (CPU/host/JTAG
+        access) via the sideband: accesses wait (wishbone-native stalls) for their slot."""
         bus = wishbone.Interface(data_width=32, address_width=32, addressing="byte")
-        # The request is REGISTERED at the scratchpad (n16 timing #3c: the CPU's bus
-        # decode reached the memory address pins combinationally - 5 ns of route from the
-        # core to a 64-BRAM address net, the largest failing family). adr/sel/dat_w/we are
-        # latched in IDLE and presented from flops; the read data is latched too, so the
-        # return trip is FF -> FF as well. +2 cycles per CPU access (a few thousand per
-        # token: noise).
+        # Request and read data are registered for timing: the CPU's bus decode reached the
+        # BRAM address pins combinationally. Costs 2 cycles per CPU access.
         adr_r  = Signal(len(self._sb_adr[0]))
         sel_r  = Signal(3)
         bsel_r = Signal(4)
@@ -212,8 +191,7 @@ class Scratchpad(LiteXModule):
             self._sb_sel[0].eq(sel_r),
             self._sb_bsel[0].eq(bsel_r),
             self._sb_wdat[0].eq(wdat_r),
-            # Writes are POSTED through the sbw FIFO (slot 0); the read path below never
-            # writes, so _sb_we[0] stays 0.
+            # Writes are posted through the sbw FIFO (slot 0); _sb_we[0] stays 0.
             self._sbw_adr[0].eq(adr_r),
             self._sbw_sel[0].eq(sel_r),
             self._sbw_bsel[0].eq(bsel_r),
@@ -256,11 +234,12 @@ class Scratchpad(LiteXModule):
         )
         return bus
 
-# _ScratchpadCSR -----------------------------------------------------------------------------------
+# Scratchpad CSR -----------------------------------------------------------------------------------
 
 class _ScratchpadCSR(LiteXModule):
     def __init__(self, scratchpad):
-        self.adr    = CSRStorage(24, description="Byte address (4-aligned). Writing triggers a read.")
+        self.adr    = CSRStorage(24, description=
+            "Byte address (4-aligned). Writing triggers a read.")
         self.data_r = CSRStatus(32,  description="Read data for the last triggered read.")
         self.data_w = CSRStorage(32, description="Writing stores 32 bits at adr.")
 
@@ -271,7 +250,7 @@ class _ScratchpadCSR(LiteXModule):
         rd_p  = Signal() # Read pending (adr written, not yet granted).
         wr_p  = Signal() # Write pending.
         cap   = Signal() # Capture read data this cycle.
-        reset_read = C(0, 1) # The retired read-status reset (kept: unchanged Verilog).
+        reset_read = C(0, 1) # Read-reset hook, tied off.
         self.comb += [
             sp._sb_adr[1].eq(self.adr.storage[5:]),
             sp._sb_sel[1].eq(self.adr.storage[2:5]),
@@ -304,27 +283,20 @@ class _ScratchpadCSR(LiteXModule):
             ),
         ]
 
-
 # Scratchpad Arbiter -------------------------------------------------------------------------------
 
 class ScratchpadArbiter(LiteXModule):
     """Flat priority arbiter for the shared scratchpad client port.
 
-    Functionally identical to nesting ScratchpadClientMux once per auxiliary unit
-    (base = the vector unit, clients in the order they were attached, the LAST attached
-    busy client wins, else the base), with the same combinational latency: requests, the
-    write grant and the broadcast read data behave exactly as through the chain. What
-    changes is depth. The chain puts one serial 2:1 mux per client on the BRAM address,
-    data and enable pins and one AND per client on the grant back; with seven clients the
-    v11 VCU build failed setup at -1.519 ns on exactly those paths (docs/vcu-clock-
-    qualification.md). Here each client gets a one-hot select from a priority reduction
-    over the busy bits and the outputs are one AND-OR level, so depth grows with log2 of
-    the client count instead of linearly.
+    `base` is the vector unit; among `clients` (in attach order) the last busy one wins, else
+    the base. Each client gets a one-hot select from a priority reduction over the busy bits
+    and the outputs are one AND-OR level, so the logic depth on the BRAM address/data/enable
+    pins grows with log2 of the client count (a serial mux chain failed timing).
     """
 
     def __init__(self, base, clients):
         clients = list(clients)
-        self.busy = Signal()
+        self.busy      = Signal()
         self.sp_rd_req = Signal()
         self.sp_rd_adr = Signal.like(base.sp_rd_adr)
         self.sp_rd_dat = Signal.like(base.sp_rd_dat)
@@ -333,12 +305,14 @@ class ScratchpadArbiter(LiteXModule):
         self.sp_wr_we  = Signal.like(base.sp_wr_we)
         self.sp_wr_dat = Signal.like(base.sp_wr_dat)
         self.sp_wr_gnt = Signal()
-        self.aux_busy  = Signal()  # Any attached (non-base) client busy.
+        self.aux_busy  = Signal() # Any attached (non-base) client busy.
+
+        # # #
 
         # One-hot select: client i wins when busy and no LATER client is busy.
         n = len(clients)
-        later = [Signal(name=f"arb_later{i}") for i in range(n)]
-        sel = [Signal(name=f"arb_sel{i}") for i in range(n)]
+        later    = [Signal(name=f"arb_later{i}") for i in range(n)]
+        sel      = [Signal(name=f"arb_sel{i}") for i in range(n)]
         base_sel = Signal()
         for i in range(n):
             self.comb += later[i].eq(reduce(or_, [c.busy for c in clients[i + 1:]], C(0, 1)))
@@ -357,6 +331,9 @@ class ScratchpadArbiter(LiteXModule):
 
         for field in ("sp_rd_req", "sp_rd_adr", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat"):
             self.comb += getattr(self, field).eq(pick(field))
-        self.comb += [base.sp_rd_dat.eq(self.sp_rd_dat), base.sp_wr_gnt.eq(self.sp_wr_gnt & base_sel)]
+        self.comb += [
+            base.sp_rd_dat.eq(self.sp_rd_dat),
+            base.sp_wr_gnt.eq(self.sp_wr_gnt & base_sel),
+        ]
         for i, c in enumerate(clients):
             self.comb += [c.sp_rd_dat.eq(self.sp_rd_dat), c.sp_wr_gnt.eq(self.sp_wr_gnt & sel[i])]

@@ -6,26 +6,23 @@
 
 """VectorUnit: microcoded 16-lane SIMD engine executing trixium.model.asm binaries.
 
-Bit-exact contract: the asm.py INTERPRETER is the golden model - this RTL must produce
+Bit-exact contract: the asm.py interpreter is the golden model - this RTL must produce
 identical scratchpad contents and scalar results for the same binary and arguments.
 
-Implementation (V1, 2026-08-29): a single-issue, in-order, ONE-INSTRUCTION-PER-CYCLE
-pipeline. The previous unit was a non-overlapped FSM (EX0/EX1/EX1B/EX2, 4 cycles per
-instruction) and the activation ops were ~48% of the token on the 1.7B; the pipeline keeps
-the ISA, the microcode and every port, and is ~3.4x on the same programs.
+Implementation: a single-issue, in-order, one-instruction-per-cycle pipeline.
 
   F  : pc -> imem (distributed LUTRAM, async read) -> insn_d. The one-entry loop buffer
        (loop_first) feeds D on a taken back-edge, so loops cost 0 bubbles.
   D  : decode, regfile reads (V[va], V[vb] with D-side forwarding; S[sa], S[sd]),
-       scoreboard; ALL scalar effects commit at the end of D: MOVSI/ARG/SADDI/SMOV/SADD/
+       scoreboard; all scalar effects commit at the end of D: MOVSI/ARG/SADDI/SMOV/SADD/
        SSHLV/SNORME, the load/store address post-increment, LOOPS/LOOPE, DONE, bad_op.
   E1 : operand forward from the instruction in E2 (2:1 x 512), lane ALU + 32x32 DSP
        multiply, one-hot writeback select -> ex1_r; reduction trees stage 1; LUT ROM
-       address launch; loads drive the scratchpad read address (sp_rd_req, ONE cycle);
+       address launch; loads drive the scratchpad read address (sp_rd_req, one cycle);
        stores pack their data.
   E2 : wb2 = load data / multiply / ex1_r -> V (write port 2); reduction stage 2; LUT
        ROM read + operand select (e_a, e_b - e_a, frac); stores drive the write port and
-       HOLD here while the integrator withholds sp_wr_gnt (F/D/E1 freeze, E3/E4 drain).
+       hold here while the integrator withholds sp_wr_gnt (F/D/E1 freeze, E3/E4 drain).
   E3 : LUT interpolation multiply-add -> lut_r; reductions read S[sd] late and write it.
   E4 : lut_r -> V (write port 3).
   FINISH: after DONE has drained E1..E4, latch res5/6/7 and pulse done.
@@ -36,13 +33,13 @@ E3 read sees the previous E3 write); any other touch of a pending S stalls. Forw
 youngest-first: E1 operand mux (ex1_r/mul of the instruction in E2) > D-side wb2 (E2) >
 D-side wb3 (E3 LUT) > regfile. Every architectural effect commits exactly once.
 
-Standalone the cycle count is deterministic (sp_wr_gnt resets to 1), so tools/bench_vecunit
-stays the hardware cycle contract; under concurrent engine traffic the store hold adds
-cycles but never changes numerics (identical data is re-driven).
+Standalone the cycle count is deterministic (sp_wr_gnt resets to 1); under concurrent engine
+traffic the store hold adds cycles but never changes numerics (identical data is re-driven).
 
-Scratchpad access goes through the integrator's per-cycle arbitration (docs/overlap-design.md):
-sp_rd (256-bit read, 1-cycle latency, claimed for exactly the load's E1 cycle) and sp_wr
-(256-bit write, 32-bit lane enables, claimed for the store's E2 cycle)."""
+Scratchpad access goes through the integrator's per-cycle arbitration: sp_rd (256-bit read,
+1-cycle latency, claimed for exactly the load's E1 cycle) and sp_wr (256-bit write, 32-bit lane
+enables, claimed for the store's E2 cycle).
+"""
 
 from functools import reduce
 from operator import or_, and_
@@ -56,15 +53,18 @@ from litex.soc.interconnect.csr import *
 from trixium.model import asm as vasm
 from trixium.model import bitexact as bx
 
+# Constants ----------------------------------------------------------------------------------------
+
 LANES = 16
 
-# VectorUnit ---------------------------------------------------------------------------------
+# Vector Unit --------------------------------------------------------------------------------------
 
 class VectorUnit(LiteXModule):
     def __init__(self, imem_depth=None, vregs=16):
         # Kept in step with model.asm.IMEM_DEPTH, which asserts the programs fit: an
         # overflowing upload wraps and silently overwrites the program at offset 0.
         if imem_depth is None:
+            # Kept function-local: moving it changes Migen's signal naming in the Verilog.
             from trixium.model.asm import IMEM_DEPTH
             imem_depth = IMEM_DEPTH
         # Scratchpad ports (muxed onto the engine's fill/gather ports by the integrator).
@@ -73,11 +73,10 @@ class VectorUnit(LiteXModule):
         self.sp_wr_adr = Signal(13)
         self.sp_wr_we  = Signal(8)   # 32-bit lane enables.
         self.sp_wr_dat = Signal(256)
-        # Per-cycle port claims (docs/overlap-design.md). rd_req is the load's E1 cycle
-        # (address on the port; dat_r next cycle reflects that address whoever owns the
-        # port then). wr_req is the store's E2 cycle; a withheld wr_gnt HOLDS the store in
-        # E2 with identical data re-driven, so numerics cannot change. wr_gnt resets to 1:
-        # unwired DUTs (unit tests, the vecunit bench) are unchanged.
+        # Per-cycle port claims. rd_req is the load's E1 cycle (address on the port; dat_r
+        # next cycle reflects that address whoever owns the port then). wr_req is the store's
+        # E2 cycle; a withheld wr_gnt holds the store in E2 with identical data re-driven, so
+        # numerics cannot change. wr_gnt resets to 1 (always granted when unwired).
         self.sp_rd_req = Signal()
         self.sp_wr_req = Signal()
         self.sp_wr_gnt = Signal(reset=1)
@@ -93,7 +92,8 @@ class VectorUnit(LiteXModule):
         self.seq_seed7 = Signal(48) # S7 initial value under seq_en (prev prog's res6).
 
         # CSRs.
-        self.prog      = CSRStorage(32, description="Instruction upload (auto-incrementing address).")
+        self.prog      = CSRStorage(32, description=
+            "Instruction upload (auto-incrementing address).")
         self.prog_adr  = CSRStorage(16, description="Upload address (write before a burst).")
         self.pc        = CSRStorage(16, description="Program start PC.")
         self.arg0 = CSRStorage(32); self.arg1 = CSRStorage(32)
@@ -106,9 +106,9 @@ class VectorUnit(LiteXModule):
             CSRField("bad_op", size=1, description="Sticky: unknown opcode executed."),
         ])
         self.done_count = CSRStatus(32)
-        self.res5 = CSRStatus(48, description="S5 after DONE.")
-        self.res6 = CSRStatus(48, description="S6 after DONE.")
-        self.res7 = CSRStatus(48, description="S7 after DONE.")
+        self.res5       = CSRStatus(48, description="S5 after DONE.")
+        self.res6       = CSRStatus(48, description="S6 after DONE.")
+        self.res7       = CSRStatus(48, description="S7 after DONE.")
 
         # # #
 
@@ -159,19 +159,17 @@ class VectorUnit(LiteXModule):
         rom_rsq = make_rom(bx.rsqrt_lut(), int(round((2**15)/2.0)))
 
         # Register files.
-        # ISA rev 2 (2026-09-03): 16 vector registers so the single-chain hot programs can
-        # be unrolled x2; the encoding moves with it (model.asm docstring). vregs=8 keeps
-        # the original encoding for reference builds.
+        # 16 vector registers (ISA rev 2) so the single-chain hot programs can be unrolled
+        # x2; the encoding moves with it (model.asm docstring). vregs=8 keeps the rev 1
+        # encoding.
         assert vregs in (8, 16), vregs
         self.vregs = vregs
         VBITS = 4 if vregs == 16 else 3
-        # The register file is two LUTRAM banks with a live-value table (2026-09-03): the
-        # unit has two write ports (E2 writeback, E4 LUT result) and a distributed RAM has
-        # one, so each writer owns a bank and a per-register bit says which bank holds the
-        # latest value; reads mux the two async ports by that bit. As flip-flops plus
-        # 16:1 read muxes the 16-entry file cost ~8k FFs and ~7.6k LUTs and pushed the
-        # full die past the endpoint gate (v7: 21,660). Same-cycle writes to the same
-        # register: E2 wins (the LVT update order below), as before.
+        # The register file is two LUTRAM banks with a live-value table: the unit has two
+        # write ports (E2 writeback, E4 LUT result) and a distributed RAM has one, so each
+        # writer owns a bank and a per-register bit says which bank holds the latest value;
+        # reads mux the two async ports by that bit (a flip-flop file costs ~8k FFs and
+        # ~7.6k LUTs). Same-cycle writes to the same register: E2 wins (LVT update order).
         vbank_a = Memory(32*LANES, vregs, name="vrf_a")   # E2 writes.
         vbank_b = Memory(32*LANES, vregs, name="vrf_b")   # E4 (LUT) writes.
         vwa = vbank_a.get_port(write_capable=True)
@@ -180,7 +178,7 @@ class VectorUnit(LiteXModule):
         vrb = [vbank_b.get_port(async_read=True) for _ in range(2)]
         self.specials += vbank_a, vbank_b, vwa, vwb, *vra, *vrb
         vlvt = Array([Signal(name=f"vlvt{i}") for i in range(vregs)])
-        # (write enables/data are assigned below, once wb2/lut_r and the E-stage tags exist)
+        # (Write enables/data are assigned below, once wb2/lut_r and the E-stage tags exist.)
         S = Array([Signal((48, True), name=f"sr{i}") for i in range(8)])
 
         def lane(sig, i):
@@ -345,8 +343,8 @@ class VectorUnit(LiteXModule):
         e1_is_red   = Signal()
         e1_wr_v     = Signal()
         e1_f = {n: Signal(name=f"e1_f_{n.lower()}") for n in VEC_WB + ST_OPS + RED_OPS}
-        # Decoded at D, registered: no opcode compare in the E1 cone (n16 timing #3c had
-        # the scalar-B select decoded from e1_op fanning out to every lane's operand mux).
+        # Decoded at D, registered: no opcode compare in the E1 cone (timing: the scalar-B
+        # select fans out to every lane's operand mux).
         e1_scalar_b = Signal()
         e1_redssq   = Signal()
         e1_is_ldw   = Signal()
@@ -386,11 +384,9 @@ class VectorUnit(LiteXModule):
         e3_is_lut   = Signal()
         e3_is_red   = Signal()
         e3_f_red    = {n: Signal(name=f"e3_f_{n.lower()}") for n in RED_OPS}
-        # LUT interpolation is split across E2/E3 (n16 timing #3c: ROM read + subtract +
-        # unregistered DSP multiply + add + select was a 16-level, 5.9 ns cone). E2 reads
-        # the ROM and selects (e_a, e_b - e_a, frac) for the op; E3 multiplies and adds;
-        # the result lands in lut_r at the E3/E4 edge and is written from E4. LUT latency
-        # is 4 (a dependent one behind stalls three cycles instead of two).
+        # LUT interpolation is split across E2/E3 for timing. E2 reads the ROM and selects
+        # (e_a, e_b - e_a, frac) for the op; E3 multiplies and adds; the result lands in
+        # lut_r at the E3/E4 edge and is written from E4. LUT latency is 4.
         e3_lea      = [Signal((18, True), name=f"e3_lea{i}") for i in range(LANES)]
         e3_ld       = [Signal((19, True), name=f"e3_ld{i}") for i in range(LANES)]
         e3_lfr      = [Signal(8, name=f"e3_lfr{i}") for i in range(LANES)]
@@ -434,9 +430,9 @@ class VectorUnit(LiteXModule):
             d_is_loops.eq(d_op == OP["LOOPS"]),
             d_is_loope.eq(d_op == OP["LOOPE"]),
             stall_ld.eq(e1_valid & e1_is_load & vd_match(e1_vd)),
-            # Multiply results are NOT forwarded into E1 (n16 timing #3d: the DSP output ->
-            # mulh select -> forward mux -> ALU -> select cone was the worst path, 15 levels).
-            # A dependent one behind waits a cycle and takes the D-side wb2 path instead.
+            # Multiply results are not forwarded into E1 (timing: DSP output -> mulh select ->
+            # forward mux -> ALU). A dependent one behind waits a cycle and takes the D-side
+            # wb2 path instead.
             stall_mul.eq(e1_valid & e1_is_mul & vd_match(e1_vd)),
             stall_lut.eq((e1_valid & e1_is_lut & vd_match(e1_vd))
                          | (e2_valid & e2_is_lut & vd_match(e2_vd))
@@ -512,11 +508,9 @@ class VectorUnit(LiteXModule):
         ]
         a_flat = Signal(32*LANES)
         b_flat = Signal(32*LANES)
-        # Forward from ex1_r ONLY (n16 #4: e2_fwd_ok already excludes muls, but wb2_nl
-        # still carried mul_val into this mux as a never-selected input - static timing
-        # cannot see the exclusion, so the whole DSP -> mulh select -> forward -> ALU ->
-        # one-hot cone stayed the worst family, 1024 endpoints at -1.14. Bit-identical:
-        # for every case fwd_a/fwd_b can select, wb2_nl equals ex1_r.)
+        # Forward from ex1_r only: e2_fwd_ok already excludes muls, so for every case
+        # fwd_a/fwd_b can select wb2_nl equals ex1_r, and keeping mul_val out of this mux
+        # keeps the DSP cone off the static timing paths.
         self.comb += [
             a_flat.eq(Mux(fwd_a, ex1_r, e1_va_r)),
             b_flat.eq(Mux(fwd_b, ex1_r, e1_vb_r)),
@@ -656,7 +650,9 @@ class VectorUnit(LiteXModule):
                 rom_rec[i].adr.eq(m15[6:14]),
                 # MSB-split rsqrt index (see bx.rsqrt_lut): [1,2) -> 0..127 step 1/128,
                 # [2,4) -> 128..255 step 1/64.
-                rom_rsq[i].adr.eq(Mux(xu[31], Cat(xu[24:31], C(1, 1)), Cat(xu[23:30], C(0, 1)))),
+                rom_rsq[i].adr.eq(Mux(xu[31],
+                    Cat(xu[24:31], C(1, 1)),
+                    Cat(xu[23:30], C(0, 1)))),
             ]
             fr7 = Signal(7); fr6 = Signal(6); fq7 = Signal(7)
             self.comb += [
@@ -753,9 +749,7 @@ class VectorUnit(LiteXModule):
             self.comb += red2_ssq_c[k].eq(mul_r[4*k] + mul_r[4*k+1] + mul_r[4*k+2] + mul_r[4*k+3])
 
         # E3: reductions read S[sd] late. REDMAX compares as the interpreter does - the
-        # 48-bit SIGNED accumulator against the zero-extended absmax (the FSM unit compared
-        # the low 32 bits unsigned, which differed for a negative accumulator; no stock
-        # program reaches that, the random hazard stress does).
+        # 48-bit signed accumulator against the zero-extended absmax.
         ssq3 = Signal((64, True))
         sd3  = Signal((48, True))
         red2_max_s = Signal((48, True))
@@ -933,7 +927,7 @@ class VectorUnit(LiteXModule):
             lut_r.eq(lut_val),
             # --- V writes: E4 (LUT) first, E2 second so the younger instruction wins ---
             If(vwb.we, vlvt[e4_vd].eq(1)),
-            If(vwa.we, vlvt[e2_vd].eq(0)),          # Listed last: E2 wins a same-reg collision.
+            If(vwa.we, vlvt[e2_vd].eq(0)), # Listed last: E2 wins a same-reg collision.
             # --- E3 reductions (late S read; the scoreboard keeps every other writer off) ---
             If(e3_valid & e3_is_red,
                 If(e3_f_red["REDSUM"], S[e3_sd].eq(sd3 + red2_sum)),
