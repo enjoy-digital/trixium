@@ -1,4 +1,8 @@
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
+//
 // Compiled-RTL check of SiluMulKernel against model/silu_hw.silu_mul_fixed.
 // Vector file: u32 count; u32 lut[4097]; u32 dlut[4096]; count x {u32 g, m, r, fixup}.
 // Loads the tables through the write ports, then streams every element with random input

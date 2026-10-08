@@ -1,4 +1,8 @@
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
+//
 // Full shared scratchpad: FP32 -> block Q8 -> Hadamard -> whole-vector Q8,
 // -> restored FP32.
 #include "Vactivation_cluster.h"

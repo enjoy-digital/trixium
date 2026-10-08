@@ -1,4 +1,8 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+// SPDX-License-Identifier: BSD-2-Clause
+
 #ifndef TRIXIUM_SEQUENCE_H
 #define TRIXIUM_SEQUENCE_H
 #include <stdint.h>
@@ -20,8 +24,7 @@ enum bns_seq_desc_result { BNS_SEQ_DESC_OK=0, BNS_SEQ_DESC_INVALID=-1 };
  * physical capacity/profile, placement, numerical admission and full-list
  * ownership. These functions check field encoding, not execution validity.
  * Addresses are scratchpad-relative bytes. Hardware checks full spans/list
- * protection. Live descriptors
- * and input buffers must remain immutable; failure invalidates output prefixes
+ * protection. Live descriptors and input buffers must remain immutable; failure invalidates output prefixes
  * and requires common reset/drain. There is no implicit quantization fallback.
  */
 int bns_seq_desc_stop(struct bns_seq_descriptor *out);

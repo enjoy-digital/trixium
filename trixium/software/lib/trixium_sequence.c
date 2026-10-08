@@ -1,4 +1,8 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+// SPDX-License-Identifier: BSD-2-Clause
+
 #include "trixium_sequence.h"
 
 static int sp_address(uint32_t value, uint32_t alignment)

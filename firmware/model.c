@@ -24,21 +24,16 @@ static const struct bons_entry *model_table(void)
 }
 
 // (role, layer) -> table-index cache. The linear scan below walks up to n_tensors entries
-// of the DRAM-resident table; measured on the card a token-loop rmsnorm call was 157k cycles
-// against 27k for the identical call with the entry pointer in hand - the difference is this
-// scan falling out of the D-cache. The loop does a dozen lookups per layer, so the scans
-// were 29% of token time, hiding as "unaccounted" because no perf region covered them.
-// `any` holds the first (role, layer) match in table order (model_entry semantics verbatim);
-// `n16` the first NORM16 match (the only kind model_entry_kind is used with - anything else
-// falls back to the scan). Rebuilt lazily; hdrload resets it when the header changes.
-// NOT in .bss: the sram region is 8 KB *including the stack* (_fstack sits at its top), and
-// these 4 KB of tables left it no room - the sim build failed to link and the card build
-// linked with so little stack that boot corrupted itself and hung. They live instead in the
-// unused main_ram window between the BONS header/table (~32 KB at TRIXIUM_HDR_ADDR) and the
-// inference heap (TRIXIUM_HDR_ADDR + 0x100000, see infer.c HEAP_BASE).
-// 32 roles: ROLE_TOK_EMB16_EXP is role 16 and sat just past the old bound of 16, so its
-// lookup fell to the 426-entry scan (~27 KB through the D$) once every forward - 33k
-// cycles of the embed window on the card (2026-09-08). 8 KB of the 64 KB window.
+// of the DRAM-resident table and falls out of the D-cache: a dozen lookups per layer made
+// the scans ~29% of token time. `any` holds the first (role, layer) match in table order
+// (model_entry semantics verbatim); `n16` the first NORM16 match (the only kind
+// model_entry_kind is used with - anything else falls back to the scan). Rebuilt lazily;
+// hdrload resets it when the header changes.
+// NOT in .bss: the sram region is 8 KB *including the stack* (_fstack sits at its top) and
+// has no room for these tables. They live in the unused main_ram window between the BONS
+// header/table (at TRIXIUM_HDR_ADDR) and the inference heap (TRIXIUM_HDR_ADDR + 0x100000,
+// see infer.c HEAP_BASE). 32 roles (every role must be covered, or its lookup falls back to
+// the full scan): 8 KB of the 64 KB window.
 #define ECACHE_ROLES  32
 #define ECACHE_LAYERS 64
 _Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every role");
@@ -46,10 +41,9 @@ _Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every 
 #define ecache_any ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE))
 #define ecache_n16 ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE + \
                         ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))
-// K-segments: the first FLAG_KSEG entry of each (role, layer, kseg < 4), 16 KB more. Every
-// K-segmented lookup used to scan the whole table (~1,100 entries on the 27B), and
-// infer_matvec_cols re-counted the segments in its loop condition: ~11 scans per FFN down
-// lookup, ~330k cycles per layer outside the FFN lists on the v17 board (2026-09-25).
+// K-segments: the first FLAG_KSEG entry of each (role, layer, kseg < 4), 16 KB more, so a
+// K-segmented lookup does not scan the whole table (~1,100 entries on the 27B; ~330k cycles
+// per layer outside the FFN lists without the cache).
 #define ECACHE_KSEG 4
 #define ecache_kseg ((int16_t (*)[ECACHE_LAYERS][ECACHE_KSEG])(ECACHE_BASE + \
                         2*ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))

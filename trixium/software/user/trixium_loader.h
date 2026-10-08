@@ -1,10 +1,13 @@
-/* Host-side HBM loader: the one upload path both trixium_load and trixium_chat use.
+/* This file is part of TriXium.
  *
- * Words are poked through BAR0 into the loader's FIFO (CSR path). The DMA path was retired:
- * litepcie's host->device DMA cannot be flow-controlled and silently dropped the first ring
- * (the staged BONS header and the first megabyte of channel 0) on every upload - see
- * docs/bringup.md "Weight upload". trixium_chat -m kept using it long after trixium_load was
- * fixed (2026-09-11), which is why this is now one module.
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Host-side weight loader: the one upload path both trixium_load and trixium_chat use.
+ *
+ * Words are poked through BAR0 into the loader's FIFO (CSR path), not the PCIe DMA:
+ * litepcie's host->device DMA cannot be flow-controlled and silently drops data on
+ * underflow.
  *
  * Every function exits the process on a hardware error with a message; the loader is only
  * ever run interactively or from the deploy scripts.

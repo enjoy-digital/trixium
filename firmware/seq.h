@@ -29,8 +29,7 @@ void     seq_desc_vec_lut(uint32_t idx, uint16_t pc, const int32_t *args, int n,
                           uint16_t srcs, uint32_t lut_beat, int lut_kreg);
 void     seq_desc_engine(uint32_t idx, const struct engine_op *op);
 void     seq_desc_stop(uint32_t idx);
-// Patch one descriptor word. Inline: it is one posted store, and it used to be a
-// cross-file call at every one of the ~150 patches a layer (2026-09-08).
+// Patch one descriptor word. Inline: it is one posted store, issued ~150 times a layer.
 #include <generated/soc.h>
 static inline void seq_patch(uint32_t idx, int word, uint32_t value)
 {
@@ -39,7 +38,7 @@ static inline void seq_patch(uint32_t idx, int word, uint32_t value)
 void     seq_run(uint32_t idx0, uint32_t count);            // Run + wait (gives up if wedged).
 void     seq_list_start(uint32_t idx0, uint32_t count);     // Start only; overlap CPU work...
 int      seq_run_trace(uint32_t idx0, uint32_t count,
-                       uint32_t *ts, int max);              // C2-1a: per-dcount timestamps.
+                       uint32_t *ts, int max);              // Per-dcount timestamps.
 void     seq_join(void);                                    // ...then wait (same wedge guard).
 extern int seq_wedged; // Set once a list stalled: every later seq_run() is a no-op.
 

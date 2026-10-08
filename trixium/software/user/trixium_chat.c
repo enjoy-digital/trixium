@@ -5,8 +5,9 @@
  *
  * trixium_chat: one-stop host tool - configure the accelerator, then talk to the model.
  *
- *   1. (-m) upload a BONS weight image to HBM over the PCIe DMA (same path as trixium_load)
- *   2. (-k) boot the firmware over the LiteX serial-boot protocol on the console UART
+ *   1. (-m) upload a BONS weight image through the BAR0 loader (same path as trixium_load)
+ *   2. (-k) boot the firmware: CPU reset, loader copy into main_ram, BIOS `boot` (-K: the
+ *           LiteX serial-boot protocol on the console UART)
  *   3.      `hdrload` so the firmware picks up the staged BONS header/table
  *   4.      REPL: your text -> BPE ids -> `tok`/`genb` -> ids back -> text
  *
@@ -517,9 +518,8 @@ static int upload_model(int devnum, const char *path)
 }
 
 /* Fast boot: CPU reset -> BIOS prompt -> firmware into main_ram through the loader ->
- * BIOS `boot`. The serial-boot protocol moved 100 KB in 64-byte frames with an ack each
- * (23-44 s, and NAKs part-way often enough that the deploy script retries three times);
- * the loader does it in about a millisecond. Cache coherency: the BIOS memtest/memspeed
+ * BIOS `boot`. The serial-boot protocol moves 100 KB in 64-byte acked frames (23-44 s, with
+ * occasional NAKs); the loader does it in about a millisecond. Cache coherency: the BIOS memtest/memspeed
  * stream 2 MB through the 32 KB write-back D$ before the prompt, so no line of the
  * firmware's first 100 KB is left in it (dirty or clean) when the loader writes past the
  * cache, and the BIOS never executes from main_ram (no stale I$ lines). */
@@ -527,8 +527,7 @@ static double g_prompt_wait = 120.0;   /* -W: seconds to wait for the firmware p
                                           XCU1525's firmware calibrates three DDR4 controllers
                                           before it prints one: minutes). */
 static int g_no_cpu_reset;   /* -R: the BIOS is already at its prompt (a host-side DDR
-                                training between its calibration and the boot - the
-                                XCU1525's controller 0 with the v3 bitstream). */
+                                training ran between its calibration and the boot). */
 
 static int fastboot(const char *fw)
 {
@@ -566,9 +565,8 @@ static int fastboot(const char *fw)
  * ring the host driver empties on a poll timer. A long `tok` line written in one burst thus
  * loses characters as soon as the echo stalls - two ids merge into one out-of-range id, and
  * an id past the vocabulary sends the engine to fetch a row that does not exist: ENGSTALL,
- * reconfigure the FPGA. Seen with 130-character lines on 2026-09-11; the 850-character
- * lines both clients allowed were never safe. Waiting for the echo bounds the bytes in
- * flight to one chunk, well inside the ring. */
+ * reconfigure the FPGA. Waiting for the echo bounds the bytes in flight to one chunk, well
+ * inside the ring. */
 #define PACE_CHUNK 48
 static void tty_write_paced(const char *buf, size_t n)
 {
@@ -626,9 +624,7 @@ static int utf8_len(unsigned char c)
 
 /* Read the generation as it arrives and print each token the moment it lands.
  *
- * The firmware already emits one printf per token, so the ids were streaming over the UART
- * all along - the tool simply buffered to "GEN DONE" and printed the reply in one lump. The
- * only real work here is UTF-8: the vocabulary is byte-level BPE, so a single token can end
+ * The firmware emits one printf per token. The only real work here is UTF-8: the vocabulary is byte-level BPE, so a single token can end
  * halfway through a multi-byte character. Bytes are held back until the character is
  * complete, otherwise the terminal shows replacement junk mid-word.
  *
@@ -824,8 +820,7 @@ int main(int argc, char **argv)
             return 0;
         case 'C': /* Clear the staged BONS header and exit: a firmware that finds one runs its
                    * self-test on the weights it describes, and after a bitstream whose
-                   * memory layout moved (the XCU1525's bank skew, v5) those are stale -
-                   * the boot wedged in the self-test (2026-09-19). */
+                   * memory layout moved those are stale (the self-test would wedge). */
             loader_bar_map(devnum);
             loader_clear_staging();
             puts("staged header cleared");
@@ -865,10 +860,9 @@ int main(int argc, char **argv)
 
     /* Sync with the firmware prompt. The firmware runs its power-on self-tests (scratchpad,
      * vector-unit programs, and with a model present the engine matvec/fetch checksums and
-     * a two-token generation) before it prints a prompt: 0.2 s on the 1.7B now that the
-     * all-CPU reference leg is skipped there, but a firmware that still runs it takes 15 s,
-     * and waiting too briefly reports "firmware not running" for a board that is merely
-     * busy, eating the startup log on the way out. */
+     * a two-token generation) before it prints a prompt - minutes on the XCU1525, which
+     * calibrates its DDR4 controllers first - and waiting too briefly reports "firmware not
+     * running" for a board that is merely busy, eating the startup log on the way out. */
     send_line("");
     if (!tty_expect("trixium>", g_prompt_wait, NULL, 0, 1)) { /* echo: show the self-tests as they run */
         fprintf(stderr,
@@ -1006,8 +1000,7 @@ int main(int argc, char **argv)
         prev_closed = (ng > 0 && ng <= 2048 && out[ng - 1] == g_im_end);
         /* The rate is the decode rate: tokens after the first over the time after it. The
          * first token's latency is this turn's prefill (the card keeps the conversation's
-         * KV cache across turns since 2026-09-11; before, it re-ran the whole history and
-         * that latency grew with the chat), so folding it in would misreport the decode. */
+         * KV cache across turns), so folding it in would misreport the decode. */
         double rate = (ng > 1 && dt > first_dt) ? (ng - 1)/(dt - first_dt) : 0.0;
         printf("\n     [%d tokens in %.1f s: first after %.2f s, then %.1f tok/s%s]\n\n",
                ng, dt, first_dt, rate, prev_closed || !g_chat ? "" : ", cut by -n");

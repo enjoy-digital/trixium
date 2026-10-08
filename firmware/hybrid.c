@@ -4,12 +4,12 @@
 // SPDX-License-Identifier: BSD-2-Clause
 //
 // The hybrid models (Bonsai 2 = Qwen3.5: Gated DeltaNet layers, gated attention with partial
-// RoPE, PrismML's rotated weight basis) on the CPU path: float math over main_ram, the engine
-// for every matvec (the projections and the rotation blocks). This is the correctness path -
-// the golden's semantics (trixium/model/golden.py) transliterated, gated on the tiny
-// hybrid model in the Verilator sim - and the reference the fast path (vector unit + engine,
-// docs/xcu1525.md) is measured against. It is slow by design: soft-float on VexiiRiscv, one
-// engine op per rotation block, the DeltaNet state walked head by head from main_ram.
+// RoPE, PrismML's rotated weight basis). The CPU path does float math over main_ram with the
+// engine for every matvec (the projections and the rotation blocks): the golden's semantics
+// (trixium/model/golden.py) transliterated, gated on the tiny hybrid model in the Verilator
+// sim, and the reference the hardware paths are checked against. Where the bitstream has the
+// units, the same layers run as scratchpad descriptor lists (resident.c), the DeltaNet stream
+// (engine op 5) and the attention stream (engine op 6) - bit-exact with the CPU path.
 //
 // What a hybrid image adds (BONS v3, layout.py): per layer either the attention tensors
 // (attn_q carries [q | gate] per head when the header says attn_gated) or the DeltaNet set
@@ -467,8 +467,8 @@ int hybrid_init(void)
     dn_hw = n_dn && hv == DN_HW_ROWS && hk == DN_HW_COLS;
     if (dn_hw) {
         // Keep the same conservative KV reservation as the image converter, then place
-        // whole recurrent matrices immediately above it. Hybrid attention currently keeps
-        // its KV cache in main RAM, but reserving the range makes this layout future-proof.
+        // whole recurrent matrices immediately above it (the attention stream's K/V spans
+        // follow above the state).
         uint32_t kv_base = (uint32_t)((TRIXIUM_CHAN_WEIGHT_BASE + H->payload_beats*32
                                       + 0xFFFu) & ~0xFFFu);
         uint32_t kv_rb = 1u + (uint32_t)head_dim/32u;
@@ -1735,7 +1735,7 @@ static void attention_layer(int l, const float *h, float *out)
 
 // LM head chunk: the rows that fit RS_F (restored FP32) and the int32 staging below it, a
 // multiple of 8*n_ch; `lmchunk` caps it (the tiny simulation model's head is one chunk
-// otherwise, and the multi-chunk path is where the 27B's v17 logits went wrong).
+// otherwise, so the cap is how the sim exercises the 27B's multi-chunk path).
 static uint32_t lm_chunk_rows(void)
 {
     uint32_t unit = 8u*(uint32_t)n_ch, room = (0x32000u - RS_F_ADDR)/4;
@@ -1896,8 +1896,8 @@ static void ffn_tok(int l, uint64_t t0)
     // Resident FFN: gate, up and act = up*silu(gate) in one scratchpad list, the act
     // then prepared for the down projection where it already is (no FETCH). The gate
     // and up projections reach main RAM only when traced.
-    // The activation stays in RS_F for the down projection's prepare (its store to main
-    // RAM was ~13k cycles per 27B layer on v17): the trace reads it there, and a failed
+    // The activation stays in RS_F for the down projection's prepare (a store to main
+    // RAM costs ~13k cycles per 27B layer): the trace reads it there, and a failed
     // down projection recomputes it on the CPU path.
     int fused = 0, act_stored = 0;
     if (e8 == E8_RESIDENT && H->hadamard_block && resident_silu_active() &&

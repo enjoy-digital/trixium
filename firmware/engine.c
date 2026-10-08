@@ -20,8 +20,7 @@ int engine_wedged; // Sticky: an op never completed, so engine results are not t
 // clock domain, gateware/engreset.py. The HBM ports stay whole behind their AXI shims;
 // the scratchpad, the vector programs and the descriptor lists survive. Returns 0 when
 // the ports drained, -1 when a port never answers (the shim's `stuck`: the FPGA needs a
-// reconfigure after all) or the drain timed out. Bitstreams before 2026-09-15 have no
-// soft reset: -2.
+// reconfigure after all) or the drain timed out.
 int engine_recover(void)
 {
     trixium_engine_csr_soft_reset_write(1);
@@ -46,10 +45,9 @@ int engine_recover(void)
     return 0;
 }
 // Per-op stall diagnostics (pre-op beat snapshots, result-slot markers) cost ~2k cycles of
-// CSR/scratchpad traffic per engine op - ~1.3M cycles per forward at ~760 ops. They were
-// indispensable while the gather wedge was live; now they are opt-in (`engdiag on`). The
-// stall printout itself stays: without the snapshot it shows absolute beat counters, which
-// still names the channel that came up short.
+// CSR/scratchpad traffic per engine op - ~1.3M cycles per forward at ~760 ops - so they are
+// opt-in (`engdiag on`). The stall printout itself stays: without the snapshot it shows
+// absolute beat counters, which still names the channel that came up short.
 int engine_diag;
 
 // Completion-poll census (spins x ~70cy CSR read = the IRQ opportunity, upper bound).
@@ -158,9 +156,8 @@ void engine_join(uint32_t done)
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
     // hanging the boot silently.
     // The report threshold scales with the op: 200k spins (~4 M cycles) covers every op at
-    // the HBM's rate, but the 8B's LM head streams 322k beats per channel and at the
-    // XCU1525 v3's 23 cycles/beat that is 7.4 M cycles of legitimate work (2026-09-19: a
-    // stall report per token, the tokens right).
+    // the HBM's rate, but the 8B's LM head streams 322k beats per channel and at ~23
+    // cycles/beat on DDR4 that is 7.4 M cycles of legitimate work.
     uint32_t spin_limit = 200000u;
     if (op->wlen > 100000u)
         spin_limit = op->wlen*2u;

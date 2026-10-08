@@ -78,7 +78,7 @@ int seq_wedged; // Sticky: a list never finished, so the engine state is not tru
 
 uint32_t seq_poll_spins, seq_poll_waits;
 
-// Split form (2026-08-31, per-cycle sideband slot): start a list and return; the CPU
+// Split form (per-cycle sideband slot): start a list and return; the CPU
 // may then patch OTHER lists' descriptors or do host-memory work while it runs, and
 // seq_join() polls completion. On bitstreams without TRIXIUM_SP_SB_SLOT the first
 // scratchpad access after seq_list_start() simply stalls until the list finishes -
@@ -111,7 +111,7 @@ void seq_join(void)
     }
 }
 
-// Traced run (C2-1a): like seq_run, but records perf_now() at every dcount transition
+// Traced run: like seq_run, but records perf_now() at every dcount transition
 // (seq_status[8:...]) into ts[0..max-1]; ts[0] at start, last entry at done. Returns
 // entries used. ~70-cycle CSR-poll resolution vs multi-thousand-cycle descriptors.
 int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
@@ -162,13 +162,9 @@ void seq_run(uint32_t idx0, uint32_t count)
     trixium_seq_base_write(SP_DESC + idx0*64);
     trixium_seq_count_write(count);
     trixium_seq_start_write(1);
-    // Spin-capped poll: a wedged list names the stuck descriptor instead of hanging.
-    //
-    // And it does have to *give up*. Spinning forever here is what turned a stalled
-    // descriptor into a dead card: the sequencer holds `busy`, the engine keeps the
-    // scratchpad grant (status bit 9), so the CPU's scratchpad reads come back garbage -
-    // SPTEST reports 64 errors - and a CPU reset does not clear either. Only reconfiguring
-    // the FPGA does. Giving up at least keeps the console alive to say so.
+    // Spin-capped poll: a wedged list names the stuck descriptor instead of hanging, and
+    // gives up: a stalled list keeps `busy` and the scratchpad grant (status bit 9), so the
+    // CPU's scratchpad reads return garbage either way; giving up keeps the console alive.
     uint32_t spins = 0, reports = 0;
     seq_poll_waits++;
     while (trixium_seq_status_read() & 1) {

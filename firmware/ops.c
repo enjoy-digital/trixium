@@ -12,20 +12,10 @@
 
 // Every op the gateware implements, on by default: each one is gated bit-exact against the
 // interpreter (VECCRC) and token-gated in simulation, and the CPU paths are debug fallbacks.
-// This used to be left at 0, so a card booted into the slowest configuration it had and the
-// accelerators sat idle unless someone typed `hwops all hw` - measured on the 1.7B at
-// 2.62e9 cycles / 6 forwards = 2.18 s per token with everything on the softcore.
-//
 // hwops_init() is called after the model header is known; `hwops all cpu` still gets the
 // fallback path for A/B work.
 uint32_t hwops_mask;
 
-// Every op the gateware implements, on by default. This was held at 0 while the interleaved
-// gather could wedge the engine partway through a generation; that is fixed (the gather
-// consumed a merged result on merge_mask but counted it on grant_valid, so a result could
-// vanish without incrementing result_cnt and RUN waited for a total it could never reach).
-// Confirmed on the card: 16 tokens on the prompt that used to stall after four.
-//
 // Measured on the 1.7B: 1.177 tok/s here against 0.192 all-CPU. Do NOT reach for a partial
 // mask as a compromise - the resident-BFP loop keeps activations in the scratchpad, so a
 // mixed mask pays a float round-trip every layer and lands at 0.121 tok/s, slower than
