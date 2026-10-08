@@ -29,12 +29,12 @@
 #include "perf.h"
 #include "infer.h"
 #include "seq.h"
-#include "bonsai_sequence.h"
+#include "trixium_sequence.h"
 #include "progs.h"
 #include "static_memory.h"
 #include "fastmath.h"
 
-#if defined(BONSAI_HAS_HADAMARD) && defined(BONSAI_HAS_ACTIVATION_QUANTIZE) && defined(BONSAI_HAS_PROJECTION_RESTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE) && defined(HAS_FLUSH_CPU_DCACHE_RANGE) && defined(HAS_CLEAN_CPU_DCACHE_RANGE)
+#if defined(TRIXIUM_HAS_HADAMARD) && defined(TRIXIUM_HAS_ACTIVATION_QUANTIZE) && defined(TRIXIUM_HAS_PROJECTION_RESTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE) && defined(HAS_FLUSH_CPU_DCACHE_RANGE) && defined(HAS_CLEAN_CPU_DCACHE_RANGE)
 #define RESIDENT_BUILT 1
 #else
 #define RESIDENT_BUILT 0
@@ -59,7 +59,7 @@
 // Unit 11 (SiLU-multiply). The FFN activation runs gate -> RS_F, up -> RS_Y (restored in
 // place), SiLU in place over RS_F; its fixup bitmap lands in RS_Q8B, which only a prepare
 // uses. The 1,025-beat table image is staged in RS_F once, at init.
-#if defined(BONSAI_HAS_SILU)
+#if defined(TRIXIUM_HAS_SILU)
 #define SILU_BUILT RESIDENT_BUILT
 #else
 #define SILU_BUILT 0
@@ -73,7 +73,7 @@ _Static_assert(sizeof(struct resident_state) <= 256, "resident_state window is 2
 
 struct resident_state *resident_state(void)
 {
-    struct resident_state *R = (struct resident_state *)BONSAI_RESIDENT_STATE_ADDR;
+    struct resident_state *R = (struct resident_state *)TRIXIUM_RESIDENT_STATE_ADDR;
     if (!initialized) {
         memset(R, 0, sizeof *R);
         R->enabled = 1;
@@ -101,10 +101,10 @@ int resident_available(void)
 {
 #if RESIDENT_BUILT
     // ABI majors 1; the requantizer (unit 5) needs activation_quantize minor >= 1.
-    return (seq_hadamard_abi_read() >> 16) == 1 &&
-           (seq_activation_quantize_abi_read() >> 16) == 1 &&
-           (seq_activation_quantize_abi_read() & 0xffff) >= 1 &&
-           (seq_projection_restore_abi_read() >> 16) == 1;
+    return (trixium_seq_hadamard_abi_read() >> 16) == 1 &&
+           (trixium_seq_activation_quantize_abi_read() >> 16) == 1 &&
+           (trixium_seq_activation_quantize_abi_read() & 0xffff) >= 1 &&
+           (trixium_seq_projection_restore_abi_read() >> 16) == 1;
 #else
     return 0;
 #endif
@@ -120,7 +120,7 @@ int resident_active(void)
 
 static inline uint32_t eng_addr(const void *p)
 {
-    return (uint32_t)((uintptr_t)p - MAIN_RAM_BASE + BONSAI_MEM_CPU_OFFSET);
+    return (uint32_t)((uintptr_t)p - MAIN_RAM_BASE + TRIXIUM_MEM_CPU_OFFSET);
 }
 
 static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d)
@@ -154,7 +154,7 @@ struct list_prof {
     uint64_t cyc[RS_DESC_MAX];
 };
 #define LISTPROF_N 16
-#define LP ((struct list_prof *)BONSAI_LISTPROF_ADDR)
+#define LP ((struct list_prof *)TRIXIUM_LISTPROF_ADDR)
 
 void resident_listprof_reset(void)
 {
@@ -221,7 +221,7 @@ static int run_list_wait(void)
     uint64_t last_t = LF.last_t;
     uint32_t spins = 0;
     for (;;) {
-        uint32_t st = seq_status_read();
+        uint32_t st = trixium_seq_status_read();
         if (prof) {
             uint32_t dc = st >> 8;
             if (dc != last_d && dc < RS_DESC_MAX) {
@@ -238,22 +238,22 @@ static int run_list_wait(void)
             }
             break;
         }
-        uint32_t eq = seq_activation_quantize_error_read(), eh = seq_hadamard_error_read(),
-                 er = seq_projection_restore_error_read(), es = 0;
+        uint32_t eq = trixium_seq_activation_quantize_error_read(), eh = trixium_seq_hadamard_error_read(),
+                 er = trixium_seq_projection_restore_error_read(), es = 0;
 #if SILU_BUILT
-        es = seq_silu_error_read();
+        es = trixium_seq_silu_error_read();
 #endif
-#ifdef CSR_SEQ_NORM_ERROR_ADDR
-        es |= seq_norm_error_read();
+#ifdef CSR_TRIXIUM_SEQ_NORM_ERROR_ADDR
+        es |= trixium_seq_norm_error_read();
 #endif
-#ifdef CSR_SEQ_CONV_ERROR_ADDR
-        es |= seq_conv_error_read();
+#ifdef CSR_TRIXIUM_SEQ_CONV_ERROR_ADDR
+        es |= trixium_seq_conv_error_read();
 #endif
         if ((eq | eh | er | es) || ++spins > 4000000u) {
             printf("resident: %s list failed at dcount %lu (quantize %08lx hadamard %08lx "
                    "restore %08lx silu/norm/conv %08lx eng %02lx)%s - engine soft reset, resident path off\n",
                    what, (unsigned long)(st >> 8), (unsigned long)eq, (unsigned long)eh,
-                   (unsigned long)er, (unsigned long)es, (unsigned long)engine_csr_status_read(),
+                   (unsigned long)er, (unsigned long)es, (unsigned long)trixium_engine_csr_status_read(),
                    (eq | eh | er | es) ? "" : " [timeout]");
             R->disabled = 1;
             engine_recover();
@@ -289,8 +289,8 @@ int resident_init(void)
     if (!resident_available())
         return -1;
     int B = H->hadamard_block;
-    if (B != (int)BONSAI_HADAMARD_BLOCK) {
-        printf("resident: image block %d, hardware %d - off\n", B, (int)BONSAI_HADAMARD_BLOCK);
+    if (B != (int)TRIXIUM_HADAMARD_BLOCK) {
+        printf("resident: image block %d, hardware %d - off\n", B, (int)TRIXIUM_HADAMARD_BLOCK);
         return -1;
     }
     // The dense rotation tensors of the image are H*diag(sign) (+-1, scale 1/32): row 0 of
@@ -315,7 +315,7 @@ int resident_init(void)
             }
             uint32_t rb = bons_row_beats(e->cols, e->kind, e->group);
             uint32_t sb = bons_scale_beats(e->cols, e->group);
-            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32, rb, RS_Y);
+            engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32, rb, RS_Y);
             const volatile uint32_t *codes = (const volatile uint32_t *)(SCRATCHPAD_BASE + RS_Y + sb*32);
             volatile uint32_t *signs = (volatile uint32_t *)(SCRATCHPAD_BASE + off);
             for (int j = 0; j < B; j += 32) {
@@ -427,7 +427,7 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
         op.kind   = (seg->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
         op.rows   = rpc;
         op.cols   = seg->cols;
-        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + (seg->chan_base_beats + (row0/(uint32_t)R->n_ch)*rb)*32;
+        op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + (seg->chan_base_beats + (row0/(uint32_t)R->n_ch)*rb)*32;
         op.wlen   = rpc*rb;
         op.sbeats = bons_scale_beats(seg->cols, seg->group);
         op.cbeats = bons_code_beats(seg->cols, seg->kind);
@@ -633,7 +633,7 @@ uint32_t rl_count(void) { return RL.n; }
 int rl_wait_desc(uint32_t k)
 {
     for (uint32_t spins = 0; spins < 20000000u; spins++) {
-        uint32_t st = seq_status_read();
+        uint32_t st = trixium_seq_status_read();
         if (((st >> 8) & 0xFFFFu) >= k || !(st & 1))
             return 0;
     }
@@ -665,7 +665,7 @@ static uint32_t silu_patch(uint32_t rows, float *act)
         while (word) {
             uint32_t i = 32*w + (uint32_t)__builtin_ctz(word);
             word &= word - 1;
-            float r = m[i]*bonsai_silu_lookup(f[i], R->silu_lut);
+            float r = m[i]*trixium_silu_lookup(f[i], R->silu_lut);
             f[i] = r;
             if (act) act[i] = r;
             patched++;
@@ -696,7 +696,7 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
                 o = ((sg % perm_a)*perm_b + sg/perm_a)*seg + within;
             }
             float mv = m_sp ? m[i] : 1.0f;
-            dst[o] = mv*bonsai_silu_lookup(g[i], R->silu_lut);
+            dst[o] = mv*trixium_silu_lookup(g[i], R->silu_lut);
             patched++;
         }
     }
@@ -739,13 +739,13 @@ static int silu_selftest(void)
     // The inputs are regenerated below; RS_F is overwritten in place.
     if (run_list(n, "silu self-test"))
         return -1;
-    uint32_t fixups = seq_silu_fixups_read(), patched = silu_patch(SILU_SELFTEST_N, NULL);
+    uint32_t fixups = trixium_seq_silu_fixups_read(), patched = silu_patch(SILU_SELFTEST_N, NULL);
     uint32_t bad = 0;
     for (uint32_t i = 0; i < SILU_SELFTEST_N; i++) {
         a.f = -100.0f + (float)i*0.3125f;
         a.u = (i % 61 == 7) ? special[(i/61) % 8] : a.u;
         b.u = mult[i % 8];
-        c.f = b.f*bonsai_silu_lookup(a.f, R->silu_lut);
+        c.f = b.f*trixium_silu_lookup(a.f, R->silu_lut);
         if (g[i] != c.u && bad++ < 4)
             printf("resident: silu self-test element %lu g=%08lx m=%08lx: unit %08lx, cpu %08lx\n",
                    (unsigned long)i, (unsigned long)a.u, (unsigned long)b.u,
@@ -765,7 +765,7 @@ static int silu_selftest(void)
 static void silu_probe(uint32_t *stage, int half)
 {
     struct resident_state *R = resident_state();
-    const uint32_t N = BONSAI_SILU_LUT_N;           // k = 0 (g = -16) is a fixup; skipped.
+    const uint32_t N = TRIXIUM_SILU_LUT_N;           // k = 0 (g = -16) is a fixup; skipped.
     union { float f; uint32_t u; } a, c;
     for (uint32_t k = 0; k < N; k++) {
         a.f = -16.0f + ((float)k + (half ? 0.5f : 0.0f))*(1.0f/128.0f);
@@ -786,7 +786,7 @@ static void silu_probe(uint32_t *stage, int half)
     uint32_t bad = 0, lo = 0, hi = 0, lane[8] = {0}, printed = 0;
     for (uint32_t k = 1; k < N; k++) {
         a.f = -16.0f + ((float)k + (half ? 0.5f : 0.0f))*(1.0f/128.0f);
-        c.f = bonsai_silu_lookup(a.f, R->silu_lut);
+        c.f = trixium_silu_lookup(a.f, R->silu_lut);
         if (r[k] == c.u)
             continue;
         if (!bad++) lo = k;
@@ -808,18 +808,18 @@ int resident_silu_init(const float *lut, uint32_t *stage)
     struct resident_state *R = resident_state();
     R->silu_ready = 0;
     R->silu_lut = lut;
-    if (!R->ready || !stage || ((uintptr_t)stage & 31) || (seq_silu_abi_read() >> 16) != 1)
+    if (!R->ready || !stage || ((uintptr_t)stage & 31) || (trixium_seq_silu_abi_read() >> 16) != 1)
         return -1;
     // The table image the unit loads: lut[0..4096] (lut[4096] alone in beat 512) and the
     // interpolation slopes lut[i+1] - lut[i], one FP32 subtraction each - exactly what
-    // bonsai_silu_lookup computes per element. Built in main RAM and DMA-fetched into RS_F
+    // trixium_silu_lookup computes per element. Built in main RAM and DMA-fetched into RS_F
     // in the same list as the LOAD, like every other bulk transfer, then read back: a bad
     // image is reported as such instead of as self-test mismatches. (v13's 82 self-test
     // mismatches were the kernel tables exported over the CSR bus - see silu_mul.py.)
     union { float f; uint32_t u; } v;
     for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++) stage[i] = 0;
-    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) { v.f = lut[i]; stage[i] = v.u; }
-    for (int i = 0; i < BONSAI_SILU_LUT_N; i++) { v.f = lut[i + 1] - lut[i]; stage[513*8 + i] = v.u; }
+    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) { v.f = lut[i]; stage[i] = v.u; }
+    for (int i = 0; i < TRIXIUM_SILU_LUT_N; i++) { v.f = lut[i + 1] - lut[i]; stage[513*8 + i] = v.u; }
     clean_cpu_dcache_range(stage, SILU_IMAGE_WORDS*4);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
@@ -860,18 +860,18 @@ int resident_gate_init(const float *sig_lut, uint32_t *image)
     struct resident_state *R = resident_state();
     R->gate_ready = 0;
     if (!R->silu_ready || !R->silu_image || !sig_lut || !image || ((uintptr_t)image & 31) ||
-        (seq_silu_abi_read() >> 16) != 1 || (seq_silu_abi_read() & 0xffff) < 2)
+        (trixium_seq_silu_abi_read() >> 16) != 1 || (trixium_seq_silu_abi_read() & 0xffff) < 2)
         return -1;
     // The SiLU image's layout (resident_silu_init) on the canonical sigmoid table.
     union { float f; uint32_t u; } v;
     for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++) image[i] = 0;
-    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) { v.f = sig_lut[i]; image[i] = v.u; }
-    for (int i = 0; i < BONSAI_SILU_LUT_N; i++) { v.f = sig_lut[i + 1] - sig_lut[i]; image[513*8 + i] = v.u; }
+    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) { v.f = sig_lut[i]; image[i] = v.u; }
+    for (int i = 0; i < TRIXIUM_SILU_LUT_N; i++) { v.f = sig_lut[i + 1] - sig_lut[i]; image[513*8 + i] = v.u; }
     clean_cpu_dcache_range(image, SILU_IMAGE_WORDS*4);
     R->sig_image = image;
     R->sig_lut = sig_lut;
     R->gate_set = 0;
-    if ((seq_silu_abi_read() & 0xffff) >= 3) {
+    if ((trixium_seq_silu_abi_read() & 0xffff) >= 3) {
         // A second resident table pair: load the sigmoid once, runs select it (no swaps).
         struct bns_seq_descriptor d;
         uint32_t n = 0;
@@ -948,7 +948,7 @@ uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, f
         while (word) {
             uint32_t i = 32*w + (uint32_t)__builtin_ctz(word);
             word &= word - 1;
-            dst[i] = m[i]*bonsai_sigmoid_lookup(g[i], R->sig_lut);
+            dst[i] = m[i]*trixium_sigmoid_lookup(g[i], R->sig_lut);
             patched++;
         }
     }
@@ -990,7 +990,7 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
         if (up_out) invd_cpu_dcache_range(up_out, rows*4);
         // Elements outside the unit's exact range (|gate| tails, specials, non-normal
         // products) kept g in RS_F; recompute them with the firmware's own function.
-        uint32_t fixups = seq_silu_fixups_read();
+        uint32_t fixups = trixium_seq_silu_fixups_read();
         R->silu_fixups += fixups;
         if (fixups)
             silu_patch(rows, act);

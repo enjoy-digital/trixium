@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 """The flat scratchpad arbiter must be the nested 2:1 client-mux chain, bit for bit.
 
-BonsaiScratchpadArbiter replaces one BonsaiScratchpadClientMux per attached unit (the
+ScratchpadArbiter replaces one ScratchpadClientMux per attached unit (the
 v11 VCU build failed setup on those serial mux levels). It is only safe to swap in if
 every output toward the scratchpad and every return toward every client is identical to
 the chain's, for every combination of busy bits - including two units busy at once,
@@ -15,10 +15,10 @@ from migen import Module, Signal, Mux, run_simulation
 
 from litex.gen import LiteXModule
 
-from trixium.core.scratchpad import BonsaiScratchpadArbiter
+from trixium.core.scratchpad import ScratchpadArbiter
 
 # Reference: the nested 2:1 client mux the arbiter replaced.
-class BonsaiScratchpadClientMux(LiteXModule):
+class ScratchpadClientMux(LiteXModule):
     """Give an auxiliary unit priority over the vector-unit scratchpad client."""
 
     def __init__(self, vector, auxiliary):
@@ -67,11 +67,11 @@ class DUT(Module):
         self.flat_base, self.flat = Client(), [Client() for _ in range(n)]
         top = self.chain_base
         for i, client in enumerate(self.chain):
-            mux = BonsaiScratchpadClientMux(top, client)
+            mux = ScratchpadClientMux(top, client)
             setattr(self.submodules, f"mux{i}", mux)
             top = mux
         self.chain_top = top
-        self.submodules.arb = BonsaiScratchpadArbiter(self.flat_base, self.flat)
+        self.submodules.arb = ScratchpadArbiter(self.flat_base, self.flat)
         # The scratchpad side feeds both trees the same read data and write grant.
         self.rd_dat, self.wr_gnt = Signal(256), Signal()
         self.comb += [self.chain_top.sp_rd_dat.eq(self.rd_dat), self.chain_top.sp_wr_gnt.eq(self.wr_gnt),

@@ -8,7 +8,7 @@
 //
 // The BIOS initialises controller 0 (main_ram) the standard way. Controllers 1..N-1 have no
 // CPU window and no BIOS support; they have the same PHY, the same module and the same init
-// sequence, and their CSRs sit at controller 0's offsets shifted by k*BONSAI_DDR_CSR_STRIDE
+// sequence, and their CSRs sit at controller 0's offsets shifted by k*TRIXIUM_DDR_CSR_STRIDE
 // (the target pins the (sdram, ddrphy) pairs to consecutive CSR pages). csr.h's accessors are
 // all `CSR_BASE + offset`, so redefining CSR_BASE as a variable for this translation unit
 // turns the unmodified sdram_init() - init sequence, write leveling, read leveling - into
@@ -20,7 +20,7 @@
 
 #include <generated/soc.h>
 
-#ifdef BONSAI_N_MEMCTRL
+#ifdef TRIXIUM_N_MEMCTRL
 
 #include <stdio.h>
 #include <stdint.h>
@@ -40,17 +40,17 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 #include "engine.h"
 #include "ddr.h"
 
-#ifndef BONSAI_CHAN_MOD
-#define BONSAI_CHAN_MOD 0
+#ifndef TRIXIUM_CHAN_MOD
+#define TRIXIUM_CHAN_MOD 0
 #endif
 
 int ddr_init(int k)
 {
-    if (k < 0 || k >= BONSAI_N_MEMCTRL) {
-        printf("ddr: controller %d does not exist (0..%d)\n", k, BONSAI_N_MEMCTRL - 1);
+    if (k < 0 || k >= TRIXIUM_N_MEMCTRL) {
+        printf("ddr: controller %d does not exist (0..%d)\n", k, TRIXIUM_N_MEMCTRL - 1);
         return 0;
     }
-    ddr_csr_base = ddr_csr_base0 + (unsigned long)k*BONSAI_DDR_CSR_STRIDE;
+    ddr_csr_base = ddr_csr_base0 + (unsigned long)k*TRIXIUM_DDR_CSR_STRIDE;
     printf("ddr: controller %d (CSRs at %08lx)\n", k, (unsigned long)CSR_SDRAM_BASE);
     int ok = sdram_init();
     ddr_csr_base = ddr_csr_base0;
@@ -61,7 +61,7 @@ int ddr_init(int k)
 int ddr_init_all(void)
 {
     int ok = 1;
-    for (int k = 1; k < BONSAI_N_MEMCTRL; k++)
+    for (int k = 1; k < TRIXIUM_N_MEMCTRL; k++)
         ok &= ddr_init(k);
     return ok;
 }
@@ -78,13 +78,13 @@ int ddr_init_all(void)
 // tokens on all three boot legs (2026-09-18). And not "base + stride": with the XCU1525's
 // 1 GB stride and 320 MB base that is past the channel's 4 GB for the last window.
 #define DDR_TEST_BEATS  64
-#ifndef BONSAI_CHAN_SKEW
-#define BONSAI_CHAN_SKEW 0
+#ifndef TRIXIUM_CHAN_SKEW
+#define TRIXIUM_CHAN_SKEW 0
 #endif
 // The smallest window of a controller: the last one, which the bank skew shortens.
-#define DDR_TEST_WINDOW (BONSAI_CHAN_STRIDE - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE) \
-                         - (BONSAI_CHAN_MOD ? (BONSAI_CHAN_MOD - 1)*BONSAI_CHAN_SKEW : 0))
-#define DDR_TEST_ADDR   (BONSAI_CHAN_WEIGHT_BASE + DDR_TEST_WINDOW - 0x1000u)
+#define DDR_TEST_WINDOW (TRIXIUM_CHAN_STRIDE - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) \
+                         - (TRIXIUM_CHAN_MOD ? (TRIXIUM_CHAN_MOD - 1)*TRIXIUM_CHAN_SKEW : 0))
+#define DDR_TEST_ADDR   (TRIXIUM_CHAN_WEIGHT_BASE + DDR_TEST_WINDOW - 0x1000u)
 #define DDR_TEST_SRC   0x0000u   // Scratchpad: the pattern (2 KB).
 #define DDR_TEST_DST   0x4000u   // Scratchpad: the readback.
 
@@ -97,7 +97,7 @@ static void ddr_pattern(uint32_t chan, uint32_t seed)
 
 int ddr_test(int chan)
 {
-    int n_ch = BONSAI_N_CHANNELS;
+    int n_ch = TRIXIUM_N_CHANNELS;
     int first = chan < 0 ? 0 : chan, last = chan < 0 ? n_ch - 1 : chan;
     if (first >= n_ch) {
         printf("ddrtest: channel %d does not exist (0..%d)\n", chan, n_ch - 1);
@@ -130,9 +130,9 @@ int ddr_test(int chan)
         }
         if (errors) failed++;
         printf("DDRTEST chan %2d (controller %d) %s (%d errors)\n", c,
-               BONSAI_CHAN_MOD ? c/BONSAI_CHAN_MOD : 0, errors ? "FAIL" : "OK", errors);
+               TRIXIUM_CHAN_MOD ? c/TRIXIUM_CHAN_MOD : 0, errors ? "FAIL" : "OK", errors);
     }
     return failed == 0;
 }
 
-#endif // BONSAI_N_MEMCTRL
+#endif // TRIXIUM_N_MEMCTRL

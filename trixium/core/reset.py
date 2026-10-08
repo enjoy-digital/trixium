@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiEngineResetDomain: the soft-resettable clock domain the engine cluster runs in.
+"""EngineResetDomain: the soft-resettable clock domain the engine cluster runs in.
 
 `eng` is the `sys` clock with a reset the firmware can pulse (the `engreset` CSR): the
 matvec engine, the loader (whose per-channel writers carry the engine's KV stores), the
@@ -28,9 +28,9 @@ from litex.gen import *
 
 from trixium.memory.axi import AXIResetShim
 
-# BonsaiEngineResetDomain --------------------------------------------------------------------------
+# EngineResetDomain --------------------------------------------------------------------------
 
-class BonsaiEngineResetDomain(LiteXModule):
+class EngineResetDomain(LiteXModule):
     def __init__(self, axis, hold_cycles=64, stuck_cycles=1 << 20):
         self.cd_eng  = ClockDomain("eng")
         # This register implements its own reset equation below. Migen's

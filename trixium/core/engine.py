@@ -4,9 +4,9 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiMatVecEngine: N-channel ternary/Q8 matvec engine.
+"""MatVecEngine: N-channel ternary/Q8 matvec engine.
 
-One BonsaiAXIReader + BonsaiChannelPipe per HBM pseudo-channel. A matvec command:
+One AXIReader + ChannelPipe per HBM pseudo-channel. A matvec command:
 
   1. FILL : broadcast x8 (cols bytes) from the scratchpad into every channel's x-buffer.
   2. ISSUE: give every reader the same {wbase, wlen} (identical relative layout per channel).
@@ -28,10 +28,10 @@ from litex.gen import *
 from litex.soc.interconnect import stream
 
 from trixium.layout import BEAT_BYTES
-from trixium.memory.axi import BonsaiAXIReader
-from trixium.core.pipe import BonsaiChannelPipe
+from trixium.memory.axi import AXIReader
+from trixium.core.pipe import ChannelPipe
 
-# BonsaiMatVecEngine -------------------------------------------------------------------------------
+# MatVecEngine -------------------------------------------------------------------------------
 
 class _ResultPacker(Module):
     """The per-pipe relay register in front of the gather, which in plain-matvec mode also
@@ -141,7 +141,7 @@ class _ResultPacker(Module):
                             p_dat[32*l:32*l + 32].eq(self.sink.data[32*l:32*l + 32]))
 
 
-class BonsaiMatVecEngine(LiteXModule):
+class MatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False):
         # chan_stride: byte distance between consecutive channels' weight regions. The HBM IP
@@ -151,7 +151,7 @@ class BonsaiMatVecEngine(LiteXModule):
         # returned byte-identical data for all eight channels despite each having been
         # uploaded a different payload. Sim keeps 0 because its per-channel HBM models are
         # independent memories (each channel already has its own address space there).
-        # When a BonsaiVectorUnit is passed, the scratchpad fill/gather ports are muxed
+        # When a VectorUnit is passed, the scratchpad fill/gather ports are muxed
         # between the engine and the vector unit (granted to the vector unit while it is
         # busy - firmware serializes engine ops and vector ops, so contention is
         # structurally impossible; never a 5th RAM port).
@@ -268,7 +268,7 @@ class BonsaiMatVecEngine(LiteXModule):
 
         # STORE (kind 3): scratchpad beats -> one HBM channel, through the loader's
         # per-channel AXI writers (wired by the integrator; a kind-3 op hangs if absent -
-        # firmware only issues it when BONSAI_HAS_KVSTORE is set). cmd reuse: chan = dest
+        # firmware only issues it when TRIXIUM_HAS_KVSTORE is set). cmd reuse: chan = dest
         # channel, wbase = HBM byte address, wlen = beats, xsrc = scratchpad byte source.
         self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 33), ("len", 24)])
         # addr is 33 bits: with port-matched 256 MB windows channel 15 lives at
@@ -281,20 +281,20 @@ class BonsaiMatVecEngine(LiteXModule):
         # (same wbase/wlen on every channel, the readers' per-channel offsets).
         self.with_dnstream = dnstream
         if dnstream:
-            from trixium.units.deltanet_stream import BonsaiDeltaNetStream
+            from trixium.units.deltanet_stream import DeltaNetStream
             # dnstream=True: the 27B geometry on the exact operators; a dict overrides the
             # unit's arguments (tests: a small geometry on integer operators).
             opts = dict(dnstream) if isinstance(dnstream, (dict, tuple)) else {}
-            self.submodules.dnstream = dn = BonsaiDeltaNetStream(
+            self.submodules.dnstream = dn = DeltaNetStream(
                 lanes=len(hbm_axis), adr_bits=len(scratchpad.fill.adr), **opts)
             self.mstore_cmd  = stream.Endpoint([("addr", 33), ("len", 24)])
             self.mstore_data = dn.sources
 
         self.with_attnstream = attnstream
         if attnstream:
-            from trixium.units.attention_stream import BonsaiAttnStream
+            from trixium.units.attention_stream import AttentionStream
             opts = dict(attnstream) if isinstance(attnstream, (dict, tuple)) else {}
-            self.submodules.attnstream = at = BonsaiAttnStream(adr_bits=len(scratchpad.fill.adr), **opts)
+            self.submodules.attnstream = at = AttentionStream(adr_bits=len(scratchpad.fill.adr), **opts)
 
         # # #
 
@@ -324,8 +324,8 @@ class BonsaiMatVecEngine(LiteXModule):
         for i, axi in enumerate(hbm_axis):
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
             # per round trip - 33.7 cycles/beat measured); round-robin ARIDs let it pipeline.
-            reader = BonsaiAXIReader(axi, n_ids=4)
-            pipe   = BonsaiChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
+            reader = AXIReader(axi, n_ids=4)
+            pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
             setattr(self.submodules, f"reader{i}", reader)
             setattr(self.submodules, f"pipe{i}",   pipe)
             # Relay register between the reader (its FIFO sits at the HBM port, bottom of

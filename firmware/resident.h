@@ -11,8 +11,8 @@
 // the fused CPU path of infer.c (same exponent rule, ties-away Q8, int32 K-segment sum, RNE
 // int32->FP32 then a power-of-two scale), so the typed-checkpoint gate must stay 87/87.
 //
-// Needs a bitstream with BONSAI_HAS_HADAMARD, BONSAI_HAS_ACTIVATION_QUANTIZE (ABI 1.1) and
-// BONSAI_HAS_PROJECTION_RESTORE (v11+). On any other bitstream resident_available() is 0
+// Needs a bitstream with TRIXIUM_HAS_HADAMARD, TRIXIUM_HAS_ACTIVATION_QUANTIZE (ABI 1.1) and
+// TRIXIUM_HAS_PROJECTION_RESTORE (v11+). On any other bitstream resident_available() is 0
 // and hybrid.c keeps its existing path; a failed list disables the path for the session
 // after an engine soft reset (the weights stay).
 #ifndef RESIDENT_H
@@ -35,7 +35,7 @@ int  resident_prepare(const float *src, uint32_t width, int rotate);
 // DMA the rows into dst (main RAM, 32-byte aligned, rows*4 bytes). 0 = ok, -1 = unsupported.
 int  resident_matvec(const struct bons_entry *e, float *dst);
 
-// Unit 11 (BONSAI_HAS_SILU): load the firmware's SiLU table into the unit (after
+// Unit 11 (TRIXIUM_HAS_SILU): load the firmware's SiLU table into the unit (after
 // resident_init), through `stage` (main RAM, 32-byte aligned, 1,025*32 bytes, free after
 // the call), and self-test it. 0 = the FFN activation can run resident.
 int  resident_silu_init(const float *lut, uint32_t *stage);

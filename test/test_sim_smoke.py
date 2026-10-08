@@ -21,8 +21,8 @@ from trixium.model.bons import BONSReader
 
 SIM_DIR = "build/sim/gateware"
 # Override to gate against a different channel count (rebuild the sim with the same
-# image first: BONSAI_SIM_IMAGE=... python3 trixium/targets/sim.py).
-IMAGE   = os.environ.get("BONSAI_SIM_IMAGE", "models/tiny/bonsai-tiny-n2.img")
+# image first: TRIXIUM_SIM_IMAGE=... python3 trixium/targets/sim.py).
+IMAGE   = os.environ.get("TRIXIUM_SIM_IMAGE", "models/tiny/bonsai-tiny-n2.img")
 
 def fnv1a(data):
     h = 2166136261
@@ -49,7 +49,7 @@ def test_sim_selftest_checksums():
     try:
         for line in p.stdout:
             lines.append(line)
-            if "BONSAI-READY" in line or len(lines) > 400000 or _t.time() > deadline:
+            if "TRIXIUM-READY" in line or len(lines) > 400000 or _t.time() > deadline:
                 break
     finally:
         p.kill()

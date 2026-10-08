@@ -99,10 +99,10 @@ def test_silu_endpoint_has_no_out_of_bounds_read(tmp_path):
 #include <math.h>
 #include "fastmath.h"
 int main(void) {
-    float lut[BONSAI_SILU_LUT_N + 1] = {0};
-    lut[BONSAI_SILU_LUT_N] = 15.999998f;
+    float lut[TRIXIUM_SILU_LUT_N + 1] = {0};
+    lut[TRIXIUM_SILU_LUT_N] = 15.999998f;
     volatile float x = nextafterf(16.0f, 0.0f);
-    return bonsai_silu_lookup(x, lut) != lut[BONSAI_SILU_LUT_N];
+    return trixium_silu_lookup(x, lut) != lut[TRIXIUM_SILU_LUT_N];
 }
 ''')
     exe = tmp_path / 'endpoint'

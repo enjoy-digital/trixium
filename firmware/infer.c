@@ -185,7 +185,7 @@ static int f32_quant_e8(const float *src, uint32_t n)
 // weights+KV tail at +144 MB. The low heap holds a few MB of norms and tables; the only big
 // consumer is the CPU-side KV cache, which is a debug fallback (HW attention keeps its own
 // KV in HBM at full context) and is capped at CPU_KV_CTX positions to fit.
-#define HEAP_BASE    (BONSAI_HDR_ADDR + 0x100000)
+#define HEAP_BASE    (TRIXIUM_HDR_ADDR + 0x100000)
 #define CPU_KV_CTX   512
 // The high heap starts above the highest weights+KV tail any engine channel puts inside
 // main_ram (channel 3, PC 4): computed per image at infer_init, 1 MB aligned. It was a
@@ -198,28 +198,28 @@ static uint32_t heap_hi_base;
 // channels) engine channel c lives on controller c / CHAN_MOD at that controller's local
 // BASE + (c % CHAN_MOD)*STRIDE, and main_ram is controller 0's local [MEM_CPU_OFFSET, +size).
 // Two SoC constants describe both; absent, the FK33's geometry.
-#ifndef BONSAI_CHAN_MOD
-#define BONSAI_CHAN_MOD 0                       // 0: one flat engine address space.
+#ifndef TRIXIUM_CHAN_MOD
+#define TRIXIUM_CHAN_MOD 0                       // 0: one flat engine address space.
 #endif
-#ifndef BONSAI_MEM_CPU_OFFSET
-#define BONSAI_MEM_CPU_OFFSET 0x40000000ull      // Engine-side address of main_ram's origin.
+#ifndef TRIXIUM_MEM_CPU_OFFSET
+#define TRIXIUM_MEM_CPU_OFFSET 0x40000000ull      // Engine-side address of main_ram's origin.
 #endif
-#ifndef BONSAI_CHAN_SKEW
-#define BONSAI_CHAN_SKEW 0                       // Per-channel bank skew inside a controller.
+#ifndef TRIXIUM_CHAN_SKEW
+#define TRIXIUM_CHAN_SKEW 0                       // Per-channel bank skew inside a controller.
 #endif
 static inline uint64_t chan_window(uint32_t c)  // Engine-side start of channel c's window.
 {
-    uint32_t local = BONSAI_CHAN_MOD ? (c % BONSAI_CHAN_MOD) : c;
-    return (uint64_t)BONSAI_CHAN_WEIGHT_BASE + (uint64_t)local*BONSAI_CHAN_STRIDE
-           + (uint64_t)local*BONSAI_CHAN_SKEW;
+    uint32_t local = TRIXIUM_CHAN_MOD ? (c % TRIXIUM_CHAN_MOD) : c;
+    return (uint64_t)TRIXIUM_CHAN_WEIGHT_BASE + (uint64_t)local*TRIXIUM_CHAN_STRIDE
+           + (uint64_t)local*TRIXIUM_CHAN_SKEW;
 }
 static inline int chan_on_cpu_memory(uint32_t c) // Same controller as main_ram?
 {
-    return BONSAI_CHAN_MOD ? (c / BONSAI_CHAN_MOD) == 0 : 1;
+    return TRIXIUM_CHAN_MOD ? (c / TRIXIUM_CHAN_MOD) == 0 : 1;
 }
 static inline uint32_t cpu_addr_of(uint64_t eng) // Engine-side -> CPU address (main_ram).
 {
-    return (uint32_t)(0x40000000ull + (eng - BONSAI_MEM_CPU_OFFSET));
+    return (uint32_t)(0x40000000ull + (eng - TRIXIUM_MEM_CPU_OFFSET));
 }
 
 static uint8_t *heap;
@@ -376,7 +376,7 @@ COLD static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 //   hm = (float)(am >> k2) * c2            -> RN24 of the product: (m2, e2)
 //   ea8 = frexpf(max hm) - 7               -> e2max + 24 - 7
 //   Mh  = lroundf(ldexpf(c2, 15 - ea8))    -> qm * 2^(qe + E1 + 15 - ea8), half away from 0
-#ifdef BONSAI_HAS_ZBB
+#ifdef TRIXIUM_HAS_ZBB
 // Zbb clz (v12+ bitstreams). GCC 10.1 knows no Zb*, so the encoding is spelled out:
 // .insn i 0x13, 1, rd, rs1, 0x600 == clz rd, rs1 (0x60059513 for a0, a1). Defined for 0
 // (returns 32), so no zero test is needed.
@@ -490,7 +490,7 @@ static void matvec_engine_rows(const struct bons_entry *e, uint32_t row0, uint32
     op.kind   = (e->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
     op.rows   = rows;
     op.cols   = e->cols;
-    op.wbase  = BONSAI_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)row0*rb)*32;
+    op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)row0*rb)*32;
     op.wlen   = rows*rb;
     op.sbeats = bons_scale_beats(e->cols, e->group);
     op.cbeats = bons_code_beats(e->cols, e->kind);
@@ -508,7 +508,7 @@ static const volatile int32_t *stage_i32_results_to(uint32_t sp_src, uint32_t co
 #if defined(HAS_INVD_CPU_DCACHE_RANGE)
     if (dma_result) {
         uint32_t eng_addr = (uint32_t)((uintptr_t)stage - MAIN_RAM_BASE
-                                      + BONSAI_MEM_CPU_OFFSET);
+                                      + TRIXIUM_MEM_CPU_OFFSET);
         engine_store(0, eng_addr, (count*4 + 31)/32, sp_src);
         invd_cpu_dcache_range(stage, count*4);
         y = stage;
@@ -692,15 +692,15 @@ int infer_rotate_quantize_f(const float *src, uint32_t width)
         const struct bons_entry *re = model_entry(ROLE_HADAMARD, HADAMARD_LAYER(wi, b));
         int xe = quantize_f_pow2(src + b*(uint32_t)B, B, SP_X);
         matvec_engine_rows(re, 0, B/n_ch, SP_Y);
-#ifdef CSR_ENGINE_CSR_ABSMAX_ADDR
-        uint32_t amax = engine_csr_absmax_read();
+#ifdef CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR
+        uint32_t amax = trixium_engine_csr_absmax_read();
 #else
         uint32_t amax = 0;
 #endif
         perf_enter(OP_NORM_I32);
         const volatile int32_t *y = stage_i32_results_to(
             SP_Y, B, 1, raw + b*(uint32_t)B);
-#ifndef CSR_ENGINE_CSR_ABSMAX_ADDR
+#ifndef CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR
         for (int i = 0; i < B; i++) {
             int64_t v = y[i];
             uint32_t a = (uint32_t)(v < 0 ? -v : v);
@@ -877,7 +877,7 @@ void *infer_halloc(uint64_t n, int big)
 uint64_t infer_heap_room(int big)
 {
     uint8_t *lim = (uint8_t *)(0x40000000ull + MAIN_RAM_SIZE - (1u << 20));
-#if !defined(BONSAI_CHAN_MOD) || BONSAI_CHAN_MOD == 0
+#if !defined(TRIXIUM_CHAN_MOD) || TRIXIUM_CHAN_MOD == 0
     // One flat memory (the FK33): the low heap ends where the first engine window inside
     // main_ram starts (channel 3's, at +64 MB) - hybrid models are not this board's.
     if (MAIN_RAM_SIZE > (64u << 20)) lim = (uint8_t *)(0x40000000u + (64u << 20));
@@ -911,7 +911,7 @@ COLD static void embed_row_f(const struct bons_entry *e, int row, float *dst)
     uint32_t rpc = e->rows/n_ch; // Rows per channel.
     uint32_t ch  = row/rpc;
     uint32_t loc = row % rpc;
-    engine_fetch(ch, BONSAI_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)loc*rb)*32,
+    engine_fetch(ch, TRIXIUM_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)loc*rb)*32,
                  rb, SP_FET);
     volatile uint8_t *p = (volatile uint8_t *)(SCRATCHPAD_BASE + SP_FET);
     uint32_t sb = bons_scale_beats(e->cols, e->group);
@@ -1011,7 +1011,7 @@ COLD static void rope_apply(float *vec, int n_heads_v, int pos)
 // Score padding granule: softmax8's x2 unroll (ISA rev 2 microcode) walks two 16-entry
 // blocks per iteration and has no odd-tail form, so scores are padded to a 32-multiple
 // with INT32_MIN there (those entries emit p8 = 0 - the sum and the AXPY do not change).
-#if BONSAI_PROGS_VREGS >= 16
+#if TRIXIUM_PROGS_VREGS >= 16
 #define SC_PAD 32
 #else
 #define SC_PAD 16
@@ -1081,7 +1081,7 @@ COLD static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
                               const struct bons_entry *w16, int n, uint32_t dst)
 {
     if (op_on_hw(OP_RMSNORM) && w16) {
-        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
+        engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
                      w16->chan_len_beats, SP_FET);
         int eps_int = eps_for(esrc);
         int ln = 0;
@@ -1138,7 +1138,7 @@ static uint32_t norm_fetch_submit(const struct bons_entry *w16)
 {
     struct engine_op op = {0};
     op.kind  = ENGINE_KIND_FETCH;
-    op.wbase = BONSAI_CHAN_WEIGHT_BASE + w16->chan_base_beats*32;
+    op.wbase = TRIXIUM_CHAN_WEIGHT_BASE + w16->chan_base_beats*32;
     op.wlen  = w16->chan_len_beats;
     op.dst   = SP_FET;
     return engine_submit(&op);
@@ -1169,7 +1169,7 @@ static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
         if (rq8_prefetched)
             rq8_prefetched = 0;                  // Row already in SP_FET (resid_add_pf).
         else
-            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
+            engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
                          w16->chan_len_beats, SP_FET);
         int eps_int = eps_for(esrc);
         int ln = 0;
@@ -1265,8 +1265,8 @@ static int op_norm_i32_sp_a(uint32_t src, uint32_t dst, int n, uint32_t amax,
 
 static int op_norm_i32_sp_m(uint32_t src, uint32_t dst, int n, uint32_t *omax)
 {
-#ifdef CSR_ENGINE_CSR_ABSMAX_ADDR
-    uint32_t amax = engine_csr_absmax_read();
+#ifdef CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR
+    uint32_t amax = trixium_engine_csr_absmax_read();
 #else
     // Pre-absmax gateware (the archived variant-b bitstream): scan on the CPU.
     uint32_t amax = 0;
@@ -1458,10 +1458,10 @@ static int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
     uint32_t rb  = bons_row_beats(e16->cols, e16->kind, e16->group); // 128 at cols 2048.
     uint32_t rpc = e16->rows/n_ch;
     engine_fetch((uint32_t)row/rpc,
-                 BONSAI_CHAN_WEIGHT_BASE + (e16->chan_base_beats + (uint64_t)((uint32_t)row % rpc)*rb)*32,
+                 TRIXIUM_CHAN_WEIGHT_BASE + (e16->chan_base_beats + (uint64_t)((uint32_t)row % rpc)*rb)*32,
                  rb, sp_dst);
     // Exponents: 16 per beat, replicated - one beat from channel 0.
-    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + (ee->chan_base_beats + (uint64_t)((uint32_t)row/16))*32,
+    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + (ee->chan_base_beats + (uint64_t)((uint32_t)row/16))*32,
                  1, SP_FET);
     return *(volatile int16_t *)(SCRATCHPAD_BASE + SP_FET + 2*((uint32_t)row % 16));
 }
@@ -1470,7 +1470,7 @@ COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_d
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
     uint32_t rpc = e->rows/n_ch;
     engine_fetch(row/rpc,
-                 BONSAI_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)(row % rpc)*rb)*32,
+                 TRIXIUM_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)(row % rpc)*rb)*32,
                  rb, SP_FET);
     volatile uint8_t *pb = (volatile uint8_t *)(SCRATCHPAD_BASE + SP_FET);
     uint32_t sb = bons_scale_beats(e->cols, e->group);
@@ -1552,7 +1552,7 @@ static int seq_qkr_di_qn = 0, seq_qkr_di_kn = 1;
 // K/V, so behind the store it absorbs the store's ~1k tail that the stop descriptor used
 // to wait out (16 packets at ~65 cycles of write latency each, per-descriptor trace).
 // Same ops, same numerics.
-// qkvx (2026-09-09, BONSAI_SEQ_LUT bitstreams): the K chain (rmsnorm_h, rope_h, pack) and
+// qkvx (2026-09-09, TRIXIUM_SEQ_LUT bitstreams): the K chain (rmsnorm_h, rope_h, pack) and
 // the V pack move INTO the qkv list, under the q projection's stream, in v-k-q order; the
 // qkr list keeps the multi-store and the Q chain. What kept them out was rmsnorm's eps -
 // a per-layer constant scaled by the norm shift the sequencer holds in a kreg - which
@@ -1578,7 +1578,7 @@ static int kv_pipe_active = 0;  // What the built list uses.
 // all from one descriptor. 16 dispatches -> 1 on the list side, 16 per-layer address
 // patches -> 1 on the CPU side - and the qkr window is the one where both sides are the
 // long pole within ~850 cycles of each other (qtrace, v11). Needs the multi-store CSR.
-#ifdef CSR_ENGINE_CSR_REP_ADDR
+#ifdef CSR_TRIXIUM_ENGINE_CSR_REP_ADDR
 static const int kv_mstore = 1;
 #else
 static const int kv_mstore = 0;
@@ -1724,7 +1724,7 @@ static void seq_build_qkr(void)
 // soft-float, and the old int16 memo could not hold the big-eps (very negative es) entries
 // at all. In the main_ram static window (not SRAM .bss: v17's headers left the 8 KiB SRAM
 // under its 4 KiB stack floor), so NOT zero-initialized: infer_static_init() clears it.
-#define eps_memo ((int32_t *)BONSAI_EPS_MEMO_ADDR)
+#define eps_memo ((int32_t *)TRIXIUM_EPS_MEMO_ADDR)
 
 void infer_static_init(void)
 {
@@ -1953,12 +1953,12 @@ static void seq_build_attn(void)
 // FFN block on whichever path ran, plus one layer's fine-grained trace per forward
 // (layer 0): descriptor timestamps for the list path, step timestamps for the op path.
 int fprof_use = 0;
-static uint64_t *const fprof_acc_list = (uint64_t *)(BONSAI_FPROF_BUFFER_ADDR);
-static uint64_t *const fprof_acc_ops = (uint64_t *)(BONSAI_FPROF_BUFFER_ADDR + 32);
+static uint64_t *const fprof_acc_list = (uint64_t *)(TRIXIUM_FPROF_BUFFER_ADDR);
+static uint64_t *const fprof_acc_ops = (uint64_t *)(TRIXIUM_FPROF_BUFFER_ADDR + 32);
 static uint32_t fprof_nlist, fprof_nops;
-static uint32_t *const fprof_ts = (uint32_t *)(BONSAI_FPROF_BUFFER_ADDR + 64);
+static uint32_t *const fprof_ts = (uint32_t *)(TRIXIUM_FPROF_BUFFER_ADDR + 64);
 static int fprof_nts;
-static uint32_t *const fprof_steps = (uint32_t *)(BONSAI_FPROF_BUFFER_ADDR + 128);
+static uint32_t *const fprof_steps = (uint32_t *)(TRIXIUM_FPROF_BUFFER_ADDR + 128);
 static int fprof_nsteps;
 void fprof_reset(void)
 {
@@ -2659,7 +2659,7 @@ embed_done: ;
         // Rope table row for this position ([c14 | s14], Q14, from the image).
         const struct bons_entry *rt = model_entry_kind(ROLE_ROPE_TAB, 0, KIND_NORM16);
         uint32_t rb = (2u*head_dim + 31)/32;
-        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + (rt->chan_base_beats + (uint64_t)pos*rb)*32,
+        engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + (rt->chan_base_beats + (uint64_t)pos*rb)*32,
                      rb, SP_TAB);
         if (likely(seq_use)) {
             perf_enter(OP_SCORES);
@@ -2698,9 +2698,9 @@ embed_done: ;
                 for (int ll = 0; ll < n_layer; ll++) {
                     const struct bons_entry *q = model_entry_kind(ROLE_ATTN_Q_NORM, ll, KIND_NORM16);
                     const struct bons_entry *k = model_entry_kind(ROLE_ATTN_K_NORM, ll, KIND_NORM16);
-                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + q->chan_base_beats*32,
+                    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + q->chan_base_beats*32,
                                  q->chan_len_beats, SP_QNW + (uint32_t)ll*head_dim*2);
-                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + k->chan_base_beats*32,
+                    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + k->chan_base_beats*32,
                                  k->chan_len_beats, SP_KNW + (uint32_t)ll*head_dim*2);
                 }
                 qkn_resident = 1;
@@ -2742,7 +2742,7 @@ embed_done: ;
                 kk2 = (bitlen32(ak) > 14) ? bitlen32(ak) - 14 : 0;
                 kv2 = (bitlen32(av) > 14) ? bitlen32(av) - 14 : 0;
             } else
-#if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
+#if defined(CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR)
             if (op_on_hw(OP_NORM_I32)) {
                 cold_path(); // Dead on the card: the qkv list above runs instead.
                 // Overlap: each norm runs UNDER the next projection's stream. Distinct
@@ -2751,14 +2751,14 @@ embed_done: ;
                 // before the next submit. Same k's, same programs - byte-identical.
                 struct engine_op mo = {0};
                 model_matvec(eqt, SP_X, SP_Y);
-                uint32_t aq = engine_csr_absmax_read();
+                uint32_t aq = trixium_engine_csr_absmax_read();
                 model_matvec_op(ekt, SP_X, SP_Y + 0x4000, &mo);
                 uint32_t dk = engine_submit(&mo);
                 kq = op_norm_i32_sp_a(SP_Y, SP_Q, q_dim, aq, 0);
                 perf_enter(OP_ENGINE_WAIT);
                 engine_join(dk);
                 perf_exit(OP_ENGINE_WAIT);
-                uint32_t ak = engine_csr_absmax_read();
+                uint32_t ak = trixium_engine_csr_absmax_read();
                 model_matvec_op(evt, SP_X, SP_Y + 0x5000, &mo);
                 uint32_t dv = engine_submit(&mo);
                 kk2 = op_norm_i32_sp_a(SP_Y + 0x4000, SP_K, kv_dim, ak, 0);
@@ -2847,7 +2847,7 @@ embed_done: ;
                 }
                 if (!qres) {
                     engine_join(dqn);
-                    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
+                    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
                                  kn16->chan_len_beats, SP_FET2);
                 }
                 if (likely(seq_use && seq_attn_heads >= n_head
@@ -2878,7 +2878,7 @@ embed_done: ;
                 kv_pack_prep_res(l, hh, 0, E_NORM);
                 kv_pack_prep_res(l, hh, 1, ev_res);
             }
-#ifdef CSR_ENGINE_CSR_REP_ADDR
+#ifdef CSR_TRIXIUM_ENGINE_CSR_REP_ADDR
             // The !kv_pipe_active guard was on the #else twin below but not here, so with
             // the in-list NOWAIT stores on (the shipping default) BOTH paths ran and every
             // KV row was written to HBM twice per layer - same bytes to the same addresses,
@@ -2986,7 +2986,7 @@ attn_scores: ;
             // whenever the list holds every head (hh == j); they are re-patched only in
             // the chunked case, where a slot serves several heads.
             int chunked = (seq_attn_heads < n_head);
-#ifdef BONSAI_SP_SB_RSLOT
+#ifdef TRIXIUM_SP_SB_RSLOT
             if (likely(!chunked)) {
                 // C2-2: fold head j while heads j+2.. still execute. The read slot lets
                 // the spill reads grant mid-list; dcount ("descriptors completed")
@@ -3002,7 +3002,7 @@ attn_scores: ;
                 for (int hh = 0; hh < n_head; hh++) {
                     uint32_t ready = attn_fold_ready(hh, n_head), spins = 0;
                     for (;;) {
-                        uint32_t st = seq_status_read();
+                        uint32_t st = trixium_seq_status_read();
                         tprof_dcount(st);
                         if (!(st & 1) || ((st >> 8) >= ready))
                             break;
@@ -3117,7 +3117,7 @@ attn_scores: ;
                     am = vec_run(PROG_REDUCE_ACC, rargs, 4);
                 }
                 if (n_ch == 1)
-                    am = engine_csr_absmax_read(); // AXPY partials tracked too.
+                    am = trixium_engine_csr_absmax_read(); // AXPY partials tracked too.
                 int k2 = 0;
                 k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
                 int32_t nargs[5] = {(int32_t)SP_SC, 0,
@@ -3340,7 +3340,7 @@ attn_heads_done: ;
                 int eg  = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
                 int eu  = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
                 int es8 = (eg + eu + 15)
-                        + quant8_shift((uint32_t)vecunit_res6_read());
+                        + quant8_shift((uint32_t)trixium_vecunit_res6_read());
                 dbg_sum("ffn_g16", l, SP_G, 2*ffn_dim, eg);      // silu(gate)*up, int16
                 dbg_sum("silu_x8", l, SP_X, ffn_dim, es8);
                 perf_enter(OP_NORM_I32);
@@ -3361,13 +3361,13 @@ attn_heads_done: ;
             model_matvec(eg_t, SP_X, SP_Y);
             if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int kg;
-#if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
+#if defined(CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR)
             if (op_on_hw(OP_NORM_I32)) {
                 // Overlap: the up stream runs UNDER the gate norm. Gate absmax is read
                 // BEFORE the submit (the tracker resets on accept); regions are disjoint
                 // (up: SP_X -> SP_YU, norm: SP_Y -> SP_G). Same kg, same program, same
                 // args as the serial order - byte-identical by construction.
-                uint32_t ag = engine_csr_absmax_read();
+                uint32_t ag = trixium_engine_csr_absmax_read();
                 struct engine_op mo = {0};
                 model_matvec_op(eu_t, SP_X, SP_YU, &mo);
                 uint32_t d0 = engine_submit(&mo);
@@ -3445,7 +3445,7 @@ attn_heads_done: ;
             op.kind   = ENGINE_KIND_TERNARY;
             op.rows   = rows;
             op.cols   = head->cols;
-            op.wbase  = BONSAI_CHAN_WEIGHT_BASE + (head->chan_base_beats + (uint64_t)r0*rb)*32;
+            op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + (head->chan_base_beats + (uint64_t)r0*rb)*32;
             op.wlen   = rows*rb;
             op.sbeats = bons_scale_beats(head->cols, head->group);
             op.cbeats = bons_code_beats(head->cols, head->kind);
@@ -3455,10 +3455,10 @@ attn_heads_done: ;
             op.dst    = SP_Y;
             op.supw   = 1;
             engine_run(&op);
-            uint32_t idx = engine_csr_argmax_idx_read();   // grant*rows + row
+            uint32_t idx = trixium_engine_csr_argmax_idx_read();   // grant*rows + row
             uint32_t tok = (idx/rows)*rpc + r0 + idx % rows;
             if (idx != 0xFFFFFF && tok < H->vocab) {
-                cval[nc] = (int32_t)engine_csr_argmax_val_read();
+                cval[nc] = (int32_t)trixium_engine_csr_argmax_val_read();
                 ctok[nc] = (int)tok;
                 nc++;
             }
@@ -3488,7 +3488,7 @@ attn_heads_done: ;
         op.kind   = ENGINE_KIND_TERNARY;
         op.rows   = rpc;
         op.cols   = head->cols;
-        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + head->chan_base_beats*32;
+        op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + head->chan_base_beats*32;
         op.wlen   = rpc*rb;
         op.sbeats = bons_scale_beats(head->cols, head->group);
         op.cbeats = bons_code_beats(head->cols, head->kind);
@@ -3508,7 +3508,7 @@ attn_heads_done: ;
             engine_join(dl);
         } else
         engine_run(&op);
-        uint32_t idx = engine_csr_argmax_idx_read();
+        uint32_t idx = trixium_engine_csr_argmax_idx_read();
         if (idx < H->vocab) {
             perf_exit(OP_LMHEAD);
             if (unlikely(tprof_active))
@@ -3530,7 +3530,7 @@ attn_heads_done: ;
         op.kind   = ENGINE_KIND_TERNARY;
         op.rows   = rows;
         op.cols   = head->cols;
-        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + (head->chan_base_beats + (uint64_t)r0*rb)*32;
+        op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + (head->chan_base_beats + (uint64_t)r0*rb)*32;
         op.wlen   = rows*rb;
         op.sbeats = bons_scale_beats(head->cols, head->group);
         op.cbeats = bons_code_beats(head->cols, head->kind);
@@ -3576,14 +3576,14 @@ int infer_init(void)
                (unsigned long)H->version, BONS_VERSION);                    // would be misread.
         return -2;
     }
-#ifdef BONSAI_N_CHANNELS
-    if (H->n_channels != BONSAI_N_CHANNELS) {
+#ifdef TRIXIUM_N_CHANNELS
+    if (H->n_channels != TRIXIUM_N_CHANNELS) {
         printf("infer: image channels (%lu) != engine channels (%u)\n",
-               (unsigned long)H->n_channels, BONSAI_N_CHANNELS);
+               (unsigned long)H->n_channels, TRIXIUM_N_CHANNELS);
         return -3;
     }
 #endif
-#if BONSAI_PROGS_VREGS >= 16
+#if TRIXIUM_PROGS_VREGS >= 16
     // The x2-unrolled programs walk two beats per iteration and have no odd tail:
     // silu_q8 needs an even ffn_dim/16; rmsnorm_h and kvpack_h an even head_dim/16;
     // rope_h an even head_dim/32 (its loop is the half-span).
@@ -3671,7 +3671,7 @@ int infer_init(void)
             const struct bons_entry *e = model_entry(norms[i].role, l);
             if (!e) return -2;
             float *dst = halloc(norms[i].n*sizeof(float));
-            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32,
+            engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32,
                          e->chan_len_beats, SP_FET);
             volatile float *p = (volatile float *)(SCRATCHPAD_BASE + SP_FET);
             for (int j = 0; j < norms[i].n; j++) dst[j] = p[j];
@@ -3680,7 +3680,7 @@ int infer_init(void)
     }
     const struct bons_entry *e = model_entry(ROLE_OUT_NORM, 0);
     out_norm = halloc(n_embd*sizeof(float));
-    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32, e->chan_len_beats, SP_FET);
+    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32, e->chan_len_beats, SP_FET);
     volatile float *p = (volatile float *)(SCRATCHPAD_BASE + SP_FET);
     for (int j = 0; j < n_embd; j++) out_norm[j] = p[j];
 
@@ -3702,7 +3702,7 @@ int infer_init(void)
     // and keeps the full context.
     cpu_kv_ctx = (max_ctx < CPU_KV_CTX) ? max_ctx : CPU_KV_CTX;
     // KV region: above the per-channel weight payload, 4 KB aligned.
-    kv_base   = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
+    kv_base   = (uint32_t)((TRIXIUM_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
     kv_rb     = 1 + head_dim/32; // One scale beat + code beats (cols = head_dim, Q8).
     kv_region = (uint32_t)((max_ctx + n_ch - 1)/n_ch)*kv_rb;
     // A channel window that lies inside main_ram (the FK33's channel 3, in PC 4): its
@@ -3712,7 +3712,7 @@ int infer_init(void)
     // channel qualifies and the high heap keeps its fixed base.
     {
         uint64_t top = 0;   // Engine-side.
-        const uint64_t ram_lo = BONSAI_MEM_CPU_OFFSET, ram_hi = ram_lo + MAIN_RAM_SIZE;
+        const uint64_t ram_lo = TRIXIUM_MEM_CPU_OFFSET, ram_hi = ram_lo + MAIN_RAM_SIZE;
         for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
             if (!chan_on_cpu_memory(c)) continue;
             uint64_t win  = chan_window(c);
@@ -3778,8 +3778,8 @@ int infer_init(void)
         uint64_t lo_win  = 0;   // Engine-side start of the lowest window inside main_ram.
         for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
             uint64_t win = chan_window(c);
-            if (chan_on_cpu_memory(c) && win >= BONSAI_MEM_CPU_OFFSET
-                && win < BONSAI_MEM_CPU_OFFSET + MAIN_RAM_SIZE && (!lo_win || win < lo_win))
+            if (chan_on_cpu_memory(c) && win >= TRIXIUM_MEM_CPU_OFFSET
+                && win < TRIXIUM_MEM_CPU_OFFSET + MAIN_RAM_SIZE && (!lo_win || win < lo_win))
                 lo_win = win;
         }
         uint32_t lo_room = lo_win ? cpu_addr_of(lo_win) - (uint32_t)HEAP_BASE : 0xFFFFFFFFu;

@@ -47,7 +47,7 @@ def encoder(tmp_path_factory):
         pytest.skip('C compiler required')
     library = tmp_path_factory.mktemp('sequence-host') / 'sequence.so'
     result = subprocess.run([cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
-        '-shared', '-fPIC', str(LIB / 'bonsai_sequence.c'), '-o', str(library)],
+        '-shared', '-fPIC', str(LIB / 'trixium_sequence.c'), '-o', str(library)],
         capture_output=True, text=True)
     assert result.returncode == 0, result.stdout+result.stderr
     lib = ct.CDLL(str(library))
@@ -204,7 +204,7 @@ def test_descriptor_library_cross_compiles_without_target_headers(tmp_path, targ
         pytest.skip(target+' compiler unavailable')
     flags = ['-march=rv32ima', '-mabi=ilp32', '-std=c11', '-ffreestanding'] if target == 'rv32' else ['-x', 'c++', '-std=c++17']
     result = subprocess.run([cc, *flags, '-O2', '-Wall', '-Wextra', '-Werror', '-c',
-        str(LIB / 'bonsai_sequence.c'), '-o', str(tmp_path / 'sequence.o')], capture_output=True, text=True)
+        str(LIB / 'trixium_sequence.c'), '-o', str(tmp_path / 'sequence.o')], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout+result.stderr
 
 

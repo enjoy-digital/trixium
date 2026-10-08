@@ -58,12 +58,12 @@ analyzer.csv
 firmware/*.d
 firmware/*.elf
 firmware/*.elf.map
-firmware/bonsai.bin
+firmware/trixium.bin
 
 # Host tool binaries (build with: make -C trixium/software/user BUILD_DIR=<build tree>).
-trixium/software/user/bonsai_util
-trixium/software/user/bonsai_load
-trixium/software/user/bonsai_chat
+trixium/software/user/trixium_util
+trixium/software/user/trixium_load
+trixium/software/user/trixium_chat
 trixium/software/user/*.d
 trixium/software/user/*.o
 trixium/software/user/liblitepcie/*.d
@@ -92,3 +92,8 @@ trixium/software/user/.build_config
 # sbt/VexiiRiscv generation leftovers
 /target/
 /project/
+
+# Per-build generated headers (copied from build/<name>/driver/kernel/ by the bring-up scripts).
+trixium/software/kernel/csr.h
+trixium/software/kernel/soc.h
+trixium/software/kernel/mem.h

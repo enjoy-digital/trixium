@@ -20,24 +20,24 @@
 #include "bons.h"
 #include "ddr.h"
 
-#ifdef BONSAI_N_MEMCTRL
+#ifdef TRIXIUM_N_MEMCTRL
 // ddr.c reaches controller k's registers as controller 0's shifted by k*STRIDE: the target
 // pins the (sdram, ddrphy) CSR pairs to consecutive pages, and this is where that is checked.
 // (The PHY model of the Verilator sim has no CSRs, hence the ddrphy guards.)
-_Static_assert(CSR_SDRAM1_BASE - CSR_SDRAM_BASE == BONSAI_DDR_CSR_STRIDE, "sdram1 CSR page");
+_Static_assert(CSR_SDRAM1_BASE - CSR_SDRAM_BASE == TRIXIUM_DDR_CSR_STRIDE, "sdram1 CSR page");
 #ifdef CSR_DDRPHY_BASE
-_Static_assert(CSR_DDRPHY1_BASE - CSR_DDRPHY_BASE == BONSAI_DDR_CSR_STRIDE, "ddrphy1 CSR page");
+_Static_assert(CSR_DDRPHY1_BASE - CSR_DDRPHY_BASE == TRIXIUM_DDR_CSR_STRIDE, "ddrphy1 CSR page");
 #endif
-#if BONSAI_N_MEMCTRL > 2
-_Static_assert(CSR_SDRAM2_BASE - CSR_SDRAM_BASE == 2*BONSAI_DDR_CSR_STRIDE, "sdram2 CSR page");
+#if TRIXIUM_N_MEMCTRL > 2
+_Static_assert(CSR_SDRAM2_BASE - CSR_SDRAM_BASE == 2*TRIXIUM_DDR_CSR_STRIDE, "sdram2 CSR page");
 #ifdef CSR_DDRPHY_BASE
-_Static_assert(CSR_DDRPHY2_BASE - CSR_DDRPHY_BASE == 2*BONSAI_DDR_CSR_STRIDE, "ddrphy2 CSR page");
+_Static_assert(CSR_DDRPHY2_BASE - CSR_DDRPHY_BASE == 2*TRIXIUM_DDR_CSR_STRIDE, "ddrphy2 CSR page");
 #endif
 #endif
-#if BONSAI_N_MEMCTRL > 3
-_Static_assert(CSR_SDRAM3_BASE - CSR_SDRAM_BASE == 3*BONSAI_DDR_CSR_STRIDE, "sdram3 CSR page");
+#if TRIXIUM_N_MEMCTRL > 3
+_Static_assert(CSR_SDRAM3_BASE - CSR_SDRAM_BASE == 3*TRIXIUM_DDR_CSR_STRIDE, "sdram3 CSR page");
 #ifdef CSR_DDRPHY_BASE
-_Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "ddrphy3 CSR page");
+_Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*TRIXIUM_DDR_CSR_STRIDE, "ddrphy3 CSR page");
 #endif
 #endif
 #endif
@@ -61,7 +61,7 @@ _Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*BONSAI_DDR_CSR_STRIDE, "d
 static char *readstr(void)
 {
     char c[2];
-    char *const s = (char *)BONSAI_CONSOLE_LINE_ADDR;
+    char *const s = (char *)TRIXIUM_CONSOLE_LINE_ADDR;
     static int ptr = 0;
 
     if (readchar_nonblock()) {
@@ -82,7 +82,7 @@ static char *readstr(void)
             ptr = 0;
             return s;
         default:
-            if (ptr >= BONSAI_CONSOLE_LINE_SIZE - 1)
+            if (ptr >= TRIXIUM_CONSOLE_LINE_SIZE - 1)
                 break;
             fputs(c, stdout);
             s[ptr] = c[0];
@@ -147,9 +147,9 @@ static void help(void)
     puts("TriXium firmware");
     puts("help            - this message");
     puts("info            - model info (BONS header)");
-    puts("hdrload         - copy BONS header+table staged by bonsai_load to CPU memory");
+    puts("hdrload         - copy BONS header+table staged by trixium_load to CPU memory");
     puts("sptest          - scratchpad bus read/write test");
-#ifdef BONSAI_N_MEMCTRL
+#ifdef TRIXIUM_N_MEMCTRL
     puts("ddrinit [k]     - re-init DDR4 controller k (default: 1..N-1, as at boot)");
     puts("ddrtest [c]     - engine store/fetch round trip through channel c's window (all)");
 #endif
@@ -275,11 +275,11 @@ static void bench_cmd(char *args)
 
 static int gen_emit_to_pbuf;
 // Chunked prompt buffer (tok/genb) - main_ram static window, not .bss (sram is tight;
-// see firmware/linker.ld). BONSAI_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000)
+// see firmware/linker.ld). TRIXIUM_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000)
 // and ek_undo (+0x90000); the heap starts at +0x100000. Sized to the KV budget (the image's
 // max_ctx, 2048 for the 1.7B): a conversation can use the whole context.
 #define PBUF_N 2048
-static int *const pbuf = (int *)(BONSAI_HDR_ADDR + 0xA0000); // [PBUF_N]
+static int *const pbuf = (int *)(TRIXIUM_HDR_ADDR + 0xA0000); // [PBUF_N]
 static int pbuf_n;
 static int      pbuf_kv;      // pbuf[0..pbuf_kv) are in the KV cache (from the last genb)...
 static uint32_t pbuf_serial;  // ...as long as no other generation ran since.
@@ -292,11 +292,11 @@ static void emit_token(int tok)
 }
 
 // Copy the BONS header+table from the HBM staging area (engine channel 0, uploaded there by
-// bonsai_load) into the CPU-visible header location, then re-init inference.
-#define HDR_STAGING (BONSAI_CHAN_WEIGHT_BASE - 0x100000)
-// The staged copy (channel 0, uploaded with every image by bonsai_load) is the truth about
+// trixium_load) into the CPU-visible header location, then re-init inference.
+#define HDR_STAGING (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
+// The staged copy (channel 0, uploaded with every image by trixium_load) is the truth about
 // what is in HBM; the main_ram copy is derived from it. The boot used to trust main_ram: a
-// CPU reset after `bonsai_load` of a DIFFERENT model then ran the boot demo with the
+// CPU reset after `trixium_load` of a DIFFERENT model then ran the boot demo with the
 // previous model's tables - the 1.7B's KV addresses, which on the 8B point into layer 18's
 // weights - and the two demo tokens overwrote them (2026-09-18: mvtest of blk.18.attn_v
 // wrong until re-uploaded, the corruption starting exactly at the 1.7B's kv_base). Now the
@@ -311,12 +311,12 @@ static int hdrload_staged(int quiet)
         if (!quiet)
             printf("hdrload: no BONS header at staging (magic %08lx)\n",
                    (unsigned long)sh->magic);
-        // Staging cleared by the host (bonsai_chat -C writes this marker before a board
+        // Staging cleared by the host (trixium_chat -C writes this marker before a board
         // boot): a header left in main_ram by an earlier session describes weights that are
         // not there - the boot demo then streamed them from controllers not yet trained and
         // the engine stalled (v22 restore, 2026-10-02). The simulation stages nothing and
         // keeps the header it preloaded into main_ram.
-        struct bons_header *mh = (struct bons_header *)BONSAI_HDR_ADDR;
+        struct bons_header *mh = (struct bons_header *)TRIXIUM_HDR_ADDR;
         if (sh->magic == BONS_STAGING_CLEARED && mh->magic == BONS_MAGIC) {
             mh->magic = 0;
             model_cache_reset();
@@ -334,7 +334,7 @@ static int hdrload_staged(int quiet)
         && mh->n_layer == sh->n_layer && mh->table_crc32 == sh->table_crc32)
         return 0;                              // main_ram already holds this image's header
     uint32_t bytes = sh->payload_offset;
-    uint8_t *dst   = (uint8_t *)BONSAI_HDR_ADDR;
+    uint8_t *dst   = (uint8_t *)TRIXIUM_HDR_ADDR;
     uint32_t off   = 0;
     while (off < bytes) {
         uint32_t chunk = bytes - off > 0x10000 ? 0x10000 : bytes - off; // 64 KB chunks.
@@ -516,7 +516,7 @@ static void genb_cmd(char *args)
 
 static void gen_cmd(char *args)
 {
-    int *const prompt = (int *)BONSAI_CONSOLE_PROMPT_ADDR;
+    int *const prompt = (int *)TRIXIUM_CONSOLE_PROMPT_ADDR;
     char *tok = get_token(&args);
     int n = parse_int(tok);
     int np = 0;
@@ -583,7 +583,7 @@ static void selftest(void)
     printf("MATVEC CSUM=%08lx\n", (unsigned long)csum);
 
     // 2. Fetch the first 8 beats of channel 0's payload into the scratchpad.
-    engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32, 8, 0xC000);
+    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32, 8, 0xC000);
     csum = fnv1a((volatile uint8_t *)(SCRATCHPAD_BASE + 0xC000), 8*32);
     printf("FETCH CSUM=%08lx\n", (unsigned long)csum);
 
@@ -640,7 +640,7 @@ static void console_service(void)
         infer_attn_chunk(parse_int(str));
     else if (strcmp(token, "engreset") == 0)
         engine_recover();
-#ifdef BONSAI_N_MEMCTRL
+#ifdef TRIXIUM_N_MEMCTRL
     else if (strcmp(token, "ddrinit") == 0) {
         char *arg = get_token(&str);
         if (arg && *arg) ddr_init(parse_int(arg)); else ddr_init_all();
@@ -758,7 +758,7 @@ static void console_service(void)
         hdrload();
     else if (strlen(token))
         puts("unknown command");
-    printf("bonsai> ");
+    printf("trixium> ");
 }
 
 int main(void)
@@ -773,7 +773,7 @@ int main(void)
     vec_init();
 
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
-#ifdef BONSAI_N_MEMCTRL
+#ifdef TRIXIUM_N_MEMCTRL
     // The BIOS brought up controller 0 (main_ram); the other DDR4 controllers carry
     // the engine channels' weights and have no BIOS support: init them here, then prove
     // every channel's window with the path the weights take (ddr.c).
@@ -909,8 +909,8 @@ int main(void)
     }
 boot_demo_done:
     hwops_init(); // Leave the shell on the fast path, not on the debug fallbacks.
-    puts("BONSAI-READY");
-    printf("bonsai> ");
+    puts("TRIXIUM-READY");
+    printf("trixium> ");
 
     while (1) {
         console_service();

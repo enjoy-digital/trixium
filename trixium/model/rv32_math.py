@@ -141,7 +141,7 @@ def silu_rv32(values):
     return result
 
 
-# Canonical sigmoid (firmware/fastmath.h bonsai_sigmoid_*): the SiLU lookup's form on a
+# Canonical sigmoid (firmware/fastmath.h trixium_sigmoid_*): the SiLU lookup's form on a
 # sigmoid table; table and tails from the bounded exp, never libm expf.
 def sigmoid_point(x):
     return f32(f32(1)/f32(f32(1) + expf_bounded(-f32(x))))
@@ -160,7 +160,7 @@ def sigmoid_tail(x):
 
 
 def softmax_exp_rv32(values):
-    """Canonical softmax exp (firmware/fastmath.h bonsai_softmax_exp): the bounded exp on
+    """Canonical softmax exp (firmware/fastmath.h trixium_softmax_exp): the bounded exp on
     [-80, 0], +0 below, NaN through as the canonical NaN."""
     values = np.asarray(values, dtype=f32)
     out = np.empty_like(values)

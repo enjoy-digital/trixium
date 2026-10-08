@@ -3,9 +3,9 @@
  * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
  * SPDX-License-Identifier: BSD-2-Clause
  *
- * bonsai_chat: one-stop host tool - configure the accelerator, then talk to the model.
+ * trixium_chat: one-stop host tool - configure the accelerator, then talk to the model.
  *
- *   1. (-m) upload a BONS weight image to HBM over the PCIe DMA (same path as bonsai_load)
+ *   1. (-m) upload a BONS weight image to HBM over the PCIe DMA (same path as trixium_load)
  *   2. (-k) boot the firmware over the LiteX serial-boot protocol on the console UART
  *   3.      `hdrload` so the firmware picks up the staged BONS header/table
  *   4.      REPL: your text -> BPE ids -> `tok`/`genb` -> ids back -> text
@@ -15,10 +15,10 @@
  * merge ranks), so no JSON or unicode tables are needed here.
  *
  * Usage:
- *   bonsai_chat -T                                   # tokeniser self-test, no hardware
- *   bonsai_chat -m models/bons/bonsai-1p7b-n8.img \
- *               -k firmware/bonsai.bin               # full bring-up, then chat
- *   bonsai_chat                                      # attach to an already-configured card
+ *   trixium_chat -T                                   # tokeniser self-test, no hardware
+ *   trixium_chat -m models/bons/bonsai-1p7b-n8.img \
+ *               -k firmware/trixium.bin               # full bring-up, then chat
+ *   trixium_chat                                      # attach to an already-configured card
  */
 
 #include <ctype.h>
@@ -38,7 +38,7 @@
 #include "liblitepcie.h"
 #include "soc.h"
 #include "mem.h"
-#include "bonsai_loader.h"
+#include "trixium_loader.h"
 
 /* Firmware load/jump address: the BIOS serialboot target is main_ram (HBM channel 0 on
  * hardware). ROM_BOOT_ADDRESS only exists in the simulation SoC. */
@@ -46,7 +46,7 @@
 #define ROM_BOOT_ADDRESS MAIN_RAM_BASE
 #endif
 
-#define HDR_STAGING  (BONSAI_CHAN_WEIGHT_BASE - 0x100000)
+#define HDR_STAGING  (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
 #define DMA_CHUNK    8192
 #define PAD(b)       (((uint64_t)(b) + DMA_CHUNK - 1) & ~(uint64_t)(DMA_CHUNK - 1))
 
@@ -367,10 +367,10 @@ static int tty_open(const char *path)
     int fd = open(path, O_RDWR | O_NOCTTY);
     if (fd < 0) { perror(path); return -1; }
     /* One console session at a time: the firmware reads one byte stream, and two readers
-     * split its replies between them (an idle bonsai_chat left at its prompt did exactly
+     * split its replies between them (an idle trixium_chat left at its prompt did exactly
      * that, 2026-09-14). Advisory lock, shared by every console tool. */
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
-        fprintf(stderr, "%s is in use by another console session (bonsai_chat, pcie_console.py, "
+        fprintf(stderr, "%s is in use by another console session (trixium_chat, pcie_console.py, "
                         "the Python client, litex_term?) - close it first\n", path);
         close(fd);
         return -1;
@@ -506,7 +506,7 @@ static int serialboot(const char *fw)
 }
 
 /*---------------------------------------------------------------------------------------*/
-/* Weight upload and firmware boot, through the shared loader (bonsai_loader.c)            */
+/* Weight upload and firmware boot, through the shared loader (trixium_loader.c)            */
 /*---------------------------------------------------------------------------------------*/
 
 static int upload_model(int devnum, const char *path)
@@ -773,7 +773,7 @@ static int self_test(const char *tests_path)
 
 static void usage(void)
 {
-    printf("usage: bonsai_chat [options]\n"
+    printf("usage: trixium_chat [options]\n"
            "  -c N       PCIe device number (default 0)\n"
            "  -t TTY     console tty (default /dev/ttyLXU0)\n"
            "  -m IMAGE   upload a BONS weight image to HBM first\n"
@@ -870,10 +870,10 @@ int main(int argc, char **argv)
      * and waiting too briefly reports "firmware not running" for a board that is merely
      * busy, eating the startup log on the way out. */
     send_line("");
-    if (!tty_expect("bonsai>", g_prompt_wait, NULL, 0, 1)) { /* echo: show the self-tests as they run */
+    if (!tty_expect("trixium>", g_prompt_wait, NULL, 0, 1)) { /* echo: show the self-tests as they run */
         fprintf(stderr,
-            "no 'bonsai>' prompt on %s after %.0f s (-W to wait longer).\n"
-            "  - firmware not running? re-run with -k firmware/bonsai.bin\n"
+            "no 'trixium>' prompt on %s after %.0f s (-W to wait longer).\n"
+            "  - firmware not running? re-run with -k firmware/trixium.bin\n"
             "  - self-test wedged? watch the console directly and look for ENGSTALL\n"
             "  - wrong console? try -t /dev/ttyLXU0 (PCIe) or use litex_term crossover\n", tty, g_prompt_wait);
         return 1;
@@ -881,14 +881,14 @@ int main(int argc, char **argv)
     printf("[init] firmware is up; loading the model header\n");
     send_line("hdrload");
     char cap[4096];
-    tty_expect("bonsai>", 30.0, cap, sizeof(cap), 0);
+    tty_expect("trixium>", 30.0, cap, sizeof(cap), 0);
     if (strstr(cap, "inference ready") == NULL)
         fprintf(stderr, "[warn] hdrload did not report 'inference ready':\n%s\n", cap);
     if (g_tok_sha_ok) {
         /* The image header carries the converter's tokenizer hash; a mismatch means the
          * ids sent and the ids the model was converted with do not agree. */
         send_line("info");
-        tty_expect("bonsai>", 10.0, cap, sizeof(cap), 0);
+        tty_expect("trixium>", 10.0, cap, sizeof(cap), 0);
         char *p = strstr(cap, "tokenizer sha256 ");
         char hex[65];
         for (int i = 0; i < 32; i++) sprintf(hex + 2*i, "%02x", g_tok_sha[i]);
@@ -911,7 +911,7 @@ int main(int argc, char **argv)
         if (sampling) sscanf(sampling, "%lf,%lf,%lf", &t, &pp, &r);
         send_line("sample %d %d %d %u", (int)(t*1000 + 0.5), (int)(pp*1000 + 0.5),
                   (int)(r*1000 + 0.5), seed);
-        tty_expect("bonsai>", 5.0, cap, sizeof(cap), 0);
+        tty_expect("trixium>", 5.0, cap, sizeof(cap), 0);
         char *nl = strchr(cap, '\n');
         printf("[init] %s", nl ? nl + 1 : cap);
     }
@@ -952,7 +952,7 @@ int main(int argc, char **argv)
             /* A firmware console command, its output echoed until the next prompt. */
             char cap[8192];
             send_line("%s", linebuf + 5);
-            if (tty_expect("bonsai>", 30.0, cap, sizeof(cap), 0)) {
+            if (tty_expect("trixium>", 30.0, cap, sizeof(cap), 0)) {
                 char *nl = strchr(cap, '\n');            /* Drop the echoed command line. */
                 fputs(nl ? nl + 1 : cap, stdout);
             } else
@@ -965,7 +965,7 @@ int main(int argc, char **argv)
                 printf("[usage: /sample temp,top_p,rep  e.g. /sample 0.7,0.9,1.1]\n"); continue;
             }
             send_line("sample %d %d %d 0", (int)(t*1000 + 0.5), (int)(pp*1000 + 0.5), (int)(r*1000 + 0.5));
-            if (tty_expect("bonsai>", 5.0, cap, sizeof(cap), 0)) {
+            if (tty_expect("trixium>", 5.0, cap, sizeof(cap), 0)) {
                 char *nl = strchr(cap, '\n');
                 fputs(nl ? nl + 1 : cap, stdout);
             }
@@ -1011,7 +1011,7 @@ int main(int argc, char **argv)
         double rate = (ng > 1 && dt > first_dt) ? (ng - 1)/(dt - first_dt) : 0.0;
         printf("\n     [%d tokens in %.1f s: first after %.2f s, then %.1f tok/s%s]\n\n",
                ng, dt, first_dt, rate, prev_closed || !g_chat ? "" : ", cut by -n");
-        tty_expect("bonsai>", 5.0, NULL, 0, 0);
+        tty_expect("trixium>", 5.0, NULL, 0, 0);
     }
     free(linebuf);
     close(g_tty);

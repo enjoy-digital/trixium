@@ -8,7 +8,7 @@ import pytest
 from migen import C, Cat, Signal, run_simulation
 from migen.fhdl import verilog
 
-from trixium.core.core import BonsaiClusterConfig
+from trixium.core.core import TriXiumConfig
 from trixium.model.hadamard import scratchpad_rotation_descriptor
 from test_hadamard import dense, packed, unpacked
 from test_integration import SoC, write
@@ -25,7 +25,7 @@ def install_list(dut, descriptors):
 
 
 def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports():
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
     rng = random.Random(941)
     values = [rng.randrange(-128, 128) for _ in range(1024)]
     signs = [rng.choice([-1, 1]) for _ in values]
@@ -68,7 +68,7 @@ def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports():
 @pytest.mark.parametrize('field,value,error', [(1, 1 << 24, 2), (4, 65536, 2),
     (6, 2, 2), (7, 1, 2), (15, 1, 2), (3, 0, 4), (5, 0, 4), (1, 0x801, 1 << 8)])
 def test_sequenced_rotation_invalid_descriptor_is_not_completed(field, value, error):
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
     words = scratchpad_rotation_descriptor(src=0x800, signs=0x600, dst=0x2000, stats=0x700, blocks=1)
     words[field] = value
     def run():
@@ -90,8 +90,8 @@ def test_sequenced_rotation_invalid_descriptor_is_not_completed(field, value, er
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
 def test_rotation_profile_checks_whole_descriptor_list_before_fetch(base, count):
-    from trixium.core.sequencer import BonsaiSequencer
-    dut = BonsaiSequencer(with_hadamard=True, scratchpad_size=16*1024)
+    from trixium.core.sequencer import Sequencer
+    dut = Sequencer(with_hadamard=True, scratchpad_size=16*1024)
     def run():
         yield from write(dut.base, base)
         yield from write(dut.count, count)
@@ -104,7 +104,7 @@ def test_rotation_profile_checks_whole_descriptor_list_before_fetch(base, count)
 
 
 def test_rotation_descriptor_encoding_and_configuration():
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.sequencer import Sequencer
     assert scratchpad_rotation_descriptor(src=32, signs=64, dst=96, stats=128, blocks=17, inverse=True) == [3, 32, 64, 96, 17, 128, 1] + [0]*9
     for changed in ({'src': 1}, {'signs': -32}, {'dst': 1 << 24}, {'stats': 7}, {'blocks': 0}, {'blocks': 65536}, {'inverse': 2}):
         args = dict(src=32, signs=64, dst=96, stats=128, blocks=1)
@@ -112,20 +112,20 @@ def test_rotation_descriptor_encoding_and_configuration():
         with pytest.raises(ValueError):
             scratchpad_rotation_descriptor(**args)
     with pytest.raises(ValueError):
-        BonsaiClusterConfig(with_hadamard=True, with_vecunit=False)
+        TriXiumConfig(with_hadamard=True, with_vecunit=False)
     with pytest.raises(ValueError):
-        BonsaiClusterConfig(with_hadamard=True, scratchpad_size=512*1024)
+        TriXiumConfig(with_hadamard=True, scratchpad_size=512*1024)
     for size in (0, 31, 33, 256*1024 + 32):
         with pytest.raises(ValueError):
-            BonsaiSequencer(with_hadamard=True, scratchpad_size=size)
+            Sequencer(with_hadamard=True, scratchpad_size=size)
 
 
 def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone(tmp_path):
     verilator = shutil.which('verilator')
     if not verilator:
         pytest.skip('Verilator required for compiled full-vector scratchpad check')
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True), n=1)
-    bus = dut.scratchpad.add_wishbone_port()
+    dut = SoC(TriXiumConfig(with_hadamard=True), n=1)
+    bus = dut.bus
     # A bare RTL fixture has no CSRBank finalization to assemble fielded status.
     # Export the real driven fields, not CSRStatus.status (otherwise an input).
     status = Signal(24)
@@ -161,7 +161,7 @@ def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone(tmp_p
 def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
     """w0[9] on a unit (OVERLAP): the rotation dispatches while the NOWAIT fetch is still
     streaming into another region; both results exact, the list end drains the fetch."""
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
     rng = random.Random(942)
     values = [rng.randrange(-128, 128) for _ in range(1024)]
     signs = [rng.choice([-1, 1]) for _ in values]
@@ -201,7 +201,7 @@ def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
 
 
 def test_without_overlap_the_rotation_waits_for_the_nowait_fetch():
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
     fetch = [1 | (1 << 9), 2, 0, 0, 0x100, 160, 0, 0, 0, 0x4000, 0] + [0]*5
     rotation = scratchpad_rotation_descriptor(src=0x800, signs=0x600, dst=0x2000, stats=0x700, blocks=1)
 

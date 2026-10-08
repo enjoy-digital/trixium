@@ -22,11 +22,11 @@ from litex.soc.interconnect.axi import AXIInterface
 from trixium import layout
 from trixium.model import bitexact as bx
 from trixium.model.bons import TensorSpec, encode_rows
-from trixium.core.scratchpad import BonsaiScratchpad
-from trixium.core.engine import BonsaiMatVecEngine
-from trixium.memory.loader import BonsaiHBMLoader
-from trixium.core.reset import BonsaiEngineResetDomain
-from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.core.scratchpad import Scratchpad
+from trixium.core.engine import MatVecEngine
+from trixium.memory.loader import Loader
+from trixium.core.reset import EngineResetDomain
+from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 
 def test_compiled_system_reset_reaches_registered_engine_domain(tmp_path):
@@ -36,7 +36,7 @@ def test_compiled_system_reset_reaches_registered_engine_domain(tmp_path):
         pytest.skip('Verilator required to check generated reset priority')
     dut = Module()
     axi = AXIInterface(data_width=256, address_width=33, id_width=4)
-    dut.submodules.domain = domain = BonsaiEngineResetDomain([axi], hold_cycles=8)
+    dut.submodules.domain = domain = EngineResetDomain([axi], hold_cycles=8)
     counter, load, value, enable = Signal(32, reset=0x1234), Signal(), Signal(32), Signal()
     dut.sync.eng += If(load, counter.eq(value)).Elif(enable, counter.eq(counter+1))
     ports = dict(counter=counter, load=load, value=value, enable=enable,
@@ -60,11 +60,11 @@ class _DUT(LiteXModule):
     def __init__(self, n_channels, chan_payloads, sp_init):
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
-        self.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
-        self.engrst = BonsaiEngineResetDomain(axis, hold_cycles=16, stuck_cycles=4000)
+        self.scratchpad = Scratchpad(size=64*1024, init=sp_init)
+        self.engrst = EngineResetDomain(axis, hold_cycles=16, stuck_cycles=4000)
         self.engine = ClockDomainsRenamer("eng")(
-            BonsaiMatVecEngine(self.scratchpad, self.engrst.masters))
-        self.loader = ClockDomainsRenamer("eng")(BonsaiHBMLoader(self.engrst.masters))
+            MatVecEngine(self.scratchpad, self.engrst.masters))
+        self.loader = ClockDomainsRenamer("eng")(Loader(self.engrst.masters))
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
             self.engine.store_data.connect(self.loader.store_data),
@@ -72,7 +72,7 @@ class _DUT(LiteXModule):
         ]
         self.models = []
         for i, axi in enumerate(axis):
-            m = BonsaiHBMChannelModel(axi, size=64*1024, init=words_from_bytes(chan_payloads[i]),
+            m = HBMChannelModel(axi, size=64*1024, init=words_from_bytes(chan_payloads[i]),
                                       latency=6)
             setattr(self, f"model{i}", m)
             self.models.append(m)

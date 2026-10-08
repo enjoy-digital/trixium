@@ -2,7 +2,7 @@
 """Bit-level model of the hardware SiLU-multiply kernel, and its exactness contract.
 
 The firmware's hybrid path computes `dst[i] = mul[i] * siluf(gate[i])` (hybrid.c
-silu_mul_fv; fastmath.h bonsai_silu_lookup): for -16 < g < 16
+silu_mul_fv; fastmath.h trixium_silu_lookup): for -16 < g < 16
 
     u = (g + 16) * 128          FP32 add (RNE), then an exact power-of-two scale
     i = (int)u                  truncation; u >= 0

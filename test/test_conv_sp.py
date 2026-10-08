@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: BSD-2-Clause
-"""BonsaiConvScratchpad (unit 13) against hybrid.c's 4-tap causal conv, compiled."""
+"""ConvScratchpad (unit 13) against hybrid.c's 4-tap causal conv, compiled."""
 import numpy as np
 import pytest
 
-from trixium.units.conv import CONV_COMMAND, BonsaiConvScratchpad
+from trixium.units.conv import CONV_COMMAND, ConvScratchpad
 from rtl_client import build_client, run_client
 
 f32 = np.float32
@@ -41,7 +41,7 @@ def command(x0, x1, x2, x3, w, dst, channels, **extra):
 
 @pytest.fixture(scope="module")
 def binary(tmp_path_factory):
-    return build_client(BonsaiConvScratchpad(SIZE), CONV_COMMAND, tmp_path_factory.mktemp("conv"), "conv_sp")
+    return build_client(ConvScratchpad(SIZE), CONV_COMMAND, tmp_path_factory.mktemp("conv"), "conv_sp")
 
 
 def test_compiled_conv_equals_the_firmware(tmp_path, binary):

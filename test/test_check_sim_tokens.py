@@ -19,9 +19,9 @@ def test_explicitly_scoped_diagnostic():
 
 def test_interactive_generations_do_not_replace_boot_legs():
     boot = GEN + HW
-    assert parse_legs(boot + "BONSAI-READY\nGEN: 143\nGEN DONE\n") == parse_legs(boot)
+    assert parse_legs(boot + "TRIXIUM-READY\nGEN: 143\nGEN DONE\n") == parse_legs(boot)
     with pytest.raises(ValueError):
-        parse_legs(GEN + "BONSAI-READY\n" + HW)
+        parse_legs(GEN + "TRIXIUM-READY\n" + HW)
 
 
 @pytest.mark.parametrize("required", [[], ["GEN", "GEN"], ["unknown"]])

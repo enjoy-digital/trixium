@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiEngineCSR: CSR front-end for the matvec engine (hybrid CPU/host control).
+"""EngineCSR: CSR front-end for the matvec engine (hybrid CPU/host control).
 
 The phase-1 sequencing model: software (VexRiscv firmware over the SoC bus, or the host over
 the PCIe BAR0 bridge - the exact same registers) programs one op at a time and polls `done`.
@@ -20,9 +20,9 @@ from litex.gen import *
 
 from litex.soc.interconnect.csr import *
 
-# BonsaiEngineCSR ----------------------------------------------------------------------------------
+# EngineCSR ----------------------------------------------------------------------------------
 
-class BonsaiEngineCSR(LiteXModule):
+class EngineCSR(LiteXModule):
     def __init__(self, engine, seq=None):
         self.kind    = CSRStorage(3,  description="Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
         self.rows    = CSRStorage(16, description="Rows per channel.")

@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 from migen import Memory, Module, run_simulation
 
-from trixium.core.core import BonsaiClusterConfig
-from trixium.core.sequencer import BonsaiSequencer
+from trixium.core.core import TriXiumConfig
+from trixium.core.sequencer import Sequencer
 from trixium.model.activation import (scratchpad_conv_descriptor, scratchpad_norm_descriptor,
                                            scratchpad_silu_descriptor)
 from test_hadamard_integration import install_list
@@ -19,7 +19,7 @@ f32 = np.float32
 
 def fixture(descriptors, **units):
     dut = Module()
-    dut.submodules.seq = seq = BonsaiSequencer(**units)
+    dut.submodules.seq = seq = Sequencer(**units)
     words = [pack(d[i:i + 8]) for d in descriptors for i in (0, 8)]
     mem = Memory(256, max(2, len(words)), init=words)
     port = mem.get_port()
@@ -87,7 +87,7 @@ def test_norm_and_conv_decode_and_reserved_words():
 def test_cluster_conv_then_norm_list():
     """conv (16 channels) then an in-place L2 over two 8-element segments, one list."""
     size = 64*1024
-    dut = SoC(BonsaiClusterConfig(with_norm=True, with_conv=True, scratchpad_size=size), n=1)
+    dut = SoC(TriXiumConfig(with_norm=True, with_conv=True, scratchpad_size=size), n=1)
     rng = np.random.default_rng(3)
     mem = np.zeros(size//4, dtype=np.uint32)
     for a in (0x1000, 0x1100, 0x1200, 0x1300):

@@ -21,10 +21,10 @@ from migen import *
 from litex.soc.interconnect.axi import AXIInterface
 
 from trixium import layout
-from trixium.core.scratchpad import BonsaiScratchpad
-from trixium.core.engine import BonsaiMatVecEngine
-from trixium.memory.loader import BonsaiHBMLoader
-from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.core.scratchpad import Scratchpad
+from trixium.core.engine import MatVecEngine
+from trixium.memory.loader import Loader
+from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
 
@@ -34,12 +34,12 @@ class _DUT(Module):
                 for _ in range(n_channels)]
         self.axis = axis
         src = np.arange(1024, dtype=np.uint8)
-        self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+        self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                       init=words_from_bytes(src.tobytes()))
-        self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+        self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
                                                     chan_stride=HBM_CHAN_STRIDE,
                                                     chan_mod=chan_mod, chan_skew=chan_skew)
-        self.submodules.loader = BonsaiHBMLoader(axis, data_width=256,
+        self.submodules.loader = Loader(axis, data_width=256,
                                                  chan_stride=HBM_CHAN_STRIDE,
                                                  chan_mod=chan_mod, chan_skew=chan_skew)
         self.comb += [
@@ -49,7 +49,7 @@ class _DUT(Module):
         ]
         for i, axi in enumerate(axis):
             # 64 KB windows addressed modulo their size: the address is checked on the bus.
-            model = BonsaiHBMChannelModel(axi, size=64*1024, latency=4)
+            model = HBMChannelModel(axi, size=64*1024, latency=4)
             setattr(self.submodules, f"model{i}", model)
 
 

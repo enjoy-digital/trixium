@@ -3,10 +3,10 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# VexRiscv bare-metal firmware. Build against a LiteX build tree:
-#   make BUILD_DIR=../build/sim   (or ../build/trixium_c)
+# TriXium firmware (VexiiRiscv, bare metal). Build against a LiteX build tree:
+#   make BUILD_DIR=../build/sim_xcu1525   (or ../build/<board build>)
 
-BUILD_DIR ?= ../build/sim
+BUILD_DIR ?= ../build/sim_xcu1525
 
 include $(BUILD_DIR)/software/include/generated/variables.mak
 include $(SOC_DIRECTORY)/software/common.mak
@@ -15,7 +15,7 @@ include $(SOC_DIRECTORY)/software/common.mak
 # attn_patch_slots ran ~14 calls and one iterative div per head, ~300 cycles of compute
 # for a dozen operations (2026-09-08 diagnostics). The firmware is ~80 KB; the per-layer
 # hot path has to stay inside the 32 KB I$, so this is measured, not assumed. Interleaved
-# A/Bs on v11 (tools/fk33_ab2.sh, 4 reps each, tokens OK): -O2 -7.9% vs -Os; -flto a
+# A/Bs on v11 (4 reps each, tokens OK): -O2 -7.9% vs -Os; -flto a
 # further -1.1% (cross-file inlining of the per-layer helpers); -O3 +0.17% = noise, so the
 # smaller -O2 stays. Text: -Os 83.6 KB, -O2 90.9, -O2 -flto 100.8.
 OPT ?= -O2 -flto -freorder-blocks-and-partition
@@ -26,7 +26,7 @@ CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
 CFLAGS += -ffp-contract=off
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o hybrid.o \
-          resident.o bonsai_sequence.o
+          resident.o trixium_sequence.o
 # The portable descriptor encoders shared with the host tools (no MMIO, no board policy).
 PORTABLE_LIB = ../trixium/software/lib
 CFLAGS += -I$(PORTABLE_LIB)
@@ -46,7 +46,7 @@ CFLAGS += -I$(PORTABLE_LIB)
 BUILD_STAMP := .build_dir_stamp
 -include $(BUILD_STAMP)
 ifneq ($(LAST_BUILD_KEY),$(BUILD_DIR) $(CPUFLAGS))
-$(shell rm -f *.o *.d bonsai.bin bonsai.elf)
+$(shell rm -f *.o *.d trixium.bin trixium.elf)
 $(shell echo "LAST_BUILD_KEY := $(BUILD_DIR) $(CPUFLAGS)" > $(BUILD_STAMP))
 endif
 
@@ -54,13 +54,13 @@ COMMA = ,
 REGULAR_LIBS = $(filter-out $(ALWAYS_LINK_LIBS),$(LIBS))
 ALWAYS_LINK_LIBFLAGS = $(if $(ALWAYS_LINK_LIBS),-Wl$(COMMA)--whole-archive $(ALWAYS_LINK_LIBS:lib%=-l%) -Wl$(COMMA)--no-whole-archive)
 
-all: bonsai.bin
+all: trixium.bin
 
 # progs.h (the vector microcode) is regenerated on EVERY build for the encoding the build
-# tree's bitstream uses (BONSAI_VEC_VREGS in soc.h; absent = the original 8-register
+# tree's bitstream uses (TRIXIUM_VEC_VREGS in soc.h; absent = the original 8-register
 # encoding). A mismatch is not a build error - the unit rejects the words via the sticky
 # bad_op, or worse decodes them as something else - so this is forced, not dependency-driven.
-VREGS := $(shell grep -oE 'define BONSAI_VEC_VREGS [0-9]+' $(BUILD_DIR)/software/include/generated/soc.h 2>/dev/null | grep -oE '[0-9]+$$')
+VREGS := $(shell grep -oE 'define TRIXIUM_VEC_VREGS [0-9]+' $(BUILD_DIR)/software/include/generated/soc.h 2>/dev/null | grep -oE '[0-9]+$$')
 VREGS := $(if $(VREGS),$(VREGS),8)
 progs.h: FORCE
 	cd .. && python3 -m trixium.model.asm firmware/progs.h --vregs $(VREGS)
@@ -78,7 +78,7 @@ vpath %.a $(PACKAGES:%=../%)
 LIBM_ARCH := $(subst i2p0_,i,$(patsubst -march=%,%,$(filter -march=%,$(CPUFLAGS))))
 LIBM_ABI  := $(patsubst -mabi=%,%,$(filter -mabi=%,$(CPUFLAGS)))
 
-bonsai.elf: $(OBJECTS)
+trixium.elf: $(OBJECTS)
 	$(CC) $(LDFLAGS) -T linker.ld -N -o $@ \
 		$(OBJECTS) \
 		$(PACKAGES:%=-L$(BUILD_DIR)/software/%) \
@@ -101,6 +101,6 @@ VPATH = $(BIOS_DIRECTORY):$(BIOS_DIRECTORY)/cmds:$(CPU_DIRECTORY):$(PORTABLE_LIB
 	$(assemble)
 
 clean:
-	$(RM) $(OBJECTS) bonsai.elf bonsai.bin .*~ *~ *.d *.map
+	$(RM) $(OBJECTS) trixium.elf trixium.bin .*~ *~ *.d *.map
 
 .PHONY: all clean

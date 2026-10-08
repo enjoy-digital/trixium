@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
-#ifndef BONSAI_SEQUENCE_H
-#define BONSAI_SEQUENCE_H
+#ifndef TRIXIUM_SEQUENCE_H
+#define TRIXIUM_SEQUENCE_H
 #include <stdint.h>
 #ifdef __cplusplus
 extern "C" {

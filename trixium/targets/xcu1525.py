@@ -41,7 +41,7 @@ from litepcie.phy.usppciephy import USPPCIEPHY
 from litepcie.software import generate_litepcie_software
 
 from trixium.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
-from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
+from trixium.core.core import TriXiumConfig, TriXiumCore
 from trixium.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from trixium.targets.common import add_cluster_constraints, CPUBusMonitor
 
@@ -97,7 +97,7 @@ class _CRG(LiteXModule):
         # checks. v8 missed the 0.270 ns maximum skew by 0.003 ns at 16 endpoints.
         # AMD UG912 CLOCK_DELAY_GROUP: apply to the clock-buffer OUTPUT net segments.
         platform.add_platform_command(
-            "set_property CLOCK_DELAY_GROUP bonsai_ddr4 "
+            "set_property CLOCK_DELAY_GROUP trixium_ddr4 "
             "[get_nets {{{slow} {fast}}}]",
             slow=cd_slow.clk, fast=cd_fast.clk)
 
@@ -232,7 +232,7 @@ class TriXiumXCU1525SoC(SoCCore):
         kwargs["with_jtagbone"] = True
         SoCCore.__init__(self, platform, sys_clk_freq,
             ident = "TriXium on XCU1525", **kwargs)
-        self.add_constant("BONSAI_VARIANT", ord("b"))
+        self.add_constant("TRIXIUM_VARIANT", ord("b"))
 
         # DDR4 x4 ----------------------------------------------------------------------------------
         # Controller 0 also carries the CPU's main_ram (256 MB, through the L2 cache);
@@ -293,7 +293,7 @@ class TriXiumXCU1525SoC(SoCCore):
         assert HBM_WEIGHT_BASE + chan_stride*chan_mod - (HBM_WEIGHT_BASE % chan_stride) <= 4 << 30
         assert chan_skew % 0x1000 == 0 and (chan_mod - 1)*chan_skew < chan_stride // 64
         assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000
-        config = BonsaiClusterConfig(scratchpad_xpm=True,
+        config = TriXiumConfig(scratchpad_xpm=True,
             chan_stride              = chan_stride,
             chan_mod                 = chan_mod,
             chan_skew                = chan_skew,
@@ -307,23 +307,25 @@ class TriXiumXCU1525SoC(SoCCore):
             with_attnstream          = True,
             attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3]))))
-        add_bonsai_cluster(self, memory_ports, config)
+        self.trixium = TriXiumCore(memory_ports, config)
+        for name, value in self.trixium.constants.items():
+            self.add_constant(name, value)
         add_cluster_constraints(platform)
-        self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
-            SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
-        self.comb += self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"})
+        self.bus.add_slave("scratchpad", self.trixium.bus,
+            SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
+        self.comb += self.pcie_dma0.source.connect(self.trixium.upload, keep={"valid", "ready", "data"})
 
         # Board memory map, for the firmware.
-        self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
-        self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
-        self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
-        self.add_constant("BONSAI_CHAN_STRIDE",      chan_stride)
-        self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
-        self.add_constant("BONSAI_CHAN_MOD",         chan_mod)
-        self.add_constant("BONSAI_CHAN_SKEW",        chan_skew)
-        self.add_constant("BONSAI_MEM_CPU_OFFSET",   0)
-        self.add_constant("BONSAI_N_MEMCTRL",        ddram_channels)
-        self.add_constant("BONSAI_DDR_CSR_STRIDE",   DDR_CSR_STRIDE)
+        self.add_constant("TRIXIUM_LOADER_ADDS_CHAN_OFFSET", 1)
+        self.add_constant("TRIXIUM_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
+        self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
+        self.add_constant("TRIXIUM_CHAN_STRIDE",      chan_stride)
+        self.add_constant("TRIXIUM_N_CHANNELS",       engine_channels)
+        self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
+        self.add_constant("TRIXIUM_CHAN_SKEW",        chan_skew)
+        self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
+        self.add_constant("TRIXIUM_N_MEMCTRL",        ddram_channels)
+        self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   DDR_CSR_STRIDE)
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -350,7 +352,7 @@ def main():
     # extension, so the firmware reaches clz through a .insn encoding behind this.
     if "--with-rvZbb" in (getattr(args, "vexii_args", "") or "") or \
        "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
-        soc.add_constant("BONSAI_HAS_ZBB")
+        soc.add_constant("TRIXIUM_HAS_ZBB")
 
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:

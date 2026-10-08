@@ -8,9 +8,9 @@ import pytest
 from migen import Module, Constant, run_simulation
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.core.csr import BonsaiEngineCSR
-from trixium.core.engine import BonsaiMatVecEngine
-from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.core.csr import EngineCSR
+from trixium.core.engine import MatVecEngine
+from trixium.core.scratchpad import Scratchpad
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +18,7 @@ NAMES = ("total", "eng", "vec", "both")
 
 
 def make_engine(sp):
-    return BonsaiMatVecEngine(sp, [AXIInterface(data_width=256, address_width=33,
+    return MatVecEngine(sp, [AXIInterface(data_width=256, address_width=33,
                                               id_width=6)], xbuf_groups=8)
 
 
@@ -27,10 +27,10 @@ def test_snapshot_is_atomic_and_stable():
         def __init__(self):
             # Only the CSR front end is simulated here; the generator drives the engine
             # signals directly to inject all four independent rollover cases.
-            sp = BonsaiScratchpad(size=16*1024)
+            sp = Scratchpad(size=16*1024)
             engine = make_engine(sp)
             self.counter_inputs = [getattr(engine, "cyc_" + n) for n in NAMES]
-            self.submodules.csr = BonsaiEngineCSR(engine)
+            self.submodules.csr = EngineCSR(engine)
     dut = DUT()
     outputs = [getattr(dut.csr, "snap_" + n).status for n in NAMES]
 
@@ -73,7 +73,7 @@ def test_snapshot_is_atomic_and_stable():
 def test_live_total_counter_crosses_48_bits():
     class DUT(Module):
         def __init__(self):
-            self.submodules.sp = BonsaiScratchpad(size=16*1024)
+            self.submodules.sp = Scratchpad(size=16*1024)
             self.submodules.engine = make_engine(self.sp)
             self.engine.cyc_total.reset = Constant((1 << 48) - 2, 64)
     dut = DUT()
@@ -102,7 +102,7 @@ static inline void timer0_reload_write(uint32_t v) { (void)v; }
 """
     flags = []
     if mode != "absent":
-        header += "#define CSR_ENGINE_CSR_CYC_TOTAL_ADDR 1\n#define CSR_ENGINE_CSR_CYC_ENG_ADDR 1\n"
+        header += "#define CSR_TRIXIUM_ENGINE_CSR_CYC_TOTAL_ADDR 1\n#define CSR_TRIXIUM_ENGINE_CSR_CYC_ENG_ADDR 1\n"
         for i, name in enumerate(NAMES):
             header += (f"static inline uint32_t engine_csr_cyc_{name}_read(void) "
                        f"{{ return (uint32_t)test_live[{i}]; }}\n")
@@ -111,8 +111,8 @@ static inline void timer0_reload_write(uint32_t v) { (void)v; }
     if mode == "wide":
         flags.append("-DTEST_WIDE_COUNTERS")
         header += """
-#define CSR_ENGINE_CSR_PERF_SNAPSHOT_ADDR 1
-static inline void engine_csr_perf_snapshot_write(uint32_t v) {
+#define CSR_TRIXIUM_ENGINE_CSR_PERF_SNAPSHOT_ADDR 1
+static inline void trixium_engine_csr_perf_snapshot_write(uint32_t v) {
     if (v) for (int i = 0; i < 4; i++) test_snap[i] = test_live[i];
 }
 """
@@ -121,7 +121,7 @@ static inline void engine_csr_perf_snapshot_write(uint32_t v) {
                        f"{{ return test_snap[{i}]; }}\n")
     (generated / "csr.h").write_text(header)
     exe = tmp_path / "perf_test"
-    subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DBONSAI_PERF_TEST",
+    subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DTRIXIUM_PERF_TEST",
                     *flags, "-I" + str(tmp_path), "-I" + str(ROOT / "firmware"),
                     str(ROOT / "firmware/perf.c"), str(ROOT / "firmware/traffic.c"),
                     str(ROOT / "test/perf_host.c"),

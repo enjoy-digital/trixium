@@ -14,7 +14,7 @@
     bonsai chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
     bonsai console   "stats" "bench 64"                         # raw firmware commands
 
-`deploy` drives the lab board from the workstation (tools/fk33_bringup_measure.sh with
+`deploy` drives the lab board from the workstation (tools/fk33_bringup.sh with
 tools/board.env); `chat` and `console` run where the card's /dev/ttyLXU0 is.
 """
 
@@ -59,7 +59,7 @@ def cmd_tokenizer(a):
 
 
 def cmd_deploy(a):
-    sys.exit(_run([os.path.join(REPO, "tools", "fk33_bringup_measure.sh"), a.build]))
+    sys.exit(_run([os.path.join(REPO, "tools", "fk33_bringup.sh"), a.build]))
 
 
 def cmd_chat(a):
@@ -79,10 +79,10 @@ def cmd_chat(a):
         # in the tree the deploy script maintains there.
         env = _board_env()
         import shlex
-        remote = (f"cd {shlex.quote(env['BOARD_DIR'])} && ./user/bonsai_chat -t {shlex.quote(a.tty)} "
+        remote = (f"cd {shlex.quote(env['BOARD_DIR'])} && ./user/trixium_chat -t {shlex.quote(a.tty)} "
                   + " ".join(shlex.quote(f) for f in flags))
         os.execvp("ssh", ["ssh", "-t", f"{env['BOARD_USER']}@{env['BOARD_HOST']}", remote])
-    exe = os.path.join(REPO, "trixium", "software", "user", "bonsai_chat")
+    exe = os.path.join(REPO, "trixium", "software", "user", "trixium_chat")
     if not os.path.exists(exe):
         sys.exit(f"{exe} not built: make -C trixium/software/user BUILD_DIR=../../../build/<build>")
     os.execv(exe, [exe, "-t", a.tty, "-z", a.tokenizer] + flags)
@@ -146,7 +146,7 @@ def main(argv=None):
     p.add_argument("--system", help="system prompt (a system turn ahead of the conversation)")
     p.add_argument("--remote", action="store_true",
                    help="run the chat on the board host over ssh (tools/board.env)")
-    p.add_argument("-k", "--firmware", help="boot this firmware first (bonsai.bin)")
+    p.add_argument("-k", "--firmware", help="boot this firmware first (trixium.bin)")
     p.add_argument("-m", "--image", help="upload this weight image first")
     p.set_defaults(fn=cmd_chat)
 

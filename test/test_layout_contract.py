@@ -120,9 +120,9 @@ def test_targets_use_one_cluster_implementation():
         tree = ast.parse((root / fname).read_text())
         calls = [node.func.id for node in ast.walk(tree)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
-        assert calls.count("add_bonsai_cluster") == 1, fname
-        for constructor in ("BonsaiMatVecEngine", "BonsaiVectorUnit", "BonsaiSequencer",
-                            "BonsaiEngineCSR", "BonsaiHBMLoader", "BonsaiEngineResetDomain"):
+        assert calls.count("TriXiumCore") == 1, fname
+        for constructor in ("MatVecEngine", "VectorUnit", "Sequencer",
+                            "EngineCSR", "Loader", "EngineResetDomain"):
             assert constructor not in calls, (fname, constructor)
 
     portable = (root / "trixium/core/core.py").read_text()

@@ -15,12 +15,12 @@
 
 const struct bons_header *model_header(void)
 {
-    return (const struct bons_header *)BONSAI_HDR_ADDR;
+    return (const struct bons_header *)TRIXIUM_HDR_ADDR;
 }
 
 static const struct bons_entry *model_table(void)
 {
-    return (const struct bons_entry *)(BONSAI_HDR_ADDR + model_header()->table_offset);
+    return (const struct bons_entry *)(TRIXIUM_HDR_ADDR + model_header()->table_offset);
 }
 
 // (role, layer) -> table-index cache. The linear scan below walks up to n_tensors entries
@@ -34,15 +34,15 @@ static const struct bons_entry *model_table(void)
 // NOT in .bss: the sram region is 8 KB *including the stack* (_fstack sits at its top), and
 // these 4 KB of tables left it no room - the sim build failed to link and the card build
 // linked with so little stack that boot corrupted itself and hung. They live instead in the
-// unused main_ram window between the BONS header/table (~32 KB at BONSAI_HDR_ADDR) and the
-// inference heap (BONSAI_HDR_ADDR + 0x100000, see infer.c HEAP_BASE).
+// unused main_ram window between the BONS header/table (~32 KB at TRIXIUM_HDR_ADDR) and the
+// inference heap (TRIXIUM_HDR_ADDR + 0x100000, see infer.c HEAP_BASE).
 // 32 roles: ROLE_TOK_EMB16_EXP is role 16 and sat just past the old bound of 16, so its
 // lookup fell to the 426-entry scan (~27 KB through the D$) once every forward - 33k
 // cycles of the embed window on the card (2026-09-08). 8 KB of the 64 KB window.
 #define ECACHE_ROLES  32
 #define ECACHE_LAYERS 64
 _Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every role");
-#define ECACHE_BASE   (BONSAI_HDR_ADDR + 0x80000)
+#define ECACHE_BASE   (TRIXIUM_HDR_ADDR + 0x80000)
 #define ecache_any ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE))
 #define ecache_n16 ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE + \
                         ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))
@@ -171,7 +171,7 @@ void model_info(void)
            (unsigned long)h->vocab, (unsigned long)h->n_tensors, (unsigned long)h->n_channels,
            (unsigned long)h->payload_beats);
     printf("tokenizer sha256 ");                     // The converter's --tokenizer file;
-    for (int i = 0; i < 32; i++)                     // bonsai_chat compares it with its own.
+    for (int i = 0; i < 32; i++)                     // trixium_chat compares it with its own.
         printf("%02x", h->tokenizer_sha256[i]);
     printf("\n");
 }
@@ -185,7 +185,7 @@ void model_matvec_op(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
     op->kind   = (e->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
     op->rows   = e->rows/h->n_channels;
     op->cols   = e->cols;
-    op->wbase  = BONSAI_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
+    op->wbase  = TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
     op->wlen   = e->chan_len_beats;
     op->sbeats = bons_scale_beats(e->cols, e->group);
     op->cbeats = bons_code_beats(e->cols, e->kind);

@@ -2,8 +2,8 @@
 import pytest
 from migen import Memory, Module, run_simulation
 
-from trixium.core.core import BonsaiClusterConfig
-from trixium.core.sequencer import BonsaiSequencer
+from trixium.core.core import TriXiumConfig
+from trixium.core.sequencer import Sequencer
 from trixium.model.activation import scratchpad_restore_descriptor
 from trixium.model import asm
 from test_projection_restore import expected
@@ -20,7 +20,7 @@ def descriptor(**changes):
 
 def fixture(descriptors):
     dut = Module()
-    dut.submodules.seq = seq = BonsaiSequencer(with_projection_restore=True)
+    dut.submodules.seq = seq = Sequencer(with_projection_restore=True)
     words = [pack(desc[start:start+8]) for desc in descriptors for start in (0, 8)]
     mem = Memory(256, max(2, len(words)), init=words)
     port = mem.get_port()
@@ -44,15 +44,15 @@ def test_restoration_descriptor_and_configuration():
     assert descriptor(adjustment=-(1 << 31))[5] == 0x80000000
     for options in ({'with_vecunit': False}, {'scratchpad_size': 512*1024}):
         with pytest.raises(ValueError):
-            BonsaiClusterConfig(with_projection_restore=True, **options)
+            TriXiumConfig(with_projection_restore=True, **options)
     for size in (0, 31, 33, 256*1024 + 32):
         with pytest.raises(ValueError):
-            BonsaiSequencer(with_projection_restore=True, scratchpad_size=size)
+            Sequencer(with_projection_restore=True, scratchpad_size=size)
 
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
 def test_restoration_only_profile_list_bounds_before_fetch(base, count):
-    dut = BonsaiSequencer(with_projection_restore=True, scratchpad_size=16*1024)
+    dut = Sequencer(with_projection_restore=True, scratchpad_size=16*1024)
     def run():
         yield from write(dut.base, base)
         yield from write(dut.count, count)
@@ -138,7 +138,7 @@ def test_restoration_waits_nowait_engine_stable_dispatch_and_failure_wins(failur
 
 @pytest.mark.parametrize('companions', [False, True])
 def test_restoration_fetch_nowait_restore_store_shared_cluster(companions):
-    dut = SoC(BonsaiClusterConfig(with_projection_restore=True, with_hadamard=companions,
+    dut = SoC(TriXiumConfig(with_projection_restore=True, with_hadamard=companions,
                                  with_activation_quantize=companions, scratchpad_size=16*1024), n=1)
     words = [(i - 8)*(1 << 24) + (i % 5) for i in range(17)]
     restored, error = expected(words, -31)
@@ -176,7 +176,7 @@ def test_restoration_fetch_nowait_restore_store_shared_cluster(companions):
 
 
 def test_restoration_actual_wrapping_vector_reduce_before_float_conversion():
-    dut = SoC(BonsaiClusterConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1)
+    dut = SoC(TriXiumConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1)
     a = [(1 << 24)+1, 0x7fffffff, 0x80000000, -7, (1 << 24)+3, 0, 1, -1]
     b = [-(1 << 24), 1, -1, 7, -(1 << 24), 0, -1, 1]
     total = [(x+y) & 0xffffffff for x, y in zip(a, b)]
@@ -205,7 +205,7 @@ def test_restoration_actual_wrapping_vector_reduce_before_float_conversion():
 
 
 def test_restoration_shared_reset_and_whole_list_protection():
-    dut = SoC(BonsaiClusterConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1)
+    dut = SoC(TriXiumConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1)
     def run():
         # Output writes target the second descriptor, not the executing one.
         bad = descriptor(dst=64, elements=1)

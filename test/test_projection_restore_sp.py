@@ -9,8 +9,8 @@ from migen import *
 from migen.fhdl import verilog
 from litex.gen import LiteXModule
 
-from trixium.units.restore import BonsaiProjectionRestoreScratchpad
-from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.units.restore import ProjectionRestoreScratchpad
+from trixium.core.scratchpad import Scratchpad
 from test_projection_restore import expected
 
 
@@ -20,8 +20,8 @@ def pack(words):
 
 class RestoreSP(LiteXModule):
     def __init__(self, size=8192):
-        self.sp = BonsaiScratchpad(size=size)
-        self.unit = BonsaiProjectionRestoreScratchpad(size)
+        self.sp = Scratchpad(size=size)
+        self.unit = ProjectionRestoreScratchpad(size)
         self.grant = Signal(reset=1)
         self.comb += [self.sp.fill.adr.eq(self.unit.sp_rd_adr), self.unit.sp_rd_dat.eq(self.sp.fill.dat_r),
                      self.unit.sp_wr_gnt.eq(self.grant & self.unit.sp_wr_req),
@@ -207,14 +207,14 @@ def test_restore_sp_cancel_pipeline_and_restart(delay):
 def test_restore_sp_invalid_physical_sizes():
     for size in (0, 31, 33, 256*1024 + 32):
         with pytest.raises(ValueError):
-            BonsaiProjectionRestoreScratchpad(size)
+            ProjectionRestoreScratchpad(size)
 
 
 def test_restore_sp_compiled_memory_tails_inplace_reset_and_extremes(tmp_path):
     verilator = shutil.which('verilator')
     if not verilator:
         pytest.skip('Verilator required for standalone compiled scratchpad restoration check')
-    dut = BonsaiProjectionRestoreScratchpad()
+    dut = ProjectionRestoreScratchpad()
     signals = {name: getattr(dut, name) for name in (
         'cancel', 'busy', 'done', 'error', 'read_beats', 'output_beats', 'exponent',
         'sp_rd_req', 'sp_rd_adr', 'sp_rd_dat', 'sp_wr_req', 'sp_wr_adr', 'sp_wr_dat', 'sp_wr_we', 'sp_wr_gnt')}

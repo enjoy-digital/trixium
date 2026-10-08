@@ -8,7 +8,7 @@ import pytest
 from migen import C, Cat, Memory, Module, Signal, run_simulation
 from migen.fhdl import verilog
 
-from trixium.core.core import BonsaiClusterConfig
+from trixium.core.core import TriXiumConfig
 from trixium.model.activation import scratchpad_quantize_descriptor, scratchpad_requantize_descriptor
 from test_activation_sp import bits, pack, reference
 from test_hadamard_integration import install_list
@@ -25,7 +25,7 @@ def test_activation_descriptor_and_configuration():
             scratchpad_quantize_descriptor(**args)
     for options in ({'with_vecunit': False}, {'scratchpad_size': 512*1024}):
         with pytest.raises(ValueError):
-            BonsaiClusterConfig(with_activation_quantize=True, **options)
+            TriXiumConfig(with_activation_quantize=True, **options)
     assert scratchpad_requantize_descriptor(src=32, dst=64, exponents=96, maxima=128,
         result_exponent=160, blocks=17) == [5, 32, 64, 96, 128, 160, 17] + [0]*9
     for changes in ({'src': 1}, {'dst': -32}, {'exponents': 1 << 24}, {'maxima': 127},
@@ -38,8 +38,8 @@ def test_activation_descriptor_and_configuration():
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
 def test_quantization_only_profile_validates_full_list_before_fetch(base, count):
-    from trixium.core.sequencer import BonsaiSequencer
-    dut = BonsaiSequencer(with_activation_quantize=True, scratchpad_size=16*1024)
+    from trixium.core.sequencer import Sequencer
+    dut = Sequencer(with_activation_quantize=True, scratchpad_size=16*1024)
     def run():
         yield from write(dut.base, base)
         yield from write(dut.count, count)
@@ -53,9 +53,9 @@ def test_quantization_only_profile_validates_full_list_before_fetch(base, count)
 
 @pytest.mark.parametrize('failure', [0, 128])
 def test_requantization_dispatch_without_hadamard_and_completion_publication(failure):
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.sequencer import Sequencer
     dut = Module()
-    dut.submodules.seq = seq = BonsaiSequencer(with_activation_quantize=True)
+    dut.submodules.seq = seq = Sequencer(with_activation_quantize=True)
     words = scratchpad_requantize_descriptor(src=0x10000, dst=0x8000, exponents=0x800,
         maxima=0x900, result_exponent=0xa00, blocks=17)
     mem = Memory(256, 2, init=[pack(words[:8], 32), pack(words[8:], 32)])
@@ -100,7 +100,7 @@ def test_requantization_dispatch_without_hadamard_and_completion_publication(fai
 
 @pytest.mark.parametrize('with_hadamard', [False, True])
 def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
-    dut = SoC(BonsaiClusterConfig(with_activation_quantize=True, with_hadamard=with_hadamard,
+    dut = SoC(TriXiumConfig(with_activation_quantize=True, with_hadamard=with_hadamard,
                                  scratchpad_size=16*1024), n=1)
     arrays = [[bits(math.ldexp((i - 32)*0.5, e)) for i in range(64)] for e in (-7, 4)]
     raw = [word for a in arrays for word in a]
@@ -141,8 +141,8 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path):
     verilator = shutil.which('verilator')
     if not verilator:
         pytest.skip('Verilator required for full resident conversion/rotation check')
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, with_activation_quantize=True), n=1)
-    bus = dut.scratchpad.add_wishbone_port()
+    dut = SoC(TriXiumConfig(with_hadamard=True, with_activation_quantize=True), n=1)
+    bus = dut.bus
     status = Signal(24)
     dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
     signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}

@@ -25,17 +25,17 @@ static struct overlap_snapshot ovl0, ovlw;
 static void overlap_snapshot(struct overlap_snapshot *s)
 {
     s->stamp = perf_now64();
-#ifdef CSR_ENGINE_CSR_PERF_SNAPSHOT_ADDR
-    engine_csr_perf_snapshot_write(1);
-    s->cycles[0] = engine_csr_snap_total_read();
-    s->cycles[1] = engine_csr_snap_eng_read();
-    s->cycles[2] = engine_csr_snap_vec_read();
-    s->cycles[3] = engine_csr_snap_both_read();
-#elif defined(CSR_ENGINE_CSR_CYC_TOTAL_ADDR)
-    s->cycles[0] = engine_csr_cyc_total_read();
-    s->cycles[1] = engine_csr_cyc_eng_read();
-    s->cycles[2] = engine_csr_cyc_vec_read();
-    s->cycles[3] = engine_csr_cyc_both_read();
+#ifdef CSR_TRIXIUM_ENGINE_CSR_PERF_SNAPSHOT_ADDR
+    trixium_engine_csr_perf_snapshot_write(1);
+    s->cycles[0] = trixium_engine_csr_snap_total_read();
+    s->cycles[1] = trixium_engine_csr_snap_eng_read();
+    s->cycles[2] = trixium_engine_csr_snap_vec_read();
+    s->cycles[3] = trixium_engine_csr_snap_both_read();
+#elif defined(CSR_TRIXIUM_ENGINE_CSR_CYC_TOTAL_ADDR)
+    s->cycles[0] = trixium_engine_csr_cyc_total_read();
+    s->cycles[1] = trixium_engine_csr_cyc_eng_read();
+    s->cycles[2] = trixium_engine_csr_cyc_vec_read();
+    s->cycles[3] = trixium_engine_csr_cyc_both_read();
 #else
     for (int i = 0; i < 4; i++) s->cycles[i] = 0;
 #endif
@@ -44,7 +44,7 @@ static void overlap_snapshot(struct overlap_snapshot *s)
 static int overlap_delta(const struct overlap_snapshot *start,
                          const struct overlap_snapshot *end, uint64_t out[4])
 {
-#ifdef CSR_ENGINE_CSR_PERF_SNAPSHOT_ADDR
+#ifdef CSR_TRIXIUM_ENGINE_CSR_PERF_SNAPSHOT_ADDR
     for (int i = 0; i < 4; i++) {
         if (end->cycles[i] < start->cycles[i]) return 0; // reset during window
         out[i] = end->cycles[i] - start->cycles[i];
@@ -52,7 +52,7 @@ static int overlap_delta(const struct overlap_snapshot *start,
     // Invariant for an atomic snapshot interval. Avoid overflowing intermediate sums.
     return out[1] <= out[0] && out[2] <= out[0] && out[3] <= out[1]
         && out[3] <= out[2] && out[1] - out[3] <= out[0] - out[2];
-#elif defined(CSR_ENGINE_CSR_CYC_TOTAL_ADDR)
+#elif defined(CSR_TRIXIUM_ENGINE_CSR_CYC_TOTAL_ADDR)
     // Cannot reconstruct wraps from two low-word samples. Include CSR-read time and
     // reject the whole interval if even one wrap could have occurred. Legacy reads are
     // not simultaneous, so their percentages are explicitly approximate.
@@ -103,7 +103,7 @@ void perf_reset(void)
     }
 }
 
-#ifndef BONSAI_PERF_TEST // Host tests inject clocks; production always uses these readers.
+#ifndef TRIXIUM_PERF_TEST // Host tests inject clocks; production always uses these readers.
 uint32_t perf_now(void)
 {
     timer0_update_value_write(1);
@@ -159,9 +159,9 @@ void tprof_event(uint32_t tag)
         return;
     tprof_buf[tprof_n++] = tag;
     tprof_buf[tprof_n++] = perf_now();
-#ifdef CSR_ENGINE_CSR_CYC_ENG_ADDR
-    tprof_buf[tprof_n++] = engine_csr_cyc_eng_read();
-    tprof_buf[tprof_n++] = engine_csr_cyc_vec_read();
+#ifdef CSR_TRIXIUM_ENGINE_CSR_CYC_ENG_ADDR
+    tprof_buf[tprof_n++] = trixium_engine_csr_cyc_eng_read();
+    tprof_buf[tprof_n++] = trixium_engine_csr_cyc_vec_read();
 #else
     tprof_buf[tprof_n++] = 0;
     tprof_buf[tprof_n++] = 0;
@@ -286,7 +286,7 @@ static void overlap_print(const char *tag, const uint64_t acc[4])
            (unsigned long)(acc[1]*100/tot), (unsigned long)(acc[2]*100/tot),
            (unsigned long)(acc[3]*100/tot), (unsigned long)(neither*100/tot));
     perf_print_u64(acc[0]);
-#ifdef CSR_ENGINE_CSR_PERF_SNAPSHOT_ADDR
+#ifdef CSR_TRIXIUM_ENGINE_CSR_PERF_SNAPSHOT_ADDR
     puts(" cycles; coherent64; neither includes CPU work)");
 #else
     puts(" cycles; legacy32 approximate; neither includes CPU work)");

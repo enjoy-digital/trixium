@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""bonsai_convert: GGUF (PrismML PQ2_0 / legacy Q2_0 g128 / PTQ1_0) -> BONS hardware weight image.
+"""trixium_convert: GGUF (PrismML PQ2_0 / legacy Q2_0 g128 / PTQ1_0) -> BONS hardware weight image.
 
 Subcommands:
   inspect  <gguf>                    - dump metadata + tensor table.
@@ -238,7 +238,7 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     # (1.2 GB) does not, so that is dropped with a note rather than refused; a model whose
     # weights alone overflow is refused here instead of by the loader (2026-09-18).
     # The window is a property of the board target (chan_stride / weight_base are what its
-    # SoC exports as BONSAI_CHAN_STRIDE / BONSAI_CHAN_WEIGHT_BASE); the FK33's constants are
+    # SoC exports as TRIXIUM_CHAN_STRIDE / TRIXIUM_CHAN_WEIGHT_BASE); the FK33's constants are
     # the default and the XCU1525 uses the same ones per controller, so the images are
     # shared. A target with a bigger stride passes it (--chan-stride / --weight-base).
     from trixium.model.bons import _tensor_beats
@@ -336,15 +336,15 @@ def main():
                    help="Leave out the pre-dequantized int16 embedding table (622 MB on the "
                         "1.7B; the firmware decodes rows itself, ~2.6%% slower per token).")
     p.add_argument("--chan-stride", default=None, type=lambda x: int(x, 0),
-                   help="The target's per-channel stride (BONSAI_CHAN_STRIDE; default: the FK33's 256 MB).")
+                   help="The target's per-channel stride (TRIXIUM_CHAN_STRIDE; default: the FK33's 256 MB).")
     p.add_argument("--kseg-max", default=layout.KSEG_MAX, type=int,
                    help="Split matvecs wider than this into K-segments (default: the engine op's "
                         "limit; small values exercise the path on tiny models).")
     p.add_argument("--window-reserve", default=0, type=lambda x: int(x, 0),
                    help="Bytes the last window of a controller loses to the per-channel bank skew "
-                        "((chan_mod-1)*BONSAI_CHAN_SKEW: 96 KB on the XCU1525).")
+                        "((chan_mod-1)*TRIXIUM_CHAN_SKEW: 96 KB on the XCU1525).")
     p.add_argument("--weight-base", default=None, type=lambda x: int(x, 0),
-                   help="The target's weight base (BONSAI_CHAN_WEIGHT_BASE; default: the FK33's).")
+                   help="The target's weight base (TRIXIUM_CHAN_WEIGHT_BASE; default: the FK33's).")
 
     p = sub.add_parser("verify")
     p.add_argument("--image", required=True)

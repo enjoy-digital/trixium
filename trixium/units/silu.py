@@ -405,7 +405,7 @@ OP_RUN, OP_LOAD = 0, 1
 LOAD_BEATS = 513 + 512
 
 
-class BonsaiSiluScratchpad(LiteXModule):
+class SiluScratchpad(LiteXModule):
     def __init__(self, scratchpad_size=256*1024, tables=None, sets=2, ways=4):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")

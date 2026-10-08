@@ -74,7 +74,7 @@ def values_reference(p, V):
     return o
 
 
-class BonsaiAttnStream(LiteXModule):
+class AttentionStream(LiteXModule):
     def __init__(self, lanes=24, groups=4, hb_max=32, t_max=2048, adr_bits=13,
                  add_factory=ExactFP32Add, mul_factory=ExactFP32Mul):
         L, P = lanes, 8

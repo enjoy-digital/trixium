@@ -80,7 +80,7 @@ uint32_t seq_poll_spins, seq_poll_waits;
 
 // Split form (2026-08-31, per-cycle sideband slot): start a list and return; the CPU
 // may then patch OTHER lists' descriptors or do host-memory work while it runs, and
-// seq_join() polls completion. On bitstreams without BONSAI_SP_SB_SLOT the first
+// seq_join() polls completion. On bitstreams without TRIXIUM_SP_SB_SLOT the first
 // scratchpad access after seq_list_start() simply stalls until the list finishes -
 // correct either way, only the overlap is lost.
 void seq_join(void)
@@ -90,7 +90,7 @@ void seq_join(void)
     uint32_t spins = 0, reports = 0;
     seq_poll_waits++;
     for (;;) {
-        uint32_t st = seq_status_read();
+        uint32_t st = trixium_seq_status_read();
         tprof_dcount(st);
         if (!(st & 1))
             break;
@@ -99,8 +99,8 @@ void seq_join(void)
             continue;
         spins = 0;
         printf("SEQSTALL dcount=%lu eng=%02lx\n",
-               (unsigned long)(seq_status_read() >> 8),
-               (unsigned long)engine_csr_status_read());
+               (unsigned long)(trixium_seq_status_read() >> 8),
+               (unsigned long)trixium_engine_csr_status_read());
         if (++reports == 8) {
             seq_wedged = 1;
             engine_wedged = 1;
@@ -121,11 +121,11 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
     int n = 0;
     uint32_t last = 0xFFFFFFFF, spins = 0;
     if (n < max) ts[n++] = perf_now();
-    seq_base_write(SP_DESC + idx0*64);
-    seq_count_write(count);
-    seq_start_write(1);
+    trixium_seq_base_write(SP_DESC + idx0*64);
+    trixium_seq_count_write(count);
+    trixium_seq_start_write(1);
     for (;;) {
-        uint32_t st = seq_status_read();
+        uint32_t st = trixium_seq_status_read();
         uint32_t dc = st >> 8;
         if (dc != last) {
             last = dc;
@@ -150,18 +150,18 @@ void seq_list_start(uint32_t idx0, uint32_t count)
         return;
     if (tprof_active)
         tprof_event((5u << 28) | ((idx0 & 0xFF) << 8) | (count & 0xFF));
-    seq_base_write(SP_DESC + idx0*64);
-    seq_count_write(count);
-    seq_start_write(1);
+    trixium_seq_base_write(SP_DESC + idx0*64);
+    trixium_seq_count_write(count);
+    trixium_seq_start_write(1);
 }
 
 void seq_run(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged) // Nothing will complete until the FPGA is reconfigured.
         return;
-    seq_base_write(SP_DESC + idx0*64);
-    seq_count_write(count);
-    seq_start_write(1);
+    trixium_seq_base_write(SP_DESC + idx0*64);
+    trixium_seq_count_write(count);
+    trixium_seq_start_write(1);
     // Spin-capped poll: a wedged list names the stuck descriptor instead of hanging.
     //
     // And it does have to *give up*. Spinning forever here is what turned a stalled
@@ -171,14 +171,14 @@ void seq_run(uint32_t idx0, uint32_t count)
     // the FPGA does. Giving up at least keeps the console alive to say so.
     uint32_t spins = 0, reports = 0;
     seq_poll_waits++;
-    while (seq_status_read() & 1) {
+    while (trixium_seq_status_read() & 1) {
         seq_poll_spins++;
         if (++spins < 200000u)
             continue;
         spins = 0;
         printf("SEQSTALL dcount=%lu/%lu eng=%02lx\n",
-               (unsigned long)(seq_status_read() >> 8), (unsigned long)count,
-               (unsigned long)engine_csr_status_read());
+               (unsigned long)(trixium_seq_status_read() >> 8), (unsigned long)count,
+               (unsigned long)trixium_engine_csr_status_read());
         if (++reports == 8) {
             seq_wedged = 1;
             engine_wedged = 1;

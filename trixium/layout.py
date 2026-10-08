@@ -339,7 +339,7 @@ HBM_CHAN_STRIDE = 0x1000_0000 # 256 MB per channel, matching the pseudo-channel 
 
 # The BONS header+table ("meta") is uploaded by the host to ENGINE channel 0 at this offset
 # (the host's PCIe window covers CSRs only, not HBM channel 0 / main_ram); the firmware's
-# `loadhdr` command copies it from there to BONSAI_HDR_ADDR via FETCH + memcpy.
+# `loadhdr` command copies it from there to TRIXIUM_HDR_ADDR via FETCH + memcpy.
 HBM_META_OFFSET = HBM_WEIGHT_BASE - 0x0010_0000 # 1 MB before the payloads.
 
 # Where the firmware keeps its CPU-side copy of the BONS header+table, as an offset into

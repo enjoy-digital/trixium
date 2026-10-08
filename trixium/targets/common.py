@@ -26,7 +26,7 @@ def add_cluster_constraints(platform):
     # The 2 Mbit shared scratchpad and the norm unit's weight buffer in BLOCK RAM. Left to inference, part of the scratchpad went to LUT RAM: every
     # client address then fans out to thousands of LUT-RAM cells across the die, and v15
     # (more clients, more area) placed those paths at -4 ns (route 9.2 ns of 11).
-    for name in ("bonsai_scratchpad", "norm_wbuf"):
+    for name in ("trixium_scratchpad", "norm_wbuf"):
         platform.add_platform_command(
             "set_property RAM_STYLE block [get_cells -quiet -hierarchical -filter "
             "{{NAME =~ *" + name + "*_reg*}}]")

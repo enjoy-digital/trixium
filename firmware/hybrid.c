@@ -32,15 +32,15 @@
 #include "engine.h"
 #include "infer.h"
 #include "hybrid.h"
-#include "bonsai_sequence.h"
+#include "trixium_sequence.h"
 
 // The resident DeltaNet layer needs units 11 (SiLU), 12 (norm) and 13 (conv).
-#if defined(BONSAI_HAS_NORM) && defined(BONSAI_HAS_CONV) && defined(BONSAI_HAS_SILU)
+#if defined(TRIXIUM_HAS_NORM) && defined(TRIXIUM_HAS_CONV) && defined(TRIXIUM_HAS_SILU)
 #define DNRES_BUILT 1
 #endif
-// The DeltaNet state in engine DDR, updated by the stream op (BONSAI_HAS_DNSTREAM): the
+// The DeltaNet state in engine DDR, updated by the stream op (TRIXIUM_HAS_DNSTREAM): the
 // heads run only there (`dnstream off` then stops with DNSTALL).
-#if defined(BONSAI_HAS_DNSTREAM)
+#if defined(TRIXIUM_HAS_DNSTREAM)
 #define DN_STATE_HW 1
 #endif
 #include "perf.h"
@@ -76,7 +76,7 @@ static int    rope_pos_cached;
 // The DeltaNet state in engine DDR (the stream op's fixed geometry: the 27B's 128x128
 // matrices); other hybrid test models keep it in main RAM for the scalar CPU recurrence.
 static int      dn_hw;
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
 static uint32_t at_hbm_base, at_slots, at_rowbeats;
 static int at_geom_ok;
 static float *at_buf;
@@ -84,7 +84,7 @@ static float *at_buf;
 
 static uint32_t dn_hbm_base;
 // DeltaNet slots whose state is still the reset's zero (bit s): with the stream layout the
-// layer's op 5 takes it as +0.0 (BONSAI_DNSTREAM_ZERO) instead of hybrid_reset clearing the
+// layer's op 5 takes it as +0.0 (TRIXIUM_DNSTREAM_ZERO) instead of hybrid_reset clearing the
 // 144 MiB in engine DDR (34 M cycles of every generation's first token on the 27B).
 static uint64_t dn_state_zero;
 
@@ -123,7 +123,7 @@ struct hyb_prof {
     uint8_t logits_clean;            // the CPU holds no dirty line of `logits` (lm_head_argmax)
     uint64_t fd_prep, fd_mv;         // inside hyb_cyc_fdown: the down prepare, the down matvec
 };
-#define HP ((struct hyb_prof *)BONSAI_HYBPROF_ADDR)
+#define HP ((struct hyb_prof *)TRIXIUM_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
 static uint32_t hyb_forwards_profiled;
 
@@ -140,7 +140,7 @@ static float *silu_lut;
 #define DN_HEAD_BYTES (DN_HW_ROWS*DN_HW_COLS*4u)
 #define DN_HEAD_BEATS (DN_HEAD_BYTES/32u)
 
-// DeltaNet stream (engine op 5, BONSAI_HAS_DNSTREAM): every head of a layer in one op, the
+// DeltaNet stream (engine op 5, TRIXIUM_HAS_DNSTREAM): every head of a layer in one op, the
 // state striped over the channels - channel c holds rows c, c+n_ch, ... of every head, in
 // the unit's column-group-major order (gateware/deltanet_stream.py), heads in processing
 // order, n_dn*nv head matrices per layer set; the layout is chosen at hybrid_reset
@@ -189,7 +189,7 @@ static void dn_hw_reset(void)
 void hybrid_dnres_enable(int on) { HP->dnres_enabled = on ? 1 : 0; }
 void hybrid_dnstream_enable(int on)
 {
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
     HP->dnstream_enabled = on ? 1 : 0;
 #else
     (void)on;
@@ -198,7 +198,7 @@ void hybrid_dnstream_enable(int on)
 int hybrid_dnstream_enabled(void) { return HP->dnstream_enabled; }
 void hybrid_attnstream_enable(int on)
 {
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     HP->attnstream_enabled = on ? 1 : 0;
 #else
     (void)on;
@@ -227,20 +227,20 @@ int hybrid_present(void)
 // Helpers -------------------------------------------------------------------------------------
 
 static float *sigmoid_lut;
-static float sigmoidf(float x) { return bonsai_sigmoid_lookup(x, sigmoid_lut); }
+static float sigmoidf(float x) { return trixium_sigmoid_lookup(x, sigmoid_lut); }
 static float softplusf(float x){ return x > 20.0f ? x : log1pf(expf(x)); }
 
 static void silu_lut_init(void)
 {
-    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) {
-        float x = -BONSAI_SILU_LUT_LIMIT + (float)i*(1.0f/BONSAI_SILU_LUT_SCALE);
+    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) {
+        float x = -TRIXIUM_SILU_LUT_LIMIT + (float)i*(1.0f/TRIXIUM_SILU_LUT_SCALE);
         silu_lut[i] = x/(1.0f + expf(-x));
     }
 }
 
 static inline float siluf(float x)
 {
-    return bonsai_silu_lookup(x, silu_lut);
+    return trixium_silu_lookup(x, silu_lut);
 }
 
 // The canonical FP32 sum of squares (docs/canonical-reductions.md): 64 partial sums, element
@@ -325,7 +325,7 @@ static float *fetch_f32(const struct bons_entry *e)
     float *dst = infer_halloc((uint64_t)e->rows*e->cols*sizeof(float), 0);
     if (!dst) return NULL;
     for (uint32_t r = 0; r < e->rows; r++) {
-        infer_fetch_f32(BONSAI_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)r*rb)*32, rb,
+        infer_fetch_f32(TRIXIUM_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)r*rb)*32, rb,
                         dst + (uint64_t)r*e->cols, e->cols);
     }
     return dst;
@@ -469,7 +469,7 @@ int hybrid_init(void)
         // Keep the same conservative KV reservation as the image converter, then place
         // whole recurrent matrices immediately above it. Hybrid attention currently keeps
         // its KV cache in main RAM, but reserving the range makes this layout future-proof.
-        uint32_t kv_base = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32
+        uint32_t kv_base = (uint32_t)((TRIXIUM_CHAN_WEIGHT_BASE + H->payload_beats*32
                                       + 0xFFFu) & ~0xFFFu);
         uint32_t kv_rb = 1u + (uint32_t)head_dim/32u;
         uint32_t kv_region = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)
@@ -478,10 +478,10 @@ int hybrid_init(void)
                       + (uint64_t)n_lay*n_kv_head*2u*kv_region*32u;
         dn_hbm_base = (uint32_t)((base + 0xFFFu) & ~0xFFFull);
         uint64_t state_per_channel = ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
-        uint32_t skew_count = BONSAI_CHAN_MOD ? BONSAI_CHAN_MOD - 1u : 0u;
-        uint64_t limit = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + BONSAI_CHAN_STRIDE
-                       - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE) - 0x1000u
-                       - (uint64_t)skew_count*BONSAI_CHAN_SKEW;
+        uint32_t skew_count = TRIXIUM_CHAN_MOD ? TRIXIUM_CHAN_MOD - 1u : 0u;
+        uint64_t limit = (uint64_t)TRIXIUM_CHAN_WEIGHT_BASE + TRIXIUM_CHAN_STRIDE
+                       - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) - 0x1000u
+                       - (uint64_t)skew_count*TRIXIUM_CHAN_SKEW;
         if ((uint64_t)dn_hbm_base + state_per_channel > limit) {
             printf("hybrid: DeltaNet state reaches %08lx, past channel limit %08lx - "
                    "reconvert for this board\n",
@@ -492,13 +492,13 @@ int hybrid_init(void)
         HP->dnres_enabled = 1;
     }
 #endif
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     // Attention stream (engine op 6): K and V rows position-striped over the channels (row
     // t on channel t % n_ch, slot t / n_ch), per attention layer a K span then a V span,
     // above the DeltaNet state. main RAM keeps its copy (the CPU path's, always complete).
     at_geom_ok = 0;
     {
-        uint32_t kv_base = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFFu) & ~0xFFFu);
+        uint32_t kv_base = (uint32_t)((TRIXIUM_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFFu) & ~0xFFFu);
         uint32_t kv_rb = 1u + (uint32_t)head_dim/32u;
         uint32_t kv_region = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch*kv_rb;
         uint64_t base = (uint64_t)kv_base + (uint64_t)n_lay*n_kv_head*2u*kv_region*32u;
@@ -507,16 +507,16 @@ int hybrid_init(void)
             base = (uint64_t)dn_hbm_base + ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
 #endif
         base = (base + 0xFFFu) & ~0xFFFull;
-        uint32_t skew_count = BONSAI_CHAN_MOD ? BONSAI_CHAN_MOD - 1u : 0u;
-        uint64_t limit = (uint64_t)BONSAI_CHAN_WEIGHT_BASE + BONSAI_CHAN_STRIDE
-                       - (BONSAI_CHAN_WEIGHT_BASE % BONSAI_CHAN_STRIDE) - 0x1000u
-                       - (uint64_t)skew_count*BONSAI_CHAN_SKEW;
+        uint32_t skew_count = TRIXIUM_CHAN_MOD ? TRIXIUM_CHAN_MOD - 1u : 0u;
+        uint64_t limit = (uint64_t)TRIXIUM_CHAN_WEIGHT_BASE + TRIXIUM_CHAN_STRIDE
+                       - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) - 0x1000u
+                       - (uint64_t)skew_count*TRIXIUM_CHAN_SKEW;
         at_rowbeats = (uint32_t)(n_kv_head*head_dim)/8u;
         at_slots = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
         uint64_t end = base + (uint64_t)n_attn*2u*at_slots*at_rowbeats*32u;
         at_hbm_base = (uint32_t)base;
-        at_geom_ok = n_attn && n_head <= BONSAI_ATTN_LANES && n_kv_head <= BONSAI_ATTN_GROUPS &&
-                     head_dim >= 8 && head_dim <= BONSAI_ATTN_HD_MAX && !(head_dim & (head_dim - 1)) &&
+        at_geom_ok = n_attn && n_head <= TRIXIUM_ATTN_LANES && n_kv_head <= TRIXIUM_ATTN_GROUPS &&
+                     head_dim >= 8 && head_dim <= TRIXIUM_ATTN_HD_MAX && !(head_dim & (head_dim - 1)) &&
                      n_head % n_kv_head == 0 && at_rowbeats <= 255 && end <= limit;
         if (n_attn && !at_geom_ok)
             printf("hybrid: attention stream off (geometry or K/V span %08lx..%08lx past %08lx)\n",
@@ -534,7 +534,7 @@ int hybrid_init(void)
     uint64_t room = infer_heap_room(1);
     // Work buffers: the widest activation a few times over, plus the logits.
     uint64_t work_b = 24u*(uint64_t)(ffn_dim > 2*nq + nvh ? ffn_dim : 2*nq + nvh)*4
-                    + 4u*H->vocab + (256u << 10) + sizeof(float)*(BONSAI_SILU_LUT_N + 1);
+                    + 4u*H->vocab + (256u << 10) + sizeof(float)*(TRIXIUM_SILU_LUT_N + 1);
     while (ctx_cap > 16 && state_b + kv_b + work_b > room) {
         ctx_cap /= 2;
         kv_b = (uint64_t)n_attn*ctx_cap*kv_dim*4*2;
@@ -551,11 +551,11 @@ int hybrid_init(void)
     kc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
     kc_rows = n_attn ? infer_halloc(((uint64_t)n_attn*2 + 31) & ~31ull, 0) : NULL;
-    silu_lut = infer_halloc(sizeof(float)*(BONSAI_SILU_LUT_N + 1), 0);
+    silu_lut = infer_halloc(sizeof(float)*(TRIXIUM_SILU_LUT_N + 1), 0);
     silu_lut_init();
-    sigmoid_lut = infer_halloc(sizeof(float)*(BONSAI_SILU_LUT_N + 1), 0);
-    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++)
-        sigmoid_lut[i] = bonsai_sigmoid_point(-BONSAI_SILU_LUT_LIMIT + (float)i*(1.0f/BONSAI_SILU_LUT_SCALE));
+    sigmoid_lut = infer_halloc(sizeof(float)*(TRIXIUM_SILU_LUT_N + 1), 0);
+    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++)
+        sigmoid_lut[i] = trixium_sigmoid_point(-TRIXIUM_SILU_LUT_LIMIT + (float)i*(1.0f/TRIXIUM_SILU_LUT_SCALE));
 
     int wmax = n_embd;
     if (ffn_dim > wmax) wmax = ffn_dim;
@@ -575,7 +575,7 @@ int hybrid_init(void)
     gateb = infer_halloc(ffn_dim*4, 0); upb = infer_halloc(ffn_dim*4, 0);
     actb = infer_halloc(ffn_dim*4, 0);   // Resident FFN activation (gateb keeps the gate trace).
     scores = infer_halloc(ctx_cap*4, 0);
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     // Scores, then p, for every head: [n_head][ctx_cap rounded to 8].
     at_buf = at_geom_ok ? infer_halloc((uint64_t)n_head*((ctx_cap + 7) & ~7)*4, 1) : NULL;
     if (!at_buf) at_geom_ok = 0;
@@ -625,12 +625,12 @@ int hybrid_init(void)
     HP->hwargmax = 1;
     HP->lm_chunk = 0;
     HP->logits_clean = 0;
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     HP->attnstream_enabled = 1;
 #else
     HP->attnstream_enabled = 0;
 #endif
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
     HP->dnstream_enabled = 1;
 #else
     HP->dnstream_enabled = 0;
@@ -644,7 +644,7 @@ int hybrid_init(void)
             uint32_t *stage = infer_halloc(1025*32, 0);   // Table image for the DMA.
             if (resident_silu_init(silu_lut, stage) == 0) {
                 puts("hybrid: resident FFN activation (unit 11 SiLU-multiply) on");
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
                 uint32_t *sig_image = n_attn && H->attn_gated ? infer_halloc(1025*32, 0) : NULL;
                 if (sig_image && resident_gate_init(sigmoid_lut, sig_image) == 0)
                     puts("hybrid: attention output gate on unit 11 (sigmoid table, ABI 1.2)");
@@ -655,8 +655,8 @@ int hybrid_init(void)
             HP->xres_enabled = 1;
             if (n_dn && resident_silu_active())
                 puts("hybrid: resident DeltaNet layer (conv/norm/SiLU units, lists) on");
-#ifdef BONSAI_HAS_DNSTREAM
-            if (n_dn && dn_hw && BONSAI_DNSTREAM_LANES == n_ch)
+#ifdef TRIXIUM_HAS_DNSTREAM
+            if (n_dn && dn_hw && TRIXIUM_DNSTREAM_LANES == n_ch)
                 printf("hybrid: DeltaNet stream (engine op 5, %d lanes) on from the next reset\n", n_ch);
 #endif
 #endif
@@ -729,16 +729,16 @@ static int dn_conv_zero(void)
 void hybrid_reset(void)
 {
     pos = 0;
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     HP->attnstream_active = HP->attnstream_enabled && at_geom_ok && resident_active();
 #endif
     if (dn_hw) {
         int cleared = 0;
         dn_state_zero = 0;
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
         HP->dnstream_active = HP->dnstream_enabled && hybrid_dnres_enabled()
-                            && BONSAI_DNSTREAM_LANES == n_ch && DN_HEAD_BEATS % (uint32_t)n_ch == 0;
-#ifdef BONSAI_DNSTREAM_ZERO
+                            && TRIXIUM_DNSTREAM_LANES == n_ch && DN_HEAD_BEATS % (uint32_t)n_ch == 0;
+#ifdef TRIXIUM_DNSTREAM_ZERO
         // Only op 5 touches the stream layout (every other path stops with DNSTALL), so the
         // first op of each layer can take its state as zero instead of the clear.
         if (HP->dnstream_active && n_dn <= 64) {
@@ -1010,7 +1010,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         const float *qh = dn_q + kh*hk, *kk = dn_k + kh*hk, *vh = dn_v + hh*hv;
         float *M = S + (uint64_t)hh*hv*hk;
         t0 = perf_now64();
-        float decay = bonsai_decay_exp(gb[hh]);
+        float decay = trixium_decay_exp(gb[hh]);
         float *oh = ob + hh*hv;
         // One pass over the state: row j's delta depends on row j alone, so the decay,
         // the k dot, the update and the q dot happen while the row (512 B) is in the
@@ -1056,7 +1056,7 @@ static uint32_t f32_bits_any(float x)
 #define XRES_SP   0x36600u        // the resident residual stream (above the persistent map)
 static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
 // The stream op's records: one per head in processing order at slot0 (q, k, v, out byte
 // addresses; decay, beta, scale), from betab/gb.
 
@@ -1070,7 +1070,7 @@ static void dn_stream_records(uint32_t slot0, uint32_t ho, float scale, int rep)
         w[1] = DNR_QKV + 4u*(uint32_t)(nq + kh*hk);
         w[2] = DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv);
         w[3] = ho + 4u*(uint32_t)(hh*hv);
-        w[4] = f32_bits(bonsai_decay_exp(gb[hh]));
+        w[4] = f32_bits(trixium_decay_exp(gb[hh]));
         w[5] = f32_bits(betab[hh]);
         w[6] = f32_bits(scale);
         w[7] = 0;
@@ -1094,7 +1094,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // outputs right above them, so z stays at Z for the gated norm (no park in main RAM,
     // no fetch back - ~6k cycles per 27B layer).
     int z_stays = 0;
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
     if (dn_hw && HP->dnstream_active &&
         SLOT0 + 0x800u + 4u*(uint32_t)nvh <= RS_F_ADDR && 32u*(uint32_t)nv <= 0x800u) {
         HO = SLOT0 + 0x800u;
@@ -1106,8 +1106,8 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     uint32_t eps = f32_bits_any(rms_eps);
     if (!HP->dnres_enabled || !resident_silu_active() || !H->hadamard_block || conv_k != 4 ||
         Z2 + 4u*(uint32_t)nvh > RS_F_ADDR || C % 8 || hv % 8 || hk % 8 ||
-        (seq_silu_abi_read() & 0xffff) < 1 || (seq_norm_abi_read() >> 16) != 1 ||
-        (seq_conv_abi_read() >> 16) != 1)
+        (trixium_seq_silu_abi_read() & 0xffff) < 1 || (trixium_seq_norm_abi_read() >> 16) != 1 ||
+        (trixium_seq_conv_abi_read() >> 16) != 1)
         return -1;
 #ifdef DN_STATE_HW
     if (dn_hw && (SLOT0 + 2u*DN_HEAD_BYTES > XRES_SP || nv > 64))
@@ -1122,7 +1122,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // above their regions, over BA/AL and the records.
     const struct bons_entry *e_qkv = model_entry(ROLE_ATTN_QKV, l), *e_z = model_entry(ROLE_ATTN_ZGATE, l);
     int early = 0;
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
     early = dn_hw && HP->dnstream_active && z_stays && e_qkv && e_z &&
             !(e_qkv->flags & FLAG_KSEG) && !(e_z->flags & FLAG_KSEG);
 #endif
@@ -1203,7 +1203,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             betab[hh] = sigmoidf(betab[hh]);
             gb[hh]    = softplusf(alphab[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
         }
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
         if (dn_hw && HP->dnstream_active)
             dn_stream_records(SLOT0, HO, scale, rep);
 #endif
@@ -1213,7 +1213,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     if (rl_wait())
         goto fatal;
     dn_conv_pos[s] = (uint8_t)p1;
-    if (seq_silu_fixups_read())
+    if (trixium_seq_silu_fixups_read())
         resident_silu_patch(DNR_QKV, 0, DNR_QKV, FIX, C, 0, 0, 0);
     dn_cyc_conv += perf_now64() - t0 - act_dt;
     t0 = perf_now64();
@@ -1226,7 +1226,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
 
     // Heads: outputs in natural head order at HO.
     t0 = perf_now64();
-#ifdef BONSAI_HAS_DNSTREAM
+#ifdef TRIXIUM_HAS_DNSTREAM
     if (dn_hw && HP->dnstream_active) {
         // Every head in one engine op, the records written during the conv list; the
         // state streamed from and back to every channel. The read-back fences the CPU's
@@ -1264,7 +1264,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             int kh = hh % nk;
             const float *qh = dn_q + kh*hk, *kk = dn_k + kh*hk, *vh = dn_v + hh*hv;
             float *M = dn_state + ((uint64_t)s*nv + hh)*hv*hk, *oh = ob + hh*hv;
-            float decay = bonsai_decay_exp(gb[hh]);
+            float decay = trixium_decay_exp(gb[hh]);
             int j = 0;
             for (; j + 3 < hv; j += 4)
                 deltanet_rows4(M + j*hk, hk, kk, qh, vh + j, decay, betab[hh], scale, oh + j);
@@ -1297,7 +1297,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     rl_desc(&d);
     if (rl_run("deltanet gated norm"))
         goto fatal;
-    if (seq_silu_fixups_read())
+    if (trixium_seq_silu_fixups_read())
         resident_silu_patch(Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, (uint32_t)hv, (uint32_t)nk, (uint32_t)rep);
     // og stays in RS_F for the out projection's prepare (its store was a list of its own,
     // ~6k cycles per layer): a failure past this point invalidates the token anyway - the
@@ -1344,7 +1344,7 @@ static int xres_ok(void)
 {
     return HP->xres_enabled && resident_active() && n_embd % 8 == 0 && n_embd <= 8192 &&
            XRES_SP + 4u*(uint32_t)n_embd <= 0x3C000u &&
-           (seq_norm_abi_read() >> 16) == 1 && (seq_conv_abi_read() >> 16) == 1;
+           (trixium_seq_norm_abi_read() >> 16) == 1 && (trixium_seq_conv_abi_read() >> 16) == 1;
 }
 
 static int xres_list(const float *y, const float *w, int load, int sync)
@@ -1381,7 +1381,7 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 }
 #endif
 
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
 // Attention stream (engine op 6, gateware/attn_stream.py). Scratchpad while the attention
 // core runs (the q/k/v list has stored its outputs; RS_Y and RS_F are free until the out
 // projection's prepare):
@@ -1418,7 +1418,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
                (ksp ? KB + (uint32_t)kv_dim*4u <= AT_REC && VB + (uint32_t)kv_dim*4u <= AT_REC
                     : (uint32_t)kv_dim*4u <= AT_VST - AT_KST) &&
                nq*hd*4u <= AT_O_END - AT_O && nq*Tp*4u <= AT_SP_END - AT_SP &&
-               T <= BONSAI_ATTN_T_MAX;
+               T <= TRIXIUM_ATTN_T_MAX;
     struct engine_op o;
     uint64_t ts = perf_now64(), tn;
 #define AT_SUB(i) do { tn = perf_now64(); HP->at_sub[i] += tn - ts; ts = tn; } while (0)
@@ -1458,7 +1458,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     for (uint32_t hh = 0; hh < nq; hh++) {
         float *sc = at_buf + hh*Tp, mx = -1e30f, sum = 0;
         for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
-        for (int t = 0; t < T; t++) { sc[t] = bonsai_softmax_exp(sc[t] - mx); sum += sc[t]; }
+        for (int t = 0; t < T; t++) { sc[t] = trixium_softmax_exp(sc[t] - mx); sum += sc[t]; }
         for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
     }
     AT_SUB(3);
@@ -1487,8 +1487,8 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
             resident_silu_restore();
         return -1;
     }
-#ifdef CSR_SEQ_SILU_FIXUPS_ADDR
-    if (unit_gate && seq_silu_fixups_read())
+#ifdef CSR_TRIXIUM_SEQ_SILU_FIXUPS_ADDR
+    if (unit_gate && trixium_seq_silu_fixups_read())
         for (uint32_t hh = 0; hh < nq; hh++)
             resident_gate_patch(AT_FX + hh*32u, QB + (hh*qstride + hd)*4u, AT_O + hh*hd*4u,
                                 attnb + hh*hd, hd);
@@ -1506,7 +1506,7 @@ static int attn_kv_main(int a, int T, float *K, float *V)
 {
     uint32_t have = kc_rows ? kc_rows[a] : 0, last = (uint32_t)T - 1u;
     if (kc_rows && have < last) {
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
         uint32_t rb = at_rowbeats, rowbytes = rb*32u, nch = (uint32_t)n_ch;
         uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes, vspan = kspan + at_slots*rowbytes;
         uint32_t bytes = (uint32_t)kv_dim*4u, per = 8;          // 8 rows of K and V per list: 64 KB of RS_F
@@ -1558,7 +1558,7 @@ static void attention_layer(int l, const float *h, float *out)
     uint32_t QS = RS_Y_ADDR, KS = QS + 4*qrows, VS = KS + 4*(uint32_t)kv_dim;
     uint32_t NQ = VS + 4*(uint32_t)kv_dim, NK = NQ + 4*(uint32_t)head_dim;
     if (H->hadamard_block && resident_active() && HP->dnres_enabled && head_dim % 8 == 0 &&
-        NK + 4u*(uint32_t)head_dim <= RS_F_ADDR && (seq_norm_abi_read() & 0xffff) >= 1) {
+        NK + 4u*(uint32_t)head_dim <= RS_F_ADDR && (trixium_seq_norm_abi_read() & 0xffff) >= 1) {
         struct bns_seq_descriptor d;
         uint32_t eps = f32_bits_any(rms_eps), hb8 = (uint32_t)head_dim/8;
         // With the attention stream and norm ABI 1.2 the RoPE runs on unit 12 too and q, k
@@ -1566,8 +1566,8 @@ static void attention_layer(int l, const float *h, float *out)
         // the cos/sin of this position go behind the k norm weight.
         uint32_t RT = (NK + 4u*(uint32_t)head_dim + 31u) & ~31u;
         int want_rope = 0;
-#ifdef BONSAI_HAS_ATTNSTREAM
-        want_rope = HP->attnstream_active && kc_rows && (seq_norm_abi_read() & 0xffff) >= 2 &&
+#ifdef TRIXIUM_HAS_ATTNSTREAM
+        want_rope = HP->attnstream_active && kc_rows && (trixium_seq_norm_abi_read() & 0xffff) >= 2 &&
                     rope_n % 16 == 0 && rope_n <= 256 && rope_n <= head_dim &&
                     RT + 4u*(uint32_t)rope_n <= RS_F_ADDR && VS + 4u*(uint32_t)kv_dim <= AT_REC;
 #endif
@@ -1623,7 +1623,7 @@ static void attention_layer(int l, const float *h, float *out)
     // The stream reads the q heads where they are (inside [q | gate] when gated, the
     // unit's lane stride); the CPU loop wants them contiguous in qb, copied only if it runs.
     int q_in_place = 0;
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     q_in_place = gated && HP->attnstream_active;
 #endif
     float *qheads = q_in_place ? qfull : qb;
@@ -1648,7 +1648,7 @@ static void attention_layer(int l, const float *h, float *out)
     t1 = perf_now64(); HP->at_rope += t1 - t0; t0 = t1;
     int   T = pos + 1;
     int stream_on = 0;
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     stream_on = HP->attnstream_active && kc_rows;
 #endif
     if (!stream_on && attn_kv_main(a, T, K, V)) {
@@ -1659,7 +1659,7 @@ static void attention_layer(int l, const float *h, float *out)
     HP->at_sub[0] += perf_now64() - t0;
     float scale = 1.0f/sqrtf((float)head_dim);
     int streamed = 0;                  // 1: attnb holds the outputs, 2: gated too
-#ifdef BONSAI_HAS_ATTNSTREAM
+#ifdef TRIXIUM_HAS_ATTNSTREAM
     if (HP->attnstream_active) {
         int rc = attn_stream(a, T, scale, gated, qheads, (uint32_t)qstride, r_q, r_k, r_v);
         streamed = rc < 0 ? 0 : 1 + rc;
@@ -1705,7 +1705,7 @@ static void attention_layer(int l, const float *h, float *out)
             if (scores[t] > mx) mx = scores[t];
         }
         float sum = 0;
-        for (int t = 0; t < T; t++) { scores[t] = bonsai_softmax_exp(scores[t] - mx); sum += scores[t]; }
+        for (int t = 0; t < T; t++) { scores[t] = trixium_softmax_exp(scores[t] - mx); sum += scores[t]; }
         for (int i = 0; i < head_dim; i++) oh[i] = 0;
         for (int t = 0; t < T; t++) {
             const float *vt = V + (uint64_t)t*kv_dim + kvh*head_dim;
@@ -1768,7 +1768,7 @@ static int lm_head_list(const struct bons_entry *head, float *dst)
     return rl_run("lm head");
 }
 
-#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+#ifdef CSR_TRIXIUM_SEQ_RESTORE_ARGMAX_IDX_ADDR
 // The greedy argmax of the LM head without the CPU's pass over ~250k logits: one list per
 // chunk, the restore unit's tracker read after each. Within a chunk the list order
 // (channel-major) is increasing model row, so the tracker's first-occurrence tie-break is
@@ -1806,8 +1806,8 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
         rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u, NULL, 0);
         if (rl_run("lm head"))
             return -1;
-        uint32_t idx = seq_restore_argmax_idx_read();
-        union { uint32_t u; float f; } v = { seq_restore_argmax_val_read() };
+        uint32_t idx = trixium_seq_restore_argmax_idx_read();
+        union { uint32_t u; float f; } v = { trixium_seq_restore_argmax_val_read() };
         uint32_t row = idx < rows ? (idx/rpc)*per + r0/nch + idx % rpc : 0xFFFFFFFFu;
         if (frozen)
             continue;
@@ -1843,7 +1843,7 @@ static int head_argmax(uint64_t t0)
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head) head = model_entry(ROLE_TOK_EMB, 0);
     int best = -1;
-#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+#ifdef CSR_TRIXIUM_SEQ_RESTORE_ARGMAX_IDX_ADDR
     // Several chunks and the hardware argmax on: one list per chunk (lm_head_argmax).
     if (HP->hwargmax && head && head->rows > lm_chunk_rows()) {
         best = lm_head_argmax(head, logits);
@@ -1865,11 +1865,11 @@ static int head_argmax(uint64_t t0)
         HP->logits_clean = 0;            // CPU-written: lm_head_argmax flushes it first
     }
     infer_dbg_f32("logits", -1, logits, H->vocab);
-#ifdef CSR_SEQ_RESTORE_ARGMAX_IDX_ADDR
+#ifdef CSR_TRIXIUM_SEQ_RESTORE_ARGMAX_IDX_ADDR
     // The restore unit tracked the firmware loop's greedy argmax over everything the LM
     // head list restored; rows past the vocabulary (padding) winning means: loop instead.
     if (head_done && HP->hwargmax && one_chunk) {
-        uint32_t i = seq_restore_argmax_idx_read();
+        uint32_t i = trixium_seq_restore_argmax_idx_read();
         if (i < H->vocab) best = (int)i;
     }
 #endif

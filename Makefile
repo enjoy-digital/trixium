@@ -6,10 +6,9 @@
 
 PYTHON  ?= .venv/bin/python
 PIP     ?= .venv/bin/pip
-PYTEST  ?= .venv/bin/pytest
+PYTEST  ?= $(PYTHON) -m pytest
 
-# Vivado 2024.1 is required: the 2025.2 install lacks VU33P device support.
-VIVADO_SETTINGS ?= /opt/Xilinx/2024.1/Vivado/2024.1/settings64.sh
+export PYTHONHASHSEED := 0
 
 # Environment ------------------------------------------------------------------------------------
 
@@ -17,100 +16,99 @@ VIVADO_SETTINGS ?= /opt/Xilinx/2024.1/Vivado/2024.1/settings64.sh
 venv:
 	python3 -m venv .venv
 	$(PIP) install --upgrade pip
-	$(PIP) install -e ".[dev]"   # numpy tokenizers pyserial + pytest huggingface_hub; the `bonsai` CLI
-
-.PHONY: df-check
-df-check:
-	@avail=$$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
-	echo "Disk available: $${avail}G"; \
-	if [ $$avail -lt 8 ]; then echo "ERROR: less than 8 GB free, clean up first (make clean-vivado)"; exit 1; fi
+	$(PIP) install -e ".[dev]"   # numpy tokenizers pyserial + pytest huggingface_hub; the `trixium` CLI
 
 # Models -----------------------------------------------------------------------------------------
 
-.PHONY: models
-models: df-check
+.PHONY: models tiny convert
+models:
 	./scripts/download_models.sh
 
-.PHONY: tiny
+# The tiny random models the tests and the simulation use (seconds).
 tiny:
-	$(PYTHON) -m trixium.model.tinygen --out models/tiny
+	$(PYTHON) -m trixium.model.tinygen --out models/tiny --channels 8 --hybrid-1k
 
-# The model path: GGUF -> BONS image (~13 s, ~2 GB RAM for the 1.7B; ~60 s for the 8B) + the
-# C tool's tokenizer. `make convert GGUF=models/8b/Ternary-Bonsai-8B-PQ2_0.gguf` for the 8B.
+# GGUF -> BONS image + the chat tool's tokenizer. `make convert GGUF=... CHANNELS=16`.
 GGUF     ?= models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf
 CHANNELS ?= 16
-.PHONY: convert
 convert:
 	$(PYTHON) -m trixium.cli convert $(GGUF) --channels $(CHANNELS)
 	$(PYTHON) -m trixium.cli tokenizer $(dir $(GGUF))tokenizer.json
 
-# The card: deploy a build to the lab board (tools/board.env), or chat where the card is.
-BUILD ?= n16_212_v16b
-.PHONY: deploy chat
-deploy:
-	$(PYTHON) -m trixium.cli deploy $(BUILD)
-chat: software
-	$(PYTHON) -m trixium.cli chat
+# Tests ------------------------------------------------------------------------------------------
 
-# Tests / Simulation -----------------------------------------------------------------------------
-
-.PHONY: test
+.PHONY: test test-guarded
 test:
 	$(PYTEST)
 
-.PHONY: test-slow
-test-slow:
-	$(PYTEST) --runslow
+# One process per test file with a memory guard (some files peak at ~10 GB).
+test-guarded:
+	$(PYTHON) tools/run_tests_guarded.py --out build/tests
 
-.PHONY: sim
+# Simulation (Verilator) -------------------------------------------------------------------------
+#
+#   make sim                 build: headers, firmware, Verilog (~1 min), Verilator (~2.5 min)
+#   make sim-run             run it (console on stdin/stdout)
+#   make sim-firmware        rebuild the firmware and re-bake it into the built sim (seconds)
+#   make sim-gate            traced generation compared with the Python mirror (~17 min)
+
+SIM_BOARD ?= xcu1525
+SIM_IMAGE ?= models/tiny/bonsai-tiny-hybrid-1k-n8.img
+SIM_DIR    = build/sim_$(SIM_BOARD)
+
+.PHONY: sim sim-run sim-firmware sim-gate
 sim:
-	$(PYTHON) trixium/targets/sim.py
+	$(PYTHON) -m trixium.targets.sim --board $(SIM_BOARD) --image $(SIM_IMAGE) --build-software
+	$(MAKE) -C firmware BUILD_DIR=../$(SIM_DIR)
+	$(PYTHON) -m trixium.targets.sim --board $(SIM_BOARD) --image $(SIM_IMAGE) --firmware firmware/trixium.bin
+	cd $(SIM_DIR)/gateware && bash build_sim.sh
 
-# Gateware ---------------------------------------------------------------------------------------
+sim-run:
+	cd $(SIM_DIR)/gateware && ./obj_dir/Vsim
 
-.PHONY: gateware-a gateware-b gateware-c
-gateware-a: df-check
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=a --build"
+sim-firmware:
+	$(MAKE) -C firmware BUILD_DIR=../$(SIM_DIR)
+	$(PYTHON) tools/sim_rebake.py $(SIM_DIR)/gateware $(SIM_IMAGE) firmware/trixium.bin
 
-gateware-b: df-check
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=b --build"
+sim-gate:
+	mkdir -p build/sim-gate
+	$(PYTHON) tools/card_vs_mirror.py mirror $(SIM_IMAGE) --ids '1 2 3' -o build/sim-gate/mirror.txt
+	$(PYTHON) tools/sim_resident_gate.py --sim $(SIM_DIR)/gateware --out build/sim-gate \
+	    --ids '1 2 3' --dbg 3 --expect-silu --skip-off
+	$(PYTHON) tools/card_vs_mirror.py compare build/sim-gate/mirror.txt build/sim-gate/trace-on.txt
 
-gateware-c: df-check
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=c --build"
+# Gateware (Vivado 2024.1) -----------------------------------------------------------------------
 
-.PHONY: load-a load-b load-c
-load-a:
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=a --load"
+.PHONY: gateware-xcu1525 gateware-fk33
+gateware-xcu1525:
+	tools/build_xcu1525.sh xcu1525
 
-load-b:
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=b --load"
-
-load-c:
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=c --load"
+gateware-fk33:
+	tools/build_fk33.sh fk33
 
 # Software ---------------------------------------------------------------------------------------
+#
+# BUILD: the build directory (under build/) whose headers the firmware/host tools compile against.
 
-.PHONY: firmware
+BUILD ?= xcu1525
+
+.PHONY: firmware software driver
 firmware:
 	$(MAKE) -C firmware BUILD_DIR=../build/$(BUILD)
 
-.PHONY: software
 software:
 	$(MAKE) -C trixium/software/user BUILD_DIR=../../../build/$(BUILD)
 
-.PHONY: driver
 driver:
 	$(MAKE) -C trixium/software/kernel
 
 # Cleanup ----------------------------------------------------------------------------------------
 
-.PHONY: clean-vivado
+.PHONY: clean-vivado clean
 clean-vivado:
 	rm -rf build/*/gateware/vivado* build/*/gateware/.Xil build/*/gateware/*.dcp
 	rm -rf .Xil vivado*.jou vivado*.log
-	df -h / | tail -1
 
-.PHONY: clean
 clean:
-	rm -rf build firmware/build
+	rm -rf build
 	find . -name __pycache__ -type d -exec rm -rf {} +

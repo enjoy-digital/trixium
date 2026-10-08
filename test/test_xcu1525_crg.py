@@ -103,31 +103,28 @@ def test_idelayctrl_reset_waits_for_mmcm_lock():
     run_simulation(dut, [gen()], clocks={"sys": 10, "idelay": 4, "idelayrst": 10, "ic": 10})
 
 
-@pytest.mark.parametrize("fast_clock_buffer", ["bufgce", "bufgce-div"])
-def test_serializer_clock_group_uses_related_buffer_outputs(fast_clock_buffer):
+def test_serializer_clock_group_uses_related_buffer_outputs():
     from litex_boards.platforms.sqrl_xcu1525 import Platform
     from trixium.targets.xcu1525 import _CRG
     platform = Platform()
-    crg = _CRG(platform, 150e6, fast_clock_buffer=fast_clock_buffer)
+    crg = _CRG(platform, 125e6, ddr_clk_freq=187.5e6)
     groups = [(command, signals) for command, signals in platform.constraint_manager.platform_commands
               if 'CLOCK_DELAY_GROUP' in command]
     assert len(groups) == 1
     command, signals = groups[0]
-    assert signals['slow'] is crg.cd_sys.clk
-    assert signals['fast'] is crg.cd_sys4x.clk
-    assert command.format(slow='sys_clk', fast='sys4x_clk') == (
-        'set_property CLOCK_DELAY_GROUP bonsai_ddr4 [get_nets {sys_clk sys4x_clk}]')
+    assert signals['slow'] is crg.cd_ddr.clk
+    assert signals['fast'] is crg.cd_ddr4x.clk
+    assert command.format(slow='ddr_clk', fast='ddr4x_clk') == (
+        'set_property CLOCK_DELAY_GROUP trixium_ddr4 [get_nets {ddr_clk ddr4x_clk}]')
     assert 'false_path' not in command and 'uncertainty' not in command
 
 
-@pytest.mark.parametrize("fast_clock_buffer", [None, "bufgce", "bufgce-div"])
-def test_serializer_buffers_share_mmcm_output_and_preserve_fabric_clock(fast_clock_buffer):
+def test_serializer_buffers_share_mmcm_output_and_preserve_fabric_clock():
     """Structural test, not a primitive simulation or a routed timing result."""
     from litex_boards.platforms.sqrl_xcu1525 import Platform
     from trixium.targets.xcu1525 import _CRG
 
-    kwargs = {} if fast_clock_buffer is None else {"fast_clock_buffer": fast_clock_buffer}
-    crg = _CRG(Platform(), 150e6, **kwargs)
+    crg = _CRG(Platform(), 125e6, ddr_clk_freq=187.5e6)
     buffers = [special for special in crg._fragment.specials if isinstance(special, Instance)]
     assert len(buffers) == 2
     by_output = {}
@@ -140,21 +137,9 @@ def test_serializer_buffers_share_mmcm_output_and_preserve_fabric_clock(fast_clo
         assert pins["CE"].value == 1
         by_output[id(pins["O"])] = buffer.of, pins, params
 
-    slow_type, slow_pins, slow_params = by_output[id(crg.cd_sys.clk)]
+    slow_type, slow_pins, slow_params = by_output[id(crg.cd_ddr.clk)]
     assert slow_type == "BUFGCE_DIV"
     assert slow_params["BUFGCE_DIVIDE"].value == 4
-    fast_type, fast_pins, fast_params = by_output[id(crg.cd_sys4x.clk)]
-    if fast_clock_buffer == "bufgce-div":
-        assert fast_type == "BUFGCE_DIV"
-        assert fast_params["BUFGCE_DIVIDE"].value == 1
-        assert fast_pins["CLR"].value == 0
-    else:
-        assert fast_type == "BUFGCE"
-        assert not fast_params
-
-
-def test_serializer_rejects_unknown_buffer_before_requesting_platform_resources():
-    from trixium.targets.xcu1525 import _CRG
-
-    with pytest.raises(ValueError, match="fast_clock_buffer"):
-        _CRG(None, 150e6, fast_clock_buffer="unknown")
+    fast_type, fast_pins, fast_params = by_output[id(crg.cd_ddr4x.clk)]
+    assert fast_type == "BUFGCE"
+    assert not fast_params

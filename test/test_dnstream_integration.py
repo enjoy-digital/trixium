@@ -12,7 +12,7 @@ import pytest
 from migen import run_simulation
 from litex.gen import LiteXModule
 
-from trixium.core.core import BonsaiClusterConfig
+from trixium.core.core import TriXiumConfig
 from test_integration import SoC, write
 
 MASK = 0xFFFFFFFF
@@ -69,7 +69,7 @@ def int_reference(m, q, k, v, decay, beta, scale):
 def test_dnstream_op_through_the_cluster(placement):
     L, rows, cols, heads = 2, 16, 16, 5
     R, G = rows//L, cols//8
-    config = BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024, with_dnstream=True,
+    config = TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024, with_dnstream=True,
         dnstream_options=(("rows", rows), ("cols", cols), ("add_factory", _IntAdd5),
                           ("mul_factory", _IntMul5), ("negate", lambda x: -x)),
         **placement)
@@ -130,4 +130,4 @@ def test_dnstream_op_through_the_cluster(placement):
         assert not (yield dut.engine.busy)
 
     run_simulation(dut, [gen()], clocks={'sys': 10, 'eng': 10})
-    assert 'BONSAI_HAS_DNSTREAM' in dut.constants
+    assert 'TRIXIUM_HAS_DNSTREAM' in dut.constants

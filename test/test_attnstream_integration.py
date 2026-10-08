@@ -11,7 +11,7 @@ import pytest
 
 from migen import run_simulation
 
-from trixium.core.core import BonsaiClusterConfig
+from trixium.core.core import TriXiumConfig
 from test_integration import SoC, write
 from test_dnstream_integration import _IntAdd5, _IntMul5
 
@@ -23,7 +23,7 @@ MASK = 0xFFFFFFFF
 def test_attn_op_through_the_cluster(placement, mode, T):
     n, nq, n_rep, nkv, hd = 2, 4, 2, 2, 32
     hb, rowbeats = hd//8, nkv*hd//8
-    config = BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024, with_attnstream=True,
+    config = TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024, with_attnstream=True,
         attnstream_options=(("lanes", 4), ("groups", 2), ("hb_max", 4), ("t_max", 64),
                             ("add_factory", _IntAdd5), ("mul_factory", _IntMul5)),
         **placement)
@@ -85,4 +85,4 @@ def test_attn_op_through_the_cluster(placement, mode, T):
         assert not (yield dut.engine.error)
 
     run_simulation(dut, [gen()], clocks={'sys': 10, 'eng': 10})
-    assert 'BONSAI_HAS_ATTNSTREAM' in dut.constants
+    assert 'TRIXIUM_HAS_ATTNSTREAM' in dut.constants

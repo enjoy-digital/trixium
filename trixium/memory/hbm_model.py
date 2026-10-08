@@ -32,9 +32,9 @@ def words_from_bytes(data):
         data = data + b"\x00"*(BEAT_BYTES - len(data) % BEAT_BYTES)
     return [int.from_bytes(data[i:i+BEAT_BYTES], "little") for i in range(0, len(data), BEAT_BYTES)]
 
-# BonsaiHBMChannelModel ----------------------------------------------------------------------------
+# HBMChannelModel ----------------------------------------------------------------------------
 
-class BonsaiHBMChannelModel(LiteXModule):
+class HBMChannelModel(LiteXModule):
     def __init__(self, axi=None, size=64*1024, init=None, latency=16, stall_rate=0,
                  reorder_ids=0, write_order="aw_first"):
         """

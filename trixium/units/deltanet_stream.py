@@ -94,7 +94,7 @@ def reference(state, q, k, v, decay, beta, scale):
     return m, out
 
 
-class BonsaiDeltaNetStream(LiteXModule):
+class DeltaNetStream(LiteXModule):
     def __init__(self, lanes=16, rows=128, cols=128, slots=4, adr_bits=13,
                  add_factory=ExactFP32Add, mul_factory=ExactFP32Mul,
                  negate=lambda x: x ^ 0x80000000, fifo_depth=8):

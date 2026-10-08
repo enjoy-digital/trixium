@@ -11,8 +11,8 @@ or any tty the console is on), tokenizes on the host with the HuggingFace tokeni
 uses the firmware's chat protocol (`tokclr` / `tok <ids>` / `genb <n>`) so a conversation
 continues on-card without resending history.
 
-    from trixium.client import Bonsai
-    with Bonsai() as b:
+    from trixium.client import TriXium
+    with TriXium() as b:
         b.hdrload()
         print(b.generate("The capital of France is", max_tokens=32))   # cap; ends at <|im_end|>
         for piece in b.stream("and Germany's?"):      # continues the conversation
@@ -27,20 +27,20 @@ import time
 
 DEFAULT_TTY       = "/dev/ttyLXU0"
 DEFAULT_TOKENIZER = "models/1.7b/tokenizer.json"
-PROMPT            = b"bonsai> "
+PROMPT            = b"trixium> "
 PBUF_TOKENS       = 2048       # firmware/main.c PBUF_N: the on-card conversation buffer (= max_ctx).
 LINE_MAX          = 850        # Firmware console line buffer is 1024 B; leave slack.
 
 
-class BonsaiError(RuntimeError):
+class TriXiumError(RuntimeError):
     pass
 
 
-class Bonsai:
+class TriXium:
     def __init__(self, tty=DEFAULT_TTY, tokenizer=DEFAULT_TOKENIZER, chat_template=True,
                  timeout=600.0, temperature=0.0, top_p=1.0, repeat_penalty=1.0, seed=None,
                  system=None):
-        """chat_template=False sends the text raw (completion style, like bonsai_chat).
+        """chat_template=False sends the text raw (completion style, like trixium_chat).
         temperature 0 = greedy (bit-exact, the default); repeat_penalty 1.1 alone already
         stops the list loops greedy decoding falls into."""
         import serial                          # Imported here: only the client needs it.
@@ -52,7 +52,7 @@ class Bonsai:
             fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.ser.close()
-            raise BonsaiError(f"{tty} is in use by another console session (bonsai_chat, "
+            raise TriXiumError(f"{tty} is in use by another console session (trixium_chat, "
                               "pcie_console.py, litex_term?) - close it first")
         self.tok = Tokenizer.from_file(tokenizer)
         self.chat_template = chat_template
@@ -77,7 +77,7 @@ class Bonsai:
         self.close()
 
     def _sync(self):
-        """Get to a fresh prompt: send an empty line, drain to the next `bonsai> `."""
+        """Get to a fresh prompt: send an empty line, drain to the next `trixium> `."""
         self.ser.reset_input_buffer()
         self.ser.write(b"\n")
         self.ser.flush()
@@ -94,7 +94,7 @@ class Bonsai:
                     on_bytes(chunk)
                 if needle in buf:
                     return bytes(buf)
-        raise BonsaiError(f"timeout waiting for {needle!r}; got {bytes(buf[-200:])!r}")
+        raise TriXiumError(f"timeout waiting for {needle!r}; got {bytes(buf[-200:])!r}")
 
     # The firmware's UART RX ring is 128 bytes and its ISR drops bytes when it is full; the
     # console loop drains one byte per iteration and echoes each through a TX ring the host
@@ -124,12 +124,12 @@ class Bonsai:
         surplus = self._write_paced(line.encode() + b"\n")
         out = surplus + self._read_until(PROMPT, timeout or self.timeout)
         text = out.decode(errors="replace")
-        return text.rsplit("bonsai>", 1)[0].replace("\r", "").strip("\n")
+        return text.rsplit("trixium>", 1)[0].replace("\r", "").strip("\n")
 
     def hdrload(self):
         out = self.command("hdrload", timeout=60.0)
         if "inference ready" not in out:
-            raise BonsaiError(f"hdrload did not report 'inference ready':\n{out}")
+            raise TriXiumError(f"hdrload did not report 'inference ready':\n{out}")
         return out
 
     def set_sampling(self, temperature=0.0, top_p=1.0, repeat_penalty=1.0, seed=None):
@@ -163,7 +163,7 @@ class Bonsai:
 
     def _send_ids(self, ids):
         if self.turns + len(ids) > PBUF_TOKENS:
-            raise BonsaiError(f"conversation would exceed the on-card buffer ({PBUF_TOKENS} "
+            raise TriXiumError(f"conversation would exceed the on-card buffer ({PBUF_TOKENS} "
                               "tokens); call reset()")
         i = 0
         while i < len(ids):
@@ -174,7 +174,7 @@ class Bonsai:
             out = self.command(line, timeout=10.0)
             m = re.search(r"TOK (\d+)", out)
             if not m:
-                raise BonsaiError(f"tok not acknowledged: {out!r}")
+                raise TriXiumError(f"tok not acknowledged: {out!r}")
         self.turns = int(m.group(1))
 
     def stream(self, text, max_tokens=256):
@@ -215,7 +215,7 @@ class Bonsai:
                     if piece:
                         yield piece
         if not done:
-            raise BonsaiError("generation timed out")
+            raise TriXiumError("generation timed out")
         self.turns += len(ids)
         self._closed = bool(ids) and ids[-1] == self.im_end
         if PROMPT.decode() not in pending.split("GEN DONE", 1)[1]:   # Usually in the same chunk.

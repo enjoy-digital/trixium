@@ -6,7 +6,7 @@
 
 # Axi Reader ---------------------------------------------------------------------------------------
 
-"""BonsaiAXIReader: native AXI burst reader (the weight streamer front-end).
+"""AXIReader: native AXI burst reader (the weight streamer front-end).
 
 Takes {addr, len} commands (beat-aligned byte address, length in 256-bit beats), splits them
 into INCR bursts (16 beats by default, never crossing a 4 KB boundary), keeps several bursts
@@ -46,9 +46,9 @@ from litex.soc.interconnect.axi import BURST_INCR
 
 from trixium.layout import BEAT_BYTES
 
-# BonsaiAXIReader ----------------------------------------------------------------------------------
+# AXIReader ----------------------------------------------------------------------------------
 
-class BonsaiAXIReader(LiteXModule):
+class AXIReader(LiteXModule):
     def __init__(self, axi, burst_beats=16, fifo_depth=512, n_ids=1, max_bursts=8):
         assert axi.data_width == 256
         assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"
@@ -248,7 +248,7 @@ class BonsaiAXIReader(LiteXModule):
 
 # Axi Writer ---------------------------------------------------------------------------------------
 
-"""BonsaiAXIWriter: native AXI burst writer (KV-cache append + weight loader back-end).
+"""AXIWriter: native AXI burst writer (KV-cache append + weight loader back-end).
 
 Takes {addr, len} commands and a beat data stream, splits into INCR bursts (4 KB safe),
 issues W data only after the corresponding AW was accepted, counts B responses and exposes
@@ -270,9 +270,9 @@ from litex.soc.interconnect.axi import BURST_INCR
 
 from trixium.layout import BEAT_BYTES
 
-# BonsaiAXIWriter ----------------------------------------------------------------------------------
+# AXIWriter ----------------------------------------------------------------------------------
 
-class BonsaiAXIWriter(LiteXModule):
+class AXIWriter(LiteXModule):
     def __init__(self, axi, burst_beats=16):
         assert axi.data_width == 256
         assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"

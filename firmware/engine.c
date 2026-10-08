@@ -24,11 +24,11 @@ int engine_wedged; // Sticky: an op never completed, so engine results are not t
 // soft reset: -2.
 int engine_recover(void)
 {
-    engine_csr_soft_reset_write(1);
-    engine_csr_soft_reset_write(0);
+    trixium_engine_csr_soft_reset_write(1);
+    trixium_engine_csr_soft_reset_write(0);
     uint32_t spins = 0;
-    while (engine_csr_rst_status_read() & 1) {  // busy: hold + drain
-        if (engine_csr_rst_status_read() & 2) { // stuck: a burst that never returns
+    while (trixium_engine_csr_rst_status_read() & 1) {  // busy: hold + drain
+        if (trixium_engine_csr_rst_status_read() & 2) { // stuck: a burst that never returns
             puts("ENGRESET: a port did not drain (a burst the HBM never answered) - "
                  "reconfigure the FPGA");
             return -1;
@@ -68,7 +68,7 @@ static int eng_shadow_valid;
 
 #define ENG_WR(field) do { \
     if (!eng_shadow_valid || eng_shadow.field != op->field) { \
-        engine_csr_##field##_write(op->field); \
+        trixium_engine_csr_##field##_write(op->field); \
         eng_shadow.field = op->field; \
     } } while (0)
 
@@ -81,12 +81,12 @@ static int eng_shadow_valid;
 //  - only touch scratchpad regions disjoint from the op's xsrc/dst,
 //  - CPU sideband scratchpad access stalls until the engine idles, so keep the
 //    in-between work on the vector unit (op_on_hw), not CPU loops.
-static uint32_t eng_beats0[BONSAI_N_CHANNELS];
+static uint32_t eng_beats0[TRIXIUM_N_CHANNELS];
 static uint32_t eng_nslot;
 
 uint32_t engine_submit(const struct engine_op *op)
 {
-    uint32_t done = engine_csr_done_count_read();
+    uint32_t done = trixium_engine_csr_done_count_read();
 
     ENG_WR(kind);
     ENG_WR(rows);
@@ -103,17 +103,17 @@ uint32_t engine_submit(const struct engine_op *op)
     ENG_WR(rem);
     ENG_WR(ilv);
     ENG_WR(supw);
-#ifdef CSR_ENGINE_CSR_QN_ADDR
+#ifdef CSR_TRIXIUM_ENGINE_CSR_QN_ADDR
     ENG_WR(qn);
     ENG_WR(qstride);
     ENG_WR(rshift2);
 #endif
-#ifdef CSR_ENGINE_CSR_REP_ADDR
+#ifdef CSR_TRIXIUM_ENGINE_CSR_REP_ADDR
     ENG_WR(rep);
     ENG_WR(dstride);
     ENG_WR(sstride);
 #endif
-#ifdef CSR_ENGINE_CSR_XRED_ADDR
+#ifdef CSR_TRIXIUM_ENGINE_CSR_XRED_ADDR
     // Must be written unconditionally, not only when set: the CSR is sticky, so an op that
     // left xred=1 would silently reshape the next AXPY's result layout.
     ENG_WR(xred);
@@ -122,12 +122,12 @@ uint32_t engine_submit(const struct engine_op *op)
     // which channel came up short, which is the one fact the status bits cannot give.
     // Expected delta per channel = wlen + (chan < rem ? sbeats + cbeats : 0).
     if (engine_diag) {
-        for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
-            engine_csr_perf_chan_write(c);
-            eng_beats0[c] = engine_csr_perf_beats_read();
+        for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+            trixium_engine_csr_perf_chan_write(c);
+            eng_beats0[c] = trixium_engine_csr_perf_beats_read();
         }
     } else {
-        for (int c = 0; c < BONSAI_N_CHANNELS; c++)
+        for (int c = 0; c < TRIXIUM_N_CHANNELS; c++)
             eng_beats0[c] = 0; // Stall print falls back to absolute counters.
     }
 
@@ -137,13 +137,13 @@ uint32_t engine_submit(const struct engine_op *op)
     volatile uint32_t *rslot = (volatile uint32_t *)(SCRATCHPAD_BASE + op->dst);
     eng_nslot = 0;
     if (engine_diag && op->kind == 1 && op->ilv) {
-        eng_nslot = op->rows*BONSAI_N_CHANNELS + op->rem;
+        eng_nslot = op->rows*TRIXIUM_N_CHANNELS + op->rem;
         if (eng_nslot > 64) eng_nslot = 64;
         for (uint32_t i = 0; i < eng_nslot; i++)
             rslot[i] = 0xDEADBEEFu;
     }
 
-    engine_csr_submit_write(1);
+    trixium_engine_csr_submit_write(1);
     eng_shadow_valid = 1;
     return done;
 }
@@ -166,7 +166,7 @@ void engine_join(uint32_t done)
         spin_limit = op->wlen*2u;
     uint32_t spins = 0, reports = 0;
     eng_poll_waits++;
-    while (engine_csr_done_count_read() == done) {
+    while (trixium_engine_csr_done_count_read() == done) {
         eng_poll_spins++;
         if (++spins < spin_limit)
             continue;
@@ -176,16 +176,16 @@ void engine_join(uint32_t done)
         // when the parameters are supplied by construction.
         printf("ENGSTALL st=%02lx seq=%02lx kind=%d rows=%lu rem=%lu cols=%lu wlen=%lu "
                "wbase=%08lx sb=%lu cb=%lu bias=%ld rsh=%ld ilv=%d qn=%d xsrc=%lx dst=%lx",
-               (unsigned long)engine_csr_status_read(),
-               (unsigned long)seq_status_read(), op->kind,
+               (unsigned long)trixium_engine_csr_status_read(),
+               (unsigned long)trixium_seq_status_read(), op->kind,
                (unsigned long)op->rows, (unsigned long)op->rem, (unsigned long)op->cols,
                (unsigned long)op->wlen, (unsigned long)op->wbase,
                (unsigned long)op->sbeats, (unsigned long)op->cbeats,
                (long)op->bias, (long)op->rshift, op->ilv, op->qn,
                (unsigned long)op->xsrc, (unsigned long)op->dst);
-        for (int c = 0; c < BONSAI_N_CHANNELS; c++) {
-            engine_csr_perf_chan_write(c);
-            uint32_t got  = engine_csr_perf_beats_read() - beats0[c];
+        for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+            trixium_engine_csr_perf_chan_write(c);
+            uint32_t got  = trixium_engine_csr_perf_beats_read() - beats0[c];
             uint32_t want = op->wlen + ((uint32_t)c < op->rem
                                         ? (uint32_t)op->sbeats + op->cbeats : 0);
             printf(" ch%d=%lu/%lu%s", c, (unsigned long)got, (unsigned long)want,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-2-Clause
-"""BonsaiDeltaNetStream against the firmware's recurrence loop, compiled (Verilator).
+"""DeltaNetStream against the firmware's recurrence loop, compiled (Verilator).
 
 Every lane's state stream is fed with random gaps, every output stream drained with
 random back-pressure, the scratchpad read and write grants are random: the state, the outputs and the
@@ -14,7 +14,7 @@ import pytest
 from migen.fhdl import verilog
 
 from trixium.units.deltanet_stream import (
-    BonsaiDeltaNetStream, lanes_to_state, reference, state_to_lanes)
+    DeltaNetStream, lanes_to_state, reference, state_to_lanes)
 
 f32 = np.float32
 
@@ -99,7 +99,7 @@ def build(tmp_path, lanes, rows, cols):
     verilator = shutil.which("verilator")
     if not verilator:
         pytest.skip("Verilator required")
-    dut = BonsaiDeltaNetStream(lanes=lanes, rows=rows, cols=cols)
+    dut = DeltaNetStream(lanes=lanes, rows=rows, cols=cols)
     sig = {n: getattr(dut, n) for n in ("start", "heads", "table", "zero", "busy", "done", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
     for l in range(lanes):

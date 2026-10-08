@@ -22,8 +22,8 @@ import pytest
 from migen import *
 
 from trixium.model import asm
-from trixium.core.scratchpad import BonsaiScratchpad
-from trixium.core.vector import BonsaiVectorUnit
+from trixium.core.scratchpad import Scratchpad
+from trixium.core.vector import VectorUnit
 from trixium.memory.hbm_model import words_from_bytes
 
 SP_SIZE = 16*1024
@@ -159,8 +159,8 @@ def _seeded_sp(rng):
 
 class _DUT(Module):
     def __init__(self, sp_init):
-        self.submodules.sp = BonsaiScratchpad(size=SP_SIZE, init=sp_init)
-        self.submodules.vu = BonsaiVectorUnit()
+        self.submodules.sp = Scratchpad(size=SP_SIZE, init=sp_init)
+        self.submodules.vu = VectorUnit()
         self.comb += [
             self.sp.fill.adr.eq(self.vu.sp_rd_adr),
             self.vu.sp_rd_dat.eq(self.sp.fill.dat_r),

@@ -33,7 +33,7 @@ from litepcie.phy.usppciephy import USPHBMPCIEPHY
 from litepcie.software import generate_litepcie_software
 
 from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
-from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
+from trixium.core.core import TriXiumConfig, TriXiumCore
 from trixium.targets.common import add_cluster_constraints
 from trixium.targets.platform_fk33 import Platform
 
@@ -82,7 +82,7 @@ class TriXiumFK33SoC(SoCCore):
         kwargs["jtagbone_chain"] = 2 # Chain 1 already used by HBM2 debug probes.
         SoCCore.__init__(self, platform, sys_clk_freq,
             ident = "TriXium B on FK33", **kwargs)
-        self.add_constant("BONSAI_VARIANT", ord("b"))
+        self.add_constant("TRIXIUM_VARIANT", ord("b"))
 
         # HBM --------------------------------------------------------------------------------------
         # 32 pseudo-channels: channel 0 is the CPU's main_ram, channels 1..N the engine's
@@ -120,22 +120,24 @@ class TriXiumFK33SoC(SoCCore):
         # TriXium ----------------------------------------------------------------------------------
         # One flat HBM address space: channel c's window is pseudo-channel c + 1's, at
         # HBM_WEIGHT_BASE + c*HBM_CHAN_STRIDE (256 MB per pseudo-channel, port-matched).
-        config = BonsaiClusterConfig(scratchpad_xpm=True,
+        config = TriXiumConfig(scratchpad_xpm=True,
             chan_stride = HBM_CHAN_STRIDE,
             chan_mod    = 0,
             chan_skew   = 0)
-        add_bonsai_cluster(self, memory_ports, config)
+        self.trixium = TriXiumCore(memory_ports, config)
+        for name, value in self.trixium.constants.items():
+            self.add_constant(name, value)
         add_cluster_constraints(platform)
-        self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
-            SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
-        self.comb += self.pcie_dma0.source.connect(self.loader.sink, keep={"valid", "ready", "data"})
+        self.bus.add_slave("scratchpad", self.trixium.bus,
+            SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
+        self.comb += self.pcie_dma0.source.connect(self.trixium.upload, keep={"valid", "ready", "data"})
 
         # Board memory map, for the firmware.
-        self.add_constant("BONSAI_LOADER_ADDS_CHAN_OFFSET", 1)
-        self.add_constant("BONSAI_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
-        self.add_constant("BONSAI_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
-        self.add_constant("BONSAI_CHAN_STRIDE",      HBM_CHAN_STRIDE)
-        self.add_constant("BONSAI_N_CHANNELS",       engine_channels)
+        self.add_constant("TRIXIUM_LOADER_ADDS_CHAN_OFFSET", 1)
+        self.add_constant("TRIXIUM_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
+        self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
+        self.add_constant("TRIXIUM_CHAN_STRIDE",      HBM_CHAN_STRIDE)
+        self.add_constant("TRIXIUM_N_CHANNELS",       engine_channels)
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -160,7 +162,7 @@ def main():
     # extension, so the firmware reaches clz through a .insn encoding behind this.
     if "--with-rvZbb" in (getattr(args, "vexii_args", "") or "") or \
        "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
-        soc.add_constant("BONSAI_HAS_ZBB")
+        soc.add_constant("TRIXIUM_HAS_ZBB")
 
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:

@@ -1,4 +1,4 @@
-"""Pipe-level AXPY test: one BonsaiChannelPipe driven directly, bit-exact vs bx.axpy_rows.
+"""Pipe-level AXPY test: one ChannelPipe driven directly, bit-exact vs bx.axpy_rows.
 
 Written for the 2026-09-10 area/timing changes in ternary_mac.py (registered shift
 amounts, ONE accumulate adder per lane shared by the four groups): the engine-level AXPY
@@ -16,7 +16,7 @@ from migen import *
 from trixium import layout
 from trixium.model import bitexact as bx
 from trixium.model.bons import TensorSpec, encode_rows
-from trixium.core.pipe import BonsaiChannelPipe, KIND_OP_AXPY
+from trixium.core.pipe import ChannelPipe, KIND_OP_AXPY
 
 
 def _beats(payload):
@@ -45,7 +45,7 @@ def _run_pipe(cols, T, seed, gaps=True):
     for t in range(T):
         xb[t] = int(p8[t])
 
-    pipe = BonsaiChannelPipe(xbuf_groups=8, chan_id=0, n_channels=1)
+    pipe = ChannelPipe(xbuf_groups=8, chan_id=0, n_channels=1)
     beats = _beats(payload)
     sbeats = layout.scale_beats(cols, layout.KIND_Q8)
     cbeats = layout.code_beats(cols, layout.KIND_Q8)

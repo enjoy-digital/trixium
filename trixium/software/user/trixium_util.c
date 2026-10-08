@@ -519,7 +519,7 @@ static void hbm_test(int chan, uint32_t length)
 static void help(void)
 {
     printf("TriXium utilities\n"
-           "usage: bonsai_util [options] cmd [args...]\n"
+           "usage: trixium_util [options] cmd [args...]\n"
            "\n"
            "options:\n"
            "-h                                Help.\n"
@@ -602,7 +602,7 @@ int main(int argc, char **argv)
         help();
 
     /* Select device. */
-    snprintf(litepcie_device, sizeof(litepcie_device), "/dev/bonsai%d", litepcie_device_num);
+    snprintf(litepcie_device, sizeof(litepcie_device), "/dev/trixium%d", litepcie_device_num);
 
     cmd = argv[optind++];
 

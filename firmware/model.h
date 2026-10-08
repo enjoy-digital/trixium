@@ -11,7 +11,7 @@
 #include "bons.h"
 
 // The BONS header/table location in CPU address space and the per-channel byte offset where
-// channel payloads live are provided as SoC constants (BONSAI_HDR_ADDR/BONSAI_CHAN_WEIGHT_BASE).
+// channel payloads live are provided as SoC constants (TRIXIUM_HDR_ADDR/TRIXIUM_CHAN_WEIGHT_BASE).
 
 const struct bons_header *model_header(void);
 const struct bons_entry  *model_entry(int role, int layer);

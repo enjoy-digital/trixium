@@ -140,7 +140,7 @@ RESTORE_COMMAND = [("src", 24), ("dst", 24), ("exponents", 24),
                    ("protect_start", 24), ("protect_end", 24)]
 
 
-class BonsaiProjectionRestoreScratchpad(LiteXModule):
+class ProjectionRestoreScratchpad(LiteXModule):
     """Read resident signed e8, then restore int32 -> FP32 with exponent e8+R-B.
 
     exponents names a 32-byte aligned beat whose low lane holds signed int32 e8.

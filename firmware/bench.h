@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 // Ready-to-ready timing, kept independent of the clock/console for native tests.
-#ifndef BONSAI_BENCH_H
-#define BONSAI_BENCH_H
+#ifndef TRIXIUM_BENCH_H
+#define TRIXIUM_BENCH_H
 #include <stdint.h>
 
 struct bench_samples {

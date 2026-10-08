@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiVectorUnit microcode: ISA, assembler, golden interpreter and stock programs.
+"""VectorUnit microcode: ISA, assembler, golden interpreter and stock programs.
 
 The vector unit is a microcoded 16-lane SIMD engine working on the scratchpad:
 - 8 vector registers V0..V7, 16 lanes x int32 (LDV sign-extends int16 beats, LDW loads
@@ -20,7 +20,7 @@ results; programs are validated against numpy/float references here first (accur
 then the RTL against the interpreter (bit-exact).
 
 Instruction word (32 bits), two encodings selected by VREGS (the SoC exports
-BONSAI_VEC_VREGS; firmware and bitstream must agree or the sticky bad_op/garbage follows):
+TRIXIUM_VEC_VREGS; firmware and bitstream must agree or the sticky bad_op/garbage follows):
 
   VREGS = 8  (bitstreams up to n16_200_v6c):
     [31:26] opcode | [25:23] vd | [22:20] va | [19:17] vb | [16:14] sd | [13:11] sa | [10:0] imm11
@@ -39,7 +39,7 @@ from trixium.model import bitexact as bx
 
 LANES = 16
 
-# BonsaiVectorUnit.imem_depth: the programs are uploaded into a 256-word instruction BRAM at
+# VectorUnit.imem_depth: the programs are uploaded into a 256-word instruction BRAM at
 # init. Overflowing it does NOT fail loudly - the write pointer wraps and quietly overwrites
 # the programs at offset 0 (one added program once corrupted resid_add's ARG setup, and only
 # that program's CRC moved). emit_c() asserts against this, so keep it in step with the RTL.
@@ -48,7 +48,7 @@ IMEM_DEPTH = 1024 # 256 until 2026-08-29, 512 until 2026-09-03 (ISA rev 2: the x
 
 # Vector register count = encoding (see the module docstring). set_vregs() switches the
 # assembler, the interpreter and emit_c() together; the firmware Makefile passes the
-# build tree's BONSAI_VEC_VREGS so progs.h always matches the bitstream it links against.
+# build tree's TRIXIUM_VEC_VREGS so progs.h always matches the bitstream it links against.
 VREGS = 16
 IMM11_OPS = ("MOVSI", "ARG", "SADDI", "LOOPS", "LOOPS2")
 
@@ -1111,7 +1111,7 @@ def prog_spill():
 # exposes at 1 IPC. emit_c() substitutes them under the same PROG_ name when VREGS == 16.
 # CONTRACTS: silu_q8_x2 needs an even beat count (ffn_dim/16 always is on the 1.7B);
 # softmax8_x2 an even block count - the firmware pads scores to a 32-multiple when
-# BONSAI_PROGS_VREGS == 16 (INT32_MIN entries emit p8 = 0: sum and AXPY unchanged).
+# TRIXIUM_PROGS_VREGS == 16 (INT32_MIN entries emit p8 = 0: sum and AXPY unchanged).
 
 def prog_silu_q8_x2():
     C_LOG2E = 739
@@ -1669,7 +1669,7 @@ def emit_c(out):
              "#include <stdint.h>", ""]
     all_words = []
     offsets = {}
-    lines.append(f"#define BONSAI_PROGS_VREGS {VREGS}")
+    lines.append(f"#define TRIXIUM_PROGS_VREGS {VREGS}")
     for name, fn in PROGRAMS.items():
         offsets[name] = len(all_words)
         if VREGS == 16 and name in UNROLL16:
@@ -1678,7 +1678,7 @@ def emit_c(out):
     assert len(all_words) <= IMEM_DEPTH, (
         f"programs need {len(all_words)} words but the instruction BRAM holds {IMEM_DEPTH}: "
         f"the upload would wrap and silently overwrite the first program")
-    lines.append(f"static const uint32_t bonsai_progs[{len(all_words)}] = {{")
+    lines.append(f"static const uint32_t trixium_progs[{len(all_words)}] = {{")
     for i in range(0, len(all_words), 8):
         lines.append("    " + ", ".join(f"0x{w:08x}" for w in all_words[i:i+8]) + ",")
     lines.append("};")

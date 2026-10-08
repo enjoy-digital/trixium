@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiVectorUnit: microcoded 16-lane SIMD engine executing trixium.model.asm binaries.
+"""VectorUnit: microcoded 16-lane SIMD engine executing trixium.model.asm binaries.
 
 Bit-exact contract: the asm.py INTERPRETER is the golden model - this RTL must produce
 identical scratchpad contents and scalar results for the same binary and arguments.
@@ -58,9 +58,9 @@ from trixium.model import bitexact as bx
 
 LANES = 16
 
-# BonsaiVectorUnit ---------------------------------------------------------------------------------
+# VectorUnit ---------------------------------------------------------------------------------
 
-class BonsaiVectorUnit(LiteXModule):
+class VectorUnit(LiteXModule):
     def __init__(self, imem_depth=None, vregs=16):
         # Kept in step with model.asm.IMEM_DEPTH, which asserts the programs fit: an
         # overflowing upload wraps and silently overwrites the program at offset 0.

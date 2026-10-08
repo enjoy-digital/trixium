@@ -51,7 +51,7 @@ def _delay(module, value, cycles, name):
     return prev
 
 
-class BonsaiNormScratchpad(LiteXModule):
+class NormScratchpad(LiteXModule):
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")

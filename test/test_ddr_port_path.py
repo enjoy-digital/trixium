@@ -35,8 +35,8 @@ from litedram.common import LiteDRAMNativePort
 from litedram.frontend.axi import LiteDRAMAXI2Native
 from litedram.frontend.adapter import LiteDRAMNativePortConverter
 
-from trixium.memory.axi import BonsaiAXIReader
-from trixium.memory.axi import BonsaiAXIWriter
+from trixium.memory.axi import AXIReader
+from trixium.memory.axi import AXIWriter
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "litex", "litedram"))
@@ -53,8 +53,8 @@ class _DUT(Module):
         self.submodules.conv   = LiteDRAMNativePortConverter(self.user_port, self.ctrl_port)
         self.submodules.bridge = LiteDRAMAXI2Native(self.axi, self.user_port,
                                                     w_buffer_depth=64, r_buffer_depth=256)
-        self.submodules.reader = BonsaiAXIReader(self.axi)
-        self.submodules.writer = BonsaiAXIWriter(self.axi)
+        self.submodules.reader = AXIReader(self.axi)
+        self.submodules.writer = AXIWriter(self.axi)
         self.comb += self.reader.source.ready.eq(1)   # Drained by the test.
         self.mem = DRAMMemory(ctrl_width, 4096)       # 4096 x 64 B = 256 KB.
 
@@ -151,7 +151,7 @@ def test_engine_port_path_through_the_controller(port_width, base_skew):
                 axi  = AXIInterface(data_width=256, address_width=33, id_width=6)
                 for j, m in enumerate(_engine_port(self.core, axi, port_width)):
                     setattr(self.submodules, f"glue{i}_{j}", m)
-                rd = BonsaiAXIReader(axi); wr = BonsaiAXIWriter(axi)
+                rd = AXIReader(axi); wr = AXIWriter(axi)
                 setattr(self.submodules, f"reader{i}", rd)
                 setattr(self.submodules, f"writer{i}", wr)
                 self.comb += rd.source.ready.eq(1)
@@ -237,8 +237,8 @@ def test_engine_port_path_streams_at_rate(port_width):
             self.axi = AXIInterface(data_width=256, address_width=33, id_width=6)
             for j, m in enumerate(_engine_port(self.core, self.axi, port_width)):
                 setattr(self.submodules, f"glue{j}", m)
-            self.submodules.reader = BonsaiAXIReader(self.axi)
-            self.submodules.writer = BonsaiAXIWriter(self.axi)
+            self.submodules.reader = AXIReader(self.axi)
+            self.submodules.writer = AXIWriter(self.axi)
             self.comb += self.reader.source.ready.eq(1)
 
     dut = _CtrlDUT()
@@ -294,20 +294,20 @@ def test_engine_port_path_through_the_reset_shim():
     (engreset.py), the shim's port side into LiteDRAMAXI2Native. The shim derives WLAST from
     its own queue of accepted AW lengths; LiteDRAM's bridge, unlike the HBM IP, accepts W
     beats into a FIFO before their AW has fired, which is where the two can disagree."""
-    from trixium.core.reset import BonsaiEngineResetDomain
+    from trixium.core.reset import EngineResetDomain
 
     class _ShimDUT(Module):
         def __init__(self):
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-            self.submodules.engrst = BonsaiEngineResetDomain([axi])
+            self.submodules.engrst = EngineResetDomain([axi])
             self.ctrl_port = LiteDRAMNativePort("both", address_width=20, data_width=512)
             self.user_port = LiteDRAMNativePort("both", address_width=21, data_width=256)
             self.submodules.conv   = LiteDRAMNativePortConverter(self.user_port, self.ctrl_port)
             self.submodules.bridge = LiteDRAMAXI2Native(axi, self.user_port,
                                                         w_buffer_depth=64, r_buffer_depth=256)
             m = self.engrst.masters[0]
-            self.submodules.reader = BonsaiAXIReader(m)
-            self.submodules.writer = BonsaiAXIWriter(m)
+            self.submodules.reader = AXIReader(m)
+            self.submodules.writer = AXIWriter(m)
             self.comb += self.reader.source.ready.eq(1)
             self.mem = DRAMMemory(512, 4096)
             self.port_axi = axi
@@ -371,20 +371,20 @@ def test_engine_port_path_short_unaligned_rows(row_beats):
     rows start at every 32-byte phase of the converter's 64-byte word, and the scores stream
     reads them back row by row. Write 8 rows one STORE each, read them back one FETCH each
     and as one long stream: every byte where it was put."""
-    from trixium.core.reset import BonsaiEngineResetDomain
+    from trixium.core.reset import EngineResetDomain
 
     class _RowDUT(Module):
         def __init__(self):
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-            self.submodules.engrst = BonsaiEngineResetDomain([axi])
+            self.submodules.engrst = EngineResetDomain([axi])
             self.ctrl_port = LiteDRAMNativePort("both", address_width=20, data_width=512)
             self.user_port = LiteDRAMNativePort("both", address_width=21, data_width=256)
             self.submodules.conv   = LiteDRAMNativePortConverter(self.user_port, self.ctrl_port)
             self.submodules.bridge = LiteDRAMAXI2Native(axi, self.user_port,
                                                         w_buffer_depth=64, r_buffer_depth=256)
             m = self.engrst.masters[0]
-            self.submodules.reader = BonsaiAXIReader(m)
-            self.submodules.writer = BonsaiAXIWriter(m)
+            self.submodules.reader = AXIReader(m)
+            self.submodules.writer = AXIWriter(m)
             self.comb += self.reader.source.ready.eq(1)
             self.mem = DRAMMemory(512, 4096)
 
@@ -453,20 +453,20 @@ def test_engine_port_path_read_right_after_write():
     write; on LiteDRAM the bridge answers B when the data left its FIFO, so this pins that
     a read issued the cycle the writer goes idle still returns the new data, row by row,
     with the previous row's read in flight."""
-    from trixium.core.reset import BonsaiEngineResetDomain
+    from trixium.core.reset import EngineResetDomain
 
     class _RAWDUT(Module):
         def __init__(self):
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-            self.submodules.engrst = BonsaiEngineResetDomain([axi])
+            self.submodules.engrst = EngineResetDomain([axi])
             self.ctrl_port = LiteDRAMNativePort("both", address_width=20, data_width=512)
             self.user_port = LiteDRAMNativePort("both", address_width=21, data_width=256)
             self.submodules.conv   = LiteDRAMNativePortConverter(self.user_port, self.ctrl_port)
             self.submodules.bridge = LiteDRAMAXI2Native(axi, self.user_port,
                                                         w_buffer_depth=64, r_buffer_depth=256)
             m = self.engrst.masters[0]
-            self.submodules.reader = BonsaiAXIReader(m)
-            self.submodules.writer = BonsaiAXIWriter(m)
+            self.submodules.reader = AXIReader(m)
+            self.submodules.writer = AXIWriter(m)
             self.comb += self.reader.source.ready.eq(1)
             self.mem = DRAMMemory(512, 4096)
 

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
-#include "bonsai_sequence.h"
+#include "trixium_sequence.h"
 
 static int sp_address(uint32_t value, uint32_t alignment)
 {

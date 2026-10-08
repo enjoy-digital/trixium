@@ -5,7 +5,7 @@
 #include "fastmath.h"
 
 extern float __ieee754_expf(float);
-static float lut[BONSAI_SILU_LUT_N + 1], slut[BONSAI_SILU_LUT_N + 1];
+static float lut[TRIXIUM_SILU_LUT_N + 1], slut[TRIXIUM_SILU_LUT_N + 1];
 
 static long sys_call(long nr, long fd, void *buf, long size)
 {
@@ -41,16 +41,16 @@ static int transfer(int write, void *buf, long size)
 
 void _start(void)
 {
-    for (int i = 0; i <= BONSAI_SILU_LUT_N; i++) {
-        float x = -BONSAI_SILU_LUT_LIMIT + (float)i*(1.0f/BONSAI_SILU_LUT_SCALE);
+    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) {
+        float x = -TRIXIUM_SILU_LUT_LIMIT + (float)i*(1.0f/TRIXIUM_SILU_LUT_SCALE);
         lut[i] = x/(1.0f + __ieee754_expf(-x));
-        slut[i] = bonsai_sigmoid_point(x);
+        slut[i] = trixium_sigmoid_point(x);
     }
     float x;
     while (transfer(0, &x, sizeof(x))) {
         float neg = x < 0.0f ? x : -x;     /* softmax arguments are s - max <= 0 */
-        float out[5] = {__ieee754_expf(x), bonsai_siluf(x), bonsai_silu_lookup(x, lut),
-                        bonsai_sigmoid_lookup(x, slut), bonsai_softmax_exp(neg)};
+        float out[5] = {__ieee754_expf(x), trixium_siluf(x), trixium_silu_lookup(x, lut),
+                        trixium_sigmoid_lookup(x, slut), trixium_softmax_exp(neg)};
         transfer(1, out, sizeof(out));
     }
     quit(0);

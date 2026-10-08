@@ -106,7 +106,7 @@ SECTIONS
  * arrays OUT of .bss (they live in the main_ram static window instead - grep ECACHE_BASE),
  * NOT moving the stack to main_ram: on the card main_ram is the HBM channel-0 window, and
  * the one firmware built with its stack there coincided with back-to-back host crashes.
- * Check after adding statics:  riscv64-unknown-elf-nm bonsai.elf | grep -E "_ebss|_fstack" */
+ * Check after adding statics:  riscv64-unknown-elf-nm trixium.elf | grep -E "_ebss|_fstack" */
 PROVIDE(_fstack = ORIGIN(sram) + LENGTH(sram));
 ASSERT(_fstack - _ebss >= 4096, "firmware must leave at least 4 KiB of SRAM for stack")
 

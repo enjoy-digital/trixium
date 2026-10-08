@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiChannelPipe: one HBM channel's compute pipeline (unpack + dot + scale-accumulate).
+"""ChannelPipe: one HBM channel's compute pipeline (unpack + dot + scale-accumulate).
 
 Consumes the weight-beat stream of one channel (row packets: scale beats then code beats, see
 trixium.layout), computes one dot product per row against the local x-buffer and emits
@@ -66,13 +66,13 @@ def _adder_tree(module, lanes, reg_every=2):
         level = nxt
     return level[0], n_regs
 
-# BonsaiChannelPipe --------------------------------------------------------------------------------
+# ChannelPipe --------------------------------------------------------------------------------
 
 KIND_OP_TERNARY = 0
 KIND_OP_Q8      = 1
 KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre).
 
-class BonsaiChannelPipe(LiteXModule):
+class ChannelPipe(LiteXModule):
     def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1):
         # Op parameters (quasi-static while busy).
         self.kind        = Signal(2)

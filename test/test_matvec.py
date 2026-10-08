@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# BonsaiMatVecEngine end-to-end unit test: BONS-encoded weight shards in HBM channel models,
+# MatVecEngine end-to-end unit test: BONS-encoded weight shards in HBM channel models,
 # x8 in the scratchpad, engine command -> results in scratchpad, compared BIT-EXACTLY against
 # trixium.model.bitexact.matvec_ternary()/matvec_q8().
 
@@ -16,9 +16,9 @@ from litex.soc.interconnect.axi import AXIInterface
 from trixium import layout
 from trixium.model import bitexact as bx
 from trixium.model.bons import TensorSpec, encode_rows
-from trixium.core.scratchpad import BonsaiScratchpad
-from trixium.core.engine import BonsaiMatVecEngine
-from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.core.scratchpad import Scratchpad
+from trixium.core.engine import MatVecEngine
+from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 class _EngineDUT(Module):
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
@@ -29,11 +29,11 @@ class _EngineDUT(Module):
         stl = stall_rate if isinstance(stall_rate, (list, tuple)) else [stall_rate]*n_channels
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
-        self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
-        self.submodules.engine     = BonsaiMatVecEngine(self.scratchpad, axis,
+        self.submodules.scratchpad = Scratchpad(size=64*1024, init=sp_init)
+        self.submodules.engine     = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=xbuf_groups)
         for i, axi in enumerate(axis):
-            model = BonsaiHBMChannelModel(axi, size=64*1024,
+            model = HBMChannelModel(axi, size=64*1024,
                 init=words_from_bytes(chan_payloads[i]), latency=lat[i], stall_rate=stl[i],
                 reorder_ids=reorder_ids)
             setattr(self.submodules, f"model{i}", model)
@@ -311,7 +311,7 @@ def test_engine_csr_single_run_per_submit():
     # the command was accepted on the submit cycle itself, replaying every op once the
     # engine returned to idle (identical results, but the replay's command accept reset
     # the absmax tracker mid-read and doubled the stream time).
-    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.csr import EngineCSR
 
     n_channels, rows_per_chan, cols, seed = 2, 8, 256, 11
     rng    = np.random.default_rng(seed)
@@ -334,7 +334,7 @@ def test_engine_csr_single_run_per_submit():
         payloads.append(encode_rows(spec, row0, nrows).tobytes())
 
     dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()))
-    dut.submodules.front = BonsaiEngineCSR(dut.engine)
+    dut.submodules.front = EngineCSR(dut.engine)
 
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
@@ -374,7 +374,7 @@ def test_engine_store_roundtrip(chan_stride):
     # its own HBM window - the AXI switch makes the address, not the port, select the
     # pseudo-channel) while this test only ever ran at 0. On hardware the KV STORE wedges the
     # engine mid-token, and an untested address path is the first suspect.
-    from trixium.memory.loader import BonsaiHBMLoader
+    from trixium.memory.loader import Loader
 
     n_channels = 2
     rng   = np.random.default_rng(17)
@@ -385,18 +385,18 @@ def test_engine_store_roundtrip(chan_stride):
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(
+            self.submodules.scratchpad = Scratchpad(
                 size=64*1024, init=words_from_bytes(src.tobytes()))
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
                                                         chan_stride=chan_stride)
-            self.submodules.loader = BonsaiHBMLoader(axis)
+            self.submodules.loader = Loader(axis)
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
                 self.engine.store_data.connect(self.loader.store_data),
                 self.engine.store_busy.eq(self.loader.store_busy),
             ]
             for i, axi in enumerate(axis):
-                model = BonsaiHBMChannelModel(axi, size=64*1024, latency=8)
+                model = HBMChannelModel(axi, size=64*1024, latency=8)
                 setattr(self.submodules, f"model{i}", model)
 
     dut = _StoreDUT()
@@ -700,11 +700,11 @@ def test_sequencer_start_drains_posted_writes():
     # has no teeth: sbw_gnt is blocked only by a vec store or a full write FIFO, so on
     # any quiet cycle the patch lands within a cycle or two and a broken design passes
     # by luck. Holding sbw_pending here makes the contract the only thing under test.
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.sequencer import Sequencer
 
     class _DUT(Module):
         def __init__(self):
-            self.submodules.seq = BonsaiSequencer()
+            self.submodules.seq = Sequencer()
 
     dut = _DUT()
 
@@ -741,9 +741,9 @@ def test_sequencer_v2_chaining():
     #   res6 preserved) -> norm_i32 with k from src=3 (k(res6)) -> reduce_acc over a
     #   crafted buffer (res6 = sum p8, standing in for softmax8's S6) -> engine AXPY with
     #   rshift_rpre=1 (rshift = bitlen(res6)+5 from the sequencer, w7 rshift left 0).
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.csr import BonsaiEngineCSR
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.vector import VectorUnit
+    from trixium.core.csr import EngineCSR
+    from trixium.core.sequencer import Sequencer
     from trixium.model import asm as vasm
 
     n_channels, cols, T, seed = 2, 64, 5, 83
@@ -817,14 +817,14 @@ def test_sequencer_v2_chaining():
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+            self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                           init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = BonsaiVectorUnit()
-            self.submodules.seq = BonsaiSequencer()
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+            self.submodules.vu  = VectorUnit()
+            self.submodules.seq = Sequencer()
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=32,
                                                         vecunit=self.vu, seq=self.seq)
-            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
             self.comb += [
                 self.vu.seq_en.eq(self.seq.busy),
                 self.vu.seq_start.eq(self.seq.vec_start),
@@ -835,7 +835,7 @@ def test_sequencer_v2_chaining():
             ]
             self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
             for i, axi in enumerate(axis):
-                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                model = HBMChannelModel(axi, size=64*1024,
                     init=words_from_bytes(payloads[i]), latency=8)
                 setattr(self.submodules, f"model{i}", model)
 
@@ -885,9 +885,9 @@ def test_sequencer_mixed_list():
     # Descriptor list: vec quant8 -> engine ternary matvec -> vec norm_i32 with the k
     # auto-arg from the engine absmax tracker -> stop. Results must match the individually
     # computed goldens; numerics are the same as CPU-dispatched ops by construction.
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.csr import BonsaiEngineCSR
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.vector import VectorUnit
+    from trixium.core.csr import EngineCSR
+    from trixium.core.sequencer import Sequencer
     from trixium.model import asm as vasm
 
     n_channels, rows_per_chan, cols, seed = 2, 4, 128, 71
@@ -939,14 +939,14 @@ def test_sequencer_mixed_list():
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+            self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                           init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = BonsaiVectorUnit()
-            self.submodules.seq = BonsaiSequencer()
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+            self.submodules.vu  = VectorUnit()
+            self.submodules.seq = Sequencer()
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=32,
                                                         vecunit=self.vu, seq=self.seq)
-            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
             self.comb += [
                 self.vu.seq_en.eq(self.seq.busy),
                 self.vu.seq_start.eq(self.seq.vec_start),
@@ -956,7 +956,7 @@ def test_sequencer_mixed_list():
             ]
             self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
             for i, axi in enumerate(axis):
-                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                model = HBMChannelModel(axi, size=64*1024,
                     init=words_from_bytes(payloads[i]), latency=8)
                 setattr(self.submodules, f"model{i}", model)
 
@@ -1024,9 +1024,9 @@ def test_sequencer_q8_scores_ragged():
       .venv/bin/python -m trixium.model.tinygen --channels 8
       .venv/bin/python trixium/targets/sim.py --image models/tiny/bonsai-tiny-n8.img --run
     """
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.csr import BonsaiEngineCSR
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.vector import VectorUnit
+    from trixium.core.csr import EngineCSR
+    from trixium.core.sequencer import Sequencer
     from trixium.model import asm as vasm
 
     vec_words = vasm.assemble(vasm.PROGRAMS["quant8"]())
@@ -1077,13 +1077,13 @@ def test_sequencer_q8_scores_ragged():
             def __init__(self):
                 axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                         for _ in range(n_channels)]
-                self.submodules.scratchpad = BonsaiScratchpad(
+                self.submodules.scratchpad = Scratchpad(
                     size=64*1024, init=words_from_bytes(bytes(sp)))
-                self.submodules.vu  = BonsaiVectorUnit()
-                self.submodules.seq = BonsaiSequencer()
-                self.submodules.engine = BonsaiMatVecEngine(
+                self.submodules.vu  = VectorUnit()
+                self.submodules.seq = Sequencer()
+                self.submodules.engine = MatVecEngine(
                     self.scratchpad, axis, xbuf_groups=32, vecunit=self.vu, seq=self.seq)
-                self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+                self.submodules.front = EngineCSR(self.engine, seq=self.seq)
                 self.comb += [
                     self.vu.seq_en.eq(self.seq.busy),
                     self.vu.seq_start.eq(self.seq.vec_start),
@@ -1093,7 +1093,7 @@ def test_sequencer_q8_scores_ragged():
                 ]
                 self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
                 for i, axi in enumerate(axis):
-                    model = BonsaiHBMChannelModel(axi, size=64*1024,
+                    model = HBMChannelModel(axi, size=64*1024,
                         init=words_from_bytes(payloads[i]), latency=8)
                     setattr(self.submodules, f"model{i}", model)
 
@@ -1358,9 +1358,9 @@ def test_sequencer_xred_absmax_spill():
     # engine-level test passed, and a 12-minute Verilator run is the wrong place to debug
     # a three-descriptor question.
     import trixium.model.asm as vasm
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.sequencer import BonsaiSequencer
-    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.vector import VectorUnit
+    from trixium.core.sequencer import Sequencer
+    from trixium.core.csr import EngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(97)
 
@@ -1414,14 +1414,14 @@ def test_sequencer_xred_absmax_spill():
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+            self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                           init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = BonsaiVectorUnit()
-            self.submodules.seq = BonsaiSequencer()
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+            self.submodules.vu  = VectorUnit()
+            self.submodules.seq = Sequencer()
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=32,
                                                         vecunit=self.vu, seq=self.seq)
-            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
             self.comb += [
                 self.vu.seq_en.eq(self.seq.busy),
                 self.vu.seq_start.eq(self.seq.vec_start),
@@ -1432,7 +1432,7 @@ def test_sequencer_xred_absmax_spill():
             ]
             self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
             for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", BonsaiHBMChannelModel(
+                setattr(self.submodules, f"model{i}", HBMChannelModel(
                     axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
 
     dut = _DUT()
@@ -1486,9 +1486,9 @@ def test_sequencer_kreg_capture_and_add():
     # is bitlen(summed absmax) - 14, i.e. exactly what SEQ_SRC_KABS would give the very next
     # op - but here it survives an arbitrary distance and combines with an immediate.
     import trixium.model.asm as vasm
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.sequencer import BonsaiSequencer
-    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.vector import VectorUnit
+    from trixium.core.sequencer import Sequencer
+    from trixium.core.csr import EngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(131)
     ev     = rng.integers(-9, -4, T)
@@ -1547,14 +1547,14 @@ def test_sequencer_kreg_capture_and_add():
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+            self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                           init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = BonsaiVectorUnit()
-            self.submodules.seq = BonsaiSequencer()
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+            self.submodules.vu  = VectorUnit()
+            self.submodules.seq = Sequencer()
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=32,
                                                         vecunit=self.vu, seq=self.seq)
-            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
             self.comb += [
                 self.vu.seq_en.eq(self.seq.busy),
                 self.vu.seq_start.eq(self.seq.vec_start),
@@ -1565,7 +1565,7 @@ def test_sequencer_kreg_capture_and_add():
             ]
             self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
             for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", BonsaiHBMChannelModel(
+                setattr(self.submodules, f"model{i}", HBMChannelModel(
                     axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
 
     dut = _DUT()
@@ -1619,9 +1619,9 @@ def test_sequencer_lut_arg():
     # same rmsnorm with the immediate the LUT holds must match bit for bit, and an index
     # past the table clamps to entry 31 rather than reading past it.
     import trixium.model.asm as vasm
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.sequencer import BonsaiSequencer
-    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.vector import VectorUnit
+    from trixium.core.sequencer import Sequencer
+    from trixium.core.csr import EngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(137)
     ev     = rng.integers(-9, -4, T)
@@ -1697,14 +1697,14 @@ def test_sequencer_lut_arg():
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+            self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                           init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = BonsaiVectorUnit()
-            self.submodules.seq = BonsaiSequencer()
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+            self.submodules.vu  = VectorUnit()
+            self.submodules.seq = Sequencer()
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=32,
                                                         vecunit=self.vu, seq=self.seq)
-            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
             self.comb += [
                 self.vu.seq_en.eq(self.seq.busy),
                 self.vu.seq_start.eq(self.seq.vec_start),
@@ -1715,7 +1715,7 @@ def test_sequencer_lut_arg():
             ]
             self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
             for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", BonsaiHBMChannelModel(
+                setattr(self.submodules, f"model{i}", HBMChannelModel(
                     axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
 
     dut = _DUT()
@@ -1771,18 +1771,18 @@ class _OverlapDUT(Module):
     # two are launched concurrently - the per-cycle port arbitration is what keeps
     # both results bit-exact.
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8):
-        from trixium.core.vector import BonsaiVectorUnit
+        from trixium.core.vector import VectorUnit
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
-        self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
-        self.submodules.vu = BonsaiVectorUnit()
-        self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+        self.submodules.scratchpad = Scratchpad(size=64*1024, init=sp_init)
+        self.submodules.vu = VectorUnit()
+        self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                     xbuf_groups=32, vecunit=self.vu)
         # Mirror the SoC's sideband idle wiring (no sequencer in this DUT): the posted-
         # write drain works without it, but read grants are units_idle-gated.
         self.comb += self.scratchpad.units_idle.eq(~self.engine.sp_busy & ~self.vu.busy)
         for i, axi in enumerate(axis):
-            model = BonsaiHBMChannelModel(axi, size=64*1024,
+            model = HBMChannelModel(axi, size=64*1024,
                 init=words_from_bytes(chan_payloads[i]), latency=latency)
             setattr(self.submodules, f"model{i}", model)
 
@@ -2194,9 +2194,9 @@ def test_sequencer_nowait_overlap():
     # WHILE the matvec streams; the next descriptor (norm_i32 with A4 = KABS) trips the
     # hazard interlock and waits for the in-flight op. All three results bit-exact,
     # real overlap measured, and the interlock's k matches the serial golden.
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.csr import BonsaiEngineCSR
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.vector import VectorUnit
+    from trixium.core.csr import EngineCSR
+    from trixium.core.sequencer import Sequencer
     from trixium.model import asm as vasm
 
     n_channels, rows_per_chan, cols, seed = 2, 32, 128, 57
@@ -2252,14 +2252,14 @@ def test_sequencer_nowait_overlap():
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+            self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                           init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = BonsaiVectorUnit()
-            self.submodules.seq = BonsaiSequencer()
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+            self.submodules.vu  = VectorUnit()
+            self.submodules.seq = Sequencer()
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=32,
                                                         vecunit=self.vu, seq=self.seq)
-            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
             self.comb += [
                 self.vu.seq_en.eq(self.seq.busy),
                 self.vu.seq_start.eq(self.seq.vec_start),
@@ -2270,7 +2270,7 @@ def test_sequencer_nowait_overlap():
             ]
             self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
             for i, axi in enumerate(axis):
-                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                model = HBMChannelModel(axi, size=64*1024,
                     init=words_from_bytes(payloads[i]), latency=8)
                 setattr(self.submodules, f"model{i}", model)
 
@@ -2318,9 +2318,9 @@ def test_sequencer_kadd_interlock_precise():
     # B's stream (real overlap), while a norm reading kreg1 must wait for B's capture
     # (done+2) and see the right k. The register-blind interlock serialized the FFN
     # list's norm-under-stream on the card (13.60M vs 13.45M cycles/token, 2026-08-29).
-    from trixium.core.vector import BonsaiVectorUnit
-    from trixium.core.csr import BonsaiEngineCSR
-    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.vector import VectorUnit
+    from trixium.core.csr import EngineCSR
+    from trixium.core.sequencer import Sequencer
     from trixium.model import asm as vasm
 
     n_channels, rows_per_chan, cols = 2, 32, 128
@@ -2374,14 +2374,14 @@ def test_sequencer_kadd_interlock_precise():
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=64*1024,
+            self.submodules.scratchpad = Scratchpad(size=64*1024,
                                                           init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = BonsaiVectorUnit()
-            self.submodules.seq = BonsaiSequencer()
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis,
+            self.submodules.vu  = VectorUnit()
+            self.submodules.seq = Sequencer()
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
                                                         xbuf_groups=32,
                                                         vecunit=self.vu, seq=self.seq)
-            self.submodules.front = BonsaiEngineCSR(self.engine, seq=self.seq)
+            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
             self.comb += [
                 self.vu.seq_en.eq(self.seq.busy),
                 self.vu.seq_start.eq(self.seq.vec_start),
@@ -2392,7 +2392,7 @@ def test_sequencer_kadd_interlock_precise():
             ]
             self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
             for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", BonsaiHBMChannelModel(
+                setattr(self.submodules, f"model{i}", HBMChannelModel(
                     axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
 
     dut = _DUT()
@@ -2436,7 +2436,7 @@ def test_engine_multi_store(chan_stride):
     # xsrc + r*sstride beats to HBM wbase + r*dstride beats - the per-layer KV append as
     # a single dispatch. Fetch every region back and compare; a wrong stride or a packet
     # count off by one shows as a mismatch in exactly one region.
-    from trixium.memory.loader import BonsaiHBMLoader
+    from trixium.memory.loader import Loader
 
     n_channels = 2
     rng   = np.random.default_rng(29)
@@ -2455,18 +2455,18 @@ def test_engine_multi_store(chan_stride):
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
-            self.submodules.scratchpad = BonsaiScratchpad(
+            self.submodules.scratchpad = Scratchpad(
                 size=64*1024, init=words_from_bytes(bytes(sp)))
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
                                                         chan_stride=chan_stride)
-            self.submodules.loader = BonsaiHBMLoader(axis)
+            self.submodules.loader = Loader(axis)
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
                 self.engine.store_data.connect(self.loader.store_data),
                 self.engine.store_busy.eq(self.loader.store_busy),
             ]
             for i, axi in enumerate(axis):
-                model = BonsaiHBMChannelModel(axi, size=64*1024, latency=8)
+                model = HBMChannelModel(axi, size=64*1024, latency=8)
                 setattr(self.submodules, f"model{i}", model)
 
     dut = _MStoreDUT()
@@ -2514,7 +2514,7 @@ def test_engine_n16_ternary_and_store_window():
     # address: channel 15's port-matched window is 0x1_0400_0000 (PC16, stack 1), which
     # a 32-bit write path silently wraps into PC0. The AW address on channel 15's AXI is
     # captured and checked against the full 33-bit value.
-    from trixium.memory.loader import BonsaiHBMLoader
+    from trixium.memory.loader import Loader
     from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
     n_channels, rows_per_chan, cols, seed = 16, 4, 256, 173
@@ -2540,11 +2540,11 @@ def test_engine_n16_ternary_and_store_window():
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                     for _ in range(n_channels)]
             self.axis = axis
-            self.submodules.scratchpad = BonsaiScratchpad(
+            self.submodules.scratchpad = Scratchpad(
                 size=64*1024, init=words_from_bytes(x8.tobytes()))
-            self.submodules.engine = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=32,
+            self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
                                                         chan_stride=HBM_CHAN_STRIDE)
-            self.submodules.loader = BonsaiHBMLoader(axis)
+            self.submodules.loader = Loader(axis)
             self.comb += [
                 self.engine.store_cmd.connect(self.loader.store_cmd),
                 self.engine.store_data.connect(self.loader.store_data),
@@ -2553,7 +2553,7 @@ def test_engine_n16_ternary_and_store_window():
             for i, axi in enumerate(axis):
                 # The models are 64 KB windows; reads/writes are addressed modulo the
                 # window, so the 33-bit AW address is checked on the bus, not the model.
-                model = BonsaiHBMChannelModel(axi, size=64*1024,
+                model = HBMChannelModel(axi, size=64*1024,
                                               init=words_from_bytes(payloads[i]), latency=4)
                 setattr(self.submodules, f"model{i}", model)
 

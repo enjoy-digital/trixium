@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiScratchpad: on-chip activation memory (URAM class on hardware).
+"""Scratchpad: on-chip activation memory (URAM class on hardware).
 
 256-bit wide memory with exactly TWO physical ports (Vivado's BRAM inference limit -
 a 4-port Memory trips 'Unsupported RAM template', dissolves into FF+LUT emulation and
@@ -32,12 +32,12 @@ from migen.genlib.fifo import SyncFIFO
 from litex.soc.interconnect import wishbone
 from litex.soc.interconnect.csr import *
 
-# BonsaiScratchpad ---------------------------------------------------------------------------------
+# Scratchpad ---------------------------------------------------------------------------------
 
 class _Facade:
     pass
 
-class BonsaiScratchpad(LiteXModule):
+class Scratchpad(LiteXModule):
     def __init__(self, size=256*1024, init=None, xpm=False):
         self.size = size
         depth     = size//32
@@ -99,7 +99,7 @@ class BonsaiScratchpad(LiteXModule):
                 i_enb=1, i_addrb=port_r.adr, o_doutb=port_r.dat_r, i_rstb=0, i_regceb=1,
                 i_sleep=0, i_injectsbiterra=0, i_injectdbiterra=0)
         else:
-            self.mem = mem = Memory(256, depth, init=init, name="bonsai_scratchpad")
+            self.mem = mem = Memory(256, depth, init=init, name="trixium_scratchpad")
             self.specials += mem
             port_r = mem.get_port()
             port_w = mem.get_port(write_capable=True, we_granularity=8)
@@ -307,10 +307,10 @@ class _ScratchpadCSR(LiteXModule):
 
 # Scratchpad Arbiter -------------------------------------------------------------------------------
 
-class BonsaiScratchpadArbiter(LiteXModule):
+class ScratchpadArbiter(LiteXModule):
     """Flat priority arbiter for the shared scratchpad client port.
 
-    Functionally identical to nesting BonsaiScratchpadClientMux once per auxiliary unit
+    Functionally identical to nesting ScratchpadClientMux once per auxiliary unit
     (base = the vector unit, clients in the order they were attached, the LAST attached
     busy client wins, else the base), with the same combinational latency: requests, the
     write grant and the broadcast read data behave exactly as through the chain. What

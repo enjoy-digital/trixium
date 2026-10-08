@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: BSD-2-Clause
-"""BonsaiNormScratchpad (unit 12) against the firmware's definitions, compiled."""
+"""NormScratchpad (unit 12) against the firmware's definitions, compiled."""
 import numpy as np
 import pytest
 
-from trixium.units.norm import NORM_COMMAND, OP_L2, OP_RMS, BonsaiNormScratchpad
+from trixium.units.norm import NORM_COMMAND, OP_L2, OP_RMS, NormScratchpad
 from rtl_client import build_client, run_client
 
 f32 = np.float32
@@ -77,7 +77,7 @@ def command(op, src, dst, n, nseg, weight=0, **extra):
 
 @pytest.fixture(scope="module")
 def binary(tmp_path_factory):
-    return build_client(BonsaiNormScratchpad(SIZE), NORM_COMMAND, tmp_path_factory.mktemp("norm"), "norm_sp")
+    return build_client(NormScratchpad(SIZE), NORM_COMMAND, tmp_path_factory.mktemp("norm"), "norm_sp")
 
 
 def activations(rng, n, kind):

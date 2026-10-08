@@ -1,4 +1,4 @@
-/* Host-side HBM loader (see bonsai_loader.h). */
+/* Host-side HBM loader (see trixium_loader.h). */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,16 +10,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "bonsai_loader.h"
+#include "trixium_loader.h"
 
 /* Keep in sync with trixium/layout.py and the generated soc.h / csr.h. */
 #include "soc.h"
 #include "csr.h"
 #include "mem.h"
-#ifndef BONSAI_CHAN_WEIGHT_BASE
-#error "SoC headers lack BONSAI_CHAN_WEIGHT_BASE (build with variant b)"
+#ifndef TRIXIUM_CHAN_WEIGHT_BASE
+#error "SoC headers lack TRIXIUM_CHAN_WEIGHT_BASE (build with variant b)"
 #endif
-#define HDR_STAGING (BONSAI_CHAN_WEIGHT_BASE - 0x100000)
+#define HDR_STAGING (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
 
 /* main_ram: the CPU's HBM window passes the CPU address through unmodified
  * (add_usphbm2_pseudochannels -> AXILiteOffset(offset=0)), so main_ram is HBM global address
@@ -28,11 +28,11 @@
  * addressing"). Read back through the BIOS to confirm on 2026-09-11: address 0 was not it. */
 /* Where the firmware goes: the ENGINE-side address of main_ram's origin. On the FK33 the CPU
  * window passes through 1:1 (HBM address = CPU address); on the XCU1525 main_ram is
- * controller 0's local address 0 and the SoC exports it (BONSAI_MEM_CPU_OFFSET = 0) - the
+ * controller 0's local address 0 and the SoC exports it (TRIXIUM_MEM_CPU_OFFSET = 0) - the
  * first XCU1525 boot put the firmware at DRAM 0x40000000, in channel 1's window, and the BIOS
  * jumped into the memtest's leftovers (2026-09-19). */
-#ifdef BONSAI_MEM_CPU_OFFSET
-#define FW_HBM_ADDR ((uint32_t)BONSAI_MEM_CPU_OFFSET)
+#ifdef TRIXIUM_MEM_CPU_OFFSET
+#define FW_HBM_ADDR ((uint32_t)TRIXIUM_MEM_CPU_OFFSET)
 #else
 #define FW_HBM_ADDR ((uint32_t)MAIN_RAM_BASE)
 #endif
@@ -97,10 +97,10 @@ void loader_cpu_reset(void)
 static void loader_wait(int chan, uint32_t base, uint64_t beats)
 {
     int timeout = 60000;
-    while (!(BAR_R(CSR_LOADER_STATUS_ADDR) & 1)) {
+    while (!(BAR_R(CSR_TRIXIUM_LOADER_STATUS_ADDR) & 1)) {
         usleep(1000);
         if (--timeout == 0) {
-            uint32_t st = BAR_R(CSR_LOADER_STATUS_ADDR);
+            uint32_t st = BAR_R(CSR_TRIXIUM_LOADER_STATUS_ADDR);
             fprintf(stderr, "loader timeout chan %d addr %08x (status %08x, %u of %llu beats%s)\n",
                     chan, base, st, (st >> 8) & 0xFFFFFF, (unsigned long long)beats,
                     (st & 2) ? ", still hunting for the sync marker" : "");
@@ -128,12 +128,12 @@ void loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t beat
 
 static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, uint64_t beats)
 {
-    BAR_W(CSR_LOADER_SRC_SEL_ADDR, 1);
-    BAR_W(CSR_LOADER_CHAN_ADDR,     chan);
-    BAR_W(CSR_LOADER_BASE_ADDR,     base);
-    BAR_W(CSR_LOADER_LENGTH_ADDR,   beats);
-    BAR_W(CSR_LOADER_RESYNC_ADDR,   0);
-    BAR_W(CSR_LOADER_START_ADDR,    1);
+    BAR_W(CSR_TRIXIUM_LOADER_SRC_SEL_ADDR, 1);
+    BAR_W(CSR_TRIXIUM_LOADER_CHAN_ADDR,     chan);
+    BAR_W(CSR_TRIXIUM_LOADER_BASE_ADDR,     base);
+    BAR_W(CSR_TRIXIUM_LOADER_LENGTH_ADDR,   beats);
+    BAR_W(CSR_TRIXIUM_LOADER_RESYNC_ADDR,   0);
+    BAR_W(CSR_TRIXIUM_LOADER_START_ADDR,    1);
 
     const uint32_t *w = (const uint32_t *)data;
     uint64_t nwords = beats*8;
@@ -141,9 +141,9 @@ static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, ui
         /* The FIFO drains at HBM speed, so it only fills if the link is unusually fast;
          * check periodically rather than per word. */
         if ((i & 0xFF) == 0)
-            while (BAR_R(CSR_LOADER_STATUS_ADDR) & 4)
+            while (BAR_R(CSR_TRIXIUM_LOADER_STATUS_ADDR) & 4)
                 ;
-        BAR_W(CSR_LOADER_POKE_ADDR, w[i]);
+        BAR_W(CSR_TRIXIUM_LOADER_POKE_ADDR, w[i]);
     }
     loader_wait(chan, base, beats);
 }
@@ -169,10 +169,10 @@ uint64_t loader_upload_image(const char *path, int verbose)
     if (verbose)
         printf("BONS image: %u layers, %u channels, %.1f MB/channel\n",
                hdr.n_layer, hdr.n_channels, hdr.payload_beats*32/1e6);
-    if (hdr.n_channels != BONSAI_N_CHANNELS) {
+    if (hdr.n_channels != TRIXIUM_N_CHANNELS) {
         fprintf(stderr, "image has %u channels but the gateware has %u engine channels - "
                 "convert with --channels %u\n",
-                hdr.n_channels, BONSAI_N_CHANNELS, BONSAI_N_CHANNELS);
+                hdr.n_channels, TRIXIUM_N_CHANNELS, TRIXIUM_N_CHANNELS);
         fclose(f);
         return 0;
     }
@@ -201,15 +201,15 @@ uint64_t loader_upload_image(const char *path, int verbose)
         fseek(f, (uint64_t)hdr.payload_offset + c*chan_bytes, SEEK_SET);
         if (fread(buf, 1, chan_bytes, f) != chan_bytes) { perror("fread"); exit(1); }
         memset(buf + chan_bytes, 0, 32*BEATS(chan_bytes) - chan_bytes);
-#ifdef BONSAI_LOADER_ADDS_CHAN_OFFSET
-        uint32_t csr_base = BONSAI_CHAN_WEIGHT_BASE;
+#ifdef TRIXIUM_LOADER_ADDS_CHAN_OFFSET
+        uint32_t csr_base = TRIXIUM_CHAN_WEIGHT_BASE;
 #else
-        uint32_t csr_base = BONSAI_CHAN_WEIGHT_BASE + (uint32_t)c*BONSAI_CHAN_STRIDE;
+        uint32_t csr_base = TRIXIUM_CHAN_WEIGHT_BASE + (uint32_t)c*TRIXIUM_CHAN_STRIDE;
 #endif
         if (verbose)
             printf("  -> base %09llx (csr %08x), first words %08x %08x\n",
-                   (unsigned long long)BONSAI_CHAN_WEIGHT_BASE
-                       + (unsigned long long)c*BONSAI_CHAN_STRIDE,
+                   (unsigned long long)TRIXIUM_CHAN_WEIGHT_BASE
+                       + (unsigned long long)c*TRIXIUM_CHAN_STRIDE,
                    (unsigned)csr_base, ((uint32_t *)buf)[0], ((uint32_t *)buf)[1]);
         loader_transfer((int)c, csr_base, buf, BEATS(chan_bytes));
     }

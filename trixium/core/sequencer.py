@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiSequencer: hardware execution of descriptor lists (engine/vector/rotation ops).
+"""Sequencer: hardware execution of descriptor lists (engine/vector/rotation ops).
 
 Op dispatch from the CPU costs ~1k cycles per op (CSR writes + completion polling) and the
 engine/vector units serialize behind it - at N >= 16 channels dispatch dominates the token
@@ -101,9 +101,9 @@ from litex.gen import *
 from litex.soc.interconnect.csr import *
 from litex.soc.interconnect import stream
 
-# BonsaiSequencer ----------------------------------------------------------------------------------
+# Sequencer ----------------------------------------------------------------------------------
 
-class BonsaiSequencer(LiteXModule):
+class Sequencer(LiteXModule):
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
                  scratchpad_size=256*1024):
@@ -199,7 +199,7 @@ class BonsaiSequencer(LiteXModule):
                 'last list start: the element index, 0xFFFFFFFF before any output.')
             self.restore_argmax_val = CSRStatus(32, description='Its FP32 value (0 when none yet).')
 
-        # Engine command side (muxed into engine.cmd by BonsaiEngineCSR while busy).
+        # Engine command side (muxed into engine.cmd by EngineCSR while busy).
         self.eng_valid  = Signal()
         self.eng_ready  = Signal()
         self.eng_kind   = Signal(3)

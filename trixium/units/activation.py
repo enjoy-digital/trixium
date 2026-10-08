@@ -237,7 +237,7 @@ ACTIVATION_COMMAND = [("src", 24), ("dst", 24), ("exponents", 24),
                       ("protect_start", 24), ("protect_end", 24)]
 
 
-class BonsaiActivationScratchpad(LiteXModule):
+class ActivationScratchpad(LiteXModule):
     """Scan, select e8, reread and pack each independent FP32 block into Q8.
 
     src/dst/exponents are 32-byte-aligned bases. elements is a positive multiple

@@ -17,7 +17,7 @@ into the memory models.
 
 Flow (from the repository root):
   python3 -m trixium.targets.sim --build-software       # headers + BIOS (no gateware)
-  make -C firmware BUILD_DIR=../build/sim_xcu1525       # firmware/bonsai.bin
+  make -C firmware BUILD_DIR=../build/sim_xcu1525       # firmware/trixium.bin
   python3 -m trixium.targets.sim --run                  # elaborate + verilate + run
 """
 
@@ -45,7 +45,7 @@ from litex.soc.integration.builder import Builder
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 from trixium.model.bons import BONSReader
 
 # Constants ----------------------------------------------------------------------------------------
@@ -55,7 +55,7 @@ MAIN_RAM_SIZE = 0x0080_0000 # 8 MB.
 from trixium.layout import HDR_CPU_OFFSET
 HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared with hardware).
 
-# BonsaiSimSoC -------------------------------------------------------------------------------------
+# SimSoC -------------------------------------------------------------------------------------
 
 # The DDR4 flavour of the sim (--mem ddr4): the XCU1525's memory plumbing on LiteDRAM's PHY
 # model - main_ram on controller 0 through the BIOS's own sdram_init(), the engine channels
@@ -188,7 +188,7 @@ class TriXiumSimSoC(SoCCore):
                     while size < len(payload) + 128*1024:
                         size *= 2
                     init = words_from_bytes(payload)
-                model = BonsaiHBMChannelModel(axi, size=size, init=init,
+                model = HBMChannelModel(axi, size=size, init=init,
                     latency=hbm_latency, stall_rate=hbm_stall_rate)
                 self.add_module(f"hbm_model{c}", model)
                 axis.append(axi)
@@ -196,8 +196,8 @@ class TriXiumSimSoC(SoCCore):
         else:
             chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
         # Same integration as both hardware targets; only memory/physical policy differs.
-        from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
-        config = BonsaiClusterConfig(with_sp_csr=False,
+        from trixium.core.core import TriXiumConfig, TriXiumCore
+        config = TriXiumConfig(with_sp_csr=False,
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
             chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0,
             with_hadamard=with_hadamard, with_activation_quantize=with_activation_quantize,
@@ -208,37 +208,39 @@ class TriXiumSimSoC(SoCCore):
             attnstream_options=tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
                 if attn_geometry else ())
-        add_bonsai_cluster(self, axis, config)
+        self.trixium = TriXiumCore(axis, config)
+        for name, value in self.trixium.constants.items():
+            self.add_constant(name, value)
         self.comb += [
-            self._prof_pads.eng_busy.eq(self.engine.busy),
-            self._prof_pads.vec_busy.eq(self.vecunit.busy),
-            self._prof_pads.seq_busy.eq(self.seq.busy),
+            self._prof_pads.eng_busy.eq(self.trixium.engine.busy),
+            self._prof_pads.vec_busy.eq(self.trixium.vecunit.busy),
+            self._prof_pads.seq_busy.eq(self.trixium.seq.busy),
         ]
 
-        self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
-            SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
+        self.bus.add_slave("scratchpad", self.trixium.bus,
+            SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
 
         # Firmware-visible contract.
-        self.add_constant("BONSAI_HDR_ADDR",         MAIN_RAM_BASE + HDR_OFFSET)
+        self.add_constant("TRIXIUM_HDR_ADDR",         MAIN_RAM_BASE + HDR_OFFSET)
         if mem == "hbm":
-            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", 0)
+            self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", 0)
             # Sim keeps stride 0: each channel has its own independent HBM model, so the models
             # already give every channel a private address space. On hardware the AXI switch makes
             # the address select the pseudo-channel, hence the non-zero stride there.
-            self.add_constant("BONSAI_CHAN_STRIDE",      0)
+            self.add_constant("TRIXIUM_CHAN_STRIDE",      0)
         else:
             # The XCU1525's geometry, scaled to the tiny model: the same constants the
-            # firmware reads on the board (BONSAI_CHAN_MOD, BONSAI_MEM_CPU_OFFSET,
-            # BONSAI_N_MEMCTRL, BONSAI_DDR_CSR_STRIDE) with 2 MB windows from 12 MB.
-            self.add_constant("BONSAI_CHAN_WEIGHT_BASE", DDR4_SIM_WEIGHT_BASE)
-            self.add_constant("BONSAI_CHAN_STRIDE",      DDR4_SIM_CHAN_STRIDE)
-            self.add_constant("BONSAI_CHAN_MOD",         chan_mod)
-            self.add_constant("BONSAI_CHAN_SKEW",        DDR4_SIM_CHAN_SKEW)
-            self.add_constant("BONSAI_MEM_CPU_OFFSET",   0)
-            self.add_constant("BONSAI_N_MEMCTRL",        n_memctrl)
-            self.add_constant("BONSAI_DDR_CSR_STRIDE",   DDR4_SIM_CSR_STRIDE)
+            # firmware reads on the board (TRIXIUM_CHAN_MOD, TRIXIUM_MEM_CPU_OFFSET,
+            # TRIXIUM_N_MEMCTRL, TRIXIUM_DDR_CSR_STRIDE) with 2 MB windows from 12 MB.
+            self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", DDR4_SIM_WEIGHT_BASE)
+            self.add_constant("TRIXIUM_CHAN_STRIDE",      DDR4_SIM_CHAN_STRIDE)
+            self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
+            self.add_constant("TRIXIUM_CHAN_SKEW",        DDR4_SIM_CHAN_SKEW)
+            self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
+            self.add_constant("TRIXIUM_N_MEMCTRL",        n_memctrl)
+            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   DDR4_SIM_CSR_STRIDE)
             self.add_constant("SDRAM_TEST_DISABLE") # The BIOS's memtest would erase the init.
-        self.add_constant("BONSAI_N_CHANNELS",       n_channels)
+        self.add_constant("TRIXIUM_N_CHANNELS",       n_channels)
         if firmware is not None:
             self.add_constant("ROM_BOOT_ADDRESS", MAIN_RAM_BASE)
 
@@ -320,7 +322,7 @@ def main():
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
     parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS), help="Hardware to mirror.")
     parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img", help="BONS image to bake in.")
-    parser.add_argument("--firmware",       default="firmware/bonsai.bin", help="Firmware binary to bake in.")
+    parser.add_argument("--firmware",       default="firmware/trixium.bin", help="Firmware binary to bake in.")
     parser.add_argument("--build-software", action="store_true", help="Generate headers + BIOS only (to build the firmware against).")
     parser.add_argument("--run",            action="store_true", help="Build and run the simulation.")
     parser.add_argument("--out-dir",        default=None,  help="Build directory (default: build/sim_<board>).")

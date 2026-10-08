@@ -3,29 +3,24 @@
 import pytest
 
 from migen import run_simulation
-from litex.gen import LiteXModule
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
-from trixium.memory.hbm_model import BonsaiHBMChannelModel
+from trixium.core.core import TriXiumConfig, TriXiumCore
+from trixium.memory.hbm_model import HBMChannelModel
 from trixium.model import asm
 
 
-class SoC(LiteXModule):
+class SoC(TriXiumCore):
+    """The core with an HBM channel model on each memory port."""
     def __init__(self, config, n=2):
-        self.constants = {}
         self.ports = [AXIInterface(data_width=256, address_width=33, id_width=6)
                       for _ in range(n)]
-        add_bonsai_cluster(self, self.ports, config)
+        TriXiumCore.__init__(self, self.ports, config)
         self.models = []
         for i, port in enumerate(self.ports):
-            model = BonsaiHBMChannelModel(port, size=256*1024, latency=7, stall_rate=3)
+            model = HBMChannelModel(port, size=256*1024, latency=7, stall_rate=3)
             setattr(self, f'model{i}', model)
             self.models.append(model)
-
-    def add_constant(self, name, value=None):
-        assert name not in self.constants
-        self.constants[name] = value
 
 
 def write(csr, value):
@@ -50,10 +45,10 @@ def submit(dut, **fields):
 
 
 @pytest.mark.parametrize('config', [
-    BonsaiClusterConfig(with_vecunit=False, scratchpad_size=16*1024),
-    BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024,
+    TriXiumConfig(with_vecunit=False, scratchpad_size=16*1024),
+    TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024,
                         chan_stride=1 << 32),  # address >4 GiB, not an extra compute pipe
-    BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024,
+    TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024,
                         chan_stride=0x10000, chan_mod=2, chan_skew=0x1000),
 ])
 def test_cluster_fetch_store_and_reset(config):
@@ -108,11 +103,11 @@ def test_cluster_fetch_store_and_reset(config):
 
     run_simulation(dut, [gen(), monitor()], clocks={'sys': 10, 'eng': 10})
     assert addresses and set(addresses) == {offset + 64}
-    assert ('BONSAI_HAS_VECUNIT' in dut.constants) == config.with_vecunit
+    assert ('TRIXIUM_HAS_VECUNIT' in dut.constants) == config.with_vecunit
 
 
 def test_shared_sequencer_seed_mux_and_arguments():
-    dut = SoC(BonsaiClusterConfig(scratchpad_size=16*1024))
+    dut = SoC(TriXiumConfig(scratchpad_size=16*1024))
     set6 = asm.assemble([('ARG', 's6', 0), ('DONE',)])
     spill = asm.assemble(asm.prog_spill())
     descriptors = []
@@ -154,14 +149,11 @@ def test_shared_sequencer_seed_mux_and_arguments():
 ])
 def test_invalid_configuration(kwargs):
     with pytest.raises(ValueError):
-        BonsaiClusterConfig(**kwargs)
+        TriXiumConfig(**kwargs)
 
 
-def test_rejects_overwrite_and_invalid_ports():
-    dut = SoC(BonsaiClusterConfig(with_vecunit=False))
-    with pytest.raises(ValueError, match='overwrite'):
-        add_bonsai_cluster(dut, dut.ports)
+def test_rejects_invalid_ports():
     for ports in ([], [AXIInterface(data_width=128)],
                   [AXIInterface(data_width=256, clock_domain='other')]):
         with pytest.raises(ValueError):
-            add_bonsai_cluster(LiteXModule(), ports)
+            TriXiumCore(ports)

@@ -20,8 +20,8 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.memory.hbm_model import BonsaiHBMChannelModel
-from trixium.memory.loader import BonsaiHBMLoader, SYNC_MAGIC
+from trixium.memory.hbm_model import HBMChannelModel
+from trixium.memory.loader import Loader, SYNC_MAGIC
 
 MEM_SIZE = 64*1024
 
@@ -36,10 +36,10 @@ class _DUT(Module):
         for i in range(n):
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
             axis.append(axi)
-            model = BonsaiHBMChannelModel(axi, size=MEM_SIZE, latency=4)
+            model = HBMChannelModel(axi, size=MEM_SIZE, latency=4)
             self.submodules += model
             self.models.append(model)
-        self.loader = BonsaiHBMLoader(axis, data_width=data_width)
+        self.loader = Loader(axis, data_width=data_width)
         self.submodules += self.loader
 
 

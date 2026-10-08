@@ -3,8 +3,8 @@
 // Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
 
-#ifndef BONSAI_FASTMATH_H
-#define BONSAI_FASTMATH_H
+#ifndef TRIXIUM_FASTMATH_H
+#define TRIXIUM_FASTMATH_H
 
 #include <stdint.h>
 
@@ -17,7 +17,7 @@
 // 2^n exactly.  The omitted Taylor term is below 1.3e-7 over this interval.  Explicit
 // fmaf() lets RV32F issue one instruction per polynomial stage; the rest of hybrid.c keeps
 // -ffp-contract=off so changing this hot approximation cannot silently change other math.
-static inline float bonsai_expf_bounded(float x)
+static inline float trixium_expf_bounded(float x)
 {
     const float log2e = 0x1.715476p+0f;
     const float ln2_hi = 0x1.62e400p-1f;
@@ -43,43 +43,43 @@ static inline float bonsai_expf_bounded(float x)
 // on [-80, 0], +0 below (a term under 2^-115 of the maximum's 1.0, below every FP32 sum
 // that holds the maximum), a NaN argument returned (s - max: already the canonical NaN).
 // Softmax arguments are s - max <= 0, exactly +0 at the maximum (exp(+0) = 1 here too).
-static inline float bonsai_softmax_exp(float x)
+static inline float trixium_softmax_exp(float x)
 {
     if (x != x) return x;
     if (x < -80.0f) return 0.0f;
-    return bonsai_expf_bounded(x);
+    return trixium_expf_bounded(x);
 }
 
 // The DeltaNet decay exp(g), g = softplus(a + dt)*A <= 0 (A = -exp(A_log)): the same
 // canonical exp (docs/canonical-reductions.md) - ~40 cycles against libm's ~250, 2,304
 // times per 27B forward.
-static inline float bonsai_decay_exp(float g) { return bonsai_softmax_exp(g); }
+static inline float trixium_decay_exp(float g) { return trixium_softmax_exp(g); }
 
-static inline float bonsai_siluf(float x)
+static inline float trixium_siluf(float x)
 {
     // These tails avoid overflow and keep the range-reduction exponent normal.  At 16,
     // the discarded sigmoid correction is about one ulp of x; the polynomial path is used
     // at the boundary so the function remains continuous to FP32 precision.
     if (x > 16.0f) return x;
     if (x < -80.0f) return -0.0f;
-    if (x < -16.0f) return x*bonsai_expf_bounded(x);
-    return x/(1.0f + bonsai_expf_bounded(-x));
+    if (x < -16.0f) return x*trixium_expf_bounded(x);
+    return x/(1.0f + trixium_expf_bounded(-x));
 }
 
-#define BONSAI_SILU_LUT_SCALE 128
-#define BONSAI_SILU_LUT_LIMIT 16
-#define BONSAI_SILU_LUT_N (2*BONSAI_SILU_LUT_LIMIT*BONSAI_SILU_LUT_SCALE)
+#define TRIXIUM_SILU_LUT_SCALE 128
+#define TRIXIUM_SILU_LUT_LIMIT 16
+#define TRIXIUM_SILU_LUT_N (2*TRIXIUM_SILU_LUT_LIMIT*TRIXIUM_SILU_LUT_SCALE)
 
 // Finite-input lookup shared by the firmware and target-math regression harness.
-static inline float bonsai_silu_lookup(float x, const float *lut)
+static inline float trixium_silu_lookup(float x, const float *lut)
 {
-    if (x >= BONSAI_SILU_LUT_LIMIT || x <= -BONSAI_SILU_LUT_LIMIT)
-        return bonsai_siluf(x);
-    float u = (x + BONSAI_SILU_LUT_LIMIT)*BONSAI_SILU_LUT_SCALE;
+    if (x >= TRIXIUM_SILU_LUT_LIMIT || x <= -TRIXIUM_SILU_LUT_LIMIT)
+        return trixium_siluf(x);
+    float u = (x + TRIXIUM_SILU_LUT_LIMIT)*TRIXIUM_SILU_LUT_SCALE;
     int i = (int)u;
     // The largest float below 16 rounds (x + 16) to 32, making i == N.
     // Its interpolation fraction is zero; return the endpoint without reading N+1.
-    if (i >= BONSAI_SILU_LUT_N) return lut[BONSAI_SILU_LUT_N];
+    if (i >= TRIXIUM_SILU_LUT_N) return lut[TRIXIUM_SILU_LUT_N];
     float f = u - (float)i;
     return __builtin_fmaf(f, lut[i + 1] - lut[i], lut[i]);
 }
@@ -87,28 +87,28 @@ static inline float bonsai_silu_lookup(float x, const float *lut)
 // Canonical sigmoid (docs/canonical-reductions.md, "sigmoid"): the SiLU lookup's form on a
 // sigmoid table, with tails from the same bounded exp - no libm expf anywhere, so the
 // firmware, the mirror and a table-driven unit agree bit for bit. The table is built by
-// bonsai_sigmoid_point at the 4,097 grid points.
-static inline float bonsai_sigmoid_point(float x)          // x in [-16, 80]
+// trixium_sigmoid_point at the 4,097 grid points.
+static inline float trixium_sigmoid_point(float x)          // x in [-16, 80]
 {
-    return 1.0f/(1.0f + bonsai_expf_bounded(-x));
+    return 1.0f/(1.0f + trixium_expf_bounded(-x));
 }
 
-static inline float bonsai_sigmoid_tail(float x)           // |x| >= 16, finite
+static inline float trixium_sigmoid_tail(float x)           // |x| >= 16, finite
 {
     if (x > 80.0f) return 1.0f;
-    if (x >= 16.0f) return bonsai_sigmoid_point(x);
+    if (x >= 16.0f) return trixium_sigmoid_point(x);
     if (x < -80.0f) return 0.0f;
-    float e = bonsai_expf_bounded(x);
+    float e = trixium_expf_bounded(x);
     return e/(1.0f + e);
 }
 
-static inline float bonsai_sigmoid_lookup(float x, const float *lut)
+static inline float trixium_sigmoid_lookup(float x, const float *lut)
 {
-    if (x >= BONSAI_SILU_LUT_LIMIT || x <= -BONSAI_SILU_LUT_LIMIT)
-        return bonsai_sigmoid_tail(x);
-    float u = (x + BONSAI_SILU_LUT_LIMIT)*BONSAI_SILU_LUT_SCALE;
+    if (x >= TRIXIUM_SILU_LUT_LIMIT || x <= -TRIXIUM_SILU_LUT_LIMIT)
+        return trixium_sigmoid_tail(x);
+    float u = (x + TRIXIUM_SILU_LUT_LIMIT)*TRIXIUM_SILU_LUT_SCALE;
     int i = (int)u;
-    if (i >= BONSAI_SILU_LUT_N) return lut[BONSAI_SILU_LUT_N];
+    if (i >= TRIXIUM_SILU_LUT_N) return lut[TRIXIUM_SILU_LUT_N];
     float f = u - (float)i;
     return __builtin_fmaf(f, lut[i + 1] - lut[i], lut[i]);
 }

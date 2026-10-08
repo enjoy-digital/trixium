@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""BonsaiHBMLoader: host -> HBM weight upload.
+"""Loader: host -> HBM weight upload.
 
 Consumes the LitePCIe DMA (host->device) byte stream, width-converts to 256-bit beats and
 writes them to the CSR-selected channel/base. Software sequence per transfer: set chan/base/
@@ -22,23 +22,23 @@ from litex.gen import *
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import *
 
-from trixium.memory.axi import BonsaiAXIWriter
+from trixium.memory.axi import AXIWriter
 
 # One 256-bit beat the host prefixes to a transfer so the loader can find the start of the
 # payload in a stream it does not otherwise control. Repeated 32-bit word so it is trivial to
 # emit from C and unlikely to occur in packed weights.
 SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 
-# BonsaiHBMLoader ----------------------------------------------------------------------------------
+# Loader ----------------------------------------------------------------------------------
 
-class BonsaiHBMLoader(LiteXModule):
+class Loader(LiteXModule):
     def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0,
                  *, with_mstore=False):
         # chan_stride: byte distance between channel windows, added IN HARDWARE to host
         # uploads (base + chan*stride, 33 bits) exactly as the engine adds it for reads
         # and stores - so the host writes the channel-relative base and channel 15's
         # window above 4 GB needs no wider CSR. The SoC exports
-        # BONSAI_LOADER_ADDS_CHAN_OFFSET so the host tools know not to add it themselves.
+        # TRIXIUM_LOADER_ADDS_CHAN_OFFSET so the host tools know not to add it themselves.
         assert chan_stride == 0 or (chan_stride & (chan_stride - 1)) == 0
         chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
         # chan_mod: channels per memory controller (see matvec.py) - the upload path adds
@@ -132,7 +132,7 @@ class BonsaiHBMLoader(LiteXModule):
         self.writers = []
         self.wbufs   = []
         for i, axi in enumerate(hbm_axis):
-            writer = BonsaiAXIWriter(axi)
+            writer = AXIWriter(axi)
             setattr(self.submodules, f"writer{i}", writer)
             self.writers.append(writer)
             wbuf = stream.Buffer([("data", 256)])

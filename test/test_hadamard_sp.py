@@ -5,15 +5,15 @@ import pytest
 from migen import *
 from litex.gen import LiteXModule
 
-from trixium.units.hadamard import BonsaiHadamardScratchpad
-from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.units.hadamard import HadamardScratchpad
+from trixium.core.scratchpad import Scratchpad
 from test_hadamard import dense, packed, unpacked
 
 
 class RotationSP(LiteXModule):
     def __init__(self, size=8192, block_size=256):
-        self.sp = BonsaiScratchpad(size=size)
-        self.unit = BonsaiHadamardScratchpad(size, block_size)
+        self.sp = Scratchpad(size=size)
+        self.unit = HadamardScratchpad(size, block_size)
         self.grant = Signal(reset=1)
         self.comb += [self.sp.fill.adr.eq(self.unit.sp_rd_adr), self.unit.sp_rd_dat.eq(self.sp.fill.dat_r),
                      self.unit.sp_wr_gnt.eq(self.grant & self.unit.sp_wr_req),

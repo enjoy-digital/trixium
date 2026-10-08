@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# BonsaiAXIReader/Writer unit tests against BonsaiHBMChannelModel (Migen simulation):
+# AXIReader/Writer unit tests against HBMChannelModel (Migen simulation):
 # exact data/last sequences under latency + R-stall jitter + consumer backpressure,
 # streamer utilization on the clean model, write-then-readback integrity.
 
@@ -16,9 +16,9 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.memory.axi import BonsaiAXIReader
-from trixium.memory.axi import BonsaiAXIWriter
-from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.memory.axi import AXIReader
+from trixium.memory.axi import AXIWriter
+from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 MEM_SIZE = 16*1024 # 512 beats.
 
@@ -29,15 +29,15 @@ def _pattern_bytes(seed=0):
 class _ReaderDUT(Module):
     def __init__(self, latency, stall_rate, init_bytes):
         axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-        self.submodules.reader = BonsaiAXIReader(axi, burst_beats=16, fifo_depth=64)
-        self.submodules.model  = BonsaiHBMChannelModel(axi, size=MEM_SIZE,
+        self.submodules.reader = AXIReader(axi, burst_beats=16, fifo_depth=64)
+        self.submodules.model  = HBMChannelModel(axi, size=MEM_SIZE,
             init=words_from_bytes(init_bytes), latency=latency, stall_rate=stall_rate)
 
 class _WriterDUT(Module):
     def __init__(self):
         axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-        self.submodules.writer = BonsaiAXIWriter(axi, burst_beats=16)
-        self.submodules.model  = BonsaiHBMChannelModel(axi, size=MEM_SIZE, latency=4)
+        self.submodules.writer = AXIWriter(axi, burst_beats=16)
+        self.submodules.model  = HBMChannelModel(axi, size=MEM_SIZE, latency=4)
 
 def _expected_beats(data, addr, nbeats):
     return [int.from_bytes(data[addr + 32*i:addr + 32*(i+1)], "little") for i in range(nbeats)]
@@ -177,13 +177,13 @@ def test_writer_readback():
 # the first engine fetch on real hardware wedged (ENGSTALL, 32 of 128 beats delivered), so the
 # limit is pinned here rather than left to a comment.
 
-@pytest.mark.parametrize("cls", [BonsaiAXIReader, BonsaiAXIWriter])
+@pytest.mark.parametrize("cls", [AXIReader, AXIWriter])
 def test_burst_beats_capped_at_axi3_limit(cls):
     axi = AXIInterface(data_width=256, address_width=33, id_width=6)
     with pytest.raises(AssertionError):
         cls(axi, burst_beats=64)
 
-@pytest.mark.parametrize("cls", [BonsaiAXIReader, BonsaiAXIWriter])
+@pytest.mark.parametrize("cls", [AXIReader, AXIWriter])
 def test_burst_beats_16_is_accepted(cls):
     axi = AXIInterface(data_width=256, address_width=33, id_width=6)
     cls(axi, burst_beats=16)
@@ -192,7 +192,7 @@ def test_hbm_model_flags_axlen_overflow():
     """The model truncates AxLEN like the IP does, and latches the protocol violation."""
     axi = AXIInterface(data_width=256, address_width=33, id_width=6)
     dut = Module()
-    dut.submodules.model = model = BonsaiHBMChannelModel(axi, size=MEM_SIZE, latency=1)
+    dut.submodules.model = model = HBMChannelModel(axi, size=MEM_SIZE, latency=1)
 
     def driver():
         yield axi.ar.addr.eq(0)
@@ -220,9 +220,9 @@ def test_hbm_model_flags_axlen_overflow():
 class _ReaderIDDUT(Module):
     def __init__(self, latency, stall_rate, init_bytes, n_ids, reorder_ids):
         axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-        self.submodules.reader = BonsaiAXIReader(axi, burst_beats=16, fifo_depth=64,
+        self.submodules.reader = AXIReader(axi, burst_beats=16, fifo_depth=64,
                                                  n_ids=n_ids)
-        self.submodules.model  = BonsaiHBMChannelModel(axi, size=MEM_SIZE,
+        self.submodules.model  = HBMChannelModel(axi, size=MEM_SIZE,
             init=words_from_bytes(init_bytes), latency=latency, stall_rate=stall_rate,
             reorder_ids=reorder_ids)
 

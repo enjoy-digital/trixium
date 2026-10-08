@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Infrastructure unit tests: engine FETCH op (HBM -> scratchpad), BonsaiHBMLoader
+# Infrastructure unit tests: engine FETCH op (HBM -> scratchpad), Loader
 # (host stream -> HBM).
 
 import numpy as np
@@ -12,10 +12,10 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.core.scratchpad import BonsaiScratchpad
-from trixium.core.engine import BonsaiMatVecEngine
-from trixium.memory.loader import BonsaiHBMLoader
-from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.core.scratchpad import Scratchpad
+from trixium.core.engine import MatVecEngine
+from trixium.memory.loader import Loader
+from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 def test_engine_fetch():
     rng  = np.random.default_rng(21)
@@ -24,10 +24,10 @@ def test_engine_fetch():
     class DUT(Module):
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6) for _ in range(2)]
-            self.submodules.scratchpad = BonsaiScratchpad(size=16*1024)
-            self.submodules.engine     = BonsaiMatVecEngine(self.scratchpad, axis, xbuf_groups=8)
-            self.submodules.model0 = BonsaiHBMChannelModel(axis[0], size=8*1024, latency=4)
-            self.submodules.model1 = BonsaiHBMChannelModel(axis[1], size=8*1024,
+            self.submodules.scratchpad = Scratchpad(size=16*1024)
+            self.submodules.engine     = MatVecEngine(self.scratchpad, axis, xbuf_groups=8)
+            self.submodules.model0 = HBMChannelModel(axis[0], size=8*1024, latency=4)
+            self.submodules.model1 = HBMChannelModel(axis[1], size=8*1024,
                 init=words_from_bytes(data), latency=12)
 
     dut  = DUT()
@@ -64,9 +64,9 @@ def test_loader():
     class DUT(Module):
         def __init__(self):
             axis = [AXIInterface(data_width=256, address_width=33, id_width=6) for _ in range(2)]
-            self.submodules.loader = BonsaiHBMLoader(axis, data_width=128)
-            self.submodules.model0 = BonsaiHBMChannelModel(axis[0], size=8*1024, latency=4)
-            self.submodules.model1 = BonsaiHBMChannelModel(axis[1], size=8*1024, latency=4)
+            self.submodules.loader = Loader(axis, data_width=128)
+            self.submodules.model0 = HBMChannelModel(axis[0], size=8*1024, latency=4)
+            self.submodules.model1 = HBMChannelModel(axis[1], size=8*1024, latency=4)
 
     dut    = DUT()
     rng    = np.random.default_rng(31)

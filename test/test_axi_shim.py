@@ -15,19 +15,19 @@ from migen.sim import run_simulation
 from litex.soc.interconnect.axi import AXIInterface
 
 from trixium.memory.axi import AXIResetShim
-from trixium.memory.axi import BonsaiAXIReader
-from trixium.memory.axi import BonsaiAXIWriter
-from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.memory.axi import AXIReader
+from trixium.memory.axi import AXIWriter
+from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 
 class _DUT(Module):
     def __init__(self, init):
         port = AXIInterface(data_width=256, address_width=33, id_width=6)
-        self.submodules.model = BonsaiHBMChannelModel(port, size=16*1024, init=init, latency=4)
+        self.submodules.model = HBMChannelModel(port, size=16*1024, init=init, latency=4)
         self.submodules.shim  = AXIResetShim(port, stuck_cycles=2000)
         self.rst = Signal()
-        self.submodules.reader = ResetInserter()(BonsaiAXIReader(self.shim.master, fifo_depth=64))
-        self.submodules.writer = ResetInserter()(BonsaiAXIWriter(self.shim.master))
+        self.submodules.reader = ResetInserter()(AXIReader(self.shim.master, fifo_depth=64))
+        self.submodules.writer = ResetInserter()(AXIWriter(self.shim.master))
         self.comb += [self.reader.reset.eq(self.rst), self.writer.reset.eq(self.rst)]
 
 
@@ -221,11 +221,11 @@ def test_shim_writes_under_every_slave_handshake_order(order):
     class _D(Module):
         def __init__(self):
             port = AXIInterface(data_width=256, address_width=33, id_width=6)
-            self.submodules.model = BonsaiHBMChannelModel(port, size=16*1024, latency=3,
+            self.submodules.model = HBMChannelModel(port, size=16*1024, latency=3,
                                                           write_order=order)
             self.submodules.shim  = AXIResetShim(port, stuck_cycles=4000)
-            self.submodules.writer = BonsaiAXIWriter(self.shim.master)
-            self.submodules.reader = BonsaiAXIReader(self.shim.master)
+            self.submodules.writer = AXIWriter(self.shim.master)
+            self.submodules.reader = AXIReader(self.shim.master)
             self.comb += self.reader.source.ready.eq(1)
             self.port = port
             self.bcount = Signal(8)

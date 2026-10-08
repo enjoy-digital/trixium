@@ -1,16 +1,16 @@
-/* Host-side HBM loader: the one upload path both bonsai_load and bonsai_chat use.
+/* Host-side HBM loader: the one upload path both trixium_load and trixium_chat use.
  *
  * Words are poked through BAR0 into the loader's FIFO (CSR path). The DMA path was retired:
  * litepcie's host->device DMA cannot be flow-controlled and silently dropped the first ring
  * (the staged BONS header and the first megabyte of channel 0) on every upload - see
- * docs/bringup.md "Weight upload". bonsai_chat -m kept using it long after bonsai_load was
+ * docs/bringup.md "Weight upload". trixium_chat -m kept using it long after trixium_load was
  * fixed (2026-09-11), which is why this is now one module.
  *
  * Every function exits the process on a hardware error with a message; the loader is only
  * ever run interactively or from the deploy scripts.
  */
-#ifndef BONSAI_LOADER_H
-#define BONSAI_LOADER_H
+#ifndef TRIXIUM_LOADER_H
+#define TRIXIUM_LOADER_H
 
 #include <stdint.h>
 
@@ -23,7 +23,7 @@ void     loader_bar_map(int devnum);
 void     loader_cpu_reset(void);
 
 /* One transfer of `beats` 256-bit beats to HBM at (chan, byte address `base`). On bitstreams
- * with BONSAI_LOADER_ADDS_CHAN_OFFSET the gateware adds chan*stride itself. */
+ * with TRIXIUM_LOADER_ADDS_CHAN_OFFSET the gateware adds chan*stride itself. */
 void     loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t beats);
 
 /* Upload a BONS image: header+table to the channel-0 staging area (the firmware's

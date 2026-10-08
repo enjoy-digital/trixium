@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-2-Clause
-"""BonsaiAttnStream against hybrid.c's attention loops, compiled (Verilator).
+"""AttentionStream against hybrid.c's attention loops, compiled (Verilator).
 
 The K/V rows stream in with random gaps, the scratchpad read and write grants are random;
 scores and outputs must equal the float32 reference of the firmware loops bit for bit.
@@ -12,7 +12,7 @@ import pytest
 from migen.fhdl import verilog
 
 from trixium.units.attention_stream import (
-    BonsaiAttnStream, MODE_SCORES, MODE_VALUES, scores_reference, values_reference)
+    AttentionStream, MODE_SCORES, MODE_VALUES, scores_reference, values_reference)
 
 f32 = np.float32
 SP = 256*1024
@@ -84,7 +84,7 @@ def build(tmp_path, **geometry):
     verilator = shutil.which("verilator")
     if not verilator:
         pytest.skip("Verilator required")
-    dut = BonsaiAttnStream(**geometry)
+    dut = AttentionStream(**geometry)
     sig = {n: getattr(dut, n) for n in ("start", "rec", "busy", "done", "error", "sp_rd_ok", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
     for f in ("valid", "ready", "data"):

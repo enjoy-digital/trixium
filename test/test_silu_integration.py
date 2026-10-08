@@ -3,8 +3,8 @@
 import pytest
 from migen import Memory, Module, run_simulation
 
-from trixium.core.core import BonsaiClusterConfig
-from trixium.core.sequencer import BonsaiSequencer
+from trixium.core.core import TriXiumConfig
+from trixium.core.sequencer import Sequencer
 from trixium.model.activation import scratchpad_silu_descriptor, silu_table_image
 from trixium.model.silu_hw import tables
 from test_hadamard_integration import install_list
@@ -36,12 +36,12 @@ def test_descriptor_encoding_and_configuration():
     assert image[:4097] == reference_image[:4097] and image[4104:] == reference_image[4104:]
     for options in ({'with_vecunit': False}, {'scratchpad_size': 512*1024}):
         with pytest.raises(ValueError):
-            BonsaiClusterConfig(with_silu=True, **options)
+            TriXiumConfig(with_silu=True, **options)
 
 
 def fixture(descriptors):
     dut = Module()
-    dut.submodules.seq = seq = BonsaiSequencer(with_silu=True)
+    dut.submodules.seq = seq = Sequencer(with_silu=True)
     words = [pack(desc[start:start+8]) for desc in descriptors for start in (0, 8)]
     mem = Memory(256, max(2, len(words)), init=words)
     port = mem.get_port()
@@ -123,7 +123,7 @@ def test_dispatch_fields_fixup_sum_and_failure_wins(failure):
 
 
 def cluster():
-    return SoC(BonsaiClusterConfig(with_silu=True, with_projection_restore=True,
+    return SoC(TriXiumConfig(with_silu=True, with_projection_restore=True,
                                    scratchpad_size=64*1024), n=1)
 
 
@@ -215,6 +215,6 @@ def test_cluster_list_protection_and_reset_recovery():
 def test_no_cluster_memory_is_exported_over_the_csr_bus():
     """AutoCSR exports Memory attributes as CSR SRAMs with an extra sys write port: the
     kernel tables became 3-port memories that simulated fine and broke on the board."""
-    dut = SoC(BonsaiClusterConfig(with_silu=True, with_projection_restore=True, with_hadamard=True,
+    dut = SoC(TriXiumConfig(with_silu=True, with_projection_restore=True, with_hadamard=True,
                                   with_activation_quantize=True, scratchpad_size=64*1024), n=1)
     assert list(dut.get_memories()) == []

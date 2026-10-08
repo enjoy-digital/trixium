@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-2-Clause
-"""BonsaiSiluScratchpad: table LOAD and in-scratchpad SiLU-multiply RUN, against the model.
+"""SiluScratchpad: table LOAD and in-scratchpad SiLU-multiply RUN, against the model.
 
 The kernel itself is proven element-exact in test_silu_mul_rtl.py; here the questions are
 the client's: every element lands in its lane, fixup lanes carry g, the bitmap has every
@@ -18,8 +18,8 @@ from migen.fhdl import verilog
 from litex.gen import LiteXModule
 from migen import Signal, Mux
 
-from trixium.core.scratchpad import BonsaiScratchpad
-from trixium.units.silu import BonsaiSiluScratchpad, LOAD_BEATS, OP_LOAD, OP_RUN, SILU_COMMAND
+from trixium.core.scratchpad import Scratchpad
+from trixium.units.silu import SiluScratchpad, LOAD_BEATS, OP_LOAD, OP_RUN, SILU_COMMAND
 from trixium.model.silu_hw import LUT_N, silu_mul_fixed, tables
 from test_silu_mul_rtl import stress_vectors
 
@@ -73,8 +73,8 @@ SIZE = 64*1024
 
 class SiluSP(LiteXModule):
     def __init__(self, size=SIZE, preload=True):
-        self.sp = BonsaiScratchpad(size=size)
-        self.unit = BonsaiSiluScratchpad(size, tables=tables() if preload else None)
+        self.sp = Scratchpad(size=size)
+        self.unit = SiluScratchpad(size, tables=tables() if preload else None)
         self.grant = Signal(reset=1)
         self.comb += [self.sp.fill.adr.eq(self.unit.sp_rd_adr), self.unit.sp_rd_dat.eq(self.sp.fill.dat_r),
                       self.unit.sp_wr_gnt.eq(self.grant & self.unit.sp_wr_req),
@@ -251,7 +251,7 @@ def test_migen_load_fills_both_tables():
 def test_invalid_physical_sizes():
     for size in (0, 31, 33, 256*1024 + 32):
         with pytest.raises(ValueError):
-            BonsaiSiluScratchpad(size)
+            SiluScratchpad(size)
 
 
 # Compiled ---------------------------------------------------------------------------------------
@@ -259,7 +259,7 @@ def test_invalid_physical_sizes():
 def test_compiled_full_scratchpad_image(tmp_path):
     from rtl_client import build_client, run_client
     size = 256*1024
-    binary = build_client(BonsaiSiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
+    binary = build_client(SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
     rng = np.random.default_rng(12)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
     tab = 0x37000
@@ -310,11 +310,11 @@ def sigmoid_tables():
 
 def test_compiled_table_only_sigmoid(tmp_path):
     """ABI 1.2: a sigmoid table, table only - the attention output gate o *= sigmoid(g).
-    Every non-fixup element equals the firmware's m * bonsai_sigmoid_lookup(g)."""
+    Every non-fixup element equals the firmware's m * trixium_sigmoid_lookup(g)."""
     from rtl_client import build_client, run_client
     from trixium.model.rv32_math import sigmoid_rv32
     size = 256*1024
-    binary = build_client(BonsaiSiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
+    binary = build_client(SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
     rng = np.random.default_rng(21)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
     # Both tables resident (ABI 1.3): the SiLU's in set 0, the sigmoid's in set 1.

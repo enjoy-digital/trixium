@@ -259,7 +259,7 @@ HADAMARD_COMMAND = [("src", 24), ("signs", 24), ("dst", 24), ("stats", 24),
                     ("blocks", 16), ("inverse", 1)]
 
 
-class BonsaiHadamardScratchpad(LiteXModule):
+class HadamardScratchpad(LiteXModule):
     """Transform complete int8 blocks into raw signed int32 scratchpad vectors.
 
     All four byte bases are 32-byte aligned. Signs are packed low-bit first,

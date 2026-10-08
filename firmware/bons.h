@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define BONS_MAGIC   0x534E4F42 // "BONS"
-#define BONS_STAGING_CLEARED 0x44524c43u // "CLRD": bonsai_loader.c loader_clear_staging()
+#define BONS_STAGING_CLEARED 0x44524c43u // "CLRD": trixium_loader.c loader_clear_staging()
 #define BONS_VERSION 3          // layout.BONS_VERSION; infer_init accepts 2 and 3.
                                 // 2: NORM16 .w16 entries carry their exponent in bias.
                                 // 3: the hybrid fields (a v2 image reads as all-zero ones).
