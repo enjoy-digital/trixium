@@ -41,8 +41,8 @@ Scratchpad access goes through the integrator's per-cycle arbitration: sp_rd (25
 enables, claimed for the store's E2 cycle).
 """
 
+from operator import or_
 from functools import reduce
-from operator import or_, and_
 
 from migen import *
 
@@ -60,6 +60,7 @@ LANES = 16
 # Vector Unit --------------------------------------------------------------------------------------
 
 class VectorUnit(LiteXModule):
+    """16-lane SIMD vector unit running trixium.model.asm microcode (see the module doc)."""
     def __init__(self, imem_depth=None, vregs=16):
         # Kept in step with model.asm.IMEM_DEPTH, which asserts the programs fit: an
         # overflowing upload wraps and silently overwrites the program at offset 0.
@@ -92,20 +93,23 @@ class VectorUnit(LiteXModule):
         self.seq_seed7 = Signal(48) # S7 initial value under seq_en (prev prog's res6).
 
         # CSRs.
-        self.prog      = CSRStorage(32, description=
-            "Instruction upload (auto-incrementing address).")
-        self.prog_adr  = CSRStorage(16, description="Upload address (write before a burst).")
-        self.pc        = CSRStorage(16, description="Program start PC.")
-        self.arg0 = CSRStorage(32); self.arg1 = CSRStorage(32)
-        self.arg2 = CSRStorage(32); self.arg3 = CSRStorage(32)
-        self.arg4 = CSRStorage(32); self.arg5 = CSRStorage(32)
-        self.arg6 = CSRStorage(32); self.arg7 = CSRStorage(32)
-        self.submit    = CSRStorage(1, description="Write 1 to run the program at pc.")
-        self.status    = CSRStatus(fields=[
-            CSRField("busy",   size=1),
+        self.prog       = CSRStorage(32, description="Instruction upload (auto-incrementing address).")
+        self.prog_adr   = CSRStorage(16, description="Upload address (write before a burst).")
+        self.pc         = CSRStorage(16, description="Program start PC.")
+        self.arg0       = CSRStorage(32, description="Program argument 0 (ARG).")
+        self.arg1       = CSRStorage(32, description="Program argument 1 (ARG).")
+        self.arg2       = CSRStorage(32, description="Program argument 2 (ARG).")
+        self.arg3       = CSRStorage(32, description="Program argument 3 (ARG).")
+        self.arg4       = CSRStorage(32, description="Program argument 4 (ARG).")
+        self.arg5       = CSRStorage(32, description="Program argument 5 (ARG).")
+        self.arg6       = CSRStorage(32, description="Program argument 6 (ARG).")
+        self.arg7       = CSRStorage(32, description="Program argument 7 (ARG).")
+        self.submit     = CSRStorage(1,  description="Write 1 to run the program at pc.")
+        self.status     = CSRStatus(fields=[
+            CSRField("busy",   size=1, description="Program running."),
             CSRField("bad_op", size=1, description="Sticky: unknown opcode executed."),
         ])
-        self.done_count = CSRStatus(32)
+        self.done_count = CSRStatus(32, description="Completed program counter.")
         self.res5       = CSRStatus(48, description="S5 after DONE.")
         self.res6       = CSRStatus(48, description="S6 after DONE.")
         self.res7       = CSRStatus(48, description="S7 after DONE.")
@@ -124,7 +128,6 @@ class VectorUnit(LiteXModule):
         imem_w = imem.get_port(write_capable=True)
         imem_r = imem.get_port(async_read=True)
         self.specials += imem_w, imem_r
-        self.autocsr_exclude = set() # (Memories here are fine: not named .mem.)
 
         up_adr = Signal(16)
         self.sync += [
@@ -158,9 +161,8 @@ class VectorUnit(LiteXModule):
         rom_rec = make_rom(bx.recip_lut(), 1 << 14)
         rom_rsq = make_rom(bx.rsqrt_lut(), int(round((2**15)/2.0)))
 
-        # Register files.
-        # 16 vector registers (ISA rev 2) so the single-chain hot programs can be unrolled
-        # x2; the encoding moves with it (model.asm docstring). vregs=8 keeps the rev 1
+        # Register files: 16 vector registers (ISA rev 2) so the single-chain hot programs can be
+        # unrolled x2; the encoding moves with it (model.asm docstring). vregs=8 keeps the rev 1
         # encoding.
         assert vregs in (8, 16), vregs
         self.vregs = vregs
@@ -184,7 +186,7 @@ class VectorUnit(LiteXModule):
         def lane(sig, i):
             return sig[32*i:32*(i+1)]
 
-        # Op classes ------------------------------------------------------------------------
+        # Op classes -------------------------------------------------------------------------------
         ALU_OPS = ["VADD", "VSUB", "VMIN", "VMAX", "VSHRI", "VSHLI", "VSHLV", "VRNE",
                    "VCLAMP8", "VCLAMP16", "VABS", "VCLZN", "VPACK", "BCAST", "VSHLS"]
         MUL_OPS = ["VMUL", "VMULH15", "VMULS"]
@@ -203,7 +205,7 @@ class VectorUnit(LiteXModule):
                    "STV", "STB", "STW", "VSHLS", "VMULS", "BCAST"]
         USES_SD = SCW_OPS # Non-reduction readers/writers of S[sd] (reductions read late).
 
-        # F / D state -----------------------------------------------------------------------
+        # F / D state ------------------------------------------------------------------------------
         pc         = Signal(16)     # Next word to fetch.
         fetch_en   = Signal()
         insn_d     = Signal(32)
@@ -220,9 +222,10 @@ class VectorUnit(LiteXModule):
         loop_start2 = Signal(16)
         loop_cnt2   = Signal(32)
         lf2_arm     = Signal()
-        running    = Signal()
-        bad_op     = Signal()
-        finish     = Signal()
+        # Run state.
+        running = Signal()
+        bad_op  = Signal()
+        finish  = Signal()
 
         self.comb += imem_r.adr.eq(pc)
 
@@ -297,12 +300,12 @@ class VectorUnit(LiteXModule):
         for i in range(8):
             self.comb += arg_eff[i].eq(Mux(self.seq_en, self.seq_args[i], csr_args[i]))
         args_arr = Array(arg_eff)
-        arg_sel = Signal(32)
+        arg_sel  = Signal(32)
         self.comb += arg_sel.eq(args_arr[d_imm[0:3]])
 
         # Scalar SSHLV: 48-bit variable shift of S[sd] by S[sa] (clamped +-47), wraps to 48.
         ssh_amt = Signal((7, True))
-        c47n = Signal((48, True), reset=-47)
+        c47n    = Signal((48, True), reset=-47)
         self.comb += ssh_amt.eq(Mux(sa_d > 47, 47, Mux(sa_d < c47n, c47n, sa_d[0:7])))
         ssh_amt_pos = Signal(6)
         ssh_amt_neg = Signal(6)
@@ -326,7 +329,7 @@ class VectorUnit(LiteXModule):
                 snorme_res.eq((30 - p) if (p % 2 == 0) else (31 - p)))
         self.comb += sn_cases
 
-        # E1 record ---------------------------------------------------------------------------
+        # E1 record --------------------------------------------------------------------------------
         e1_valid    = Signal()
         e1_op       = Signal(6)
         e1_vd       = Signal(VBITS)
@@ -350,7 +353,7 @@ class VectorUnit(LiteXModule):
         e1_is_ldw   = Signal()
         e1_is_mul   = Signal()
 
-        # E2 record ---------------------------------------------------------------------------
+        # E2 record --------------------------------------------------------------------------------
         e2_valid    = Signal()
         e2_op       = Signal(6)
         e2_vd       = Signal(VBITS)
@@ -377,7 +380,7 @@ class VectorUnit(LiteXModule):
         e2_fr6      = [Signal(6, name=f"e2_fr6_{i}") for i in range(LANES)]
         e2_fq7      = [Signal(7, name=f"e2_fq7_{i}") for i in range(LANES)]
 
-        # E3 record ---------------------------------------------------------------------------
+        # E3 record --------------------------------------------------------------------------------
         e3_valid    = Signal()
         e3_vd       = Signal(VBITS)
         e3_sd       = Signal(3)
@@ -395,35 +398,36 @@ class VectorUnit(LiteXModule):
         red2_max    = Signal(32)
         red2_smax   = Signal((32, True))
 
-        # E4 record (LUT writeback only) --------------------------------------------------------
+        # E4 record (LUT writeback only) -----------------------------------------------------------
         e4_valid    = Signal()
         e4_vd       = Signal(VBITS)
         e4_is_lut   = Signal()
         lut_r       = Signal(32*LANES)
 
-        # Hazards / pipeline control ----------------------------------------------------------
+        # Hazards / pipeline control ---------------------------------------------------------------
         def vd_match(stage_vd):
             return (d_uses_va & (stage_vd == d_va)) | (d_uses_vb & (stage_vd == d_vb))
+
         def red_pending(x):
             return ((e1_valid & e1_is_red & (e1_sd == x))
                     | (e2_valid & e2_is_red & (e2_sd == x))
                     | (e3_valid & e3_is_red & (e3_sd == x)))
-        stall_ld   = Signal()
-        stall_mul  = Signal()
-        stall_lut  = Signal()
-        stall_waw  = Signal()
-        stall_s    = Signal()
-        stall_mem  = Signal()
-        done_wait  = Signal()
-        stall_d    = Signal()
-        hold_e2    = Signal()
-        d_go       = Signal()
-        d_is_done  = Signal()
-        d_is_loops = Signal()
-        d_is_loope = Signal()
-        loope_taken = Signal()
-        d_is_loops2 = Signal()
-        d_is_loope2 = Signal()
+        stall_ld     = Signal()
+        stall_mul    = Signal()
+        stall_lut    = Signal()
+        stall_waw    = Signal()
+        stall_s      = Signal()
+        stall_mem    = Signal()
+        done_wait    = Signal()
+        stall_d      = Signal()
+        hold_e2      = Signal()
+        d_go         = Signal()
+        d_is_done    = Signal()
+        d_is_loops   = Signal()
+        d_is_loope   = Signal()
+        loope_taken  = Signal()
+        d_is_loops2  = Signal()
+        d_is_loope2  = Signal()
         loope2_taken = Signal()
         self.comb += [
             d_is_done.eq(d_op == OP["DONE"]),
@@ -463,7 +467,7 @@ class VectorUnit(LiteXModule):
         start_pc = Signal(16)
         self.comb += start_pc.eq(Mux(self.seq_en, self.seq_pc, self.pc.storage))
 
-        # E2 writeback value (also the D-side forward source) -----------------------------------
+        # E2 writeback value (also the D-side forward source) --------------------------------------
         ld_val = Signal(32*LANES)
         for i in range(LANES):
             ldv_l = Cat(self.sp_rd_dat[16*i:16*(i+1)], Replicate(self.sp_rd_dat[16*i+15], 16))
@@ -497,9 +501,9 @@ class VectorUnit(LiteXModule):
         va_d = d_operand(d_va, 0)
         vb_d = d_operand(d_vb, 1)
 
-        # E1 datapath -------------------------------------------------------------------------
-        fwd_a = Signal()
-        fwd_b = Signal()
+        # E1 datapath ------------------------------------------------------------------------------
+        fwd_a     = Signal()
+        fwd_b     = Signal()
         e2_fwd_ok = Signal()
         self.comb += [
             e2_fwd_ok.eq(e2_valid & e2_wr_v & ~e2_is_load & ~e2_is_lut & ~e2_is_mul),
@@ -544,6 +548,7 @@ class VectorUnit(LiteXModule):
             s = Signal(32)
             self.comb += s.eq(Mux(a_l[i] < 0, -a_l[i], a_l[i]))
             abs_l.append(s)
+
         def max2(x, y, signed):
             m = Signal((32, True)) if signed else Signal(32)
             self.comb += m.eq(Mux(x > y, x, y))
@@ -562,11 +567,11 @@ class VectorUnit(LiteXModule):
 
         # Lanewise ALU results.
         res = {name: Signal(32*LANES, name=f"res_{name.lower()}") for name in ALU_OPS}
-        c31n  = Signal((32, True), reset=-31)
-        c8p   = Signal((32, True), reset=127)
-        c8n   = Signal((32, True), reset=-127)
-        c8p_v = Signal((32, True), reset=127)
-        c8n_v = Signal((32, True), reset=-127)
+        c31n   = Signal((32, True), reset=-31)
+        c8p    = Signal((32, True), reset=127)
+        c8n    = Signal((32, True), reset=-127)
+        c8p_v  = Signal((32, True), reset=127)
+        c8n_v  = Signal((32, True), reset=-127)
         c16p   = Signal((32, True), reset=32767)
         c16n   = Signal((32, True), reset=-32767)
         c16p_v = Signal((32, True), reset=32767)
@@ -654,13 +659,17 @@ class VectorUnit(LiteXModule):
                     Cat(xu[24:31], C(1, 1)),
                     Cat(xu[23:30], C(0, 1)))),
             ]
-            fr7 = Signal(7); fr6 = Signal(6); fq7 = Signal(7)
+            fr7 = Signal(7)
+            fr6 = Signal(6)
+            fq7 = Signal(7)
             self.comb += [
                 fr7.eq(x15[0:7]),
                 fr6.eq(m15[0:6]),
                 fq7.eq(Mux(xu[31], xu[17:24], xu[16:23])),
             ]
-            fr7_c.append(fr7); fr6_c.append(fr6); fq7_c.append(fq7)
+            fr7_c.append(fr7)
+            fr6_c.append(fr6)
+            fq7_c.append(fq7)
 
         # Store data packing (E1).
         st16 = Signal(256)
@@ -695,7 +704,7 @@ class VectorUnit(LiteXModule):
             self.sp_wr_we.eq(Mux(e2_valid & e2_is_store, e2_st_we, 0)),
         ]
 
-        # E2 datapath: LUT operand select and reduction stage 2 -------------------------------
+        # E2 datapath: LUT operand select and reduction stage 2 ------------------------------------
         # E2 picks (e_a, d = e_b - e_a, frac) for the op; E3 does e_a + ((d*frac) >> 7).
         # The recip table's 6-bit fraction is doubled so one shift serves all three:
         # (d*(2f)) >> 7 == (d*f) >> 6 exactly (floor on both sides).
@@ -723,7 +732,9 @@ class VectorUnit(LiteXModule):
                 lfr.eq(Mux(e2_f_lut["LUTE2"], e2_fr7[i],
                        Mux(e2_f_lut["LUTRECIP"], Cat(C(0, 1), e2_fr6[i]), e2_fq7[i]))),
             ]
-            lea_c.append(lea); ld_c.append(ld); lfr_c.append(lfr)
+            lea_c.append(lea)
+            ld_c.append(ld)
+            lfr_c.append(lfr)
         # E3 datapath: LUT interpolation multiply-add.
         lut_val = Signal(32*LANES)
         for i in range(LANES):
@@ -750,8 +761,8 @@ class VectorUnit(LiteXModule):
 
         # E3: reductions read S[sd] late. REDMAX compares as the interpreter does - the
         # 48-bit signed accumulator against the zero-extended absmax.
-        ssq3 = Signal((64, True))
-        sd3  = Signal((48, True))
+        ssq3       = Signal((64, True))
+        sd3        = Signal((48, True))
         red2_max_s = Signal((48, True))
         self.comb += [
             ssq3.eq(red2_ssq[0] + red2_ssq[1] + red2_ssq[2] + red2_ssq[3]),
@@ -767,9 +778,9 @@ class VectorUnit(LiteXModule):
             self.done.eq(finish),
         ]
 
-        # Sequential: F/D advance, D commits, E1/E2/E3 records -------------------------------
+        # Sequential: F/D advance, D commits, E1/E2/E3 records -------------------------------------
         self.sync += [
-            # --- F / D ---
+            # F / D.
             If(start,
                 pc.eq(start_pc),
                 fetch_en.eq(1),
@@ -813,7 +824,7 @@ class VectorUnit(LiteXModule):
                 loop_first2.eq(d_word),
                 lf2_arm.eq(0),
             ),
-            # --- D commits (exactly once, on d_go) ---
+            # D commits (exactly once, on d_go).
             If(d_go,
                 If(d_op == OP["MOVSI"],  S[d_sd].eq(d_imm)),
                 If(d_op == OP["ARG"],    S[d_sd].eq(Cat(arg_sel, Replicate(arg_sel[31], 16)))),
@@ -850,7 +861,7 @@ class VectorUnit(LiteXModule):
                 If(d_is_done, fetch_en.eq(0), finish.eq(1)),
                 If(~d_is_known, bad_op.eq(1)),
             ),
-            # --- FINISH (one cycle after DONE committed; the pipe is empty by then) ---
+            # FINISH (one cycle after DONE committed; the pipe is empty by then).
             If(finish,
                 finish.eq(0),
                 running.eq(0),
@@ -859,7 +870,7 @@ class VectorUnit(LiteXModule):
                 self.res6.status.eq(S[6]),
                 self.res7.status.eq(S[7]),
             ),
-            # --- E1 record (from D) ---
+            # E1 record (from D).
             If(~hold_e2,
                 e1_valid.eq(d_valid & ~stall_d),
                 e1_op.eq(d_op),
@@ -878,7 +889,7 @@ class VectorUnit(LiteXModule):
                 e1_redssq.eq(d_op == OP["REDSSQ"]),
                 e1_is_ldw.eq(d_op == OP["LDW"]),
                 e1_is_mul.eq(is_in(d_op, MUL_OPS)),
-                # --- E2 record (from E1) ---
+                # E2 record (from E1).
                 e2_valid.eq(e1_valid),
                 e2_op.eq(e1_op),
                 e2_vd.eq(e1_vd), e2_sd.eq(e1_sd),
@@ -903,7 +914,7 @@ class VectorUnit(LiteXModule):
                 *[e2_fr7[i].eq(fr7_c[i]) for i in range(LANES)],
                 *[e2_fr6[i].eq(fr6_c[i]) for i in range(LANES)],
                 *[e2_fq7[i].eq(fq7_c[i]) for i in range(LANES)],
-                # --- E3 record (from E2) ---
+                # E3 record (from E2).
                 e3_valid.eq(e2_valid),
                 e3_vd.eq(e2_vd), e3_sd.eq(e2_sd),
                 e3_is_lut.eq(e2_is_lut),
@@ -920,15 +931,15 @@ class VectorUnit(LiteXModule):
                 # A held store freezes everything upstream and nothing downstream.
                 e3_valid.eq(0),
             ),
-            # --- E4 record (from E3): always advances, held store or not ---
+            # E4 record (from E3): always advances, held store or not.
             e4_valid.eq(e3_valid),
             e4_vd.eq(e3_vd),
             e4_is_lut.eq(e3_is_lut),
             lut_r.eq(lut_val),
-            # --- V writes: E4 (LUT) first, E2 second so the younger instruction wins ---
+            # V writes: E4 (LUT) first, E2 second so the younger instruction wins.
             If(vwb.we, vlvt[e4_vd].eq(1)),
             If(vwa.we, vlvt[e2_vd].eq(0)), # Listed last: E2 wins a same-reg collision.
-            # --- E3 reductions (late S read; the scoreboard keeps every other writer off) ---
+            # E3 reductions (late S read; the scoreboard keeps every other writer off).
             If(e3_valid & e3_is_red,
                 If(e3_f_red["REDSUM"], S[e3_sd].eq(sd3 + red2_sum)),
                 If(e3_f_red["REDSSQ"], S[e3_sd].eq(sd3 + ssq3[0:48])),

@@ -19,10 +19,9 @@ from migen import *
 from litex.gen import *
 
 from litex.soc.interconnect import stream
-from litex.soc.interconnect.axi import AXIInterface, BURST_INCR
+from litex.soc.interconnect.axi import AXIInterface
 
 from trixium.layout import BEAT_BYTES
-
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -33,38 +32,39 @@ def words_from_bytes(data):
         data = data + b"\x00"*(BEAT_BYTES - len(data) % BEAT_BYTES)
     return [int.from_bytes(data[i:i+BEAT_BYTES], "little") for i in range(0, len(data), BEAT_BYTES)]
 
-
 # HBMChannelModel ----------------------------------------------------------------------------------
 
 class HBMChannelModel(LiteXModule):
+    """Behavioral HBM2 pseudo-channel port (simulation only).
+
+    axi        : AXIInterface slave (created if None).
+    size       : modeled memory bytes (power of two).
+    init       : optional list of 256-bit init words (words_from_bytes()).
+    latency    : cycles between AR acceptance and first R beat.
+    stall_rate : R-stall density, 0..15 (LFSR nibble < stall_rate stalls R).
+    reorder_ids: 0 keeps the simple in-order read server. N (power of two) models the
+                 real Xilinx HBM controller's read behavior instead: requests with the
+                 SAME ARID are strictly serialized - the next one is not even started
+                 until the previous one's data has fully returned, plus a `latency` gap -
+                 while requests on DIFFERENT IDs overlap (one burst's latency counts down
+                 while another streams). Measured on the FK33, that same-ID serialization
+                 is exactly why a single-ID reader gets 33.7 cycles/beat out of a port
+                 whose RTL-side path sustains 2.35 in the full-SoC sim: one 16-beat burst
+                 per round trip. A single-ID reader against this model reproduces the
+                 pathology; the multi-ID reader must erase it. Response order across IDs
+                 follows service order (rotating scan), not request order.
+    write_order: the slave's AW/W handshake discipline - every one is legal AXI and a
+                 master must work with all three (see AXIResetShim):
+                 "aw_first"   : AW into a FIFO whenever presented; W taken only after
+                                its AW (the default).
+                 "w_first"    : W beats taken into a FIFO ahead of their AW (LiteDRAM's
+                                bridge: a W FIFO independent of its one-deep AW buffer).
+                 "aw_after_w" : AWREADY only once WVALID is seen (a slave that waits for
+                                data before the address - the HBM IP behaves like this).
+    """
     def __init__(self, axi=None, size=64*1024, init=None, latency=16, stall_rate=0,
                  reorder_ids=0, write_order="aw_first"):
-        """
-        axi        : AXIInterface slave (created if None).
-        size       : modeled memory bytes (power of two).
-        init       : optional list of 256-bit init words (words_from_bytes()).
-        latency    : cycles between AR acceptance and first R beat.
-        stall_rate : R-stall density, 0..15 (LFSR nibble < stall_rate stalls R).
-        reorder_ids: 0 keeps the simple in-order read server. N (power of two) models the
-                     real Xilinx HBM controller's read behavior instead: requests with the
-                     SAME ARID are strictly serialized - the next one is not even started
-                     until the previous one's data has fully returned, plus a `latency` gap -
-                     while requests on DIFFERENT IDs overlap (one burst's latency counts down
-                     while another streams). Measured on the FK33, that same-ID serialization
-                     is exactly why a single-ID reader gets 33.7 cycles/beat out of a port
-                     whose RTL-side path sustains 2.35 in the full-SoC sim: one 16-beat burst
-                     per round trip. A single-ID reader against this model reproduces the
-                     pathology; the multi-ID reader must erase it. Response order across IDs
-                     follows service order (rotating scan), not request order.
-        write_order: the slave's AW/W handshake discipline - every one is legal AXI and a
-                     master must work with all three (see AXIResetShim):
-                     "aw_first"   : AW into a FIFO whenever presented; W taken only after
-                                    its AW (the default).
-                     "w_first"    : W beats taken into a FIFO ahead of their AW (LiteDRAM's
-                                    bridge: a W FIFO independent of its one-deep AW buffer).
-                     "aw_after_w" : AWREADY only once WVALID is seen (a slave that waits for
-                                    data before the address - the HBM IP behaves like this).
-        """
+        assert write_order in ("aw_first", "w_first", "aw_after_w")
         if axi is None:
             axi = AXIInterface(data_width=256, address_width=33, id_width=6)
         self.axi = axi
@@ -72,14 +72,15 @@ class HBMChannelModel(LiteXModule):
         # stops answering - the wedge the engine soft reset exists for); released later, the
         # beats of the bursts it still owes come out, which is what the AXI shim must absorb.
         self.freeze = Signal()
-        assert write_order in ("aw_first", "w_first", "aw_after_w")
-        self.write_order = write_order
-        depth    = size//BEAT_BYTES
+
+        self.write_order     = write_order
         self.autocsr_exclude = {"mem"} # Keep the model memory off the CSR bus (AutoCSR scan).
 
         # # #
 
-        mem = Memory(256, depth, init=init)
+        # Memory.
+        depth = size//BEAT_BYTES
+        mem   = Memory(256, depth, init=init)
         self.specials += mem
         wr_port = mem.get_port(write_capable=True, we_granularity=8)
         rd_port = mem.get_port(async_read=True)
@@ -94,25 +95,25 @@ class HBMChannelModel(LiteXModule):
         # AXI3 burst-length truncation -------------------------------------------------------------
         # The real IP's ports are AXI3: AXI_nn_AxLEN is 4 bits, so anything above 16 beats
         # silently loses its upper bits on the way in. Model that exactly, or simulation
-        # happily serves 64-beat bursts that hardware never will (which is precisely how the
-        # first engine fetch on silicon came to stall). `axlen_overflow` latches the mistake
-        # so a test can name it instead of just timing out.
+        # happily serves 64-beat bursts that hardware never will (a stall on the first fetch).
+        # `axlen_overflow` latches the mistake so a test can name it instead of timing out.
         self.axlen_overflow = axlen_overflow = Signal()
         self.sync += If((axi.ar.valid & (axi.ar.len[4:] != 0)) |
                         (axi.aw.valid & (axi.aw.len[4:] != 0)),
-            axlen_overflow.eq(1))
+            axlen_overflow.eq(1),
+        )
 
         if reorder_ids:
             self._reorder_read_path(axi, rd_port, latency, stall, reorder_ids)
         else:
             self._legacy_read_path(axi, rd_port, latency, stall)
         self._write_path(axi, wr_port)
-        self.mem = mem # Exposed for direct inspection in tests.
+        self.mem = mem # Exposed for direct inspection in tests (excluded from AutoCSR above).
 
     def _legacy_read_path(self, axi, rd_port, latency, stall):
         # Read path --------------------------------------------------------------------------------
         ar_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
-        self.submodules += ar_fifo
+        self += ar_fifo
         self.comb += [
             ar_fifo.sink.valid.eq(axi.ar.valid),
             axi.ar.ready.eq(ar_fifo.sink.ready),
@@ -139,8 +140,8 @@ class HBMChannelModel(LiteXModule):
             ar_fifo.source.ready.eq(1),
             If(ar_fifo.source.valid,
                 NextValue(r_beat, ar_fifo.source.addr[log2_int(BEAT_BYTES):]),
-                NextValue(r_left, ar_fifo.source.len + 1),
-                NextValue(r_id,   ar_fifo.source.id),
+                NextValue(r_left,  ar_fifo.source.len + 1),
+                NextValue(r_id,    ar_fifo.source.id),
                 NextValue(lat_cnt, latency),
                 NextState("LATENCY"),
             )
@@ -191,12 +192,12 @@ class HBMChannelModel(LiteXModule):
         # its previous burst finished streaming (cooldown), so single-ID traffic degrades
         # to one burst per round trip - the measured hardware pathology - while multi-ID
         # chains bursts back-to-back on the data channel.
-        st_valid = [Signal(name=f"st_valid{i}") for i in range(nq)]
-        st_addr  = [Signal(33,  name=f"st_addr{i}") for i in range(nq)]
-        st_len   = [Signal(8,   name=f"st_len{i}")  for i in range(nq)]
-        st_id    = [Signal(6,   name=f"st_id{i}")   for i in range(nq)]
-        st_lat   = [Signal(16,  name=f"st_lat{i}")  for i in range(nq)]
-        cooldown = [Signal(16,  name=f"cooldown{i}") for i in range(nq)]
+        st_valid = [Signal(    name=f"st_valid{i}") for i in range(nq)]
+        st_addr  = [Signal(33, name=f"st_addr{i}")  for i in range(nq)]
+        st_len   = [Signal(8,  name=f"st_len{i}")   for i in range(nq)]
+        st_id    = [Signal(6,  name=f"st_id{i}")    for i in range(nq)]
+        st_lat   = [Signal(16, name=f"st_lat{i}")   for i in range(nq)]
+        cooldown = [Signal(16, name=f"cooldown{i}") for i in range(nq)]
 
         cur_valid = Signal()
         cur_beat  = Signal(30)
@@ -279,7 +280,7 @@ class HBMChannelModel(LiteXModule):
     def _write_path(self, axi, wr_port):
         # Write path -------------------------------------------------------------------------------
         aw_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
-        self.submodules += aw_fifo
+        self += aw_fifo
         self.comb += [
             aw_fifo.sink.addr.eq(axi.aw.addr),
             aw_fifo.sink.len.eq(axi.aw.len[:4]),
@@ -298,10 +299,10 @@ class HBMChannelModel(LiteXModule):
             ]
 
         # The data source of the write server: the bus, or a FIFO fed ahead of the AW.
-        w = stream.Endpoint([("data", 256), ("strb", 32)])   # `last` is the stream's own.
+        w = stream.Endpoint([("data", 256), ("strb", 32)]) # `last` is the stream's own.
         if self.write_order == "w_first":
             w_fifo = stream.SyncFIFO([("data", 256), ("strb", 32)], 64)
-            self.submodules += w_fifo
+            self += w_fifo
             self.comb += [
                 w_fifo.sink.valid.eq(axi.w.valid),
                 axi.w.ready.eq(w_fifo.sink.ready),

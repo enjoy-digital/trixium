@@ -107,6 +107,7 @@ from trixium.units.conv import CONV_COMMAND
 # Sequencer ----------------------------------------------------------------------------------------
 
 class Sequencer(LiteXModule):
+    """Descriptor-list executor (see the module doc for the descriptor format)."""
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False,
                  with_conv=False, scratchpad_size=256*1024):
@@ -116,23 +117,26 @@ class Sequencer(LiteXModule):
                          or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit "
                              "address space")
+
+        # CSRs.
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
         self.count  = CSRStorage(16, description="Descriptor count (stop descriptor also ends).")
         self.start  = CSRStorage(1,  description="Write 1 to run the list.")
-        self.sbmode = CSRStorage(1, reset=0, description=
-            "Posted-write ordering. 0: the descriptor fetch stalls while any posted write is "
-            "in flight. 1: drain-at-start only (see sbw_pending). The start drain runs in "
-            "both modes.")
+        self.sbmode = CSRStorage(1,  reset=0, description="Posted-write ordering. 0: the "
+            "descriptor fetch stalls while any posted write is in flight. 1: drain-at-start only "
+            "(see sbw_pending). The start drain runs in both modes.")
         self.status = CSRStatus(fields=[
-            CSRField("busy",   size=1),
+            CSRField("busy",   size=1,            description="List running."),
             CSRField("dcount", size=16, offset=8, description="Descriptors completed."),
         ])
+
+        # Optional resident units: command stream, handshake and ABI/error CSRs.
         extension_errors = []
         if with_hadamard:
             self.hadamard_cmd    = stream.Endpoint(HADAMARD_COMMAND)
             self.hadamard_done   = Signal()
             self.hadamard_failed = Signal(8)
-            self.hadamard_abi    = CSRStatus(32, reset=0x00010000)
+            self.hadamard_abi    = CSRStatus(32, reset=0x00010000, description="ABI version (16.16).")
             self.hadamard_error  = CSRStatus(32, description=
                 "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
                 "descriptor, bit2 output overlaps descriptor list, bits8..15 rotation-unit "
@@ -142,7 +146,7 @@ class Sequencer(LiteXModule):
             self.activation_quantize_cmd    = stream.Endpoint(ACTIVATION_COMMAND)
             self.activation_quantize_done   = Signal()
             self.activation_quantize_failed = Signal(8)
-            self.activation_quantize_abi    = CSRStatus(32, reset=0x00010001)
+            self.activation_quantize_abi    = CSRStatus(32, reset=0x00010001, description="ABI version (16.16).")
             self.activation_quantize_error  = CSRStatus(32, description=
                 "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
                 "descriptor, bits8..15 conversion-unit error (bit14 protects descriptor list; "
@@ -152,43 +156,43 @@ class Sequencer(LiteXModule):
             self.projection_restore_cmd    = stream.Endpoint(RESTORE_COMMAND)
             self.projection_restore_done   = Signal()
             self.projection_restore_failed = Signal(8)
-            self.projection_restore_abi    = CSRStatus(32, reset=0x00010000)
+            self.projection_restore_abi    = CSRStatus(32, reset=0x00010000, description="ABI version (16.16).")
             self.projection_restore_error  = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
-                'descriptor, bits8..15 restoration-client error (bit14 protects the full '
-                'descriptor list).')
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
+                "descriptor, bits8..15 restoration-client error (bit14 protects the full "
+                "descriptor list).")
             extension_errors.append(self.projection_restore_error)
         if with_silu:
             self.silu_cmd         = stream.Endpoint(SILU_COMMAND)
             self.silu_done        = Signal()
             self.silu_failed      = Signal(8)
             self.silu_unit_fixups = Signal(16)
-            self.silu_abi         = CSRStatus(32, reset=0x00010003)
+            self.silu_abi         = CSRStatus(32, reset=0x00010003, description="ABI version (16.16).")
             self.silu_error       = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
-                'descriptor, bits8..15 SiLU-client error (bit14 protects the full descriptor '
-                'list).')
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
+                "descriptor, bits8..15 SiLU-client error (bit14 protects the full descriptor "
+                "list).")
             self.silu_fixups      = CSRStatus(32, description=
-                'Fixup elements flagged by unit 11 since the last list start (all its RUN '
-                'descriptors).')
+                "Fixup elements flagged by unit 11 since the last list start (all its RUN "
+                "descriptors).")
             extension_errors.append(self.silu_error)
         if with_norm:
             self.norm_cmd   = stream.Endpoint(NORM_COMMAND)
             self.norm_done, self.norm_failed = Signal(), Signal(8)
-            self.norm_abi   = CSRStatus(32, reset=0x00010002)
+            self.norm_abi   = CSRStatus(32, reset=0x00010002, description="ABI version (16.16).")
             self.norm_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
-                'descriptor, bits8..15 norm-client error (bit14 protects the full descriptor '
-                'list).')
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
+                "descriptor, bits8..15 norm-client error (bit14 protects the full descriptor "
+                "list).")
             extension_errors.append(self.norm_error)
         if with_conv:
             self.conv_cmd   = stream.Endpoint(CONV_COMMAND)
             self.conv_done, self.conv_failed = Signal(), Signal(8)
-            self.conv_abi   = CSRStatus(32, reset=0x00010000)
+            self.conv_abi   = CSRStatus(32, reset=0x00010000, description="ABI version (16.16).")
             self.conv_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
-                'descriptor, bits8..15 conv-client error (bit14 protects the full descriptor '
-                'list).')
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
+                "descriptor, bits8..15 conv-client error (bit14 protects the full descriptor "
+                "list).")
             extension_errors.append(self.conv_error)
 
         if with_projection_restore:
@@ -197,10 +201,10 @@ class Sequencer(LiteXModule):
             self.restore_argmax_valid_in = Signal()
             self.restore_argmax_idx_in, self.restore_argmax_val_in = Signal(32), Signal(32)
             self.restore_argmax_idx      = CSRStatus(32, description=
-                'Greedy argmax (first max, NaN-first frozen) of every unit-8 output since the '
-                'last list start: the element index, 0xFFFFFFFF before any output.')
+                "Greedy argmax (first max, NaN-first frozen) of every unit-8 output since the "
+                "last list start: the element index, 0xFFFFFFFF before any output.")
             self.restore_argmax_val      = CSRStatus(32, description=
-                'Its FP32 value (0 when none yet).')
+                "Its FP32 value (0 when none yet).")
 
         # Engine command side (muxed into engine.cmd by EngineCSR while busy).
         self.eng_valid   = Signal()
@@ -231,13 +235,13 @@ class Sequencer(LiteXModule):
         self.absmax      = Signal(32) # From the engine tracker.
 
         # Vector-unit direct-drive side.
-        self.vec_start = Signal()    # Pulse.
+        self.vec_start = Signal()   # Pulse.
         self.vec_pc    = Signal(16)
         self.vec_args  = [Signal(32, name=f"seq_vec_arg{i}") for i in range(8)]
-        self.vec_done  = Signal()    # From the vector unit (pulse).
-        self.vec_res6  = Signal(48)  # Vector unit S6 result (registered at DONE).
-        self.vec_seed7 = Signal(48)  # S7 seed for the next program: res6, or the engine
-                                     # absmax when w0[4] is set (see below).
+        self.vec_done  = Signal()   # From the vector unit (pulse).
+        self.vec_res6  = Signal(48) # Vector unit S6 result (registered at DONE).
+        self.vec_seed7 = Signal(48) # S7 seed for the next program: res6, or the engine absmax
+                                    # when w0[4] is set (see below).
 
         # Scratchpad read (through the engine's fill-port mux).
         self.sp_adr    = Signal(13)
@@ -255,14 +259,15 @@ class Sequencer(LiteXModule):
         #     scratchpad window is uncached and the CPU is in-order).
         # Unwired (reset 0) this is a no-op.
         self.sbw_pending = Signal()
-        self.sp_gnt    = Signal(reset=1) # Integrator: port is the seq's this cycle (a vec
-                                         # load outranks descriptor fetches). Reset 1 when
-                                         # unwired.
+        # Integrator grant: the port is the sequencer's this cycle (a vec load outranks
+        # descriptor fetches). Reset 1 when unwired.
+        self.sp_gnt      = Signal(reset=1)
 
         self.busy = Signal()
 
         # # #
 
+        # Descriptor buffer.
         dptr   = Signal(13) # Beat index of the current descriptor.
         left   = Signal(16)
         dcount = Signal(16)
@@ -279,12 +284,14 @@ class Sequencer(LiteXModule):
         # (WAIT-ENGINE) is not needed on these units, which wait for the engine by default.
         ovl = Signal()
         w0u = Signal(32)
-        self.overlap = Signal()   # To the integrator's unit guard: this dispatch may overlap.
+        self.overlap = Signal() # To the integrator's unit guard: this dispatch may overlap.
         self.comb += [
             ovl.eq(w(0, 0)[9]),
             w0u.eq(w(0, 0) & ~(1 << 9)),
             self.overlap.eq(self.busy & ovl),
         ]
+
+        # Resident unit descriptor checks and command fields.
         had_dispatch, quant_dispatch, restore_dispatch, bad_list = [], [], [], []
         silu_dispatch, norm_dispatch, conv_dispatch = [], [], []
         unknown_unit = [NextState("IDLE")]
@@ -295,7 +302,9 @@ class Sequencer(LiteXModule):
             self.comb += start_end.eq(self.base.storage + (self.count.storage << 6))
             list_ok = (self.base.storage[:5] == 0) & (start_end <= scratchpad_size)
             self.sync += If(self.start.re & self.start.storage & ~self.busy,
-                list_base.eq(self.base.storage), list_end.eq(start_end))
+                list_base.eq(self.base.storage),
+                list_end.eq(start_end),
+            )
             unknown_unit = [*[NextValue(error.status, 2) for error in extension_errors],
                             NextState("EXT_FAILED")]
             bad_list     = [*[NextValue(error.status, 1) for error in extension_errors],
@@ -349,7 +358,7 @@ class Sequencer(LiteXModule):
             ).Else(NextState("DISPATCH_QUANT"))]
         if with_projection_restore:
             malformed = Signal()
-            command = self.projection_restore_cmd
+            command   = self.projection_restore_cmd
             self.comb += [
                 malformed.eq((w0u != 8) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
@@ -360,8 +369,8 @@ class Sequencer(LiteXModule):
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             restore_dispatch = [If(malformed,
-                NextValue(self.projection_restore_error.status, 2), NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_RESTORE'))]
+                NextValue(self.projection_restore_error.status, 2), NextState("EXT_FAILED"),
+            ).Else(NextState("DISPATCH_RESTORE"))]
             self.comb += [
                 self.restore_argmax_clear.eq(self.start.re & self.start.storage & ~self.busy),
                 self.restore_argmax_idx.status.eq(Mux(self.restore_argmax_valid_in,
@@ -370,7 +379,7 @@ class Sequencer(LiteXModule):
             ]
         if with_silu:
             malformed = Signal()
-            command = self.silu_cmd
+            command   = self.silu_cmd
             self.comb += [
                 malformed.eq((w0u != 11) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 4)[24:] != 0) | (w(0, 5)[16:] != 0) |
@@ -385,13 +394,14 @@ class Sequencer(LiteXModule):
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             self.sync += If(self.start.re & self.start.storage & ~self.busy,
-                self.silu_fixups.status.eq(0))
+                self.silu_fixups.status.eq(0),
+            )
             silu_dispatch = [If(malformed,
-                NextValue(self.silu_error.status, 2), NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_SILU'))]
+                NextValue(self.silu_error.status, 2), NextState("EXT_FAILED"),
+            ).Else(NextState("DISPATCH_SILU"))]
         if with_norm:
             malformed = Signal()
-            command = self.norm_cmd
+            command   = self.norm_cmd
             self.comb += [
                 malformed.eq((w0u != 12) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
                     (w(0, 3)[24:] != 0) | (w(0, 6)[1:8] != 0) | (w(0, 6)[13:16] != 0) |
@@ -405,11 +415,11 @@ class Sequencer(LiteXModule):
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             norm_dispatch = [If(malformed,
-                NextValue(self.norm_error.status, 2), NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_NORM'))]
+                NextValue(self.norm_error.status, 2), NextState("EXT_FAILED"),
+            ).Else(NextState("DISPATCH_NORM"))]
         if with_conv:
             malformed = Signal()
-            command = self.conv_cmd
+            command   = self.conv_cmd
             self.comb += [
                 malformed.eq((w0u != 13) |
                     reduce(or_, [w(0, i)[24:] != 0 for i in range(1, 7)]) |
@@ -424,8 +434,10 @@ class Sequencer(LiteXModule):
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             conv_dispatch = [If(malformed,
-                NextValue(self.conv_error.status, 2), NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_CONV'))]
+                NextValue(self.conv_error.status, 2), NextState("EXT_FAILED"),
+            ).Else(NextState("DISPATCH_CONV"))]
+
+        # Common descriptor fields.
         unit   = Signal(4)
         argsrc = Signal(16)
         nowait = Signal()
@@ -476,7 +488,7 @@ class Sequencer(LiteXModule):
         absmax_bl = bitlen(self.absmax)
         res6_lo   = Signal(48)
         self.comb += res6_lo.eq(self.vec_res6)
-        res6_bl   = bitlen(res6_lo)
+        res6_bl = bitlen(res6_lo)
 
         k_absmax = Signal(32)
         rpre_v   = Signal(32)
@@ -568,6 +580,7 @@ class Sequencer(LiteXModule):
             lut_word.eq(Array([lut_beat_r[32*j:32*j + 32] for j in range(8)])[lut_sel_r]),
         ]
 
+        # Vector-unit arguments.
         for i in range(8):
             src  = Signal(2)
             imm  = Signal(32)
@@ -621,11 +634,13 @@ class Sequencer(LiteXModule):
             self.vec_pc.eq(w(0, 1)[0:16]),
         ]
 
+        # Status.
         self.comb += [
             self.status.fields.busy.eq(self.busy),
             self.status.fields.dcount.eq(dcount),
         ]
 
+        # FSM.
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(self.start.re & self.start.storage,
@@ -635,7 +650,8 @@ class Sequencer(LiteXModule):
                 If(list_ok, NextState("SBDRAIN")).Else(*bad_list),
             )
         )
-        fsm.act("SBDRAIN", # Let every patch posted for this list land before fetching it.
+        fsm.act("SBDRAIN",
+            # Let every patch posted for this list land before fetching it.
             self.busy.eq(1),
             If(~self.sbw_pending,
                 NextState("FETCH0"),
@@ -653,8 +669,9 @@ class Sequencer(LiteXModule):
                 NextState("FETCH0_L"),
             )
         )
-        fsm.act("FETCH0_L", # dat valid this cycle: it reflects the address sampled at the
-            # end of the granted FETCH0 cycle, whoever owns the port now.
+        fsm.act("FETCH0_L",
+            # dat valid this cycle: it reflects the address sampled at the end of the granted
+            # FETCH0 cycle, whoever owns the port now.
             self.busy.eq(1),
             self.sp_active.eq(1),
             self.sp_adr.eq(dptr), # Hold.
@@ -682,7 +699,8 @@ class Sequencer(LiteXModule):
                 NextState("DISPATCH"),
             )
         )
-        fsm.act("FETCHL", # Resolve the LUT index (waits for its kreg), register the address.
+        fsm.act("FETCHL",
+            # Resolve the LUT index (waits for its kreg), register the address.
             self.busy.eq(1),
             # The index reads a kreg: hold while its capture is still in flight or in the
             # done+2 pipe (the same interlock DISPATCH applies to kadd consumers).
@@ -692,7 +710,8 @@ class Sequencer(LiteXModule):
                 NextState("FETCHL_A"),
             )
         )
-        fsm.act("FETCHL_A", # One more beat: the LUT entry for this descriptor's A5.
+        fsm.act("FETCHL_A",
+            # One more beat: the LUT entry for this descriptor's A5.
             self.busy.eq(1),
             self.sp_active.eq(1),
             self.sp_adr.eq(lut_adr_r),
@@ -755,56 +774,92 @@ class Sequencer(LiteXModule):
                 If(self.hadamard_failed != 0,
                     NextValue(self.hadamard_error.status, self.hadamard_failed << 8),
                     NextState("EXT_FAILED"),
-                ).Elif(self.hadamard_done, NextState("NEXT")),
+                ).Elif(self.hadamard_done,
+                    NextState("NEXT"),
+                ),
             )
         if with_activation_quantize:
-            fsm.act("DISPATCH_QUANT", self.busy.eq(1),
-                If(~eng_inflight | ovl, self.activation_quantize_cmd.valid.eq(1),
-                    If(self.activation_quantize_cmd.ready, NextState("WAIT_QUANT"))))
-            fsm.act("WAIT_QUANT", self.busy.eq(1),
+            fsm.act("DISPATCH_QUANT",
+                self.busy.eq(1),
+                If(~eng_inflight | ovl,
+                    self.activation_quantize_cmd.valid.eq(1),
+                    If(self.activation_quantize_cmd.ready, NextState("WAIT_QUANT")),
+                ),
+            )
+            fsm.act("WAIT_QUANT",
+                self.busy.eq(1),
                 If(self.activation_quantize_failed != 0,
                     NextValue(self.activation_quantize_error.status,
                         self.activation_quantize_failed << 8),
                     NextState("EXT_FAILED"),
-                ).Elif(self.activation_quantize_done, NextState("NEXT")))
+                ).Elif(self.activation_quantize_done,
+                    NextState("NEXT"),
+                ),
+            )
         if extended:
-            fsm.act("EXT_FAILED", self.busy.eq(1))
+            fsm.act("EXT_FAILED",
+                self.busy.eq(1),
+            )
         if with_projection_restore:
-            fsm.act('DISPATCH_RESTORE', self.busy.eq(1),
-                If(~eng_inflight | ovl, self.projection_restore_cmd.valid.eq(1),
-                    If(self.projection_restore_cmd.ready, NextState('WAIT_RESTORE'))))
-            fsm.act('WAIT_RESTORE', self.busy.eq(1),
+            fsm.act("DISPATCH_RESTORE",
+                self.busy.eq(1),
+                If(~eng_inflight | ovl,
+                    self.projection_restore_cmd.valid.eq(1),
+                    If(self.projection_restore_cmd.ready, NextState("WAIT_RESTORE")),
+                ),
+            )
+            fsm.act("WAIT_RESTORE",
+                self.busy.eq(1),
                 If(self.projection_restore_failed != 0,
                     NextValue(self.projection_restore_error.status,
                         self.projection_restore_failed << 8),
-                    NextState('EXT_FAILED'),
-                ).Elif(self.projection_restore_done, NextState('NEXT')))
+                    NextState("EXT_FAILED"),
+                ).Elif(self.projection_restore_done,
+                    NextState("NEXT"),
+                ),
+            )
         if with_silu:
-            fsm.act('DISPATCH_SILU', self.busy.eq(1),
-                If(~eng_inflight | ovl, self.silu_cmd.valid.eq(1),
-                    If(self.silu_cmd.ready, NextState('WAIT_SILU'))))
-            fsm.act('WAIT_SILU', self.busy.eq(1),
+            fsm.act("DISPATCH_SILU",
+                self.busy.eq(1),
+                If(~eng_inflight | ovl,
+                    self.silu_cmd.valid.eq(1),
+                    If(self.silu_cmd.ready, NextState("WAIT_SILU")),
+                ),
+            )
+            fsm.act("WAIT_SILU",
+                self.busy.eq(1),
                 If(self.silu_failed != 0,
                     NextValue(self.silu_error.status, self.silu_failed << 8),
-                    NextState('EXT_FAILED'),
+                    NextState("EXT_FAILED"),
                 ).Elif(self.silu_done,
                     NextValue(self.silu_fixups.status,
                         self.silu_fixups.status + self.silu_unit_fixups),
-                    NextState('NEXT')))
+                    NextState("NEXT"),
+                ),
+            )
         for name, enabled in (("norm", with_norm), ("conv", with_conv)):
             if not enabled:
                 continue
-            cmd, failed, done = (getattr(self, name + "_cmd"), getattr(self, name + "_failed"),
-                                 getattr(self, name + "_done"))
-            error = getattr(self, name + "_error")
-            fsm.act('DISPATCH_' + name.upper(), self.busy.eq(1),
+            cmd    = getattr(self, name + "_cmd")
+            failed = getattr(self, name + "_failed")
+            done   = getattr(self, name + "_done")
+            error  = getattr(self, name + "_error")
+            fsm.act("DISPATCH_" + name.upper(),
+                self.busy.eq(1),
                 If(~eng_inflight | ovl,
                     cmd.valid.eq(1),
-                    If(cmd.ready, NextState('WAIT_' + name.upper()))))
-            fsm.act('WAIT_' + name.upper(), self.busy.eq(1),
+                    If(cmd.ready, NextState("WAIT_" + name.upper())),
+                ),
+            )
+            fsm.act("WAIT_" + name.upper(),
+                self.busy.eq(1),
                 If(failed != 0,
-                    NextValue(error.status, failed << 8), NextState('EXT_FAILED'),
-                ).Elif(done, NextState('NEXT')))
+                    NextValue(error.status, failed << 8),
+                    NextState("EXT_FAILED"),
+                ).Elif(done,
+                    NextState("NEXT"),
+                ),
+            )
         fsm.act("WAIT_ENG",
             self.busy.eq(1),
             If(self.eng_done,

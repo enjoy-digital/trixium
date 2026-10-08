@@ -17,8 +17,8 @@ The same writers serve the engine's STOREs (scratchpad -> memory, single channel
 DeltaNet stream's multi-channel store, granted only while no upload is in progress.
 """
 
-from functools import reduce
 from operator import and_, or_
+from functools import reduce
 
 from migen import *
 
@@ -29,7 +29,6 @@ from litex.soc.interconnect.csr import *
 
 from trixium.memory.axi import AXIWriter
 
-
 # Constants ----------------------------------------------------------------------------------------
 
 # One 256-bit beat the host prefixes to a transfer so the loader can find the start of the
@@ -37,10 +36,10 @@ from trixium.memory.axi import AXIWriter
 # emit from C and unlikely to occur in packed weights.
 SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 
-
 # Loader -------------------------------------------------------------------------------------------
 
 class Loader(LiteXModule):
+    """Weight upload (DMA stream or CSR pokes) and engine STORE path onto per-channel AXIWriters."""
     def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0,
                  *, with_mstore=False):
         # chan_stride: byte distance between channel windows, added IN HARDWARE to host
@@ -50,40 +49,40 @@ class Loader(LiteXModule):
         # TRIXIUM_LOADER_ADDS_CHAN_OFFSET so the host tools know not to add it themselves.
         assert chan_stride == 0 or (chan_stride & (chan_stride - 1)) == 0
         chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
-        # chan_mod: channels per memory controller (see matvec.py) - the upload path adds
+        # chan_mod: channels per memory controller (see engine.py) - the upload path adds
         # (chan % chan_mod)*stride, the window's offset inside the channel's own controller.
         assert chan_mod == 0 or (chan_mod & (chan_mod - 1)) == 0
         chan_sel = (lambda c: c & (chan_mod - 1)) if chan_mod else (lambda c: c)
-        # chan_skew: the per-channel bank skew the engine adds (matvec.py), added here too.
+        # chan_skew: the per-channel bank skew the engine adds (engine.py), added here too.
         assert chan_skew == 0 or chan_mod
         chan_skew_of = lambda sel: Array([k*chan_skew for k in range(chan_mod)])[sel]
-        self.sink = stream.Endpoint([("data", data_width)]) # From PCIe DMA (host->device).
 
+        # Upload stream (from the PCIe DMA, host->device).
+        self.sink = stream.Endpoint([("data", data_width)])
+
+        # CSRs.
         self.chan   = CSRStorage(5,  description="Destination channel.")
         self.base   = CSRStorage(32, description="Destination byte address (beat-aligned).")
         self.length = CSRStorage(24, description="Transfer length in 256-bit beats.")
         self.start  = CSRStorage(1,  description="Write 1 to arm the transfer.")
-        # NB: not `self.sync` - that name is Migen's synchronous-logic proxy on a Module.
-        self.resync = CSRStorage(1,  description=
-            "Arm with stream resynchronisation: discard beats until the LOADER_SYNC_MAGIC "
-            "beat is seen, then take the payload from the beat after it.")
+        # Not `self.sync`: that name is Migen's synchronous-logic proxy on a Module.
+        self.resync = CSRStorage(1,  description="Arm with stream resynchronisation: discard beats "
+            "until the LOADER_SYNC_MAGIC beat is seen, then take the payload from the beat after it.")
         # CSR upload path: the host poking words through BAR0 instead of streaming over DMA.
-        #
-        # The DMA is the fast path but it cannot be flow-controlled - see the resync notes
-        # below - so this is the one that is simply always right: the host writes each word
-        # itself, so nothing can be dropped, reordered or invented. It is slower (a posted
-        # PCIe write per 32 bits) but it needs no marker, no pacing and no luck.
-        self.src_sel = CSRStorage(1, description="Upload source: 0 = PCIe DMA, 1 = CSR poke.")
+        # The DMA is the fast path but cannot be flow-controlled (see the resync notes below);
+        # here the host writes each word itself, so nothing can be dropped, reordered or
+        # invented. Slower (a posted PCIe write per 32 bits), but needs no marker and no pacing.
+        self.src_sel = CSRStorage(1,  description="Upload source: 0 = PCIe DMA, 1 = CSR poke.")
         self.poke    = CSRStorage(32, description="Write a 32-bit word into the upload stream.")
 
         self.status = CSRStatus(fields=[
-            CSRField("done",  size=1, description="Transfer complete (idle)."),
-            CSRField("sync",  size=1, offset=1, description="Hunting for the sync marker."),
-            CSRField("poke_full", size=1, offset=2, description="CSR poke FIFO cannot accept."),
-            CSRField("beats", size=24, offset=8, description="Beats written so far."),
+            CSRField("done",      size=1,             description="Transfer complete (idle)."),
+            CSRField("sync",      size=1,  offset=1,  description="Hunting for the sync marker."),
+            CSRField("poke_full", size=1,  offset=2,  description="CSR poke FIFO cannot accept."),
+            CSRField("beats",     size=24, offset=8,  description="Beats written so far."),
         ])
 
-        # Engine STORE source (scratchpad -> HBM, KV append): granted only from IDLE, so
+        # Engine STORE source (scratchpad -> memory, KV append): granted only from IDLE, so
         # host uploads and engine stores serialize on the shared per-channel writers.
         # Firmware never overlaps them (weight upload happens before generation).
         self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 33), ("len", 24)])
@@ -103,12 +102,10 @@ class Loader(LiteXModule):
         # Width conversion to 256-bit beats.
         self.conv = conv = stream.Converter(data_width, 256)
 
-        # CSR poke -> stream: pack 32-bit writes into sink-width words, buffer them, and mux
-        # that in place of the DMA when src_sel is set.
-        # Pack straight to 256-bit beats and mux at the *converter output*, not its input:
-        # feeding 128-bit words into the up-converter duplicated each one across both halves
-        # of the beat (a data_width=256 simulation never exercises the converter). Nothing
-        # needs converting here anyway - the host knows it is writing beats.
+        # CSR poke -> stream: pack 32-bit writes straight into 256-bit beats, buffer them, and
+        # mux them in place of the DMA at the *converter output* when src_sel is set (feeding
+        # 128-bit words into the up-converter would duplicate each one across both halves of
+        # the beat; a data_width=256 simulation never exercises the converter).
         poke_ratio = 256//32
         poke_sr    = Signal(256)
         poke_cnt   = Signal(max=poke_ratio)
@@ -130,24 +127,23 @@ class Loader(LiteXModule):
         #
         # Data reaches the writers through register slices at both ends of the crossing
         # (otherwise the store data is the scratchpad BRAM output, combinational through the
-        # state mux into every writer's W register: long routes to the far HBM ports and a
-        # timing failure). `sbuf` registers the engine's store beats
-        # once at the loader; `wbuf[i]` registers them again next to each writer, so the
-        # 16-way fan-out is FF -> FF and Vivado can replicate the source. The DMA upload
-        # path shares the per-writer slices. Latency only: +1 cycle per beat at each slice,
-        # and the drain states still wait on the writers (w_active holds until the last
-        # beat has left the slice).
+        # state mux into every writer's W register: long routes to the far memory ports and a
+        # timing failure). `sbuf` registers the engine's store beats once at the loader;
+        # `wbuf[i]` registers them again next to each writer, so the 16-way fan-out is FF -> FF
+        # and Vivado can replicate the source. The DMA upload path shares the per-writer slices.
+        # Latency only: +1 cycle per beat at each slice, and the drain states still wait on the
+        # writers (w_active holds until the last beat has left the slice).
         self.writers = []
         self.wbufs   = []
         for i, axi in enumerate(hbm_axis):
             writer = AXIWriter(axi)
-            setattr(self.submodules, f"writer{i}", writer)
+            setattr(self, f"writer{i}", writer)
             self.writers.append(writer)
             wbuf = stream.Buffer([("data", 256)])
-            setattr(self.submodules, f"wbuf{i}", wbuf)
+            setattr(self, f"wbuf{i}", wbuf)
             self.comb += wbuf.source.connect(writer.sink_data)
             self.wbufs.append(wbuf)
-        self.submodules.sbuf = sbuf = stream.Buffer([("data", 256)])
+        self.sbuf = sbuf = stream.Buffer([("data", 256)])
         self.comb += self.store_data.connect(sbuf.sink)
         st_src = sbuf.source
 
@@ -170,7 +166,7 @@ class Loader(LiteXModule):
         # tell payload from filler, and a transfer that starts on the wrong beat writes
         # plausible-looking rubbish to memory.
         #
-        # So let the stream say where it starts. Armed with `sync`, the loader discards beats
+        # So let the stream say where it starts. Armed with `resync`, the loader discards beats
         # until it sees SYNC_MAGIC and takes the payload from the beat after it; the host
         # prefixes one marker beat per transfer. Anything the DMA invents beforehand is
         # discarded instead of written.
@@ -185,6 +181,7 @@ class Loader(LiteXModule):
             conv.source.connect(src),
         )
 
+        # FSM: upload (CMD/SYNC/DATA/DRAIN), engine STORE (EST_*), multi-channel store (MST_*).
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             # Deliberately NOT ready here.
@@ -220,13 +217,13 @@ class Loader(LiteXModule):
         )
         mst_states = []
         if with_mstore:
-            def chan_off(i): # The engine's per-reader constant (matvec.py _chan_off).
+            def chan_off(i): # The engine's per-reader constant (engine.py _chan_off).
                 local = (i % chan_mod) if chan_mod else i
                 return local*chan_stride + local*chan_skew
             mst_cmd_done = Signal(n)
-            mst_cnt = [Signal(24, name=f"mst_cnt{i}") for i in range(n)]
-            mst_left = [Signal(name=f"mst_left{i}") for i in range(n)]
-            all_cmd = Signal()
+            mst_cnt      = [Signal(24, name=f"mst_cnt{i}") for i in range(n)]
+            mst_left     = [Signal(name=f"mst_left{i}")    for i in range(n)]
+            all_cmd      = Signal()
             self.comb += all_cmd.eq(reduce(and_, [
                 mst_cmd_done[i] | (w.sink_cmd.valid & w.sink_cmd.ready)
                 for i, w in enumerate(self.writers)]))
@@ -236,7 +233,9 @@ class Loader(LiteXModule):
                 *[w.sink_cmd.valid.eq(~mst_cmd_done[i]) for i, w in enumerate(self.writers)],
                 *[w.sink_cmd.addr.eq(mst_addr + chan_off(i)) for i, w in enumerate(self.writers)],
                 *[w.sink_cmd.len.eq(mst_len) for w in self.writers],
-                If(all_cmd, NextState("MST_DATA")),
+                If(all_cmd,
+                    NextState("MST_DATA"),
+                ),
             )
             fsm.act("MST_DATA",
                 *[w.sink.valid.eq(d.valid & mst_left[i])
@@ -244,10 +243,14 @@ class Loader(LiteXModule):
                 *[w.sink.data.eq(d.data) for w, d in zip(self.wbufs, self.mstore_data)],
                 *[d.ready.eq(w.sink.ready & mst_left[i])
                   for i, (w, d) in enumerate(zip(self.wbufs, self.mstore_data))],
-                If(~reduce(or_, mst_left), NextState("MST_DRAIN")),
+                If(~reduce(or_, mst_left),
+                    NextState("MST_DRAIN"),
+                ),
             )
             fsm.act("MST_DRAIN",
-                If(reduce(and_, [w.idle for w in self.writers]), NextState("IDLE")),
+                If(reduce(and_, [w.idle for w in self.writers]),
+                    NextState("IDLE"),
+                ),
             )
             self.sync += [
                 If(fsm.ongoing("IDLE"),
@@ -284,14 +287,15 @@ class Loader(LiteXModule):
                 )
             )
         )
-        fsm.act("EST_DRAIN", # B responses: data readable once idle.
+        fsm.act("EST_DRAIN",
+            # B responses: data readable once idle.
             If(Array([w.idle for w in self.writers])[st_chan],
                 NextState("IDLE"),
             )
         )
         self.comb += self.store_busy.eq(fsm.ongoing("EST_CMD") | fsm.ongoing("EST_DATA")
                                         | fsm.ongoing("EST_DRAIN") | reduce(or_, mst_states, 0))
-        # Built term by term so that chan_skew=0 emits exactly the expression it always did.
+        # Upload address, built term by term: with chan_skew=0 the expression has no skew term.
         _upload_addr = self.base.storage + ((chan_sel(chan) << chan_shift) if chan_stride else 0)
         if chan_skew:
             _upload_addr = _upload_addr + chan_skew_of(chan_sel(chan))
@@ -319,9 +323,9 @@ class Loader(LiteXModule):
                 src.ready.eq(1),
                 NextValue(sync_seen, 1),
             ).Elif(src.valid & sync_seen,
-                NextState("DATA"),          # leave this beat for DATA
+                NextState("DATA"), # Leave this beat for DATA.
             ).Else(
-                src.ready.eq(1),    # pre-marker filler
+                src.ready.eq(1), # Pre-marker filler.
             )
         )
         fsm.act("DATA",
@@ -336,7 +340,8 @@ class Loader(LiteXModule):
                 )
             )
         )
-        fsm.act("DRAIN", # Wait for B responses.
+        fsm.act("DRAIN",
+            # Wait for B responses.
             If(Array([w.idle for w in self.writers])[chan],
                 NextState("IDLE"),
             )
