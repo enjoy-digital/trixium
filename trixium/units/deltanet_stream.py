@@ -58,6 +58,8 @@ from litex.soc.interconnect import stream
 from trixium.units.fp32 import ExactFP32Add, ExactFP32Mul
 
 
+# Helpers ------------------------------------------------------------------------------------------
+
 def state_to_lanes(states, lanes):
     """[heads, rows, cols] float32 -> [lanes, heads*G*R*8] uint32 (each lane's stream)."""
     states = np.asarray(states, dtype=np.float32)
@@ -93,6 +95,8 @@ def reference(state, q, k, v, decay, beta, scale):
         out = (o*f32(scale)).astype(f32)
     return m, out
 
+
+# DeltaNet Stream ----------------------------------------------------------------------------------
 
 class DeltaNetStream(LiteXModule):
     def __init__(self, lanes=16, rows=128, cols=128, slots=4, adr_bits=13,
@@ -252,7 +256,7 @@ class DeltaNetStream(LiteXModule):
             v_w.we.eq(rsp_v & (rsp_kind == 2)),
         ]
 
-        # Operators ---------------------------------------------------------------------------
+        # Operators --------------------------------------------------------------------------------
         def op(factory, name):
             o = factory()
             setattr(self.submodules, name, o)
@@ -268,7 +272,7 @@ class DeltaNetStream(LiteXModule):
         mul_b   = op(mul_factory, "mul_b")
         mul_s   = op(mul_factory, "mul_s")
 
-        # Input half-buffers (per lane, two column groups) -------------------------------------
+        # Input half-buffers (per lane, two column groups) -----------------------------------------
         p1_grp = Signal(2)       # Column groups consumed by P1 (mod 4, all lanes).
         fill_grp = []
         inbufs = []
@@ -293,7 +297,7 @@ class DeltaNetStream(LiteXModule):
             )
         grp_ok = reduce(and_, [fg != p1_grp for fg in fill_grp])
 
-        # P1: decay, k dot ---------------------------------------------------------------------
+        # P1: decay, k dot -------------------------------------------------------------------------
         p1_run = Signal()
         p1_g, p1_jj, p1_r = Signal(gb), Signal(3), Signal(rb)
         p1_issue = Signal()
@@ -338,7 +342,8 @@ class DeltaNetStream(LiteXModule):
         # u: one register after the input buffer's float select (memory -> 8:1 mux ->
         # multiplier is not one clock at speed).
         u_v, u_dec = dly(s1_v, 1, "uv"), dly(s1_dec, 1, "udec")
-        t2_v, t2_mda, t2_k = dly(s1_v, Lm + 1, "t2v"), dly(s1_mda, Lm + 1, "t2mda"), dly(s1_k, Lm + 1, "t2k")
+        t2_v, t2_mda, t2_k = (dly(s1_v, Lm + 1, "t2v"), dly(s1_mda, Lm + 1, "t2mda"),
+                              dly(s1_k, Lm + 1, "t2k"))
         t2_first, t2_last, t2_r = (dly(s1_first, Lm + 1, "t2f"), dly(s1_last, Lm + 1, "t2l"),
                                    dly(s1_r, Lm + 1, "t2r"))
         t3_v, t3_first = dly(t2_v, Lm, "t3v"), dly(t2_first, Lm, "t3f")
@@ -378,7 +383,7 @@ class DeltaNetStream(LiteXModule):
             ]
             self.sync += If(t4_v, da[t4_r].eq(add_d[l].result))
 
-        # Delta (shared): delta = (v - d)*beta over rows in natural order --------------------
+        # Delta (shared): delta = (v - d)*beta over rows in natural order --------------------------
         dl_run = Signal()
         dl_idx = Signal(max=rows)
         dl_slot = dl_head[:sb]
@@ -416,7 +421,8 @@ class DeltaNetStream(LiteXModule):
         ]
         e2_v, e2_last = dly(e1_v, La, "e2v"), dly(e1_last, La, "e2l")
         e2_slot, e2_bank = dly(e1_slot, La, "e2s"), dly(e1_bank, La, "e2b")
-        e3_v, e3_last, e3_bank = dly(e2_v, Lm, "e3v"), dly(e2_last, Lm, "e3l"), dly(e2_bank, Lm, "e3b")
+        e3_v, e3_last, e3_bank = (dly(e2_v, Lm, "e3v"), dly(e2_last, Lm, "e3l"),
+                                  dly(e2_bank, Lm, "e3b"))
         self.comb += [
             add_v.a.eq(e1_a), add_v.b.eq(e1_b), add_v.valid.eq(e1_v),
             mul_b.a.eq(add_v.result), mul_b.b.eq(bet[e2_slot]), mul_b.valid.eq(e2_v),
@@ -432,7 +438,7 @@ class DeltaNetStream(LiteXModule):
             dl_done.eq(dl_done + 1),
         )
 
-        # P2: rank-1 update, q dot -------------------------------------------------------------
+        # P2: rank-1 update, q dot -----------------------------------------------------------------
         p2_run = Signal()
         p2_g, p2_jj, p2_r = Signal(gb), Signal(3), Signal(rb)
         p2_grp = Signal()        # Output half of the current column group.
@@ -482,19 +488,22 @@ class DeltaNetStream(LiteXModule):
             f1_q.eq(fsel(q_r.dat_r, p2_jj)),
         ]
         g2_v = dly(f1_v, Lm, "g2v")
-        g3_v, g3_r, g3_jj = dly(g2_v, La, "g3v"), dly(f1_r, Lm + La, "g3r"), dly(f1_jj, Lm + La, "g3jj")
+        g3_v, g3_r, g3_jj = (dly(g2_v, La, "g3v"), dly(f1_r, Lm + La, "g3r"),
+                             dly(f1_jj, Lm + La, "g3jj"))
         g3_half, g3_glast = dly(f1_half, Lm + La, "g3h"), dly(f1_glast, Lm + La, "g3gl")
         g3_q = dly(f1_q, Lm + La, "g3q")
-        g4_v, g4_first, g4_r = dly(g3_v, Lm, "g4v"), dly(f1_first, 2*Lm + La, "g4f"), dly(g3_r, Lm, "g4r")
+        g4_v, g4_first, g4_r = (dly(g3_v, Lm, "g4v"), dly(f1_first, 2*Lm + La, "g4f"),
+                                dly(g3_r, Lm, "g4r"))
         assert La >= 1
         g5_ve, g5_r = dly(g4_v, La - 1, "g5ve"), dly(g4_r, La, "g5r")
         g5_laste = dly(f1_last, 2*Lm + 2*La - 1, "g5le")
         g5_banke = dly(f1_bank, 2*Lm + 2*La - 1, "g5be")
-        g5_v, g5_last, g5_bank = dly(g5_ve, 1, "g5v"), dly(g5_laste, 1, "g5l"), dly(g5_banke, 1, "g5b")
+        g5_v, g5_last, g5_bank = (dly(g5_ve, 1, "g5v"), dly(g5_laste, 1, "g5l"),
+                                  dly(g5_banke, 1, "g5b"))
         p2_capture = Signal()
         self.comb += p2_capture.eq(g5_v & g5_last)
-        # The snapshot capture enables 2 x rows x 32 flops spread over the unit (v27: an 8.8 ns
-        # route from g5l): one register per bank, decided a stage early, replicated by Vivado.
+        # The snapshot capture enables 2 x rows x 32 flops spread over the unit (a single source
+        # routes poorly): one register per bank, decided a stage early, replicated by Vivado.
         cap = [Signal(name=f"dns_cap{b}", attr={("max_fanout", 128)}) for b in range(2)]
         self.sync += [cap[b].eq(g5_ve & g5_laste & (g5_banke == b)) for b in range(2)]
 
@@ -533,7 +542,7 @@ class DeltaNetStream(LiteXModule):
             p2_done.eq(p2_done + 1),
         )
 
-        # Emission: completed output halves -> per-lane source FIFOs -----------------------------
+        # Emission: completed output halves -> per-lane source FIFOs -------------------------------
         em_run, em_half, em_i, em_push = Signal(), Signal(), Signal(rb), Signal()
         fifos = []
         for l in range(L):
@@ -571,7 +580,7 @@ class DeltaNetStream(LiteXModule):
             )
         ]
 
-        # Scale (shared) and the output writes ---------------------------------------------------
+        # Scale (shared) and the output writes -----------------------------------------------------
         sc_run = Signal()
         sc_idx = Signal(max=rows)
         sc_slot = sc_head[:sb]
@@ -625,7 +634,7 @@ class DeltaNetStream(LiteXModule):
             retired.eq(retired + 1),
         )
 
-        # Command -----------------------------------------------------------------------------
+        # Command ----------------------------------------------------------------------------------
         drained = reduce(and_, [~f.source.valid for f in fifos])
         finish = Signal()
         self.comb += [

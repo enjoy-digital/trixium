@@ -4,13 +4,11 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Silu Mul -----------------------------------------------------------------------------------------
+"""Resident SiLU-multiply (sequencer unit 11): r = m * siluf(g) on binary32, bit-exact.
 
-"""SiluMulKernel: r = m * siluf(g) on IEEE-754 binary32, bit-exact with the firmware.
-
-Portable Migen (no vendor floating-point IP), one element per cycle, a globally stalled
-pipeline. The contract and the arithmetic are in model/silu_hw.py; this is
-`silu_mul_fixed()` stage for stage:
+SiluMulKernel is portable Migen (no vendor floating-point IP), one element per cycle in a
+globally stalled pipeline. The contract and the arithmetic are in trixium/model/silu_hw.py;
+the kernel is `silu_mul_fixed()` stage for stage:
 
   S1  classify g/m; a20 = RNE_f32(g + 16) * 2**20 as a shift-and-round of g's significand
   S2  i = a20 >> 13, F = a20 & 0x1FFF; read lut[i] (lut[4096] at the endpoint) and dlut[i]
@@ -30,10 +28,39 @@ firmware's own code. Every other `r` equals hybrid.c's `mul * siluf(gate)`.
 Tables: write lut[0..4096] and dlut[0..4095] (dlut[i] = lut[i+1] - lut[i], computed by the
 firmware with one FP32 subtraction) through the write ports before streaming; they are
 not modified by streaming. Both are read in S2 with synchronous read ports.
+
+SiluScratchpad runs `ways` kernels over the shared two-port scratchpad. Its command
+(SILU_COMMAND, the firmware's descriptor layout) has two operations:
+
+RUN (op 0): for i < elements, dst[i] = m[i] * siluf(g[i]) with g at src_g and m at src_m
+(binary32 vectors, 8 per 256-bit beat), bit-exact with hybrid.c's silu_mul_fv. An element
+outside the kernel's fast path is a FIXUP: its dst lane receives g unchanged and bit i of
+the bitmap at `fixmap` is set; the firmware recomputes those elements from the untouched
+g/m. `fixups` counts them. The bitmap is ceil(elements/32) little-endian words (bit i%32 of
+word i//32); every word of it is written, so no stale bit survives. dst == src_g (in place,
+as the firmware does) is allowed; any other overlap between dst, fixmap and the sources is
+rejected. unit_m replaces m by 1.0 (no m read); perm_a/perm_b/seg_beats permute output
+segments (see the output beat offset below); table_only/table_set select the table pair.
+
+LOAD (op 1): read the kernel's tables from src_g: beats 0..512 hold lut[0..4096] (lut[4096]
+in lane 0 of beat 512), beats 513..1024 hold dlut[0..4095]. Once per boot.
+
+Contract with the integrator, as for the other resident clients: exclusive ownership while
+busy; every read is granted and returns data one clock later; a write happens only on
+sp_wr_req & sp_wr_gnt and its payload is held until then. error bits: 0 geometry /
+alignment, 1 bounds, 2 forbidden overlap, 6 protected output. A failure stays busy until
+cancel; all partial output is invalid.
 """
+
 from migen import *
+from migen.genlib.fifo import SyncFIFO
+
 from litex.gen import LiteXModule
+
 from litex.soc.interconnect import stream
+
+
+# SiLU Mul Kernel ----------------------------------------------------------------------------------
 
 LUT_N = 4096
 IN_LAYOUT = [("g", 32), ("m", 32)]
@@ -84,8 +111,8 @@ class SiluMulKernel(LiteXModule):
         self.specials += lut, dlut, lut_w, dlut_w, lut_r, dlut_r
         # Handles for tests to preload the tables. Never CSR-exported: AutoCSR turns a Memory
         # attribute into a CSR-bus SRAM with a THIRD (sys, read/write) port, which Verilator
-        # simulates exactly but Vivado cannot map onto a BRAM - v13's tables read wrong on
-        # the board while every simulation passed.
+        # simulates exactly but Vivado cannot map onto a BRAM (the tables then read wrong on
+        # the board while every simulation passes).
         self.autocsr_exclude = {"lut_mem", "dlut_mem"}
         self.lut_mem, self.dlut_mem = lut, dlut
         self.comb += [
@@ -118,7 +145,7 @@ class SiluMulKernel(LiteXModule):
         g = carry("g", 32, sink.g)
         m = carry("m", 32, sink.m)
 
-        # S1: classify and add 16 ------------------------------------------------------------
+        # S1: classify and add 16 ------------------------------------------------------------------
         gs, ge, gf = sink.g[31], sink.g[23:31], sink.g[0:23]
         me, mf = sink.m[23:31], sink.m[0:23]
         mag = sink.g[0:31]
@@ -138,7 +165,7 @@ class SiluMulKernel(LiteXModule):
         ]
         kind = carry("kind", 2, kind0)
 
-        # a20 = RNE_f32(g + 16) * 2**20 (see model.silu_hw.add16_fixed).
+        # a20 = RNE_f32(g + 16) * 2**20 (see trixium.model.silu_hw.add16_fixed).
         sig = Signal(24)
         ge_eff = Signal(8)
         sh = Signal(8)                  # right shift of the significand, capped
@@ -165,7 +192,7 @@ class SiluMulKernel(LiteXModule):
         a20 = Signal(26)
         self.sync += If(ce, a20.eq(a20_0))
 
-        # S2: index, fraction, table read --------------------------------------------------
+        # S2: index, fraction, table read ----------------------------------------------------------
         idx = Signal(13)
         endpoint2 = Signal()
         self.comb += [
@@ -181,7 +208,7 @@ class SiluMulKernel(LiteXModule):
         self.sync += If(ce, F2.eq(a20[0:13]), endpoint.eq(endpoint2))
         # Stage 3 sees lut_r.dat_r / dlut_r.dat_r, F2 and endpoint (all stage-2 outputs).
 
-        # S3: product P = F * d, unpack c -----------------------------------------------------
+        # S3: product P = F * d, unpack c ----------------------------------------------------------
         c_w, d_w = lut_r.dat_r, dlut_r.dat_r
         P3 = Signal(37)
         pe3 = Signal((10, True))        # value = P * 2**pe (d's exponent minus 13)
@@ -207,7 +234,7 @@ class SiluMulKernel(LiteXModule):
             cw3.eq(c_w), ep3.eq(endpoint),
         )
 
-        # S4: align (both significands are 37 bits, exponents pe3 / ce3) --------------------
+        # S4: align (both significands are 37 bits, exponents pe3 / ce3) ---------------------------
         p_big = Signal()
         diff = Signal(10)
         big_m, small_m = Signal(37), Signal(37)
@@ -250,7 +277,7 @@ class SiluMulKernel(LiteXModule):
         cw4 = Signal(32)
         self.sync += If(ce, ep4.eq(ep3), cw4.eq(cw3))
 
-        # S5: add or subtract -------------------------------------------------------------
+        # S5: add or subtract ----------------------------------------------------------------------
         sum5 = Signal(42)
         diff5 = Signal((42, True))
         res5 = Signal(41)
@@ -273,7 +300,7 @@ class SiluMulKernel(LiteXModule):
         self.sync += If(ce, res5.eq(res_c), rs5.eq(rs_c), be5.eq(be4),
                         zb5.eq(zero_both4), zs5.eq(zsign4), ep5.eq(ep4), cw5.eq(cw4))
 
-        # S6: leading zeros ---------------------------------------------------------------
+        # S6: leading zeros ------------------------------------------------------------------------
         lz, lz_stmts = _lzc(res5, 41)
         self.comb += lz_stmts
         res6 = Signal(41)
@@ -284,7 +311,7 @@ class SiluMulKernel(LiteXModule):
         self.sync += If(ce, res6.eq(res5), lz6.eq(lz), rs6.eq(rs5), be6.eq(be5),
                         zb6.eq(zb5), zs6.eq(zs5), ep6.eq(ep5), cw6.eq(cw5))
 
-        # S7: normalize, round, select s ----------------------------------------------------
+        # S7: normalize, round, select s -----------------------------------------------------------
         # value = res6 * 2**(be6 - 3); leading one at bit L = 40 - lz6.
         norm = Signal(41 + 1)
         q7, q7r = Signal(24), Signal(25)
@@ -318,7 +345,7 @@ class SiluMulKernel(LiteXModule):
         })
         self.sync += If(ce, s7.eq(s_sel))
 
-        # S8: significand product ----------------------------------------------------------
+        # S8: significand product ------------------------------------------------------------------
         m7 = m[7]
         prod8 = Signal(48)
         zero8 = Signal()
@@ -338,7 +365,7 @@ class SiluMulKernel(LiteXModule):
             ebsum8.eq(m7[23:31] + s7[23:31] - 127),
         )
 
-        # S9: normalize, round, encode, flag ------------------------------------------------
+        # S9: normalize, round, encode, flag -------------------------------------------------------
         top = Signal()
         qm, qmr = Signal(24), Signal(25)
         gm, stm = Signal(), Signal()
@@ -369,34 +396,7 @@ class SiluMulKernel(LiteXModule):
         self.comb += [source.r.eq(out_r), source.fixup.eq(out_fix), source.g.eq(g[n])]
 
 
-# Silu Sp ------------------------------------------------------------------------------------------
-
-"""Resident SiLU-multiply over the shared two-port scratchpad (future sequencer unit 11).
-
-RUN (op 0): for i < elements, dst[i] = m[i] * siluf(g[i]) with g at src_g and m at src_m
-(binary32 vectors, 8 per 256-bit beat), bit-exact with hybrid.c's silu_mul_fv through
-SiluMulKernel. An element outside the kernel's fast path (see gateware/silu_mul.py) is a
-FIXUP: its dst lane receives g unchanged and bit i of the bitmap at `fixmap` is set; the
-firmware recomputes those elements from the untouched g/m. `fixups` counts them. The
-bitmap is ceil(elements/32) little-endian words (bit i%32 of word i//32); every word of
-it is written, so no stale bit survives. dst == src_g (in place, as the firmware does) is
-allowed; any other overlap between dst, fixmap and the sources is rejected.
-
-LOAD (op 1): read the kernel's tables from src_g: beats 0..512 hold lut[0..4096] (lut[4096]
-in lane 0 of beat 512), beats 513..1024 hold dlut[0..4095]. Once per boot.
-
-Contract with the integrator, as for the other resident clients: exclusive ownership while
-busy; every read is granted and returns data one clock later; a write happens only on
-sp_wr_req & sp_wr_gnt and its payload is held until then. error bits: 0 geometry /
-alignment, 1 bounds, 2 forbidden overlap, 6 protected output. A failure stays busy until
-cancel; all partial output is invalid.
-"""
-from migen import *
-from migen.genlib.fifo import SyncFIFO
-from litex.gen import LiteXModule
-from litex.soc.interconnect import stream
-
-from trixium.units.silu import SiluMulKernel, LUT_N
+# SiLU Scratchpad ----------------------------------------------------------------------------------
 
 SILU_COMMAND = [("op", 1), ("src_g", 24), ("src_m", 24), ("dst", 24), ("fixmap", 24),
                 ("elements", 16), ("unit_m", 1), ("seg_beats", 16), ("perm_a", 8), ("perm_b", 8),
@@ -408,7 +408,8 @@ LOAD_BEATS = 513 + 512
 class SiluScratchpad(LiteXModule):
     def __init__(self, scratchpad_size=256*1024, tables=None, sets=2, ways=4):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
-            raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")
+            raise ValueError("scratchpad_size must be aligned within the 13-bit client "
+                             "address space")
         self.cmd = stream.Endpoint(SILU_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
@@ -420,10 +421,11 @@ class SiluScratchpad(LiteXModule):
         self.sp_wr_we = Signal(8)
         # ways kernels in lockstep (same valid, same ready, their own table copies loaded
         # together): `ways` elements per clock. 4 = the read port's pace (a g and an m beat
-        # per 8 elements); 1 element per clock was ~1.9M cycles per 27B forward (v17).
+        # per 8 elements); 1 element per clock cost ~1.9M cycles per 27B forward.
         assert ways in (1, 2, 4)
         W = ways
-        self.kernels = kernels = [ResetInserter()(SiluMulKernel(tables, sets=sets)) for _ in range(W)]
+        self.kernels = kernels = [ResetInserter()(SiluMulKernel(tables, sets=sets))
+                                  for _ in range(W)]
         self.kernel = kernel = kernels[0]             # (LiteXModule registers it)
         for k, kern in enumerate(kernels[1:], 1):
             setattr(self.submodules, f"kernel{k}", kern)
@@ -463,8 +465,10 @@ class SiluScratchpad(LiteXModule):
                           # A permuted output: whole segments of whole beats, a full grid.
                           (perm & ((cap["seg_beats"] == 0) | (cap["perm_b"] == 0) |
                                    (perm_elems != cap["elements"])))))),
-            bounds_bad.eq((ends["src_g"] > scratchpad_size) | (cap["protect_end"] > scratchpad_size) |
-                (~load & ((~unit_m & (ends["src_m"] > scratchpad_size)) | (ends["dst"] > scratchpad_size) |
+            bounds_bad.eq((ends["src_g"] > scratchpad_size) |
+                (cap["protect_end"] > scratchpad_size) |
+                (~load & ((~unit_m & (ends["src_m"] > scratchpad_size)) |
+                          (ends["dst"] > scratchpad_size) |
                           (ends["fixmap"] > scratchpad_size)))),
             overlap_bad.eq(~load & (
                 (overlap("dst", "src_g") & ((cap["dst"] != cap["src_g"]) | perm)) |
@@ -473,7 +477,7 @@ class SiluScratchpad(LiteXModule):
             protected_bad.eq(~load & (protected("dst") | protected("fixmap"))),
         ]
 
-        # Read side: pairs of beats (g, m) for RUN, single beats for LOAD --------------------
+        # Read side: pairs of beats (g, m) for RUN, single beats for LOAD --------------------------
         # One read per cycle at most; the response is captured a cycle later. `rd_second`
         # says the next request is the m beat of the current pair.
         pairs = ResetInserter()(SyncFIFO(width=512, depth=4))
@@ -549,7 +553,7 @@ class SiluScratchpad(LiteXModule):
         ]
 
         # Unpack pairs into the kernels, `ways` lanes per cycle (a multiple of ways: lanes past
-        # the vector's end are fed and their results dropped) ------------------------------
+        # the vector's end are fed and their results dropped) --------------------------------------
         lane = Signal(3)
         fed = Signal(17)                           # elements fed
         head_g, head_m = Signal(256), Signal(256)
@@ -570,7 +574,7 @@ class SiluScratchpad(LiteXModule):
         self.sync += If(clear, lane.eq(0), fed.eq(0)).Elif(feed,
             fed.eq(fed + W), lane.eq(Mux(last_lane, 0, lane + W)))
 
-        # Collect results into output beats and bitmap words --------------------------------
+        # Collect results into output beats and bitmap words ---------------------------------------
         out_lane = Signal(3)
         got = Signal(17)                           # results collected
         acc = Signal(256)
@@ -669,7 +673,8 @@ class SiluScratchpad(LiteXModule):
             self.sp_wr_req.eq(run_active & ~self.cancel & (word_full | beat_full)),
             self.sp_wr_adr.eq(Mux(write_word, (cap["fixmap"] >> 5) + word_idx[3:12], beat_adr)),
             self.sp_wr_dat.eq(Mux(write_word, Replicate(word_val, 8), beat_dat)),
-            self.sp_wr_we.eq(Mux(write_word, Cat(*[word_idx[0:3] == j for j in range(8)]), beat_we)),
+            self.sp_wr_we.eq(Mux(write_word, Cat(*[word_idx[0:3] == j for j in range(8)]),
+                                 beat_we)),
         ]
         wrote = Signal()
         self.comb += wrote.eq(self.sp_wr_req & self.sp_wr_gnt)
@@ -685,7 +690,7 @@ class SiluScratchpad(LiteXModule):
         )
         self.sync += If(~clear & take, self.fixups.eq(self.fixups + sum(fixes)))
 
-        # Control ---------------------------------------------------------------------------
+        # Control ----------------------------------------------------------------------------------
         all_written = Signal()
         self.comb += [
             self.cmd.ready.eq((state == IDLE) & ~self.cancel),
@@ -708,7 +713,8 @@ class SiluScratchpad(LiteXModule):
                     self.fixups.eq(0), self.read_beats.eq(0), self.output_beats.eq(0),
                     self.error.eq(0), state.eq(VALIDATE)),
                 VALIDATE: If(geometry_bad | bounds_bad | overlap_bad | protected_bad,
-                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
+                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3),
+                                      protected_bad)),
                     state.eq(FAILED),
                 ).Else(state.eq(Mux(load, LOAD, RUN))),
                 LOAD: [
@@ -722,7 +728,8 @@ class SiluScratchpad(LiteXModule):
                         ).Else(ld_lane.eq(ld_lane + 1)),
                     ),
                 ],
-                RUN: If(all_written & (got >= cap["elements"]), state.eq(FINISH)),   # got: whole groups
+                # got counts whole groups of `ways` elements.
+                RUN: If(all_written & (got >= cap["elements"]), state.eq(FINISH)),
                 FINISH: [self.done.eq(1), state.eq(IDLE)],
             }),
         )

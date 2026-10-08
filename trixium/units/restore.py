@@ -4,13 +4,26 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Projection Restore -------------------------------------------------------------------------------
+"""Projection restore: bit-exact conversion of integer projection results to binary32.
 
-"""Portable, bit-exact restoration of integer projection results to binary32."""
+I32ToFp32Scaled is the portable streaming converter, float32(int32(x)) * 2**exponent with
+round-to-nearest-even. ProjectionRestoreScratchpad is the resident unit built on it over the
+shared two-port scratchpad: it reads a signed e8 from the scratchpad, adds the command's
+adjustment, restores a vector to FP32, and tracks the greedy argmax of everything it writes
+(the LM head's token). Its command (RESTORE_COMMAND) is the firmware's descriptor layout.
+"""
+
 from migen import *
+from migen.genlib.fifo import SyncFIFO
+
 from litex.gen import LiteXModule
+
 from litex.soc.interconnect import stream
 
+from trixium.units.fp32 import FP32ArgmaxTracker
+
+
+# I32 To FP32 Scaled -------------------------------------------------------------------------------
 
 class I32ToFp32Scaled(LiteXModule):
     """Four-stage elastic ``float32(int32(x)) * float32(2**exponent)``.
@@ -44,7 +57,8 @@ class I32ToFp32Scaled(LiteXModule):
             raise ValueError("lanes must be a power of two in [1, 16]")
         self.lanes = lanes
         self.sink = stream.Endpoint([("data", lanes*32), ("exponent", 10)])
-        self.source = stream.Endpoint([("data", lanes*32), ("exponent", 10), ("error", lanes + 1)])
+        self.source = stream.Endpoint([("data", lanes*32), ("exponent", 10),
+                                       ("error", lanes + 1)])
         self.cancel = Signal()
 
         valid = [Signal() for _ in range(4)]
@@ -65,7 +79,8 @@ class I32ToFp32Scaled(LiteXModule):
                        metadata[0][2].eq(self.sink.last),
                        metadata[0][3].eq((exponent < -149) | (exponent > 127))]
         for stage in (1, 2):
-            updates[stage] += [dst.eq(src) for dst, src in zip(metadata[stage], metadata[stage - 1])]
+            updates[stage] += [dst.eq(src)
+                               for dst, src in zip(metadata[stage], metadata[stage - 1])]
             updates[stage] += [signs[stage].eq(signs[stage - 1]), zeros[stage].eq(zeros[stage - 1])]
         updates[3] += [self.source.exponent.eq(metadata[2][0]),
                        self.source.first.eq(metadata[2][1]), self.source.last.eq(metadata[2][2]),
@@ -123,17 +138,7 @@ class I32ToFp32Scaled(LiteXModule):
         ])
 
 
-# Projection Restore Sp ----------------------------------------------------------------------------
-
-"""Resident projection-result restoration using the shared two-port scratchpad."""
-from migen import *
-from migen.genlib.fifo import SyncFIFO
-from litex.gen import LiteXModule
-from litex.soc.interconnect import stream
-
-from trixium.units.restore import I32ToFp32Scaled
-from trixium.units.fp32 import FP32ArgmaxTracker
-
+# Projection Restore Scratchpad --------------------------------------------------------------------
 
 RESTORE_COMMAND = [("src", 24), ("dst", 24), ("exponents", 24),
                    ("elements", 16), ("adjustment", 32),
@@ -163,12 +168,13 @@ class ProjectionRestoreScratchpad(LiteXModule):
     6 protected output. Any failure stays busy until cancel/reset; all partial
     output is invalid. done publishes success only after all accepted writes
     and a drain cycle. This client does not combine K-segments or publish a
-    model result. Optional sequencer unit 8 supplies exclusive ownership and
-    the protected descriptor-list interval through the shared integration.
+    model result. The sequencer supplies exclusive ownership and the protected
+    descriptor-list interval through the shared integration.
     """
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
-            raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")
+            raise ValueError("scratchpad_size must be aligned within the 13-bit client "
+                             "address space")
         self.cmd = stream.Endpoint(RESTORE_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
@@ -182,7 +188,7 @@ class ProjectionRestoreScratchpad(LiteXModule):
         self.responses = responses = ResetInserter()(SyncFIFO(width=258, depth=2))
         # The greedy argmax of everything this unit writes, across commands, until
         # argmax_clear (the sequencer's list start): the LM head's token without the CPU
-        # reading the logits back (the firmware loop's semantics, gateware/fp32_exact.py).
+        # reading the logits back (the firmware loop's semantics, see FP32ArgmaxTracker).
         self.argmax = argmax = FP32ArgmaxTracker()
         self.argmax_clear = Signal()
 
@@ -203,11 +209,13 @@ class ProjectionRestoreScratchpad(LiteXModule):
                 (captured["dst"][:5] != 0) | (captured["exponents"][:5] != 0) |
                 (captured["protect_start"] > captured["protect_end"])),
             bounds_bad.eq((ends["src"] > scratchpad_size) | (ends["dst"] > scratchpad_size) |
-                (ends["exponents"] > scratchpad_size) | (captured["protect_end"] > scratchpad_size)),
+                (ends["exponents"] > scratchpad_size) |
+                (captured["protect_end"] > scratchpad_size)),
             overlap_bad.eq((overlap("src", "dst") & (captured["src"] != captured["dst"])) |
                 overlap("dst", "exponents")),
             protected_bad.eq((captured["protect_start"] != captured["protect_end"]) &
-                (captured["dst"] < captured["protect_end"]) & (captured["protect_start"] < ends["dst"])),
+                (captured["dst"] < captured["protect_end"]) &
+                (captured["protect_start"] < ends["dst"])),
         ]
 
         metadata = Signal((32, True))
@@ -218,7 +226,8 @@ class ProjectionRestoreScratchpad(LiteXModule):
                       exponent_bad.eq((combined < -149) | (combined > 127))]
 
         active, clear, read_pending, read_first, read_last = (Signal() for _ in range(5))
-        pop, credit_error, conversion_error, overflow, failed, written = (Signal() for _ in range(6))
+        pop, credit_error, conversion_error, overflow, failed, written = (
+            Signal() for _ in range(6))
         reserved = Signal(3)
         tail = captured["elements"][:3]
         mask = Signal(8)
@@ -274,9 +283,11 @@ class ProjectionRestoreScratchpad(LiteXModule):
                     *[value.eq(getattr(self.cmd, name)) for name, value in captured.items()],
                     count.eq((self.cmd.elements + C(7, 17)) >> 3),
                     issued.eq(0), retired.eq(0), self.exponent.eq(0),
-                    self.read_beats.eq(0), self.output_beats.eq(0), self.error.eq(0), state.eq(VALIDATE)),
+                    self.read_beats.eq(0), self.output_beats.eq(0), self.error.eq(0),
+                    state.eq(VALIDATE)),
                 VALIDATE: If(geometry_bad | bounds_bad | overlap_bad | protected_bad,
-                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
+                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3),
+                                      protected_bad)),
                     state.eq(FAILED),
                 ).Else(state.eq(META_REQ)),
                 META_REQ: state.eq(META_CAPTURE),
@@ -286,5 +297,8 @@ class ProjectionRestoreScratchpad(LiteXModule):
                 FINISH: [self.done.eq(1), state.eq(IDLE)],
             }),
             # Numerical/credit failure wins over any same-cycle retirement.
-            If(failed, self.error.eq(Cat(C(0, 4), overflow, credit_error | conversion_error)), state.eq(FAILED)),
+            If(failed,
+                self.error.eq(Cat(C(0, 4), overflow, credit_error | conversion_error)),
+                state.eq(FAILED),
+            ),
         )

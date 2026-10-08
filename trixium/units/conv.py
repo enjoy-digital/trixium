@@ -1,5 +1,10 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
-"""Resident DeltaNet causal convolution over the shared scratchpad (future unit 13).
+
+"""Resident DeltaNet causal convolution over the shared scratchpad (sequencer unit 13).
 
 For `channels` channels (a multiple of 8), bit-exact with hybrid.c's 4-tap conv:
 
@@ -11,7 +16,7 @@ unused), dst == x0 or x3 in place.
 x0, x1, x2 are the window slots oldest to newest, x3 the new input (the QKV projection),
 w the per-channel taps interleaved as in the model (4 FP32 per channel). The SiLU that
 follows is unit 11 with a unit multiplier. Every operation is exact IEEE binary32
-(gateware/fp32_exact.py): no fixups.
+(trixium/units/fp32.py): no fixups.
 
 Eight channels need eight scratchpad beats (x0..x3 and four beats of taps) and produce
 one; one channel per clock matches that, so the datapath is a single lane (four
@@ -19,22 +24,31 @@ multipliers, the leading +0 add as a sign fix, three adders) fed from double-buf
 gather registers. y may overwrite x3 in place (each output beat is written after its own
 input beats were read); every other overlap is rejected.
 
-Integrator contract and error bits as for the other resident clients.
+Integrator contract and error bits as for the other resident clients. The command
+(CONV_COMMAND) is the firmware's descriptor layout.
 """
+
 from functools import reduce
 from operator import or_
 
 from migen import *
 from migen.genlib.fifo import SyncFIFO
+
 from litex.gen import LiteXModule
+
 from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import FP32Add, FP32Mul
 
-CONV_COMMAND = [("op", 1), ("x0", 24), ("x1", 24), ("x2", 24), ("x3", 24), ("w", 24), ("dst", 24),
-                ("channels", 16), ("protect_start", 24), ("protect_end", 24)]
+
+# Constants ----------------------------------------------------------------------------------------
+
+CONV_COMMAND = [("op", 1), ("x0", 24), ("x1", 24), ("x2", 24), ("x3", 24), ("w", 24),
+                ("dst", 24), ("channels", 16), ("protect_start", 24), ("protect_end", 24)]
 OP_CONV, OP_ADD = 0, 1
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def _delay(module, value, cycles, name):
     prev = value
@@ -45,10 +59,13 @@ def _delay(module, value, cycles, name):
     return prev
 
 
+# Conv Scratchpad ----------------------------------------------------------------------------------
+
 class ConvScratchpad(LiteXModule):
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
-            raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")
+            raise ValueError("scratchpad_size must be aligned within the 13-bit client "
+                             "address space")
         self.cmd = stream.Endpoint(CONV_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
@@ -85,7 +102,8 @@ class ConvScratchpad(LiteXModule):
                 ~disjoint("dst", "w") |
                 (~disjoint("dst", "x3") & (cap["dst"] != cap["x3"])))),
             protected_bad.eq((cap["protect_start"] != cap["protect_end"]) &
-                             (cap["dst"] < cap["protect_end"]) & (cap["protect_start"] < ends["dst"])),
+                             (cap["dst"] < cap["protect_end"]) &
+                             (cap["protect_start"] < ends["dst"])),
         ]
 
         # Read side: 8 beats per group (x0, x1, x2, x3, w0..w3) into one of two gather banks.
@@ -127,7 +145,8 @@ class ConvScratchpad(LiteXModule):
         ]
         for b in range(2):
             for i in range(8):
-                self.sync += If(rd_pending & (rd_bank == b) & (rd_sub == i), banks[b][i].eq(self.sp_rd_dat))
+                self.sync += If(rd_pending & (rd_bank == b) & (rd_sub == i),
+                    banks[b][i].eq(self.sp_rd_dat))
 
         # Compute side: one channel per clock from the full bank.
         cbank = Signal()
@@ -141,11 +160,12 @@ class ConvScratchpad(LiteXModule):
         self.comb += [
             ofifo.reset.eq(clear),
             out_room.eq((ofifo.level + groups_in_flight) < FIFO_DEPTH),
-            feed.eq((state == S["RUN"]) & bank_full[cbank] & ~self.cancel & (out_room | (lane != 0))),
+            feed.eq((state == S["RUN"]) & bank_full[cbank] & ~self.cancel &
+                    (out_room | (lane != 0))),
         ]
         # ADD takes a whole group (beat) per clock through eight adders of its own - reads
-        # then pace it (x0 and x3, two beats per group): the residual adds were ~4.2k clocks
-        # per 5,120 floats one lane at a time (v17 board).
+        # then pace it (x0 and x3, two beats per group): one lane at a time, the residual adds
+        # cost ~4.2k clocks per 5,120 floats.
         last_lane = Signal()
         self.comb += last_lane.eq(add | (lane == 7))
         # A bank is full once its 8th beat has landed; it empties when its last lane is fed.
@@ -224,7 +244,8 @@ class ConvScratchpad(LiteXModule):
                     self.error.eq(0), self.read_beats.eq(0), self.output_beats.eq(0),
                     state.eq(S["VALIDATE"])),
                 S["VALIDATE"]: If(geometry_bad | bounds_bad | overlap_bad | protected_bad,
-                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
+                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3),
+                                      protected_bad)),
                     state.eq(S["FAILED"]),
                 ).Else(state.eq(S["RUN"])),
                 S["RUN"]: If((wgrp == groups) & ~ofifo.readable, state.eq(S["FINISH"])),

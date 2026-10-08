@@ -4,13 +4,18 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""Loader: host -> HBM weight upload.
+"""Loader: host -> engine memory weight upload, and the engine's STORE path.
 
-Consumes the LitePCIe DMA (host->device) byte stream, width-converts to 256-bit beats and
-writes them to the CSR-selected channel/base. Software sequence per transfer: set chan/base/
-length, arm `start`, then DMA exactly length*32 bytes; poll `done`. Upload verification uses
-the engine's FETCH op (HBM -> scratchpad) + software CRC - no readback datapath needed here.
-A CPU fallback path also exists (channel windows / scratchpad), PCIe-less bring-up only."""
+Consumes the LitePCIe DMA (host->device) byte stream (or 32-bit CSR pokes), width-converts
+to 256-bit beats and writes them to the CSR-selected channel/base through one AXIWriter per
+channel. Software sequence per transfer: set chan/base/length, arm `start`, then DMA exactly
+length*32 bytes; poll `done`. Upload verification uses the engine's FETCH op (memory ->
+scratchpad) + software CRC - no readback datapath needed here. A CPU fallback path also
+exists (channel windows / scratchpad), PCIe-less bring-up only.
+
+The same writers serve the engine's STOREs (scratchpad -> memory, single channel) and the
+DeltaNet stream's multi-channel store, granted only while no upload is in progress.
+"""
 
 from functools import reduce
 from operator import and_, or_
@@ -24,12 +29,16 @@ from litex.soc.interconnect.csr import *
 
 from trixium.memory.axi import AXIWriter
 
+
+# Constants ----------------------------------------------------------------------------------------
+
 # One 256-bit beat the host prefixes to a transfer so the loader can find the start of the
 # payload in a stream it does not otherwise control. Repeated 32-bit word so it is trivial to
 # emit from C and unlikely to occur in packed weights.
 SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 
-# Loader ----------------------------------------------------------------------------------
+
+# Loader -------------------------------------------------------------------------------------------
 
 class Loader(LiteXModule):
     def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0,
@@ -97,10 +106,9 @@ class Loader(LiteXModule):
         # CSR poke -> stream: pack 32-bit writes into sink-width words, buffer them, and mux
         # that in place of the DMA when src_sel is set.
         # Pack straight to 256-bit beats and mux at the *converter output*, not its input:
-        # feeding 128-bit words into the upconverter duplicated each one across both halves of
-        # the beat on hardware (the sim DUT used data_width=256, so it never saw the
-        # converter and the bug did not show). Nothing needs converting here anyway - the
-        # host knows it is writing beats.
+        # feeding 128-bit words into the up-converter duplicated each one across both halves
+        # of the beat (a data_width=256 simulation never exercises the converter). Nothing
+        # needs converting here anyway - the host knows it is writing beats.
         poke_ratio = 256//32
         poke_sr    = Signal(256)
         poke_cnt   = Signal(max=poke_ratio)
@@ -121,9 +129,9 @@ class Loader(LiteXModule):
         # One writer per channel; command + data demuxed by `chan`.
         #
         # Data reaches the writers through register slices at both ends of the crossing
-        # (n16 timing #3c: the store data was the scratchpad BRAM output, combinational
-        # through the state mux into every writer's W register - 5.8 ns of pure route to
-        # the far HBM ports, two logic levels). `sbuf` registers the engine's store beats
+        # (otherwise the store data is the scratchpad BRAM output, combinational through the
+        # state mux into every writer's W register: long routes to the far HBM ports and a
+        # timing failure). `sbuf` registers the engine's store beats
         # once at the loader; `wbuf[i]` registers them again next to each writer, so the
         # 16-way fan-out is FF -> FF and Vivado can replicate the source. The DMA upload
         # path shares the per-writer slices. Latency only: +1 cycle per beat at each slice,
@@ -160,8 +168,7 @@ class Loader(LiteXModule):
         # contents whether or not software has written them, and litepcie_write() silently
         # drops the caller's data whenever the hardware laps it. Either way the loader cannot
         # tell payload from filler, and a transfer that starts on the wrong beat writes
-        # plausible-looking rubbish to HBM - which is exactly how the staged BONS header and
-        # the first megabyte of channel 0 were lost.
+        # plausible-looking rubbish to memory.
         #
         # So let the stream say where it starts. Armed with `sync`, the loader discards beats
         # until it sees SYNC_MAGIC and takes the payload from the beat after it; the host
@@ -220,8 +227,9 @@ class Loader(LiteXModule):
             mst_cnt = [Signal(24, name=f"mst_cnt{i}") for i in range(n)]
             mst_left = [Signal(name=f"mst_left{i}") for i in range(n)]
             all_cmd = Signal()
-            self.comb += all_cmd.eq(reduce(and_, [mst_cmd_done[i] | (w.sink_cmd.valid & w.sink_cmd.ready)
-                                                  for i, w in enumerate(self.writers)]))
+            self.comb += all_cmd.eq(reduce(and_, [
+                mst_cmd_done[i] | (w.sink_cmd.valid & w.sink_cmd.ready)
+                for i, w in enumerate(self.writers)]))
             for i in range(n):
                 self.comb += mst_left[i].eq(mst_cnt[i] != mst_len)
             fsm.act("MST_CMD",
