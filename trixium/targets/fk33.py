@@ -58,9 +58,10 @@ class _CRG(LiteXModule):
         pll.create_clkout(self.cd_sys,     sys_clk_freq)
         pll.create_clkout(self.cd_hbm_ref, 100e6)
         pll.create_clkout(self.cd_apb,     100e6)
-        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
+        # Ignore sys_clk to pll.clkin path created by SoC's rst.
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin)
 
-# TriXiumFK33SoC ----------------------------------------------------------------------------------
+# TriXiumFK33SoC -----------------------------------------------------------------------------------
 
 class TriXiumFK33SoC(SoCCore):
     def __init__(self, sys_clk_freq=212.5e6, hbm_tck=800, engine_channels=16, **kwargs):
@@ -130,7 +131,8 @@ class TriXiumFK33SoC(SoCCore):
         add_cluster_constraints(platform)
         self.bus.add_slave("scratchpad", self.trixium.bus,
             SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
-        self.comb += self.pcie_dma0.source.connect(self.trixium.upload, keep={"valid", "ready", "data"})
+        self.comb += self.pcie_dma0.source.connect(self.trixium.upload,
+            keep={"valid", "ready", "data"})
 
         # Board memory map, for the firmware.
         self.add_constant("TRIXIUM_LOADER_ADDS_CHAN_OFFSET", 1)

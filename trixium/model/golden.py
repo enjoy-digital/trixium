@@ -20,8 +20,8 @@ CLI smoke test:
       --tokenizer models/1.7b/tokenizer.json --prompt "The capital of France is" -n 8
 """
 
-import argparse
 import math
+import argparse
 
 import numpy as np
 
@@ -36,11 +36,10 @@ from trixium.model import qformats
 # 48 Gated DeltaNet layers and 16 gated-attention layers (every 4th), the DeltaNet keys under
 # ssm.* (time_step_rank = value heads, group_count = key heads, state_size = head dim,
 # inner_size = value heads x head dim, conv_kernel), rope.dimension_count = the partial RoPE,
-# and PrismML's prism.hadamard.* rotation metadata. Read from the file on 2026-09-18:
-# 24/4 attention heads x 256 with the output gate, 48/16 DeltaNet heads x 128, hidden 5120,
-# FFN 17408, vocab 248320, Hadamard block 1024 with sign vectors for widths 5120/6144/17408.
-# Its DeltaNet layers are refused by the converter until the engine has a recurrent unit
-# (docs/xcu1525.md).
+# and PrismML's prism.hadamard.* rotation metadata. From the file: 24/4 attention heads x 256
+# with the output gate, 48/16 DeltaNet heads x 128, hidden 5120, FFN 17408, vocab 248320,
+# Hadamard block 1024 with sign vectors for widths 5120/6144/17408. check_engine_support()
+# names what the plain Qwen3 path cannot run (docs/xcu1525.md); the image is built anyway.
 GGUF_ARCHS = ("qwen3", "qwen35", "qwen3next")
 
 def config_from_gguf(reader):
@@ -163,8 +162,8 @@ def load_gguf_f32(path, lazy=False):
             raise NotImplementedError(f"{name}: a group-64 Q2_0 file - use the PQ2_0 (g128) file")
         if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_PQ2_0, qformats.GGML_PTQ1_0):
             # In place: the generic dequant's float temporaries (codes - 1, times the
-            # broadcast scales) doubled the 8B's 2.5 GB embedding table three times over
-            # and the whole 33 GB model was OOM-killed at 57 GB (2026-09-18).
+            # broadcast scales) double the 8B's 2.5 GB embedding table three times over, and
+            # the whole 33 GB model would not fit in memory.
             unpack = qformats.ptq1_0_unpack if t.type_id == qformats.GGML_PTQ1_0 else qformats.q2_0_unpack
             scales, codes = unpack(raw)
             if lazy:
@@ -245,7 +244,7 @@ def l2norm(x, eps):
 # matrix of the block, R[i][j] = (-1)^popcount(i & j) / sqrt(block) - symmetric and its own
 # inverse. A folded weight W' = W R diag(s) is applied as y = W' (R (s * x)), blockwise on
 # the input dimension; a folded embedding table stores z = R diag(s) e... and is restored as
-# e = s * (R z) after the lookup. Exactly llama.cpp's fork (llama-graph.cpp, 2026-09-18).
+# e = s * (R z) after the lookup. Exactly llama.cpp's fork (llama-graph.cpp).
 def hadamard_matrix(block):
     i = np.arange(block)
     par = np.bitwise_and(i[:, None], i[None, :])

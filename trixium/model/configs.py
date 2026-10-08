@@ -8,6 +8,8 @@
 
 from dataclasses import dataclass
 
+# Model Config -------------------------------------------------------------------------------------
+
 @dataclass
 class ModelConfig:
     name           : str
@@ -20,7 +22,7 @@ class ModelConfig:
     vocab          : int           # Real vocab size (may be odd, e.g. Qwen3's 151669).
     rope_theta     : float = 1000000.0
     rms_eps        : float = 1e-6
-    max_ctx        : int   = 2048  # Phase-1 KV budget, not the model's native limit.
+    max_ctx        : int   = 2048  # KV budget, not the model's native limit.
     tie_embeddings : bool  = False
     # YaRN rope scaling (Ternary-Bonsai GGUFs ship yarn factor 4 over 8192). Pure table math:
     # host/firmware fold it into the precomputed sin/cos tables, no hardware impact.
@@ -28,8 +30,8 @@ class ModelConfig:
     yarn_orig_ctx  : int   = 0
     # Bonsai 2 / Qwen3.8 (the 27B): a hybrid of Gated DeltaNet layers with full attention
     # every full_attention_interval-th layer. () = every layer is attention (the Qwen3
-    # models). The DeltaNet geometry is carried so the converter and the firmware can say
-    # exactly what the missing recurrent unit has to compute (docs/xcu1525.md).
+    # models). The DeltaNet geometry sizes the recurrent state for the converter and the
+    # firmware (docs/xcu1525.md).
     layer_types    : tuple = ()           # "attn" / "deltanet" per layer, or ().
     dn_num_v_heads : int   = 0            # DeltaNet value heads (GGUF ssm.time_step_rank).
     dn_num_k_heads : int   = 0            # DeltaNet key heads (ssm.group_count).
@@ -68,6 +70,8 @@ class ModelConfig:
         """Vocab-sharded tensors (embeddings/LM head) are row-padded to divide the channel
         count; the top-k unit masks rows >= vocab so pad rows can never win."""
         return (self.vocab + n_channels - 1)//n_channels*n_channels
+
+# Configs ------------------------------------------------------------------------------------------
 
 # bonsai-tiny: random-weight config for simulation (2 layers, dims chosen so every sharded
 # tensor divides by the sim channel count and every ternary K divides the 128 group).

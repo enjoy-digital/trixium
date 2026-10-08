@@ -22,10 +22,10 @@ then the RTL against the interpreter (bit-exact).
 Instruction word (32 bits), two encodings selected by VREGS (the SoC exports
 TRIXIUM_VEC_VREGS; firmware and bitstream must agree or the sticky bad_op/garbage follows):
 
-  VREGS = 8  (bitstreams up to n16_200_v6c):
+  VREGS = 8:
     [31:26] opcode | [25:23] vd | [22:20] va | [19:17] vb | [16:14] sd | [13:11] sa | [10:0] imm11
-  VREGS = 16 (ISA rev 2, 2026-09-03: sixteen vector registers so the single-chain hot
-             programs can be unrolled x2 - silu_q8's body alone needed all eight):
+  VREGS = 16 (ISA rev 2: sixteen vector registers so the single-chain hot programs can be
+             unrolled x2 - silu_q8's body alone needs all eight):
     [31:26] opcode | [25:22] vd | [21:18] va | [17:14] vb | [13:11] sd | [10:8] sa | [7:0] imm8
     and for the scalar-only IMM11 ops (MOVSI, ARG, SADDI, LOOPS, LOOPS2), which have no
     vector operands: imm11 = [25:15] instead (sd/sa stay at [13:11]/[10:8]).
@@ -33,18 +33,19 @@ imm is signed. Vector ops' immediates are shift counts (fit 8 bits). Memory ops 
 addresses in scalar regs, post-incremented by 32 (one 256-bit beat).
 """
 
+import sys
+
 import numpy as np
 
 from trixium.model import bitexact as bx
 
 LANES = 16
 
-# VectorUnit.imem_depth: the programs are uploaded into a 256-word instruction BRAM at
-# init. Overflowing it does NOT fail loudly - the write pointer wraps and quietly overwrites
-# the programs at offset 0 (one added program once corrupted resid_add's ARG setup, and only
-# that program's CRC moved). emit_c() asserts against this, so keep it in step with the RTL.
-IMEM_DEPTH = 1024 # 256 until 2026-08-29, 512 until 2026-09-03 (ISA rev 2: the x2 unrolls
-                  # cost ~30 words each; 1024 x 32 distributed RAM, 4 KB).
+# VectorUnit.imem_depth: the programs are uploaded into the instruction RAM at init.
+# Overflowing it does NOT fail loudly - the write pointer wraps and quietly overwrites the
+# programs at offset 0 (only the overwritten program's CRC moves). emit_c() asserts against
+# this, so keep it in step with the RTL.
+IMEM_DEPTH = 1024 # 1024 x 32 distributed RAM, 4 KB (the x2 unrolls cost ~30 words each).
 
 # Vector register count = encoding (see the module docstring). set_vregs() switches the
 # assembler, the interpreter and emit_c() together; the firmware Makefile passes the
@@ -131,16 +132,16 @@ OPCODES = [
     "SNORME",   # sd = EVEN shift e such that (S[sa] << e) lands in [2^30, 2^32); 0 for S[sa] <= 0.
                 # (Even so the shift splits cleanly into the rsqrt exponent half; the caller
                 #  guarantees S[sa] > 0 - firmware clamps the eps term to >= 1.)
-    # M8 additions (softmax/reduce programs).
+    # Softmax/reduce programs.
     "REDSMAX",  # sd = max(sd, max(lanes)) SIGNED (REDMAX is an abs-max).
     "STW",      # store lanes 0..7 as 8 x int32 (32 bytes; S[sa] += 32).
     # Scalar-B ALU forms: b comes from S[sa] instead of a vector register. The BCAST+V<op>
     # idiom costs 1-3 body instructions per use to materialise a per-iteration-constant
-    # vector; at 4 cycles/instruction on a non-overlapped FSM that idiom was 8 of
-    # silu_mul's 36 body instructions. RTL cost: one 2:1 mux on the shared b-lane feed.
+    # vector; at 4 cycles/instruction on a non-overlapped FSM that idiom costs 8 of a
+    # 36-instruction silu_mul body. RTL cost: one 2:1 mux on the shared b-lane feed.
     "VSHLS",  # vd = va shifted lanewise by S[sa]: left if >= 0, arith right if < 0 (+-31).
     "VMULS",  # vd = low 32 bits of va * S[sa].
-    # Second (outer) loop level, 2026-08-30: independent count/start registers, so a
+    # Second (outer) loop level: independent count/start registers, so a
     # per-head body (LOOPS..LOOPE over beats) can be wrapped in LOOPS2..LOOPE2 over heads
     # and the 24+16 per-head descriptors of the qk-norm/rope/KV-pack lists become one
     # program each. Same encoding rules as LOOPS/LOOPE.
@@ -376,8 +377,8 @@ class VecInterp:
                 V[vd] = np.clip(V[va], -32767, 32767)
             elif op == "VABS":
                 # Wraps like the 32-bit lane does: |INT_MIN| = 2^31 does not fit, so the
-                # result is INT_MIN again (the FSM and V1 units both do this; the random
-                # hazard stress found the interpreter keeping +2^31, 2026-08-30).
+                # result is INT_MIN again, as in the RTL (the random hazard stress checks
+                # it).
                 V[vd] = np.asarray([_s32(abs(_s32(x))) for x in V[va]], dtype=np.int64)
             elif op == "VCLZN":
                 r = []
@@ -422,7 +423,7 @@ def prog_resid_add():
     Firmware picks A4/A5 = e_a - e_out / e_b - e_out from the operands' *measured* absmax,
     so the residual keeps its full 15-bit mantissa. Taking e_out = max(e_a, e_b) + 1 instead
     - the bound for two full mantissas - spends a bit on every call, and the loop calls this
-    twice per layer: the 1.7B's residual was down to one bit by layer 11.
+    twice per layer: the 1.7B's residual would be down to one bit by layer 11.
 
     Returns S6 = output absmax, which is what lets the *next* call size its own shifts."""
     return [
@@ -468,7 +469,7 @@ def prog_quant8():
     return [
         ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
         ("MOVSI", "s6", 0),
-        # x2 unroll (2026-08-31): both passes are pure chains, so two interleaved chains
+        # x2 unroll: both passes are pure chains, so two interleaved chains
         # hide the load-use stalls. A3 still arrives as beats (call sites unchanged, all
         # even - batched q8 128, kvpack 8, FFN 384, VECCRC 8); the program halves it.
         ("MOVSI", "s5", -1),
@@ -505,26 +506,25 @@ def prog_norm_i32():
     source beats -> one 16xint16 beat out), A4 = right-shift k >= 0 (firmware computes
     bitlen(absmax) - 14 from the engine absmax tracker; output exponent += k).
 
-    CONTRACT (2026-08-29): k MUST come from the absmax of the source - the engine tracker,
-    a spilled copy of it, or a CPU scan - i.e. bitlen(absmax) - 14. Then |v >> k| < 2^14
-    for every lane, so the old VCLAMP16 could never fire and was dropped; an out-of-
-    contract smaller k now wraps in the int16 store instead of saturating. The old REDMAX
-    into S6 (output absmax) had no consumer anywhere - every KRES6 reader follows a spill
-    and both CPU call sites discard the result - so it was dropped too. Body 8 -> 6
-    instructions on a 4-cycle-per-instruction unit: -25% on the top op of the token.
+    CONTRACT: k MUST come from the absmax of the source - the engine tracker, a spilled
+    copy of it, or a CPU scan - i.e. bitlen(absmax) - 14. Then |v >> k| < 2^14 for every
+    lane, so no clamp is needed; an out-of-contract smaller k wraps in the int16 store
+    instead of saturating. No output absmax either (every KRES6 reader follows a spill and
+    the CPU call sites have no use for it): a 6-instruction body on a 4-cycle-per-instruction
+    unit, on the top op of the token.
     Returns S6 = 0."""
     return [
         ("ARG",   "s0", 0), ("ARG", "s2", 2), ("ARG", "s3", 3), ("ARG", "s4", 4),
         ("MOVSI", "s6", 0),
         ("MOVSI", "s5", 0),
-        # -k is a loop constant: build it once. It used to cost two BCASTs and a VSUB on every
-        # iteration, 3 of a 10-instruction body, for a value that never changes.
+        # -k is a loop constant: build it once (two BCASTs and a VSUB per iteration
+        # otherwise, for a value that never changes).
         ("BCAST", "v3", "s5"),          # 0
         ("BCAST", "v2", "s4"),
         ("VSUB",  "v2", "v3", "v2"),    # -k
-        # x2 unroll (2026-08-31): two independent LDW->VPACK->VSHLV->STV chains interleave,
-        # so the load-use and pack-use stalls of one chain fill under the other - the body
-        # was 2 stalls per output beat on a pure chain. A3 still arrives as output beats
+        # x2 unroll: two independent LDW->VPACK->VSHLV->STV chains interleave, so the
+        # load-use and pack-use stalls of one chain (2 per output beat) fill under the
+        # other. A3 still arrives as output beats
         # (call sites unchanged, all even - q/kv/ffn/embd widths and head_dim/16 = 8);
         # the program halves it itself.
         ("MOVSI", "s5", -1),
@@ -548,14 +548,13 @@ def prog_silu_mul():
     """dst_i16 = clamp16(silu(gate) * up >> 15-ish), all Q15 fixed point.
     gate value = mg * 2^eg, up value = mu * 2^eu. Firmware supplies:
       A4 = eg + 6, the DIRECT (usually negative => right) shift for f = (mg*C_LOG2E) << A4.
-           CONVENTION CHANGE 2026-08-28: this used to be -(eg+6), negated in-loop; VSHLS
-           shifts by the scalar directly, so the negation moved to the caller.
+           VSHLS shifts by the scalar directly, so the caller does the negation.
       A6 = output shift so that dst mantissa = (sig_q15 * mg * mu-ish) fits int16 (direct).
-    Body is 21 instructions (was 27 on 2026-08-28, 36 before that). 2026-08-29: the two
-    clamp constants are hoisted - v1 = -15*2^15 and v7 = 14*2^15 live across the loop; the
-    register plan that frees them: VCLZN's n goes to v4 (i = floor(f) is dead after the
-    e2 shift) and mu is loaded late into v3 (f is dead after LUTE2). Same arithmetic,
-    instruction for instruction, as the pinned pre-hoist program in test_asm_hoist.
+    Body is 21 instructions: the two clamp constants are hoisted - v1 = -15*2^15 and
+    v7 = 14*2^15 live across the loop; the register plan that frees them: VCLZN's n goes to
+    v4 (i = floor(f) is dead after the e2 shift) and mu is loaded late into v3 (f is dead
+    after LUTE2). Same arithmetic, instruction for instruction, as the pinned pre-hoist
+    program in test_asm_hoist.
     """
     C_LOG2E = 739 # round(log2(e) * 2^9) - fits the 11-bit immediate; A4 folds the 2^9 scale.
     return [
@@ -667,8 +666,8 @@ def prog_softmax8():
     Padding entries clamp to f = -15*2^15 -> p8 = 0.
 
       A6 = spill address (32 B beat): the exact p8 sum (S6) is ALSO written there as 8 int32
-           copies, replacing the separate PROG_SPILL descriptor the attention list used to
-           run after every softmax (F0-5, 2026-08-29). S6/S7 are unchanged by the tail."""
+           copies, so the attention list needs no separate PROG_SPILL descriptor after
+           every softmax. S6/S7 are unchanged by the tail."""
     return [
         ("ARG",   "s0", 0), ("ARG", "s3", 3),
         ("MOVSI", "s5", 47),
@@ -691,8 +690,8 @@ def prog_softmax8():
         ("MOVSI", "s1", -480),
         ("BCAST", "v4", "s1"),
         ("VSHLI", "v4", "v4", 10),      # -15*2^15.
-        # Both shift amounts are loop constants; they used to be rebuilt into v1 on every
-        # iteration of a 19-instruction body. v3/v6 are free across this loop.
+        # Both shift amounts are loop constants: built once, outside the loop. v3/v6 are free
+        # across this loop.
         ("BCAST", "v3", "s4"),
         ("BCAST", "v6", "s5"),
         ("LOOPS", "s3"),
@@ -723,7 +722,7 @@ def prog_softmax8():
 
 def prog_rmsnorm_h():
     """rmsnorm over H contiguous heads with one weight row (the qk-norm of every head in ONE
-    program, 2026-08-30). Per head exactly prog_rmsnorm's instruction sequence, so the
+    program). Per head exactly prog_rmsnorm's instruction sequence, so the
     numerics are identical head for head; the outer LOOPS2 walks the heads.
       A0 = src of head 0, A1 = w (rewound per head), A2 = dst of head 0 (may equal A0),
       A3 = beats per head, A4 = -log2(hd), A5 = eps_int, A6 = e_w - E_NORM - 15,
@@ -832,9 +831,9 @@ def prog_kvpack_h():
     ]
 
 def prog_rmsnorm_q8():
-    """prog_rmsnorm followed by a measured-mode quant8 of its own output, in one program
-    (F1-3, 2026-08-30): the int16 result still lands at A2 (SP_H, the attention/FFN
-    input the rest of the layer reads) and the int8 x8 at A7. Pass 2 REDMAXes the clamped
+    """prog_rmsnorm followed by a measured-mode quant8 of its own output, in one program: the
+    int16 result still lands at A2 (SP_H, the attention/FFN input the rest of the layer
+    reads) and the int8 x8 at A7. Pass 2 REDMAXes the clamped
     int16 values it stores - exactly what quant8's first pass measured - so pass 3 is
     quant8's second pass verbatim. S6 = that absmax (firmware: s = quant8_shift(S6)).
       A0..A6 as prog_rmsnorm, A7 = int8 dst."""
@@ -895,8 +894,8 @@ def prog_nopd():
     return [("DONE",)]
 
 def prog_silu_q8():
-    """prog_silu_mul followed by a measured-mode quant8 of its output in one program
-    (2026-08-30): the int16 result still lands at A2 (SP_G) and the int8 x8 at A7. The loop
+    """prog_silu_mul followed by a measured-mode quant8 of its output in one program:
+    the int16 result still lands at A2 (SP_G) and the int8 x8 at A7. The loop
     REDMAXes the clamped output it stores (quant8's first pass), then quant8's rescale
     pass runs over the int16 output. S6 = the absmax (firmware: s = quant8_shift(S6)).
       A0..A6 as prog_silu_mul, A7 = int8 dst."""
@@ -948,7 +947,7 @@ def prog_silu_q8():
         ("DONE",),
     ]
 
-# The FFN SiLU split (2026-09-07). In prog_silu_q8 everything up to and including the
+# The FFN SiLU split. In prog_silu_q8 everything up to and including the
 # VMULH15 that forms x*sigmoid(x) is a function of the GATE alone; the up operand is first
 # touched by the VMUL after it. So the gate half can run under the up-projection's stream
 # (the FFN list already runs norm_g there) and only the multiply/shift/clamp/absmax/quant8
@@ -1105,7 +1104,7 @@ def prog_spill():
     ]
 
 
-# ISA rev 2 unrolls (2026-09-03): two interleaved chains per iteration, chain B in v8..
+# ISA rev 2 unrolls: two interleaved chains per iteration, chain B in v8..
 # The interpreter proves them byte-identical to the single-chain programs (in place too);
 # the win is RTL-only - the second chain fills the LUT/load-use/mul stalls the first one
 # exposes at 1 IPC. emit_c() substitutes them under the same PROG_ name when VREGS == 16.
@@ -1657,7 +1656,7 @@ PROGRAMS = {
     "rmsnorm_q8": prog_rmsnorm_q8,
     "silu_q8":    prog_silu_q8,
     "silu_gate":  prog_silu_gate,   # FFN split: gate half, runs under the up stream.
-    "mul_q8":     prog_mul_q8,      # FFN split: up-dependent tail (was silu_q8's tail).
+    "mul_q8":     prog_mul_q8,      # FFN split: up-dependent tail (silu_q8's tail).
     "nopd": prog_nopd,
     "dn_a": prog_dn_a,              # Gated DeltaNet recurrence, pass A (deltanet.py).
     "dn_b": prog_dn_b,              # pass B.
@@ -1689,7 +1688,6 @@ def emit_c(out):
         f.write("\n".join(lines))
 
 if __name__ == "__main__":
-    import sys
     argv = sys.argv[1:]
     if "--vregs" in argv:                       # python -m ... progs.h --vregs 8|16
         i = argv.index("--vregs"); set_vregs(int(argv[i + 1])); del argv[i:i + 2]

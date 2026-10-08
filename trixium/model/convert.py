@@ -14,10 +14,11 @@ Subcommands:
 Vocab-sharded tensors (embeddings/LM head) are row-padded to divide the channel count with
 zero-weight rows (code 1 -> w = 0, scale 0); the top-k unit masks rows >= vocab."""
 
-import argparse
-import hashlib
-import time
 import sys
+import time
+import zlib
+import hashlib
+import argparse
 
 import numpy as np
 
@@ -30,11 +31,13 @@ from trixium.layout import (
     ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
     ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
     ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
+    HBM_CHAN_STRIDE, HBM_WEIGHT_BASE,
 )
 from trixium.model import qformats
 from trixium.model.gguf_reader import GGUFReader, inspect as gguf_inspect
-from trixium.model.golden import config_from_gguf, check_engine_support
+from trixium.model.golden import config_from_gguf, check_engine_support, hadamard_matrix
 from trixium.model.bons import TensorSpec, write_image, BONSReader, decode_rows
+from trixium.model.bons import split_wide, _tensor_beats
 
 # GGUF name -> (role, replicated) ------------------------------------------------------------------
 
@@ -93,7 +96,6 @@ def _hadamard_specs(cfg):
     x[b*block : (b+1)*block] - one engine matvec per block with the x slice as its input,
     the tensor sharded over the channels like any other. Entry layer = width index * 256 +
     block index (layout.hadamard_layer); the widths are listed in the header."""
-    from trixium.model.golden import hadamard_matrix
     block = cfg.hadamard_block
     R = hadamard_matrix(block)*np.sqrt(float(block))          # +-1
     specs = []
@@ -225,7 +227,6 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
         specs += _hadamard_specs(cfg)
     # Matvecs wider than one engine op (the 27B's FFN down projection, K = 17408) become
     # K-segments the firmware sums (layout.FLAG_KSEG).
-    from trixium.model.bons import split_wide
     specs = [seg for spec in specs for seg in split_wide(spec, kseg_max)]
     nseg = sum(1 for sp in specs if sp.flags & layout.FLAG_KSEG)
     if nseg:
@@ -236,13 +237,11 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     # the weights (kv rows of 1 + head_dim/32 beats, max_ctx/n_channels per (layer, kv
     # head, K|V)). The 8B (136 MB/channel of ternary) fits; its int16 embedding table
     # (1.2 GB) does not, so that is dropped with a note rather than refused; a model whose
-    # weights alone overflow is refused here instead of by the loader (2026-09-18).
+    # weights alone overflow is refused here instead of by the loader.
     # The window is a property of the board target (chan_stride / weight_base are what its
     # SoC exports as TRIXIUM_CHAN_STRIDE / TRIXIUM_CHAN_WEIGHT_BASE); the FK33's constants are
     # the default and the XCU1525 uses the same ones per controller, so the images are
     # shared. A target with a bigger stride passes it (--chan-stride / --weight-base).
-    from trixium.model.bons import _tensor_beats
-    from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
     if chan_stride is None: chan_stride = HBM_CHAN_STRIDE
     if weight_base is None: weight_base = HBM_WEIGHT_BASE
     window   = chan_stride - (weight_base % chan_stride) - 0x1000 - window_reserve  # The last 4 KB: the
@@ -301,7 +300,6 @@ def verify(image_path):
     h   = img.header
     print(f"BONS v{h['version']}: {h['n_tensors']} tensors, {h['n_channels']} channels, "
           f"{h['payload_beats']*32/1e6:.1f} MB/channel")
-    import zlib
     bad = 0
     for e in img.entries:
         crc = 0

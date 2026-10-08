@@ -12,8 +12,9 @@ golden model and the RTL simulation regenerate identical images.
 Usage: python -m trixium.model.tinygen --out models/tiny --channels 2 [--seed 1234]
 """
 
-import argparse
 import os
+import argparse
+import dataclasses
 
 import numpy as np
 
@@ -23,9 +24,13 @@ from trixium.layout import (
     ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
     ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
     ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
+    ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA,
+    ROLE_SSM_ALPHA, ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM, ROLE_HADAMARD,
 )
-from trixium.model.bons import TensorSpec, write_image
-from trixium.model.configs import BONSAI_TINY
+from trixium.model.bons import TensorSpec, write_image, split_wide
+from trixium.model.golden import hadamard_matrix
+from trixium.model.convert import _hadamard_specs
+from trixium.model.configs import BONSAI_TINY, BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K
 
 def _ternary(rng, name, role, layer, rows, cols):
     scales = rng.uniform(0.02, 0.08, (rows, cols//GROUP_TERNARY)).astype(np.float16)
@@ -70,10 +75,6 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
     with the fused qkv, the z gate, Q8 beta/alpha head projections, F32 conv taps (rows of
     1024), A, dt bias and the head norm; gated attention layers with [q | gate]; the
     Hadamard block tensors per input width; post_attention_norm as the FFN norm."""
-    import dataclasses
-    from trixium.layout import (ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA,
-        ROLE_SSM_ALPHA, ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM, ROLE_HADAMARD)
-    from trixium.model.golden import hadamard_matrix
     rng = np.random.default_rng(seed)
     nk, hk, nv, hv = cfg.dn_num_k_heads, cfg.dn_k_head_dim, cfg.dn_num_v_heads, cfg.dn_v_head_dim
     nq, nvh = nk*hk, nv*hv
@@ -112,7 +113,6 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
     t.append(_norm(rng, "output_norm.weight", ROLE_OUT_NORM, 0, cfg.n_embd))
     t.append(_ternary(rng, "output.weight", ROLE_LM_HEAD, 0, cfg.vocab, cfg.n_embd))
     # The rotation tensors, exactly as convert._hadamard_specs builds them.
-    from trixium.model.convert import _hadamard_specs
     t += _hadamard_specs(cfg)
     return t
 
@@ -126,7 +126,6 @@ def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
     else:
         tensors = make_tiny_tensors(cfg, seed)
     if kseg_max is not None:
-        from trixium.model.bons import split_wide
         tensors = [seg for t in tensors for seg in split_wide(t, kseg_max)]
         suffix += "-kseg"
     img_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.img")
@@ -144,7 +143,6 @@ def main():
                         help="bonsai-tiny-hybrid-1k: 1,024-wide rotation blocks (the resident path).")
     parser.add_argument("--kseg-max", default=None, type=int, help="Split matvecs wider than this (K-segments).")
     args = parser.parse_args()
-    from trixium.model.configs import BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K
     cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
     img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")

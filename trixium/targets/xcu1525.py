@@ -21,8 +21,8 @@
 import os
 
 from migen import *
-from migen.genlib.resetsync import AsyncResetSynchronizer
 from migen.genlib.cdc import MultiReg
+from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
 
@@ -78,7 +78,8 @@ class _CRG(LiteXModule):
         # without a fractional divide; IDELAYCTRL takes 300-800 MHz and the PHY is told).
         self.idelay_freq = 400e6
         pll.create_clkout(self.cd_idelay, self.idelay_freq)
-        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
+        # Ignore sys_clk to pll.clkin path created by SoC's rst.
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin)
         self.syspll = syspll = USPMMCM(speedgrade=-2)
         self.comb += syspll.reset.eq(self.rst)
         syspll.register_clkin(pll.clkin, 300e6)
@@ -91,11 +92,10 @@ class _CRG(LiteXModule):
         self.specials += Instance("BUFGCE",
             i_CE=1, i_I=self.cd_pll4x.clk, o_O=cd_fast.clk)
 
-        # These parallel buffers share one MMCM output, but their distribution trees
-        # have very different loads (sys fabric vs four PHYs across three SLRs).
-        # Ask the placer/router to balance them; do NOT waive OSERDESE3 CLK/CLKDIV
-        # checks. v8 missed the 0.270 ns maximum skew by 0.003 ns at 16 endpoints.
-        # AMD UG912 CLOCK_DELAY_GROUP: apply to the clock-buffer OUTPUT net segments.
+        # These parallel buffers share one MMCM output, but their distribution trees have very
+        # different loads (ddr fabric vs four PHYs across three SLRs): ask the placer/router to
+        # balance them (UG912 CLOCK_DELAY_GROUP, on the clock-buffer OUTPUT nets) for the
+        # OSERDESE3 CLK/CLKDIV skew checks (0.270 ns max); do NOT waive those checks here.
         platform.add_platform_command(
             "set_property CLOCK_DELAY_GROUP trixium_ddr4 "
             "[get_nets {{{slow} {fast}}}]",
@@ -103,7 +103,10 @@ class _CRG(LiteXModule):
 
         locked = Signal()
         self.comb += locked.eq(pll.locked & self.syspll.locked)
-        self.idelayctrl = _IDELAYCTRL(platform, cd_ref=self.cd_idelay, cd_sys=self.cd_sys, locked=locked)
+        self.idelayctrl = _IDELAYCTRL(platform,
+            cd_ref = self.cd_idelay,
+            cd_sys = self.cd_sys,
+            locked = locked)
         # ddr leaves reset with sys (after the IDELAYCTRL is ready), synchronized.
         self.specials += AsyncResetSynchronizer(self.cd_ddr, self.cd_sys.rst)
 
@@ -113,26 +116,25 @@ class _IDELAYCTRL(LiteXModule):
     """LiteX's USPIDELAYCTRL with the reset counter on the sys clock in a reset-less domain,
     and a false path to the IDELAYCTRL RST pins.
 
-    LiteX clocks its 64-cycle reset counter with the 500 MHz IDELAY reference and Vivado
-    replicates the IDELAYCTRL once per I/O bank: with four DDR4 channels the replicas sit in
-    all three SLRs, the reset net is 2.1 ns of route against a 2 ns period, and every one of
-    the first build's 82 failing endpoints was this net (xcu1525_n16_125_v1: WNS -0.809, the
-    engine and controllers at 125 MHz all met). The RST pin is asynchronous on UltraScale+
-    (UG571: a 52 ns minimum pulse, no clock relation), so the counter runs at the sys clock
-    (512 ns of reset) and the RST paths are false paths. The RDY handling is LiteX's.
+    LiteX clocks its 64-cycle reset counter with the IDELAY reference and Vivado replicates
+    the IDELAYCTRL once per I/O bank: with four DDR4 channels the replicas sit in all three
+    SLRs and the reset net needs more route than one reference period (it was every failing
+    endpoint of the first build). The RST pin is asynchronous on UltraScale+ (UG571: a 52 ns
+    minimum pulse, no clock relation), so the counter runs at the sys clock (512 ns of reset)
+    and the RST paths are false paths. The RDY handling is LiteX's.
 
     The counter's domain must NOT be `sys`: sys is held in reset until the IDELAYCTRL is
-    ready, and the IDELAYCTRL is not ready until this counter releases RST - a counter in
-    sys never counts and the SoC never leaves reset (v2 on the board, 2026-09-19: PCIe up,
-    every CSR read 0xffffffff). LiteX's original avoided it by counting in the reference
-    domain; this one counts in a reset-less domain on the sys clock (test_xcu1525_crg.py).
+    ready, and the IDELAYCTRL is not ready until this counter releases RST - a counter in sys
+    never counts and the SoC never leaves reset (PCIe up, every CSR read 0xffffffff). LiteX's
+    original avoids it by counting in the reference domain; this one counts in a reset-less
+    domain on the sys clock (test_xcu1525_crg.py).
 
     The count starts at MMCM lock, not at configuration: UG571 wants the IDELAYCTRL reset
-    applied after REFCLK is stable, and LiteX gets that for free because its reference
-    domain is reset by ~locked. Here `locked` is synchronised into the counter's domain and
-    holds RST asserted (counter reloaded) while it is low - the MMCM outputs toggle for the
-    ~100 us of lock acquisition, 64 sys cycles would have released RST into an unstable
-    REFCLK, and a RDY that never rises is the v2 symptom again.
+    applied after REFCLK is stable, and LiteX gets that for free because its reference domain
+    is reset by ~locked. Here `locked` is synchronised into the counter's domain and holds RST
+    asserted (counter reloaded) while it is low: the MMCM outputs toggle for the ~100 us of
+    lock acquisition, and 64 sys cycles would release RST into an unstable REFCLK (a RDY that
+    never rises).
     """
     def __init__(self, platform, cd_ref, cd_sys, reset_cycles=64, ready_cycles=64, locked=None):
         self.cd_ic       = ClockDomain()
@@ -177,13 +179,13 @@ class _IDELAYCTRL(LiteXModule):
                     o_RDY        = ic_ready),
                 AsyncResetSynchronizer(self.cd_ic, ic_reset)
             ]
-            platform.add_platform_command(
-                "set_false_path -to [get_pins -hierarchical -filter {{REF_NAME == IDELAYCTRL && NAME =~ *RST}}]")
+            platform.add_platform_command("set_false_path -to [get_pins -hierarchical "
+                "-filter {{REF_NAME == IDELAYCTRL && NAME =~ *RST}}]")
         else:
             # Test: no primitive; the test drives ic_ready and resets cd_ic itself.
             self.specials += AsyncResetSynchronizer(self.cd_ic, ic_reset)
 
-# TriXiumXCU1525SoC -------------------------------------------------------------------------------
+# TriXiumXCU1525SoC --------------------------------------------------------------------------------
 
 # The (sdram, ddrphy) CSR pairs of the four controllers: their own CSR bus in the ddr domain,
 # behind a wishbone crossing at DDR_CSR_WINDOW (between the CLINT and the PLIC), controller k's
@@ -218,7 +220,8 @@ class TriXiumXCU1525SoC(SoCCore):
         cpu_slr        = 1,
         **kwargs):
         ddram_channels = 4
-        assert engine_channels % ddram_channels == 0, "engine channels shard evenly over the controllers"
+        assert engine_channels % ddram_channels == 0, \
+            "engine channels shard evenly over the controllers"
         chan_mod = engine_channels//ddram_channels
         assert chan_mod & (chan_mod - 1) == 0, "channels per controller must be a power of two"
         platform = sqrl_xcu1525.Platform()
@@ -262,12 +265,12 @@ class TriXiumXCU1525SoC(SoCCore):
             bar0_size  = 0x40000) # Covers DDR_CSR_WINDOW (CSR region + 0x20000): host DDR trainer.
         self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
 
-        # CPU bus monitor (read over PCIe by tools/cpumon.py) -------------------------------------
+        # CPU Bus Monitor (read over PCIe by tools/cpumon.py) --------------------------------------
         self.cpumon = CPUBusMonitor(self.cpu)
         self.csr.add("cpumon", 31)  # Pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console).
         if cpu_slr is not None:
-            # The CPU in one SLR: spread over two, its memory-bus return crossed the boundary
-            # at 8 logic levels (-0.50 ns).
+            # The CPU in one SLR: spread over two, its memory-bus return crosses the boundary
+            # at 8 logic levels and misses timing.
             platform.add_platform_command("create_pblock pb_cpu")
             platform.add_platform_command(f"resize_pblock pb_cpu -add SLR{cpu_slr}")
             platform.add_platform_command(
@@ -313,7 +316,8 @@ class TriXiumXCU1525SoC(SoCCore):
         add_cluster_constraints(platform)
         self.bus.add_slave("scratchpad", self.trixium.bus,
             SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
-        self.comb += self.pcie_dma0.source.connect(self.trixium.upload, keep={"valid", "ready", "data"})
+        self.comb += self.pcie_dma0.source.connect(self.trixium.upload,
+            keep={"valid", "ready", "data"})
 
         # Board memory map, for the firmware.
         self.add_constant("TRIXIUM_LOADER_ADDS_CHAN_OFFSET", 1)

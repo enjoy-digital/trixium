@@ -18,17 +18,30 @@
 tools/board.env); `chat` and `console` run where the card's /dev/ttyLXU0 is.
 """
 
-import argparse
 import os
-import subprocess
 import sys
+import shlex
+import argparse
+import subprocess
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Helpers ------------------------------------------------------------------------------------------
 
 def _run(cmd, cwd=REPO):
     return subprocess.call(cmd, cwd=cwd)
 
+
+def _board_env():
+    env = {}
+    for line in open(os.path.join(REPO, "tools", "board.env")):
+        line = line.split("#", 1)[0].strip()
+        if "=" in line and not line.startswith(("H=", "REPO=")):
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"')
+    return env
+
+# Commands -----------------------------------------------------------------------------------------
 
 def cmd_convert(a):
     from trixium.model.convert import convert
@@ -78,7 +91,6 @@ def cmd_chat(a):
         # From the workstation: the chat runs on the board host over ssh (tools/board.env),
         # in the tree the deploy script maintains there.
         env = _board_env()
-        import shlex
         remote = (f"cd {shlex.quote(env['BOARD_DIR'])} && ./user/trixium_chat -t {shlex.quote(a.tty)} "
                   + " ".join(shlex.quote(f) for f in flags))
         os.execvp("ssh", ["ssh", "-t", f"{env['BOARD_USER']}@{env['BOARD_HOST']}", remote])
@@ -88,16 +100,6 @@ def cmd_chat(a):
     os.execv(exe, [exe, "-t", a.tty, "-z", a.tokenizer] + flags)
 
 
-def _board_env():
-    env = {}
-    for line in open(os.path.join(REPO, "tools", "board.env")):
-        line = line.split("#", 1)[0].strip()
-        if "=" in line and not line.startswith(("H=", "REPO=")):
-            k, v = line.split("=", 1)
-            env[k.strip()] = v.strip().strip('"')
-    return env
-
-
 def cmd_console(a):
     cmd = [sys.executable, os.path.join(REPO, "tools", "pcie_console.py"), "-t", a.tty,
            "-w", str(a.wait), "--quiet-after", str(a.quiet)]
@@ -105,6 +107,7 @@ def cmd_console(a):
         cmd += ["-c", c]
     sys.exit(_run(cmd))
 
+# Main ---------------------------------------------------------------------------------------------
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="trixium", description=__doc__,

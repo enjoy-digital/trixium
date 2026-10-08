@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Numerical profile of the baseline RV32F firmware, not a generic libm claim.
 
 GCC 10.1's rv32imf/ilp32f newlib expf contains fused operations even though our
