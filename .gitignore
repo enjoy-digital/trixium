@@ -20,6 +20,8 @@ models/
 /ip/hbm
 ip/hbm900/*
 !ip/hbm900/hbm_0.xci
+ip/hbm800/*
+!ip/hbm800/hbm_800.xci
 
 # Vivado FP32 IP products (regenerated from the reviewed XCI files).
 ip/fp32/fp32_add/*
@@ -91,3 +93,7 @@ vivado*.jou
 vivado*.log
 trixium/software/user/.build_config
 trixium/software/user/bonsai_caps
+
+# sbt/VexiiRiscv generation leftovers
+/target/
+/project/
