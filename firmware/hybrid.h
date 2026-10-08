@@ -18,8 +18,6 @@ void hybrid_dnstream_enable(int on);          // Console `dnstream`: op 5 heads 
 int  hybrid_dnstream_enabled(void);
 void hybrid_attnstream_enable(int on);        // Console `attnstream`: op 6 (at next reset).
 int  hybrid_attnstream_enabled(void);
-void hybrid_attn_fail_at(int p);                // Console `attnfail <pos>` (debug).
-void hybrid_lm_check(void);                   // Console `lmcheck` (debug).
 void hybrid_lm_chunk(uint32_t rows);          // Console `lmchunk <rows>` (0 = automatic).
 void hybrid_hwargmax_enable(int on);          // Console `hwargmax`: the LM head list's argmax.
 int  hybrid_hwargmax_enabled(void);

@@ -107,7 +107,6 @@ int  rl_wait(void);
 uint32_t rl_count(void);
 void resident_rsf_set(const void *src);   // RS_F now holds src (FP32), after a list
 int  rl_rsf_is(const void *src);          // the list being built still has src in RS_F
-void resident_desc_bench(void);       // console `descbench` (debug)
 int  rl_wait_desc(uint32_t k);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,

@@ -41,7 +41,6 @@ extern int seq_use;
 void infer_dbg(int n);    // Checksum the resident intermediates of the next n forwards (dbg).
 void infer_dbg_f32(const char *tag, int layer, const float *values, uint32_t n);
 int  infer_dbg_armed(void);   // Typed traces on: callers that skip a main-RAM copy must not.
-void infer_dbg_dump(const char *tag, int l, int pos); // ...and print one of them whole.
 void infer_attn_chunk(int cap); // Debug: cap the heads per attention list (attnchunk N).
 extern uint32_t infer_forwards;  // Forwards run since boot.
 void infer_qkvx_report(void);     // Print the qkvx state (at init; never mid-generation).

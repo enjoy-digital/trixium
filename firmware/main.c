@@ -670,13 +670,6 @@ static void console_service(void)
         infer_dbg(n);
         printf("DBG armed for %d forwards\n", n);
     }
-    else if (strcmp(token, "dbgdump") == 0) { // dbgdump <tag> <layer> <pos>
-        char *tag = get_token(&str);
-        char *ls  = get_token(&str);
-        char *ps  = get_token(&str);
-        infer_dbg_dump(tag, parse_int(ls), parse_int(ps));
-        printf("DBG dump %s l=%d pos=%d\n", tag, parse_int(ls), parse_int(ps));
-    }
     else if (strcmp(token, "stats") == 0) {
         if (strncmp(str, "reset", 5) == 0)
             perf_reset();
@@ -714,16 +707,6 @@ static void console_service(void)
         printf("SEQ %s (off runs the same ops CPU-dispatched per head, ~20%% slower)\n",
                seq_use ? "on" : "off");
     }
-    else if (strcmp(token, "dnpipe") == 0) {
-        extern int dn_pipe_use;
-        if (strncmp(str, "on", 2) == 0)  dn_pipe_use = 1;
-        if (strncmp(str, "off", 3) == 0) dn_pipe_use = 0;
-        printf("DNPIPE %s (DeltaNet head state store/fetch under the CPU's head work)\n",
-               dn_pipe_use ? "on" : "off");
-    }
-    else if (strcmp(token, "lmcheck") == 0) {
-        hybrid_lm_check();
-    }
     else if (strcmp(token, "lmchunk") == 0) {
         uint32_t rows = (uint32_t)strtoul(str, NULL, 0);
         hybrid_lm_chunk(rows);
@@ -734,14 +717,6 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);
         printf("HWARGMAX %s (the LM head list's restore-unit argmax; off: the CPU loop over the logits)\n",
                hybrid_hwargmax_enabled() ? "on" : "off");
-    }
-    else if (strcmp(token, "descbench") == 0) {
-        resident_desc_bench();
-    }
-    else if (strcmp(token, "attnfail") == 0) {
-        int p = (int)strtoul(str, NULL, 0);
-        hybrid_attn_fail_at(p);
-        printf("attnfail: the attention stream fails at position %d (0 = never)\n", p);
     }
     else if (strcmp(token, "attnstream") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_attnstream_enable(1);
