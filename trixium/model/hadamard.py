@@ -4,8 +4,9 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""Board-independent sequencer descriptor encoding; not a model execution profile."""
+"""Sequencer descriptor of the resident Hadamard unit (unit 3), board independent."""
 
+# Hadamard (unit 3) --------------------------------------------------------------------------------
 
 def scratchpad_rotation_descriptor(*, src, signs, dst, stats, blocks, inverse=False):
     """ABI 1.0, unit 3: N=1024 int8 blocks -> raw int32 + per-block raw absmax.

@@ -14,7 +14,6 @@ Usage: python -m trixium.model.tinygen --out models/tiny --channels 2 [--seed 12
 
 import os
 import argparse
-import dataclasses
 
 import numpy as np
 
@@ -25,12 +24,13 @@ from trixium.layout import (
     ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
     ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
     ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA,
-    ROLE_SSM_ALPHA, ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM, ROLE_HADAMARD,
+    ROLE_SSM_ALPHA, ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM,
 )
 from trixium.model.bons import TensorSpec, write_image, split_wide
-from trixium.model.golden import hadamard_matrix
 from trixium.model.convert import _hadamard_specs
 from trixium.model.configs import BONSAI_TINY, BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def _ternary(rng, name, role, layer, rows, cols):
     scales = rng.uniform(0.02, 0.08, (rows, cols//GROUP_TERNARY)).astype(np.float16)
@@ -43,13 +43,20 @@ def _q8(rng, name, role, layer, rows, cols):
     return TensorSpec(name, role, layer, KIND_Q8, rows, cols, scales=scales, values=values)
 
 def _norm(rng, name, role, layer, cols):
-    # RMSNorm gains around 1.0, replicated in every channel.
+    """RMSNorm gains around 1.0, replicated in every channel."""
     values = rng.uniform(0.8, 1.2, (1, cols)).astype(np.float32)
     return TensorSpec(name, role, layer, KIND_F32, 1, cols, values=values, flags=FLAG_REPLICATED)
 
+def _f32(name, role, layer, values):
+    """A replicated F32 tensor (the DeltaNet conv taps, A and dt bias)."""
+    rows, cols = values.shape
+    return TensorSpec(name, role, layer, KIND_F32, rows, cols, values=values, flags=FLAG_REPLICATED)
+
+# Tensors ------------------------------------------------------------------------------------------
+
 def make_tiny_tensors(cfg, seed=1234):
-    # Mirrors the real Ternary-Bonsai GGUF inventory: ternary everything (embeddings included,
-    # tied - no separate output.weight) + F32 norm vectors.
+    """The real Ternary-Bonsai GGUF inventory: ternary everything (embeddings included, tied:
+    no separate output.weight) + F32 norm vectors."""
     rng = np.random.default_rng(seed)
     t   = []
     t.append(_ternary(rng, "token_embd.weight", ROLE_TOK_EMB, 0, cfg.vocab, cfg.n_embd))
@@ -90,13 +97,13 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
             t.append(_ternary(rng, p+"attn_gate.weight", ROLE_ATTN_ZGATE, l, nvh,        cfg.n_embd))
             t.append(_q8     (rng, p+"ssm_beta.weight",  ROLE_SSM_BETA,   l, nv,         cfg.n_embd))
             t.append(_q8     (rng, p+"ssm_alpha.weight", ROLE_SSM_ALPHA,  l, nv,         cfg.n_embd))
+            # Conv taps as rows of 1024 floats, as convert.py stores them.
             taps = rng.uniform(-0.5, 0.5, (2*nq + nvh)*cfg.dn_conv_kernel).astype(np.float32)
-            t.append(TensorSpec(p+"ssm_conv1d.weight", ROLE_SSM_CONV, l, KIND_F32,
-                                len(taps)//1024, 1024, values=taps.reshape(-1, 1024), flags=FLAG_REPLICATED))
-            t.append(TensorSpec(p+"ssm_a", ROLE_SSM_A, l, KIND_F32, 1, nv,
-                                values=-np.exp(rng.uniform(-1.5, 0.5, (1, nv))).astype(np.float32), flags=FLAG_REPLICATED))
-            t.append(TensorSpec(p+"ssm_dt.bias", ROLE_SSM_DT, l, KIND_F32, 1, nv,
-                                values=rng.uniform(-2.0, 0.5, (1, nv)).astype(np.float32), flags=FLAG_REPLICATED))
+            t.append(_f32(p+"ssm_conv1d.weight", ROLE_SSM_CONV, l, taps.reshape(-1, 1024)))
+            a    = -np.exp(rng.uniform(-1.5, 0.5, (1, nv))).astype(np.float32)
+            t.append(_f32(p+"ssm_a",             ROLE_SSM_A,    l, a))
+            dt   = rng.uniform(-2.0, 0.5, (1, nv)).astype(np.float32)
+            t.append(_f32(p+"ssm_dt.bias",       ROLE_SSM_DT,   l, dt))
             t.append(_norm   (rng, p+"ssm_norm.weight",  ROLE_SSM_NORM,   l, hv))
             t.append(_ternary(rng, p+"ssm_out.weight",   ROLE_SSM_OUT,    l, cfg.n_embd,  nvh))
         else:
@@ -116,6 +123,8 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
     t += _hadamard_specs(cfg)
     return t
 
+# Generate -----------------------------------------------------------------------------------------
+
 def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
     """kseg_max: split matvecs wider than this into K-segments (the 27B's FFN down projection
     path, exercised on the tiny model with e.g. 256); the image is named `-kseg`."""
@@ -133,16 +142,18 @@ def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
     manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path)
     return img_path, man_path, manifest
 
+# Run ----------------------------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="Generate the bonsai-tiny random model.")
-    parser.add_argument("--out",      default="models/tiny", help="Output directory.")
-    parser.add_argument("--channels", default=2, type=int,   help="Channel shard count.")
-    parser.add_argument("--seed",     default=1234, type=int)
-    parser.add_argument("--hybrid",   action="store_true", help="bonsai-tiny-hybrid (the 27B's shape).")
-    parser.add_argument("--hybrid-1k", action="store_true",
-                        help="bonsai-tiny-hybrid-1k: 1,024-wide rotation blocks (the resident path).")
-    parser.add_argument("--kseg-max", default=None, type=int, help="Split matvecs wider than this (K-segments).")
+    parser.add_argument("--out",       default="models/tiny", help="Output directory.")
+    parser.add_argument("--channels",  default=2, type=int,   help="Channel shard count.")
+    parser.add_argument("--seed",      default=1234, type=int, help="Random seed.")
+    parser.add_argument("--hybrid",    action="store_true",   help="bonsai-tiny-hybrid (the 27B's shape).")
+    parser.add_argument("--hybrid-1k", action="store_true",   help="bonsai-tiny-hybrid-1k (1024-wide rotation blocks).")
+    parser.add_argument("--kseg-max",  default=None, type=int, help="Split matvecs wider than this (K-segments).")
     args = parser.parse_args()
+
     cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
     img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")

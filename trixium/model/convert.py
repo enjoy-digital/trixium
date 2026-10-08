@@ -24,20 +24,19 @@ import numpy as np
 
 from trixium import layout
 from trixium.layout import (
-    ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
-    ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM, ROLE_HADAMARD,
     KIND_TERNARY, KIND_Q8, KIND_F32, FLAG_REPLICATED,
     ROLE_TOK_EMB, ROLE_OUT_NORM, ROLE_LM_HEAD,
     ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
     ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
     ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
+    ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
+    ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM, ROLE_HADAMARD,
     HBM_CHAN_STRIDE, HBM_WEIGHT_BASE,
 )
 from trixium.model import qformats
-from trixium.model.gguf_reader import GGUFReader, inspect as gguf_inspect
+from trixium.model.bons import TensorSpec, BONSReader, write_image, split_wide, _tensor_beats
 from trixium.model.golden import config_from_gguf, check_engine_support, hadamard_matrix
-from trixium.model.bons import TensorSpec, write_image, BONSReader, decode_rows
-from trixium.model.bons import split_wide, _tensor_beats
+from trixium.model.gguf_reader import GGUFReader, inspect as gguf_inspect
 
 # GGUF name -> (role, replicated) ------------------------------------------------------------------
 
@@ -47,35 +46,38 @@ _GLOBAL_ROLES = {
     "output.weight"      : (ROLE_LM_HEAD,  False),
 }
 _BLK_ROLES = {
-    "attn_norm"   : (ROLE_ATTN_NORM,   True),
-    "attn_q"      : (ROLE_ATTN_Q,      False),
-    "attn_k"      : (ROLE_ATTN_K,      False),
-    "attn_v"      : (ROLE_ATTN_V,      False),
-    "attn_q_norm" : (ROLE_ATTN_Q_NORM, True),
-    "attn_k_norm" : (ROLE_ATTN_K_NORM, True),
-    "attn_output" : (ROLE_ATTN_OUT,    False),
-    "ffn_norm"    : (ROLE_FFN_NORM,    True),
-    "ffn_gate"    : (ROLE_FFN_GATE,    False),
-    "ffn_up"      : (ROLE_FFN_UP,      False),
-    "ffn_down"    : (ROLE_FFN_DOWN,    False),
+    "attn_norm"           : (ROLE_ATTN_NORM,   True),
+    "attn_q"              : (ROLE_ATTN_Q,      False),
+    "attn_k"              : (ROLE_ATTN_K,      False),
+    "attn_v"              : (ROLE_ATTN_V,      False),
+    "attn_q_norm"         : (ROLE_ATTN_Q_NORM, True),
+    "attn_k_norm"         : (ROLE_ATTN_K_NORM, True),
+    "attn_output"         : (ROLE_ATTN_OUT,    False),
+    "ffn_norm"            : (ROLE_FFN_NORM,    True),
+    "ffn_gate"            : (ROLE_FFN_GATE,    False),
+    "ffn_up"              : (ROLE_FFN_UP,      False),
+    "ffn_down"            : (ROLE_FFN_DOWN,    False),
     # The 27B's hybrid layers (Qwen3.5 names in the GGUF).
-    "post_attention_norm" : (ROLE_FFN_NORM,   True),   # the FFN's input norm, renamed
-    "attn_qkv"    : (ROLE_ATTN_QKV,    False),
-    "attn_gate"   : (ROLE_ATTN_ZGATE,  False),
-    "ssm_out"     : (ROLE_SSM_OUT,     False),
-    "ssm_beta"    : (ROLE_SSM_BETA,    False),
-    "ssm_alpha"   : (ROLE_SSM_ALPHA,   False),
-    "ssm_conv1d"  : (ROLE_SSM_CONV,    True),
-    "ssm_a"       : (ROLE_SSM_A,       True),
-    "ssm_dt"      : (ROLE_SSM_DT,      True),
-    "ssm_norm"    : (ROLE_SSM_NORM,    True),
+    "post_attention_norm" : (ROLE_FFN_NORM,    True), # The FFN's input norm, renamed.
+    "attn_qkv"            : (ROLE_ATTN_QKV,    False),
+    "attn_gate"           : (ROLE_ATTN_ZGATE,  False),
+    "ssm_out"             : (ROLE_SSM_OUT,     False),
+    "ssm_beta"            : (ROLE_SSM_BETA,    False),
+    "ssm_alpha"           : (ROLE_SSM_ALPHA,   False),
+    "ssm_conv1d"          : (ROLE_SSM_CONV,    True),
+    "ssm_a"               : (ROLE_SSM_A,       True),
+    "ssm_dt"              : (ROLE_SSM_DT,      True),
+    "ssm_norm"            : (ROLE_SSM_NORM,    True),
 }
 
+# Per-layer tensor order: Qwen3 attention, Qwen3.5 attention and Qwen3.5 Gated DeltaNet layers.
+_ATTN_LAYER_TENSORS = ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
+                       "attn_output", "ffn_norm", "ffn_gate", "ffn_up", "ffn_down")
+_ATTN_LAYER_TENSORS_Q35 = ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
+                           "attn_output", "post_attention_norm", "ffn_gate", "ffn_up", "ffn_down")
 _DN_LAYER_TENSORS = ("attn_norm", "attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha", "ssm_conv1d",
                      "ssm_a", "ssm_dt", "ssm_norm", "ssm_out", "post_attention_norm",
                      "ffn_gate", "ffn_up", "ffn_down")
-_ATTN_LAYER_TENSORS_Q35 = ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
-                           "attn_output", "post_attention_norm", "ffn_gate", "ffn_up", "ffn_down")
 
 def _name_role(name):
     if name in _GLOBAL_ROLES:
@@ -89,6 +91,9 @@ def _name_role(name):
 
 # Conversion ---------------------------------------------------------------------------------------
 
+def _mb(nbytes):
+    return f"{nbytes/1e6:.0f} MB"
+
 def _hadamard_specs(cfg):
     """PrismML's rotation as ternary tensors, one per (input width, block): rows = cols =
     block, row i = R[i] * s[b*block + i], scale 1/sqrt(block) (exact in fp16 for a power-of-
@@ -97,15 +102,17 @@ def _hadamard_specs(cfg):
     the tensor sharded over the channels like any other. Entry layer = width index * 256 +
     block index (layout.hadamard_layer); the widths are listed in the header."""
     block = cfg.hadamard_block
-    R = hadamard_matrix(block)*np.sqrt(float(block))          # +-1
+    R     = hadamard_matrix(block)*np.sqrt(float(block)) # +-1.
     specs = []
     for wi, width in enumerate(sorted(cfg.hadamard_signs)):
         s = np.asarray(cfg.hadamard_signs[width], dtype=np.float32)
         for b in range(width//block):
             codes  = (R*s[b*block:(b + 1)*block][None, :] + 1).astype(np.uint8)
-            scales = np.full((block, block//layout.GROUP_TERNARY), 1.0/np.sqrt(float(block)), np.float16)
+            scales = np.full((block, block//layout.GROUP_TERNARY), 1.0/np.sqrt(float(block)),
+                             np.float16)
             specs.append(TensorSpec(f"had.{width}.{b}", ROLE_HADAMARD, layout.hadamard_layer(wi, b),
-                                    KIND_TERNARY, block, block, scales=scales, values=codes, flags=0))
+                                    KIND_TERNARY, block, block, scales=scales, values=codes,
+                                    flags=0))
     return specs
 
 def _spec_from_gguf(reader, name, n_channels, vocab_pad):
@@ -119,10 +126,10 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
         raw = reader.tensor_bytes(name)
         # Scales now (bias/rshift need them: a few MB for the whole model); the codes
         # through a loader when the writer gets to this tensor, one tensor in memory at
-        # a time (the 1.7B's codes alone are 1.7 GB).
+        # a time.
         if t.type_id == qformats.GGML_Q2_0 and qformats.q2_0_group(raw, rows*cols) != 128:
-            # PrismML gave type 42 to upstream's group-64 Q2_0 in 2026-06 (the *_Q2_0_g64
-            # files); two scales per 128 weights do not fit the engine's g128 rows.
+            # Type 42 is now upstream's group-64 Q2_0 (the *_Q2_0_g64 files); two scales per
+            # 128 weights do not fit the engine's g128 rows.
             raise NotImplementedError(f"{name}: group-64 Q2_0 - convert the PQ2_0 (g128) "
                                       "file of the same model instead")
         if t.type_id in (qformats.GGML_Q2_0, qformats.GGML_PQ2_0):
@@ -146,7 +153,7 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
         def load(unpack=unpack, rows=rows, cols=cols, pad=pad):
             codes = unpack().reshape(rows, cols)
             if pad:
-                codes = np.concatenate([codes, np.ones((pad, cols), np.uint8)]) # code 1 -> w=0.
+                codes = np.concatenate([codes, np.ones((pad, cols), np.uint8)]) # Code 1 -> w = 0.
             return codes
         return TensorSpec(name, role, layer, KIND_TERNARY, rows + pad, cols,
                           scales=scales, loader=load, flags=flags)
@@ -177,13 +184,13 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
         # engine, one fp16 scale per 32 weights, rounded to nearest.
         assert role in (ROLE_SSM_BETA, ROLE_SSM_ALPHA), name
         rows, cols = t.shape
-        raw = np.frombuffer(reader.tensor_bytes(name), dtype=np.uint16).astype(np.uint32) << 16
-        w = raw.view(np.float32).reshape(rows, cols)
-        g = w.reshape(rows, cols//layout.GROUP_Q8, layout.GROUP_Q8)
-        amax = np.abs(g).max(axis=2)
+        raw    = np.frombuffer(reader.tensor_bytes(name), dtype=np.uint16).astype(np.uint32) << 16
+        w      = raw.view(np.float32).reshape(rows, cols)
+        g      = w.reshape(rows, cols//layout.GROUP_Q8, layout.GROUP_Q8)
+        amax   = np.abs(g).max(axis=2)
         scales = (amax/127.0).astype(np.float16)
-        sc = scales.astype(np.float32)[:, :, None]
-        q = np.where(sc > 0, np.round(g/np.where(sc > 0, sc, 1.0)), 0).clip(-127, 127)
+        sc     = scales.astype(np.float32)[:, :, None]
+        q      = np.where(sc > 0, np.round(g/np.where(sc > 0, sc, 1.0)), 0).clip(-127, 127)
         return TensorSpec(name, role, layer, KIND_Q8, rows, cols, scales=scales,
                           values=q.reshape(rows, cols).astype(np.int8), flags=0)
 
@@ -213,8 +220,7 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
         elif f"blk.{l}.post_attention_norm.weight" in reader.tensors:
             bases = _ATTN_LAYER_TENSORS_Q35
         else:
-            bases = ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
-                     "attn_output", "ffn_norm", "ffn_gate", "ffn_up", "ffn_down")
+            bases = _ATTN_LAYER_TENSORS
         for base in bases:
             suffix = ".bias" if base == "ssm_dt" else ("" if base == "ssm_a" else ".weight")
             names.append(f"blk.{l}.{base}{suffix}")
@@ -242,10 +248,13 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     # SoC exports as TRIXIUM_CHAN_STRIDE / TRIXIUM_CHAN_WEIGHT_BASE); the FK33's constants are
     # the default and the XCU1525 uses the same ones per controller, so the images are
     # shared. A target with a bigger stride passes it (--chan-stride / --weight-base).
-    if chan_stride is None: chan_stride = HBM_CHAN_STRIDE
-    if weight_base is None: weight_base = HBM_WEIGHT_BASE
-    window   = chan_stride - (weight_base % chan_stride) - 0x1000 - window_reserve  # The last 4 KB: the
-    # firmware's DDR round-trip test (ddr.c) writes them on boards with several controllers.
+    # The last 4 KB of the window are left out: the firmware's DDR round-trip test (ddr.c)
+    # writes them on boards with several controllers.
+    if chan_stride is None:
+        chan_stride = HBM_CHAN_STRIDE
+    if weight_base is None:
+        weight_base = HBM_WEIGHT_BASE
+    window   = chan_stride - (weight_base % chan_stride) - 0x1000 - window_reserve
     kv_rb    = 1 + cfg.head_dim//32
     kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
     dn_bytes = layout.deltanet_state_bytes_per_channel(cfg, n_channels)
@@ -253,26 +262,26 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     emb16_b  = 0
     if emb16:
         erows   = (vocab_pad + 15)//16
-        emb16_b = (vocab_pad*cfg.n_embd*2 + erows*32)//n_channels   # int16 rows + exponents
-    def mb(b): return f"{b/1e6:.0f} MB"
+        emb16_b = (vocab_pad*cfg.n_embd*2 + erows*32)//n_channels # int16 rows + exponents.
     reserved = weights + kv_bytes + dn_bytes
     if reserved > window:
-        raise SystemExit(f"{cfg.name}: {mb(weights)} of weights + {mb(kv_bytes)} of KV"
-                         f"{' + ' + mb(dn_bytes) + ' of DeltaNet state' if dn_bytes else ''} per "
-                         f"channel exceed the {mb(window)} channel window at {n_channels} "
+        raise SystemExit(f"{cfg.name}: {_mb(weights)} of weights + {_mb(kv_bytes)} of KV"
+                         f"{' + ' + _mb(dn_bytes) + ' of DeltaNet state' if dn_bytes else ''} per "
+                         f"channel exceed the {_mb(window)} channel window at {n_channels} "
                          f"channels - this model does not fit the card")
     if emb16 and reserved + emb16_b > window:
-        print(f"  int16 embedding table ({mb(emb16_b)}/channel) would overflow the channel "
-              f"window ({mb(reserved)} used of {mb(window)}): left out, the firmware "
+        print(f"  int16 embedding table ({_mb(emb16_b)}/channel) would overflow the channel "
+              f"window ({_mb(reserved)} used of {_mb(window)}): left out, the firmware "
               f"decodes the ternary embedding rows itself (~2.6% per token)")
         emb16 = False
-    print(f"  per channel: weights {mb(weights)} + KV {mb(kv_bytes)}"
-          f"{' + DeltaNet state ' + mb(dn_bytes) if dn_bytes else ''}"
-          f"{' + emb16 ' + mb(emb16_b) if emb16 else ''} of {mb(window)}")
+    print(f"  per channel: weights {_mb(weights)} + KV {_mb(kv_bytes)}"
+          f"{' + DeltaNet state ' + _mb(dn_bytes) if dn_bytes else ''}"
+          f"{' + emb16 ' + _mb(emb16_b) if emb16 else ''} of {_mb(window)}")
 
     sha = b""
     if tokenizer_path:
-        sha = hashlib.sha256(open(tokenizer_path, "rb").read()).digest()
+        with open(tokenizer_path, "rb") as f:
+            sha = hashlib.sha256(f.read()).digest()
 
     t0 = time.time()
     manifest = write_image(cfg, specs, n_channels, out_path,
@@ -313,39 +322,37 @@ def verify(image_path):
     print("verify: OK" if bad == 0 else f"verify: {bad} bad tensors")
     return bad == 0
 
-# CLI ----------------------------------------------------------------------------------------------
+# Run ----------------------------------------------------------------------------------------------
+
+def _int(x):
+    return int(x, 0)
 
 def main():
     parser = argparse.ArgumentParser(description="GGUF -> BONS converter.")
     sub    = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("inspect")
-    p.add_argument("gguf")
+    # Inspect.
+    p = sub.add_parser("inspect", help="Dump GGUF metadata and tensor table.")
+    p.add_argument("gguf", help="GGUF file.")
 
-    p = sub.add_parser("convert")
-    p.add_argument("--gguf",      required=True)
-    p.add_argument("--channels",  required=True, type=int)
-    p.add_argument("--out",       required=True)
-    p.add_argument("--manifest",  default=None)
-    p.add_argument("--tokenizer", default=None)
-    p.add_argument("--layers",    default=None, type=int, help="Truncate to first K layers.")
-    p.add_argument("--check",     action="store_true")
-    p.add_argument("--no-emb16",  action="store_true",
-                   help="Leave out the pre-dequantized int16 embedding table (622 MB on the "
-                        "1.7B; the firmware decodes rows itself, ~2.6%% slower per token).")
-    p.add_argument("--chan-stride", default=None, type=lambda x: int(x, 0),
-                   help="The target's per-channel stride (TRIXIUM_CHAN_STRIDE; default: the FK33's 256 MB).")
-    p.add_argument("--kseg-max", default=layout.KSEG_MAX, type=int,
-                   help="Split matvecs wider than this into K-segments (default: the engine op's "
-                        "limit; small values exercise the path on tiny models).")
-    p.add_argument("--window-reserve", default=0, type=lambda x: int(x, 0),
-                   help="Bytes the last window of a controller loses to the per-channel bank skew "
-                        "((chan_mod-1)*TRIXIUM_CHAN_SKEW: 96 KB on the XCU1525).")
-    p.add_argument("--weight-base", default=None, type=lambda x: int(x, 0),
-                   help="The target's weight base (TRIXIUM_CHAN_WEIGHT_BASE; default: the FK33's).")
+    # Convert.
+    p = sub.add_parser("convert", help="Convert a GGUF file to a BONS image.")
+    p.add_argument("--gguf",           required=True,           help="GGUF file.")
+    p.add_argument("--channels",       required=True, type=int, help="Engine channel count.")
+    p.add_argument("--out",            required=True,           help="Output BONS image.")
+    p.add_argument("--manifest",       default=None,            help="Output JSON manifest (default: <out>.json).")
+    p.add_argument("--tokenizer",      default=None,            help="tokenizer.json (sha256 stored in the header).")
+    p.add_argument("--layers",         default=None, type=int,  help="Truncate to the first K layers.")
+    p.add_argument("--check",          action="store_true",     help="Read two tensors back and compare.")
+    p.add_argument("--no-emb16",       action="store_true",     help="Leave out the int16 embedding table (~2.6%% slower).")
+    p.add_argument("--chan-stride",    default=None, type=_int, help="Per-channel stride (TRIXIUM_CHAN_STRIDE, default: FK33's).")
+    p.add_argument("--weight-base",    default=None, type=_int, help="Weight base (TRIXIUM_CHAN_WEIGHT_BASE, default: FK33's).")
+    p.add_argument("--window-reserve", default=0,    type=_int, help="Bytes lost to the bank skew ((chan_mod-1)*TRIXIUM_CHAN_SKEW).")
+    p.add_argument("--kseg-max",       default=layout.KSEG_MAX, type=int, help="Split matvecs wider than this (K-segments).")
 
-    p = sub.add_parser("verify")
-    p.add_argument("--image", required=True)
+    # Verify.
+    p = sub.add_parser("verify", help="Re-CRC all tensor payloads of a BONS image.")
+    p.add_argument("--image", required=True, help="BONS image.")
 
     args = parser.parse_args()
     if args.cmd == "inspect":

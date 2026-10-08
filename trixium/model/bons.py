@@ -16,18 +16,18 @@ streams, so golden results computed from it are bit-faithful to what the engine 
 import json
 import zlib
 import struct
+from types import SimpleNamespace
 
 import numpy as np
 
 from trixium import layout
-from trixium.model import bitexact as bx
-from trixium.model.golden import hadamard_restore, rope_tables
-from trixium.layout import BONS_NAME_BYTES
 from trixium.layout import (
-    BEAT_BYTES, GROUP_TERNARY, GROUP_Q8, SCALES_PER_BEAT,
+    BEAT_BYTES, BONS_NAME_BYTES,
     KIND_TERNARY, KIND_Q8, KIND_F16, KIND_F32, KIND_NORM16, KIND_NAMES, ROLE_NAMES,
     FLAG_REPLICATED, ceil_div, scale_beats, code_beats, row_beats, shard_rows,
 )
+from trixium.model import bitexact as bx
+from trixium.model.golden import hadamard_restore, rope_tables
 
 # TensorSpec ---------------------------------------------------------------------------------------
 
@@ -49,10 +49,9 @@ class TensorSpec:
         self.scales = scales
         self.values = values
         self.flags  = flags
-        self.kseg   = kseg          # K-segment index (with FLAG_KSEG), see layout.FLAG_KSEG.
-        # loader: a callable returning `values` on demand, for the streaming writer - the
-        # 1.7B's codes are 1.7 GB and the whole image another 1.1, so holding both plus every
-        # temporary does not scale (the 8B would not convert at all).
+        self.kseg   = kseg   # K-segment index (with FLAG_KSEG), see layout.FLAG_KSEG.
+        # loader: a callable returning `values` on demand, for the streaming writer: holding
+        # every tensor's codes plus the image and its temporaries does not scale to the 8B.
         self.loader = loader
         if kind in (KIND_TERNARY, KIND_Q8):
             group = layout.KIND_GROUP[kind]
@@ -63,7 +62,7 @@ class TensorSpec:
             gs_max      = bx.GS_MAX if kind == KIND_TERNARY else bx.GS_MAX_Q8
             self.bias   = bx.choose_scale_bias(e16)
             self.rshift = bx.choose_result_shift(scales, self.bias, gs_max=gs_max)
-            if fixed_point is not None:   # A K-segment: the whole tensor's contract.
+            if fixed_point is not None: # A K-segment: the whole tensor's contract.
                 self.bias, self.rshift = fixed_point
         else:
             # NORM16 norm companions: bias = the tensor's exponent (int8, two's complement).
@@ -79,7 +78,7 @@ class TensorSpec:
         the caller encodes every channel from one load and drops it)."""
         return self.values if self.values is not None else self.loader()
 
-# Row packet encoding ------------------------------------------------------------------------------
+# Row Packet Encoding ------------------------------------------------------------------------------
 
 def split_wide(spec, kseg_max=layout.KSEG_MAX):
     """A matvec spec wider than kseg_max as K-segments: equal column ranges (a multiple of the
@@ -89,11 +88,11 @@ def split_wide(spec, kseg_max=layout.KSEG_MAX):
         kseg_max = min(kseg_max, layout.KSEG_MAX_Q8)
     if spec.kind not in (layout.KIND_TERNARY, layout.KIND_Q8) or spec.cols <= kseg_max:
         return [spec]
-    group = layout.KIND_GROUP[spec.kind]
-    nseg  = -(-spec.cols // kseg_max)
-    ngrp  = spec.cols // group
+    group  = layout.KIND_GROUP[spec.kind]
+    nseg   = -(-spec.cols // kseg_max)
+    ngrp   = spec.cols // group
     bounds = [(ngrp*k // nseg)*group for k in range(nseg + 1)]
-    segs = []
+    segs   = []
     for k in range(nseg):
         c0, c1 = bounds[k], bounds[k + 1]
         scales = np.ascontiguousarray(spec.scales[:, c0//group:c1//group])
@@ -107,12 +106,11 @@ def split_wide(spec, kseg_max=layout.KSEG_MAX):
                                fixed_point=(spec.bias, spec.rshift)))
     return segs
 
-
 def encode_rows(spec, row0, nrows, values=None):
     """Encode rows [row0, row0+nrows) of a tensor as row-packet bytes -> (nrows*row_beats*32,).
     `values` overrides spec.values (the streaming writer passes one load for all channels)."""
-    sb = scale_beats(spec.cols, spec.kind)
-    cb = code_beats(spec.cols, spec.kind)
+    sb  = scale_beats(spec.cols, spec.kind)
+    cb  = code_beats(spec.cols, spec.kind)
     out = np.zeros((nrows, (sb + cb)*BEAT_BYTES), dtype=np.uint8)
 
     if spec.kind in (KIND_TERNARY, KIND_Q8):
@@ -124,7 +122,7 @@ def encode_rows(spec, row0, nrows, values=None):
         values = spec.get_values()
     v = values[row0:row0+nrows]
     if spec.kind == KIND_TERNARY:
-        codes = np.ascontiguousarray(v.astype(np.uint8)).reshape(nrows, spec.cols//4, 4)
+        codes  = np.ascontiguousarray(v.astype(np.uint8)).reshape(nrows, spec.cols//4, 4)
         packed = (codes[:, :, 0] | (codes[:, :, 1] << 2) |
                   (codes[:, :, 2] << 4) | (codes[:, :, 3] << 6)).astype(np.uint8)
         out[:, sb*BEAT_BYTES:sb*BEAT_BYTES + packed.shape[1]] = packed
@@ -186,7 +184,8 @@ def embed_bfp_rows(spec):
     k2 = bitlen(absmax) - 15 so mantissas land in [2^14, 2^15); net = sh - k2 shifts left
     or arithmetic-right; the result is truncated to int16."""
     m11, e16 = bx.fp16_decompose(spec.scales.astype(np.float16))          # (rows, G)
-    m11 = m11.astype(np.int64); e16 = e16.astype(np.int64)
+    m11 = m11.astype(np.int64)
+    e16 = e16.astype(np.int64)
     rows, cols = spec.values.shape
     G = cols//layout.GROUP_TERNARY
     q = spec.values.astype(np.int64).reshape(rows, G, layout.GROUP_TERNARY) - 1
@@ -206,7 +205,7 @@ def embed_bfp_rows(spec):
     v2 = q*m11[:, :, None]                                                   # (rows, G, 128)
     netc = net[:, :, None]
     out = np.where(netc >= 0, v2 << np.maximum(netc, 0), v2 >> np.maximum(-netc, 0))
-    mant = out.reshape(rows, cols).astype(np.int16)                         # truncation, as the firmware
+    mant = out.reshape(rows, cols).astype(np.int16)                         # Truncation, as the firmware.
     exps = (e16min[:, 0] + k2).astype(np.int32)
     return mant, exps
 
@@ -214,8 +213,7 @@ def _tensor_beats(spec, n_channels):
     """Per-channel payload beats of a tensor: every channel carries the same count (the
     sharding divides rows exactly; replicated tensors carry all rows everywhere)."""
     nrows = spec.rows if (spec.flags & FLAG_REPLICATED) else shard_rows(spec.rows, n_channels, 0)[1]
-    return nrows*(scale_beats(spec.cols, spec.kind) + code_beats(spec.cols, spec.kind))
-
+    return nrows*row_beats(spec.cols, spec.kind)
 
 def restored_bfp_rows(scales, codes, signs, hblock):
     """A rotated embedding block (PrismML's basis) dequantized, restored to the plain basis
@@ -233,11 +231,10 @@ def restored_bfp_rows(scales, codes, signs, hblock):
     mant = np.clip(np.round(e*2.0**(-exps[:, None])), -32767, 32767)
     return mant.astype(np.int16), exps.astype(np.int32)
 
-
-def _emb16_specs(emb, n_channels, block=8192, restore=None):
+def _emb16_specs(emb, block=8192, restore=None):
     """The token embedding pre-dequantized to int16 BFP rows (ROLE_TOK_EMB16) plus the per-row
     exponent (ROLE_TOK_EMB16_EXP), bit-exact with the firmware's embed_row_bfp. Computed in
-    row blocks when loaded (the int64 intermediates of the whole table were 2.5 GB).
+    row blocks when loaded (the int64 intermediates of the whole table do not fit).
     restore = (signs, hadamard_block): the table is in PrismML's rotated basis and the rows
     are restored to the plain one here (restored_bfp_rows) - the firmware cannot decode
     the ternary rows itself for such a model (header flag HYB_EMB16_RESTORED)."""
@@ -248,18 +245,15 @@ def _emb16_specs(emb, n_channels, block=8192, restore=None):
     def compute():
         if "mant" in state:
             return
-        codes  = emb.get_values()
-        mant   = np.empty((rows, cols), dtype=np.int16)
-        exps   = np.empty(rows, dtype=np.int32)
+        codes = emb.get_values()
+        mant  = np.empty((rows, cols), dtype=np.int16)
+        exps  = np.empty(rows, dtype=np.int32)
         for r0 in range(0, rows, block):
             r1 = min(rows, r0 + block)
             if restore is not None:
                 m, e = restored_bfp_rows(emb.scales[r0:r1], codes[r0:r1], *restore)
             else:
-                sub = type("Sub", (), {})()
-                sub.values = codes[r0:r1]
-                sub.scales = emb.scales[r0:r1]
-                m, e = embed_bfp_rows(sub)
+                m, e = embed_bfp_rows(SimpleNamespace(values=codes[r0:r1], scales=emb.scales[r0:r1]))
             mant[r0:r1] = m
             exps[r0:r1] = e
         state["mant"] = mant
@@ -269,7 +263,7 @@ def _emb16_specs(emb, n_channels, block=8192, restore=None):
 
     def load_mant():
         compute()
-        return state.pop("mant")           # Dropped after the writer has encoded it.
+        return state.pop("mant") # Dropped after the writer has encoded it.
 
     def load_etab():
         compute()
@@ -281,7 +275,6 @@ def _emb16_specs(emb, n_channels, block=8192, restore=None):
             # firmware fetches one beat from channel 0 per token.
             TensorSpec("token_embd.bfp16_exp", layout.ROLE_TOK_EMB16_EXP, 0, layout.KIND_NORM16,
                        erows, 16, loader=load_etab, flags=FLAG_REPLICATED)]
-
 
 def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_path=None,
                 emb16=True, progress=None):
@@ -312,7 +305,7 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
     # name - the entry name field is 24 bytes; consumers select by kind).
     for spec in [t for t in tensors if t.kind == KIND_F32]:
         w = spec.get_values().astype(np.float64)
-        e = layout.norm16_exp(w)               # per tensor: the gammas reach 153 in the 1.7B
+        e = layout.norm16_exp(w)
         q = np.round(w*2.0**(-e))
         assert np.abs(q).max() <= 32767, (spec.name, e)
         n16_name = spec.name.replace(".weight", "") + ".w16"
@@ -326,7 +319,7 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
         if getattr(cfg, "hadamard_block", 0):
             # The rotated table is restored offline: the firmware never sees the rotation.
             restore = (cfg.hadamard_signs[emb[0].cols], cfg.hadamard_block)
-        tensors.extend(_emb16_specs(emb[0], n_channels, restore=restore))
+        tensors.extend(_emb16_specs(emb[0], restore=restore))
 
     # Metadata pass: offsets from shapes alone.
     bases, base = [], 0
@@ -347,7 +340,7 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
             if progress:
                 progress(spec.name)
             values = spec.get_values()
-            crc = 0 # CRC over the channel-major concatenation of this tensor's payload.
+            crc    = 0 # CRC over the channel-major concatenation of this tensor's payload.
             for c in range(n_channels):
                 if spec.flags & FLAG_REPLICATED:
                     row0, nrows = 0, spec.rows
@@ -378,17 +371,17 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
         f.write(table.ljust(table_padded_n, b"\x00"))
 
     manifest = {
-        "model"          : cfg.name,
-        "config"         : cfg.__dict__,
-        "n_channels"     : n_channels,
-        "payload_beats"  : payload_beats,
-        "payload_bytes_per_channel": payload_beats*BEAT_BYTES,
-        "table_crc32"    : table_crc,
-        "tokenizer_sha256": tokenizer_sha256.hex() if tokenizer_sha256 else "",
-        "tensors"        : manifest_tensors,
+        "model"                     : cfg.name,
+        "config"                    : cfg.__dict__,
+        "n_channels"                : n_channels,
+        "payload_beats"             : payload_beats,
+        "payload_bytes_per_channel" : payload_beats*BEAT_BYTES,
+        "table_crc32"               : table_crc,
+        "tokenizer_sha256"          : tokenizer_sha256.hex() if tokenizer_sha256 else "",
+        "tensors"                   : manifest_tensors,
     }
     if manifest_path is not None:
-        with open(manifest_path, "w") as f:
+        with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
     return manifest
 
@@ -398,9 +391,8 @@ class _TruncTolerantNames(dict):
     """Name -> entry, tolerant of the 24-byte name field.
 
     Anything longer is stored truncated - "blk.10.attn_q_norm.weight" (25 chars) lands as
-    "...weigh" - so a lookup by the real name misses and the tensor looks absent from the
-    image. The firmware indexes by (role, layer) and never saw this; every by-name consumer
-    did, including the Python mirror of the firmware loop.
+    "...weigh" - so a lookup by the real name would miss and the tensor would look absent
+    from the image. The firmware indexes by (role, layer) instead.
     """
     def __missing__(self, name):
         e = dict.get(self, name[:BONS_NAME_BYTES])
@@ -408,26 +400,20 @@ class _TruncTolerantNames(dict):
             raise KeyError(name)
         return e
 
-
 class BONSReader:
     def __init__(self, path):
-        self.data   = np.memmap(path, dtype=np.uint8, mode="r")
+        self.data = np.memmap(path, dtype=np.uint8, mode="r")
         # Explicit even under python -O: never reinterpret the offsets of an image version
         # this reader does not know.
-        if len(self.data) < 8 or struct.unpack_from('<I', self.data, 4)[0] not in layout.BONS_VERSIONS_OK:
-            raise ValueError('BONSReader accepts BONS v2/v3 images only')
-        self.header = layout.unpack_header(bytes(self.data[:layout.BONS_HEADER_SIZE]))
+        if len(self.data) < 8 or struct.unpack_from("<I", self.data, 4)[0] not in layout.BONS_VERSIONS_OK:
+            raise ValueError("BONSReader accepts BONS v2/v3 images only")
+        self.header  = layout.unpack_header(bytes(self.data[:layout.BONS_HEADER_SIZE]))
         self.entries = []
-        table_off = self.header["table_offset"]
+        table_off    = self.header["table_offset"]
         for i in range(self.header["n_tensors"]):
             self.entries.append(layout.unpack_entry(
                 bytes(self.data[table_off + i*layout.BONS_ENTRY_SIZE:
                                 table_off + (i+1)*layout.BONS_ENTRY_SIZE])))
-        # The entry name field is 24 bytes, so anything longer is stored truncated -
-        # "blk.10.attn_q_norm.weight" (25 chars) lands as "...weigh". Index both forms so a
-        # lookup by the real name still resolves; the firmware indexes by (role, layer) and
-        # never saw this, but every by-name consumer did, and it looks exactly like the
-        # tensor being absent from the image.
         self.by_name = _TruncTolerantNames()
         for e in self.entries:
             self.by_name.setdefault(e["name"], e)
@@ -449,12 +435,7 @@ class BONSReader:
                   (e["chan_base_beats"] + e["chan_len_beats"])*BEAT_BYTES]
 
     def _lookup(self, name):
-        e = self.by_name.get(name)
-        if e is None:
-            e = self.by_name.get(name[:BONS_NAME_BYTES])
-        if e is None:
-            raise KeyError(name)
-        return e
+        return self.by_name[name]
 
     def tensor(self, name):
         """Reassemble a full tensor from its shards -> (scales, values) numpy arrays."""

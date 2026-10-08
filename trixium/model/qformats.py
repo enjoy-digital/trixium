@@ -11,10 +11,10 @@ Semantics taken from the PrismML llama.cpp fork (ggml-quants.c, prism branch):
 - PQ2_0 (ggml type 142, g128): block of 128 weights = 2B fp16 scale `d` + 32B of 2-bit
   codes. Element j lives in byte j//4 at bit offset (j%4)*2 (LSB-first).
   Dequant: w = (q - 1) * d with q in {0,1,2}; q = 3 (+2*d) is reserved/unused for ternary.
-  This is the block the fork shipped as "Q2_0" (type 42) until 2026-06; the fork then gave
-  type 42 to upstream's group-64 Q2_0 (18-byte blocks, two scales per 128 weights - not
-  representable in the engine's g128 image) and moved the g128 block to type 142. A type-42
-  payload is told apart by its size (34 vs 18 bytes per block), see q2_0_group().
+  Older fork files ship this block as "Q2_0" (type 42); the fork then gave type 42 to
+  upstream's group-64 Q2_0 (18-byte blocks, two scales per 128 weights - not representable
+  in the engine's g128 image) and moved the g128 block to type 142. A type-42 payload is
+  told apart by its size (34 vs 18 bytes per block), see q2_0_group().
 
 - PTQ1_0 (ggml type 143, g128): the same ternary weights packed 5 trits per byte (base 3,
   upstream TQ1_0's layout at group 128): 24 bytes of 5-trit bytes + 2 bytes of 4-trit bytes
@@ -25,6 +25,19 @@ Semantics taken from the PrismML llama.cpp fork (ggml-quants.c, prism branch):
 
 import numpy as np
 
+# GGML Type Ids ------------------------------------------------------------------------------------
+
+GGML_BF16   = 30
+GGML_Q1_0   = 41  # PrismML fork (1-bit builds).
+GGML_Q2_0   = 42  # PrismML fork: the g128 block in older files, upstream's g64 in newer ones.
+GGML_PQ2_0  = 142 # PrismML fork: the g128 2-bit block, its current name.
+GGML_PTQ1_0 = 143 # PrismML fork: g128 dense trits (5 per byte).
+
+# Helpers ------------------------------------------------------------------------------------------
+
+def _as_u8(raw):
+    return np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+
 # Q2_0 (g128) --------------------------------------------------------------------------------------
 
 QK_Q2_0    = 128
@@ -32,7 +45,7 @@ BLOCK_Q2_0 = 2 + QK_Q2_0//4 # 34 bytes.
 
 def q2_0_unpack(raw):
     """Raw Q2_0 bytes -> (scales float16 (nb,), codes uint8 (nb, 128) with values 0..3)."""
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    raw = _as_u8(raw)
     assert raw.size % BLOCK_Q2_0 == 0, f"Q2_0 payload not a multiple of {BLOCK_Q2_0} bytes"
     blocks = raw.reshape(-1, BLOCK_Q2_0)
     scales = blocks[:, 0:2].copy().view(np.float16).reshape(-1)
@@ -45,7 +58,7 @@ def q2_0_scales(raw):
     """Raw Q2_0 bytes -> scales float16 (nb,) only - the 2 bytes of every 34, no code
     unpacking. The converter's metadata pass needs the scales (bias/rshift) for every
     tensor while the codes stream one tensor at a time."""
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    raw = _as_u8(raw)
     assert raw.size % BLOCK_Q2_0 == 0, f"Q2_0 payload not a multiple of {BLOCK_Q2_0} bytes"
     return raw.reshape(-1, BLOCK_Q2_0)[:, 0:2].copy().view(np.float16).reshape(-1)
 
@@ -65,9 +78,9 @@ def q2_0_pack(scales, codes):
     return out.reshape(-1)
 
 def q2_0_group(raw, n_elements):
-    """128 or 64: which Q2_0 block a type-42 payload holds, from its size. The fork stored
-    the g128 block as type 42 until 2026-06 (34 B per 128), upstream's type 42 is g64 (18 B
-    per 64 = 36 B per 128)."""
+    """128 or 64: which Q2_0 block a type-42 payload holds, from its size. Older fork files
+    store the g128 block as type 42 (34 B per 128), upstream's type 42 is g64 (18 B per 64 =
+    36 B per 128)."""
     nbytes = raw.size if isinstance(raw, np.ndarray) else len(raw)
     if nbytes*128 == n_elements*BLOCK_Q2_0:
         return 128
@@ -84,7 +97,7 @@ def q2_0_dequant(raw):
 # PTQ1_0 (g128, dense trits) -----------------------------------------------------------------------
 
 QK_PTQ1_0    = 128
-BLOCK_PTQ1_0 = 24 + 2 + 2 # 28 bytes: qs[24] (5 trits each), qh[2] (4 trits each), fp16 scale.
+BLOCK_PTQ1_0 = 24 + 2 + 2  # 28 bytes: qs[24] (5 trits each), qh[2] (4 trits each), fp16 scale.
 _PTQ1_STAGES = (32, 16, 8) # ggml-quants.c ptq1_0_stages: the qs bytes come in runs of c
                            # bytes, run k of stage c holding elements m + n*c, n = 0..4.
 _POW3        = np.array([1, 3, 9, 27, 81, 243], dtype=np.uint16)
@@ -115,7 +128,7 @@ _PTQ1_QS_IDX, _PTQ1_QH_IDX = _ptq1_0_layout()
 def ptq1_0_unpack(raw):
     """Raw PTQ1_0 bytes -> (scales float16 (nb,), codes uint8 (nb, 128) with values 0..2).
     Trit n of a byte q is ((q * 3^n) & 0xFF) * 3 >> 8, exactly the C kernel's arithmetic."""
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    raw = _as_u8(raw)
     assert raw.size % BLOCK_PTQ1_0 == 0, f"PTQ1_0 payload not a multiple of {BLOCK_PTQ1_0} bytes"
     blocks = raw.reshape(-1, BLOCK_PTQ1_0)
     nb     = blocks.shape[0]
@@ -132,8 +145,8 @@ def ptq1_0_unpack(raw):
     return scales, codes
 
 def ptq1_0_scales(raw):
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
-    assert raw.size % BLOCK_PTQ1_0 == 0
+    raw = _as_u8(raw)
+    assert raw.size % BLOCK_PTQ1_0 == 0, f"PTQ1_0 payload not a multiple of {BLOCK_PTQ1_0} bytes"
     return raw.reshape(-1, BLOCK_PTQ1_0)[:, 26:28].copy().view(np.float16).reshape(-1)
 
 def ptq1_0_pack(scales, codes):
@@ -151,7 +164,7 @@ def ptq1_0_pack(scales, codes):
     qh = np.zeros((nb, 2), dtype=np.uint16)
     for n in range(4):
         qh = qh*3 + codes[:, _PTQ1_QH_IDX[:, n]]
-    qh = qh*3                                        # the first trit to the top digit
+    qh = qh*3                                        # The first trit to the top digit.
     qh = (qh*256 + 242)//243
     out = np.empty((nb, BLOCK_PTQ1_0), dtype=np.uint8)
     out[:, 0:24]  = qs.astype(np.uint8)
@@ -172,7 +185,7 @@ BLOCK_Q1_0 = 2 + QK_Q1_0//8 # 18 bytes.
 
 def q1_0_unpack(raw):
     """Raw Q1_0 bytes -> (scales float16 (nb,), bits uint8 (nb, 128) with values 0/1)."""
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    raw = _as_u8(raw)
     assert raw.size % BLOCK_Q1_0 == 0, f"Q1_0 payload not a multiple of {BLOCK_Q1_0} bytes"
     blocks = raw.reshape(-1, BLOCK_Q1_0)
     scales = blocks[:, 0:2].copy().view(np.float16).reshape(-1)
@@ -209,7 +222,7 @@ BLOCK_Q8_0 = 2 + QK_Q8_0 # 34 bytes.
 
 def q8_0_unpack(raw):
     """Raw Q8_0 bytes -> (scales float16 (nb,), quants int8 (nb, 32))."""
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    raw = _as_u8(raw)
     assert raw.size % BLOCK_Q8_0 == 0, f"Q8_0 payload not a multiple of {BLOCK_Q8_0} bytes"
     blocks = raw.reshape(-1, BLOCK_Q8_0)
     scales = blocks[:, 0:2].copy().view(np.float16).reshape(-1)
@@ -238,36 +251,29 @@ def q8_0_quant(w):
     q  = np.clip(np.round(w*id[:, None]), -127, 127).astype(np.int8)
     return q8_0_pack(d.astype(np.float16), q)
 
-# F16/F32 ------------------------------------------------------------------------------------------
+# F16/BF16/F32 -------------------------------------------------------------------------------------
 
 def f16_dequant(raw):
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    raw = _as_u8(raw)
     return np.ascontiguousarray(raw).view(np.float16).astype(np.float32)
 
 def f32_dequant(raw):
-    raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
+    raw = _as_u8(raw)
     return np.ascontiguousarray(raw).view(np.float32).copy()
-
-# GGUF type id -> dequant dispatch -----------------------------------------------------------------
-
-GGML_Q2_0   = 42  # PrismML fork type id: the g128 block until 2026-06, upstream's g64 since.
-GGML_Q1_0   = 41  # PrismML fork type id (1-bit builds).
-GGML_PQ2_0  = 142 # PrismML fork: the g128 2-bit block, its current name.
-GGML_PTQ1_0 = 143 # PrismML fork: g128 dense trits (5 per byte).
 
 def bf16_dequant(raw):
     """GGML type 30: bfloat16 = the top 16 bits of an fp32."""
     return (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
 
-GGML_BF16 = 30
+# GGUF Type Id -> Dequant Dispatch -----------------------------------------------------------------
 
 DEQUANT = {
-    0:           f32_dequant,
-    1:           f16_dequant,
-    8:           q8_0_dequant,
-    GGML_BF16:   bf16_dequant,
-    GGML_Q1_0:   q1_0_dequant,
-    GGML_Q2_0:   q2_0_dequant,   # g128 only - load_gguf_f32 checks q2_0_group() first
-    GGML_PQ2_0:  q2_0_dequant,
-    GGML_PTQ1_0: ptq1_0_dequant,
+    0           : f32_dequant,
+    1           : f16_dequant,
+    8           : q8_0_dequant,
+    GGML_BF16   : bf16_dequant,
+    GGML_Q1_0   : q1_0_dequant,
+    GGML_Q2_0   : q2_0_dequant, # g128 only: load_gguf_f32 checks q2_0_group() first.
+    GGML_PQ2_0  : q2_0_dequant,
+    GGML_PTQ1_0 : ptq1_0_dequant,
 }

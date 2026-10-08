@@ -44,11 +44,16 @@ import numpy as np
 
 from trixium.model import bitexact as bx
 
-DELTA_FRAC = 19    # delta_j, v_j and the decayed dot live in units of 2^-19.
-O_SHIFT    = 8     # o_j leaves the unit as (M'_j . q16) >> 8 (fits int32 for any state).
-STATE_LIM  = (1 << 15) - 4   # the ratchet keeps |M'| below this (rounding adds < 2).
+# Constants ----------------------------------------------------------------------------------------
+
+DELTA_FRAC = 19            # delta_j, v_j and the decayed dot live in units of 2^-19.
+O_SHIFT    = 8             # o_j leaves the unit as (M'_j . q16) >> 8 (fits int32 for any state).
+STATE_LIM  = (1 << 15) - 4 # The ratchet keeps |M'| below this (rounding adds < 2).
+
+# Quantization -------------------------------------------------------------------------------------
 
 def lroundf(x):
+    """C lroundf: round half away from zero."""
     x = np.asarray(x, dtype=np.float64)
     return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
 
@@ -65,6 +70,8 @@ def q16_head(x):
 def q15(x):
     """A [0, 1] constant as Q15 (32767 at most)."""
     return int(np.clip(lroundf(np.float32(x)*np.float32(32768.0)), 0, 32767))
+
+# CPU Algebra --------------------------------------------------------------------------------------
 
 def pass_a_args(eM, ek, decay, beta):
     """(dot shift for SSHLV, d15, -beta_q) for prog_dn_a."""
@@ -90,6 +97,8 @@ def pass_b_args(eM2, ek, n, decay):
     d15n = int(np.clip(lroundf(np.float32(decay)*np.float32(np.exp2(15 - n))), 0, 32767))
     rnd = (1 << (sh - 1)) if sh > 0 else 0
     return -sh, d15n, rnd
+
+# Head Step ----------------------------------------------------------------------------------------
 
 def head_step(M, eM, kk, qh, vh, decay, beta, maxM=None, stats=None, trace=None):
     """One head, one token: M (int64 array hv x hk, updated in place, int16 range), eM

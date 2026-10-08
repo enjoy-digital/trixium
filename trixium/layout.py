@@ -37,10 +37,7 @@ GROUP_TERNARY   = 128           # Weights per ternary group (one fp16 scale, one
 GROUP_Q8        = 32            # Weights per int8 group (one fp16 scale, one code beat each).
 SCALES_PER_BEAT = BEAT_BYTES//2 # 16 fp16 scales per beat.
 
-HBM_NCHANNELS    = 32
-HBM_CHANNEL_SIZE = 0x1000_0000 # 256 MB per pseudo-channel.
-
-# Tensor kinds -------------------------------------------------------------------------------------
+# Tensor Kinds -------------------------------------------------------------------------------------
 
 KIND_TERNARY = 0 # 2-bit codes {0,1,2}, group=128, w = (q-1)*scale.
 KIND_Q8      = 1 # int8 quants, group=32, w = q*scale.
@@ -50,8 +47,8 @@ KIND_NORM16  = 4 # int16 rows; for the ".w16" norm companions the entry's bias b
                  # tensor's exponent (int8): w = q * 2^bias. Rope/embedding NORM16 rows keep
                  # their own fixed formats and bias 0.
 
-# Per-tensor: the smallest exponent whose 15-bit mantissa still holds the tensor's absmax. A
-# fixed exponent does not fit: Qwen3-1.7B's norm gammas reach 153 (blk.27 ffn_norm), while the
+# NORM16 exponent, per tensor: the smallest exponent whose 15-bit mantissa still holds the
+# tensor's absmax. A fixed exponent does not fit: Qwen3-1.7B's norm gammas reach 153, while the
 # tiny models' gammas are all small (so their gates cannot see a clipped gamma).
 NORM16_EXP_MAX_FALLBACK = -13 # For an all-zero tensor.
 
@@ -61,10 +58,18 @@ def norm16_exp(values):
         return NORM16_EXP_MAX_FALLBACK
     return math.ceil(math.log2(amax/32767.0))
 
-KIND_NAMES = {KIND_TERNARY: "ternary", KIND_Q8: "q8", KIND_F16: "f16", KIND_F32: "f32",
-              KIND_NORM16: "norm16"}
+KIND_NAMES = {
+    KIND_TERNARY : "ternary",
+    KIND_Q8      : "q8",
+    KIND_F16     : "f16",
+    KIND_F32     : "f32",
+    KIND_NORM16  : "norm16",
+}
 
-KIND_GROUP = {KIND_TERNARY: GROUP_TERNARY, KIND_Q8: GROUP_Q8}
+KIND_GROUP = {
+    KIND_TERNARY : GROUP_TERNARY,
+    KIND_Q8      : GROUP_Q8,
+}
 
 # Tensor flags.
 FLAG_REPLICATED = 0x01 # Tensor payload identical in every channel (not row-sharded).
@@ -73,10 +78,10 @@ FLAG_KSEG       = 0x02 # One K-segment of a matvec too wide for one engine op: t
                        # and the tensor's bias/rshift; the firmware sums their int32 results
                        # (the 27B's FFN down projection: K = 17408 > the op's 14-bit cols and
                        # the 16 KB int8 input buffer).
-KSEG_MAX        = 16384 # The widest K one engine op takes.
+KSEG_MAX        = 16384  # The widest K one engine op takes.
 KSEG_MAX_Q8     = 255*32 # Q8: one code beat per 32 columns, 8-bit cbeats.
 
-# Tensor roles -------------------------------------------------------------------------------------
+# Tensor Roles -------------------------------------------------------------------------------------
 
 (ROLE_TOK_EMB, ROLE_OUT_NORM, ROLE_LM_HEAD,
  ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
@@ -84,13 +89,20 @@ KSEG_MAX_Q8     = 255*32 # Q8: one code beat per 32 columns, 8-bit cbeats.
  ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
  ROLE_ROPE_TAB,
  ROLE_TOK_EMB16, ROLE_TOK_EMB16_EXP) = range(17)
-# The 27B's hybrid layers (BONS v3). Gated DeltaNet: the fused [q|k|v]
-# projection, the z gate projection, the out projection (its input in grouped head order),
-# the beta and alpha head projections (Q8), the conv taps (F32, kernel rows), A = -exp(A_log)
-# and the dt bias (F32, one row of value heads), the per-head norm (F32, one row of head dim).
-# The attention layers' q projection carries [q | gate] per head when the header says
-# attn_gated. Hadamard: the block matrices R diag(s) per input width as ternary tensors
-# (rows = width, cols = block), layer = the width's index in the header's list.
+
+# ROLE_TOK_EMB16: the token embedding rows pre-dequantized to the firmware's int16 BFP form
+# (bit-exact with embed_row_bfp / the sim's embed_bfp_int), one NORM16 row per token, so a
+# forward starts with a 128-beat engine fetch instead of ~47k cycles of CPU decode and
+# uncached scratchpad stores. ROLE_TOK_EMB16_EXP: the per-row exponent, 16 int16 per beat,
+# replicated.
+
+# The 27B's hybrid layers (BONS v3). Gated DeltaNet: the fused [q|k|v] projection, the z gate
+# projection, the out projection (its input in grouped head order), the beta and alpha head
+# projections (Q8), the conv taps (F32, kernel rows), A = -exp(A_log) and the dt bias (F32,
+# one row of value heads), the per-head norm (F32, one row of head dim). The attention layers'
+# q projection carries [q | gate] per head when the header says attn_gated. Hadamard: the
+# block matrices R diag(s) per input width as ternary tensors (rows = width, cols = block),
+# layer = the width's index in the header's list.
 (ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA, ROLE_SSM_ALPHA,
  ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM,
  ROLE_HADAMARD) = range(17, 27)
@@ -101,27 +113,38 @@ def hadamard_layer(width_index, block_index):
     list, then the block)."""
     assert 0 <= width_index < 4 and 0 <= block_index < 256
     return width_index*256 + block_index
-# ROLE_TOK_EMB16: the token embedding rows pre-dequantized to the firmware's int16 BFP form
-# (bit-exact with embed_row_bfp / the sim's embed_bfp_int), one NORM16 row per token, so a
-# forward starts with a 128-beat engine fetch instead of ~47k cycles of CPU decode and
-# uncached scratchpad stores. ROLE_TOK_EMB16_EXP: the per-row exponent, 16
-# int16 per beat, replicated.
 
 ROLE_NAMES = {
-    ROLE_TOK_EMB     : "tok_emb",     ROLE_OUT_NORM  : "out_norm",  ROLE_LM_HEAD  : "lm_head",
-    ROLE_ATTN_NORM   : "attn_norm",   ROLE_ATTN_Q    : "attn_q",    ROLE_ATTN_K   : "attn_k",
-    ROLE_ATTN_V      : "attn_v",      ROLE_ATTN_OUT  : "attn_out",  ROLE_ATTN_Q_NORM: "attn_q_norm",
-    ROLE_ATTN_K_NORM : "attn_k_norm", ROLE_FFN_NORM  : "ffn_norm",  ROLE_FFN_GATE : "ffn_gate",
-    ROLE_FFN_UP      : "ffn_up",      ROLE_FFN_DOWN  : "ffn_down",
-    ROLE_ROPE_TAB    : "rope_tab",
-    ROLE_TOK_EMB16   : "tok_emb16",   ROLE_TOK_EMB16_EXP: "tok_emb16_exp",
-    ROLE_ATTN_QKV    : "attn_qkv",    ROLE_ATTN_ZGATE: "attn_zgate", ROLE_SSM_OUT : "ssm_out",
-    ROLE_SSM_BETA    : "ssm_beta",    ROLE_SSM_ALPHA : "ssm_alpha",  ROLE_SSM_CONV: "ssm_conv",
-    ROLE_SSM_A       : "ssm_a",       ROLE_SSM_DT    : "ssm_dt",     ROLE_SSM_NORM: "ssm_norm",
-    ROLE_HADAMARD    : "hadamard",
+    ROLE_TOK_EMB       : "tok_emb",
+    ROLE_OUT_NORM      : "out_norm",
+    ROLE_LM_HEAD       : "lm_head",
+    ROLE_ATTN_NORM     : "attn_norm",
+    ROLE_ATTN_Q        : "attn_q",
+    ROLE_ATTN_K        : "attn_k",
+    ROLE_ATTN_V        : "attn_v",
+    ROLE_ATTN_OUT      : "attn_out",
+    ROLE_ATTN_Q_NORM   : "attn_q_norm",
+    ROLE_ATTN_K_NORM   : "attn_k_norm",
+    ROLE_FFN_NORM      : "ffn_norm",
+    ROLE_FFN_GATE      : "ffn_gate",
+    ROLE_FFN_UP        : "ffn_up",
+    ROLE_FFN_DOWN      : "ffn_down",
+    ROLE_ROPE_TAB      : "rope_tab",
+    ROLE_TOK_EMB16     : "tok_emb16",
+    ROLE_TOK_EMB16_EXP : "tok_emb16_exp",
+    ROLE_ATTN_QKV      : "attn_qkv",
+    ROLE_ATTN_ZGATE    : "attn_zgate",
+    ROLE_SSM_OUT       : "ssm_out",
+    ROLE_SSM_BETA      : "ssm_beta",
+    ROLE_SSM_ALPHA     : "ssm_alpha",
+    ROLE_SSM_CONV      : "ssm_conv",
+    ROLE_SSM_A         : "ssm_a",
+    ROLE_SSM_DT        : "ssm_dt",
+    ROLE_SSM_NORM      : "ssm_norm",
+    ROLE_HADAMARD      : "hadamard",
 }
 
-# Row packet math ----------------------------------------------------------------------------------
+# Row Packet Math ----------------------------------------------------------------------------------
 
 def ceil_div(a, b):
     return (a + b - 1)//b
@@ -129,13 +152,13 @@ def ceil_div(a, b):
 def deltanet_state_bytes_per_channel(cfg, n_channels):
     """FP32 recurrent-matrix storage needed by the hardware DeltaNet path.
 
-    Whole value-head matrices are striped over the engine channels.  Return the largest
+    Whole value-head matrices are striped over the engine channels. Return the largest
     channel's allocation so the converter's fit check covers a non-even final stripe too.
     The short convolution history remains CPU-resident and is not part of this region.
     """
     if not cfg.n_dn_layers:
         return 0
-    heads = cfg.n_dn_layers*cfg.dn_num_v_heads
+    heads      = cfg.n_dn_layers*cfg.dn_num_v_heads
     head_bytes = cfg.dn_v_head_dim*cfg.dn_k_head_dim*4
     return ceil_div(heads, n_channels)*head_bytes
 
@@ -173,19 +196,12 @@ def shard_rows(rows, n_channels, channel):
     per = rows//n_channels
     return channel*per, per
 
-def tensor_chan_beats(rows, cols, kind, n_channels, flags=0):
-    """Per-channel payload length in beats."""
-    if flags & FLAG_REPLICATED:
-        return rows*row_beats(cols, kind)
-    assert rows % n_channels == 0, f"rows {rows} not divisible by {n_channels} channels"
-    return (rows//n_channels)*row_beats(cols, kind)
-
 # BONS Image Format --------------------------------------------------------------------------------
 #
 # Single file: [header 4 KiB][tensor table, 64 B/entry, padded to 4 KiB][channel 0 payload]
 # [channel 1 payload]...[channel N-1 payload]. All channel payloads have the same length
 # (payload_beats). In HBM, each channel's payload is uploaded at the same base offset of its
-# pseudo-channel; the header+table are uploaded at HBM_HEADER_BASE in channel 0 so the firmware
+# pseudo-channel; the header+table are uploaded at HBM_WEIGHT_BASE in channel 0 so the firmware
 # can walk the model without host-side sideband.
 
 BONS_MAGIC       = 0x534E4F42 # "BONS" little-endian.
@@ -211,9 +227,9 @@ BONS_NAME_BYTES  = 24  # Entry name field; longer names are stored truncated.
 # 142: u8 attn_gated  143: u8 hyb_flags (bit 0: the emb16 rows are un-rotated)
 # 144: 4 x u32 hadamard_widths (the ROLE_HADAMARD tensors, by layer index)
 # 160: u8 reserved (0)                     161: pad to 4096.
-_HEADER_FMT = "<IIIIIIIIIIfIIIIIQII32s"
-_HEADER_V3_FMT = "<QQHHHHHHHBBIIII"
-_HEADER_V3_OFF = 112
+_HEADER_FMT        = "<IIIIIIIIIIfIIIIIQII32s"
+_HEADER_V3_FMT     = "<QQHHHHHHHBBIIII"
+_HEADER_V3_OFF     = 112
 HYB_EMB16_RESTORED = 0x01
 
 MODE_HOST_OWNED = 0
@@ -221,7 +237,8 @@ MODE_FW_OWNED   = 1
 
 def pack_header(cfg, n_channels, n_tensors, payload_beats, table_crc32, tokenizer_sha256=b""):
     table_offset   = BONS_HEADER_SIZE
-    payload_offset = BONS_HEADER_SIZE + ceil_div(n_tensors*BONS_ENTRY_SIZE, BONS_HEADER_SIZE)*BONS_HEADER_SIZE
+    table_size     = ceil_div(n_tensors*BONS_ENTRY_SIZE, BONS_HEADER_SIZE)*BONS_HEADER_SIZE
+    payload_offset = BONS_HEADER_SIZE + table_size
     hdr = struct.pack(_HEADER_FMT,
         BONS_MAGIC, BONS_VERSION,
         cfg.n_layer, cfg.n_embd, cfg.n_head, cfg.n_kv_head, cfg.head_dim, cfg.ffn_dim, cfg.vocab,
@@ -246,17 +263,19 @@ def pack_header(cfg, n_channels, n_tensors, payload_beats, table_crc32, tokenize
 
 def unpack_header(data):
     fields = struct.unpack_from(_HEADER_FMT, data, 0)
-    keys = ("magic", "version", "n_layer", "n_embd", "n_head", "n_kv_head", "head_dim",
-            "ffn_dim", "vocab", "rope_theta", "rms_eps", "max_ctx", "n_channels", "n_tensors",
-            "table_offset", "payload_offset", "payload_beats", "mode", "table_crc32",
-            "tokenizer_sha256")
+    keys   = ("magic", "version", "n_layer", "n_embd", "n_head", "n_kv_head", "head_dim",
+              "ffn_dim", "vocab", "rope_theta", "rms_eps", "max_ctx", "n_channels", "n_tensors",
+              "table_offset", "payload_offset", "payload_beats", "mode", "table_crc32",
+              "tokenizer_sha256")
     hdr = dict(zip(keys, fields))
     assert hdr["magic"] == BONS_MAGIC, "not a BONS image"
     assert hdr["version"] in BONS_VERSIONS_OK, hdr["version"]
-    v3 = struct.unpack_from(_HEADER_V3_FMT, data, _HEADER_V3_OFF) if hdr["version"] >= 3 \
-         else (0,)*15
+    # A v2 image reads as v3 with every hybrid field zero.
+    v3 = (0,)*15
+    if hdr["version"] >= 3:
+        v3 = struct.unpack_from(_HEADER_V3_FMT, data, _HEADER_V3_OFF)
     lt = v3[0] | (v3[1] << 64)
-    hdr["layer_types"]     = tuple("deltanet" if (lt >> l) & 1 else "attn" for l in range(hdr["n_layer"]))
+    hdr["layer_types"] = tuple("deltanet" if (lt >> l) & 1 else "attn" for l in range(hdr["n_layer"]))
     hdr["dn_num_v_heads"], hdr["dn_num_k_heads"], hdr["dn_k_head_dim"], hdr["dn_v_head_dim"], \
         hdr["dn_conv_kernel"], hdr["rope_dims"], hdr["hadamard_block"] = v3[2:9]
     hdr["attn_gated"], hdr["hyb_flags"] = v3[9], v3[10]
@@ -274,7 +293,8 @@ def pack_entry(role, kind, flags, layer, rows, cols, chan_base_beats, chan_len_b
                bias=0, rshift=0, name="", kseg=0):
     group = KIND_GROUP.get(kind, 0)
     return struct.pack(_ENTRY_FMT, role, kind, flags, kseg, layer, group, rows, cols,
-                       chan_base_beats, chan_len_beats, crc32, bias, rshift, name.encode()[:BONS_NAME_BYTES])
+                       chan_base_beats, chan_len_beats, crc32, bias, rshift,
+                       name.encode()[:BONS_NAME_BYTES])
 
 def unpack_entry(data, offset=0):
     role, kind, flags, kseg, layer, group, rows, cols, base, length, crc, bias, rshift, name = \
@@ -291,47 +311,26 @@ def crc32(data):
 
 # HBM Placement ------------------------------------------------------------------------------------
 
-# Weight payloads start at this byte offset inside every pseudo-channel (per-channel address
-# space). The BONS header+table are uploaded verbatim at HBM_WEIGHT_BASE in channel 0 for
-# firmware discovery (payloads follow per the header's payload_offset). Channel 0 also hosts the
-# CPU's main_ram at channel offset 0, so the CPU heap is capped to this base. 64 MB keeps
-# 192 MB/channel for weights: Bonsai-8B (~2.9 GB with embeddings/LM head) fits from N=16 up
-# (~180 MB/channel).
-# The HBM IP has its AXI switch enabled (USER_SWITCH_ENABLE_00/01), so the *address* selects
-# the pseudo-channel and the port it arrives on does not. Channels therefore need distinct
-# address windows: with every channel using one base, all N payloads land on top of each other
-# and every channel streams identical bytes.
-#
-# Channel c owns [HBM_WEIGHT_BASE + c*HBM_CHAN_STRIDE, +HBM_CHAN_STRIDE). Constraints:
-#  - clear of the CPU's main_ram window, which maps SoC 0x4000_0000 straight through to AXI
-#    0x4000_0000 on port 0 (LiteX does not strip the origin for a single mapped channel);
-#  - within one stack: the engine's ports are 1..N, all on stack 0, which is the low 4 GB;
-#  - a power of two, so the engine's STORE path can shift rather than multiply.
-# With N=16, channel 15's window is PC16 = 0x1_0400_0000 - stack 1's first pseudo-channel,
-# still its own port's; the write path (engine STORE and the host-upload loader) carries
-# 33-bit addresses with the channel offset added in hardware, like the read path.
-# The base is chosen so each engine channel's window lands on its OWN port's pseudo-channel:
-# engine channel c is HBM AXI port c+1 (port 0 = CPU main_ram = PC 0), so its window must be
-# PC c+1 = [(c+1)*256 MB, ...). A far pseudo-channel costs the AXI switch's segment links on
-# every burst (measured ~27-34 cycles/beat single-port reads, 4.6 cycles/beat aggregate);
-# port-matched windows keep every read inside its own switch segment.
-# 64 MB into PC 1, not PC 1 exactly: the CPU's main_ram bridge passes addresses through
-# 1:1, so the CPU lives in PC 4 (0x4000_0000..) - engine channel 3 is port 4, and its
-# window necessarily overlaps PC 4. The +64 MB skip keeps that overlap above everything the
-# CPU touches at the bottom of its RAM (firmware, header, low heap - all < 8 MB; the
-# CPU-side KV cache is placed in a HIGH heap region above the weights tail, see infer.c).
-# Payload + KV is ~77 MB < 192 MB, so every channel's data still sits entirely inside its
-# own port's pseudo-channel and no read crosses a switch segment.
+# Engine channel c owns [HBM_WEIGHT_BASE + c*HBM_CHAN_STRIDE, +HBM_CHAN_STRIDE) and its weight
+# payload starts at the bottom of that window. The HBM IP has its AXI switch enabled, so the
+# *address* selects the pseudo-channel, not the port: the channels need distinct windows
+# (with one shared base all N payloads would land on top of each other). Constraints:
+#  - Port-matched: engine channel c is HBM AXI port c+1 (port 0 = CPU main_ram), so its window
+#    sits in PC c+1 and no read crosses an AXI switch segment (a far pseudo-channel costs the
+#    segment links on every burst).
+#  - 64 MB into PC c+1: the CPU's main_ram bridge passes addresses through 1:1, so the CPU
+#    lives in PC 4 (0x4000_0000..), which engine channel 3's window overlaps. The skip keeps
+#    that overlap above everything the CPU touches at the bottom of its RAM (firmware, header,
+#    low heap; the CPU-side KV cache sits in a high heap region, see infer.c).
+#  - Within stack 0 for the engine ports; with N=16, channel 15's window is stack 1's first
+#    pseudo-channel, still its own port's (the write path carries 33-bit addresses with the
+#    channel offset added in hardware, like the read path).
+#  - A power-of-two stride, so the engine's STORE path can shift rather than multiply.
+# This leaves 192 MB/channel for weights + KV.
 HBM_WEIGHT_BASE = 0x1400_0000 # PC(c+1) + 64 MB per channel c (port-matched, CPU-safe).
 HBM_CHAN_STRIDE = 0x1000_0000 # 256 MB per channel, matching the pseudo-channel size.
 
-# The BONS header+table ("meta") is uploaded by the host to ENGINE channel 0 at this offset
-# (the host's PCIe window covers CSRs only, not HBM channel 0 / main_ram); the firmware's
-# `loadhdr` command copies it from there to TRIXIUM_HDR_ADDR via FETCH + memcpy.
-HBM_META_OFFSET = HBM_WEIGHT_BASE - 0x0010_0000 # 1 MB before the payloads.
-
 # Where the firmware keeps its CPU-side copy of the BONS header+table, as an offset into
-# main_ram. This is a CPU address and has nothing to do with the HBM weight base (deriving it
-# from HBM_WEIGHT_BASE can put it outside main_ram). The firmware also places its heap 1 MB
-# above this.
+# main_ram. This is a CPU address, unrelated to the HBM weight base (deriving it from
+# HBM_WEIGHT_BASE can put it outside main_ram). The firmware places its heap 1 MB above.
 HDR_CPU_OFFSET = 0x0040_0000 # main_ram + 4 MB.

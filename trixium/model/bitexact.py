@@ -49,12 +49,9 @@ def arith_shift(v, k):
     v = np.asarray(v, dtype=np.int64)
     return v << k if k >= 0 else v >> (-k)
 
-def clamp(v, lo, hi):
-    return np.clip(v, lo, hi)
-
 # fp16 decomposition -------------------------------------------------------------------------------
 
-FP16_EXP_BIAS = 25 # value = m11 * 2^(E - 25) for normals (m11 includes the implicit bit).
+FP16_EXP_BIAS = 25 # Value = m11 * 2^(E - 25) for normals (m11 includes the implicit bit).
 
 def fp16_decompose(s):
     """fp16 -> (m11 signed int, e16 int): value = m11 * 2^e16 exactly.
@@ -87,8 +84,8 @@ def tensor_acc_bound(scales_f16, B, gs_max=GS_MAX):
     m11, e16 = fp16_decompose(scales_f16)
     shift    = e16 + B
     # Bound per group: gs_max * |m11| shifted; sum per row.
-    mag = np.abs(m11).astype(np.float64)*gs_max*np.exp2(shift.astype(np.float64))
-    per_row = np.ceil(mag).sum(axis=1)
+    mag      = np.abs(m11).astype(np.float64)*gs_max*np.exp2(shift.astype(np.float64))
+    per_row  = np.ceil(mag).sum(axis=1)
     return per_row.max()
 
 def choose_result_shift(scales_f16, B, gs_max=GS_MAX):
@@ -153,7 +150,7 @@ def axpy_rows(scales_f16, v8w, p8, B, Rpre):
     assert np.all(np.abs(m11) == 1024), "axpy requires pow-2 row scales"
     acc = np.zeros(K, dtype=np.int64)
     for t in range(M):
-        sh = 10 + int(e16[t, 0]) + B - Rpre  # Row-constant lane shift.
+        sh   = 10 + int(e16[t, 0]) + B - Rpre # Row-constant lane shift.
         prod = int(p8[t])*v8w[t].astype(np.int64)
         acc += (prod << sh) if sh >= 0 else (prod >> -sh)
         assert np.all(np.abs(acc) < 2**31), "axpy accumulator overflow"
@@ -175,7 +172,7 @@ def normalize_i32_to_bfp(v32, e_in):
     amax = int(np.abs(v).max())
     if amax == 0:
         return v.astype(np.int16), e_in
-    k = amax.bit_length() - 15 # Shift so absmax has 15 bits.
+    k = amax.bit_length() - 15 # Shift so the absmax has 15 bits.
     if k > 0:
         m = rne_shift(v, k)
         # RNE can push absmax to 2^15: renormalize once more.
@@ -185,10 +182,6 @@ def normalize_i32_to_bfp(v32, e_in):
     else:
         m = v << (-k)
     return m.astype(np.int16), e_in + k
-
-def bfp_to_int8(m16):
-    """Matvec input quantization: int16 mantissa -> int8, exponent caller-side += 8."""
-    return clamp(rne_shift(np.asarray(m16, dtype=np.int64), 8), -127, 127).astype(np.int8)
 
 def f32_to_bfp(vec):
     """One-time load conversion of f32 vectors (norm gains, rope tables) to BFP int16.
