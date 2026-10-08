@@ -42,9 +42,14 @@ from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import ExactFP32Add, ExactFP32Mul
 
+
+# Constants ----------------------------------------------------------------------------------------
+
 MODE_SCORES = 0
 MODE_VALUES = 1
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def scores_reference(q, K, scale):
     """q [nq, hd], K [T, nkv, hd] (kv head l // n_rep): hybrid.c's score loop."""
@@ -73,6 +78,8 @@ def values_reference(p, V):
                 o[l] = (o[l] + (p[l, t]*V[t, l//n_rep]).astype(f32)).astype(f32)
     return o
 
+
+# Attention Stream ---------------------------------------------------------------------------------
 
 class AttentionStream(LiteXModule):
     def __init__(self, lanes=24, groups=4, hb_max=32, t_max=2048, adr_bits=13,
@@ -121,13 +128,14 @@ class AttentionStream(LiteXModule):
         T = Signal(16)
         hd = Signal(16)                     # Floats per head.
         hb = Signal(max=hb_max + 1)         # Beats per head.
-        src, sstr, dst, dstr = Signal(adr_bits), Signal(adr_bits), Signal(adr_bits), Signal(adr_bits)
+        src, sstr, dst, dstr = (Signal(adr_bits), Signal(adr_bits), Signal(adr_bits),
+                                Signal(adr_bits))
         scale = Signal(32)
         rowbeats = Signal(12)
         tbeats = Signal(max=t_max//8 + 1)   # ceil(T/8)
         ngroups = Signal(max=t_max//8 + 1)
 
-        # Record, then the per-lane operands: registered read requests ---------------------------
+        # Record, then the per-lane operands: registered read requests -----------------------------
         ld_st = Signal(3)       # 0 idle, 1 record, 2 decode, 3 operands, 4 last, 5 ready
         rq_v, rq_adr, rq_lane, rq_word, rq_last = (Signal(), Signal(adr_bits), Signal(max=L),
                                                    Signal(pw), Signal())
@@ -166,7 +174,8 @@ class AttentionStream(LiteXModule):
                             self.error.eq(1), ld_st.eq(0),
                         ).Else(
                             mode.eq(rec_w[0][0]),
-                            nq.eq(rec_w[0][8:16]), n_rep.eq(rec_w[0][16:24]), nkv.eq(rec_w[0][24:32]),
+                            nq.eq(rec_w[0][8:16]), n_rep.eq(rec_w[0][16:24]),
+                            nkv.eq(rec_w[0][24:32]),
                             T.eq(rec_w[1]), hd.eq(rec_w[2]), hb.eq(rec_w[2] >> 3),
                             src.eq(rec_w[3] >> 5), sstr.eq(rec_w[4] >> 5),
                             dst.eq(rec_w[5] >> 5), dstr.eq(rec_w[6] >> 5),
@@ -203,7 +212,7 @@ class AttentionStream(LiteXModule):
         ]
 
         # Row buffers: one per kv head, two halves of 8 rows (mode 0: a group of 8
-        # positions; mode 1: one position per half) --------------------------------------------
+        # positions; mode 1: one position per half) ------------------------------------------------
         rb_bits = hbb + 3 + 1
         rowmems, rowrd = [], []
         fill_beat = Signal(12)          # Beat within the row.
@@ -247,7 +256,7 @@ class AttentionStream(LiteXModule):
                 rp.adr.eq(rd_adr),
             ]
 
-        # Issue -----------------------------------------------------------------------------------
+        # Issue ------------------------------------------------------------------------------------
         # mode 0: units = groups of 8 positions; per unit i in [0, hd), p in [0, 8).
         # mode 1: units = positions; per unit i in [0, hd).
         is_run, is_i, is_p, is_unit = Signal(), Signal(16), Signal(3), Signal(16)
@@ -287,8 +296,9 @@ class AttentionStream(LiteXModule):
             s1_last.eq(unit_last), s1_unit.eq(is_unit),
         ]
         # Stage 2: operands registered per lane; the multiply issues.
-        s2_v, s2_first, s2_p, s2_i, s2_last, s2_unit = (dly(s1_v, 1, "s2v"), dly(s1_first, 1, "s2f"),
-            dly(s1_p, 1, "s2p"), dly(s1_i, 1, "s2i"), dly(s1_last, 1, "s2l"), dly(s1_unit, 1, "s2u"))
+        s2_v, s2_first, s2_p, s2_i, s2_last, s2_unit = (
+            dly(s1_v, 1, "s2v"), dly(s1_first, 1, "s2f"), dly(s1_p, 1, "s2p"),
+            dly(s1_i, 1, "s2i"), dly(s1_last, 1, "s2l"), dly(s1_unit, 1, "s2u"))
         # Add stage (after the multiply) and write-back stage (after the add).
         a_v, a_first = dly(s2_v, Lm, "av"), dly(s2_first, Lm, "af")
         a_p, a_i = dly(s2_p, Lm, "ap"), dly(s2_i, Lm, "ai")
@@ -321,7 +331,9 @@ class AttentionStream(LiteXModule):
         ).Elif(kv_ptr < L,
             kv_ptr.eq(kv_ptr + 1),
             Case(kv_ptr, {l: kv_of[l].eq(kv_cnt) for l in range(L)}),
-            If(kv_rep == n_rep - 1, kv_rep.eq(0), kv_cnt.eq(kv_cnt + 1)).Else(kv_rep.eq(kv_rep + 1)),
+            If(kv_rep == n_rep - 1,
+                kv_rep.eq(0), kv_cnt.eq(kv_cnt + 1),
+            ).Else(kv_rep.eq(kv_rep + 1)),
         )
         self.comb += params_ready.eq((ld_st == 5) & (kv_ptr == L))
 
@@ -364,7 +376,8 @@ class AttentionStream(LiteXModule):
             self.sync += If(w_v & ~mode, a0[w_p].eq(adds[l].result))
             for b in range(2):
                 self.sync += If(capture & (cap_bank == b),
-                    *[snap[b][l][p].eq(adds[l].result if p == P - 1 else acc0[l][p]) for p in range(P)])
+                    *[snap[b][l][p].eq(adds[l].result if p == P - 1 else acc0[l][p])
+                      for p in range(P)])
 
         # mode 0 output: scale the snapshot (shared multiplier), a beat per lane -------------------
         sc_run, sc_l, sc_p, sc_unit = Signal(), Signal(max=L + 1), Signal(3), Signal(16)
@@ -412,13 +425,17 @@ class AttentionStream(LiteXModule):
         self.comb += [mul_s.a.eq(h1_a), mul_s.b.eq(scale), mul_s.valid.eq(h1_v)]
         self.sync += If(h2_v, Case(h2_p, {i: pack[i].eq(mul_s.result) for i in range(7)}))
 
-        # mode 1 output: drain the accumulators, hd/8 beats per lane -----------------------------
+        # mode 1 output: drain the accumulators, hd/8 beats per lane -------------------------------
         dr_run, dr_l, dr_w, dr_v = Signal(), Signal(max=L + 1), Signal(max=hb_max + 1), Signal()
         dr_adr, dr_lane = Signal(adr_bits), Signal(max=L)
         dr_base = Signal(adr_bits)
         dr_done = Signal()
         v_retired = Signal(16)
-        self.sync += If(self.start, v_retired.eq(0)).Elif(w_v & w_last & mode, v_retired.eq(v_retired + 1))
+        self.sync += If(self.start,
+            v_retired.eq(0),
+        ).Elif(w_v & w_last & mode,
+            v_retired.eq(v_retired + 1),
+        )
         dr_issue = Signal()
         self.comb += dr_issue.eq(dr_run & (ofifo.level < 10))
         for l in range(L):
@@ -455,7 +472,7 @@ class AttentionStream(LiteXModule):
             ofifo.source.ready.eq(self.sp_wr_gnt),
         ]
 
-        # Command -------------------------------------------------------------------------------
+        # Command ----------------------------------------------------------------------------------
         finish = Signal()
         outputs_done = Signal()
         self.comb += [

@@ -4,90 +4,25 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Ddr Port -----------------------------------------------------------------------------------------
+"""DDR4 attachment of the engine (the XCU1525): channel ports and the split `ddr` domain.
 
-"""An engine channel's 256-bit AXI onto a LiteDRAM controller (the XCU1525's DDR4).
-
-Two ways, measured on the real LiteDRAM core in simulation (2026-09-19):
+Engine ports. An engine channel's 256-bit AXI reaches a LiteDRAM controller in one of two
+ways, measured on the real LiteDRAM core in simulation:
 
 - a 256-bit crossbar port: LiteDRAM's native up-converter groups two 256-bit commands into
   one 512-bit controller word through a five-state FSM - ~5 cycles per word even with reads
-  pipelined (docs/patches/litedram-native-port-upconverter-pipelined-reads.patch; before
-  that patch one word per round trip, 23 cycles/beat on the board). 2.55 cycles/beat for a
-  lone stream, 4.3 with four ports on one controller;
+  pipelined (docs/patches/litedram-native-port-upconverter-pipelined-reads.patch). 2.55
+  cycles/beat for a lone stream, 4.3 with four ports on one controller;
 - a 512-bit crossbar port behind LiteX's AXIUpConverter: every 256-bit beat becomes a
   single 512-bit transaction on the lane its address selects. Twice the DRAM traffic, but
   the bridge issues a controller command per cycle: 1.31 cycles/beat alone, 2.9 with four
-  ports. The default here until a converter that merges the two halves of a word exists.
-"""
+  ports. engine_ddr_port uses the 512-bit port and, by default, merges the read bursts two
+  beats per word (AXIWide) to avoid the doubled read traffic.
 
-from migen import *
-
-from litex.gen import LiteXModule
-from litex.soc.interconnect import stream
-from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter
-from litedram.frontend.axi import LiteDRAMAXI2Native
-
-
-class AXICrossing(LiteXModule):
-    """An AXI interface from cd_from to cd_to, one async FIFO per channel (LiteX's
-    AXIClockDomainCrossing with a depth and output buffers).
-
-    The split DDR domain crosses here, not with the crossbar's native-port CDC: that one's
-    read-data FIFO (16 words) has no backpressure - the controller cannot be stalled - so a
-    LiteDRAMAXI2Native holding more reads in flight than it (the engine ports: 256) loses
-    data once the ddr clock outruns sys. The AXI R channel has a ready; the bridge then sits
-    in the ddr domain on a native port with no CDC at all."""
-    def __init__(self, master, slave, cd_from, cd_to, depth=16):
-        for ch, a, b in (("aw", cd_from, cd_to), ("w", cd_from, cd_to), ("ar", cd_from, cd_to),
-                         ("b", cd_to, cd_from), ("r", cd_to, cd_from)):
-            src, dst = (master, slave) if a == cd_from else (slave, master)
-            cdc = stream.ClockDomainCrossing(getattr(src, ch).description, a, b,
-                                             depth=depth, buffered=True)
-            self.add_module(f"{ch}_cdc", cdc)
-            self.comb += [getattr(src, ch).connect(cdc.sink), cdc.source.connect(getattr(dst, ch))]
-
-
-def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64, r_buffer_depth=256,
-                    clock_domain="sys"):
-    """Returns the list of modules (to register as submodules) that connect `axi` (the
-    engine channel's 256-bit AXI) to a crossbar port of `core` of `port_width` bits.
-    merge: on a wider port, merge the read bursts two beats per word (axi_merge.AXIWide)
-    instead of one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic).
-    clock_domain: the port's side when the controller runs in its own domain (the crossbar
-    inserts the native-port CDC; see the XCU1525 target's --ddr-clk-freq)."""
-    split = clock_domain != "sys"
-    # Split: a native port on the controller's own side (the core renames its sys to ddr),
-    # the bridge there too, and the AXI crossing into it (AXICrossing).
-    port = core.crossbar.get_port(data_width=port_width)
-    mods = []
-    wide = axi
-    if port_width != len(axi.r.data):
-        wide = AXIInterface(data_width=port_width, address_width=axi.address_width,
-                            id_width=axi.id_width)
-        if merge:
-            from trixium.memory.axi import AXIWide
-            mods.append(AXIWide(axi, wide))
-        else:
-            mods.append(AXIUpConverter(axi, wide))
-    if split:
-        far = AXIInterface(data_width=port_width, address_width=axi.address_width,
-                           id_width=axi.id_width, version=wide.version)
-        mods.append(AXICrossing(wide, far, "sys", "ddr"))
-        wide = far
-    bridge = LiteDRAMAXI2Native(wide, port, w_buffer_depth=w_buffer_depth,
-                                r_buffer_depth=r_buffer_depth)
-    mods.append(ClockDomainsRenamer("ddr")(bridge) if split else bridge)
-    return mods
-
-
-# Ddr Domain ---------------------------------------------------------------------------------------
-
-"""DDR controllers in their own `ddr` clock domain (the SoC's add_sdram, by hand).
-
-Shared by the XCU1525 target (--ddr-clk-freq, USPDDRPHYs) and the simulation (--ddr-split,
-LiteDRAM's PHY model on a second sim clock), so the split SoC boots in simulation before it
-goes on the board.
+DDR domain. add_ddr_domain_controllers places the controllers in their own `ddr` clock
+domain (the SoC's add_sdram, by hand). It is shared by the XCU1525 target (--ddr-clk-freq,
+USPDDRPHYs) and the simulation (--ddr-split, LiteDRAM's PHY model on a second sim clock), so
+the split SoC boots in simulation before it goes on the board.
 
 Each core is renamed {sys: ddr, sys_port: sys}: its crossbar ports, requested with
 clock_domain="sys_port", get LiteDRAM's native-port CDC between the two. Controller 0 also
@@ -106,19 +41,82 @@ from types import SimpleNamespace
 from migen import *
 from migen.fhdl.simplify import FullMemoryWE
 
-from litex.soc.interconnect import csr_bus, wishbone, axi
+from litex.gen import LiteXModule
+
+from litex.soc.interconnect import csr_bus, wishbone, axi, stream
+from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter
 from litex.soc.integration.soc import SoCRegion, SoCCSRRegion
 
 from litedram.core import LiteDRAMCore
 from litedram.frontend.axi import LiteDRAMAXI2Native
 from litedram.frontend.wishbone import LiteDRAMWishbone2Native
 
+from trixium.memory.axi import AXIWide
+
+
+# AXI Crossing -------------------------------------------------------------------------------------
+
+class AXICrossing(LiteXModule):
+    """An AXI interface from cd_from to cd_to, one async FIFO per channel (LiteX's
+    AXIClockDomainCrossing with a depth and output buffers).
+
+    The split DDR domain crosses here, not with the crossbar's native-port CDC: that one's
+    read-data FIFO (16 words) has no backpressure - the controller cannot be stalled - so a
+    LiteDRAMAXI2Native holding more reads in flight than it (the engine ports: 256) loses
+    data once the ddr clock outruns sys. The AXI R channel has a ready; the bridge then sits
+    in the ddr domain on a native port with no CDC at all."""
+    def __init__(self, master, slave, cd_from, cd_to, depth=16):
+        for ch, a, b in (("aw", cd_from, cd_to), ("w", cd_from, cd_to), ("ar", cd_from, cd_to),
+                         ("b", cd_to, cd_from), ("r", cd_to, cd_from)):
+            src, dst = (master, slave) if a == cd_from else (slave, master)
+            cdc = stream.ClockDomainCrossing(getattr(src, ch).description, a, b,
+                                             depth=depth, buffered=True)
+            self.add_module(f"{ch}_cdc", cdc)
+            self.comb += [getattr(src, ch).connect(cdc.sink),
+                          cdc.source.connect(getattr(dst, ch))]
+
+
+# Engine DDR Port ----------------------------------------------------------------------------------
+
+def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
+                    r_buffer_depth=256, clock_domain="sys"):
+    """Returns the list of modules (to register as submodules) that connect `axi` (the
+    engine channel's 256-bit AXI) to a crossbar port of `core` of `port_width` bits.
+    merge: on a wider port, merge the read bursts two beats per word (AXIWide)
+    instead of one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic).
+    clock_domain: the port's side when the controller runs in its own domain (the crossbar
+    inserts the native-port CDC; see the XCU1525 target's --ddr-clk-freq)."""
+    split = clock_domain != "sys"
+    # Split: a native port on the controller's own side (the core renames its sys to ddr),
+    # the bridge there too, and the AXI crossing into it (AXICrossing).
+    port = core.crossbar.get_port(data_width=port_width)
+    mods = []
+    wide = axi
+    if port_width != len(axi.r.data):
+        wide = AXIInterface(data_width=port_width, address_width=axi.address_width,
+                            id_width=axi.id_width)
+        if merge:
+            mods.append(AXIWide(axi, wide))
+        else:
+            mods.append(AXIUpConverter(axi, wide))
+    if split:
+        far = AXIInterface(data_width=port_width, address_width=axi.address_width,
+                           id_width=axi.id_width, version=wide.version)
+        mods.append(AXICrossing(wide, far, "sys", "ddr"))
+        wide = far
+    bridge = LiteDRAMAXI2Native(wide, port, w_buffer_depth=w_buffer_depth,
+                                r_buffer_depth=r_buffer_depth)
+    mods.append(ClockDomainsRenamer("ddr")(bridge) if split else bridge)
+    return mods
+
+
+# DDR CSR ------------------------------------------------------------------------------------------
 
 class PipelinedDDRCSR(Module):
     """Wishbone -> the ddr-domain CSR banks, one registered bus copy per controller.
 
-    v27 (ddr at 200 MHz): the shared CSR bus decoded straight into the PHYs' IDELAY/ODELAY CE
-    pins of four controllers over three SLRs (worst -0.801 ns, 5.1 ns of route). Here each
+    A shared CSR bus decoded straight into the PHYs' IDELAY/ODELAY CE pins of four
+    controllers over three SLRs does not meet timing at the DDR clock (long routes). Here each
     controller's banks get their own registered adr/we/re/dat_w and a registered dat_r, so
     every hop is one register to the next: an access takes 4 cycles instead of 2 (the
     controllers' CSRs are only touched by calibration and the BIOS)."""
@@ -156,6 +154,8 @@ class _DDRCSRHolder(Module):
     CSRBankArray does (its attributes sdram, ddrphy, sdram1, ... are the bank names)."""
 
 
+# DDR Domain Controllers ---------------------------------------------------------------------------
+
 def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_size,
                                csr_window, phy_renames={"sys": "ddr"}):
     """phys/modules: one per controller (controller 0 carries main_ram). Fills soc.sdrams;
@@ -166,7 +166,8 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
     for i, (phy, module) in enumerate(zip(phys, modules)):
         sfx = "" if i == 0 else str(i)
         g = module.geom_settings
-        memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits))*phy.settings.nranks*phy.settings.databits//8)
+        memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits)) *
+                            phy.settings.nranks*phy.settings.databits//8)
         core = LiteDRAMCore(phy=phy, geom_settings=module.geom_settings,
                             timing_settings=module.timing_settings, clk_freq=clk_freq)
         setattr(holder, f"ddrphy{sfx}", phy)
@@ -182,31 +183,36 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
 
     # main_ram on controller 0 (add_sdram's connection, the ports crossing into sys).
     sdram_size = min(memory_sizes[0], main_ram_size)
-    soc.bus.add_region("main_ram", SoCRegion(origin=soc.mem_map["main_ram"], size=sdram_size, mode="rwx"))
+    soc.bus.add_region("main_ram", SoCRegion(origin=soc.mem_map["main_ram"], size=sdram_size,
+                                             mode="rwx"))
     base = soc.bus.regions["main_ram"].origin
     if hasattr(soc.cpu, "add_memory_buses"):
         soc.cpu.add_memory_buses(address_width=32, data_width=core0.crossbar.controller.data_width)
     for mem_bus in soc.cpu.memory_buses:
-        # The AXI crosses (ddr_port.AXICrossing: the R channel has backpressure, the native
-        # port CDC's read data has none); the bridge sits on a native port in ddr.
-        from trixium.memory.ddr import AXICrossing
+        # The AXI crosses (AXICrossing: the R channel has backpressure, the native port CDC's
+        # read data has none); the bridge sits on a native port in ddr.
         port = core0.crossbar.get_port()
         assert isinstance(mem_bus, axi.AXIInterface) and mem_bus.data_width == port.data_width, \
             "the ddr-domain main_ram expects the CPU's AXI memory bus at the controller's width"
-        far = axi.AXIInterface(data_width=mem_bus.data_width, address_width=mem_bus.address_width,
+        far = axi.AXIInterface(data_width=mem_bus.data_width,
+                               address_width=mem_bus.address_width,
                                id_width=mem_bus.id_width, version=mem_bus.version)
         soc.submodules += AXICrossing(mem_bus, far, "sys", "ddr")
-        soc.submodules += ClockDomainsRenamer("ddr")(LiteDRAMAXI2Native(axi=far, port=port, base_address=base))
+        soc.submodules += ClockDomainsRenamer("ddr")(
+            LiteDRAMAXI2Native(axi=far, port=port, base_address=base))
     if (not len(soc.cpu.memory_buses)) or not hasattr(soc.cpu, "dma_bus"):
         port = core0.crossbar.get_port(clock_domain="sys_port")
-        wb_sdram = wishbone.Interface(data_width=soc.bus.data_width, address_width=32, addressing="word")
+        wb_sdram = wishbone.Interface(data_width=soc.bus.data_width, address_width=32,
+                                      addressing="word")
         soc.bus.add_slave(name="main_ram", slave=wb_sdram)
         l2_size = 2**int(math.log2(max(l2_size, int(2*port.data_width/8))))
         l2 = wishbone.Cache(cachesize=l2_size//4, master=wb_sdram,
-            slave=wishbone.Interface(data_width=max(port.data_width, 128), address_width=32, addressing="word"))
+            slave=wishbone.Interface(data_width=max(port.data_width, 128), address_width=32,
+                                     addressing="word"))
         soc.l2_cache = FullMemoryWE()(l2)
         soc.add_config("L2_SIZE", l2_size)
-        soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=soc.l2_cache.slave, port=port, base_address=base)
+        soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=soc.l2_cache.slave, port=port,
+                                                      base_address=base)
 
     # The ddr-domain CSR bus: sdram{k} on page 2k, ddrphy{k} on 2k + 1.
     pages = {}

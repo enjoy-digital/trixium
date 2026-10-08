@@ -4,17 +4,29 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Hadamard -----------------------------------------------------------------------------------------
+"""Exact blockwise integer Hadamard transform and its scratchpad client.
 
-"""Exact blockwise integer Hadamard transform, independent of board and memory bus.
+IntegerHadamard is the board- and memory-independent kernel: one fixed-size block in natural
+Sylvester order, without normalization or rounding. The caller owns quantization, block
+exponents and whole-vector requantization.
 
-This is an internal kernel, not yet a public command or resident-model path.
-The caller owns quantization, block exponents and whole-vector requantization.
+HadamardScratchpad runs the kernel over the shared two-port scratchpad: it rotates complete
+int8 blocks into raw signed int32 vectors and writes one raw absmax per block. Its command
+(HADAMARD_COMMAND, also the firmware's descriptor layout) is: src/signs/dst/stats byte bases
+(32-byte aligned), blocks (block count) and inverse.
 """
+
+from functools import reduce
+from operator import or_
+
 from migen import *
+
 from litex.gen import LiteXModule
+
 from litex.soc.interconnect import stream
 
+
+# Integer Hadamard ---------------------------------------------------------------------------------
 
 class IntegerHadamard(LiteXModule):
     """One fixed-size block, natural Sylvester order, no normalization/rounding.
@@ -31,11 +43,11 @@ class IntegerHadamard(LiteXModule):
     and output interfaces transfer ``lanes`` values per cycle, with backpressure.
 
     done pulses after the last output handshake and log2(lanes) absmax drain
-    cycles; absmax then describes the entire block. Framing failure is sticky/
-    busy until cancel. cancel discards
-    all valid state, including stalled outputs, but does not clear RAM: a new
-    command must overwrite a complete block before any result can be emitted.
-    An external consumer must discard any prefix from a cancelled command.
+    cycles; absmax then describes the entire block. A framing failure is sticky
+    (busy) until cancel. cancel discards all valid state, including stalled
+    outputs, but does not clear RAM: a new command must overwrite a complete
+    block before any result can be emitted. An external consumer must discard
+    any prefix from a cancelled command.
     """
     def __init__(self, block_size=1024, lanes=8, input_width=8):
         if (not isinstance(block_size, int) or block_size < 4 or
@@ -79,12 +91,13 @@ class IntegerHadamard(LiteXModule):
         # Migen's default WRITE_FIRST emits registered addresses + asynchronous
         # data reads, which Vivado rejects for this two-writer memory template.
         # No algorithm phase observes a port's output during its write cycle.
-        ports = [[memory.get_port(write_capable=True, has_re=True, mode=NO_CHANGE) for _ in range(2)]
-                 for memory in memories]
+        ports = [[memory.get_port(write_capable=True, has_re=True, mode=NO_CHANGE)
+                  for _ in range(2)] for memory in memories]
         signs = Memory(lanes, words, name="hadamard_signs")
         sign_write = signs.get_port(write_capable=True)
         sign_read = signs.get_port(has_re=True, mode=READ_FIRST)
-        self.specials += memories + [p for group in ports for p in group] + [signs, sign_write, sign_read]
+        self.specials += memories + [p for group in ports for p in group] + [
+            signs, sign_write, sign_read]
 
         self.comb += [
             self.cmd.ready.eq((state == IDLE) & ~self.cancel),
@@ -150,7 +163,8 @@ class IntegerHadamard(LiteXModule):
                 lhs, rhs, subtract = selected[port][lane]
                 # Select operands BEFORE arithmetic; do not duplicate an adder
                 # bank for each stage. Fixed-width two's-complement add/subtract.
-                self.comb += results[port][lane].eq(lhs + (rhs ^ Replicate(subtract, width)) + subtract)
+                self.comb += results[port][lane].eq(
+                    lhs + (rhs ^ Replicate(subtract, width)) + subtract)
 
         for which in range(2):
             for port in range(2):
@@ -159,7 +173,8 @@ class IntegerHadamard(LiteXModule):
                 self.comb += If(~self.cancel,
                     If(state == LOAD,
                         *([ram.adr.eq(load_index), ram.dat_w.eq(Cat(*incoming)),
-                           ram.we.eq(self.sink.valid & self.sink.ready)] if which == 0 and port == 0 else []),
+                           ram.we.eq(self.sink.valid & self.sink.ready)]
+                          if which == 0 and port == 0 else []),
                     ).Elif((state == RUN) | (state == DRAIN),
                         If(bank == which,
                             ram.adr.eq(read_b if port else read_a), ram.re.eq(state == RUN),
@@ -246,14 +261,7 @@ class IntegerHadamard(LiteXModule):
         )
 
 
-# Hadamard Sp --------------------------------------------------------------------------------------
-
-"""Bounded quantized-vector rotation through the existing scratchpad client port."""
-from migen import *
-from litex.gen import LiteXModule
-from litex.soc.interconnect import stream
-
-from trixium.units.hadamard import IntegerHadamard
+# Hadamard Scratchpad ------------------------------------------------------------------------------
 
 HADAMARD_COMMAND = [("src", 24), ("signs", 24), ("dst", 24), ("stats", 24),
                     ("blocks", 16), ("inverse", 1)]
@@ -275,13 +283,14 @@ class HadamardScratchpad(LiteXModule):
     """
     def __init__(self, scratchpad_size=256*1024, block_size=1024, lanes=32):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
-            raise ValueError("scratchpad_size must be 32-byte aligned and within the 13-bit client address space")
+            raise ValueError("scratchpad_size must be 32-byte aligned and within the 13-bit "
+                             "client address space")
         if block_size < 256 or block_size > 32768 or block_size & (block_size - 1):
             raise ValueError("block_size must be a power of two in [256, 32768]")
         # lanes: core butterflies per clock and values per core word. 32 = one scratchpad
         # input beat per word: ~10*(block/64 + 1) stage clocks against 10*(block/16 + 1) at
         # 8 lanes, the output then bound by the write port (8 int32 per beat, L/8 beats
-        # per word). 27B prepares: ~1.5k -> ~0.4k clocks per 1,024-block.
+        # per word): ~1.5k -> ~0.4k clocks per 1,024-element block.
         if lanes not in (8, 16, 32):
             raise ValueError("lanes must be 8, 16 or 32")
         self.cmd = stream.Endpoint(HADAMARD_COMMAND)
@@ -304,7 +313,8 @@ class HadamardScratchpad(LiteXModule):
         wpb, wps = 32//L, 256//L      # core words per data beat, per sign beat
         bpw = L//8                    # output beats per core word
 
-        IDLE, START, SIGN_REQ, SIGN_CAP, DATA_REQ, DATA_CAP, SEND, OUTPUT, STATS, NEXT, FINISH, FAILED = range(12)
+        (IDLE, START, SIGN_REQ, SIGN_CAP, DATA_REQ, DATA_CAP, SEND, OUTPUT, STATS, NEXT, FINISH,
+         FAILED) = range(12)
         state = Signal(4, reset=IDLE)
         captured = {name: Signal(width) for name, width in HADAMARD_COMMAND}
         block = Signal(16)
@@ -322,7 +332,8 @@ class HadamardScratchpad(LiteXModule):
             ends["dst"].eq(self.cmd.dst + self.cmd.blocks*(block_size*4)),
             ends["stats"].eq(self.cmd.stats + stats_bytes),
             config_bad.eq((self.cmd.blocks == 0) | (self.cmd.src[:5] != 0) |
-                          (self.cmd.signs[:5] != 0) | (self.cmd.dst[:5] != 0) | (self.cmd.stats[:5] != 0)),
+                          (self.cmd.signs[:5] != 0) | (self.cmd.dst[:5] != 0) |
+                          (self.cmd.stats[:5] != 0)),
             bounds_bad.eq((ends["src"] > scratchpad_size) | (ends["signs"] > scratchpad_size) |
                           (ends["dst"] > scratchpad_size) | (ends["stats"] > scratchpad_size)),
         ]
@@ -330,8 +341,6 @@ class HadamardScratchpad(LiteXModule):
         for a, b in (("dst", "src"), ("dst", "signs"), ("stats", "src"),
                      ("stats", "signs"), ("stats", "dst")):
             overlaps.append((getattr(self.cmd, a) < ends[b]) & (getattr(self.cmd, b) < ends[a]))
-        from functools import reduce
-        from operator import or_
         self.comb += overlap_bad.eq(reduce(or_, overlaps))
 
         self.comb += [
@@ -347,9 +356,12 @@ class HadamardScratchpad(LiteXModule):
                                  ~self.cancel),
             self.sp_rd_req.eq(((state == SIGN_REQ) | (state == DATA_REQ)) & ~self.cancel),
             self.sp_rd_adr.eq(Mux(state == SIGN_REQ,
-                (captured["signs"] >> 5) + block*(block_size//256) + (in_word >> (wps.bit_length() - 1)),
-                (captured["src"] >> 5) + block*(block_size//32) + (in_word >> (wpb.bit_length() - 1)))),
-            self.sp_wr_req.eq(((state == OUTPUT) & core.source.valid | (state == STATS)) & ~self.cancel),
+                (captured["signs"] >> 5) + block*(block_size//256) +
+                (in_word >> (wps.bit_length() - 1)),
+                (captured["src"] >> 5) + block*(block_size//32) +
+                (in_word >> (wpb.bit_length() - 1)))),
+            self.sp_wr_req.eq(((state == OUTPUT) & core.source.valid | (state == STATS)) &
+                              ~self.cancel),
             self.sp_wr_adr.eq(Mux(state == STATS,
                 (captured["stats"] >> 5) + (block >> 3),
                 (captured["dst"] >> 5) + block*(block_size//8) + out_word)),
@@ -363,7 +375,8 @@ class HadamardScratchpad(LiteXModule):
                                          for sub in range(bpw))[out_sub] if bpw > 1 else
                                    core.source.data[lane*ow:(lane + 1)*ow]),
                           wide.eq(value),
-                          self.sp_wr_dat[32*lane:32*(lane+1)].eq(Mux(state == STATS, core.absmax, wide))]
+                          self.sp_wr_dat[32*lane:32*(lane+1)].eq(
+                              Mux(state == STATS, core.absmax, wide))]
         self.sync += If(self.cancel,
             state.eq(IDLE), self.done.eq(0), self.error.eq(0),
             self.blocks_done.eq(0), self.output_beats.eq(0),
@@ -377,7 +390,9 @@ class HadamardScratchpad(LiteXModule):
                     block.eq(0), in_word.eq(0), out_word.eq(0), out_sub.eq(0),
                     self.blocks_done.eq(0), self.output_beats.eq(0),
                     self.error.eq(Cat(config_bad, bounds_bad, overlap_bad)),
-                    If(config_bad | bounds_bad | overlap_bad, state.eq(FAILED)).Else(state.eq(START)),
+                    If(config_bad | bounds_bad | overlap_bad,
+                        state.eq(FAILED),
+                    ).Else(state.eq(START)),
                 ),
                 START: If(core.cmd.ready, state.eq(SIGN_REQ)),
                 SIGN_REQ: state.eq(SIGN_CAP),

@@ -4,37 +4,15 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Axi Reader ---------------------------------------------------------------------------------------
+"""AXI building blocks of the engine's memory channels.
 
-"""AXIReader: native AXI burst reader (the weight streamer front-end).
+- AXIReader:    burst reader (the weight streamer front-end), multi-ID, credit-based.
+- AXIWriter:    burst writer (KV-cache append, weight loader back-end).
+- AXIResetShim: keeps an HBM port's AXI protocol whole while the master behind it is reset.
+- AXIReadMerge / AXIWide: a 256-bit master onto a 512-bit slave, read bursts merged.
 
-Takes {addr, len} commands (beat-aligned byte address, length in 256-bit beats), splits them
-into INCR bursts (16 beats by default, never crossing a 4 KB boundary), keeps several bursts
-outstanding with credit-based reservation of the output FIFO (so R data is never
-back-pressured by us at the AXI port when credits were granted), and streams beats out with
-`last` on the final beat of each command.
-
-**ARIDs.** With n_ids=1 every burst carries ARID 0 and R data is in-order. That is
-functionally fine and catastrophically slow on the real HBM: the Xilinx controller strictly
-serializes same-ID reads (measured on the FK33: 33.7 cycles/beat from one port, one 16-beat
-burst per round trip, while the identical RTL sustains 2.35 in the full-SoC simulation).
-With n_ids=N bursts round-robin over N ARIDs so the controller can pipeline them; R data
-then interleaves across IDs (in-order only per ID), so beats land in N per-ID FIFOs and a
-drain stage replays them in issue order - reordering by construction, no address matching.
-The per-ID FIFOs are sized for the outstanding-burst cap (info FIFO depth), so they can
-never overflow: a third burst on an ID cannot have been issued while two sit unconsumed.
-
-**burst_beats must not exceed 16.** The Xilinx HBM controller's ports are AXI3
-(`AXI_nn_ARLEN[3:0]`, see ip/hbm*/hbm_*_stub.v), so AxLEN is four bits wide and the longest
-legal burst is 16 beats. LiteX's AXIInterface carries an 8-bit `len`, and the upper bits are
-simply dropped where it meets the IP - asking for 64 beats arrives as 16. Nothing complains:
-the reader then waits forever for beats 17..64 of each burst. On hardware that showed up as
-`ENGSTALL ... ch0 beats=00000020` (two bursts in flight x 16 beats delivered, then a
-permanent stall) on the very first engine fetch from HBM.
-
-Perf counters (free-running Signals, aggregated at the engine level): total beats delivered,
-AR stall cycles (command issued but not accepted), R stall cycles (R valid, FIFO not ready -
-should stay 0 thanks to crediting).
+Bursts are capped at 16 beats everywhere: the Xilinx HBM controller's ports are AXI3, so
+AxLEN is four bits wide (see AXIReader).
 """
 
 from migen import *
@@ -42,13 +20,44 @@ from migen import *
 from litex.gen import *
 
 from litex.soc.interconnect import stream
-from litex.soc.interconnect.axi import BURST_INCR
+from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter, BURST_INCR
 
 from trixium.layout import BEAT_BYTES
 
-# AXIReader ----------------------------------------------------------------------------------
+
+# AXIReader ----------------------------------------------------------------------------------------
 
 class AXIReader(LiteXModule):
+    """AXI burst reader (the weight streamer front-end).
+
+    Takes {addr, len} commands (beat-aligned byte address, length in 256-bit beats), splits
+    them into INCR bursts (16 beats by default, never crossing a 4 KB boundary), keeps several
+    bursts outstanding with credit-based reservation of the output FIFO (so R data is never
+    back-pressured by us at the AXI port when credits were granted), and streams beats out
+    with `last` on the final beat of each command.
+
+    **ARIDs.** With n_ids=1 every burst carries ARID 0 and R data is in-order. That is
+    functionally fine and very slow on the real HBM: the Xilinx controller strictly
+    serializes same-ID reads (measured on the FK33: 33.7 cycles/beat from one port, one
+    16-beat burst per round trip, while the identical RTL sustains 2.35 in the full-SoC
+    simulation). With n_ids=N bursts round-robin over N ARIDs so the controller can pipeline
+    them; R data then interleaves across IDs (in-order only per ID), so beats land in N
+    per-ID FIFOs and a drain stage replays them in issue order - reordering by construction,
+    no address matching. The per-ID FIFOs are sized for the outstanding-burst cap (info FIFO
+    depth), so they can never overflow: a third burst on an ID cannot have been issued while
+    two sit unconsumed.
+
+    **burst_beats must not exceed 16.** The Xilinx HBM controller's ports are AXI3
+    (`AXI_nn_ARLEN[3:0]`), so AxLEN is four bits wide and the longest legal burst is 16
+    beats. LiteX's AXIInterface carries an 8-bit `len`, and the upper bits are simply
+    dropped where it meets the IP - asking for 64 beats arrives as 16. Nothing complains:
+    the reader then waits forever for beats 17..64 of each burst (a permanent stall after
+    the first bursts of the first fetch).
+
+    Perf counters (free-running Signals, aggregated at the engine level): total beats
+    delivered, AR stall cycles (command issued but not accepted), R stall cycles (R valid,
+    FIFO not ready - should stay 0 thanks to crediting).
+    """
     def __init__(self, axi, burst_beats=16, fifo_depth=512, n_ids=1, max_bursts=8):
         assert axi.data_width == 256
         assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"
@@ -65,7 +74,7 @@ class AXIReader(LiteXModule):
 
         beat_shift = log2_int(BEAT_BYTES)
 
-        # Burst splitter ----------------------------------------------------------------------
+        # Burst splitter ---------------------------------------------------------------------------
         cur_addr   = Signal(axi.address_width)
         beats_left = Signal(24)
         active     = Signal()
@@ -135,9 +144,9 @@ class AXIReader(LiteXModule):
         ]
 
         # R-channel register slice (skid buffer): the HBM hard macro's AXI interface pins
-        # sit at fixed die locations; a comb path from them into the fabric FIFO was the
-        # residual timing family at 225MHz. The slice holds beats outside the FIFO, so
-        # the AR credit accounting (bounded by fifo_depth) stays conservative.
+        # sit at fixed die locations; a comb path from them into the fabric FIFO limited
+        # timing. The slice holds beats outside the FIFO, so the AR credit accounting
+        # (bounded by fifo_depth) stays conservative.
         r_valid  = Signal()
         r_data   = Signal(256)
         r_last   = Signal()
@@ -174,7 +183,7 @@ class AXIReader(LiteXModule):
             )
         ]
 
-        # Data FIFO ---------------------------------------------------------------------------
+        # Data FIFO --------------------------------------------------------------------------------
         fifo = stream.SyncFIFO([("data", 256)], fifo_depth, buffered=True)
         self.submodules += fifo
 
@@ -234,7 +243,7 @@ class AXIReader(LiteXModule):
             reserved.eq(reserved + Mux(ar_fire, burst_len, 0) - Mux(out_fire, 1, 0)),
         ]
 
-        # Perf counters -----------------------------------------------------------------------
+        # Perf counters ----------------------------------------------------------------------------
         self.sync += [
             If(out_fire,                     self.total_beats.eq(self.total_beats + 1)),
             If(axi.ar.valid & ~axi.ar.ready, self.ar_stalls.eq(self.ar_stalls + 1)),
@@ -246,33 +255,22 @@ class AXIReader(LiteXModule):
         self.comb += self.idle.eq(~active & (reserved == 0) & ~source.valid)
 
 
-# Axi Writer ---------------------------------------------------------------------------------------
-
-"""AXIWriter: native AXI burst writer (KV-cache append + weight loader back-end).
-
-Takes {addr, len} commands and a beat data stream, splits into INCR bursts (4 KB safe),
-issues W data only after the corresponding AW was accepted, counts B responses and exposes
-`idle` for sequencing. Full-beat writes only (wstrb all-ones). Single AWID.
-
-**burst_beats must not exceed 16**: the HBM controller's ports are AXI3, so AWLEN is four bits
-(see the note in axi_reader.py). Overlong write bursts fail more quietly than overlong reads -
-they do not stall: the IP ends the burst after 16 beats while we keep driving W data and place
-WLAST 48 beats late, so the surplus beats are attributed by the controller rather than by us.
-A weight upload still reports success, because the count it reports is our own beat counter and
-not an acknowledgement from HBM."""
-
-from migen import *
-
-from litex.gen import *
-
-from litex.soc.interconnect import stream
-from litex.soc.interconnect.axi import BURST_INCR
-
-from trixium.layout import BEAT_BYTES
-
-# AXIWriter ----------------------------------------------------------------------------------
+# AXIWriter ----------------------------------------------------------------------------------------
 
 class AXIWriter(LiteXModule):
+    """AXI burst writer (KV-cache append, weight loader back-end).
+
+    Takes {addr, len} commands and a beat data stream, splits them into INCR bursts (4 KB
+    safe), issues W data only after the corresponding AW was accepted, counts B responses and
+    exposes `idle` for sequencing. Full-beat writes only (wstrb all-ones). Single AWID.
+
+    **burst_beats must not exceed 16**: the HBM controller's ports are AXI3, so AWLEN is four
+    bits (see AXIReader). Overlong write bursts fail more quietly than overlong reads - they
+    do not stall: the IP ends the burst after 16 beats while we keep driving W data and place
+    WLAST 48 beats late, so the surplus beats are attributed by the controller rather than by
+    us. A weight upload still reports success, because the count it reports is our own beat
+    counter and not an acknowledgement from HBM.
+    """
     def __init__(self, axi, burst_beats=16):
         assert axi.data_width == 256
         assert 1 <= burst_beats <= 16, "AXI3 AxLEN is 4 bits: bursts are capped at 16 beats"
@@ -290,7 +288,7 @@ class AXIWriter(LiteXModule):
         active     = Signal()
 
         self.comb += cmd.ready.eq(~active)
-        cmd_ok = C(1, 1) # Stands in for the retired checked-mode command test (unchanged Verilog).
+        cmd_ok = C(1, 1) # Constant-true command check (kept: the generated Verilog depends on it).
         self.sync += [
             If(cmd.valid & cmd.ready,
                 cur_addr.eq(cmd.addr),
@@ -299,7 +297,7 @@ class AXIWriter(LiteXModule):
             )
         ]
 
-        boundary_full  = Signal(13) # Full-width intermediate (see axi_reader.py).
+        boundary_full  = Signal(13) # Full-width intermediate (see AXIReader).
         boundary_beats = Signal(8)
         b_tmp          = Signal(25)
         burst_len      = Signal(8)
@@ -410,56 +408,47 @@ class AXIWriter(LiteXModule):
                 - Mux(b_valid_r, 1, 0)),
         ]
 
-        # C(1, 1): the retired checked-mode idle terms (unchanged Verilog).
+        # C(1, 1): constant-true term (kept: the generated Verilog depends on it).
         self.comb += self.idle.eq(~active & ~w_active & (outstanding == 0) & ~winfo.source.valid
                                  & C(1, 1))
 
 
-# Axi Shim -----------------------------------------------------------------------------------------
-
-"""AXIResetShim: keeps one HBM port's AXI protocol whole while the master behind it is reset.
-
-The engine, the loader, the sequencer and the vector unit live in a soft-resettable clock
-domain (the `engreset` CSR) so a wedged op - a stalled sequencer, a fetch of a row that does
-not exist - costs a few microseconds instead of an FPGA reconfigure and a host reboot. A
-reset in the middle of an AXI transaction, though, would leave the HBM controller with a
-burst nobody drains (R beats for a reader that is gone), an accepted AW whose W beats never
-come, or a `valid` that vanished before its `ready`; every one of those wedges the port for
-good, which is the very thing the reset is for.
-
-So the shim sits between the port and the master, in the never-reset `sys` domain, and owns
-the protocol:
-
-- AR and AW go through one-entry skids: a request the master presented is held valid until
-  the port takes it, whatever the master does afterwards.
-- It counts what the port still owes or is owed: read bursts issued minus R-last beats
-  seen; W beats promised by accepted AWs minus W beats delivered; write bursts issued minus
-  B responses.
-- `hold` (the soft reset, stretched) starts a drain: the master side is blocked (no new AR/
-  AW/W, R and B hidden from it), R beats of outstanding bursts are accepted and discarded,
-  W beats still owed are padded with wstrb = 0 (a legal write of nothing - HBM keeps its
-  contents), B responses are collected. `busy` stays up until every counter is zero.
-- A burst the port never answers (the fetch of an unmapped address) never drains: `stuck`
-  goes up after ~5 ms so the firmware can say "reconfigure" instead of waiting forever.
-
-Between drains the shim is transparent on R, W and B (no added registers on the streaming
-paths); AR/AW gain one register, which the readers already amortize with 8 outstanding
-bursts. No W handshake depends on the AW one (AXI's rule for masters): WLAST is the
-master's on the normal path, and the accepted-AW length queue only pads during a drain.
-"""
-
-from migen import *
-
-from litex.gen import *
-
-from litex.soc.interconnect import stream
-from litex.soc.interconnect.axi import AXIInterface
-
 # AXIResetShim -------------------------------------------------------------------------------------
 
 class AXIResetShim(LiteXModule):
+    """Keeps one HBM port's AXI protocol whole while the master behind it is reset.
+
+    The engine, the loader, the sequencer and the vector unit live in a soft-resettable clock
+    domain (the `engreset` CSR) so a wedged op - a stalled sequencer, a fetch of a row that does
+    not exist - costs a few microseconds instead of an FPGA reconfigure and a host reboot. A
+    reset in the middle of an AXI transaction, though, would leave the HBM controller with a
+    burst nobody drains (R beats for a reader that is gone), an accepted AW whose W beats never
+    come, or a `valid` that vanished before its `ready`; every one of those wedges the port for
+    good, which is the very thing the reset is for.
+
+    So the shim sits between the port and the master, in the never-reset `sys` domain, and owns
+    the protocol:
+
+    - AR and AW go through one-entry skids: a request the master presented is held valid until
+      the port takes it, whatever the master does afterwards.
+    - It counts what the port still owes or is owed: read bursts issued minus R-last beats
+      seen; W beats promised by accepted AWs minus W beats delivered; write bursts issued minus
+      B responses.
+    - `hold` (the soft reset, stretched) starts a drain: the master side is blocked (no new AR/
+      AW/W, R and B hidden from it), R beats of outstanding bursts are accepted and discarded,
+      W beats still owed are padded with wstrb = 0 (a legal write of nothing - HBM keeps its
+      contents), B responses are collected. `busy` stays up until every counter is zero.
+    - A burst the port never answers (the fetch of an unmapped address) never drains: `stuck`
+      goes up after ~5 ms so the firmware can say "reconfigure" instead of waiting forever.
+
+    Between drains the shim is transparent on R, W and B (no added registers on the streaming
+    paths); AR/AW gain one register, which the readers already amortize with 8 outstanding
+    bursts. No W handshake depends on the AW one (AXI's rule for masters): WLAST is the
+    master's on the normal path, and the accepted-AW length queue only pads during a drain.
+
+    port: the HBM-side AXIInterface. self.master: the engine-side one (same params).
+    """
     def __init__(self, port, stuck_cycles=1 << 20):
-        """port: the HBM-side AXIInterface. self.master: the engine-side one (same params)."""
         self.master = master = AXIInterface(data_width=port.data_width,
                                             address_width=port.address_width,
                                             id_width=port.id_width)
@@ -469,7 +458,7 @@ class AXIResetShim(LiteXModule):
 
         # # #
 
-        # Read side ---------------------------------------------------------------------------
+        # Read side --------------------------------------------------------------------------------
         drain_r = Signal()
         out_r   = Signal(16)   # Bursts issued to the port, not yet fully returned.
 
@@ -524,7 +513,7 @@ class AXIResetShim(LiteXModule):
             ),
         ]
 
-        # Write side --------------------------------------------------------------------------
+        # Write side -------------------------------------------------------------------------------
         drain_w = Signal()
         out_b   = Signal(16)   # Write bursts issued, B not yet seen.
         w_due   = Signal(24)   # W beats promised by accepted AWs, not yet delivered.
@@ -566,8 +555,8 @@ class AXIResetShim(LiteXModule):
         # On the normal path WLAST is the master's own (the writers set it right), and no W
         # handshake depends on the AW one: AXI forbids a master to wait for AWREADY before
         # WVALID, and a slave may wait for WVALID before AWREADY - the HBM IP does something
-        # of the kind (2026-09-18: a W gated on the accepted-AW queue cost ~3k cycles per
-        # KV-store packet on the card, 7% of the token), while LiteDRAM's bridge takes W
+        # of the kind (a W gated on the accepted-AW queue cost ~3k cycles per KV-store
+        # packet, 7% of a token), while LiteDRAM's bridge takes W
         # into a FIFO ahead of its one-deep AW buffer, so W beats may fire before their AW
         # and whole bursts may complete before it. The queue of accepted AW lengths serves
         # only the drain: padding the rest of a burst the master abandoned, and whole
@@ -644,7 +633,7 @@ class AXIResetShim(LiteXModule):
             ),
         ]
 
-        # Status ------------------------------------------------------------------------------
+        # Status -----------------------------------------------------------------------------------
         timer = Signal(max=stuck_cycles + 1)
         self.comb += self.busy.eq(drain_r | drain_w)
         self.sync += [
@@ -661,30 +650,22 @@ class AXIResetShim(LiteXModule):
         ]
 
 
-# Axi Merge ----------------------------------------------------------------------------------------
-
-"""A 256-bit AXI master onto a 512-bit slave with its read bursts MERGED, two beats per word.
-
-LiteX's AXIUpConverter turns every narrow beat into its own wide single-beat transaction:
-correct, pipelined, but a 512-bit DRAM word per 256-bit beat - twice the traffic, and on
-the XCU1525 the four engine ports of a DDR4 controller are already near the controller's
-word rate (v5: 0.74 words/cycle of a possible 1). This module keeps that converter for
-the write path (STOREs and uploads, a small share of the traffic, byte strobes make the
-half-word writes exact) and merges reads: a 16-beat 256-bit burst becomes one 512-bit
-burst of 8 or 9 words (9 when it starts in the upper half of a word), and each word
-coming back is split into its two halves, the unused half at the ends dropped. IDs pass
-through; the R order is the AR order, which LiteDRAMAXI2Native guarantees.
-"""
-
-from migen import *
-
-from litex.gen import *
-from litex.soc.interconnect import stream
-from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter, BURST_INCR
-
+# AXIReadMerge -------------------------------------------------------------------------------------
 
 class AXIReadMerge(LiteXModule):
-    """The read channels only: axi_from.ar/r (narrow) <-> axi_to.ar/r (wide)."""
+    """A 256-bit AXI master onto a 512-bit slave with its read bursts MERGED, two beats per
+    word. The read channels only: axi_from.ar/r (narrow) <-> axi_to.ar/r (wide).
+
+    LiteX's AXIUpConverter turns every narrow beat into its own wide single-beat transaction:
+    correct, pipelined, but a 512-bit DRAM word per 256-bit beat - twice the traffic, and on
+    the XCU1525 the four engine ports of a DDR4 controller are already near the controller's
+    word rate (measured 0.74 words/cycle of a possible 1). AXIWide keeps that converter for
+    the write path (STOREs and uploads, a small share of the traffic, byte strobes make the
+    half-word writes exact) and merges reads here: a 16-beat 256-bit burst becomes one
+    512-bit burst of 8 or 9 words (9 when it starts in the upper half of a word), and each
+    word coming back is split into its two halves, the unused half at the ends dropped. IDs
+    pass through; the R order is the AR order, which LiteDRAMAXI2Native guarantees.
+    """
     def __init__(self, axi_from, axi_to, depth=16):
         dw_from = len(axi_from.r.data)
         dw_to   = len(axi_to.r.data)
@@ -693,7 +674,8 @@ class AXIReadMerge(LiteXModule):
         lsb = log2_int(bytes_from)          # The narrow beat's address bit selects the half.
 
         # AR: one wide burst per narrow burst. The wide length covers the words the narrow
-        # beats touch: first word = addr >> (lsb+1), last = (addr + (len+1)*bytes - 1) >> (lsb+1).
+        # beats touch: first word = addr >> (lsb+1),
+        # last word = (addr + (len+1)*bytes - 1) >> (lsb+1).
         info = stream.SyncFIFO([("id", axi_from.id_width), ("nbeats", 9), ("upper", 1)], depth)
         self.submodules += info
         ar = axi_from.ar
@@ -752,13 +734,16 @@ class AXIReadMerge(LiteXModule):
         )
 
 
+# AXIWide ------------------------------------------------------------------------------------------
+
 class AXIWide(LiteXModule):
     """A 256-bit master onto a 512-bit slave: writes through LiteX's beat-wise up-converter,
     reads merged (AXIReadMerge)."""
     def __init__(self, axi_from, axi_to):
         w_to = AXIInterface(data_width=len(axi_to.r.data), address_width=axi_to.address_width,
                             id_width=axi_to.id_width)
-        w_from = AXIInterface(data_width=len(axi_from.r.data), address_width=axi_from.address_width,
+        w_from = AXIInterface(data_width=len(axi_from.r.data),
+                              address_width=axi_from.address_width,
                               id_width=axi_from.id_width)
         self.submodules.writes = AXIUpConverter(w_from, w_to)
         self.submodules.reads  = AXIReadMerge(axi_from, axi_to)

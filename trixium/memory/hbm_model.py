@@ -23,6 +23,7 @@ from litex.soc.interconnect.axi import AXIInterface, BURST_INCR
 
 from trixium.layout import BEAT_BYTES
 
+
 # Helpers ------------------------------------------------------------------------------------------
 
 def words_from_bytes(data):
@@ -32,7 +33,8 @@ def words_from_bytes(data):
         data = data + b"\x00"*(BEAT_BYTES - len(data) % BEAT_BYTES)
     return [int.from_bytes(data[i:i+BEAT_BYTES], "little") for i in range(0, len(data), BEAT_BYTES)]
 
-# HBMChannelModel ----------------------------------------------------------------------------
+
+# HBMChannelModel ----------------------------------------------------------------------------------
 
 class HBMChannelModel(LiteXModule):
     def __init__(self, axi=None, size=64*1024, init=None, latency=16, stall_rate=0,
@@ -43,7 +45,7 @@ class HBMChannelModel(LiteXModule):
         init       : optional list of 256-bit init words (words_from_bytes()).
         latency    : cycles between AR acceptance and first R beat.
         stall_rate : R-stall density, 0..15 (LFSR nibble < stall_rate stalls R).
-        reorder_ids: 0 keeps the legacy in-order read server. N (power of two) models the
+        reorder_ids: 0 keeps the simple in-order read server. N (power of two) models the
                      real Xilinx HBM controller's read behavior instead: requests with the
                      SAME ARID are strictly serialized - the next one is not even started
                      until the previous one's data has fully returned, plus a `latency` gap -
@@ -55,9 +57,9 @@ class HBMChannelModel(LiteXModule):
                      pathology; the multi-ID reader must erase it. Response order across IDs
                      follows service order (rotating scan), not request order.
         write_order: the slave's AW/W handshake discipline - every one is legal AXI and a
-                     master must work with all three (the shim's lesson, 2026-09-18):
+                     master must work with all three (see AXIResetShim):
                      "aw_first"   : AW into a FIFO whenever presented; W taken only after
-                                    its AW (the legacy model).
+                                    its AW (the default).
                      "w_first"    : W beats taken into a FIFO ahead of their AW (LiteDRAM's
                                     bridge: a W FIFO independent of its one-deep AW buffer).
                      "aw_after_w" : AWREADY only once WVALID is seen (a slave that waits for
@@ -89,7 +91,7 @@ class HBMChannelModel(LiteXModule):
         stall = Signal()
         self.comb += stall.eq(lfsr[:4] < stall_rate)
 
-        # AXI3 burst-length truncation ---------------------------------------------------------
+        # AXI3 burst-length truncation -------------------------------------------------------------
         # The real IP's ports are AXI3: AXI_nn_AxLEN is 4 bits, so anything above 16 beats
         # silently loses its upper bits on the way in. Model that exactly, or simulation
         # happily serves 64-beat bursts that hardware never will (which is precisely how the
@@ -108,7 +110,7 @@ class HBMChannelModel(LiteXModule):
         self.mem = mem # Exposed for direct inspection in tests.
 
     def _legacy_read_path(self, axi, rd_port, latency, stall):
-        # Read path ---------------------------------------------------------------------------
+        # Read path --------------------------------------------------------------------------------
         ar_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
         self.submodules += ar_fifo
         self.comb += [
@@ -275,7 +277,7 @@ class HBMChannelModel(LiteXModule):
             ]
 
     def _write_path(self, axi, wr_port):
-        # Write path --------------------------------------------------------------------------
+        # Write path -------------------------------------------------------------------------------
         aw_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
         self.submodules += aw_fifo
         self.comb += [

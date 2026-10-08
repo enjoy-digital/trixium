@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Portable, exact IEEE-754 binary32 arithmetic for the resident units.
 
 Every operation rounds to nearest-even, handles subnormal inputs and results, and returns
@@ -7,18 +12,25 @@ firmware's RV32F CPU, so a unit built from these reproduces the firmware bit for
 vendor floating-point IP (the Xilinx operators flush subnormals and exist only in Vivado):
 the same Verilog is simulated by Verilator and implemented on the FPGA.
 
-  FP32Mul     pipelined a*b: LATENCY register stages (a result is visible after its
-              entry clock plus LATENCY-1 further enabled clocks)
-  FP32Add     pipelined a+b (a-b: flip b's sign bit), same interface
-  FP32DivSqrt sequential a/b or sqrt(a) for per-vector scalars, ~30 clocks
+  FP32Mul           pipelined a*b: LATENCY register stages (a result is visible after its
+                    entry clock plus LATENCY-1 further enabled clocks)
+  FP32Add           pipelined a+b (a-b: flip b's sign bit), same interface
+  FP32DivSqrt       sequential a/b or sqrt(a) for per-vector scalars, ~30 clocks
+  ExactFP32Add/Mul  the same pipelines behind a valid/result_valid/`latency` interface
+  FP32ArgmaxTracker the CPU's greedy argmax over a stream of FP32 beats
 
 Shifts are explicit Case multiplexers, never Migen variable shifts (the Verilog width
 pitfall). Tests: test/test_fp32_exact.py, compiled, against numpy's IEEE float32.
 """
+
 from migen import *
+
 from litex.gen import LiteXModule
 
 CANONICAL_NAN = 0x7FC00000
+
+
+# Helpers ------------------------------------------------------------------------------------------
 
 
 def _shift_right_sticky(value, width, amount, amount_max, out_width):
@@ -69,6 +81,8 @@ def _lzc(value, width):
     return count, stmts
 
 
+# Unpack -------------------------------------------------------------------------------------------
+
 class _Unpack(Module):
     """Classify and expose a binary32 word: significand with hidden bit, effective biased
     exponent (1 for subnormals), flags."""
@@ -88,6 +102,8 @@ class _Unpack(Module):
             self.is_zero.eq((self.exp == 0) & (self.frac == 0)),
         ]
 
+
+# FP32 Mul -----------------------------------------------------------------------------------------
 
 class FP32Mul(LiteXModule):
     """r = RNE(a * b). Register stages advance on `ce`; results are LATENCY enabled clocks
@@ -118,7 +134,8 @@ class FP32Mul(LiteXModule):
             ),
         )
         # S2: the exact 48-bit product.
-        s2_p, s2_sign, s2_special, s2_sval, s2_esum = Signal(48), Signal(), Signal(), Signal(32), Signal(10)
+        s2_p, s2_sign, s2_special, s2_sval, s2_esum = (Signal(48), Signal(), Signal(), Signal(32),
+                                                       Signal(10))
         self.sync += If(self.ce, s2_p.eq(s1_ma*s1_mb), s2_sign.eq(s1_sign),
                         s2_special.eq(s1_special), s2_sval.eq(s1_sval), s2_esum.eq(s1_esum))
         # S3: shift amount. value = P * 2**(esum - 300); keep the lsb at or above 2**-149:
@@ -131,8 +148,9 @@ class FP32Mul(LiteXModule):
             s_sub.eq(C(151, 11) - s2_esum),
             s_sel.eq(Mux(s_norm > s_sub, s_norm, s_sub)),
         ]
-        s3_p, s3_s, s3_sign, s3_special, s3_sval, s3_esum = (Signal(48), Signal((11, True)), Signal(),
-                                                              Signal(), Signal(32), Signal(10))
+        s3_p, s3_s, s3_sign, s3_special, s3_sval, s3_esum = (Signal(48), Signal((11, True)),
+                                                              Signal(), Signal(), Signal(32),
+                                                              Signal(10))
         self.sync += If(self.ce, s3_p.eq(s2_p), s3_s.eq(s_sel), s3_sign.eq(s2_sign),
                         s3_special.eq(s2_special), s3_sval.eq(s2_sval), s3_esum.eq(s2_esum))
         # S4: shift to 24 bits + guard + sticky.
@@ -156,6 +174,8 @@ class FP32Mul(LiteXModule):
                                                   s4_esum, s4_s, bias=-150)
         self.sync += If(self.ce, self.r.eq(Mux(s4_special, s4_sval, pack.word)))
 
+
+# Round Pack ---------------------------------------------------------------------------------------
 
 class _RoundPack(Module):
     """RNE-round a 24-bit significand q (plus guard g and sticky st) whose lsb weighs
@@ -182,6 +202,8 @@ class _RoundPack(Module):
             ),
         ]
 
+
+# FP32 Add -----------------------------------------------------------------------------------------
 
 class FP32Add(LiteXModule):
     """r = RNE(a + b), IEEE signed-zero rules (x + -x = +0; -0 + -0 = -0)."""
@@ -225,8 +247,8 @@ class FP32Add(LiteXModule):
         dq, dst, dcase = _shift_right_sticky(Cat(C(0, 3), s1_sm), 27, s1_d, 27, 27)
         self.comb += dcase
         s2_big, s2_small = Signal(27), Signal(27)
-        s2_bs, s2_sub, s2_be, s2_special, s2_sval, s2_zsign = (Signal(), Signal(), Signal(8), Signal(),
-                                                              Signal(32), Signal())
+        s2_bs, s2_sub, s2_be, s2_special, s2_sval, s2_zsign = (Signal(), Signal(), Signal(8),
+                                                              Signal(), Signal(32), Signal())
         self.sync += If(self.ce,
             s2_big.eq(Cat(C(0, 3), s1_bm)), s2_small.eq(dq | dst),
             s2_bs.eq(s1_bs), s2_sub.eq(s1_sub), s2_be.eq(s1_be),
@@ -253,7 +275,8 @@ class FP32Add(LiteXModule):
         self.comb += lcase
         s4_n = Signal(27)
         s4_e = Signal((11, True))
-        s4_bs, s4_special, s4_sval, s4_zero, s4_zsign = Signal(), Signal(), Signal(32), Signal(), Signal()
+        s4_bs, s4_special, s4_sval, s4_zero, s4_zsign = (Signal(), Signal(), Signal(32), Signal(),
+                                                         Signal())
         self.sync += If(self.ce,
             If(s3_sum[27],
                 s4_n.eq(Cat(s3_sum[1] | s3_sum[0], s3_sum[2:28])), s4_e.eq(s3_be + 1),
@@ -268,6 +291,8 @@ class FP32Add(LiteXModule):
         self.sync += If(self.ce, self.r.eq(
             Mux(s4_special, s4_sval, Mux(s4_zero, Cat(C(0, 31), s4_zsign), pack.word))))
 
+
+# FP32 Div/Sqrt ------------------------------------------------------------------------------------
 
 class FP32DivSqrt(LiteXModule):
     """Sequential r = RNE(a / b) (op 0) or RNE(sqrt(a)) (op 1). Pulse `start` with the
@@ -353,7 +378,7 @@ class FP32DivSqrt(LiteXModule):
         shift_used = Signal((12, True))
         self.comb += shift_used.eq(Mux(s_sel < 0, s_sel, rsh))
         # The count/shift and the round/pack are split over two clocks (PACK, PACK2): as
-        # one they were the norm unit's critical path (26 levels, +0.2 ns synthesis-only).
+        # one they were the norm unit's critical path (26 logic levels).
         r_q, r_g, r_st, r_s = Signal(24), Signal(), Signal(), Signal((12, True))
         self.submodules.pack = pack = _RoundPack(sign, r_q, r_g, r_st, l0, r_s, bias=150)
 
@@ -366,7 +391,8 @@ class FP32DivSqrt(LiteXModule):
                         sign.eq(ua.sign ^ ub.sign),
                         special.eq(ua.is_nan | ub.is_nan | ua.is_inf | ub.is_inf |
                                    ua.is_zero | ub.is_zero),
-                        If(ua.is_nan | ub.is_nan | (ua.is_inf & ub.is_inf) | (ua.is_zero & ub.is_zero),
+                        If(ua.is_nan | ub.is_nan | (ua.is_inf & ub.is_inf) |
+                           (ua.is_zero & ub.is_zero),
                             sval.eq(CANONICAL_NAN),
                         ).Elif(ua.is_inf | ub.is_zero,
                             sval.eq(Cat(C(0, 23), C(0xFF, 8), ua.sign ^ ub.sign)),
@@ -415,9 +441,11 @@ class FP32DivSqrt(LiteXModule):
         ]
 
 
+# Valid Adapters -----------------------------------------------------------------------------------
+
 class _ValidAdapter(LiteXModule):
-    """The vendor-operator interface (a, b, valid -> result, result_valid, `latency`) over
-    an exact pipeline, for units written against gateware/fp32.py (the DeltaNet recurrence)."""
+    """A vendor-operator style interface (a, b, valid -> result, result_valid, `latency`) over
+    an exact pipeline, for the streaming units (DeltaNet recurrence, attention passes)."""
     def __init__(self, op_cls):
         self.a, self.b, self.valid = Signal(32), Signal(32), Signal()
         self.result, self.result_valid = Signal(32), Signal()
@@ -444,6 +472,8 @@ class ExactFP32Mul(_ValidAdapter):
     def __init__(self):
         _ValidAdapter.__init__(self, FP32Mul)
 
+
+# FP32 Argmax Tracker ------------------------------------------------------------------------------
 
 class FP32ArgmaxTracker(LiteXModule):
     """The CPU's greedy argmax over a stream of FP32 beats, bit for bit:
@@ -490,8 +520,8 @@ class FP32ArgmaxTracker(LiteXModule):
         for a, b in zip(cands[0::2], cands[1::2]):
             v, k, x, l = Signal(), Signal(32), Signal(32), Signal(3)
             take_a = a[0] & (~b[0] | (a[1] >= b[1]))
-            self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])), x.eq(Mux(take_a, a[2], b[2])),
-                          l.eq(Mux(take_a, a[3], b[3]))]
+            self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])),
+                          x.eq(Mux(take_a, a[2], b[2])), l.eq(Mux(take_a, a[3], b[3]))]
             s1.append((v, k, x, l))
         s1_v, s1_base, s1_first, s1_nan0 = Signal(), Signal(32), Signal(), Signal()
         s1_x0 = Signal(32)
@@ -503,13 +533,14 @@ class FP32ArgmaxTracker(LiteXModule):
             for a, b in zip(level[0::2], level[1::2]):
                 v, k, x, l = Signal(), Signal(32), Signal(32), Signal(3)
                 take_a = a[0] & (~b[0] | (a[1] >= b[1]))
-                self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])), x.eq(Mux(take_a, a[2], b[2])),
-                              l.eq(Mux(take_a, a[3], b[3]))]
+                self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])),
+                              x.eq(Mux(take_a, a[2], b[2])), l.eq(Mux(take_a, a[3], b[3]))]
                 nxt.append((v, k, x, l))
             level = nxt
             pv, pb, pf, pn, px = pipe[-1]
             q = (Signal(), Signal(32), Signal(), Signal(), Signal(32))
-            self.sync += [q[0].eq(pv & ~self.clear), q[1].eq(pb), q[2].eq(pf), q[3].eq(pn), q[4].eq(px)]
+            self.sync += [q[0].eq(pv & ~self.clear), q[1].eq(pb), q[2].eq(pf), q[3].eq(pn),
+                          q[4].eq(px)]
             pipe.append(q)
         (wv, wk, wx, wl), = level
         bv, bbase, bfirst, bnan0, bx0 = pipe[-1]

@@ -4,13 +4,26 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Integer Quantize ---------------------------------------------------------------------------------
+"""Activation quantization: FP32 or raw integer vectors to Q8 with power-of-two scales.
 
-"""Exact signed-integer power-of-two quantization, without FP conversion."""
+IntegerToQ8, Fp32AbsmaxWord and Fp32ToQ8 are portable elastic streaming primitives: exact
+signed-integer or FP32 quantization without floating-point IP or board memory mapping.
+
+ActivationScratchpad is the resident unit built on them over the shared scratchpad: per
+block it scans the FP32 absmax, selects e8, then rereads and packs the block into Q8; in
+requantize mode it instead rescales raw 1024-element int32 Hadamard blocks to a single
+whole-vector exponent. Its command (ACTIVATION_COMMAND) is the firmware's descriptor layout.
+"""
+
 from migen import *
+from migen.genlib.fifo import SyncFIFO
+
 from litex.gen import LiteXModule
+
 from litex.soc.interconnect import stream
 
+
+# Integer To Q8 ------------------------------------------------------------------------------------
 
 class IntegerToQ8(LiteXModule):
     """Three elastic stages: q=clamp(round_ties_away(x/2**e8), -127, 127).
@@ -47,9 +60,12 @@ class IntegerToQ8(LiteXModule):
         right_amount = Signal(max=max(2, input_width))
         left_amount = Signal(3)
         self.comb += [right_amount.eq(exponents[0] - 1), left_amount.eq(-exponents[0])]
-        capture = [exponents[0].eq(self.sink.e8), first[0].eq(self.sink.first), last[0].eq(self.sink.last)]
-        shift = [exponents[1].eq(exponents[0]), first[1].eq(first[0]), last[1].eq(last[0]), signs[1].eq(signs[0])]
-        finish = [self.source.e8.eq(exponents[1]), self.source.first.eq(first[1]), self.source.last.eq(last[1])]
+        capture = [exponents[0].eq(self.sink.e8), first[0].eq(self.sink.first),
+                   last[0].eq(self.sink.last)]
+        shift = [exponents[1].eq(exponents[0]), first[1].eq(first[0]), last[1].eq(last[0]),
+                 signs[1].eq(signs[0])]
+        finish = [self.source.e8.eq(exponents[1]), self.source.first.eq(first[1]),
+                  self.source.last.eq(last[1])]
         for lane in range(lanes):
             value = Signal((input_width, True))
             self.comb += value.eq(self.sink.data[lane*input_width:(lane+1)*input_width])
@@ -69,7 +85,8 @@ class IntegerToQ8(LiteXModule):
                             Mux(left_result > 127, 128, left_result)))))))
             clamped = Signal(8)
             self.comb += clamped.eq(Mux(rounded > 127, 127, rounded))
-            finish.append(self.source.data[lane*8:(lane+1)*8].eq(Mux(signs[1][lane], -clamped, clamped)))
+            finish.append(self.source.data[lane*8:(lane+1)*8].eq(
+                Mux(signs[1][lane], -clamped, clamped)))
         self.sync += If(self.cancel, *[v.eq(0) for v in valid]).Else(
             If(ready[0], valid[0].eq(self.sink.valid), If(self.sink.valid, *capture)),
             If(ready[1], valid[1].eq(valid[0]), If(valid[0], *shift)),
@@ -77,13 +94,7 @@ class IntegerToQ8(LiteXModule):
         )
 
 
-# Activation Quantize ------------------------------------------------------------------------------
-
-"""Portable activation conversion; no floating-point IP or board memory mapping."""
-from migen import *
-from litex.gen import LiteXModule
-from litex.soc.interconnect import stream
-
+# FP32 Absmax Word ---------------------------------------------------------------------------------
 
 class Fp32AbsmaxWord(LiteXModule):
     """Elastic finite absmax reduction of one word, not a whole vector.
@@ -131,6 +142,8 @@ class Fp32AbsmaxWord(LiteXModule):
                       self.source.absmax.eq(values[0]), self.source.error.eq(errors[0]),
                       self.source.first.eq(first[-1]), self.source.last.eq(last[-1])]
 
+
+# FP32 To Q8 ---------------------------------------------------------------------------------------
 
 class Fp32ToQ8(LiteXModule):
     """Three-stage elastic FP32 -> symmetric int8 converter, eight lanes by default.
@@ -220,16 +233,7 @@ class Fp32ToQ8(LiteXModule):
         )
 
 
-# Activation Sp ------------------------------------------------------------------------------------
-
-"""Resident FP32 conversion and scaled integer requantization on shared scratchpad."""
-from migen import *
-from migen.genlib.fifo import SyncFIFO
-from litex.gen import LiteXModule
-from litex.soc.interconnect import stream
-
-from trixium.units.activation import Fp32AbsmaxWord, Fp32ToQ8
-from trixium.units.activation import IntegerToQ8
+# Activation Scratchpad ----------------------------------------------------------------------------
 
 ACTIVATION_COMMAND = [("src", 24), ("dst", 24), ("exponents", 24),
                       ("elements", 16), ("blocks", 16),
@@ -247,7 +251,7 @@ class ActivationScratchpad(LiteXModule):
 
     The complete input/output/rounded-exponent spans must fit physical memory
     and be mutually disjoint. An optional half-open protected interval (empty
-    by default) additionally protects a sequencer's descriptor list from writes.
+    by default) additionally protects the sequencer's descriptor list from writes.
     Bounds use wide arithmetic before any scratchpad access. The integrator
     grants every read, returns it one cycle later and gates writes with gnt;
     no other owner may change these buffers while the command is active.
@@ -267,7 +271,8 @@ class ActivationScratchpad(LiteXModule):
     """
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
-            raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")
+            raise ValueError("scratchpad_size must be aligned within the 13-bit client "
+                             "address space")
         self.cmd = stream.Endpoint(ACTIVATION_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
@@ -292,7 +297,8 @@ class ActivationScratchpad(LiteXModule):
         captured = {name: Signal(width) for name, width in ACTIVATION_COMMAND}
         rotation = captured["requantize"]
         total = Signal(32)
-        ends = {name: Signal(64) for name in ("src", "dst", "exponents", "maxima", "result_exponent")}
+        ends = {name: Signal(64)
+                for name in ("src", "dst", "exponents", "maxima", "result_exponent")}
         cache_depth = max(1, scratchpad_size//4096)
         # Small per-command metadata cache. Entries are all overwritten before
         # use, so cancellation only invalidates control; no RAM scrub is needed.
@@ -308,7 +314,8 @@ class ActivationScratchpad(LiteXModule):
         self.comb += [
             ends["src"].eq(captured["src"] + (total << 2)),
             ends["dst"].eq(captured["dst"] + total),
-            ends["exponents"].eq(captured["exponents"] + (((captured["blocks"] + C(7, 17)) >> 3) << 5)),
+            ends["exponents"].eq(captured["exponents"] +
+                                 (((captured["blocks"] + C(7, 17)) >> 3) << 5)),
             ends["maxima"].eq(captured["maxima"] + (((captured["blocks"] + C(7, 17)) >> 3) << 5)),
             ends["result_exponent"].eq(captured["result_exponent"] + C(32, 25)),
             config_bad.eq((captured["elements"] == 0) | (captured["elements"][:5] != 0) |
@@ -318,15 +325,18 @@ class ActivationScratchpad(LiteXModule):
                 (rotation & ((captured["elements"] != 1024) | (captured["maxima"][:5] != 0) |
                              (captured["result_exponent"][:5] != 0)))),
             bounds_bad.eq((ends["src"] > scratchpad_size) | (ends["dst"] > scratchpad_size) |
-                (ends["exponents"] > scratchpad_size) | (captured["protect_end"] > scratchpad_size) |
-                (rotation & ((ends["maxima"] > scratchpad_size) | (ends["result_exponent"] > scratchpad_size) |
+                (ends["exponents"] > scratchpad_size) |
+                (captured["protect_end"] > scratchpad_size) |
+                (rotation & ((ends["maxima"] > scratchpad_size) |
+                             (ends["result_exponent"] > scratchpad_size) |
                              (captured["blocks"] > cache_depth)))),
             overlap_bad.eq(overlaps("src", "dst") | overlaps("dst", "exponents") |
                 Mux(rotation, overlaps("dst", "maxima") | overlaps("dst", "result_exponent") |
                     overlaps("src", "result_exponent") | overlaps("exponents", "result_exponent") |
                     overlaps("maxima", "result_exponent"), overlaps("src", "exponents"))),
             protected_bad.eq((captured["protect_start"] != captured["protect_end"]) &
-                (protected_span("dst") | Mux(rotation, protected_span("result_exponent"), protected_span("exponents")))),
+                (protected_span("dst") | Mux(rotation, protected_span("result_exponent"),
+                                             protected_span("exponents")))),
         ]
 
         block = Signal(16)
@@ -378,28 +388,35 @@ class ActivationScratchpad(LiteXModule):
             in_scan.eq((state == SCAN) | (state == SCAN_DRAIN)),
             in_convert.eq((state == CONVERT) | (state == CONVERT_DRAIN)),
             clear.eq(self.cancel | (~in_scan & ~in_convert)),
-            scan.cancel.eq(clear), quantize.cancel.eq(clear), integer_quantize.cancel.eq(clear), responses.reset.eq(clear),
+            scan.cancel.eq(clear), quantize.cancel.eq(clear), integer_quantize.cancel.eq(clear),
+            responses.reset.eq(clear),
             read_count.eq(captured["elements"] >> 3),
             scan.sink.valid.eq(read_pending & in_scan & ~self.cancel),
-            scan.sink.data.eq(self.sp_rd_dat), scan.sink.first.eq(read_first), scan.sink.last.eq(read_last),
+            scan.sink.data.eq(self.sp_rd_dat), scan.sink.first.eq(read_first),
+            scan.sink.last.eq(read_last),
             scan.source.ready.eq(1),
             maximum.eq(Mux(scan.source.absmax > self.absmax, scan.source.absmax, self.absmax)),
             responses.we.eq(read_pending & in_convert & ~self.cancel),
             responses.din.eq(Cat(self.sp_rd_dat, read_first, read_last)),
             quantize.sink.valid.eq(responses.readable & in_convert & ~rotation & ~self.cancel),
-            quantize.sink.data.eq(responses.dout[:256]), quantize.sink.first.eq(responses.dout[256]),
+            quantize.sink.data.eq(responses.dout[:256]),
+            quantize.sink.first.eq(responses.dout[256]),
             quantize.sink.last.eq(responses.dout[257]), quantize.sink.e8.eq(self.exponent),
-            integer_quantize.sink.valid.eq(responses.readable & in_convert & rotation & ~self.cancel),
-            integer_quantize.sink.first.eq(responses.dout[256]), integer_quantize.sink.last.eq(responses.dout[257]),
+            integer_quantize.sink.valid.eq(responses.readable & in_convert & rotation &
+                                           ~self.cancel),
+            integer_quantize.sink.first.eq(responses.dout[256]),
+            integer_quantize.sink.last.eq(responses.dout[257]),
             integer_quantize.sink.e8.eq(self.exponent - input_exponent + 5),
             response_pop.eq(Mux(rotation, integer_quantize.sink.valid & integer_quantize.sink.ready,
-                               quantize.sink.valid & quantize.sink.ready)), responses.re.eq(response_pop),
+                               quantize.sink.valid & quantize.sink.ready)),
+            responses.re.eq(response_pop),
             reserved.eq(responses.level + read_pending),
             self.sp_rd_req.eq(~self.cancel & ((state == SCAN) |
                 ((state == CONVERT) & ((reserved < 2) | response_pop)) |
                 (state == META_E_REQ) | (state == META_A_REQ))),
             self.sp_rd_adr.eq(Mux(state == META_E_REQ, (captured["exponents"] >> 5) + (block >> 3),
-                Mux(state == META_A_REQ, (captured["maxima"] >> 5) + (block >> 3), src_base + issued))),
+                Mux(state == META_A_REQ, (captured["maxima"] >> 5) + (block >> 3),
+                    src_base + issued))),
             convert_error.eq(in_convert & ((quantize.source.valid & (quantize.source.error != 0)) |
                 (responses.we & ~responses.writable))),
             raw_bad.eq(raw_bad_lanes != 0), raw_equal.eq(raw_equal_lanes != 0),
@@ -418,9 +435,11 @@ class ActivationScratchpad(LiteXModule):
             self.sp_wr_adr.eq(Mux(state == EXPONENT,
                 (captured["exponents"] >> 5) + (block >> 3),
                 Mux(state == RESULT, captured["result_exponent"] >> 5, dst_base + output_index))),
-            self.sp_wr_we.eq(Mux(state == EXPONENT, C(1, 8) << block[:3], Mux(state == RESULT, 1, 0xff))),
+            self.sp_wr_we.eq(Mux(state == EXPONENT, C(1, 8) << block[:3],
+                                 Mux(state == RESULT, 1, 0xff))),
             wide_exponent.eq(self.exponent),
-            self.sp_wr_dat.eq(Mux((state == EXPONENT) | (state == RESULT), Replicate(wide_exponent, 8), packed_word)),
+            self.sp_wr_dat.eq(Mux((state == EXPONENT) | (state == RESULT),
+                                  Replicate(wide_exponent, 8), packed_word)),
             write_word.eq(in_convert & self.sp_wr_req & self.sp_wr_gnt),
         ]
         self.sync += If(clear, read_pending.eq(0)).Else(
@@ -442,7 +461,9 @@ class ActivationScratchpad(LiteXModule):
                     state.eq(Mux(state == SCAN, SCAN_DRAIN, CONVERT_DRAIN)))),
             If(write_word, packed_pending.eq(0), output_index.eq(output_index + 1),
                 self.output_beats.eq(self.output_beats + 1), If(packed_last,
-                    If(rotation, self.blocks_done.eq(self.blocks_done + 1), state.eq(NEXT)).Else(state.eq(EXPONENT)))),
+                    If(rotation,
+                        self.blocks_done.eq(self.blocks_done + 1), state.eq(NEXT),
+                    ).Else(state.eq(EXPONENT)))),
             If(selected_valid & selected_ready, *packing),
             If(rotation & response_pop & raw_equal, seen_equal.eq(1)),
             If(in_scan & scan.source.valid,
@@ -452,37 +473,48 @@ class ActivationScratchpad(LiteXModule):
                     *[value.eq(getattr(self.cmd, name)) for name, value in captured.items()],
                     total.eq(self.cmd.elements * self.cmd.blocks),
                     src_base.eq(self.cmd.src >> 5), dst_base.eq(self.cmd.dst >> 5),
-                    block.eq(0), issued.eq(0), output_index.eq(0), packed_index.eq(0), packed_pending.eq(0),
+                    block.eq(0), issued.eq(0), output_index.eq(0), packed_index.eq(0),
+                    packed_pending.eq(0),
                     self.absmax.eq(0), self.exponent.eq(0), self.blocks_done.eq(0),
                     global_nonzero.eq(0), seen_equal.eq(0),
-                    self.read_beats.eq(0), self.output_beats.eq(0), self.error.eq(0), state.eq(VALIDATE)),
+                    self.read_beats.eq(0), self.output_beats.eq(0), self.error.eq(0),
+                    state.eq(VALIDATE)),
                 VALIDATE: If(config_bad | bounds_bad | overlap_bad | protected_bad,
                     self.error.eq(Cat(config_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
                     state.eq(FAILED),
                 ).Else(state.eq(Mux(rotation, META_E_REQ, SCAN))),
                 META_E_REQ: state.eq(META_E_CAPTURE),
-                META_E_CAPTURE: [metadata_e.eq(Array(self.sp_rd_dat[32*i:32*(i+1)] for i in range(8))[block[:3]]),
-                                 state.eq(META_A_REQ)],
+                META_E_CAPTURE: [
+                    metadata_e.eq(
+                        Array(self.sp_rd_dat[32*i:32*(i+1)] for i in range(8))[block[:3]]),
+                    state.eq(META_A_REQ)],
                 META_A_REQ: state.eq(META_A_CAPTURE),
-                META_A_CAPTURE: [metadata_a.eq(Array(self.sp_rd_dat[32*i:32*(i+1)] for i in range(8))[block[:3]]),
-                                 state.eq(META_CHECK)],
+                META_A_CAPTURE: [
+                    metadata_a.eq(
+                        Array(self.sp_rd_dat[32*i:32*(i+1)] for i in range(8))[block[:3]]),
+                    state.eq(META_CHECK)],
                 META_CHECK: If(metadata_bad, self.error.eq(128), state.eq(FAILED)).Else(
                     If(metadata_a != 0, global_nonzero.eq(1),
-                        If(~global_nonzero | (metadata_candidate > self.exponent), self.exponent.eq(metadata_candidate))),
+                        If(~global_nonzero | (metadata_candidate > self.exponent),
+                            self.exponent.eq(metadata_candidate))),
                     If(block == captured["blocks"] - 1, state.eq(GLOBAL_CHOOSE)).Else(
                         block.eq(block + 1), state.eq(META_E_REQ))),
                 GLOBAL_CHOOSE: If((self.exponent < -127) | (self.exponent > 121),
                     self.error.eq(16), state.eq(FAILED),
                 ).Else(block.eq(0), state.eq(CACHE_READ)),
                 CACHE_READ: state.eq(CACHE_CAPTURE),
-                CACHE_CAPTURE: [input_exponent.eq(cache_rd.dat_r[:10]), declared_maximum.eq(cache_rd.dat_r[10:]),
+                CACHE_CAPTURE: [input_exponent.eq(cache_rd.dat_r[:10]),
+                                declared_maximum.eq(cache_rd.dat_r[10:]),
                                 seen_equal.eq(0), state.eq(CONVERT)],
                 CHOOSE: If((self.absmax != 0) & (self.absmax[23:] < 6),
                     self.error.eq(16), state.eq(FAILED),
                 ).Else(self.exponent.eq(Mux(self.absmax == 0, 0, self.absmax[23:] - 133)),
                        issued.eq(0), state.eq(CONVERT)),
-                EXPONENT: If(self.sp_wr_gnt, self.blocks_done.eq(self.blocks_done + 1), state.eq(NEXT)),
-                NEXT: If(block == captured["blocks"] - 1, state.eq(Mux(rotation, RESULT, FINISH))).Else(
+                EXPONENT: If(self.sp_wr_gnt,
+                    self.blocks_done.eq(self.blocks_done + 1), state.eq(NEXT)),
+                NEXT: If(block == captured["blocks"] - 1,
+                    state.eq(Mux(rotation, RESULT, FINISH)),
+                ).Else(
                     block.eq(block + 1), src_base.eq(src_base + read_count),
                     dst_base.eq(dst_base + (captured["elements"] >> 5)),
                     issued.eq(0), output_index.eq(0), packed_index.eq(0), packed_pending.eq(0),

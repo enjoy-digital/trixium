@@ -1,5 +1,10 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
-"""Resident RMSNorm / L2 norm over the shared scratchpad (future sequencer unit 12).
+
+"""Resident RMSNorm / L2 norm (+ optional RoPE) over the shared scratchpad (sequencer unit 12).
 
 For each of `nseg` segments of `n` FP32 values at src + seg*n*4, bit-exact with hybrid.c:
 
@@ -8,7 +13,7 @@ For each of `nseg` segments of `n` FP32 values at src + seg*n*4, bit-exact with 
 
 sum64 is the canonical reduction of docs/canonical-reductions.md (64 partials, i % 64 in
 index order, then a halving tree); every operation is an exact IEEE binary32 operation
-(gateware/fp32_exact.py), so there are no fixups. `w` (RMS only, n values) is read once
+(trixium/units/fp32.py), so there are no fixups. `w` (RMS only, n values) is read once
 per command into an internal buffer and shared by every segment. dst == src (in place)
 or disjoint. Segments may be strided (src_stride / dst_stride in beats, 0 = contiguous):
 the attention's q heads sit between their gates in the Q projection output.
@@ -19,18 +24,31 @@ partials (each revisited every 8 beats, past the adder's latency), the tree reus
 adder and the sequential divide/sqrt, pass 2 streams the segment again through two
 multipliers per lane into a credit-counted output FIFO. Two stages overlap consecutive
 segments: pass 1 and the tree of segment i+1 run under the scalar chain and pass 2 of
-segment i (short segments were ~85% fixed cost: 226 cycles for 32 beats at n = 128).
+segment i (without the overlap, short segments are ~85% fixed cost: 226 cycles for 32 beats
+at n = 128).
+
+With rope_hb != 0, pass 2 also applies the firmware's neox RoPE to the first 2*rope_hb
+beats of every segment, from cos/sin tables at beat address rope_tab (rope_hb cos beats,
+then rope_hb sin beats).
+
+The command (NORM_COMMAND) is the firmware's descriptor layout.
 
 Contract with the integrator as for the other resident clients (one-cycle reads, writes
 on sp_wr_req & sp_wr_gnt with the payload held). error bits: 0 geometry, 1 bounds,
 2 forbidden overlap, 6 protected output; a failure stays busy until cancel.
 """
+
 from migen import *
 from migen.genlib.fifo import SyncFIFO
+
 from litex.gen import LiteXModule
+
 from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import FP32Add, FP32DivSqrt, FP32Mul, _lzc, _shift_left
+
+
+# Constants ----------------------------------------------------------------------------------------
 
 NORM_COMMAND = [("op", 1), ("src", 24), ("dst", 24), ("weight", 24), ("n", 16), ("nseg", 16),
                 ("eps", 32), ("src_stride", 16), ("dst_stride", 16),
@@ -42,6 +60,8 @@ HB_MAX = 16                     # RoPE: half the rotated dims, in beats (<= 128 
 F32_ONE = 0x3F800000
 
 
+# Helpers ------------------------------------------------------------------------------------------
+
 def _delay(module, value, cycles, name):
     regs = [Signal.like(value, name=f"{name}{i}") for i in range(cycles)]
     prev = value
@@ -51,10 +71,13 @@ def _delay(module, value, cycles, name):
     return prev
 
 
+# Norm Scratchpad ----------------------------------------------------------------------------------
+
 class NormScratchpad(LiteXModule):
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
-            raise ValueError("scratchpad_size must be aligned within the 13-bit client address space")
+            raise ValueError("scratchpad_size must be aligned within the 13-bit client "
+                             "address space")
         self.cmd = stream.Endpoint(NORM_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
@@ -70,7 +93,7 @@ class NormScratchpad(LiteXModule):
         seg_bytes = Signal(24)
         total = Signal(64)                           # bytes of all segments
         s_stride, d_stride = Signal(16), Signal(16)  # beats between segment starts
-        s_span, d_span = Signal(64), Signal(64)      # bytes from the first to the end of the last
+        s_span, d_span = Signal(64), Signal(64)      # bytes from the first to the last's end
         ends = {k: Signal(64, name=f"end_{k}") for k in ("src", "dst", "weight")}
         geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
         self.comb += [
@@ -100,10 +123,11 @@ class NormScratchpad(LiteXModule):
                  (cap["dst"] < ends["src"]) & (cap["src"] < ends["dst"])) |
                 (rms & (cap["dst"] < ends["weight"]) & (cap["weight"] < ends["dst"]))),
             protected_bad.eq((cap["protect_start"] != cap["protect_end"]) &
-                             (cap["dst"] < cap["protect_end"]) & (cap["protect_start"] < ends["dst"])),
+                             (cap["dst"] < cap["protect_end"]) &
+                             (cap["protect_start"] < ends["dst"])),
         ]
 
-        # Arithmetic ------------------------------------------------------------------------
+        # Arithmetic -------------------------------------------------------------------------------
         L_MUL, L_ADD = FP32Mul.LATENCY, FP32Add.LATENCY
         sq = [FP32Mul() for _ in range(8)]           # pass 1: x*x
         acc = [FP32Add() for _ in range(8)]          # pass 1: partial + x*x
@@ -129,7 +153,7 @@ class NormScratchpad(LiteXModule):
         P2_LAT = 1 + L_MUL + L_MUL                   # read -> m1 -> m2
         inflight = Signal(max=FIFO_DEPTH + 1)
 
-        # Control ---------------------------------------------------------------------------
+        # Control ----------------------------------------------------------------------------------
         # Top level: IDLE -> VALIDATE -> WLOAD (RMS) -> RUN -> FINISH. In RUN two stages
         # work on consecutive segments: A (pass 1, tree) on segment i+1 while B (scalar
         # chain, pass 2) finishes segment i. A hands B the sum of squares and the segment
@@ -155,8 +179,8 @@ class NormScratchpad(LiteXModule):
             self.cmd.ready.eq((state == S["IDLE"]) & ~self.cancel),
             self.busy.eq(state != S["IDLE"]),
         ]
-        # Segment bases, advanced by one stride per segment (a seg*stride product fed the
-        # read address every clock: the unit's critical path, +0.35 ns synthesis-only).
+        # Segment bases, advanced by one stride per segment: a seg*stride product feeding the
+        # read address every clock was the unit's critical path.
         src_a, dst_a = Signal(24), Signal(24)        # stage A's segment
         src_b, dst_b = Signal(24), Signal(24)        # stage B's segment
 
@@ -233,7 +257,8 @@ class NormScratchpad(LiteXModule):
         self.comb += [
             tree_mode.eq(a_st == A["TREE"]),
             tree_issue.eq(run & tree_mode & (tj < w_cur)),
-            lane_mask.eq(Array([C(0xFF, 8)]*3 + [C(0x0F, 8), C(0x03, 8), C(0x01, 8), C(0, 8), C(0, 8)])[level]),
+            lane_mask.eq(Array([C(0xFF, 8)]*3 +
+                               [C(0x0F, 8), C(0x03, 8), C(0x01, 8), C(0, 8), C(0, 8)])[level]),
         ]
         tree_valid = _delay(self, tree_issue, L_ADD, "tree_valid")
         tree_slot = _delay(self, tj[3:5], L_ADD, "tree_slot")
@@ -249,10 +274,12 @@ class NormScratchpad(LiteXModule):
         for lane in range(8):
             x = self.sp_rd_dat[32*lane:32*lane + 32]
             a_tree = Array(P[8*s + lane] for s in range(4))[s_tj]
-            b_tree = Array([P[lane + 32 + 8*s] for s in range(4)] + [P[lane + 16 + 8*s] for s in range(2)] +
+            b_tree = Array([P[lane + 32 + 8*s] for s in range(4)] +
+                           [P[lane + 16 + 8*s] for s in range(2)] +
                            [P[lane + d] for d in (8, 4, 2, 1)])[b_sel]
             self.comb += [sq[lane].a.eq(x), sq[lane].b.eq(x),
-                          acc[lane].a.eq(Mux(tree_mode, a_tree, Array(P[8*s + lane] for s in range(8))[slot_sq])),
+                          acc[lane].a.eq(Mux(tree_mode, a_tree,
+                                             Array(P[8*s + lane] for s in range(8))[slot_sq])),
                           acc[lane].b.eq(Mux(tree_mode, b_tree, sq[lane].r))]
         # Scalar chain on its own adder: ss/n + eps.
         sc_add = Signal()
@@ -321,7 +348,8 @@ class NormScratchpad(LiteXModule):
                 rmul[1][lane].a.eq(y1), rmul[1][lane].b.eq(sn),
                 rmul[2][lane].a.eq(y0), rmul[2][lane].b.eq(sn),
                 rmul[3][lane].a.eq(y1), rmul[3][lane].b.eq(c),
-                radd[0][lane].a.eq(rmul[0][lane].r), radd[0][lane].b.eq(rmul[1][lane].r ^ 0x80000000),
+                radd[0][lane].a.eq(rmul[0][lane].r),
+                radd[0][lane].b.eq(rmul[1][lane].r ^ 0x80000000),
                 radd[1][lane].a.eq(rmul[2][lane].r), radd[1][lane].b.eq(rmul[3][lane].r),
             ]
         LR = L_MUL + L_ADD
@@ -357,12 +385,13 @@ class NormScratchpad(LiteXModule):
             self.sp_wr_dat.eq(ofifo.dout[:256]),
             self.sp_wr_we.eq(0xFF),
             ofifo.re.eq(self.sp_wr_req & self.sp_wr_gnt),
-            drained.eq((inflight == 0) & ~ofifo.readable & ~(rd_pending & (rd_kind == 2)) & ~pend_v),
+            drained.eq((inflight == 0) & ~ofifo.readable & ~(rd_pending & (rd_kind == 2)) &
+                       ~pend_v),
         ]
         self.sync += If(clear, wr_beat.eq(0)).Elif(ofifo.re,
             wr_beat.eq(wr_beat + 1), self.output_beats.eq(self.output_beats + 1))
 
-        # Sequencing ------------------------------------------------------------------------
+        # Sequencing -------------------------------------------------------------------------------
         ds_start = Signal()
         self.comb += ds.start.eq(ds_start)
         stage_a = Case(a_st, {
@@ -386,11 +415,16 @@ class NormScratchpad(LiteXModule):
             # RMS: ss/n -> +eps -> sqrt -> 1/x.  L2: sqrt(ss) -> max(eps) -> 1/x.
             B["SCALAR"]: If(~sc_wait,
                 Case(sc_step, {
-                    0: If(rms, ds.a.eq(ss), ds.b.eq(n_f32), ds.op.eq(0), ds_start.eq(1), sc_wait.eq(1),
-                        ).Else(ds.a.eq(ss), ds.op.eq(1), ds_start.eq(1), sc_wait.eq(1), sc_step.eq(2)),
+                    0: If(rms,
+                            ds.a.eq(ss), ds.b.eq(n_f32), ds.op.eq(0), ds_start.eq(1),
+                            sc_wait.eq(1),
+                        ).Else(
+                            ds.a.eq(ss), ds.op.eq(1), ds_start.eq(1), sc_wait.eq(1),
+                            sc_step.eq(2)),
                     1: [sc_add.eq(1), sc_wait.eq(1)],                       # tmp + eps
                     2: [ds.a.eq(tmp), ds.op.eq(1), ds_start.eq(1), sc_wait.eq(1)],   # sqrt
-                    3: [ds.a.eq(C(F32_ONE, 32)), ds.b.eq(tmp), ds.op.eq(0), ds_start.eq(1), sc_wait.eq(1)],
+                    3: [ds.a.eq(C(F32_ONE, 32)), ds.b.eq(tmp), ds.op.eq(0), ds_start.eq(1),
+                        sc_wait.eq(1)],                                     # 1/x
                     # The previous segment's pass 2 still reads `scale` and the output base.
                     4: If(drained, scale.eq(tmp), beat_b.eq(0), wr_beat.eq(0),
                           wr_seg_base.eq(dst_b >> 5), b_st.eq(B["P2"])),
@@ -420,11 +454,13 @@ class NormScratchpad(LiteXModule):
                     beat.eq(0),
                     state.eq(S["VALIDATE"])),
                 S["VALIDATE"]: If(geometry_bad | bounds_bad | overlap_bad | protected_bad,
-                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
+                    self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3),
+                                      protected_bad)),
                     state.eq(S["FAILED"]),
                 ).Else(beat.eq(0), src_a.eq(cap["src"]), dst_a.eq(cap["dst"]),
                        seg_a.eq(0), seg_b.eq(0), beat_a.eq(0), a_st.eq(A["P1"]), b_st.eq(B["WAIT"]),
-                       state.eq(Mux(rms, S["WLOAD"], Mux(cap["rope_hb"] != 0, S["TLOAD"], S["RUN"])))),
+                       state.eq(Mux(rms, S["WLOAD"],
+                                    Mux(cap["rope_hb"] != 0, S["TLOAD"], S["RUN"])))),
                 S["WLOAD"]: If((beat == nbeats) & ~rd_pending,
                     beat.eq(0), state.eq(Mux(cap["rope_hb"] != 0, S["TLOAD"], S["RUN"]))),
                 S["TLOAD"]: If((beat == (cap["rope_hb"] << 1)) & ~rd_pending, state.eq(S["RUN"])),
