@@ -2,7 +2,7 @@ from migen import If, Signal
 from migen.fhdl import tools as fhdl_tools
 from migen.fhdl.namer import build_namespace
 
-from tools.litex_fast import linear_group_by_targets, linear_topological_sort
+from trixium.migen_fast import linear_group_by_targets, linear_topological_sort
 
 
 def _component_signature(groups):
