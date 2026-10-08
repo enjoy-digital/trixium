@@ -14,13 +14,23 @@ from litex.gen import LiteXModule
 
 from trixium.gateware.integration import BonsaiClusterConfig
 from test_integration import SoC, write
-from test_deltanet_state import _IntAdd
 
 MASK = 0xFFFFFFFF
 
 
-class _IntAdd5(_IntAdd):
+class _IntAdd5(LiteXModule):
     latency = 5
+
+    def __init__(self):
+        from migen import Signal
+        self.a, self.b, self.valid = Signal(32), Signal(32), Signal()
+        self.result, self.result_valid = Signal(32), Signal()
+        data = [Signal(32) for _ in range(self.latency)]
+        valid = [Signal() for _ in range(self.latency)]
+        self.sync += [data[0].eq(self.a + self.b), valid[0].eq(self.valid)]
+        for i in range(1, self.latency):
+            self.sync += [data[i].eq(data[i - 1]), valid[i].eq(valid[i - 1])]
+        self.comb += [self.result.eq(data[-1]), self.result_valid.eq(valid[-1])]
 
 
 class _IntMul5(LiteXModule):
@@ -55,15 +65,13 @@ def int_reference(m, q, k, v, decay, beta, scale):
     return m, out
 
 
-@pytest.mark.parametrize('pair', [False, True])
 @pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
-def test_dnstream_op_through_the_cluster(placement, pair):
+def test_dnstream_op_through_the_cluster(placement):
     L, rows, cols, heads = 2, 16, 16, 5
     R, G = rows//L, cols//8
     config = BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024, with_dnstream=True,
         dnstream_options=(("rows", rows), ("cols", cols), ("add_factory", _IntAdd5),
-                          ("mul_factory", _IntMul5), ("negate", lambda x: -x))
-                         + ((("pair", True),) if pair else ()),
+                          ("mul_factory", _IntMul5), ("negate", lambda x: -x)),
         **placement)
     dut = SoC(config, n=L)
     rng = np.random.default_rng(1)
@@ -83,19 +91,13 @@ def test_dnstream_op_through_the_cluster(placement, pair):
             sp[Q//32 + 2*G*h + G + g] = beat(k[h][8*g:8*g + 8])
         for b in range(rows//8):
             sp[V//32 + (rows//8)*h + b] = beat(v[h][8*b:8*b + 8])
-        slot = (h//2 if h % 2 == 0 else (heads + 1)//2 + h//2) if pair else h   # unit 0's, then unit 1's
-        sp[T//32 + slot] = beat([Q + 64*G*h, Q + 64*G*h + 32*G, V + 4*rows*h, O + 4*rows*h,
+        sp[T//32 + h] = beat([Q + 64*G*h, Q + 64*G*h + 32*G, V + 4*rows*h, O + 4*rows*h,
                               dec[h], bet[h], scl[h], 0])
     want = [int_reference(states[h], q[h], k[h], v[h], dec[h], bet[h], scl[h]) for h in range(heads)]
 
     def lane_beats(st, l):     # This lane's stream: beat g*R + r = row r*L + l, cols 8g..
         per = [[beat(st[h][r*L + l][8*g:8*g + 8]) for g in range(G) for r in range(R)] for h in range(heads)]
-        if not pair:
-            return [b for h in per for b in h]
-        out = []                # heads 2p, 2p+1 beat-interleaved; an odd last head alone
-        for p in range(heads//2):
-            out += [b for ab in zip(per[2*p], per[2*p + 1]) for b in ab]
-        return out + (per[-1] if heads % 2 else [])
+        return [b for h in per for b in h]
 
     def gen():
         for a, value in sp.items():
@@ -129,4 +131,3 @@ def test_dnstream_op_through_the_cluster(placement, pair):
 
     run_simulation(dut, [gen()], clocks={'sys': 10, 'eng': 10})
     assert 'BONSAI_HAS_DNSTREAM' in dut.constants
-    assert ('BONSAI_DNSTREAM_PAIR' in dut.constants) == pair

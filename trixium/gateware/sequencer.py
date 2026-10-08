@@ -65,18 +65,9 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   requant: Unit 5 (quant ABI >=1.1), serialized; w0 exactly 5, w1 raw int32 src,
            w2 Q8 dst, w3 input exponent array, w4 raw absmax array, w5 result
            exponent, w6 blocks of 1024, w7..w15 zero. See docs/rotation-requantization.md.
-  native: Optional units 6 (pipe region/offset/stride setup) and 7 (projection),
-          always serialized. See docs/native-sequencer.md for their strict ABI.
   restore: Optional unit 8, serialized; w0 exactly 8, w1 int32 src, w2 FP32 dst,
            w3 resident exponent beat, w4 elements, w5 signed adjustment (R-B),
            w6..w15 zero. See docs/projection-restoration.md.
-  embedding: Optional unit 9, serialized; w0 exactly 9, w1 compact PTQ src,
-             w2 inverse signs, w3 FP32 dst, w4 groups, w5..w15 zero.
-             See docs/native-embedding-restoration.md.
-  region fetch: Optional unit 10, serialized; w0 exactly 10, w1 region ID,
-                w2/w3 64-bit byte offset low/high, w4 full 32-byte beat count,
-                w5 scratchpad dst, w6..w15 zero. Bounds/reservations/transport
-                checks use the shared region reader; no legacy physical address.
   silu:   Optional unit 11 (ABI 1.1), serialized; w0 exactly 11, w1 FP32 gate src, w2
           FP32 multiplier src, w3 dst (== w1 or disjoint), w4 fixup bitmap, w5 elements,
           w6 op (bit0: 0 RUN, 1 LOAD tables from w1) | unit_m << 1 (m = 1.0, w2 unused)
@@ -113,16 +104,11 @@ from litex.soc.interconnect import stream
 # BonsaiSequencer ----------------------------------------------------------------------------------
 
 class BonsaiSequencer(LiteXModule):
-    def __init__(self, *, with_hadamard=False, with_activation_quantize=False, native_pipes=0,
-                 with_projection_restore=False, with_embedding_restore=False,
-                 with_region_fetch=False, with_silu=False, with_norm=False, with_conv=False,
+    def __init__(self, *, with_hadamard=False, with_activation_quantize=False,
+                 with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
                  scratchpad_size=256*1024):
-        if not isinstance(native_pipes, int) or not 0 <= native_pipes <= 31:
-            raise ValueError('native_pipes must be in [0, 31]')
-        if with_region_fetch and not native_pipes:
-            raise ValueError('Sequenced region fetch requires native memory support')
-        extended = (with_hadamard or with_activation_quantize or native_pipes or with_projection_restore or
-                    with_embedding_restore or with_silu or with_norm or with_conv)
+        extended = (with_hadamard or with_activation_quantize or with_projection_restore or
+                    with_silu or with_norm or with_conv)
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
@@ -160,22 +146,7 @@ class BonsaiSequencer(LiteXModule):
                 "bits8..15 conversion-unit error (bit14 protects descriptor list; "
                 "bit15 rejects invalid rotation metadata/raw values).")
             extension_errors.append(self.activation_quantize_error)
-        if native_pipes:
-            self.native_abi = CSRStatus(32, reset=0x00010000)
-            self.native_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
-                'bit2 output overlaps descriptor list, bit3 config channel, bit8 engine failure.')
-            extension_errors.append(self.native_error)
-            self.native_cfg = stream.Endpoint([('chan', 5), ('region', 32), ('offset', 64), ('stride', 64)])
-            self.native_cfg_error = Signal()
-            self.native_failed = Signal()
-            self.native_manual_pending = Signal()
-            self.native_engine_busy = Signal()
-            self.native_manual_drain = Signal()
-            self.eng_native = Signal()
         if with_projection_restore:
-            # Append after native CSRs so all previously existing profiles keep
-            # their register addresses when this independent option is enabled.
             from trixium.gateware.projection_restore_sp import RESTORE_COMMAND
             self.projection_restore_cmd = stream.Endpoint(RESTORE_COMMAND)
             self.projection_restore_done = Signal()
@@ -185,34 +156,6 @@ class BonsaiSequencer(LiteXModule):
                 'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
                 'bits8..15 restoration-client error (bit14 protects the full descriptor list).')
             extension_errors.append(self.projection_restore_error)
-        if with_embedding_restore:
-            # Append-only optional ABI. The shared-cluster profile is currently
-            # max_groups=64/input_width=16; reject unsupported model spans before
-            # execution rather than silently falling back to lossy arithmetic.
-            from trixium.gateware.embedding_restore_sp import EMBEDDING_COMMAND
-            self.embedding_restore_cmd = stream.Endpoint(EMBEDDING_COMMAND)
-            self.embedding_restore_done = Signal()
-            self.embedding_restore_failed = Signal(16)
-            self.embedding_restore_abi = CSRStatus(32, reset=0x00010000)
-            self.embedding_restore_limits = CSRStatus(32, reset=64 | (16 << 16), description=
-                'Bits0..15 maximum PTQ groups; bits16..23 exact aligned integer input width.')
-            self.embedding_restore_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
-                'bits8..23 embedding-client error (bit10 protects the full descriptor list).')
-            extension_errors.append(self.embedding_restore_error)
-        if with_region_fetch:
-            self.region_fetch_cmd = stream.Endpoint([
-                ('region', 32), ('offset', 64), ('length', 24), ('dst', 24)])
-            self.region_fetch_done = Signal()
-            self.region_fetch_failed = Signal(9)
-            self.region_fetch_manual_pending = Signal()
-            self.region_fetch_manual_failed = Signal()
-            self.region_fetch_abi = CSRStatus(32, reset=0x00010000)
-            self.region_fetch_error = CSRStatus(32, description=
-                'Sticky until common reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
-                'bit2 output overlaps list, bit3 older manual read failure, '
-                'bits8..15 transport/config errors, bit16 failed reader state.')
-            extension_errors.append(self.region_fetch_error)
         if with_silu:
             # Append-only, after every other optional block.
             from trixium.gateware.silu_sp import SILU_COMMAND
@@ -261,7 +204,7 @@ class BonsaiSequencer(LiteXModule):
         self.eng_ready  = Signal()
         self.eng_kind   = Signal(3)
         self.eng_rows   = Signal(16)
-        self.eng_cols   = Signal(17 if native_pipes else 14)
+        self.eng_cols   = Signal(14)
         self.eng_wbase  = Signal(32)
         self.eng_wlen   = Signal(24)
         self.eng_sbeats = Signal(4)
@@ -325,11 +268,15 @@ class BonsaiSequencer(LiteXModule):
 
         # # #
 
+        # Explicit names (d0/d1 and the other name='with_*'/'native_pipes' signals below): the
+        # Verilog net names stay those of the v30b board build. Migen's tracer names closure
+        # (cell) variables after unrelated locals on Python 3.10, so these used to come from
+        # constructor parameters that no longer exist.
         dptr   = Signal(13) # Beat index of the current descriptor.
         left   = Signal(16)
         dcount = Signal(16)
-        d0     = Signal(256)
-        d1     = Signal(256)
+        d0     = Signal(256, name='with_projection_restore')
+        d1     = Signal(256, name='with_embedding_restore')
 
         def w(beat, i): # Word i of a captured beat.
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
@@ -343,8 +290,8 @@ class BonsaiSequencer(LiteXModule):
         w0u = Signal(32)
         self.overlap = Signal()   # To the integrator's unit guard: this dispatch may overlap.
         self.comb += [ovl.eq(w(0, 0)[9]), w0u.eq(w(0, 0) & ~(1 << 9)), self.overlap.eq(self.busy & ovl)]
-        had_dispatch, quant_dispatch, restore_dispatch, embedding_dispatch, bad_list = [], [], [], [], []
-        region_fetch_dispatch, silu_dispatch, norm_dispatch, conv_dispatch = [], [], [], []
+        had_dispatch, quant_dispatch, restore_dispatch, bad_list = [], [], [], []
+        silu_dispatch, norm_dispatch, conv_dispatch = [], [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24)
@@ -416,20 +363,6 @@ class BonsaiSequencer(LiteXModule):
                                                       self.restore_argmax_idx_in, 0xFFFFFFFF)),
                 self.restore_argmax_val.status.eq(self.restore_argmax_val_in),
             ]
-        if with_embedding_restore:
-            malformed = Signal()
-            command = self.embedding_restore_cmd
-            self.comb += [
-                malformed.eq((w(0, 0) != 9) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
-                    (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
-                    (w(0, 5) != 0) | (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
-                command.src.eq(w(0, 1)[:24]), command.signs.eq(w(0, 2)[:24]),
-                command.dst.eq(w(0, 3)[:24]), command.groups.eq(w(0, 4)[:16]),
-                command.protect_start.eq(list_base), command.protect_end.eq(list_end),
-            ]
-            embedding_dispatch = [If(malformed,
-                NextValue(self.embedding_restore_error.status, 2), NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_EMBEDDING'))]
         if with_silu:
             malformed = Signal()
             command = self.silu_cmd
@@ -482,55 +415,6 @@ class BonsaiSequencer(LiteXModule):
             conv_dispatch = [If(malformed,
                 NextValue(self.conv_error.status, 2), NextState('EXT_FAILED'),
             ).Else(NextState('DISPATCH_CONV'))]
-        if with_region_fetch:
-            malformed, list_overlap = Signal(), Signal()
-            destination_end = Signal(64)
-            command = self.region_fetch_cmd
-            self.comb += [
-                malformed.eq((w(0, 0) != 10) | (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) |
-                    (w(0, 6) != 0) | (w(0, 7) != 0) | (d1 != 0)),
-                destination_end.eq(w(0, 5) + (w(0, 4) << 5)),
-                list_overlap.eq((w(0, 4) != 0) & (w(0, 5) < list_end) & (list_base < destination_end)),
-                command.region.eq(w(0, 1)), command.offset.eq(Cat(w(0, 2), w(0, 3))),
-                command.length.eq(w(0, 4)[:24]), command.dst.eq(w(0, 5)[:24]),
-            ]
-            region_fetch_dispatch = [If(malformed | list_overlap,
-                NextValue(self.region_fetch_error.status, Cat(C(0, 1), malformed, list_overlap)),
-                NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_REGION_FETCH'))]
-        if native_pipes:
-            cfg_malformed, cfg_channel_bad = Signal(), Signal()
-            projection_malformed, projection_overlap = Signal(), Signal()
-            projection_rows = Signal(32)
-            projection_end, head_b_start, head_b_end = Signal(64), Signal(64), Signal(64)
-            self.comb += [
-                cfg_malformed.eq((w(0, 0) != 6) | (w(0, 7) != 0) | (d1 != 0)),
-                cfg_channel_bad.eq(w(0, 1) >= native_pipes),
-                self.native_cfg.chan.eq(w(0, 1)[:5]), self.native_cfg.region.eq(w(0, 2)),
-                self.native_cfg.offset.eq(Cat(w(0, 3), w(0, 4))),
-                self.native_cfg.stride.eq(Cat(w(0, 5), w(0, 6))),
-                self.eng_native.eq(w(0, 0) == 7),
-                projection_malformed.eq((w(0, 0) != 7) | ((w(0, 1) & 0xfffff4fe) != 0) |
-                    (w(0, 2)[21:] != 0) | (w(0, 3) != 0) | (w(0, 4) != 0) | (w(0, 5) != 0) |
-                    (w(0, 6)[:8] != 0) | ((w(0, 7) & 0xffc0ff80) != 0) |
-                    (w(1, 8)[24:] != 0) | (w(1, 9)[24:] != 0) | (d1[64:] != 0)),
-                projection_rows.eq(w(0, 2)[:16]*native_pipes + w(0, 2)[16:21]),
-                projection_end.eq(w(1, 9) + (projection_rows << 2)),
-                head_b_start.eq(w(1, 9) + (w(0, 6)[16:] << 2)),
-                head_b_end.eq(head_b_start + (projection_rows << 2)),
-                projection_overlap.eq(~w(0, 1)[9] &
-                    (((w(1, 9) < list_end) & (list_base < projection_end)) |
-                     (w(0, 1)[11] & (head_b_start < list_end) & (list_base < head_b_end)))),
-            ]
-            cfg_dispatch = [If(cfg_malformed | cfg_channel_bad,
-                NextValue(self.native_error.status, Cat(C(0, 1), cfg_malformed, C(0, 1), cfg_channel_bad)),
-                NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_NATIVE_CFG'))]
-            native_dispatch = [If(projection_malformed | projection_overlap,
-                NextValue(self.native_error.status, Cat(C(0, 1), projection_malformed, projection_overlap)),
-                NextState('EXT_FAILED'),
-            ).Else(NextState('DISPATCH_NATIVE'))]
-
         unit    = Signal(4)
         argsrc  = Signal(16)
         nowait  = Signal()
@@ -545,10 +429,10 @@ class BonsaiSequencer(LiteXModule):
         # (the engine's cmd.ready is an IDLE-state signal, one cycle after done), so the
         # set/clear priority below is safe.
         eng_disp     = Signal()
-        eng_inflight = Signal()
+        eng_inflight = Signal(name='with_region_fetch')
         # Capture target of the IN-FLIGHT op (for the per-register kadd hazard below).
-        infl_cap_en  = Signal()
-        infl_cap_sel = Signal(2)
+        infl_cap_en  = Signal(name='with_silu')
+        infl_cap_sel = Signal(2, name='with_norm')
         self.sync += [
             If(eng_disp & nowait,
                 eng_inflight.eq(1),
@@ -621,12 +505,10 @@ class BonsaiSequencer(LiteXModule):
         cap_d   = Signal(2)
         cap_en  = Signal()
         cap_acc = Signal()
-        cap_sel = Signal(2)
+        cap_sel = Signal(2, name='native_pipes')
         self.sync += [
-            # SBDRAIN can finish older manual commands while busy is asserted.
-            # Their completion must never replay a previous list's k capture.
-            cap_d.eq(Cat(self.busy & self.eng_done &
-                         (~self.native_manual_drain if native_pipes else C(1, 1)), cap_d[0])),
+            # C(1, 1): the retired native manual-drain gate (unchanged Verilog).
+            cap_d.eq(Cat(self.busy & self.eng_done & C(1, 1), cap_d[0])),
             # Latched at the DISPATCH handshake: with NOWAIT the descriptor buffer holds a
             # LATER descriptor when done pulses. Serial lists latch identical values (the
             # buffer does not move during WAIT_ENG).
@@ -677,7 +559,7 @@ class BonsaiSequencer(LiteXModule):
         # d0/d1) and the word select runs off that register a cycle later.
         lut_adr_r  = Signal(13)
         lut_sel_r  = Signal(3)
-        lut_beat_r = Signal(256)
+        lut_beat_r = Signal(256, name='with_conv')
         self.comb += [
             lut_mode.eq((unit == 2) & w(0, 0)[12]),
             lut_base.eq(w(1, 10)[0:13]),
@@ -724,9 +606,7 @@ class BonsaiSequencer(LiteXModule):
             self.eng_supw.eq(w(0, 1)[9]),
             self.eng_rows.eq(w(0, 2)[0:16]),
             self.eng_rem.eq(w(0, 2)[16:21]),
-            self.eng_cols.eq(Mux(self.eng_native,
-                Mux(w(0, 1)[0], w(0, 6)[8:16] << 5, w(0, 6)[8:16] << 7),
-                w(0, 3)[0:14]) if native_pipes else w(0, 3)[0:14]),
+            self.eng_cols.eq(w(0, 3)[0:14]),
             self.eng_wbase.eq(w(0, 4)),
             self.eng_wlen.eq(w(0, 5)[0:24]),
             self.eng_sbeats.eq(w(0, 6)[0:4]),
@@ -762,17 +642,10 @@ class BonsaiSequencer(LiteXModule):
         )
         fsm.act("SBDRAIN", # Let every patch posted for this list land before fetching it.
             self.busy.eq(1),
-            *([self.native_manual_drain.eq(1)] if native_pipes else []),
-            If(~self.sbw_pending &
-               (~(self.native_manual_pending | self.native_engine_busy) if native_pipes else C(1, 1)) &
-               (~self.region_fetch_manual_pending if with_region_fetch else C(1, 1)),
+            # The C(1, 1) terms stand in for retired drain conditions (unchanged Verilog).
+            If(~self.sbw_pending & C(1, 1) & C(1, 1),
                 NextState("FETCH0"),
             ),
-            *([If(self.native_failed, NextValue(self.native_error.status, 256), NextState('EXT_FAILED'))]
-              if native_pipes else []),
-            *([If(self.region_fetch_manual_failed,
-                NextValue(self.region_fetch_error.status, 8 | (self.region_fetch_failed << 8)),
-                NextState('EXT_FAILED'))] if with_region_fetch else []),
         )
         fsm.act("FETCH0",
             self.busy.eq(1),
@@ -868,11 +741,12 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 3, *(had_dispatch if with_hadamard else unknown_unit)
             ).Elif(unit == 4, *(quant_dispatch if with_activation_quantize else unknown_unit)
             ).Elif(unit == 5, *(quant_dispatch if with_activation_quantize else unknown_unit)
-            ).Elif(unit == 6, *(cfg_dispatch if native_pipes else unknown_unit)
-            ).Elif(unit == 7, *(native_dispatch if native_pipes else unknown_unit)
+            # Units 6, 7, 9 and 10 are retired; their explicit rejects keep the Verilog unchanged.
+            ).Elif(unit == 6, *unknown_unit
+            ).Elif(unit == 7, *unknown_unit
             ).Elif(unit == 8, *(restore_dispatch if with_projection_restore else unknown_unit)
-            ).Elif(unit == 9, *(embedding_dispatch if with_embedding_restore else unknown_unit)
-            ).Elif(unit == 10, *(region_fetch_dispatch if with_region_fetch else unknown_unit)
+            ).Elif(unit == 9, *unknown_unit
+            ).Elif(unit == 10, *unknown_unit
             ).Elif(unit == 11, *(silu_dispatch if with_silu else unknown_unit)
             ).Elif(unit == 12, *(norm_dispatch if with_norm else unknown_unit)
             ).Elif(unit == 13, *(conv_dispatch if with_conv else unknown_unit)
@@ -914,15 +788,6 @@ class BonsaiSequencer(LiteXModule):
                     NextValue(self.projection_restore_error.status, self.projection_restore_failed << 8),
                     NextState('EXT_FAILED'),
                 ).Elif(self.projection_restore_done, NextState('NEXT')))
-        if with_embedding_restore:
-            fsm.act('DISPATCH_EMBEDDING', self.busy.eq(1),
-                If(~eng_inflight, self.embedding_restore_cmd.valid.eq(1),
-                    If(self.embedding_restore_cmd.ready, NextState('WAIT_EMBEDDING'))))
-            fsm.act('WAIT_EMBEDDING', self.busy.eq(1),
-                If(self.embedding_restore_failed != 0,
-                    NextValue(self.embedding_restore_error.status, self.embedding_restore_failed << 8),
-                    NextState('EXT_FAILED'),
-                ).Elif(self.embedding_restore_done, NextState('NEXT')))
         if with_silu:
             fsm.act('DISPATCH_SILU', self.busy.eq(1),
                 If(~eng_inflight | ovl, self.silu_cmd.valid.eq(1),
@@ -946,44 +811,6 @@ class BonsaiSequencer(LiteXModule):
                 If(failed != 0,
                     NextValue(error.status, failed << 8), NextState('EXT_FAILED'),
                 ).Elif(done, NextState('NEXT')))
-        if with_region_fetch:
-            fsm.act('DISPATCH_REGION_FETCH', self.busy.eq(1),
-                If(self.region_fetch_failed != 0,
-                    NextValue(self.region_fetch_error.status, self.region_fetch_failed << 8),
-                    NextState('EXT_FAILED'),
-                ).Elif(~eng_inflight,
-                    self.region_fetch_cmd.valid.eq(1),
-                    If(self.region_fetch_cmd.ready,
-                        # Raw reads pulse eng_done too. Clear stale k-capture
-                        # controls via the ordinary engine-dispatch bookkeeping;
-                        # exact w0=10 has no NOWAIT or capture flags set.
-                        eng_disp.eq(1), NextState('WAIT_REGION_FETCH'))))
-            fsm.act('WAIT_REGION_FETCH', self.busy.eq(1),
-                If(self.region_fetch_failed != 0,
-                    NextValue(self.region_fetch_error.status, self.region_fetch_failed << 8),
-                    NextState('EXT_FAILED'),
-                ).Elif(self.region_fetch_done, NextState('NEXT')))
-        if native_pipes:
-            fsm.act('DISPATCH_NATIVE_CFG', self.busy.eq(1),
-                If(self.native_failed,
-                    NextValue(self.native_error.status, 256), NextState('EXT_FAILED'),
-                ).Elif(~eng_inflight,
-                    self.native_cfg.valid.eq(1),
-                    If(self.native_cfg.ready, NextState('WAIT_NATIVE_CFG'))))
-            fsm.act('WAIT_NATIVE_CFG', self.busy.eq(1),
-                If(self.native_cfg_error,
-                    NextValue(self.native_error.status, 8), NextState('EXT_FAILED'),
-                ).Else(NextState('NEXT')))
-            fsm.act('DISPATCH_NATIVE', self.busy.eq(1),
-                If(self.native_failed,
-                    NextValue(self.native_error.status, 256), NextState('EXT_FAILED'),
-                ).Elif(~eng_inflight,
-                    self.eng_valid.eq(1),
-                    If(self.eng_ready, eng_disp.eq(1), NextState('WAIT_NATIVE'))))
-            fsm.act('WAIT_NATIVE', self.busy.eq(1),
-                If(self.native_failed,
-                    NextValue(self.native_error.status, 256), NextState('EXT_FAILED'),
-                ).Elif(self.eng_done, NextState('NEXT')))
         fsm.act("WAIT_ENG",
             self.busy.eq(1),
             If(self.eng_done,

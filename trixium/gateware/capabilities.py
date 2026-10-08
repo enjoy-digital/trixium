@@ -26,14 +26,7 @@ class BonsaiCapabilitiesCSR(LiteXModule):
 
 
 def add_capabilities(soc, config, memory_ports, regions, reservations=(), *, sys_hz):
-    """Install after cluster and optional traffic monitors; never infer a board.
-
-    The experimental native projection CSR path is not a complete region-I/O
-    runtime: raw readback and execution lowering are still missing, despite the
-    experimental checked uploader. Keep the public
-    contract conservative until those interfaces are implemented and qualified;
-    physical capacity or an opt-in target flag alone must not advertise them.
-    """
+    """Install after the cluster; never infer a board."""
     if hasattr(soc, 'zzcaps'):
         raise ValueError('capabilities already installed')
     features = Feature.SOFT_RESET | Feature.COHERENT_OVERLAP
@@ -45,6 +38,6 @@ def add_capabilities(soc, config, memory_ports, regions, reservations=(), *, sys
                         config.scratchpad_size, features,
                         (1 << WeightEncoding.TERNARY_ROWS) | (1 << WeightEncoding.Q8_ROWS),
                         regions, reservations)
-    # Alphabetically after ztraffic: existing CSR bank positions stay unchanged.
+    # The zz prefix sorts it after the cluster banks: their positions stay unchanged.
     soc.zzcaps = BonsaiCapabilitiesCSR(caps)
     return caps

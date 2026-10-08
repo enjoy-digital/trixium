@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 # Infrastructure unit tests: engine FETCH op (HBM -> scratchpad), BonsaiHBMLoader
-# (host stream -> HBM), BonsaiHBMBIST (write/read/check + error injection via seed mismatch).
+# (host stream -> HBM).
 
 import numpy as np
 from migen import *
@@ -15,7 +15,6 @@ from litex.soc.interconnect.axi import AXIInterface
 from trixium.gateware.scratchpad import BonsaiScratchpad
 from trixium.gateware.matvec import BonsaiMatVecEngine
 from trixium.gateware.loader import BonsaiHBMLoader
-from trixium.gateware.bist import BonsaiHBMBIST, GOLDEN
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 def test_engine_fetch():
@@ -102,48 +101,5 @@ def test_loader():
             got    = (yield dut.model1.mem[base//32 + i])
             expect = int.from_bytes(data[32*i:32*(i+1)], "little")
             assert got == expect, f"beat {i}"
-
-    run_simulation(dut, [gen()])
-
-def _bist_run(dut, mode, seed, length=16, chan=1, base=64):
-    yield dut.bist.chan.storage.eq(chan)
-    yield dut.bist.base.storage.eq(base)
-    yield dut.bist.length.storage.eq(length)
-    yield dut.bist.seed.storage.eq(seed)
-    yield dut.bist.mode.storage.eq(mode)
-    yield dut.bist.start.storage.eq(1)
-    yield dut.bist.start.re.eq(1)
-    yield
-    yield dut.bist.start.re.eq(0)
-    yield
-    for _ in range(3000):
-        if (yield dut.bist.status.fields.done):
-            return
-        yield
-    raise AssertionError("bist timeout")
-
-def test_bist():
-    class DUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6) for _ in range(2)]
-            self.submodules.bist   = BonsaiHBMBIST(axis, channels=[0, 1])
-            self.submodules.model0 = BonsaiHBMChannelModel(axis[0], size=8*1024, latency=4)
-            self.submodules.model1 = BonsaiHBMChannelModel(axis[1], size=8*1024, latency=4)
-
-    dut = DUT()
-
-    def gen():
-        # Write with seed 5, check with seed 5 -> 0 errors.
-        yield from _bist_run(dut, mode=0, seed=5)
-        yield from _bist_run(dut, mode=2, seed=5)
-        assert (yield dut.bist.errors.status) == 0
-        cycles = (yield dut.bist.cycles.status)
-        assert cycles > 0
-        # Check with a different seed -> every beat mismatches.
-        yield from _bist_run(dut, mode=2, seed=6)
-        assert (yield dut.bist.errors.status) == 16
-        # Channel 0 was never written: check there -> mismatches too.
-        yield from _bist_run(dut, mode=2, seed=5, chan=0)
-        assert (yield dut.bist.errors.status) > 0
 
     run_simulation(dut, [gen()])

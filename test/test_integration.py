@@ -6,7 +6,7 @@ from migen import run_simulation
 from litex.gen import LiteXModule
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
+from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
 from trixium.gateware.hbm_model import BonsaiHBMChannelModel
 from trixium.model import asm
 
@@ -53,7 +53,7 @@ def submit(dut, **fields):
     BonsaiClusterConfig(with_vecunit=False, scratchpad_size=16*1024),
     BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024,
                         chan_stride=1 << 32),  # address >4 GiB, not an extra compute pipe
-    BonsaiClusterConfig(with_vecunit=True, with_dual=True, scratchpad_size=16*1024,
+    BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024,
                         chan_stride=0x10000, chan_mod=2, chan_skew=0x1000),
 ])
 def test_cluster_fetch_store_and_reset(config):
@@ -109,7 +109,6 @@ def test_cluster_fetch_store_and_reset(config):
     run_simulation(dut, [gen(), monitor()], clocks={'sys': 10, 'eng': 10})
     assert addresses and set(addresses) == {offset + 64}
     assert ('BONSAI_HAS_VECUNIT' in dut.constants) == config.with_vecunit
-    assert ('BONSAI_HAS_DUALQ' in dut.constants) == config.with_dual
 
 
 def test_shared_sequencer_seed_mux_and_arguments():
@@ -149,10 +148,9 @@ def test_shared_sequencer_seed_mux_and_arguments():
 
 
 @pytest.mark.parametrize('kwargs', [
-    {'with_vecunit': False, 'with_dnrec': True}, {'chan_stride': 96},
+    {'chan_stride': 96},
     {'chan_stride': -32}, {'chan_mod': 3}, {'chan_skew': 4096},
     {'chan_mod': 2, 'chan_skew': 1}, {'scratchpad_size': 33}, {'loader_data_width': 96},
-    {'native_endpoints': [0]}, {'native_reservations': [object()]},
 ])
 def test_invalid_configuration(kwargs):
     with pytest.raises(ValueError):
@@ -167,28 +165,3 @@ def test_rejects_overwrite_and_invalid_ports():
                   [AXIInterface(data_width=256, clock_domain='other')]):
         with pytest.raises(ValueError):
             add_bonsai_cluster(LiteXModule(), ports)
-
-
-def test_native_configuration_is_explicit_frozen_and_separate_from_public_caps():
-    from trixium.capabilities import Access
-    from test_native_reader import region
-    regions, reservations, endpoints = [region(access=Access(0))], [], [0]
-    opts = native_read_options(regions, reservations, endpoints)
-    config = BonsaiClusterConfig(with_vecunit=False, **opts)
-    regions.clear()
-    endpoints[0] = 9
-    assert config.native_regions[0].access == Access.READ
-    assert config.native_endpoints == (0,)
-    assert opts['native_regions'][0].access == Access.READ
-    original = region(access=Access(0))
-    native_read_options([original], [], [0])
-    assert original.access == Access(0)
-    writable = native_read_options([original], [], [0], write=True)
-    assert writable['native_regions'][0].access == Access.READ | Access.WRITE
-    assert original.access == Access(0)
-    with pytest.raises(ValueError, match='every compute port'):
-        add_bonsai_cluster(LiteXModule(), [AXIInterface(data_width=256)]*2, config)
-    default = SoC(BonsaiClusterConfig(with_vecunit=False), n=1)
-    assert not hasattr(default.engine.cmd, 'native')
-    assert not hasattr(default, 'zznative')
-    assert 'BONSAI_HAS_NATIVE_ENGINE' not in default.constants

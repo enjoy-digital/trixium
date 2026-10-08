@@ -33,24 +33,7 @@ SYNC_MAGIC = int("B0FFA5A5"*8, 16)
 
 class BonsaiHBMLoader(LiteXModule):
     def __init__(self, hbm_axis, data_width=128, chan_stride=0, chan_mod=0, chan_skew=0,
-                 *, regions=None, reservations=(), endpoints=None, with_mstore=False):
-        with_regions = regions is not None
-        if with_regions:
-            from trixium.capabilities import Access
-            from trixium.gateware.region_span import RegionSpanValidator
-            endpoints = tuple(endpoints or [0]*len(hbm_axis))
-            if len(endpoints) != len(hbm_axis):
-                raise ValueError('one endpoint is required per loader transport port')
-            self.region_cmd = stream.Endpoint([('region', 32), ('offset', 64), ('length', 24)])
-            self.region_data = stream.Endpoint([('data', 256)])
-            self.region_abort = Signal()
-            self.region_busy, self.region_done, self.region_failed = Signal(), Signal(), Signal()
-            self.region_error = Signal(8)
-            self.region_beats = Signal(24)
-            self.region_validator = validator = RegionSpanValidator(regions, reservations,
-                [(endpoint, axi.address_width) for endpoint, axi in zip(endpoints, hbm_axis)], access=Access.WRITE)
-            self.comb += [validator.region.eq(self.region_cmd.region), validator.offset.eq(self.region_cmd.offset),
-                          validator.length.eq(self.region_cmd.length << 5)]
+                 *, with_mstore=False):
         # chan_stride: byte distance between channel windows, added IN HARDWARE to host
         # uploads (base + chan*stride, 33 bits) exactly as the engine adds it for reads
         # and stores - so the host writes the channel-relative base and channel 15's
@@ -149,7 +132,7 @@ class BonsaiHBMLoader(LiteXModule):
         self.writers = []
         self.wbufs   = []
         for i, axi in enumerate(hbm_axis):
-            writer = BonsaiAXIWriter(axi, checked=with_regions)
+            writer = BonsaiAXIWriter(axi)
             setattr(self.submodules, f"writer{i}", writer)
             self.writers.append(writer)
             wbuf = stream.Buffer([("data", 256)])
@@ -163,12 +146,16 @@ class BonsaiHBMLoader(LiteXModule):
         beats = Signal(24)
         chan  = self.chan.storage
 
-        st_chan = Signal(5)
-        st_addr  = Signal(33)
-        st_len  = Signal(24)
+        # Explicit names (here, src and mst_cmd_done below): the Verilog net names stay those
+        # of the v30b board build. Migen's tracer names closure (cell) variables after
+        # unrelated locals on Python 3.10, so these used to come from the retired region
+        # upload parameters/locals.
+        st_chan = Signal(5, name='poke_ratio')
+        st_addr  = Signal(33, name='conv')
+        st_len  = Signal(24, name='poke_sr')
         st_cnt  = Signal(24)
-        mst_addr = Signal(33)
-        mst_len  = Signal(24)
+        mst_addr = Signal(33, name='endpoints')
+        mst_len  = Signal(24, name='RegionSpanValidator')
 
         # Stream resynchronisation.
         #
@@ -188,7 +175,8 @@ class BonsaiHBMLoader(LiteXModule):
         sync_seen = Signal()
 
         # Upload source seen by the transfer FSM: DMA (via the width converter) or CSR pokes.
-        src = stream.Endpoint([("data", 256)])
+        # Named and unpacked so its Verilog names stay those of the v30b build (see above).
+        src, = [stream.Endpoint([("data", 256)], name="n")]
         self.comb += If(self.src_sel.storage,
             poke_fifo.source.connect(src),
         ).Else(
@@ -196,62 +184,6 @@ class BonsaiHBMLoader(LiteXModule):
         )
 
         self.fsm = fsm = FSM(reset_state="IDLE")
-        region_idle = []
-        if with_regions:
-            region_port, region_address, region_length = Signal(5), Signal(64), Signal(24)
-            region_fault = Signal(8)
-            writer_error = Signal(4)
-            self.comb += [
-                writer_error.eq(Array([w.error for w in self.writers])[region_port]),
-                self.region_busy.eq(fsm.ongoing('REGION_CMD') | fsm.ongoing('REGION_DATA')
-                                    | fsm.ongoing('REGION_DRAIN') | fsm.ongoing('REGION_FAILED')),
-                self.region_failed.eq(fsm.ongoing('REGION_FAILED')),
-                self.region_error.eq(region_fault | Mux(self.region_busy, writer_error << 3, 0)),
-                self.region_cmd.ready.eq(fsm.ongoing('IDLE') & ~(self.start.re & self.start.storage)
-                                         & ~self.store_cmd.valid & ~self.region_abort
-                                         & (~self.mstore_cmd.valid if with_mstore else 1)),
-            ]
-            region_idle = [If(self.region_cmd.valid & self.region_cmd.ready,
-                NextValue(region_port, validator.port), NextValue(region_address, validator.address),
-                NextValue(region_length, self.region_cmd.length), NextValue(self.region_beats, 0),
-                NextValue(region_fault, validator.error),
-                If(validator.valid, NextState('REGION_CMD')).Else(NextState('REGION_FAILED')),
-            )]
-            fsm.act('REGION_CMD',
-                *[w.sink_cmd.valid.eq((region_port == i) & ~self.region_abort & (writer_error == 0))
-                  for i, w in enumerate(self.writers)],
-                *[w.sink_cmd.addr.eq(region_address) for w in self.writers],
-                *[w.sink_cmd.len.eq(region_length) for w in self.writers],
-                If(self.region_abort | (writer_error != 0),
-                    NextValue(region_fault, region_fault | (self.region_abort << 7)), NextState('REGION_FAILED'),
-                ).Elif(Array([w.sink_cmd.ready for w in self.writers])[region_port], NextState('REGION_DATA')),
-            )
-            framing_bad = Signal()
-            self.comb += framing_bad.eq(self.region_data.last != (self.region_beats == region_length-1))
-            fsm.act('REGION_DATA',
-                *[w.sink.valid.eq((region_port == i) & self.region_data.valid & ~framing_bad
-                                  & ~self.region_abort & (writer_error == 0)) for i, w in enumerate(self.wbufs)],
-                *[w.sink.data.eq(self.region_data.data) for w in self.wbufs],
-                self.region_data.ready.eq(Array([w.sink.ready for w in self.wbufs])[region_port]
-                                          & ~self.region_abort & (writer_error == 0)),
-                If(self.region_abort | (writer_error != 0) | (self.region_data.valid & framing_bad),
-                    NextValue(region_fault, region_fault | ((self.region_abort
-                              | (self.region_data.valid & framing_bad)) << 7)), NextState('REGION_FAILED'),
-                ).Elif(self.region_data.valid & self.region_data.ready,
-                    NextValue(self.region_beats, self.region_beats+1),
-                    If(self.region_beats == region_length-1, NextState('REGION_DRAIN')),
-                ),
-            )
-            fsm.act('REGION_DRAIN',
-                If(self.region_abort | (writer_error != 0),
-                    NextValue(region_fault, region_fault | (self.region_abort << 7)), NextState('REGION_FAILED'),
-                ).Elif(Array([w.idle for w in self.writers])[region_port],
-                    self.region_done.eq(1), NextState('IDLE'),
-                ),
-            )
-            # Full cluster reset/drain is required after failure. Never retract
-            # the writer's held AW/W here or falsely acknowledge partial writes.
-            fsm.act('REGION_FAILED')
         fsm.act("IDLE",
             # Deliberately NOT ready here.
             #
@@ -282,14 +214,14 @@ class BonsaiHBMLoader(LiteXModule):
                    NextValue(mst_addr, self.mstore_cmd.addr),
                    NextValue(mst_len, self.mstore_cmd.len),
                    NextState("MST_CMD")] if with_mstore else []),
-            ).Else(*region_idle)
+            )
         )
         mst_states = []
         if with_mstore:
             def chan_off(i): # The engine's per-reader constant (matvec.py _chan_off).
                 local = (i % chan_mod) if chan_mod else i
                 return local*chan_stride + local*chan_skew
-            mst_cmd_done = Signal(n)
+            mst_cmd_done = Signal(n, name='with_mstore')
             mst_cnt = [Signal(24, name=f"mst_cnt{i}") for i in range(n)]
             mst_left = [Signal(name=f"mst_left{i}") for i in range(n)]
             all_cmd = Signal()
