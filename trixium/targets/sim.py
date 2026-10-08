@@ -77,7 +77,7 @@ class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
                  cpu_type="vexriscv", icache_kb=0, vexii_extra="",
                  mem="hbm", n_memctrl=4, update_repo="no",
-                 with_capabilities=True, with_hadamard=False, with_activation_quantize=False,
+                 with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
                  with_dnstream=False, attn_geometry=None, ddr_split=False):
         assert mem in ("hbm", "ddr4")
@@ -196,27 +196,6 @@ class BonsaiSimSoC(SoCCore):
             chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
         # Same integration as both hardware targets; only memory/physical policy differs.
         from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
-        def memory_description():
-            from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
-            if mem == 'hbm':
-                regions = [MemoryRegion(i, MemoryKind.SIMULATION, i, 0, size, locality=i)
-                           for i, size in enumerate(memory_sizes)]
-                # Integrated CPU RAM is distinct from the simulated accelerator memories.
-                regions.append(MemoryRegion(0x80000000, MemoryKind.SIMULATION, 0x80000000, 0, MAIN_RAM_SIZE))
-                reservations = [Reservation(0x80000000, ReservationKind.CPU, 0, MAIN_RAM_SIZE)]
-            else:
-                regions = [MemoryRegion(i, MemoryKind.SIMULATION, i, 0, 32 << 20, locality=i)
-                           for i in range(n_memctrl)]
-                reservations = [Reservation(0, ReservationKind.CPU, 0, MAIN_RAM_SIZE),
-                                Reservation(0, ReservationKind.UPLOAD_STAGING,
-                                            DDR4_SIM_WEIGHT_BASE - 0x100000, 0x100000)]
-                test_base = DDR4_SIM_WEIGHT_BASE + DDR4_SIM_CHAN_STRIDE
-                test_base -= DDR4_SIM_WEIGHT_BASE % DDR4_SIM_CHAN_STRIDE
-                test_base -= (chan_mod - 1)*DDR4_SIM_CHAN_SKEW + 0x1000
-                reservations += [Reservation(c//chan_mod, ReservationKind.DIAGNOSTIC,
-                    test_base + (c % chan_mod)*(DDR4_SIM_CHAN_STRIDE + DDR4_SIM_CHAN_SKEW), 0x1000)
-                    for c in range(n_channels)]
-            return regions, reservations
         config = BonsaiClusterConfig(with_sp_csr=False,
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
             chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0,
@@ -229,11 +208,6 @@ class BonsaiSimSoC(SoCCore):
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
                 if attn_geometry else ())
         add_bonsai_cluster(self, axis, config)
-        if with_capabilities:
-            from trixium.core.capabilities import add_capabilities
-            regions, reservations = memory_description()
-            self.bonsai_capabilities = add_capabilities(self, config, axis, regions, reservations,
-                                                       sys_hz=int(self.sys_clk_freq))
         self.comb += [
             self._prof_pads.eng_busy.eq(self.engine.busy),
             self._prof_pads.vec_busy.eq(self.vecunit.busy),
@@ -390,7 +364,6 @@ def main():
                         help="Build directory (default: build/sim, build/sim_ddr4 or build/sim_ddr4_split).")
     parser.add_argument("--with-attnstream", nargs="?", const="8,2,128,256", default=None,
                         help="Enable the attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
-    parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
     out_dir = args.out_dir or ("build/sim" if args.mem == "hbm" else
                                ("build/sim_ddr4_split" if args.ddr_split else "build/sim_ddr4"))
@@ -403,7 +376,7 @@ def main():
     soc_kwargs = dict(cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
         mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
-        with_capabilities=not args.no_capabilities, with_hadamard=args.with_hadamard,
+        with_hadamard=args.with_hadamard,
         with_activation_quantize=args.with_activation_quantize,
         with_projection_restore=args.with_projection_restore,
         with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
@@ -415,8 +388,6 @@ def main():
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
-        if hasattr(soc, 'bonsai_capabilities'):
-            soc.bonsai_capabilities.write_artifacts(builder.output_dir)
         return
 
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, **soc_kwargs)
@@ -444,8 +415,6 @@ def main():
     builder.build(sim_config=sim_config, run=args.run, opt_level="O3",
         threads=args.threads, trace=args.trace, trace_fst=args.trace,
         verilator_extra_sources=extra_sources)
-    if hasattr(soc, 'bonsai_capabilities'):
-        soc.bonsai_capabilities.write_artifacts(builder.output_dir)
 
 if __name__ == "__main__":
     main()

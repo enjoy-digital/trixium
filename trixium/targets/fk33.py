@@ -54,7 +54,6 @@ class _CRG(LiteXModule):
 
 class BonsaiSoC(SoCCore):
     def __init__(self, sys_clk_freq=225e6, pcie_lanes=4, engine_channels=16, hbm_tck=900,
-                 with_capabilities=True,
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
                  with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
                  attn_geometry=None,
@@ -136,18 +135,6 @@ class BonsaiSoC(SoCCore):
             from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
             from trixium.targets.common import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
-            def memory_description():
-                from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
-                from trixium.layout import HBM_NCHANNELS, HBM_CHANNEL_SIZE, HBM_META_OFFSET
-                regions = [MemoryRegion(i, MemoryKind.HBM, 0, i*HBM_CHANNEL_SIZE,
-                                        HBM_CHANNEL_SIZE, locality=i) for i in range(HBM_NCHANNELS)]
-                # Current CPU addresses reach physical PC4, not the planned F0 PC0.
-                cpu = self.bus.regions['main_ram']
-                reservations = [Reservation(cpu.origin//HBM_CHANNEL_SIZE, ReservationKind.CPU,
-                                            cpu.origin % HBM_CHANNEL_SIZE, cpu.size),
-                                Reservation(HBM_META_OFFSET//HBM_CHANNEL_SIZE, ReservationKind.UPLOAD_STAGING,
-                                            HBM_META_OFFSET % HBM_CHANNEL_SIZE, 0x100000)]
-                return regions, reservations
             config = BonsaiClusterConfig(scratchpad_xpm=True,
                 chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
@@ -181,13 +168,6 @@ class BonsaiSoC(SoCCore):
             if cluster_n_memctrl is not None:
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
 
-            if with_capabilities:
-                from trixium.core.capabilities import add_capabilities
-                regions, reservations = memory_description()
-                configured_sys_hz = round(self.crg.pll.compute_config()['clkout0_freq'])
-                self.bonsai_capabilities = add_capabilities(self, config, engine_axis, regions, reservations,
-                                                           sys_hz=configured_sys_hz)
-
 # Build --------------------------------------------------------------------------------------------
 
 def main():
@@ -209,7 +189,6 @@ def main():
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
                                help="Attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
-    parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     args = parser.parse_args()
 
     # Builds must run from the repo root: USPHBM2 resolves the XCI as <cwd>/ip/hbm/<name>.xci.
@@ -233,7 +212,6 @@ def main():
 
     soc = BonsaiSoC(
         engine_channels = args.engine_channels,
-        with_capabilities = not args.no_capabilities,
         with_hadamard     = args.with_hadamard,
         with_activation_quantize = args.with_activation_quantize,
         with_projection_restore = args.with_projection_restore,
@@ -265,8 +243,6 @@ def main():
             builder.compile_software = False
             builder.compile_gateware = False
         builder.build(**parser.toolchain_argdict)
-        if hasattr(soc, 'bonsai_capabilities'):
-            soc.bonsai_capabilities.write_artifacts(builder.output_dir)
 
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))

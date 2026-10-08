@@ -11,7 +11,7 @@ LDFLAGS=-g
 CC=$(CROSS_COMPILE)gcc
 AR=ar
 
-PROGS=bonsai_util bonsai_load bonsai_chat bonsai_caps
+PROGS=bonsai_util bonsai_load bonsai_chat
 
 all: $(PROGS)
 
@@ -27,12 +27,6 @@ bonsai_load: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_load.o
 
 bonsai_chat: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_chat.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
-
-bonsai_caps: liblitepcie/liblitepcie.a bonsai_caps.o caps_parser.o
-	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
-
-caps_parser.o: ../lib/bonsai_caps.c ../lib/bonsai_caps.h
-	$(CC) -c $(CFLAGS) -o $@ $<
 
 clean:
 	rm -f $(PROGS) *.o *.a *.d *~ liblitepcie/*.a liblitepcie/*.o liblitepcie/*.d

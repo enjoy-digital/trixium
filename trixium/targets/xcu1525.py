@@ -229,7 +229,7 @@ class BonsaiXCU1525SoC(SoCCore):
 
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
                  ddram_module="MT40A512M8", ddram_channels=4, main_ram_size=0x1000_0000,
-                 chan_stride=0x4000_0000, chan_skew=0x8000, port_width=512, with_capabilities=True,
+                 chan_stride=0x4000_0000, chan_skew=0x8000, port_width=512,
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
                  with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
                  cpu_slr=None, ddr_clk_freq=None, attn_geometry=None,
@@ -389,19 +389,6 @@ class BonsaiXCU1525SoC(SoCCore):
             from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
             from trixium.targets.common import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
-            def memory_description():
-                from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
-                regions = [MemoryRegion(i, MemoryKind.DDR4, i, 0, size, locality=i)
-                           for i, size in enumerate(memory_sizes)]
-                reservations = [Reservation(0, ReservationKind.CPU, 0, self.bus.regions['main_ram'].size),
-                                Reservation(0, ReservationKind.UPLOAD_STAGING,
-                                            cluster_weight_base - 0x100000, 0x100000)]
-                test_base = cluster_weight_base + chan_stride - (cluster_weight_base % chan_stride)
-                test_base -= (chan_mod - 1)*chan_skew + 0x1000
-                reservations += [Reservation(c//chan_mod, ReservationKind.DIAGNOSTIC,
-                    test_base + (c % chan_mod)*(chan_stride + chan_skew), 0x1000)
-                    for c in range(engine_channels)]
-                return regions, reservations
             config = BonsaiClusterConfig(scratchpad_xpm=True,
                 chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
@@ -434,15 +421,6 @@ class BonsaiXCU1525SoC(SoCCore):
                 self.add_constant("BONSAI_MEM_CPU_OFFSET", cluster_mem_cpu_offset)
             if cluster_n_memctrl is not None:
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
-
-            if with_capabilities:
-                from trixium.core.capabilities import add_capabilities
-                regions, reservations = memory_description()
-                sys_pll = self.crg.syspll if self.crg.split else self.crg.pll
-                configured_sys_hz = round(sys_pll.compute_config()['clkout0_freq']/(1 if self.crg.split else 4))
-                self.bonsai_capabilities = add_capabilities(self, config, engine_axis, regions, reservations,
-                                                           sys_hz=configured_sys_hz)
-
 
         self.add_constant("BONSAI_DDR_CSR_STRIDE", DDR_CSR_STRIDE)
 
@@ -477,7 +455,6 @@ def main():
         help="The DDR4 controllers in their own clock domain at this frequency (4:1: DDR4 data rate 8x; 200e6 = DDR4-1600); default: in sys.")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
                                help="Attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
-    parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
     args = parser.parse_args()
 
     soc = BonsaiXCU1525SoC(
@@ -490,7 +467,6 @@ def main():
         chan_stride     = args.chan_stride,
         chan_skew       = args.chan_skew,
         port_width      = args.port_width,
-        with_capabilities = not args.no_capabilities,
         with_hadamard     = args.with_hadamard,
         with_activation_quantize = args.with_activation_quantize,
         with_projection_restore = args.with_projection_restore,
@@ -521,8 +497,6 @@ def main():
             builder.compile_software = False
             builder.compile_gateware = False
         builder.build(**parser.toolchain_argdict)
-        if hasattr(soc, 'bonsai_capabilities'):
-            soc.bonsai_capabilities.write_artifacts(builder.output_dir)
 
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
