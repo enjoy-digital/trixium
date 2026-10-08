@@ -76,7 +76,7 @@ def test_missing_and_duplicate_fields():
 
 
 def test_recorded_vcu_baseline():
-    path = Path(__file__).resolve().parents[1] / "docs/measurements/v0-2026-09-21.md"
+    path = Path(__file__).resolve().parent / "data/v0-2026-09-21.md"
     records = read_records(path)
     assert len(records) == 3
     assert all(r["decode_wall_cycles"] > 2**32 and r["request_complete"] for r in records)

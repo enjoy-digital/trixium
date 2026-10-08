@@ -1763,7 +1763,7 @@ def test_sequencer_lut_arg():
     run_simulation(dut, [driver()])
 
 
-# Per-cycle scratchpad arbitration (docs/overlap-design.md) ----------------------------------------
+# Per-cycle scratchpad arbitration (docs/units.md (Overlap and scratchpad arbitration)) ----------------------------------------
 
 class _OverlapDUT(Module):
     # Engine + vector unit sharing the scratchpad WITHOUT a sequencer or CSR front:
@@ -2672,7 +2672,7 @@ def test_matvec_packed_writes():
 
 
 def test_overlap_vec_throughput_under_stream():
-    # The mechanism behind the result packer (docs/performance.md 2026-09-07): with one
+    # The mechanism behind the result packer (docs/history.md 2026-09-07): with one
     # result per W-port write, a saturating plain-matvec stream held the port ~92% of the
     # time and a vector STORE was granted about one cycle in twelve - norm_i32 ran 2.9x
     # slower under the up projection than idle. This pins the property: the same

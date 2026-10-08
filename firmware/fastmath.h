@@ -47,7 +47,7 @@ static inline float trixium_expf_bounded(float x)
     return p*scale.f;
 }
 
-// Canonical softmax exp (docs/canonical-reductions.md, "softmax"): the bounded exp above
+// Canonical softmax exp (docs/units.md (Canonical reductions), "softmax"): the bounded exp above
 // on [-80, 0], +0 below (a term under 2^-115 of the maximum's 1.0, below every FP32 sum
 // that holds the maximum), a NaN argument returned (s - max: already the canonical NaN).
 // Softmax arguments are s - max <= 0, exactly +0 at the maximum (exp(+0) = 1 here too).
@@ -59,7 +59,7 @@ static inline float trixium_softmax_exp(float x)
 }
 
 // The DeltaNet decay exp(g), g = softplus(a + dt)*A <= 0 (A = -exp(A_log)): the same
-// canonical exp (docs/canonical-reductions.md) - ~40 cycles against libm's ~250, 2,304
+// canonical exp (docs/units.md (Canonical reductions)) - ~40 cycles against libm's ~250, 2,304
 // times per 27B forward.
 static inline float trixium_decay_exp(float g) { return trixium_softmax_exp(g); }
 
@@ -98,7 +98,7 @@ static inline float trixium_silu_lookup(float x, const float *lut)
 /* Sigmoid */
 /*---------*/
 
-// Canonical sigmoid (docs/canonical-reductions.md, "sigmoid"): the SiLU lookup's form on a
+// Canonical sigmoid (docs/units.md (Canonical reductions), "sigmoid"): the SiLU lookup's form on a
 // sigmoid table, with tails from the same bounded exp - no libm expf anywhere, so the
 // firmware, the mirror and a table-driven unit agree bit for bit. The table is built by
 // trixium_sigmoid_point at the 4,097 grid points.

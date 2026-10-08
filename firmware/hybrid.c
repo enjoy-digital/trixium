@@ -267,7 +267,7 @@ static inline float siluf(float x)
     return trixium_silu_lookup(x, silu_lut);
 }
 
-// The canonical FP32 sum of squares (docs/canonical-reductions.md): 64 partial sums, element
+// The canonical FP32 sum of squares (docs/units.md (Canonical reductions)): 64 partial sums, element
 // i into partial i % 64 in index order (each term x*x rounded, then added, starting from
 // +0), then a halving tree P[j] += P[j + w] for w = 32, 16, ..., 1. A scratchpad unit that
 // takes one 8-float beat per clock revisits each partial every 8 clocks, so it can use a
@@ -306,7 +306,7 @@ static void l2norm_fv(float *v, int n)   // ggml_l2_norm: v / max(|v|, eps)
     int i;
     float nrm = sqrtf(ss);
     if (nrm < rms_eps) nrm = rms_eps;
-    // Canonical (docs/canonical-reductions.md): one correctly rounded reciprocal, then a
+    // Canonical (docs/units.md (Canonical reductions)): one correctly rounded reciprocal, then a
     // multiply per element - what the norm unit does - not a divide per element.
     float inv = 1.0f/nrm;
     i = 0;
