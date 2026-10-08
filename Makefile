@@ -3,6 +3,14 @@
 #
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+#
+#   make venv                     Python environment (.venv) with the trixium package
+#   make models | tiny | convert  PrismML models, tiny test models, GGUF -> BONS image
+#   make test | test-guarded      test suite (guarded: one process per file, memory watchdog)
+#   make sim | sim-run | ...      Verilator simulation (see the Simulation section)
+#   make gateware-xcu1525 | gateware-fk33
+#   make firmware | software | driver  BUILD=<build dir under build/>
+#   make clean-vivado | clean
 
 PYTHON  ?= .venv/bin/python
 PIP     ?= .venv/bin/pip
@@ -10,7 +18,7 @@ PYTEST  ?= $(PYTHON) -m pytest
 
 export PYTHONHASHSEED := 0
 
-# Environment ------------------------------------------------------------------------------------
+# Environment --------------------------------------------------------------------------------------
 
 .PHONY: venv
 venv:
@@ -18,7 +26,7 @@ venv:
 	$(PIP) install --upgrade pip
 	$(PIP) install -e ".[dev]"   # numpy tokenizers pyserial + pytest huggingface_hub; the `trixium` CLI
 
-# Models -----------------------------------------------------------------------------------------
+# Models -------------------------------------------------------------------------------------------
 
 .PHONY: models tiny convert
 models:
@@ -37,7 +45,7 @@ convert:
 	$(PYTHON) -m trixium.cli convert $(GGUF) --channels $(CHANNELS)
 	$(PYTHON) -m trixium.cli tokenizer $(dir $(GGUF))tokenizer.json
 
-# Tests ------------------------------------------------------------------------------------------
+# Tests --------------------------------------------------------------------------------------------
 
 .PHONY: test test-guarded
 test:
@@ -47,7 +55,7 @@ test:
 test-guarded:
 	$(PYTHON) tools/run_tests_guarded.py --out build/tests
 
-# Simulation (Verilator) -------------------------------------------------------------------------
+# Simulation (Verilator) ---------------------------------------------------------------------------
 #
 #   make sim                 build: headers, firmware, Verilog (~1 min), Verilator (~2.5 min)
 #   make sim-run             run it (console on stdin/stdout)
@@ -79,7 +87,7 @@ sim-gate:
 	    --ids '1 2 3' --dbg 3 --expect-silu --skip-off
 	$(PYTHON) tools/card_vs_mirror.py compare build/sim-gate/mirror.txt build/sim-gate/trace-on.txt
 
-# Gateware (Vivado 2024.1) -----------------------------------------------------------------------
+# Gateware (Vivado 2024.1) -------------------------------------------------------------------------
 
 .PHONY: gateware-xcu1525 gateware-fk33
 gateware-xcu1525:
@@ -88,7 +96,7 @@ gateware-xcu1525:
 gateware-fk33:
 	tools/build_fk33.sh fk33
 
-# Software ---------------------------------------------------------------------------------------
+# Software -----------------------------------------------------------------------------------------
 #
 # BUILD: the build directory (under build/) whose headers the firmware/host tools compile against.
 
@@ -104,7 +112,7 @@ software:
 driver:
 	$(MAKE) -C trixium/software/kernel
 
-# Cleanup ----------------------------------------------------------------------------------------
+# Cleanup ------------------------------------------------------------------------------------------
 
 .PHONY: clean-vivado clean
 clean-vivado:
