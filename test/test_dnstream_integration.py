@@ -55,12 +55,9 @@ def int_reference(m, q, k, v, decay, beta, scale):
     return m, out
 
 
-@pytest.mark.parametrize('shift', [0, 0x2000, -0x2000])
 @pytest.mark.parametrize('pair', [False, True])
 @pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
-def test_dnstream_op_through_the_cluster(placement, pair, shift):
-    # shift: the state written dstride beats (signed) away from where it was read, the read
-    # version left as it was (speculative decoding keeps it for a rollback); 0 = in place.
+def test_dnstream_op_through_the_cluster(placement, pair):
     L, rows, cols, heads = 2, 16, 16, 5
     R, G = rows//L, cols//8
     config = BonsaiClusterConfig(with_vecunit=True, scratchpad_size=16*1024, with_dnstream=True,
@@ -106,8 +103,7 @@ def test_dnstream_op_through_the_cluster(placement, pair, shift):
         for l in range(L):
             for i, value in enumerate(lane_beats(states, l)):
                 yield dut.models[l].mem[(offset[l] + wbase)//32 + i].eq(value)
-        for name, value in dict(kind=5, rows=heads, wbase=wbase, wlen=wlen, xsrc=T,
-                                dstride=(shift//32) & 0xFFFFFF).items():
+        for name, value in dict(kind=5, rows=heads, wbase=wbase, wlen=wlen, xsrc=T).items():
             yield from write(getattr(dut.engine_csr, name), value)
         yield from write(dut.engine_csr.submit, 1)
         for cycle in range(20000):
@@ -121,13 +117,8 @@ def test_dnstream_op_through_the_cluster(placement, pair, shift):
         for l in range(L):
             got = []
             for i in range(wlen):
-                got.append((yield dut.models[l].mem[(offset[l] + wbase + shift)//32 + i]))
+                got.append((yield dut.models[l].mem[(offset[l] + wbase)//32 + i]))
             assert got == lane_beats([w[0] for w in want], l), l
-            if shift:
-                old = []
-                for i in range(wlen):
-                    old.append((yield dut.models[l].mem[(offset[l] + wbase)//32 + i]))
-                assert old == lane_beats(states, l), l
         for h in range(heads):
             got = []
             for b in range(rows//8):

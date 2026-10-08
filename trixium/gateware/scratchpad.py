@@ -20,6 +20,9 @@ touches the scratchpad between hardware ops, so waits are boot/debug-path only.
 
 Addresses are in 256-bit words; the gather facade addresses int32 slots."""
 
+from functools import reduce
+from operator import or_
+
 from migen import *
 
 from litex.gen import *
@@ -312,3 +315,60 @@ class _ScratchpadCSR(LiteXModule):
                              for i in range(8)}),
             ),
         ]
+
+
+# Scratchpad Arbiter -------------------------------------------------------------------------------
+
+class BonsaiScratchpadArbiter(LiteXModule):
+    """Flat priority arbiter for the shared scratchpad client port.
+
+    Functionally identical to nesting BonsaiScratchpadClientMux once per auxiliary unit
+    (base = the vector unit, clients in the order they were attached, the LAST attached
+    busy client wins, else the base), with the same combinational latency: requests, the
+    write grant and the broadcast read data behave exactly as through the chain. What
+    changes is depth. The chain puts one serial 2:1 mux per client on the BRAM address,
+    data and enable pins and one AND per client on the grant back; with seven clients the
+    v11 VCU build failed setup at -1.519 ns on exactly those paths (docs/vcu-clock-
+    qualification.md). Here each client gets a one-hot select from a priority reduction
+    over the busy bits and the outputs are one AND-OR level, so depth grows with log2 of
+    the client count instead of linearly.
+    """
+
+    def __init__(self, base, clients):
+        clients = list(clients)
+        self.busy = Signal()
+        self.sp_rd_req = Signal()
+        self.sp_rd_adr = Signal.like(base.sp_rd_adr)
+        self.sp_rd_dat = Signal.like(base.sp_rd_dat)
+        self.sp_wr_req = Signal()
+        self.sp_wr_adr = Signal.like(base.sp_wr_adr)
+        self.sp_wr_we  = Signal.like(base.sp_wr_we)
+        self.sp_wr_dat = Signal.like(base.sp_wr_dat)
+        self.sp_wr_gnt = Signal()
+        self.aux_busy  = Signal()  # Any attached (non-base) client busy.
+
+        # One-hot select: client i wins when busy and no LATER client is busy.
+        n = len(clients)
+        later = [Signal(name=f"arb_later{i}") for i in range(n)]
+        sel = [Signal(name=f"arb_sel{i}") for i in range(n)]
+        base_sel = Signal()
+        for i in range(n):
+            self.comb += later[i].eq(reduce(or_, [c.busy for c in clients[i + 1:]], C(0, 1)))
+            self.comb += sel[i].eq(clients[i].busy & ~later[i])
+        any_aux = reduce(or_, [c.busy for c in clients], C(0, 1))
+        self.comb += [
+            self.aux_busy.eq(any_aux),
+            base_sel.eq(~any_aux),
+            self.busy.eq(base.busy | any_aux),
+        ]
+
+        def pick(field):
+            terms = [Mux(base_sel, getattr(base, field), 0)]
+            terms += [Mux(sel[i], getattr(clients[i], field), 0) for i in range(n)]
+            return reduce(or_, terms)
+
+        for field in ("sp_rd_req", "sp_rd_adr", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat"):
+            self.comb += getattr(self, field).eq(pick(field))
+        self.comb += [base.sp_rd_dat.eq(self.sp_rd_dat), base.sp_wr_gnt.eq(self.sp_wr_gnt & base_sel)]
+        for i, c in enumerate(clients):
+            self.comb += [c.sp_rd_dat.eq(self.sp_rd_dat), c.sp_wr_gnt.eq(self.sp_wr_gnt & sel[i])]

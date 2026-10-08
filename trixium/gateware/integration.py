@@ -21,7 +21,7 @@ from operator import or_
 
 from migen import C, ClockDomainsRenamer
 
-from trixium.gateware.scratchpad import BonsaiScratchpad
+from trixium.gateware.scratchpad import BonsaiScratchpad, BonsaiScratchpadArbiter
 from trixium.gateware.engreset import BonsaiEngineResetDomain
 from trixium.gateware.vector import BonsaiVectorUnit
 from trixium.gateware.sequencer import BonsaiSequencer
@@ -30,42 +30,19 @@ from trixium.gateware.csr_front import BonsaiEngineCSR
 from trixium.gateware.loader import BonsaiHBMLoader
 
 
-def native_read_options(regions, reservations, endpoints, *, write=False):
-    """Opt-in memory policy for the experimental native engine, not capability bits.
-
-    The target supplies physical facts/reservations once. Grant READ to the
-    bounded native path without mutating its conservative public capability
-    records. Optionally grant WRITE for the checked region-upload path as well;
-    this is still not a complete public region-I/O/runtime capability.
-    """
-    from dataclasses import replace
-    from trixium.capabilities import Access
-    access = Access.READ | (Access.WRITE if write else Access(0))
-    return dict(native_regions=tuple(replace(r, access=access) for r in regions),
-                native_reservations=tuple(reservations), native_endpoints=tuple(endpoints))
-
-
 @dataclass(frozen=True)
 class BonsaiClusterConfig:
     with_vecunit: bool = True
-    with_dual: bool = False
-    with_dnrec: bool = False
-    dnrec_exact: bool = True     # Portable exact IEEE operators (fp32_exact), not the vendor IP.
     chan_stride: int = 0
     chan_mod: int = 0
     chan_skew: int = 0
     scratchpad_size: int = 256*1024
     loader_data_width: int = 128
     with_sp_csr: bool = True
-    native_regions: tuple = ()
-    native_reservations: tuple = ()
-    native_endpoints: tuple = ()
     append_sp_csr: bool = False  # New peek bank after existing banks (targets that had no sp_csr).
     with_hadamard: bool = False
     with_activation_quantize: bool = False
     with_projection_restore: bool = False
-    with_embedding_restore: bool = False
-    with_region_fetch: bool = False
     with_silu: bool = False
     with_norm: bool = False
     with_conv: bool = False
@@ -74,23 +51,10 @@ class BonsaiClusterConfig:
     dnstream_options: tuple = () # (name, value) overrides of the unit's arguments (tests).
     with_attnstream: bool = False  # Engine op 6: the attention passes (scores, weighted V).
     attnstream_options: tuple = () # (name, value) overrides of the unit's arguments.
-    with_prefetch: bool = False    # Run-ahead weight prefetch per channel (gateware/prefetch.py).
-    prefetch_options: tuple = ()   # (name, value): depth, chunk, sched_depth.
-    nbatch: int = 1                # Batched matvec: token vectors per weight stream (1..4).
 
     def __post_init__(self):
-        for name in ('native_regions', 'native_reservations', 'native_endpoints'):
-            object.__setattr__(self, name, tuple(getattr(self, name)))
-        if not self.native_regions and (self.native_reservations or self.native_endpoints):
-            raise ValueError('native reservations/endpoints require a native region table')
-        if self.with_dnrec and not self.with_vecunit:
-            raise ValueError("DeltaNet recurrence needs the vector scratchpad arbiter")
-        if self.with_region_fetch and (not self.native_regions or not self.with_vecunit):
-            raise ValueError('Sequenced region fetch needs native memory regions and the vector/sequencer arbiter')
-        if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore or self.with_embedding_restore or self.with_silu or self.with_norm or self.with_conv) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
+        if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore or self.with_silu or self.with_norm or self.with_conv) and (not self.with_vecunit or self.scratchpad_size > 256*1024):
             raise ValueError("Resident clients need the vector/sequencer arbiter and at most 256 KiB scratchpad")
-        if self.native_regions and self.with_vecunit and self.scratchpad_size > 256*1024:
-            raise ValueError('Native sequencer needs at most 256 KiB scratchpad')
         if self.append_sp_csr and not self.with_sp_csr:
             raise ValueError('append_sp_csr requires a scratchpad CSR port')
         for name in ("chan_stride", "chan_mod"):
@@ -110,34 +74,28 @@ class BonsaiClusterConfig:
 def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     """Install one cluster on ``soc``; leave memory adapters/SoC bus/DMA to target.
 
-    All memory ports are 256-bit AXI in sys. Legacy commands and upload/store
-    retain stride/mod/skew placement. Optional native projections use explicit
-    region/offset/stride descriptors on the same reader and MAC per pipe; optional
-    checked region uploads share the existing writers. The optional native
-    sequencer consumes explicit pipe descriptors; full model lowering is still
-    separate unfinished work. Ports are
-    storage endpoints, not an assertion about board capacity.
+    All memory ports are 256-bit AXI in sys. Commands and upload/store use the
+    stride/mod/skew placement. Ports are storage endpoints, not an assertion about
+    board capacity.
     """
     ports = list(memory_ports)
     if not 1 <= len(ports) <= 31:
         raise ValueError("legacy cluster requires 1..31 memory ports")
     if config.chan_mod and len(ports) % config.chan_mod:
         raise ValueError("memory ports must divide evenly over controllers")
-    if config.native_regions and len(config.native_endpoints) != len(ports):
-        raise ValueError('native endpoint mapping must name every compute port')
     for port in ports:
         if port.data_width != 256 or port.address_width < 32:
             raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
         if getattr(port, "clock_domain", "sys") != "sys":
             raise ValueError("memory ports need target-side CDC into sys")
-    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "dnunit", "hadamard", "activation_quantize", "projection_restore", "embedding_restore", "silu", "norm", "conv", "sparb", "zznative", "zzregion", "zzverify"):
+    for name in ("scratchpad", "sp_csr", "zzxsp", "engrst", "engine", "engine_csr", "loader", "vecunit", "seq", "hadamard", "activation_quantize", "projection_restore", "silu", "norm", "conv", "sparb"):
         if hasattr(soc, name):
             raise ValueError("cluster would overwrite existing SoC module: " + name)
 
     soc.scratchpad = BonsaiScratchpad(size=config.scratchpad_size, xpm=config.scratchpad_xpm)
     sp_csr = None
     if config.with_sp_csr:
-        sp_csr = soc.scratchpad.add_csr_port(with_read_status=bool(config.native_regions))
+        sp_csr = soc.scratchpad.add_csr_port()
         setattr(soc, 'zzxsp' if config.append_sp_csr else 'sp_csr', sp_csr)
     soc.engrst = BonsaiEngineResetDomain(ports)
     axis = soc.engrst.masters
@@ -148,11 +106,9 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         vecunit = soc.vecunit = ClockDomainsRenamer("eng")(BonsaiVectorUnit())
         seq = soc.seq = ClockDomainsRenamer("eng")(BonsaiSequencer(
             with_hadamard=config.with_hadamard, with_activation_quantize=config.with_activation_quantize,
-            with_projection_restore=config.with_projection_restore,
-            with_embedding_restore=config.with_embedding_restore,
-            with_region_fetch=config.with_region_fetch, with_silu=config.with_silu,
+            with_projection_restore=config.with_projection_restore, with_silu=config.with_silu,
             with_norm=config.with_norm, with_conv=config.with_conv,
-            native_pipes=len(ports) if config.native_regions else 0, scratchpad_size=config.scratchpad_size))
+            scratchpad_size=config.scratchpad_size))
         soc.comb += [
             vecunit.seq_en.eq(seq.busy),
             vecunit.seq_start.eq(seq.vec_start),
@@ -175,26 +131,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     # on that chain with seven clients; the arbiter is proven equal to it).
     sp_clients = []
     base_busy = [vecunit.busy] if vecunit is not None else []
-    if config.with_dnrec:
-        from trixium.gateware.deltanet import BonsaiDeltaNetUnit
-        core = None
-        if config.dnrec_exact:
-            # Full IEEE binary32 (subnormals, canonical NaN): the CPU's semantics, and
-            # simulable by Verilator. The vendor operators flush subnormals.
-            from trixium.gateware.deltanet import BonsaiDeltaNetRecurrence
-            from trixium.gateware.fp32_exact import ExactFP32Add, ExactFP32Mul
-            core = BonsaiDeltaNetRecurrence(add_factory=ExactFP32Add, mul_factory=ExactFP32Mul)
-        soc.dnunit = ClockDomainsRenamer("eng")(BonsaiDeltaNetUnit(core=core,
-            with_dispatch_guard=bool(config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.with_silu or config.with_norm or config.with_conv or config.native_regions)))
-        sp_clients.append(soc.dnunit)
-        base_busy.append(soc.dnunit.busy)
-        soc.add_constant("BONSAI_HAS_DNREC")
-
     extensions = []
-    if config.with_dnrec and (config.with_hadamard or config.with_activation_quantize or config.with_projection_restore or config.with_embedding_restore or config.with_silu or config.with_norm or config.with_conv or config.native_regions):
-        # Manual vector starts are already masked by seq_en. Apply the same
-        # ownership rule to manual recurrence starts; never steal a read port.
-        soc.comb += soc.dnunit.dispatch_allowed.eq(~seq.busy)
     if config.with_hadamard:
         from trixium.gateware.hadamard_sp import BonsaiHadamardScratchpad
         soc.hadamard = ClockDomainsRenamer("eng")(BonsaiHadamardScratchpad(config.scratchpad_size))
@@ -220,12 +157,6 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             seq.restore_argmax_val_in.eq(soc.projection_restore.argmax.best_val),
         ]
         soc.add_constant("BONSAI_HAS_PROJECTION_RESTORE")
-    if config.with_embedding_restore:
-        from trixium.gateware.embedding_restore_sp import BonsaiEmbeddingScratchpad
-        soc.embedding_restore = ClockDomainsRenamer("eng")(BonsaiEmbeddingScratchpad(config.scratchpad_size))
-        sp_clients.append(soc.embedding_restore)
-        extensions.append(("embedding_restore", soc.embedding_restore))
-        soc.add_constant("BONSAI_HAS_EMBEDDING_RESTORE")
     if config.with_silu:
         from trixium.gateware.silu_sp import BonsaiSiluScratchpad
         soc.silu = ClockDomainsRenamer("eng")(BonsaiSiluScratchpad(config.scratchpad_size))
@@ -248,33 +179,17 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
 
     placement = dict(chan_stride=config.chan_stride, chan_mod=config.chan_mod,
                      chan_skew=config.chan_skew)
-    native = (dict(native_regions=config.native_regions, native_reservations=config.native_reservations,
-                   native_endpoints=config.native_endpoints) if config.native_regions else {})
     sp_client = vecunit
     if sp_clients:
         if vecunit is None:  # The chain had the same requirement (it wrapped the vector unit).
             raise ValueError("scratchpad units need the vector unit as the arbiter's base client")
-        from trixium.gateware.deltanet import BonsaiScratchpadArbiter
         soc.sparb = BonsaiScratchpadArbiter(vecunit, sp_clients)
         sp_client = soc.sparb
     soc.engine = ClockDomainsRenamer("eng")(
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
-                          seq=seq, dual=config.with_dual, **placement, **native,
+                          seq=seq, dual=False, **placement,
                           dnstream=config.with_dnstream and (config.dnstream_options or True),
-                          attnstream=config.with_attnstream and (config.attnstream_options or True),
-                          prefetch=config.with_prefetch and (config.prefetch_options or True),
-                          nbatch=config.nbatch,
-                          # Batched: nb vectors share the x-buffer. Deeper is free up to 512
-                          # words (1024-bit rows: 15 RAMB36 either way); the 27B's widest
-                          # segment (FFN down, 68 words) x 4 still fits 384.
-                          **({"xbuf_groups": 96*config.nbatch} if config.nbatch > 1 else {})))
-    if config.nbatch > 1:
-        soc.add_constant("BONSAI_HAS_NBATCH", config.nbatch)
-    if config.with_prefetch:
-        pf = soc.engine.prefetch_units[0]
-        soc.add_constant("BONSAI_HAS_PREFETCH")
-        soc.add_constant("BONSAI_PREFETCH_SCHED", pf.sched_depth)
-        soc.add_constant("BONSAI_PREFETCH_DEPTH", pf.depth)
+                          attnstream=config.with_attnstream and (config.attnstream_options or True)))
     if config.with_attnstream:
         at = soc.engine.attnstream
         soc.add_constant("BONSAI_HAS_ATTNSTREAM")
@@ -286,9 +201,6 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         soc.add_constant("BONSAI_HAS_DNSTREAM")
         soc.add_constant("BONSAI_DNSTREAM_LANES", len(axis))
         soc.add_constant("BONSAI_DNSTREAM_ZERO")     # op 5 bias bit 0: state taken as +0.0
-        soc.add_constant("BONSAI_DNSTREAM_WSHIFT")   # op 5 writes at wbase + signed dstride beats
-        if dict(config.dnstream_options or ()).get("pair"):
-            soc.add_constant("BONSAI_DNSTREAM_PAIR")  # records: even heads, then odd
     soc.engine_csr = BonsaiEngineCSR(soc.engine, seq=seq)
     for name, unit in extensions:
         from migen import Signal
@@ -309,37 +221,15 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
             getattr(seq, name + "_done").eq(unit.done), getattr(seq, name + "_failed").eq(unit.error),
             unit.cancel.eq(soc.engine_csr.rst_trigger | soc.engine_csr.rst_busy),
         ]
-    if config.native_regions:
-        from trixium.gateware.native_csr import BonsaiNativeCSR
-        soc.zznative = BonsaiNativeCSR(soc.engine, soc.engine_csr, seq=seq)
-        soc.add_constant('BONSAI_HAS_NATIVE_ENGINE')
-        if seq is not None:
-            soc.add_constant('BONSAI_HAS_NATIVE_SEQ')
-        from trixium.gateware.region_read_csr import BonsaiRegionReadCSR
-        soc.zzverify = BonsaiRegionReadCSR(soc.engine, soc.engine_csr,
-                                         scratchpad_csr=sp_csr, seq=seq if config.with_region_fetch else None)
-        soc.add_constant('BONSAI_HAS_REGION_READ')
-        if config.with_region_fetch:
-            soc.add_constant('BONSAI_HAS_REGION_FETCH_SEQ')
     soc.comb += [
         soc.engrst.trigger.eq(soc.engine_csr.rst_trigger),
         soc.engine_csr.rst_busy.eq(soc.engrst.busy),
         soc.engine_csr.rst_stuck.eq(soc.engrst.stuck),
     ]
-    if config.with_dual:
-        soc.add_constant("BONSAI_HAS_DUALQ")
 
-    from trixium.capabilities import Access
-    region_upload = (dict(regions=config.native_regions, reservations=config.native_reservations,
-                          endpoints=config.native_endpoints)
-                     if any(r.access & Access.WRITE for r in config.native_regions) else {})
     soc.loader = ClockDomainsRenamer("eng")(
-        BonsaiHBMLoader(axis, data_width=config.loader_data_width, **placement, **region_upload,
+        BonsaiHBMLoader(axis, data_width=config.loader_data_width, **placement,
                         with_mstore=config.with_dnstream))
-    if region_upload:
-        from trixium.gateware.region_csr import BonsaiRegionUploadCSR
-        soc.zzregion = BonsaiRegionUploadCSR(soc.loader, soc.engine_csr)
-        soc.add_constant('BONSAI_HAS_REGION_UPLOAD')
     soc.comb += [
         soc.engine.store_cmd.connect(soc.loader.store_cmd),
         soc.engine.store_data.connect(soc.loader.store_data),

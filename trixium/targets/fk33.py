@@ -8,14 +8,10 @@
 
 # Build/Use (from the repo root: USPHBM2 resolves ip/hbm/<name>.xci relative to CWD, and ip/hbm
 # is a symlink at the TCK variant you are building - ip/hbm900 or ip/hbm800):
-# ./trixium.py --variant=a --build --load
+# tools/build_fk33.sh <name>  (the recipe that ships), or by hand:
+# ./trixium.py --engine-channels 16 --hbm-tck 800 --sys-clk-freq 212.5e6 --build --load
 # litex_server --jtag --jtag-config=prog/openocd_xc7_ft2232.cfg --jtag-chain=2
 # litex_term crossover
-#
-# Variants:
-# - a: Infrastructure : HBM2 + PCIe x4 + per-channel bandwidth BIST + JTAGBone + Crossover-UART.
-# - b: a + Ternary MatVec Engine (host-driven, N=4 HBM channels).
-# - c: Full inference  : Engine + Vector Unit + KV-Cache + Top-K + firmware token loop.
 
 import atexit
 import os
@@ -57,28 +53,18 @@ class _CRG(LiteXModule):
 # BonsaiSoC ----------------------------------------------------------------------------------------
 
 class BonsaiSoC(SoCCore):
-    def __init__(self, variant="a", sys_clk_freq=225e6, pcie_lanes=4, engine_channels=None,
-                 with_nvme=False, with_vecunit=False, with_dual=False, hbm_tck=900,
-                 with_memory_traffic=False, with_capabilities=True, with_native=False,
+    def __init__(self, sys_clk_freq=225e6, pcie_lanes=4, engine_channels=16, hbm_tck=900,
+                 with_capabilities=True,
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
+                 with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
                  attn_geometry=None,
-                 with_region_fetch=False,
                  **kwargs):
-        # Phase-2 exploration flags (see docs/phase2.md).
-        if with_nvme:
-            raise NotImplementedError(
-                "--with-nvme (LiteNVMe standalone weight loading) is a phase-2 option: the "
-                "PCIe lanes switch from endpoint (host) to root (NVMe) role - mutually "
-                "exclusive with --with-pcie host access. See docs/phase2.md.")
-        assert variant in ["a", "b", "c"]
         # The HBM AXI clock must sit in [tck/4, tck/2] (PG276). tck is the stack clock set
         # by the IP's PLL divider: 900 MHz (1800 Mbps, ip/hbm900/hbm_0.xci) -> 225..450 MHz;
         # 800 MHz (1600 Mbps, ip/hbm800/hbm_800.xci) -> 200..400 MHz at 11% less bandwidth,
         # which buys timing headroom when the fabric cannot make 225.
         assert hbm_tck in (800, 900)
         assert (hbm_tck/4)*1e6 <= sys_clk_freq <= (hbm_tck/2)*1e6 # HBM AXI clock range.
-        self.bonsai_variant = variant
         platform = Platform()
 
         # CRG --------------------------------------------------------------------------------------
@@ -90,8 +76,8 @@ class BonsaiSoC(SoCCore):
         kwargs["with_jtagbone"]  = True
         kwargs["jtagbone_chain"] = 2 # Chain 1 already used by HBM2 debug probes.
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = f"TriXium {variant.upper()} on FK33", **kwargs)
-        self.add_constant("BONSAI_VARIANT", ord(variant))
+            ident = "TriXium B on FK33", **kwargs)
+        self.add_constant("BONSAI_VARIANT", ord("b"))
 
         # HBM --------------------------------------------------------------------------------------
         # 32 pseudo-channels; CPU/BIOS window on channel 0 only (main_ram). Channels 1..31 are
@@ -132,16 +118,12 @@ class BonsaiSoC(SoCCore):
             sys_clk_freq = sys_clk_freq)
 
         # Bonsai -----------------------------------------------------------------------------------
-        # Channel budget: ch0 = CPU main_ram (AXI-Lite window); engine/loader own ch1..N;
-        # BIST muxes over the remaining channels. N scales the engine (phase-1 default 4;
-        # 8B needs N >= 16, phase-2 throughput target N = 31).
-        if engine_channels is None:
-            engine_channels = {"a": 0, "b": 4, "c": 8}[variant]
-        assert 0 <= engine_channels <= 31
+        # Channel budget: ch0 = CPU main_ram (AXI-Lite window); engine/loader own ch1..N
+        # (the 8B needs N >= 16, max 31).
+        assert 1 <= engine_channels <= 31
         engine_axis   = [hbm.axi[1 + i] for i in range(engine_channels)]
-        bist_channels = list(range(1 + engine_channels, 32))
 
-        with_bonsai            = variant in ["b", "c"]
+        with_bonsai            = True
         cluster_chan_mod       = 0     # One flat HBM address space.
         cluster_mem_cpu_offset = None  # The CPU window passes through 1:1 (the default).
         cluster_n_memctrl      = None  # The BIOS owns the one memory system.
@@ -149,10 +131,9 @@ class BonsaiSoC(SoCCore):
         cluster_chan_stride    = HBM_CHAN_STRIDE  # 256 MB: one pseudo-channel per engine channel.
         cluster_chan_skew      = 0     # No shared controller, no bank skew.
         cluster_weight_base    = HBM_WEIGHT_BASE  # +64 MB into it (port-matched, CPU-safe).
-        cluster_with_dnrec     = False # The XCU1525-only exact-FP32 recurrence engine.
         # One portable wiring implementation; board policy stays here.
         if with_bonsai:
-            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
+            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
             from trixium.gateware.xilinx_constraints import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
             def memory_description():
@@ -167,31 +148,18 @@ class BonsaiSoC(SoCCore):
                                 Reservation(HBM_META_OFFSET//HBM_CHANNEL_SIZE, ReservationKind.UPLOAD_STAGING,
                                             HBM_META_OFFSET % HBM_CHANNEL_SIZE, 0x100000)]
                 return regions, reservations
-            native = (native_read_options(*memory_description(), [0]*engine_channels, write=True)
-                      if with_native else {})
             config = BonsaiClusterConfig(scratchpad_xpm=True,
-                with_vecunit=with_vecunit, with_dual=with_dual,
-                with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
+                chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
                 with_activation_quantize=with_activation_quantize, with_projection_restore=with_projection_restore,
-                with_embedding_restore=with_embedding_restore, with_region_fetch=with_region_fetch,
                 with_silu=with_silu, with_norm=with_norm, with_conv=with_conv,
                 with_dnstream=bool(with_dnstream),
-                dnstream_options=(("pair", True),) if with_dnstream == "pair" else (),
                 with_attnstream=attn_geometry is not None,
                 attnstream_options=tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                     (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
-                    if attn_geometry else (),
-                **native)
+                    if attn_geometry else ())
             add_bonsai_cluster(self, engine_axis, config)
-            if with_memory_traffic:
-                from trixium.gateware.traffic import add_memory_traffic
-                add_memory_traffic(self, engine_axis)
-            add_cluster_constraints(platform, with_vecunit=with_vecunit)
-            if cluster_with_dnrec and not config.dnrec_exact:
-                # Vendor implementations are target-owned, not portable-core sources.
-                platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
-                platform.add_ip(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
+            add_cluster_constraints(platform)
             self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
                 SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
             self.comb += self.pcie_dma0.source.connect(
@@ -220,44 +188,26 @@ class BonsaiSoC(SoCCore):
                 self.bonsai_capabilities = add_capabilities(self, config, engine_axis, regions, reservations,
                                                            sys_hz=configured_sys_hz)
 
-
-        # Per-channel HBM bandwidth BIST (channels not owned by the engine). Skipped on
-        # phase-2 inference builds (--with-vecunit): its 20+ channels of unsliced macro-
-        # boundary FIFO paths were the residual 225MHz timing family, and the archived
-        # phase-1 bitstreams remain the bandwidth-test vehicle.
-        if not with_vecunit:
-            from trixium.gateware.bist import BonsaiHBMBIST
-            self.bist = BonsaiHBMBIST(hbm.axi, channels=bist_channels)
-
 # Build --------------------------------------------------------------------------------------------
 
 def main():
     from litex.build.parser import LiteXArgumentParser
     parser = LiteXArgumentParser(platform=Platform, description="TriXium SoC on FK33.")
-    parser.add_target_argument("--variant",      default="a",               help="Bonsai variant (a: infra, b: matvec, c: full).")
     parser.add_target_argument("--sys-clk-freq", default=225e6, type=float, help="System clock frequency (= HBM AXI clock, 225-450 MHz).")
     parser.add_target_argument("--pcie-lanes",   default=4, type=int,       choices=[2, 4, 8, 16], help="PCIe lane count.")
     parser.add_target_argument("--driver",       action="store_true",       help="Generate LitePCIe driver headers.")
-    parser.add_target_argument("--engine-channels", default=None, type=int, help="Engine HBM channel count override (default: 4 for b, 8 for c; 8B needs >= 16, max 31).")
-    parser.add_target_argument("--with-nvme",    action="store_true",       help="Phase-2: standalone NVMe weight loading (LiteNVMe root, no host PCIe) - not implemented yet.")
+    parser.add_target_argument("--engine-channels", default=16, type=int, help="Engine HBM channel count (the 8B needs >= 16, max 31).")
     parser.add_target_argument("--hbm-tck",      default=900, type=int, choices=[800, 900], help="HBM stack clock MHz: 900 (AXI 225-450) or 800 (AXI 200-400, -11%% bandwidth).")
-    parser.add_target_argument("--with-dual",    action="store_true",       help="Phase-2: dual-Q GQA + speculative pair-verify datapath (~2x engine area; needs headroom).")
-    parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent accelerator AXI counters (not physical HBM traffic).")
-    parser.add_target_argument("--with-native", action="store_true", help="Experimental shared native PTQ/Q8 engine and append-only controls; no FK33 deployment qualification.")
     parser.add_target_argument("--with-hadamard", action="store_true", help="Experimental sequenced scratchpad integer rotations; no FK33 deployment qualification.")
     parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 and post-rotation Q8 quantization; no FK33 deployment qualification.")
     parser.add_target_argument("--with-projection-restore", action="store_true", help="Experimental resident int32 projection to FP32 restoration; no FK33 deployment qualification.")
-    parser.add_target_argument("--with-embedding-restore", action="store_true", help="Experimental compact PTQ embedding restoration; no FK33 deployment qualification.")
     parser.add_target_argument("--with-silu", action="store_true", help="Exact FP32 SiLU-multiply scratchpad unit (sequencer unit 11).")
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
-    parser.add_target_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
                                help="Attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
-    parser.add_target_argument("--with-region-fetch", action="store_true", help="Experimental sequenced 64-bit checked region reads; requires --with-native.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
-    parser.add_target_argument("--with-vecunit", action="store_true",       help="Phase-2: microcoded vector unit + resident attention (all offload milestones sim-gated 2026-07-29; default off so the archived phase-1 bitstreams stay reproducible).")
     args = parser.parse_args()
 
     # Builds must run from the repo root: USPHBM2 resolves the XCI as <cwd>/ip/hbm/<name>.xci.
@@ -280,24 +230,16 @@ def main():
         atexit.register(lambda p=_hbm_xci: os.path.islink(p) and os.unlink(p))
 
     soc = BonsaiSoC(
-        variant         = args.variant,
         engine_channels = args.engine_channels,
-        with_nvme       = args.with_nvme,
-        with_vecunit    = args.with_vecunit,
-        with_dual       = args.with_dual,
-        with_memory_traffic = args.with_memory_traffic,
         with_capabilities = not args.no_capabilities,
-        with_native       = args.with_native,
         with_hadamard     = args.with_hadamard,
         with_activation_quantize = args.with_activation_quantize,
         with_projection_restore = args.with_projection_restore,
-        with_embedding_restore = args.with_embedding_restore,
         with_silu              = args.with_silu,
         with_norm              = args.with_norm,
         with_conv              = args.with_conv,
-        with_dnstream          = ("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
+        with_dnstream          = args.with_dnstream,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
-        with_region_fetch = args.with_region_fetch,
         hbm_tck         = args.hbm_tck,
         sys_clk_freq = args.sys_clk_freq,
         pcie_lanes   = args.pcie_lanes,
@@ -309,11 +251,9 @@ def main():
        "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
         soc.add_constant("BONSAI_HAS_ZBB")
 
-    # Per-variant build directory (default Builder output_dir collides across variants).
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
-        suffix = f"_n{args.engine_channels}" if args.engine_channels is not None else ""
-        builder_argd["output_dir"] = os.path.join("build", f"trixium_{args.variant}{suffix}")
+        builder_argd["output_dir"] = os.path.join("build", f"fk33_n{args.engine_channels}")
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = "csr.csv"
 

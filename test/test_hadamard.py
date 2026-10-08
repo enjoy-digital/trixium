@@ -235,32 +235,3 @@ def test_compiled_integer_hadamard(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "HADAMARD_COMPILED_PASS" in result.stdout
     print(result.stdout)
-
-
-def test_synthesis_probe_generator_refuses_overwrite(tmp_path):
-    import sys
-
-    tool = Path(__file__).resolve().parents[1] / "tools/synth_hadamard.py"
-    output = tmp_path / "probe"
-    args = [sys.executable, str(tool), "--output-dir", str(output)]
-    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
-    initial = {path.name: path.read_bytes() for path in output.iterdir()}
-    assert set(initial) == {"integer_hadamard.v", "synth.tcl", "synth.xdc"}
-    assert b"-mode out_of_context" in initial["synth.tcl"]
-    assert b"set_false_path" not in initial["synth.xdc"]
-    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
-    assert result.returncode != 0
-    assert {path.name: path.read_bytes() for path in output.iterdir()} == initial
-
-
-def test_synthesis_probe_generator_validates_part(tmp_path):
-    import sys
-
-    tool = Path(__file__).resolve().parents[1] / "tools/synth_hadamard.py"
-    output = tmp_path / "probe"
-    result = subprocess.run([sys.executable, str(tool), "--output-dir", str(output),
-                             "--part", "not-a-part; error injected"], capture_output=True,
-                            text=True, timeout=30)
-    assert result.returncode != 0 and "invalid FPGA part name" in result.stderr
-    assert not output.exists()

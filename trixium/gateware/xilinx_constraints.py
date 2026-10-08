@@ -7,7 +7,7 @@ coverage checks. In particular a signal-name refactor is not physically neutral.
 """
 
 
-def add_cluster_constraints(platform, with_vecunit=True):
+def add_cluster_constraints(platform):
     # engreset holds reset for 64 sys cycles. Preserve setup=4 / hold=3 for the
     # reset launch net; firmware cannot submit during the reset/drain handshake.
     platform.add_platform_command(
@@ -16,22 +16,15 @@ def add_cluster_constraints(platform, with_vecunit=True):
     platform.add_platform_command(
         "set_multicycle_path -hold 3 -from "
         "[get_cells -hierarchical -filter {{NAME =~ *eng_rst_reg*}}]")
-    # The 2 Mbit shared scratchpad, the recurrence's state banks and the norm unit's weight
-    # buffer in BLOCK RAM. Left to inference, part of the scratchpad went to LUT RAM: every
+    # The 2 Mbit shared scratchpad and the norm unit's weight buffer in BLOCK RAM. Left to inference, part of the scratchpad went to LUT RAM: every
     # client address then fans out to thousands of LUT-RAM cells across the die, and v15
     # (more clients, more area) placed those paths at -4 ns (route 9.2 ns of 11).
-    for name in ("bonsai_scratchpad", "dn_state", "norm_wbuf"):
+    for name in ("bonsai_scratchpad", "norm_wbuf"):
         platform.add_platform_command(
             "set_property RAM_STYLE block [get_cells -quiet -hierarchical -filter "
             "{{NAME =~ *" + name + "*_reg*}}]")
-    # The run-ahead weight prefetch FIFOs (gateware/prefetch.py): 16k x 256 bits per channel,
-    # UltraRAM (the block RAM could not hold 16 of them). -quiet: absent without prefetch.
+    # Preserve distributed vector imem: a BRAM output register changes the
+    # decode launch's clock-to-out and placement. No vector multicycle paths.
     platform.add_platform_command(
-        "set_property RAM_STYLE ultra [get_cells -quiet -hierarchical -filter "
-        "{{NAME =~ *pf_fifo*_reg*}}]")
-    if with_vecunit:
-        # Preserve distributed vector imem: a BRAM output register changes the
-        # decode launch's clock-to-out and placement. No vector multicycle paths.
-        platform.add_platform_command(
-            "set_property RAM_STYLE distributed "
-            "[get_cells -hierarchical -filter {{NAME =~ *imem_reg*}}]")
+        "set_property RAM_STYLE distributed "
+        "[get_cells -hierarchical -filter {{NAME =~ *imem_reg*}}]")

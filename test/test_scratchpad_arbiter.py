@@ -11,9 +11,41 @@ the busy combinations for one to six attached clients, with random payloads.
 import random
 
 import pytest
-from migen import Module, Signal, run_simulation
+from migen import Module, Signal, Mux, run_simulation
 
-from trixium.gateware.deltanet import BonsaiScratchpadArbiter, BonsaiScratchpadClientMux
+from litex.gen import LiteXModule
+
+from trixium.gateware.scratchpad import BonsaiScratchpadArbiter
+
+# Reference: the nested 2:1 client mux the arbiter replaced.
+class BonsaiScratchpadClientMux(LiteXModule):
+    """Give an auxiliary unit priority over the vector-unit scratchpad client."""
+
+    def __init__(self, vector, auxiliary):
+        self.busy = Signal()
+        self.sp_rd_req = Signal()
+        self.sp_rd_adr = Signal.like(vector.sp_rd_adr)
+        self.sp_rd_dat = Signal.like(vector.sp_rd_dat)
+        self.sp_wr_req = Signal()
+        self.sp_wr_adr = Signal.like(vector.sp_wr_adr)
+        self.sp_wr_we  = Signal.like(vector.sp_wr_we)
+        self.sp_wr_dat = Signal.like(vector.sp_wr_dat)
+        self.sp_wr_gnt = Signal()
+        sel = auxiliary.busy
+        self.comb += [
+            self.busy.eq(vector.busy | auxiliary.busy),
+            self.sp_rd_req.eq(Mux(sel, auxiliary.sp_rd_req, vector.sp_rd_req)),
+            self.sp_rd_adr.eq(Mux(sel, auxiliary.sp_rd_adr, vector.sp_rd_adr)),
+            vector.sp_rd_dat.eq(self.sp_rd_dat),
+            auxiliary.sp_rd_dat.eq(self.sp_rd_dat),
+            self.sp_wr_req.eq(Mux(sel, auxiliary.sp_wr_req, vector.sp_wr_req)),
+            self.sp_wr_adr.eq(Mux(sel, auxiliary.sp_wr_adr, vector.sp_wr_adr)),
+            self.sp_wr_we.eq(Mux(sel, auxiliary.sp_wr_we, vector.sp_wr_we)),
+            self.sp_wr_dat.eq(Mux(sel, auxiliary.sp_wr_dat, vector.sp_wr_dat)),
+            vector.sp_wr_gnt.eq(self.sp_wr_gnt & ~sel),
+            auxiliary.sp_wr_gnt.eq(self.sp_wr_gnt & sel),
+        ]
+
 
 WIDTHS = dict(sp_rd_adr=13, sp_rd_dat=256, sp_wr_adr=13, sp_wr_we=8, sp_wr_dat=256)
 DRIVEN = ("busy", "sp_rd_req", "sp_rd_adr", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat")

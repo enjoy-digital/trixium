@@ -39,14 +39,6 @@ def add_capabilities(soc, config, memory_ports, regions, reservations=(), *, sys
     features = Feature.SOFT_RESET | Feature.COHERENT_OVERLAP
     if config.with_vecunit:
         features |= Feature.VECTOR | Feature.SEQUENCER
-    if config.with_dual:
-        features |= Feature.DUAL_Q
-    if config.with_dnrec:
-        features |= Feature.DELTANET_FP32
-    if hasattr(soc, 'traffic_axi0'):
-        features |= Feature.AXI_TRAFFIC
-    if hasattr(soc, 'traffic_ddr0'):
-        features |= Feature.DDR_TRAFFIC
     # Target supplies the configured frequency, not merely the requested one.
     # The current eng domain is the sys clock; independent clocks are future work.
     caps = Capabilities(sys_hz, sys_hz, len(memory_ports),

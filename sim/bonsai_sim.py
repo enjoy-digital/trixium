@@ -76,13 +76,11 @@ DDR4_SIM_CSR_STRIDE  = 0x1000
 
 class BonsaiSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
-                 dual=True, cpu_type="vexriscv", icache_kb=0, vexii_extra="",
-                 mem="hbm", n_memctrl=4, update_repo="no", with_memory_traffic=False,
-                 with_capabilities=True, with_native=False, with_hadamard=False, with_activation_quantize=False,
-                 with_projection_restore=False, with_embedding_restore=False, with_region_fetch=False,
-                 with_silu=False, with_norm=False, with_conv=False, with_dnrec=False,
-                 with_dnstream=False, attn_geometry=None, prefetch=0, ddr_split=False,
-                 nbatch=1):
+                 cpu_type="vexriscv", icache_kb=0, vexii_extra="",
+                 mem="hbm", n_memctrl=4, update_repo="no",
+                 with_capabilities=True, with_hadamard=False, with_activation_quantize=False,
+                 with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
+                 with_dnstream=False, attn_geometry=None, ddr_split=False):
         assert mem in ("hbm", "ddr4")
         assert not ddr_split or mem == "ddr4"
         self.ddr_split = ddr_split
@@ -198,7 +196,7 @@ class BonsaiSimSoC(SoCCore):
         else:
             chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
         # Same integration as both hardware targets; only memory/physical policy differs.
-        from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
+        from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
         def memory_description():
             from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
             if mem == 'hbm':
@@ -220,33 +218,18 @@ class BonsaiSimSoC(SoCCore):
                     test_base + (c % chan_mod)*(DDR4_SIM_CHAN_STRIDE + DDR4_SIM_CHAN_SKEW), 0x1000)
                     for c in range(n_channels)]
             return regions, reservations
-        native = (native_read_options(*memory_description(),
-                   list(range(n_channels)) if mem == 'hbm' else [c//chan_mod for c in range(n_channels)], write=True)
-                  if with_native else {})
-        config = BonsaiClusterConfig(
-            with_vecunit=True, with_dual=dual, with_sp_csr=with_native, append_sp_csr=with_native,
+        config = BonsaiClusterConfig(with_sp_csr=False,
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
             chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0,
             with_hadamard=with_hadamard, with_activation_quantize=with_activation_quantize,
-            with_projection_restore=with_projection_restore, with_embedding_restore=with_embedding_restore,
-            with_region_fetch=with_region_fetch, with_silu=with_silu,
-            with_norm=with_norm, with_conv=with_conv, with_dnrec=with_dnrec,
-            with_prefetch=bool(prefetch),
-            nbatch=nbatch,
-            prefetch_options=(("depth", prefetch), ("chunk", 64), ("sched_depth", 1024)) if prefetch else (),
+            with_projection_restore=with_projection_restore, with_silu=with_silu,
+            with_norm=with_norm, with_conv=with_conv,
             with_dnstream=bool(with_dnstream),
-            dnstream_options=(("pair", True),) if with_dnstream == "pair" else (),
             with_attnstream=attn_geometry is not None,
             attnstream_options=tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
-                if attn_geometry else (),
-            **native)
+                if attn_geometry else ())
         add_bonsai_cluster(self, axis, config)
-        if with_memory_traffic:
-            from trixium.gateware.traffic import add_memory_traffic
-            controllers = [self.sdrams[i].controller.interface
-                           for i in range(n_memctrl)] if mem == 'ddr4' else []
-            add_memory_traffic(self, axis, controllers)
         if with_capabilities:
             from trixium.gateware.capabilities import add_capabilities
             regions, reservations = memory_description()
@@ -387,12 +370,6 @@ def main():
     parser.add_argument("--hbm-latency",    default=16, type=int)
     parser.add_argument("--hbm-stall-rate", default=0, type=int)
     parser.add_argument("--threads",        default=4, type=int)
-    parser.add_argument("--dual",           action="store_true",
-        help="Build the dual-Q engine (S3/S6 head-B datapath, spec decode). The default is the "
-             "slim engine the hardware builds ship (no --with-dual): the dual attention path "
-             "(attn_seq2_layer) is not what the card runs, and on 2026-09-11 it was the one "
-             "diverging from the mirror while the slim path matched at every checksum.")
-    parser.add_argument("--no-dual",        action="store_true", help=argparse.SUPPRESS)  # old default
     parser.add_argument("--mem",            default="hbm", choices=["hbm", "ddr4"],
         help="hbm: one independent channel model per engine channel (the FK33's shape, the "
              "default). ddr4: the XCU1525's memory system on LiteDRAM's PHY model - N "
@@ -401,27 +378,17 @@ def main():
     parser.add_argument("--ddr-split",      action="store_true",
         help="--mem ddr4: the controllers in their own ddr clock domain (the XCU1525's --ddr-clk-freq).")
     parser.add_argument("--n-memctrl",      default=4, type=int, help="--mem ddr4: controllers.")
-    parser.add_argument("--with-memory-traffic", action="store_true", help="Enable coherent memory traffic counters.")
-    parser.add_argument("--with-native", action="store_true", help="Enable the experimental shared native projection engine.")
     parser.add_argument("--with-hadamard", action="store_true", help="Enable experimental sequenced scratchpad integer rotations.")
     parser.add_argument("--with-activation-quantize", action="store_true", help="Enable experimental resident FP32 and post-rotation Q8 quantization.")
     parser.add_argument("--with-projection-restore", action="store_true", help="Enable experimental resident int32 projection to FP32 restoration.")
-    parser.add_argument("--with-embedding-restore", action="store_true", help="Enable experimental compact PTQ embedding restoration.")
     parser.add_argument("--with-silu", action="store_true", help="Enable the exact FP32 SiLU-multiply scratchpad unit (sequencer unit 11).")
     parser.add_argument("--with-norm", action="store_true", help="Enable the exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_argument("--with-conv", action="store_true", help="Enable the exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_argument("--with-dnstream", action="store_true", help="Enable the DeltaNet stream unit (engine op 5, one lane per channel).")
-    parser.add_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
-    parser.add_argument("--with-prefetch", nargs="?", const=4096, default=0, type=int,
-                        help="Run-ahead weight prefetch: FIFO depth in beats per channel (default 4096).")
     parser.add_argument("--out-dir", default=None,
                         help="Build directory (default: build/sim, build/sim_ddr4 or build/sim_ddr4_split).")
-    parser.add_argument("--nbatch", default=1, type=int,
-                        help="Batched matvec: token vectors per weight stream (1..4, engine cmd.nb).")
     parser.add_argument("--with-attnstream", nargs="?", const="8,2,128,256", default=None,
                         help="Enable the attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
-    parser.add_argument("--with-dnrec", action="store_true", help="DeltaNet recurrence unit on the exact FP32 operators (the board's hardware path).")
-    parser.add_argument("--with-region-fetch", action="store_true", help="Enable sequenced checked region reads; requires --with-native.")
     parser.add_argument("--no-capabilities", action="store_true", help="Omit read-only capability ROM.")
     args = parser.parse_args()
     out_dir = args.out_dir or ("build/sim" if args.mem == "hbm" else
@@ -432,19 +399,18 @@ def main():
     if args.ddr_split:
         sim_config.add_clocker("ddr_clk", int(1e6)*DDR_SPLIT_CLK_RATIO)
 
+    soc_kwargs = dict(cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
+        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
+        mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
+        with_capabilities=not args.no_capabilities, with_hadamard=args.with_hadamard,
+        with_activation_quantize=args.with_activation_quantize,
+        with_projection_restore=args.with_projection_restore,
+        with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
+        with_dnstream=args.with_dnstream, attn_geometry=attn_geometry(args.with_attnstream),
+        ddr_split=args.ddr_split)
+
     if args.build_software:
-        soc     = BonsaiSimSoC(image=args.image, firmware=None, dual=args.dual,
-        cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
-            hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
-            mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
-            with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
-            with_native=args.with_native, with_hadamard=args.with_hadamard,
-            with_activation_quantize=args.with_activation_quantize, with_projection_restore=args.with_projection_restore,
-            with_embedding_restore=args.with_embedding_restore, with_region_fetch=args.with_region_fetch,
-            with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
-            with_dnrec=args.with_dnrec, with_dnstream=("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
-            attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch,
-            ddr_split=args.ddr_split, nbatch=args.nbatch)
+        soc     = BonsaiSimSoC(image=args.image, firmware=None, **soc_kwargs)
         builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
         builder.compile_gateware = False
         builder.build(sim_config=sim_config, run=False)
@@ -452,18 +418,7 @@ def main():
             soc.bonsai_capabilities.write_artifacts(builder.output_dir)
         return
 
-    soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, dual=args.dual,
-        cpu_type=args.cpu_type, icache_kb=args.icache_kb, vexii_extra=args.vexii_extra,
-        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate,
-        mem=args.mem, n_memctrl=args.n_memctrl, update_repo=args.update_repo,
-        with_memory_traffic=args.with_memory_traffic, with_capabilities=not args.no_capabilities,
-        with_native=args.with_native, with_hadamard=args.with_hadamard,
-        with_activation_quantize=args.with_activation_quantize, with_projection_restore=args.with_projection_restore,
-        with_embedding_restore=args.with_embedding_restore, with_region_fetch=args.with_region_fetch,
-            with_silu=args.with_silu, with_norm=args.with_norm, with_conv=args.with_conv,
-            with_dnrec=args.with_dnrec, with_dnstream=("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
-            attn_geometry=attn_geometry(args.with_attnstream), prefetch=args.with_prefetch,
-            ddr_split=args.ddr_split, nbatch=args.nbatch)
+    soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, **soc_kwargs)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
     # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the

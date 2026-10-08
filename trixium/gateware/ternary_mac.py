@@ -74,7 +74,7 @@ KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre
 
 class BonsaiChannelPipe(LiteXModule):
     def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1,
-                 dual=True, semantic=False, with_native=False, nbatch=1):
+                 dual=True, semantic=False, with_native=False):
         if semantic and with_native:
             raise ValueError('choose semantic-only or selectable native ingress, not both')
         checked = semantic or with_native
@@ -85,13 +85,6 @@ class BonsaiChannelPipe(LiteXModule):
         # AXPY accumulator bank, x-buffer copy). It roughly DOUBLES the pipe's area, so
         # hardware builds that do not need dual-Q GQA / speculative pair-verify leave it
         # out (the firmware falls back to the single-head sequencer lists).
-        # nbatch: up to this many token vectors per weight stream (batched verification,
-        # docs/speculative-verify-design.md step 2), time-multiplexed on the ONE lane set:
-        # each code beat is replayed nb times, vector b reading its x at word b*xw and
-        # accumulating in its own (rotating) accumulator; results carry head = b. Ternary
-        # and Q8 matvec only, legacy beat ingress only (the engine rejects the rest).
-        assert 1 <= nbatch <= 4
-        assert nbatch == 1 or not semantic
         # Op parameters (quasi-static while busy).
         self.kind        = Signal(2)
         self.rows        = Signal(16)
@@ -101,7 +94,6 @@ class BonsaiChannelPipe(LiteXModule):
         self.rshift      = Signal(6)   # R.
         self.qn          = Signal()    # Dual-Q GQA mode (Q8/AXPY): 2 heads per stream.
         self.rshift2     = Signal(6)   # Head-B AXPY pre-shift.
-        self.nb          = Signal(2)   # Batched matvec: token vectors - 1 (0 = one).
         self.start       = Signal()    # Pulse: reset counters/accumulator/error.
 
         # Weight beats in, results out.
@@ -123,9 +115,8 @@ class BonsaiChannelPipe(LiteXModule):
             groups_in = self.native_sink if with_native else self.sink
         # Matvec results present one int32 in data[:32] (wide=0); AXPY drain entries carry
         # 8 accumulators = one full scratchpad beat (wide=1, row = first lane index).
-        # head=1 marks dual-Q head-B results (gather adds the qstride offset); batched
-        # matvec results carry their vector index (gather adds head*qstride).
-        self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1), ("head", 2)])
+        # head=1 marks dual-Q head-B results (gather adds the qstride offset).
+        self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1), ("head", 1)])
 
         # x-buffer broadcast write port (from the engine's fill FSM).
         self.xw_group = Signal(max=max(xbuf_groups, 2))
@@ -279,29 +270,16 @@ class BonsaiChannelPipe(LiteXModule):
                     ).Else(native_g.eq(g_cnt + 1)),
                 ),
             )
-        rep      = Signal(2) # Batched matvec: the vector this code beat is replayed for.
-        rep_last = Signal()
-        legacy_code_fire = C(0, 1)
-        if nbatch > 1:
-            self.comb += rep_last.eq(rep == self.nb)
-        else:
-            self.comb += rep_last.eq(1)
         if not semantic:
             legacy_accept = Signal()
-            legacy_code_fire = Signal()
             self.comb += [
                 # Beat intake throttles on result-FIFO headroom: at N channels the aggregate
                 # result rate (N/row_beats per cycle) can exceed the 1/cycle gather drain
                 # (first bites at N=4 ternary, 3 beats/row) - without this the FIFO drops
                 # results and the op never completes.
-                # Batched: a code beat is held (not accepted) for its first nb-1 replays.
-                self.sink.ready.eq(out_fifo_room & ~native_mode & (~phase | rep_last)),
+                self.sink.ready.eq(out_fifo_room & ~native_mode),
                 legacy_accept.eq(self.sink.valid & self.sink.ready),
-                legacy_code_fire.eq(self.sink.valid & out_fifo_room & ~native_mode & phase),
             ]
-            if nbatch > 1:
-                self.sync += If(self.start, rep.eq(0)
-                                ).Elif(legacy_code_fire, rep.eq(Mux(rep_last, 0, rep + 1)))
             if not with_native:
                 self.comb += [is_code.eq(phase == 1),
                               row_last.eq(is_code & (g_cnt == self.code_beats - 1))]
@@ -328,16 +306,6 @@ class BonsaiChannelPipe(LiteXModule):
 
         # T0: code-beat acceptance: launch x-buffer + scale reads, register codes. ----------------
         t0_fire = Signal()
-        # Batched matvec: vector b's x starts at word b*xw (xw = words per vector: one per
-        # ternary group, one per 4 Q8 groups, rounded up), op-stable registers.
-        xbase = C(0, 1)
-        if nbatch > 1:
-            xw     = Signal(8)
-            xbases = [C(0, 1)] + [Signal(10, name=f"xbase{b}") for b in range(1, nbatch)]
-            self.sync += xw.eq(Mux(self.kind == KIND_OP_Q8, (self.code_beats + 3) >> 2, self.code_beats))
-            self.sync += [xbases[b].eq(xw*b) for b in range(1, nbatch)]
-            xbase = Signal(10)
-            self.comb += Case(rep, {b: xbase.eq(xbases[b] if b < nbatch else 0) for b in range(4)})
         pidx    = Signal(16) # AXPY: probs byte index = row*n_channels + chan_id.
         # Dual-Q x layout: the fill interleaves the two heads' vectors at 32-byte
         # granularity (position 2g = head A group g, 2g+1 = head B group g), so one xbuf
@@ -345,15 +313,14 @@ class BonsaiChannelPipe(LiteXModule):
         # lives at (t>>5)*64 + (t&31), head B at +32 - always inside the same 1024b word.
         pidx_d = Signal(16) # AXPY dual: interleaved byte index of head A.
         self.comb += [
-            # One T0 per replay of a code beat (legacy), one per accepted group (native).
-            t0_fire.eq(legacy_code_fire | (native_accept & is_code)),
+            t0_fire.eq(accept & is_code),
             pidx.eq(row_cnt*n_channels + chan_id),
             pidx_d.eq(Cat(pidx[0:5], C(0, 1), pidx[5:15])),
             xbuf_r.adr.eq(Mux(self.kind == KIND_OP_AXPY,
                               Mux(self.qn, pidx_d[7:], pidx[7:]),
                           Mux(self.kind == KIND_OP_Q8,
                               Mux(self.qn, g_cnt[1:], g_cnt[2:]),
-                              Mux(self.qn, Cat(C(0, 1), g_cnt[:7]), g_cnt))) + xbase),
+                              Mux(self.qn, Cat(C(0, 1), g_cnt[:7]), g_cnt)))),
 
         ]
         if not semantic:
@@ -405,7 +372,6 @@ class BonsaiChannelPipe(LiteXModule):
         v1b_q8   = [v1b_rep(f"q{k}") for k in range(2)] if dual else []
         row1      = _delay(self, row_cnt, 1)
         row_last1 = _delay(self, row_last, 1)
-        bsel1     = _delay(self, rep, 1)
 
         # T1: lane select + scale fp16 mux; register lanes. ---------------------------------------
         # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error).
@@ -761,7 +727,6 @@ class BonsaiChannelPipe(LiteXModule):
         v2        = _delay(self, v1,        n_tree + 1)
         row2      = _delay(self, row1,      n_tree + 1)
         row_last2 = _delay(self, row_last1, n_tree + 1)
-        bsel2     = _delay(self, bsel1,     n_tree + 1)
         scale2    = _delay(self, scale_f16, n_tree)
 
         # fp16 decompose (comb) at the tree output. All arithmetic goes through dedicated
@@ -798,7 +763,6 @@ class BonsaiChannelPipe(LiteXModule):
         v3     = Signal()
         row3   = Signal(16)
         rlast3 = Signal()
-        bsel3  = Signal(2)
         self.comb += [
             bias_s.eq(self.bias),
             sh_c.eq(12 - e16 - bias_s),
@@ -809,7 +773,6 @@ class BonsaiChannelPipe(LiteXModule):
             v3.eq(v2),
             row3.eq(row2),
             rlast3.eq(row_last2),
-            bsel3.eq(bsel2),
         ]
 
         # T+2: shift to accumulator scale (contribution = prod << (e16+B), via <<12 then >>). -----
@@ -817,13 +780,11 @@ class BonsaiChannelPipe(LiteXModule):
         v4      = Signal()
         row4    = Signal(16)
         rlast4  = Signal()
-        bsel4   = Signal(2)
         self.sync += [
             contrib.eq((prod << 12) >> shamt),
             v4.eq(v3),
             row4.eq(row3),
             rlast4.eq(rlast3),
-            bsel4.eq(bsel3),
         ]
 
         # T+3: 48-bit accumulate; emit on row_last. -----------------------------------------------
@@ -862,7 +823,7 @@ class BonsaiChannelPipe(LiteXModule):
         if checked:
             self.comb += arithmetic_event.eq(native_mode & reduce(or_, arithmetic_events))
 
-        out_fifo = stream.SyncFIFO([("row", 16), ("data", 32), ("head", 2)], out_fifo_depth)
+        out_fifo = stream.SyncFIFO([("row", 16), ("data", 32), ("head", 1)], out_fifo_depth)
         # AXPY wide-drain FIFO: 8 accumulators per entry (one full beat). Matvec and AXPY
         # entries never interleave (drain runs only in AXPY mode, row-last pushes only in
         # matvec kinds), so the source muxes by kind.
@@ -875,20 +836,12 @@ class BonsaiChannelPipe(LiteXModule):
         if dual:
             pendb_row = Signal(16)
             pendb_dat = Signal(32)
-        # Batched matvec: the nb vectors' accumulators ROTATE - the beat at v4 always adds
-        # into `acc`, which then takes the next vector's and the updated sum goes to the
-        # back of the ring (slot nb). Vectors reach v4 strictly in turn (0..nb-1 per code
-        # beat), so the adder never sees a mux; only the ring's write-back does.
-        accs = [acc] + [Signal((48, True), name=f"acc_b{k}") for k in range(1, nbatch)]
-        acc_wb = Signal((48, True))
-        self.comb += acc_wb.eq(Mux(rlast4, 0, acc_new))
         self.sync += [
             If(self.start,
-                *[a.eq(0) for a in accs],
+                acc.eq(0),
                 *([acc2.eq(0)] if dual else []),
             ).Elif(v4,
-                *[accs[k].eq(acc_wb if k + 1 == nbatch else Mux(self.nb == k, acc_wb, accs[k + 1]))
-                  for k in range(nbatch)],
+                acc.eq(Mux(rlast4, 0, acc_new)),
                 *([acc2.eq(Mux(rlast4, 0, acc2_new))] if dual else []),
             ),
             # Head-B staging: set on row-last (priority), clear only when the push is
@@ -933,7 +886,6 @@ class BonsaiChannelPipe(LiteXModule):
                 out_fifo.sink.valid.eq(v4 & rlast4),
                 out_fifo.sink.row.eq(row4),
                 out_fifo.sink.data.eq(result[:32]),
-                out_fifo.sink.head.eq(bsel4),
             ),
             out_fifo_rdy_ax.eq(axw_fifo.sink.ready),
             # 9 slots of slack cover in-flight results (<= 4 row-lasts in the T+0..T+4

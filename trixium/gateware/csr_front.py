@@ -162,12 +162,6 @@ class BonsaiEngineCSR(LiteXModule):
                 self.pf_recorded.status.eq(units[0].recorded),
                 self.pf_synced.status.eq(Cat(*[u.synced for u in units])),
             ]
-        # Batched matvec (append-only: builds without nbatch keep every CSR address).
-        nb_csr = 0
-        if getattr(engine, "nbatch", 1) > 1:
-            self.nb = CSRStorage(2, description="Batched matvec: token vectors - 1 "
-                                    "(x at xsrc + b*dstride beats, results at dst + b*qstride words).")
-            nb_csr = self.nb.storage
         # `submit.re` fires on CSR write; latch as cmd.valid until accepted. While the
         # sequencer runs it owns the command interface (firmware never mixes the two).
         seq_own = Signal()
@@ -213,7 +207,6 @@ class BonsaiEngineCSR(LiteXModule):
                 engine.cmd.rep.eq(0 if seq is None else seq.eng_rep),
                 engine.cmd.dstride.eq(0 if seq is None else seq.eng_dstride),
                 engine.cmd.sstride.eq(0 if seq is None else seq.eng_sstride),
-                engine.cmd.nb.eq(0 if seq is None else seq.eng_nb),
             ).Else(
             engine.cmd.valid.eq((pending | manual_request) & ~native_blocked),
             engine.cmd.kind.eq(self.kind.storage),
@@ -238,7 +231,6 @@ class BonsaiEngineCSR(LiteXModule):
             engine.cmd.rep.eq(self.rep.storage),
             engine.cmd.dstride.eq(self.dstride.storage),
             engine.cmd.sstride.eq(self.sstride.storage),
-            engine.cmd.nb.eq(nb_csr),
             ),
             self.cyc_total.status.eq(engine.cyc_total[:32]),
             self.cyc_eng.status.eq(engine.cyc_eng[:32]),

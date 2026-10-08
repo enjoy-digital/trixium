@@ -50,10 +50,7 @@ from litepcie.software import generate_litepcie_software
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(LiteXModule):
-    def __init__(self, platform, sys_clk_freq, clk_channel=0, fast_clock_buffer="bufgce",
-                 ddr_clk_freq=None):
-        if fast_clock_buffer not in ("bufgce", "bufgce-div"):
-            raise ValueError("fast_clock_buffer must be bufgce or bufgce-div")
+    def __init__(self, platform, sys_clk_freq, clk_channel=0, ddr_clk_freq=None):
         self.rst       = Signal()
         self.cd_sys    = ClockDomain()
         self.cd_sys4x  = ClockDomain()
@@ -101,17 +98,8 @@ class _CRG(LiteXModule):
         self.specials += Instance("BUFGCE_DIV",
             p_BUFGCE_DIVIDE=4,
             i_CE=1, i_I=self.cd_pll4x.clk, o_O=cd_slow.clk)
-        if fast_clock_buffer == "bufgce-div":
-            # Opt-in timing experiment: UG949 permits a second BUFGCE_DIV with
-            # divide=1 on CLK. Match buffer types while preserving the same MMCM
-            # output, fabric/CLKDIV clock and clock-delay group. This is NOT a
-            # waiver or a timing-closure claim; route and apply the strict gate.
-            self.specials += Instance("BUFGCE_DIV",
-                p_BUFGCE_DIVIDE=1,
-                i_CE=1, i_CLR=0, i_I=self.cd_pll4x.clk, o_O=cd_fast.clk)
-        else:
-            self.specials += Instance("BUFGCE",
-                i_CE=1, i_I=self.cd_pll4x.clk, o_O=cd_fast.clk)
+        self.specials += Instance("BUFGCE",
+            i_CE=1, i_I=self.cd_pll4x.clk, o_O=cd_fast.clk)
 
         # These parallel buffers share one MMCM output, but their distribution trees
         # have very different loads (sys fabric vs four PHYs across three SLRs).
@@ -240,15 +228,11 @@ class BonsaiXCU1525SoC(SoCCore):
             l2_size, DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
 
     def __init__(self, sys_clk_freq=125e6, pcie_lanes=4, engine_channels=16,
-                 with_vecunit=True, with_dual=False, ddram_module="MT40A512M8",
-                 ddram_channels=4, main_ram_size=0x1000_0000, chan_stride=0x4000_0000, chan_skew=0x8000,
-                 port_width=512, with_memory_traffic=False, with_capabilities=True, with_native=False,
-                 ddr_fast_clock_buffer="bufgce",
+                 ddram_module="MT40A512M8", ddram_channels=4, main_ram_size=0x1000_0000,
+                 chan_stride=0x4000_0000, chan_skew=0x8000, port_width=512, with_capabilities=True,
                  with_hadamard=False, with_activation_quantize=False, with_projection_restore=False,
-                 with_embedding_restore=False, with_silu=False, with_norm=False, with_conv=False, with_dnstream=False, with_dnrec=True, prefetch=0, prefetch_pblock=False, cpu_slr=None, units_slr=None,
-                 ddr_clk_freq=None,
-                 attn_geometry=None,
-                 with_region_fetch=False,
+                 with_silu=False, with_norm=False, with_conv=False, with_dnstream=False,
+                 cpu_slr=None, ddr_clk_freq=None, attn_geometry=None,
                  **kwargs):
         assert 1 <= ddram_channels <= 4
         assert engine_channels % ddram_channels == 0, \
@@ -258,8 +242,7 @@ class BonsaiXCU1525SoC(SoCCore):
         platform = sqrl_xcu1525.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.crg = _CRG(platform, sys_clk_freq, fast_clock_buffer=ddr_fast_clock_buffer,
-                        ddr_clk_freq=ddr_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq, ddr_clk_freq=ddr_clk_freq)
         ddr_split = self.crg.split
 
         # SoCCore ----------------------------------------------------------------------------------
@@ -353,18 +336,6 @@ class BonsaiXCU1525SoC(SoCCore):
             from trixium.gateware.cpu_monitor import CPUBusMonitor
             self.cpumon = CPUBusMonitor(self.cpu)
             self.csr.add("cpumon", 31)  # pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console)
-        if units_slr is not None:
-            # v28a (-1.146 ns, 29k endpoints): the scratchpad's memory and part of its client
-            # logic sat in SLR1 (87% CLB) while most of its units were in SLR2, and every
-            # scratchpad port path crossed the boundary at ~7 ns. The scratchpad and all its
-            # units together (the DeltaNet stream stays with the readers it streams from).
-            platform.add_platform_command("create_pblock pb_units")
-            platform.add_platform_command(f"resize_pblock pb_units -add SLR{units_slr}")
-            platform.add_platform_command(
-                "add_cells_to_pblock pb_units [get_cells -quiet -hierarchical -filter "
-                "{{(NAME =~ xpm_memory_sdpram* || NAME =~ *scratchpad* || NAME =~ *hadamard* || "
-                "NAME =~ attn_* || NAME =~ *attnstream* || NAME =~ *vectorunit* || NAME =~ vrf_* || "
-                "NAME =~ *silu* || NAME =~ norm_*) && NAME !~ *dnstream*}}]")
         if cpu_slr is not None:
             # v27 spread the CPU over SLR1 (8k cells) and SLR2 (14k): its memory-bus return
             # crossed the boundary at 8 logic levels (-0.50 ns). Keep it in one SLR.
@@ -413,12 +384,9 @@ class BonsaiXCU1525SoC(SoCCore):
         # (chan_mod-1)*skew = 96 KB (the converter's --window-reserve).
         cluster_chan_skew      = chan_skew
         cluster_weight_base    = HBM_WEIGHT_BASE
-        # The per-head exact FP32 recurrence unit (~30k LUTs): the 27B's heads before the
-        # stream op (--with-dnstream); --without-dnrec drops it when the stream carries them.
-        cluster_with_dnrec     = with_dnrec
         # One portable wiring implementation; board policy stays here.
         if with_bonsai:
-            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster, native_read_options
+            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
             from trixium.gateware.xilinx_constraints import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
             def memory_description():
@@ -434,46 +402,18 @@ class BonsaiXCU1525SoC(SoCCore):
                     test_base + (c % chan_mod)*(chan_stride + chan_skew), 0x1000)
                     for c in range(engine_channels)]
                 return regions, reservations
-            native = (native_read_options(*memory_description(),
-                       [c//chan_mod for c in range(engine_channels)], write=True) if with_native else {})
             config = BonsaiClusterConfig(scratchpad_xpm=True,
-                with_vecunit=with_vecunit, with_dual=with_dual,
-                with_prefetch=bool(prefetch),
-                prefetch_options=(("depth", prefetch), ("chunk", 64), ("sched_depth", 1024)) if prefetch else (),
-                with_dnrec=cluster_with_dnrec, chan_stride=cluster_chan_stride,
+                chan_stride=cluster_chan_stride,
                 chan_mod=cluster_chan_mod, chan_skew=cluster_chan_skew, with_hadamard=with_hadamard,
                 with_activation_quantize=with_activation_quantize, with_projection_restore=with_projection_restore,
-                with_embedding_restore=with_embedding_restore, with_region_fetch=with_region_fetch,
                 with_silu=with_silu, with_norm=with_norm, with_conv=with_conv,
                 with_dnstream=bool(with_dnstream),
-                dnstream_options=(("pair", True),) if with_dnstream == "pair" else (),
                 with_attnstream=attn_geometry is not None,
                 attnstream_options=tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                     (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
-                    if attn_geometry else (),
-                **native)
+                    if attn_geometry else ())
             add_bonsai_cluster(self, engine_axis, config)
-            if with_memory_traffic:
-                from trixium.gateware.traffic import add_memory_traffic
-                add_memory_traffic(self, engine_axis,
-                    [core.controller.interface for core in self.sdrams])
-            add_cluster_constraints(platform, with_vecunit=with_vecunit)
-            if prefetch and prefetch_pblock:
-                # Opt-in (--prefetch-pblock; v26 with it: -2.1 ns, worse than v24's -1.14).
-                # The prefetch units and their FIFO URAMs with the channel pipes in SLR0: left
-                # free, v24 packed all 256 URAMs into the DDR PHYs' SLR1 (85% of its URAM,
-                # CLBs 86%), the pipes stayed in SLR0 and every channel's data and the
-                # engine's pipe controls crossed the boundary (-1.14 ns, 58k endpoints; the
-                # reader <-> prefetch crossing has a register stage each way, matvec.py).
-                platform.add_platform_command("create_pblock pb_prefetch")
-                platform.add_platform_command("resize_pblock pb_prefetch -add SLR0")
-                platform.add_platform_command(
-                    "add_cells_to_pblock pb_prefetch [get_cells -quiet -hierarchical -filter "
-                    "{{NAME =~ *weightprefetch* || NAME =~ pf_fifo*}}]")
-            if cluster_with_dnrec and not config.dnrec_exact:
-                # Vendor implementations are target-owned, not portable-core sources.
-                platform.add_ip(os.path.join("ip", "fp32", "fp32_add", "fp32_add.xci"))
-                platform.add_ip(os.path.join("ip", "fp32", "fp32_mul", "fp32_mul.xci"))
+            add_cluster_constraints(platform)
             self.bus.add_slave("scratchpad", self.scratchpad.add_wishbone_port(),
                 SoCRegion(origin=0xa000_0000, size=self.scratchpad.size, cached=False))
             self.comb += self.pcie_dma0.source.connect(
@@ -513,8 +453,6 @@ def main():
     parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform,
                                  description="TriXium SoC on the SQRL XCU1525.")
     parser.add_target_argument("--sys-clk-freq",    default=125e6, type=float, help="System clock = DDR4 controller clock (4:1).")
-    parser.add_target_argument("--ddr-fast-clock-buffer", default="bufgce", choices=["bufgce", "bufgce-div"],
-                               help="DDR CLK buffer: legacy BUFGCE or experimental BUFGCE_DIV /1; both require strict routed timing qualification.")
     parser.add_target_argument("--pcie-lanes",      default=4, type=int,       choices=[2, 4, 8, 16], help="PCIe lane count.")
     parser.add_target_argument("--driver",          action="store_true",       help="Generate LitePCIe driver headers.")
     parser.add_target_argument("--engine-channels", default=16, type=int,      help="Engine channel count (a multiple of the DDR4 channel count).")
@@ -524,68 +462,43 @@ def main():
     parser.add_target_argument("--chan-stride",     default=0x4000_0000, type=lambda x: int(x, 0), help="Per-engine-channel stride inside a controller (default 1 GB: 704 MB windows, the 27B fits; 0x10000000 = the FK33's 256 MB).")
     parser.add_target_argument("--chan-skew",       default=0x8000, type=lambda x: int(x, 0), help="Extra per-channel offset inside a controller so the windows start in different DDR4 bank groups (default 32 KB; 0 = none).")
     parser.add_target_argument("--port-width",      default=512, type=int, help="Crossbar port width per engine channel: 512 (LiteX AXIUpConverter, default) or 256 (LiteDRAM's native up-converter).")
-    parser.add_target_argument("--with-dual",       action="store_true",       help="Dual-Q GQA + speculative pair-verify datapath (~2x engine area).")
-    parser.add_target_argument("--with-memory-traffic", action="store_true", help="Passive coherent AXI/controller traffic counters (new CSR bank).")
-    parser.add_target_argument("--with-native", action="store_true", help="Experimental shared native PTQ/Q8 engine and append-only controls; not resident runtime qualification.")
     parser.add_target_argument("--with-hadamard", action="store_true", help="Experimental sequenced scratchpad integer rotations; not resident runtime qualification.")
     parser.add_target_argument("--with-activation-quantize", action="store_true", help="Experimental resident FP32 and post-rotation Q8 quantization; not resident runtime qualification.")
     parser.add_target_argument("--with-projection-restore", action="store_true", help="Experimental resident int32 projection to FP32 restoration; not resident runtime qualification.")
-    parser.add_target_argument("--with-embedding-restore", action="store_true", help="Experimental compact PTQ embedding restoration; not resident runtime qualification.")
     parser.add_target_argument("--with-silu", action="store_true", help="Exact FP32 SiLU-multiply scratchpad unit (sequencer unit 11).")
     parser.add_target_argument("--with-norm", action="store_true", help="Exact RMSNorm/L2 scratchpad unit (sequencer unit 12).")
     parser.add_target_argument("--with-conv", action="store_true", help="Exact DeltaNet conv scratchpad unit (sequencer unit 13).")
     parser.add_target_argument("--with-dnstream", action="store_true", help="DeltaNet stream unit (engine op 5, one lane per channel).")
-    parser.add_target_argument("--units-slr", type=int, default=None,
-        help="Constrain the scratchpad and its units to this SLR (pblock).")
     parser.add_target_argument("--cpu-slr", type=int, default=None,
         help="Constrain the CPU to this SLR (pblock).")
-    parser.add_target_argument("--prefetch-pblock", action="store_true",
-        help="With --with-prefetch: constrain the prefetch units and URAMs to SLR0 (v26).")
-    parser.add_target_argument("--with-prefetch", nargs="?", const=16384, default=0, type=int,
-        help="Run-ahead weight prefetch: FIFO depth in beats per channel (UltraRAM; default 16384 = 512 KB).")
     parser.add_target_argument("--ddr-clk-freq", default=None, type=float,
         help="The DDR4 controllers in their own clock domain at this frequency (4:1: DDR4 data rate 8x; 200e6 = DDR4-1600); default: in sys.")
-    parser.add_target_argument("--without-dnrec", action="store_true", help="Drop the per-head DeltaNet recurrence unit (the heads then run only on --with-dnstream).")
-    parser.add_target_argument("--dnstream-pair", action="store_true", help="With --with-dnstream: two units, heads alternating (twice the heads per clock).")
     parser.add_target_argument("--with-attnstream", nargs="?", const="24,4,256,1024", default=None,
                                help="Attention stream unit (engine op 6): lanes,kv groups,max head dim,max positions.")
-    parser.add_target_argument("--with-region-fetch", action="store_true", help="Experimental sequenced 64-bit checked region reads; requires --with-native.")
     parser.add_target_argument("--no-capabilities", action="store_true", help="Omit the read-only capability ROM (legacy build reproduction).")
-    parser.add_target_argument("--no-vecunit",      action="store_true",       help="Build without the vector unit + sequencer (engine only).")
     args = parser.parse_args()
 
     soc = BonsaiXCU1525SoC(
         sys_clk_freq    = args.sys_clk_freq,
         pcie_lanes      = args.pcie_lanes,
         engine_channels = args.engine_channels,
-        with_vecunit    = not args.no_vecunit,
-        with_dual       = args.with_dual,
         ddram_module    = args.ddram_module,
         ddram_channels  = args.ddram_channels,
         main_ram_size   = args.main_ram_size,
         chan_stride     = args.chan_stride,
         chan_skew       = args.chan_skew,
         port_width      = args.port_width,
-        with_memory_traffic = args.with_memory_traffic,
         with_capabilities = not args.no_capabilities,
-        with_native       = args.with_native,
-        ddr_fast_clock_buffer = args.ddr_fast_clock_buffer,
         with_hadamard     = args.with_hadamard,
         with_activation_quantize = args.with_activation_quantize,
         with_projection_restore = args.with_projection_restore,
-        with_embedding_restore = args.with_embedding_restore,
         with_silu              = args.with_silu,
         with_norm              = args.with_norm,
         with_conv              = args.with_conv,
-        with_dnstream          = ("pair" if args.dnstream_pair else True) if args.with_dnstream else False,
-        with_dnrec             = not args.without_dnrec,
+        with_dnstream          = args.with_dnstream,
         ddr_clk_freq           = args.ddr_clk_freq,
-        prefetch               = args.with_prefetch,
-        prefetch_pblock        = args.prefetch_pblock,
         cpu_slr                = args.cpu_slr,
-        units_slr              = args.units_slr,
         attn_geometry          = tuple(int(v) for v in args.with_attnstream.split(",")) if args.with_attnstream else None,
-        with_region_fetch = args.with_region_fetch,
         **parser.soc_argdict)
 
     # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates
