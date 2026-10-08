@@ -1,9 +1,12 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// BONS model walking: header/table access + per-tensor engine ops.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium BONS model access: header/table lookups and per-tensor engine ops
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <stdio.h>
 
@@ -12,6 +15,9 @@
 
 #include "model.h"
 #include "engine.h"
+
+/* Header / Table */
+/*----------------*/
 
 const struct bons_header *model_header(void)
 {
@@ -23,17 +29,17 @@ static const struct bons_entry *model_table(void)
     return (const struct bons_entry *)(TRIXIUM_HDR_ADDR + model_header()->table_offset);
 }
 
-// (role, layer) -> table-index cache. The linear scan below walks up to n_tensors entries
-// of the DRAM-resident table and falls out of the D-cache: a dozen lookups per layer made
-// the scans ~29% of token time. `any` holds the first (role, layer) match in table order
-// (model_entry semantics verbatim); `n16` the first NORM16 match (the only kind
-// model_entry_kind is used with - anything else falls back to the scan). Rebuilt lazily;
-// hdrload resets it when the header changes.
-// NOT in .bss: the sram region is 8 KB *including the stack* (_fstack sits at its top) and
-// has no room for these tables. They live in the unused main_ram window between the BONS
-// header/table (at TRIXIUM_HDR_ADDR) and the inference heap (TRIXIUM_HDR_ADDR + 0x100000,
-// see infer.c HEAP_BASE). 32 roles (every role must be covered, or its lookup falls back to
-// the full scan): 8 KB of the 64 KB window.
+/* Lookup Cache */
+/*--------------*/
+
+// (role, layer) -> table-index cache: a linear scan of the main_ram table per lookup falls out
+// of the D-cache, and a dozen lookups per layer made the scans a large part of token time.
+// `any` holds the first (role, layer) match in table order (model_entry semantics); `n16` the
+// first NORM16 match (the only kind model_entry_kind is used with, any other kind falls back to
+// the scan). Built lazily; hdrload resets it when the header changes.
+// Not in .bss: sram is 8 KB including the stack. The tables live in the unused main_ram window
+// between the BONS header/table (TRIXIUM_HDR_ADDR) and the heap (+0x100000, static_memory.h).
+// Every role must be covered, or its lookups fall back to the full scan.
 #define ECACHE_ROLES  32
 #define ECACHE_LAYERS 64
 _Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every role");
@@ -41,9 +47,8 @@ _Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every 
 #define ecache_any ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE))
 #define ecache_n16 ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE + \
                         ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))
-// K-segments: the first FLAG_KSEG entry of each (role, layer, kseg < 4), 16 KB more, so a
-// K-segmented lookup does not scan the whole table (~1,100 entries on the 27B; ~330k cycles
-// per layer outside the FFN lists without the cache).
+// K-segments: the first FLAG_KSEG entry of each (role, layer, kseg < 4), so a K-segmented
+// lookup does not scan the whole table (~1,100 entries on the 27B).
 #define ECACHE_KSEG 4
 #define ecache_kseg ((int16_t (*)[ECACHE_LAYERS][ECACHE_KSEG])(ECACHE_BASE + \
                         2*ECACHE_ROLES*ECACHE_LAYERS*sizeof(int16_t)))
@@ -63,7 +68,8 @@ static void ecache_build(void)
     for (int r = 0; r < ECACHE_ROLES; r++)
         for (int l = 0; l < ECACHE_LAYERS; l++) {
             ecache_any[r][l] = ecache_n16[r][l] = -1;
-            for (int k = 0; k < ECACHE_KSEG; k++) ecache_kseg[r][l][k] = -1;
+            for (int k = 0; k < ECACHE_KSEG; k++)
+                ecache_kseg[r][l][k] = -1;
         }
     for (uint32_t i = 0; i < h->n_tensors && i < 32767; i++) {
         int r = t[i].role, l = t[i].layer;
@@ -78,6 +84,9 @@ static void ecache_build(void)
     }
     ecache_ok = 1;
 }
+
+/* Lookups */
+/*---------*/
 
 const struct bons_entry *model_entry(int role, int layer)
 {
@@ -151,6 +160,9 @@ int model_entry_nkseg(const struct bons_entry *e0)
     return n;
 }
 
+/* Info */
+/*------*/
+
 void model_info(void)
 {
     const struct bons_header *h = model_header();
@@ -169,6 +181,9 @@ void model_info(void)
         printf("%02x", h->tokenizer_sha256[i]);
     printf("\n");
 }
+
+/* Matvec */
+/*--------*/
 
 // Fill the engine op for a tensor without running it: the FFN descriptor list rebuilds its
 // three matvec descriptors from this per layer, so the encoding lives in exactly one place.

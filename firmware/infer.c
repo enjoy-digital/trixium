@@ -1,13 +1,18 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Qwen3 token loop: the engine does every matvec (ternary weights streamed from the weight
-// memory); the vector unit and the descriptor sequencer run the vector ops and attention on
-// resident block-floating-point activations in the scratchpad. Every op keeps a CPU
-// reference implementation (hwops). The hybrid models' forward lives in hybrid.c, on top of
-// the float matvec primitives exported here.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium Qwen3 token loop and the float matvec primitives of the hybrid path
+ *
+ * The engine does every matvec (ternary weights streamed from the weight memory); the vector
+ * unit and the descriptor sequencer run the vector ops and attention on resident
+ * block-floating-point activations in the scratchpad. Every op keeps a CPU reference
+ * implementation (hwops). The hybrid models' forward lives in hybrid.c, on top of the float
+ * matvec primitives exported here.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <math.h>
 #include <stdio.h>
@@ -17,6 +22,7 @@
 #include <generated/csr.h>
 #include <generated/soc.h>
 #include <generated/mem.h>
+
 #include <system.h>
 
 #include "bons.h"
@@ -25,34 +31,41 @@
 #include "model.h"
 #include "infer.h"
 #include "static_memory.h"
-
-// Code layout only: the per-layer hot path is ~28 KB of text against a 32 KB
-// I$ with no L2 behind it (a miss is a ~150-cycle HBM round trip), and tprof showed the
-// same helper running 1.1k cycles slower the first time in a layer than the second. These
-// hints and the cold attributes below move the CPU fallback paths out of the hot text
-// (-freorder-blocks-and-partition, firmware/Makefile) - same instructions, same numerics.
-#define likely(x)   __builtin_expect(!!(x), 1)
-#define unlikely(x) __builtin_expect(!!(x), 0)
-#define COLD        __attribute__((cold, noinline))
-// A call to a cold function is the one thing GCC's partitioner treats as "never executed"
-// (__builtin_expect is only 90%): placed first in a branch that is dead on the card (the
-// op-by-op paths behind the sequencer lists), it moves that whole branch to .text.unlikely.
-static COLD void cold_path(void) { __asm__ volatile("" ::: "memory"); }
 #include "ops.h"
 #include "perf.h"
 #include "vec.h"
 #include "seq.h"
 #include "progs.h"
 
+/* Code Layout */
+/*-------------*/
+
+// The per-layer hot path is ~28 KB of text against a 32 KB I$ with no L2 behind it (a miss
+// is a ~150-cycle HBM round trip). These hints and the cold attributes below move the CPU
+// fallback paths out of the hot text (-freorder-blocks-and-partition, see the Makefile):
+// same instructions, same numerics.
+#define likely(x)   __builtin_expect(!!(x), 1)
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#define COLD        __attribute__((cold, noinline))
+
+// A call to a cold function is the one thing GCC's partitioner treats as "never executed"
+// (__builtin_expect is only 90%): placed first in a branch that is dead on the card (the
+// op-by-op paths behind the sequencer lists), it moves that whole branch to .text.unlikely.
+static COLD void cold_path(void) { __asm__ volatile("" ::: "memory"); }
+
+/* Float Helpers */
+/*---------------*/
+
 // newlib-libm compatibility: the toolchain libm.a references __errno, absent from the
 // picolibc environment LiteX links against.
+int *__errno(void);
 static int __errno_storage;
 int *__errno(void) { return &__errno_storage; }
 
-// The LiteX firmware is built with -fno-builtin, so even an RV32F build would call
-// libm for every fabsf/lroundf in float->int8 quantisation. That is thousands of calls
-// per 27B token. RISC-V's static RMM rounding mode is exactly lroundf's finite-input
-// rule (nearest, ties away from zero); keep libm as the bit-identical soft-float fallback.
+// The LiteX firmware is built with -fno-builtin, so even an RV32F build would call libm for
+// every fabsf/lroundf in float->int8 quantization. RISC-V's static RMM rounding mode is
+// exactly lroundf's finite-input rule (nearest, ties away from zero); libm stays as the
+// bit-identical soft-float fallback.
 static inline float f32_abs(float x)
 {
     union { float f; uint32_t u; } v = { .f = x };
@@ -99,10 +112,9 @@ static inline uint32_t f32_pack_q8x4(const float *src, float is)
 
 static inline uint32_t i32_pack_q8x4(const int32_t *src, float is)
 {
-    // This is the fused form of the old Hadamard boundary: int32 -> FP32*2^e was
-    // materialised in main RAM, then loaded again and multiplied by 2^-e8.  Both scales
-    // are powers of two, so applying their combined exponent after the same int32->FP32
-    // conversion is bit-identical for the normal finite values produced by the engine.
+    // Fused Hadamard boundary: instead of int32 -> FP32*2^e in main RAM, then *2^-e8, both
+    // power-of-two scales are combined after the same int32->FP32 conversion, which is
+    // bit-identical for the normal finite values produced by the engine.
     uint32_t q0 = (uint8_t)(int8_t)f32_q8((float)src[0], is);
     uint32_t q1 = (uint8_t)(int8_t)f32_q8((float)src[1], is);
     uint32_t q2 = (uint8_t)(int8_t)f32_q8((float)src[2], is);
@@ -144,8 +156,11 @@ static int f32_quant_e8(const float *src, uint32_t n)
     return f32_e8_from_amax_bits(amax);
 }
 
-// Scratchpad layout (byte offsets) - resident-BFP regions (int16 mantissas + firmware-
-// tracked exponents; sized for the 8B: E=4096, F=12288).
+/* Scratchpad Layout */
+/*-------------------*/
+
+// Byte offsets of the resident-BFP regions (int16 mantissas + firmware-tracked exponents;
+// sized for the 8B: E=4096, F=12288).
 #define SP_X    0x00000 // int8 matvec input (<= 12 KB).
 #define SP_Y    0x04000 // Engine int32 results (<= 48 KB).
 #define SP_YU   0x10000 // Engine int32 results, second stream (up proj).
@@ -168,15 +183,18 @@ static int f32_quant_e8(const float *src, uint32_t n)
                         // table slot (the row is 2*head_dim bytes, 256 on these models). Not
                         // between SP_H and SP_XR: the 8B's SP_H (8 KB) fills that gap.
 #define SP_FET2 0x3C000 // Second norm16 staging slot (k_norm while q_norm sits in SP_FET).
-// Resident qk-norm weight rows (qres): head_dim int16 = 256 B per layer per
-// kind, 28 layers = 7 KB each, in the tails of the SP_FET and SP_D regions (their live
-// occupants are <= 4 KB). Fetched once; the qkr list's rmsnorm_h A1 is patched per layer
-// instead of two 8-beat engine fetches paid at ~1.5k cycles of op latency each, x56/token.
+// Resident qk-norm weight rows (qres): head_dim int16 = 256 B per layer per kind, 28 layers =
+// 7 KB each, in the tails of the SP_FET and SP_D regions (their live occupants are <= 4 KB).
+// Fetched once; the qkr list's rmsnorm_h A1 is patched per layer instead of two engine
+// fetches per layer.
 #define SP_QNW  (SP_FET + 0x1000)
 #define SP_KNW  (SP_D + 0x1000)
 
 // Fixed exponent for CPU-produced normed vectors (values bounded ~16 by construction).
 #define E_NORM  (-11)
+
+/* Heap and Channel Windows */
+/*--------------------------*/
 
 // Heap: after the BONS header/table area. The CPU's RAM is HBM pseudo-channel 4 and engine
 // channel 3's weight window overlaps it at [64 MB, ~141 MB) (see layout.py HBM_WEIGHT_BASE):
@@ -239,7 +257,8 @@ static void *halloc_hi(uint32_t n)
     return p;
 }
 
-// Model state --------------------------------------------------------------------------------
+/* Model State */
+/*-------------*/
 
 static const struct bons_header *H;
 static int n_ch, head_dim, n_head, n_kv_head, n_embd, ffn_dim, n_layer;
@@ -262,7 +281,8 @@ static int ex_state; // Exponent of the resident x (SP_XR).
 #define X_AMAX_AFTER_EMBED 32767u
 static uint32_t x_amax;
 
-// Helpers ------------------------------------------------------------------------------------
+/* Helpers */
+/*---------*/
 
 static float fp16_to_float(uint16_t b)
 {
@@ -304,6 +324,9 @@ COLD static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
     perf_exit(OP_QUANT8);
     return e8;
 }
+
+/* KV Cache */
+/*----------*/
 
 // KV-to-HBM: per (layer, kv-head, K|V) region of Q8 row packets, position-striped
 // (position t -> channel t % n_ch, local row t / n_ch). All groups of a row share one
@@ -364,12 +387,11 @@ COLD static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
     if (ek > kv_ekmax[idx]) kv_ekmax[idx] = ek;
 }
 
-// AXPY pre-shift keeping the int32 lane accumulators safe (bitexact.axpy_rpre):
-// pure bit-length form so the descriptor sequencer can compute it in hardware.
+/* Attention Fold */
+/*----------------*/
+
 // The per-head attention fold in integers, emulating the float32 path bit-for-bit so tokens
-// stay byte-identical. The float form is soft-float without an FPU - a divide, ldexpf, a
-// multiply and frexpf per head, then lroundf(ldexpf()) per head for the scale8 multiplier:
-// ~1.4k cycles per head, 448 per token.
+// stay byte-identical, without the soft-float divide/ldexpf/frexpf/lroundf per head:
 //   q  = RN24(1.0f / (float)P8)            -> (qm, qe): q = qm * 2^qe, qm in [2^23, 2^24)
 //   c2 = ldexpf(q, E1)                     -> (qm, qe + E1), no rounding
 //   hm = (float)(am >> k2) * c2            -> RN24 of the product: (m2, e2)
@@ -386,8 +408,12 @@ static inline __attribute__((always_inline)) int bitlen32(uint32_t x)
     return 32 - (int)r;
 }
 #else
-static inline __attribute__((always_inline)) int bitlen32(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
+static inline __attribute__((always_inline)) int bitlen32(uint32_t x)
+{
+    return x ? 32 - __builtin_clz(x) : 0;
+}
 #endif
+
 static void attn_f32_recip(uint32_t p8, uint32_t *qm, int *qe)
 {
     // m = 2^(23+L)/p8 in (2^23, 2^24] with an exact remainder, on the 32-bit divider:
@@ -413,14 +439,13 @@ static void attn_f32_recip(uint32_t p8, uint32_t *qm, int *qe)
     *qm = m;
     *qe = e;
 }
+
 static void attn_f32_mul(uint32_t a, uint32_t qm, int qe, uint32_t *m2, int *e2)
 {
-    // 32-bit throughout: 64-bit variable shifts are libgcc calls on RV32 (most of a
-    // 640-cycle fold). a <= 2^14 and
-    // qm < 2^24 give p < 2^38 and sh in 0..14, so m = p >> sh is (pl >> sh) | (ph <<
-    // (32-sh)) exactly (the bits of ph that would overflow are zero because p < 2^L),
-    // and the remainder/half live entirely in pl. Proven bit-identical to the 64-bit
-    // form over 20M random inputs plus the edges.
+    // 32-bit throughout: 64-bit variable shifts are libgcc calls on RV32. a <= 2^14 and
+    // qm < 2^24 give p < 2^38 and sh in 0..14, so m = p >> sh is (pl >> sh) | (ph << (32-sh))
+    // exactly (the bits of ph that would overflow are zero because p < 2^L), and the
+    // remainder/half live entirely in pl: bit-identical to the 64-bit form.
     uint64_t p = (uint64_t)a*qm;                 // mul + mulhu, no library call
     uint32_t ph = (uint32_t)(p >> 32), pl = (uint32_t)p;
     int L = ph ? 32 + bitlen32(ph) : bitlen32(pl);
@@ -434,6 +459,7 @@ static void attn_f32_mul(uint32_t a, uint32_t qm, int qe, uint32_t *m2, int *e2)
     *m2 = m;
     *e2 = qe + sh;
 }
+
 static int32_t attn_mh_int(uint32_t qm, int sh)
 {
     if (sh >= 0) {
@@ -446,14 +472,17 @@ static int32_t attn_mh_int(uint32_t qm, int sh)
     uint32_t v = (qm + (1u << (r - 1))) >> r;    // lroundf: half away from 0; <= 2^25.
     return (v > 32767) ? 32767 : (int32_t)v;
 }
+
 static uint32_t aw_qm[32];   // Per-head c2 mantissa (float32 emulation).
 static int      aw_qe[32];   // Per-head c2 exponent (qe + E1).
 static uint32_t aw_hm2;      // max hm mantissa/exponent over heads.
 static int      aw_he2, aw_hvalid;
 
+// AXPY pre-shift keeping the int32 lane accumulators safe (bitexact.axpy_rpre): pure
+// bit-length form so the descriptor sequencer can compute it in hardware.
 static int axpy_rpre_c(uint64_t p8sum)
 {
-    // Bit length via clz - a 64-bit shift loop costs ~300-450 cycles per fold on RV32.
+    // Bit length via clz: a 64-bit shift loop is several hundred cycles on RV32.
     uint32_t hi = (uint32_t)(p8sum >> 32), lo = (uint32_t)p8sum;
     int bl = hi ? 32 + bitlen32(hi) : bitlen32(lo);
     return bl + 5;
@@ -462,14 +491,16 @@ static int axpy_rpre_c(uint64_t p8sum)
 // B/R for a scores op over a region: pow-2 scales make e16 + B == 12 exactly
 // (fp16_decompose: 2^ek = 1024 * 2^(ek-10); B = 12 - (ekmax - 10) = 22 - ekmax), so the
 // worst-row acc bound is closed-form: groups * (32*127*127) * 1024 << 12.
-static int kv_br_r = -1; // Model constant (head_dim only); computed once at infer_init
-                         // (per call it costs ~7k cycles/layer of 64-bit shifts).
+static int kv_br_r = -1; // Model constant (head_dim only), computed once at infer_init.
 
 static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
 {
     *B = 22 - kv_ekmax[kv_ek_idx(l, kvh, kind)];
     *R = kv_br_r;
 }
+
+/* Float Matvec */
+/*--------------*/
 
 // Hybrid float-result staging.  CPU reads of the scratchpad use a registered 32-bit
 // Wishbone sideband (several round trips per word).  On the XCU1525 the engine can STORE
@@ -526,7 +557,7 @@ static const volatile int32_t *stage_i32_results(uint32_t sp_src, uint32_t count
 // scaled by xscale) into dst[gathered global order: chan*rows + row]. With `acc` the int32
 // results are added into acc[] instead (a K-segment of a wide matvec; the caller scales).
 COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32_t rows,
-                          float xscale, float *dst, int32_t *acc, int acc_add, int dma_result)
+                               float xscale, float *dst, int32_t *acc, int acc_add, int dma_result)
 {
     matvec_engine_rows(e, row0, rows, SP_Y);
 
@@ -572,6 +603,7 @@ COLD static void matvec_rows_f(const struct bons_entry *e, uint32_t row0, uint32
 // stay inside SP_Y..SP_H (96 KB) whatever the row count (the 27B's LM head is 15,520 rows
 // per channel).
 static float *rot_scratch;   // (SP_H - SP_Y)/4 floats/ints, allocated on first use.
+
 static void ensure_float_matvec_scratch(void)
 {
     if (!rot_scratch) {
@@ -579,6 +611,7 @@ static void ensure_float_matvec_scratch(void)
         i32_stage   = halloc((SP_H - SP_Y));
     }
 }
+
 static void matvec_f_one(const struct bons_entry *e, float xs, float *dst, int32_t *acc,
                          int acc_add)
 {
@@ -593,8 +626,6 @@ static void matvec_f_one(const struct bons_entry *e, float xs, float *dst, int32
         } else if (acc) {
             // K-segment: the int32 results arrive as [chan][n]; add them at [chan][rpc].
             matvec_rows_f(e, r0, n, xs, 0, (int32_t *)rot_scratch, 0, 1);
-            volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
-            (void)y;
             for (int c = 0; c < n_ch; c++)
                 for (uint32_t i = 0; i < n; i++)
                     if (acc_add)
@@ -602,8 +633,8 @@ static void matvec_f_one(const struct bons_entry *e, float xs, float *dst, int32
                     else
                         acc[(uint32_t)c*rpc + r0 + i] = ((int32_t *)rot_scratch)[(uint32_t)c*n + i];
         } else {
-            // Results arrive as [chan][n] at the scratchpad; scatter them into the
-            // caller's [chan][rpc] row order straight from there.
+            // Results arrive as [chan][n] in rot_scratch; scatter them into the caller's
+            // [chan][rpc] row order.
             matvec_rows_f(e, r0, n, xs, rot_scratch, 0, 0, 1);
             for (int c = 0; c < n_ch; c++)
                 for (uint32_t i = 0; i < n; i++)
@@ -634,8 +665,9 @@ int infer_quantize_f(const float *src, uint32_t n)
     return quantize_f_pow2(src, n, SP_X);
 }
 
-// Fused Prism rotation boundary ---------------------------------------------------------------
-//
+/* Fused Prism Rotation */
+/*----------------------*/
+
 // Rather than materialising every Hadamard block as FP32 in main RAM, scanning the
 // concatenated vector for its Q8 exponent, then reading it all again to feed the immediately
 // following projection: a rotation result is an int32 engine value times a power of two, so
@@ -766,6 +798,9 @@ void infer_matvec_f_rotated_quantized(const struct bons_entry *e, int e8, float 
     for (; i < e->rows; i++) dst[i] = (float)y[i]*sc;
     perf_exit(OP_NORM_I32);
 }
+
+/* Hybrid Path Primitives */
+/*------------------------*/
 
 void infer_matvec_f_quantized(const struct bons_entry *e, int e8, float *dst)
 {
@@ -898,6 +933,8 @@ void infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n)
     }
 }
 
+/* CPU Embedding and RoPE */
+/*------------------------*/
 
 // Embedding row: fetch the row packet from HBM and dequantize (ternary).
 COLD static void embed_row_f(const struct bons_entry *e, int row, float *dst)
@@ -1003,6 +1040,14 @@ COLD static void rope_apply(float *vec, int n_heads_v, int pos)
     }
 }
 
+/* Resident BFP Ops */
+/*------------------*/
+
+// Every op has a CPU implementation (float math over the int16 scratchpad regions - the
+// always-available fallback) and, when the vector unit exists, a HW implementation running
+// the corresponding microcode program. Exponent algebra stays in this file; ops receive
+// shift amounts only.
+
 // Score padding granule: softmax8's x2 unroll (ISA rev 2 microcode) walks two 16-entry
 // blocks per iteration and has no odd-tail form, so scores are padded to a 32-multiple
 // with INT32_MIN there (those entries emit p8 = 0 - the sum and the AXPY do not change).
@@ -1012,11 +1057,6 @@ COLD static void rope_apply(float *vec, int n_heads_v, int pos)
 #define SC_PAD 16
 #endif
 #define SC_PADN(cnt) ((SC_PAD - ((cnt) & (SC_PAD - 1))) & (SC_PAD - 1))
-
-// Resident-BFP op layer: every op has a CPU implementation (float math over the int16
-// scratchpad regions - the always-available fallback) and, when the vector unit exists,
-// a HW implementation running the corresponding microcode program. Exponent algebra stays
-// in this file; ops receive shift amounts only.
 
 static inline volatile int16_t *sp16(uint32_t off) { return (volatile int16_t *)(SCRATCHPAD_BASE + off); }
 static inline volatile int32_t *sp32(uint32_t off) { return (volatile int32_t *)(SCRATCHPAD_BASE + off); }
@@ -1039,9 +1079,8 @@ static inline int w16_shift(const struct bons_entry *e)
 //
 // The value wanted is lroundf(rms_eps * 2^-2esrc) - a pure power-of-two scaling, so float32
 // computes it with no rounding beyond rms_eps's own representation. Decomposing once into a
-// 24-bit mantissa (all a float32 has) makes the per-call work a shift and a rounding add, and
-// bit-identical to what the float path produced. The per-head norms run ~700 times a
-// forward, and ldexpf+lroundf are hundreds of cycles each on a core with no FPU.
+// 24-bit mantissa (all a float32 has) makes the per-call work a shift and a rounding add,
+// bit-identical to the float path, instead of soft-float ldexpf+lroundf per head norm.
 static uint32_t eps_m;   // rms_eps = eps_m * 2^(eps_e - 24), eps_m in [2^23, 2^24)
 static int      eps_e;
 
@@ -1066,8 +1105,9 @@ static int eps_for(int esrc)
     uint32_t v = (eps_m + (1u << (s - 1))) >> s; // round half away from zero (values > 0)
     return (int)(v < 1 ? 1 : v);
 }
+
 COLD static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
-                              const struct bons_entry *w16, int n, uint32_t dst)
+                               const struct bons_entry *w16, int n, uint32_t dst)
 {
     if (op_on_hw(OP_RMSNORM) && w16) {
         engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
@@ -1114,15 +1154,14 @@ static int quant8_shift(uint32_t amax)
     return bitlen32(amax) - 7;
 }
 
-// rmsnorm + measured quant8 in one program: saves a dispatch and
-// quant8's absmax pass at every norm->x8 site. Returns the quant8 shift like op_quant8_sp;
-// falls back to the two ops when either is off the hardware or the NORM16 row is absent.
 static int op_quant8_sp(uint32_t src, uint32_t dst, int n);
+
 // The norm-weight row fetch that opens every rmsnorm_q8 would otherwise be a blocking engine
-// op between two vector ops (4k cycles x 56 per token with both units idle). The caller
-// submits it BEFORE the preceding resid_add so it streams underneath, joins, and flags it;
-// the op then skips its own fetch.
+// op between two vector ops, with both units idle. The caller submits it BEFORE the
+// preceding resid_add so it streams underneath, joins, and flags it; the op then skips its
+// own fetch.
 static int rq8_prefetched;
+
 static uint32_t norm_fetch_submit(const struct bons_entry *w16)
 {
     struct engine_op op = {0};
@@ -1132,11 +1171,13 @@ static uint32_t norm_fetch_submit(const struct bons_entry *w16)
     op.dst   = SP_FET;
     return engine_submit(&op);
 }
+
 static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
                            uint32_t bmax, uint32_t *amax_io);
-// resid_add with the NEXT norm's weight row streaming underneath. SP_FET is
-// idle here (its last reader, the previous rmsnorm or the qkr list, has finished) and
-// the engine is idle (the preceding matvec/list joined) - same numerics either way.
+
+// resid_add with the NEXT norm's weight row streaming underneath. SP_FET is idle here (its
+// last reader, the previous rmsnorm or the qkr list, has finished) and the engine is idle
+// (the preceding matvec/list joined) - same numerics either way.
 static int resid_add_pf(uint32_t src, int esrc, uint32_t d, int ed, int n, uint32_t dmax,
                         uint32_t *xamax, const struct bons_entry *next_w16)
 {
@@ -1150,6 +1191,9 @@ static int resid_add_pf(uint32_t src, int esrc, uint32_t d, int ed, int n, uint3
     return e;
 }
 
+// rmsnorm + measured quant8 in one program: saves a dispatch and quant8's absmax pass at
+// every norm->x8 site. Returns the quant8 shift like op_quant8_sp; falls back to the two ops
+// when either is off the hardware or the NORM16 row is absent.
 static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
                             const struct bons_entry *w16, int n, uint32_t dst16,
                             uint32_t dst8)
@@ -1179,8 +1223,9 @@ static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
     return s;
 }
 
-// silu_mul + measured quant8 in one program. Returns the quant8 shift.
 static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n);
+
+// silu_mul + measured quant8 in one program. Returns the quant8 shift.
 static int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, uint32_t dst8)
 {
     if (op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
@@ -1338,6 +1383,9 @@ static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
     return eo;
 }
 
+/* Resident Attention and KV Store */
+/*---------------------------------*/
+
 // Resident attention front (all attention hwops on): q/k/v live in the scratchpad as
 // int16 from the matvec on; qk-norm/rope/kv-pack run on the vector unit; the CPU float
 // K/V cache is not maintained (attention op bits are latched per generation - flipping
@@ -1362,11 +1410,10 @@ static void vec_quant8_head(uint32_t sp, uint32_t dst, int n)
 //
 // Staging slots so the scale beat is written only when the exponent CHANGES, not per store:
 // K's exponent is the constant E_NORM+8 and V's changes once per layer, and rewriting 16
-// scratchpad halfwords costs ~1.1k cycles of uncached bus traffic, 448 stores per forward.
-// One staging slot per (kv_head, kind) - 16 x 512 B fills SP_KVP exactly. Two slots would
-// do if pack and store alternated, but they must not: the vector unit and the engine share
-// the scratchpad port, and interleaving them 32 times per layer measures 1.6x the cost of
-// packing everything first and then storing (vbench kv_pair_alt 74,948 vs 46,167 phased).
+// scratchpad halfwords is costly uncached bus traffic. One staging slot per (kv_head, kind):
+// 16 x 512 B fills SP_KVP exactly. Two slots would do if pack and store alternated, but they
+// must not: the vector unit and the engine share the scratchpad port, and interleaving them
+// is ~1.6x slower than packing everything first and then storing.
 #define KVP_SLOTS 16
 static int kvp_scale_e8[KVP_SLOTS];
 
@@ -1383,12 +1430,10 @@ static void kv_store_scale_prep(int kvh, int kind, int e8)
         return;
     // Eight word stores instead of sixteen halfword stores: the beat is byte-identical
     // (halfword g = scale for g < groups, else 0) and uncached scratchpad stores are the
-    // cost here, not the arithmetic.
-    // Only the words that carry a scale change with the exponent - ceil(groups/2) = 2 of
-    // 8 on the 1.7B (head_dim 128 -> 4 groups). The other six are constant zero and
-    // nothing else ever writes the scale beat, so they are staged once per slot epoch (a
-    // sentinel in kvp_scale_e8 at init) and left alone after: 6 posted stores per
-    // exponent change, V changes every layer.
+    // cost here, not the arithmetic. Only the words that carry a scale change with the
+    // exponent - ceil(groups/2) = 2 of 8 on the 1.7B (head_dim 128 -> 4 groups). The others
+    // are constant zero and nothing else ever writes the scale beat, so they are staged once
+    // per slot epoch (a sentinel in kvp_scale_e8 at init) and left alone after.
     volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + kvp_slot(kvh, kind));
     int groups = head_dim/32;
     int nw = (prev <= -1000) ? 8 : (groups + 1)/2;
@@ -1411,7 +1456,9 @@ static void kv_pack_prep_res(int l, int kvh, int kind, int es)
     if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
 }
 
-// Store phase: stream the already-packed slots out. Engine only.
+#ifndef CSR_TRIXIUM_ENGINE_CSR_REP_ADDR
+// Store phase: stream the already-packed slots out (one store per slot without the
+// multi-store CSR). Engine only.
 static void kv_store_row_res(int l, int kvh, int kind, int t)
 {
     struct engine_op op = {0};
@@ -1422,19 +1469,21 @@ static void kv_store_row_res(int l, int kvh, int kind, int t)
     op.xsrc  = kvp_slot(kvh, kind);
     engine_run(&op);
 }
+#endif
 
-// Integer embedding: fetch the ternary row, dequantize with exact fp16 decomposition
-// ((q-1)*m11 aligned to the smallest group exponent), then normalize to int16 BFP.
-// Pure integer (~6 ops/element vs ~50 soft-float ones); exponent returned.
+/* Resident Embedding */
+/*--------------------*/
+
 static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst);
-// The embedding row already in int16 BFP form in the image (ROLE_TOK_EMB16, bit-exact
-// with embed_row_bfp below - bons.py embed_bfp_rows): one 128-beat engine fetch straight
-// into the residual buffer plus one beat for the exponent, instead of ~47k cycles of CPU
-// decode and 1,024 uncached scratchpad stores. Falls back to the decode when the image has
-// no such table.
-// Both entries resolved once at init (norm16_cache_build): the lookups are HBM-backed
+
+// The embedding row already in int16 BFP form in the image (ROLE_TOK_EMB16, bit-exact with
+// embed_row_bfp below - bons.py embed_bfp_rows): one engine fetch straight into the
+// residual buffer plus one beat for the exponent, instead of the CPU decode and its
+// uncached scratchpad stores. Falls back to the decode when the image has no such table.
+// Both entries are resolved once at init (norm16_cache_build): the lookups are HBM-backed
 // table walks, and this runs once per forward.
 static const struct bons_entry *emb16_ent, *emb16x_ent;
+
 static int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
     const struct bons_entry *e16 = emb16_ent;
@@ -1452,6 +1501,10 @@ static int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
                  1, SP_FET);
     return *(volatile int16_t *)(SCRATCHPAD_BASE + SP_FET + 2*((uint32_t)row % 16));
 }
+
+// Integer embedding: fetch the ternary row, dequantize with exact fp16 decomposition
+// ((q-1)*m11 aligned to the smallest group exponent), then normalize to int16 BFP.
+// Pure integer (~6 ops/element vs ~50 soft-float ones); exponent returned.
 COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
@@ -1480,7 +1533,7 @@ COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_d
     // |m11[g]| << sh over any nonzero code - scan codes once for group nonzero-ness.
     // Scratchpad accesses are uncached bus transactions (~30 cycles each), so the codes
     // are read as 32-bit words (16 codes per read) and the int16 results are stored two
-    // per word (byte/halfword accesses cost ~85k cycles per token for 2048 elements).
+    // per word.
     const volatile uint32_t *cw = (const volatile uint32_t *)(pb + sb*32);
     int32_t amax = 0;
     for (int g = 0; g < G; g++) {
@@ -1526,6 +1579,9 @@ int infer_embed_f(int token, float *dst)
     return 0;
 }
 
+/* Sequencer: QK-Norm/RoPE List */
+/*------------------------------*/
+
 // Sequencer descriptor list for the per-head qk-norm + rope loops. Addresses are
 // head-relative inside SP_Q/SP_K, so the list is layer-independent; per layer only the
 // rmsnorm eps_int args (A5 = descriptor word 7) change. Built once at init.
@@ -1533,10 +1589,11 @@ static int seq_qkr_count;
 // Descriptor indices of the q-norm and k-norm in the qkr list (their A1/A5 are patched
 // per layer).
 static int seq_qkr_di_qn = 0, seq_qkr_di_kn = 1;
-// qkr list order: K chain -> packs -> multi-store (NOWAIT) -> Q chain -> Q quant8. The
-// q-side work (rmsnorm_h/rope_h over 16 heads, ~3k cycles) is independent of K/V, so behind
-// the store it absorbs the store's ~1k tail that the stop descriptor would otherwise wait
-// out (16 packets at ~65 cycles of write latency each). Same ops, same numerics.
+
+// qkr list order: K chain -> packs -> multi-store (NOWAIT) -> Q chain -> Q quant8. The q-side
+// work (rmsnorm_h/rope_h over the q heads) is independent of K/V, so behind the store it
+// absorbs the store's write-latency tail that the stop descriptor would otherwise wait out.
+// Same ops, same numerics.
 // qkvx (TRIXIUM_SEQ_LUT bitstreams): the K chain (rmsnorm_h, rope_h, pack) and the V pack
 // move INTO the qkv list, under the q projection's stream, in v-k-q order; the qkr list
 // keeps the multi-store and the Q chain. rmsnorm's eps - a per-layer constant scaled by the
@@ -1550,18 +1607,19 @@ static int seq_qkv_len = 10;
 static int seq_qkv_di_kn = -1;
 #define SP_LUTQ (SP_DESC + 188*64) // 32 x int32 eps for the q norm (descriptor slots
 #define SP_LUTK (SP_LUTQ + 128)    // 188-191, past every list).
-// In-list KV stores: each (kvh, kind) staging slot's
-// engine STORE rides the qkr list as a NOWAIT descriptor right after the pack quant8
-// that fills the slot - the next head's quant8 (vec) runs under the store's stream, so
-// the ~9k cycles/layer of serial CPU-dispatched stores hide under vector work the layer
-// does anyway. Needs the scale-beat prep to run BEFORE the list (the store streams the
-// scale beat), which is equally correct in the CPU-store layout.
+
+// In-list KV stores: each (kvh, kind) staging slot's engine STORE rides the qkr list as a
+// NOWAIT descriptor right after the pack quant8 that fills the slot - the next head's
+// quant8 (vec) runs under the store's stream, so the serial CPU-dispatched stores hide under
+// vector work the layer does anyway. Needs the scale-beat prep to run BEFORE the list (the
+// store streams the scale beat), which is equally correct in the CPU-store layout.
 static int kv_pipe_active = 0;  // What the built list uses.
-// One in-list MULTI-STORE for all 2*n_kv_head slots instead of 16 NOWAIT store ops: the
-// staging slots are 0x200 B apart and a layer's (kvh, kind) regions kv_region beats apart,
-// so the engine's rep/dstride/sstride store scatters them all from one descriptor. 16
-// dispatches -> 1 on the list side, 16 per-layer address patches -> 1 on the CPU side, in
-// the qkr window where both sides are the long pole. Needs the multi-store CSR.
+
+// One in-list MULTI-STORE for all 2*n_kv_head slots instead of one NOWAIT store per slot:
+// the staging slots are 0x200 B apart and a layer's (kvh, kind) regions kv_region beats
+// apart, so the engine's rep/dstride/sstride store scatters them all from one descriptor
+// (one dispatch on the list side, one per-layer address patch on the CPU side). Needs the
+// multi-store CSR.
 #ifdef CSR_TRIXIUM_ENGINE_CSR_REP_ADDR
 static const int kv_mstore = 1;
 #else
@@ -1571,7 +1629,7 @@ static int kv_mstore_active = 0; // What the built list uses.
 static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2 + kind).
 // What the store descriptors' constant words currently hold (~0 = unknown/rebuilt).
 static uint32_t kvst_rb_set = 0xFFFFFFFFu, kvst_chan_set = 0xFFFFFFFFu;
-extern int seq_use;
+
 static int qkvx_possible(void)
 {
     // The K chain lives inside the qkv list, so qkvx only holds while that list runs:
@@ -1618,25 +1676,10 @@ static void seq_build_qkr(void)
             seq_desc_vec(di++, PROG_KVPACK_H, pv, 8, 0);               // 5: V packs
         }
     }
-    if (0)
-    for (int hh = 0; hh < n_head + n_kv_head; hh++) {
-        int      is_q = hh < n_head;
-        uint32_t sp   = is_q ? (SP_Q + hh*head_dim*2)
-                             : (SP_K + (hh - n_head)*head_dim*2);
-        uint32_t wsp  = is_q ? SP_FET : SP_FET2;
-        int32_t rargs[7] = {(int32_t)sp, (int32_t)wsp, (int32_t)sp, head_dim/16,
-                            -ln, 1, 0};                        // A5, A6 patched per layer
-        seq_desc_vec(di++, PROG_RMSNORM, rargs, 7, 0);
-        int32_t pargs[7] = {(int32_t)sp, (int32_t)(sp + head_dim), (int32_t)SP_TAB,
-                            (int32_t)(SP_TAB + head_dim), (head_dim/2)/16,
-                            (int32_t)sp, (int32_t)(sp + head_dim)};
-        seq_desc_vec(di++, PROG_ROPE, pargs, 7, 0);
-    }
     // The fixed-shift KV-pack quant8s ride the same list: the whole-tensor PROG_KVPACK_H
     // descriptors 4/5 pack every kv head (K's after K's rope; V is resident before the list
     // runs). The CPU keeps only the scale-beat prep and the kv_ekmax ratchet
-    // (kv_pack_prep_res). An in-list descriptor measures ~50 cycles against ~420 for a CPU
-    // vec_run. The ENGINE STORES below are needed without the multi-store.
+    // (kv_pack_prep_res). The ENGINE STORES below are needed without the multi-store.
     // kv_pipe_active must be reset unconditionally: a stale value would make a list
     // rebuild patch descriptors that now belong to the attention list.
     kv_pipe_active = 0;
@@ -1681,10 +1724,9 @@ static void seq_build_qkr(void)
     } else
         seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);                  // q-norm (A5 patched)
     seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                         // q-rope
-    // ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB
-    // post-increments 16 B, so head j lands at +j*head_dim); the attention list's
-    // scores read x from there. The region
-    // is dead during attention: softmax p8 lives at SP_X[0, ctx) and nothing else
+    // ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB post-increments
+    // 16 B, so head j lands at +j*head_dim); the attention list's scores read x from there.
+    // The region is dead during attention: softmax p8 lives at SP_X[0, ctx) and nothing else
     // touches SP_X until the FFN quant8 overwrites it.
     {
         // Fixed shift only: PROG_QUANT8 with A1 = 0 would still run its absmax pass over
@@ -1701,9 +1743,9 @@ static void seq_build_qkr(void)
 
 // seq_eps_int cache, index es+64; 0 = not computed yet. int32 over [-64, 63]: the qkvx LUT
 // fill asks for 32 es values per norm per layer (including the big-eps, very negative es
-// entries) and a miss is ~500 cycles of soft-float. In the main_ram static window (not SRAM
-// .bss, which is at its 4 KiB stack floor), so NOT zero-initialized: infer_static_init()
-// clears it.
+// entries) and a miss is soft-float work. In the main_ram static window (not SRAM .bss,
+// which is at its 4 KiB stack floor), so NOT zero-initialized: infer_static_init() clears
+// it.
 #define eps_memo ((int32_t *)TRIXIUM_EPS_MEMO_ADDR)
 
 void infer_static_init(void)
@@ -1713,9 +1755,8 @@ void infer_static_init(void)
 
 static int seq_eps_int(int es)
 {
-    // Soft-float (lroundf/ldexpf) costs hundreds of cycles on this FPU-less core and
-    // es takes a handful of values - memoize. e >= 1 always, so
-    // 0 doubles as the empty marker.
+    // Soft-float lroundf/ldexpf costs hundreds of cycles and es takes a handful of values:
+    // memoize. e >= 1 always, so 0 doubles as the empty marker.
     int mi = es + 64;
     if (mi >= 0 && mi < 128 && eps_memo[mi])
         return eps_memo[mi];
@@ -1726,6 +1767,9 @@ static int seq_eps_int(int es)
     return e;
 }
 
+/* Sequencer: Attention List */
+/*---------------------------*/
+
 // Sequencer descriptor list for the fused per-head attention chain:
 //   quant8 -> scores (engine) -> softmax8 -> spill(p8 sum) -> AXPY (rshift from rpre of
 //   the chained res6 = p8 sum) -> reduce x(n_ch-1) -> spill(absmax) -> norm_i32 (k via
@@ -1733,14 +1777,13 @@ static int seq_eps_int(int es)
 //   words are patched before each run. Spills feed the one CPU float fold per head
 //   (c2/hmax) after the list - identical numerics to the CPU-dispatched fused path.
 static int seq_attn_base, seq_attn_dph, seq_attn_heads;
-// Pipelined attention list: head j+1's scores op is dispatched
-// NOWAIT before head j's softmax8, so the engine streams K(j+1) while the vector unit
-// works. Scores double-buffer between the two HALVES of the SP_SC region - both halves
-// are written only by scores ops, so the INT32_MIN padding written once per forward
-// survives across layers, the same invariant the single buffer relies on (not SP_G: the FFN
-// rewrites it every layer). The serialization softmax8(j) needs against scores(j) comes free from the
-// dispatch of scores(j+1) - an engine descriptor only dispatches when the engine is
-// idle - so no barrier bits are required. Layout when active:
+// Pipelined attention list: head j+1's scores op is dispatched NOWAIT before head j's
+// softmax8, so the engine streams K(j+1) while the vector unit works. Scores double-buffer
+// between two buffers written only by scores ops, so the INT32_MIN padding written once per
+// forward survives across layers, the same invariant the single buffer relies on (not SP_G:
+// the FFN rewrites it every layer). The serialization softmax8(j) needs against scores(j)
+// comes free from the dispatch of scores(j+1) - an engine descriptor only dispatches when
+// the engine is idle - so no barrier bits are required. Layout when active:
 //   base+0                 scores(slot 0), NOWAIT                    (prologue)
 //   base+1+j*5 .. +4       [spill(j-1)|nopd] [scores(j+1) NOWAIT|nopd] [norm(j-1)|nopd]
 //                          softmax8(j)  wv(j) NOWAIT
@@ -1769,30 +1812,42 @@ static uint32_t sp_scb2;          // Second scores buffer (0 = no deep layout po
 static uint32_t sc_b_cap_bytes;   // Its capacity.
 #define SP_SCB2        sp_scb2
 #define SC_B_CAP_BYTES sc_b_cap_bytes
-static inline uint32_t attn_grp(int j) {
+static inline uint32_t attn_grp(int j)
+{
     return (uint32_t)seq_attn_base + (attn_pipe_active ? 1u : 0u)
            + (uint32_t)j*(uint32_t)seq_attn_dph;
 }
-static inline uint32_t attn_di_sc(int j) { // scores descriptor serving slot j
+
+static inline uint32_t attn_di_sc(int j) // Scores descriptor serving slot j.
+{
     if (!attn_pipe_active) return attn_grp(j);
     // Deep layout: slot 1 of the previous group (slot 0 is that group's spill; an
     // unwritten slot would be w0 = 0, a STOP).
     return (j == 0) ? (uint32_t)seq_attn_base : attn_grp(j - 1) + 1u;
 }
-static inline uint32_t attn_di_sm(int j) { // softmax8 slot
+
+static inline uint32_t attn_di_sm(int j) // softmax8 slot.
+{
     return attn_grp(j) + (attn_pipe_active ? 3u : 1u);
 }
-static inline uint32_t attn_di_wv(int j) { // wv (AXPY) slot
+
+static inline uint32_t attn_di_wv(int j) // wv (AXPY) slot.
+{
     return attn_grp(j) + (attn_pipe_active ? 4u : 2u);
 }
-static inline uint32_t attn_sc_dst(int j) {
+
+static inline uint32_t attn_sc_dst(int j)
+{
     // Double-buffered ONLY in the pipelined layout: the INT32_MIN padding is only
     // maintained for the active layout, so the plain list must not read the second buffer.
     return (attn_pipe_active && (j & 1)) ? (uint32_t)SP_SCB2 : (uint32_t)SP_SC;
 }
-static inline int attn_list_len(int nh) {
+
+static inline int attn_list_len(int nh)
+{
     return nh*seq_attn_dph + (attn_pipe_active ? 3 : 0); // Prologue + 2-slot epilogue.
 }
+
 static void seq_build_attn(void)
 {
     seq_attn_heads = 0;
@@ -1889,19 +1944,12 @@ static void seq_build_attn(void)
     }
 }
 
-// Sequencer attention: the descriptor lists collapse ~6 dispatch round-trips per head into
-// one submit. On by default - measured 1.415 tok/s against 1.175 with the lists off, same
-// tokens either way. `seq off` selects the CPU-dispatched path per head.
-// FFN chain as ONE descriptor list (kreg exponent registers, sequencer w0[5]/w1[16+2i]),
-// layout in seq_build_ffn: the silu shift eg = ex8 - bias + rshift + kg mixes a per-layer
-// constant with the gate matvec's k - inexpressible with KABS alone, hence the kreg.
-// Post-list the CPU recovers: kg/ku from the two spilled absmaxes, s from vec res6, kd and
-// dmax from the engine absmax CSR (down ran last) - the SAME values the op-by-op path
-// computes, so the numerics are identical by construction. The final norm -> SP_D and
-// resid_add stay CPU-side (they need *omax and the residual ratchet state).
-// FFN diagnosis (fprof console command): windowed overlap accumulators over the
-// FFN block on whichever path ran, plus one layer's fine-grained trace per forward
-// (layer 0): descriptor timestamps for the list path, step timestamps for the op path.
+/* FFN Profiling */
+/*---------------*/
+
+// FFN diagnosis (fprof console command): windowed overlap accumulators over the FFN block on
+// whichever path ran, plus one layer's fine-grained trace per forward (layer 0): descriptor
+// timestamps for the list path, step timestamps for the op path.
 int fprof_use = 0;
 static uint64_t *const fprof_acc_list = (uint64_t *)(TRIXIUM_FPROF_BUFFER_ADDR);
 static uint64_t *const fprof_acc_ops = (uint64_t *)(TRIXIUM_FPROF_BUFFER_ADDR + 32);
@@ -1910,17 +1958,23 @@ static uint32_t *const fprof_ts = (uint32_t *)(TRIXIUM_FPROF_BUFFER_ADDR + 64);
 static int fprof_nts;
 static uint32_t *const fprof_steps = (uint32_t *)(TRIXIUM_FPROF_BUFFER_ADDR + 128);
 static int fprof_nsteps;
+
 void fprof_reset(void)
 {
     for (int i = 0; i < 4; i++) fprof_acc_list[i] = fprof_acc_ops[i] = 0;
     fprof_nlist = fprof_nops = 0; fprof_nts = 0; fprof_nsteps = 0;
 }
+
 void fprof_print(void)
 {
-    if (fprof_nlist) { perf_ovl_report("FFN-list", fprof_acc_list);
-                       printf("  windows %lu\n", (unsigned long)fprof_nlist); }
-    if (fprof_nops)  { perf_ovl_report("FFN-ops", fprof_acc_ops);
-                       printf("  windows %lu\n", (unsigned long)fprof_nops); }
+    if (fprof_nlist) {
+        perf_ovl_report("FFN-list", fprof_acc_list);
+        printf("  windows %lu\n", (unsigned long)fprof_nlist);
+    }
+    if (fprof_nops) {
+        perf_ovl_report("FFN-ops", fprof_acc_ops);
+        printf("  windows %lu\n", (unsigned long)fprof_nops);
+    }
     if (fprof_nts) {
         printf("FFNTRACE list dcounts (deltas):");
         for (int i = 1; i < fprof_nts; i++)
@@ -1935,17 +1989,29 @@ void fprof_print(void)
     }
 }
 
+/* Sequencer: FFN List */
+/*---------------------*/
+
+// FFN chain as ONE descriptor list (kreg exponent registers, sequencer w0[5]/w1[16+2i]),
+// layout in seq_build_ffn: the silu shift eg = ex8 - bias + rshift + kg mixes a per-layer
+// constant with the gate matvec's k - inexpressible with KABS alone, hence the kreg.
+// Post-list the CPU recovers: kg/ku from the two spilled absmaxes, s from vec res6, kd and
+// dmax from the engine absmax CSR (down ran last) - the SAME values the op-by-op path
+// computes, so the numerics are identical by construction. The final norm -> SP_D and
+// resid_add stay CPU-side (they need *omax and the residual ratchet state).
 static int seq_ffn_base = -1;
 static int seq_ffn_len  = 0;
 static int ffn_shape_base = -1; // seq_ffn_base the FFN engine shape images were written for.
+
 // The SiLU split: everything in silu_q8 up to the x*sigmoid(x) product is a function of the
 // GATE alone, so that half (silu_gate) runs UNDER the up matvec's stream (where norm_g
 // already runs) and only the multiply/absmax/quant8 tail (mul_q8) waits for up.
-// Byte-identical by construction (asm.py, test_silu_split_matches_fused); -4.07%
-// cycles/token. It relies on the matvec result packer: without it the vector unit runs
-// ~2.9x slower under an engine stream and norm_g alone fills the window.
+// Byte-identical by construction (asm.py, test_silu_split_matches_fused). It relies on the
+// matvec result packer: without it the vector unit runs ~2.9x slower under an engine stream
+// and norm_g alone fills the window.
 static int ffn_di_down = 7; // Down matvec's descriptor (seq_build_ffn).
 static int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
+
 static void seq_build_ffn(void)
 {
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
@@ -2012,13 +2078,14 @@ static void seq_build_ffn(void)
     seq_desc_stop(d);
 }
 
+/* Sequencer: Scale8 List */
+/*------------------------*/
 
-// The per-head attention-output scale8 as one n_head-descriptor list.
-// Only A4 (the per-head Q15 multiplier Mh) changes per layer; a CPU vec_run costs ~500
-// cycles of dispatch against ~50 for an in-list descriptor, x16 heads x 28 layers.
-// Placed behind the FFN list (which is behind the attention list); 156..172 of 192 on
-// the 1.7B.
+// The per-head attention-output scale8 as one n_head-descriptor list. Only A4 (the per-head
+// Q15 multiplier Mh) changes per layer; an in-list descriptor dispatches ~10x faster than a
+// CPU vec_run. Placed behind the FFN list (which is behind the attention list).
 static int seq_scale8_base = -1;
+
 static void seq_build_scale8(void)
 {
     // Invalidate first, like seq_build_qkv does with its own base: seq_build_qkv derives
@@ -2042,12 +2109,14 @@ static void seq_build_scale8(void)
     seq_desc_stop(di + n_head);
 }
 
-// QKV projection list ("qkvl"): the three attention projections and their
-// norm_i32s as one sequencer run, the FFN list's shape - each norm runs UNDER the next
-// projection's NOWAIT stream with its shift derived in-sequencer (KRES6) from the
-// absmax the preceding spill left in res6. Replaces six CPU dispatches per layer. The
-// three absmaxes are
-// spilled to SP_QKSP so the CPU recovers kq/kk/kv exactly as the op path computes them.
+/* Sequencer: QKV List */
+/*---------------------*/
+
+// QKV projection list ("qkvl"): the three attention projections and their norm_i32s as one
+// sequencer run, the FFN list's shape - each norm runs UNDER the next projection's NOWAIT
+// stream with its shift derived in-sequencer (KRES6) from the absmax the preceding spill
+// left in res6. Replaces six CPU dispatches per layer. The three absmaxes are spilled to
+// SP_QKSP so the CPU recovers kq/kk/kv exactly as the op path computes them.
 //   0 q mv            1 spill q-absmax -> SP_QKSP+0
 //   2 k mv NOWAIT     3 norm_q SP_Y -> SP_Q [k via KRES6]      <- under the k stream
 //   4 spill k-absmax  5 v mv NOWAIT   6 norm_k SP_Y+0x4000 -> SP_K [KRES6] <- under v
@@ -2059,6 +2128,7 @@ static void seq_build_scale8(void)
 
 static int seq_qkv_base = -1;
 static int qkv_prepped  = -1; // Layer whose projections are currently in the slots.
+
 static void seq_build_qkv(void)
 {
     seq_qkv_base = -1;
@@ -2187,21 +2257,17 @@ static void qkv_prep_layer(int l)
     qkv_prepped = l;
 }
 
+/* Sequencer Control */
+/*-------------------*/
+
+// The descriptor lists (attention, FFN, qkv, scale8) are on by default: they collapse the
+// per-head and per-op dispatch round-trips into one submit per list, same tokens either way.
+// `seq off` selects the CPU-dispatched op-by-op path, which still overlaps the engine and
+// the vector unit (docs/overlap-design.md): e.g. the FFN up-projection stream runs UNDER the
+// gate-norm vector program (disjoint regions; gate absmax captured before the submit, so
+// numerics are byte-identical by construction).
 int seq_use = 1;
-// The FFN descriptor list is on by default: same-boot windowed counters read list 12.03M
-// vs ops 14.32M per bench-8 (neither-busy 4% vs 19%), bench-64 -2.0%/token. A/B the two
-// like-for-like (both sides fused silu+quant8). `seq off` selects the op-by-op path.
-// The op-by-op path overlaps the engine and the vector unit (docs/overlap-design.md): the
-// FFN up-projection stream runs UNDER the gate-norm vector program (disjoint regions; gate
-// absmax captured before the submit, so numerics are byte-identical by construction).
 
-// Forward one token; returns argmax token id (only meaningful when wanted). ------------------
-
-// Token-invariant words of the attention list, patched ONCE per forward instead of once
-// per layer per head: rowsw/wlen (scores + AXPY) and the softmax block count depend on pos
-// only, and the score-slot padding survives across heads and layers because only the scores
-// op writes SP_SC (exactly cnt slots). Written 28x less often than per layer - uncached
-// scratchpad stores are ~25-70 cycles each.
 void infer_seq(int on)
 {
     seq_use = on ? 1 : 0;
@@ -2209,6 +2275,7 @@ void infer_seq(int on)
     seq_ffn_base = -1;
     seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
 }
+
 void infer_qkvx_report(void)
 {
     if (qkvx_ok)
@@ -2224,6 +2291,10 @@ void infer_attn_chunk(int cap)
     printf("ATTNCHUNK cap %d: list holds %d of %d heads, pipelined %d\n", cap, seq_attn_heads,
            n_head, attn_pipe_active);
 }
+
+/* Per-Layer List Patching */
+/*-------------------------*/
+
 // Per-layer attention slot patches, extracted so they can run UNDER the qkr list
 // (per-cycle sideband slot): the sequencer is executing qkr descriptors and never
 // dispatches attention ones, so patching them mid-list is safe; every input
@@ -2232,18 +2303,21 @@ void infer_attn_chunk(int cap)
 static int attn_prepatched;
 static int ffn_prepatched;
 static int qkn_resident;   // 1 once every layer's q/k norm rows sit in SP_QNW/SP_KNW.
+
 // List-relative dcount ("descriptors completed") threshold after which head j's fold
 // inputs (softmax8's AWP8 self-spill and spill(j)'s AWAM) are certainly written: one
 // past norm(j), whose producers are all earlier vec descriptors in the same list.
-static inline uint32_t attn_fold_ready(int j, int chunk) {
+static inline uint32_t attn_fold_ready(int j, int chunk)
+{
     if (!attn_pipe_active) return (uint32_t)(j*5 + 5);
     if (j >= chunk - 2)    return (uint32_t)(1 + (j + 1)*5 + 2); // last-group/epilogue slots.
     return (uint32_t)(1 + (j + 1)*5 + 3);
 }
-// Per-layer FFN list rebuild (three engine descriptors + their flag words), extracted so
-// it can POST under the qkr list (all inputs are layer-known: model
-// entries and static scratchpad addresses; only the silu A4 imm needs ex8 and stays at
-// FFN time). The sequencer-fetch interlock orders these writes before the FFN list runs.
+
+// Per-layer FFN list rebuild (three engine descriptors + their flag words), extracted so it
+// can POST under the qkr list (all inputs are layer-known: model entries and static
+// scratchpad addresses; only the silu A4 imm needs ex8 and stays at FFN time). The
+// sequencer-fetch interlock orders these writes before the FFN list runs.
 static inline void ffn_patch_lw(uint32_t di, const struct engine_op *mo)
 {
     seq_patch(di, 4, mo->wbase);
@@ -2269,6 +2343,7 @@ static void ffn_prep_layer(int l)
     else ffn_patch_lw(b + (uint32_t)ffn_di_down, &mo);
     ffn_shape_base = seq_ffn_base;
 }
+
 static void attn_patch_slots(int l, int h0, int nh, int chunked)
 {
     int lg = 0;
@@ -2297,6 +2372,10 @@ static void attn_patch_slots(int l, int h0, int nh, int chunked)
     }
 }
 
+// Token-invariant words of the attention list, patched ONCE per forward instead of once per
+// layer per head: rowsw/wlen (scores + AXPY) and the softmax block count depend on pos only,
+// and the score-slot padding survives across heads and layers because only the scores op
+// writes SP_SC (exactly cnt slots). Uncached scratchpad stores are expensive.
 static void attn_list_prep_token(int pos)
 {
     if (seq_attn_heads <= 0)
@@ -2337,7 +2416,11 @@ static void attn_list_prep_token(int pos)
     attn_prep_pos = pos;
 }
 
+/* Attention Fold Inputs */
+/*-----------------------*/
+
 static int fold_nrep_sh = 1; // log2(n_head/n_kv_head) when a power of two (set at init).
+
 // The per-head fold from its two hardware results (softmax8's p8 sum, the AXPY absmax),
 // in the integer form the output projection consumes. ONE producer for both the list
 // path (spilled values, attn_fold_head) and the seq-off op-by-op path, so both fill the
@@ -2363,6 +2446,7 @@ static void attn_fold_vals(int l, int hh, uint32_t P8, uint32_t am)
         }
     }
 }
+
 static void attn_fold_head(int l, int hh)
 {
     uint32_t P8 = *(volatile uint32_t *)(SCRATCHPAD_BASE + SP_AWP8 + (uint32_t)hh*32);
@@ -2370,11 +2454,15 @@ static void attn_fold_head(int l, int hh)
     attn_fold_vals(l, hh, P8, am);
 }
 
-// Per-layer norm16 entries, resolved once at init into .bss - which lives in the 8 KB
-// tightly-coupled SRAM. model_entry_kind() walks the entry cache and the tensor table,
-// both in HBM-backed main_ram behind a 2-way L1 with no L2, so each of these lookups
-// would be a couple of ~150-cycle misses, 5+ times a layer.
+/* Norm16 Cache */
+/*--------------*/
+
+// Per-layer norm16 entries, resolved once at init into .bss - which lives in the
+// tightly-coupled SRAM. model_entry_kind() walks the entry cache and the tensor table, both
+// in main_ram behind an L1 with no L2, so each of these lookups would be a couple of cache
+// misses, several times a layer.
 static const struct bons_entry *nrm_attn16[NRM_MAXL], *nrm_ffn16[NRM_MAXL], *nrm_out16;
+
 static void norm16_cache_build(void)
 {
     for (int l = 0; l < n_layer && l < NRM_MAXL; l++) {
@@ -2393,7 +2481,11 @@ static const struct bons_entry *next_norm16(int l)
 }
 
 uint32_t infer_forwards; // Forwards run since boot (bench reports cycles per forward too).
-// Sampling (`sample <temp> <top_p> <rep> [seed]`; temp 0 = greedy, the default).
+
+/* Sampling */
+/*----------*/
+
+// `sample <temp> <top_p> <rep> [seed]`; temp 0 = greedy, the default.
 //
 // The LM head's argmax tap returns one (value, index); sampling needs a candidate set. The
 // head runs as SMP_SLICES row-range ops instead of one, and each tap returns the best of
@@ -2418,12 +2510,22 @@ void infer_set_sampling(float temp, float top_p, float rep, uint32_t seed)
     smp_rep = rep < 1.0f ? 1.0f : rep;
     if (seed) smp_rng = seed;
 }
+
 void infer_get_sampling(float *temp, float *top_p, float *rep)
 {
     *temp = smp_temp; *top_p = smp_top_p; *rep = smp_rep;
 }
-void infer_set_recent(const int *buf, const int *n_ptr) { smp_recent = buf; smp_recent_np = n_ptr; }
-static int smp_on(void) { return smp_temp > 0.0f || smp_rep > 1.0f; }
+
+void infer_set_recent(const int *buf, const int *n_ptr)
+{
+    smp_recent    = buf;
+    smp_recent_np = n_ptr;
+}
+
+static int smp_on(void)
+{
+    return smp_temp > 0.0f || smp_rep > 1.0f;
+}
 
 static uint32_t smp_rand(void)
 {
@@ -2479,6 +2581,8 @@ static int smp_pick(const int32_t *val, const int *tok, int n, float lscale)
     return tok[ord[keep - 1]];
 }
 
+/* Debug Traces */
+/*--------------*/
 
 // `dbg N`: checksum the resident intermediates of the next N forwards, the same regions at
 // the same points as the Python mirror's raw trace (test_sim_smoke.hybrid_generate, tag
@@ -2486,8 +2590,16 @@ static int smp_pick(const int32_t *val, const int *tok, int n, float lscale)
 // The only bit-exact reference the 1.7B has: the tiny sim model answers token 0 to
 // everything, so its token gate cannot see a numerics deviation.
 static int dbg_armed;
-void infer_dbg(int n) { dbg_armed = n; }
-int infer_dbg_armed(void) { return dbg_armed; }
+
+void infer_dbg(int n)
+{
+    dbg_armed = n;
+}
+
+int infer_dbg_armed(void)
+{
+    return dbg_armed;
+}
 
 static void dbg_typed(const char *tag, int layer, const void *values, uint32_t n,
                       const char *dtype)
@@ -2534,6 +2646,10 @@ static void dbg_sum(const char *tag, int l, uint32_t off, uint32_t bytes, int e)
            (unsigned long)h, (long)amax, (long)v[0], (long)v[1], (long)v[2], (long)v[3]);
 }
 
+/* Forward */
+/*---------*/
+
+// Forward one token; returns the next token id (only meaningful when want_logits).
 static int forward(int token, int want_logits)
 {
     if (hybrid_present()) {          // The 27B's layers: hybrid.c, the CPU path.
@@ -2609,7 +2725,7 @@ embed_done: ;
                                    nrm_attn16[l],
                                    n_embd, SP_H, SP_X);
         dbg_sum("attn_in_x8", l, SP_X, n_embd, E_NORM + sx8);
-        int eq_res = 0, ev_res = 0;
+        int ev_res = 0;
         if (likely(attn_hw)) {
             // q/k/v: engine matvec -> vec norm_i32 -> int16 resident; qk-norm + rope on
             // the vector unit; K/V packed and stored to HBM. No CPU floats anywhere.
@@ -2731,14 +2847,14 @@ embed_done: ;
                 // One sequencer run replaces the 2*(n_head+n_kv) per-head dispatches;
                 // only the eps args change per layer (descriptor word 7 = A5).
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
-                if (!qkvx_ok) { // qkvx: the sequencer reads both from the layer's LUTs,
-                                // and qkv_prep_layer patched both A6s.
+                // qkvx: the sequencer reads both from the layer's LUTs, and qkv_prep_layer
+                // patched both A6s.
+                if (!qkvx_ok) {
                     seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
                     seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);   // rmsnorm_h A5 (k heads).
                     seq_patch((uint32_t)seq_qkr_di_qn, 8, (uint32_t)w16_shift(qn16)); // A6 (gamma exp).
                     seq_patch((uint32_t)seq_qkr_di_kn, 8, (uint32_t)w16_shift(kn16));
                 }
-                (void)epq; (void)epk;
                 if (kv_pipe_active) {
                     // In-list stores: the scale beats must exist before the list runs
                     // (the store streams them), and each store's target row moves per
@@ -2746,10 +2862,9 @@ embed_done: ;
                     // post-list placement.
                     // Only the target address is per (layer, slot): the beat count is a
                     // model constant once kv_rb is known and the channel is per TOKEN, so
-                    // those are rewritten only on change - posted writes under a running
-                    // list cost ~80 cycles each. This removes writes, not the arithmetic
-                    // between them: that arithmetic is what keeps the sequencer's
-                    // descriptor fetch alive.
+                    // those are rewritten only on change (posted writes under a running list
+                    // are expensive). This removes writes, not the arithmetic between them:
+                    // that arithmetic is what keeps the sequencer's descriptor fetch alive.
                     uint32_t rowoff = (uint32_t)(pos/n_ch)*kv_rb*32;
                     uint32_t chan   = (uint32_t)(pos % n_ch);
                     int wr_rb   = (kvst_rb_set   != (uint32_t)kv_rb);
@@ -2794,8 +2909,9 @@ embed_done: ;
                         ffn_prepatched = 1;
                     }
                     seq_join();
-                } else
-                seq_run(0, seq_qkr_count);
+                } else {
+                    seq_run(0, seq_qkr_count);
+                }
             }
             perf_exit(OP_QKNORM);
             dbg_sum("q16", l, SP_Q, 2*q_dim, E_NORM);      // q heads normed + roped
@@ -2811,10 +2927,10 @@ embed_done: ;
 #ifdef CSR_TRIXIUM_ENGINE_CSR_REP_ADDR
             // Only without the in-list NOWAIT stores (the default): with them, the list has
             // already written every KV row (a second store would cost time, not tokens).
-            if (!kv_pipe_active)
-            {   // ...then ONE multi-packet store for all 2*n_kv_head slots: the
-                // (kvh, kind) regions of a layer are consecutive (kv_region beats apart)
-                // and the staging slots 0x200 B apart, so one op scatters them all.
+            if (!kv_pipe_active) {
+                // ...then ONE multi-packet store for all 2*n_kv_head slots: the (kvh, kind)
+                // regions of a layer are consecutive (kv_region beats apart) and the staging
+                // slots 0x200 B apart, so one op scatters them all.
                 struct engine_op op = {0};
                 op.kind    = ENGINE_KIND_STORE;
                 op.chan    = pos % n_ch;
@@ -2834,15 +2950,13 @@ embed_done: ;
                 }
 #endif
             perf_exit(OP_KVQUANT);
-            eq_res = E_NORM;
-            (void)eq_res;
             goto attn_scores;
         }
         {
-        float sx = ldexpf(1.0f, E_NORM + sx8);
-        matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q, 0, 0, 0);
-        matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k, 0, 0, 0);
-        matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v, 0, 0, 0);
+            float sx = ldexpf(1.0f, E_NORM + sx8);
+            matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q, 0, 0, 0);
+            matvec_rows_f(model_entry(ROLE_ATTN_K, l), 0, kv_dim/n_ch, sx, k, 0, 0, 0);
+            matvec_rows_f(model_entry(ROLE_ATTN_V, l), 0, kv_dim/n_ch, sx, v, 0, 0, 0);
         }
 
         perf_enter(OP_QKNORM);
@@ -2863,9 +2977,9 @@ embed_done: ;
                 goto cpu_kv_full; // Cache capped; HW KV (full ctx) is unaffected.
             int8_t *kd = k_cache + ((uint64_t)l*cpu_kv_ctx + pos)*kv_dim;
             int8_t *vd = v_cache + ((uint64_t)l*cpu_kv_ctx + pos)*kv_dim;
-            // Per-head scales, not one per token: the head spread of K is large (16x at
-            // layer 0 of the 1.7B, head 4 peaking at 311 against head 6 at 18.9), so a single
-            // tensor scale leaves the quiet heads under 3 bits and wrecks their scores.
+            // Per-head scales, not one per token: the head spread of K is large (16x at layer 0
+            // of the 1.7B), so a single tensor scale leaves the quiet heads under 3 bits and
+            // wrecks their scores.
             for (int h = 0; h < n_kv_head; h++) {
                 const float *kh = k + h*head_dim, *vh = v + h*head_dim;
                 float ka = 0, va = 0;
@@ -2971,7 +3085,6 @@ attn_scores: ;
                 // Fused resident path: scores (engine) -> softmax8 (vec, p8 + exact sum)
                 // -> weighted-V (engine AXPY) -> cross-channel reduce (vec). Scores never
                 // touch the CPU; the 1/sum fold is one float divide per head.
-                float *ah = attn + hh*head_dim;
                 perf_enter(OP_SCORES);
                 int eq;
                 if (likely(attn_hw)) {
@@ -3041,15 +3154,13 @@ attn_scores: ;
                 }
                 if (n_ch == 1)
                     am = trixium_engine_csr_absmax_read(); // AXPY partials tracked too.
-                int k2 = 0;
-                k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
+                int k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
                 int32_t nargs[5] = {(int32_t)SP_SC, 0,
                                     (int32_t)(SP_H + hh*head_dim*2), head_dim/16, k2};
                 vec_run(PROG_NORM_I32, nargs, 5);
                 // Both fold forms, same producer as the list path (see attn_fold_vals):
                 // Bv/Rpre/k2 there are exactly the ones computed above.
                 attn_fold_vals(l, hh, (uint32_t)P8, (uint32_t)am);
-                (void)Rpre; (void)Bv; (void)ah;
                 perf_exit(OP_WV);
                 continue;
             }
@@ -3082,22 +3193,22 @@ attn_scores: ;
                     scores[t] = sc;
                     if (sc > smax) smax = sc;
                 }
-            } else
-            { // The whole CPU fallback (scores from the CPU-side k_cache).
-            if (pos >= cpu_kv_ctx) {
-                // The CPU fallback cache is capped (see CPU_KV_CTX); results past it would
-                // read out of bounds. The HW path carries full context - switch back.
-                puts("CPU attention past CPU_KV_CTX: use hwops attention or shorter prompts");
-                pos = cpu_kv_ctx - 1;
-            }
-            for (int t = 0; t <= pos; t++) {
-                const int8_t *kt = k_cache + ((uint64_t)l*cpu_kv_ctx + t)*kv_dim + kvh*head_dim;
-                float dot = 0;
-                for (int d = 0; d < head_dim; d++) dot += qh[d]*kt[d];
-                float sc = dot*k_scale[((uint64_t)l*cpu_kv_ctx + t)*n_kv_head + kvh]*scale;
-                scores[t] = sc;
-                if (sc > smax) smax = sc;
-            }
+            } else {
+                // The whole CPU fallback (scores from the CPU-side k_cache).
+                if (pos >= cpu_kv_ctx) {
+                    // The CPU fallback cache is capped (see CPU_KV_CTX); results past it
+                    // would read out of bounds. The HW path carries full context.
+                    puts("CPU attention past CPU_KV_CTX: use hwops attention or shorter prompts");
+                    pos = cpu_kv_ctx - 1;
+                }
+                for (int t = 0; t <= pos; t++) {
+                    const int8_t *kt = k_cache + ((uint64_t)l*cpu_kv_ctx + t)*kv_dim + kvh*head_dim;
+                    float dot = 0;
+                    for (int d = 0; d < head_dim; d++) dot += qh[d]*kt[d];
+                    float sc = dot*k_scale[((uint64_t)l*cpu_kv_ctx + t)*n_kv_head + kvh]*scale;
+                    scores[t] = sc;
+                    if (sc > smax) smax = sc;
+                }
             }
             perf_exit(OP_SCORES);
             perf_enter(OP_SOFTMAX);
@@ -3191,8 +3302,9 @@ attn_heads_done: ;
                 if (likely(seq_use && seq_scale8_base >= 0))
                     seq_run((uint32_t)seq_scale8_base, (uint32_t)n_head);
                 perf_exit(OP_QUANT8);
-            } else
-            ea8 = quantize_f_pow2(attn, q_dim, SP_X);
+            } else {
+                ea8 = quantize_f_pow2(attn, q_dim, SP_X);
+            }
             dbg_sum("attn_x8", l, SP_X, q_dim, ea8);
             // The attention list's per-head spills (int32 as int16 pairs: the low half of
             // each 32 B beat's first word is what the fold reads) and scores buffer B.
@@ -3346,7 +3458,6 @@ attn_heads_done: ;
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head)
         head = model_entry(ROLE_TOK_EMB, 0);
-    float sc  = 0; // Argmax runs on raw int32 (same scale across chunks).
     uint32_t rpc       = head->rows/n_ch;
     uint32_t chunk_rpc = 0x20000/(4*n_ch); // 128 KB of int32 results per chunk.
     if (chunk_rpc > rpc) chunk_rpc = rpc;
@@ -3423,8 +3534,9 @@ attn_heads_done: ;
             attn_list_prep_token(n_pos);
             qkv_prep_layer(0);   // Next forward's layer-0 projections ride here too.
             engine_join(dl);
-        } else
-        engine_run(&op);
+        } else {
+            engine_run(&op);
+        }
         uint32_t idx = trixium_engine_csr_argmax_idx_read();
         if (idx < H->vocab) {
             perf_exit(OP_LMHEAD);
@@ -3468,7 +3580,6 @@ attn_heads_done: ;
             }
         }
     }
-    (void)sc;
     perf_exit(OP_LMHEAD);
     if (unlikely(tprof_active))
         tprof_end();
@@ -3479,7 +3590,8 @@ attn_heads_done: ;
     return best_tok;
 }
 
-// Public API ---------------------------------------------------------------------------------
+/* Init */
+/*------*/
 
 int infer_init(void)
 {
@@ -3511,20 +3623,24 @@ int infer_init(void)
         return -4;
     }
 #endif
-    n_ch     = H->n_channels;
-    n_layer  = H->n_layer;
-    n_embd   = H->n_embd;
-    n_head   = H->n_head;
-    n_kv_head= H->n_kv_head;
-    head_dim = H->head_dim;
-    ffn_dim  = H->ffn_dim;
+    n_ch      = H->n_channels;
+    n_layer   = H->n_layer;
+    n_embd    = H->n_embd;
+    n_head    = H->n_head;
+    n_kv_head = H->n_kv_head;
+    head_dim  = H->head_dim;
+    ffn_dim   = H->ffn_dim;
 
-    heap    = (uint8_t *)HEAP_BASE;
-    if (!hybrid_present()) {   // The integer attention's per-head fold shifts by log2(n_rep);
-                               // the hybrid CPU path takes any ratio (the 27B: 24/4 = 6).
+    heap = (uint8_t *)HEAP_BASE;
+    // The integer attention's per-head fold shifts by log2(n_rep); the hybrid CPU path takes
+    // any ratio (the 27B: 24/4 = 6).
+    if (!hybrid_present()) {
         int nrep = n_head/n_kv_head, sh = 0;
         while ((1 << sh) < nrep) sh++;
-        if ((1 << sh) != nrep) { printf("infer: n_head/n_kv_head must be a power of two\n"); return -5; }
+        if ((1 << sh) != nrep) {
+            printf("infer: n_head/n_kv_head must be a power of two\n");
+            return -5;
+        }
         fold_nrep_sh = sh;
     }
     qkn_resident = 0; // New image / re-init: the resident qk-norm rows must be refetched.
@@ -3544,7 +3660,7 @@ int infer_init(void)
     norm16_cache_build();
     tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
     {
-        // kv_scores_br's R: depends only on head_dim - once, not 1792x/token.
+        // kv_scores_br's R: depends only on head_dim.
         uint64_t bound = (uint64_t)(head_dim/32)*32u*127u*127u*1024u << 12;
         int r = 0;
         while ((bound >> r) >= (1ull << 31)) r++;
@@ -3623,9 +3739,8 @@ int infer_init(void)
     kv_rb     = 1 + head_dim/32; // One scale beat + code beats (cols = head_dim, Q8).
     kv_region = (uint32_t)((max_ctx + n_ch - 1)/n_ch)*kv_rb;
     // A channel window that lies inside main_ram (the FK33's channel 3, in PC 4): its
-    // payload + KV tail decides where the high heap can start (142 MB on the 1.7B with the
-    // int16 embedding table, 212 MB on the 8B), and the image is refused only when that
-    // tail leaves main_ram. On a board whose windows sit above main_ram (the XCU1525) no
+    // payload + KV tail decides where the high heap can start, and the image is refused only
+    // when that tail leaves main_ram. On a board whose windows sit above main_ram (the XCU1525) no
     // channel qualifies and the high heap keeps its fixed base.
     {
         uint64_t top = 0;   // Engine-side.
@@ -3648,9 +3763,8 @@ int infer_init(void)
         if (heap_hi_base < 0x40000000u + 0x09000000u)
             heap_hi_base = 0x40000000u + 0x09000000u;   // floor: main_ram + 144 MB
         heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)heap_hi_base : 0;
-        // The CPU-side KV cache (the debug fallback) must fit between the high heap's
-        // base and the end of main_ram: halve its depth until it does (37 MB at 512
-        // positions on the 8B, against the 44 MB left above its 212 MB tail).
+        // The CPU-side KV cache (the debug fallback) must fit between the high heap's base
+        // and the end of main_ram: halve its depth until it does.
         if (heap_hi) {
             uint64_t room = 0x40000000ull + MAIN_RAM_SIZE - heap_hi_base - (2u << 20);
             while (cpu_kv_ctx > 64
@@ -3658,7 +3772,7 @@ int infer_init(void)
                 cpu_kv_ctx /= 2;
         }
     }
-    kv_ekmax  = halloc(n_layer*n_kv_head*2);
+    kv_ekmax = halloc(n_layer*n_kv_head*2);
     for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
     seq_build_qkr();
     seq_build_attn();
@@ -3687,8 +3801,9 @@ int infer_init(void)
     // The low heap lives BELOW the lowest engine window inside main_ram (on the FK33
     // channel 3's, at +64 MB: HBM_WEIGHT_BASE is port-matched, see layout.py). Overrunning
     // it would scribble on that channel's weights and show up as wrong tokens with
-    // everything else looking healthy. Check it, loudly, once per init; the numbers are cheap to print and worth having in
-    // every boot log. A board whose windows sit above main_ram has no such limit.
+    // everything else looking healthy. Check it, loudly, once per init; the numbers are cheap
+    // to print and worth having in every boot log. A board whose windows sit above main_ram
+    // has no such limit.
     {
         uint32_t lo_used = (uint32_t)(heap - (uint8_t *)HEAP_BASE);
         uint64_t lo_win  = 0;   // Engine-side start of the lowest window inside main_ram.
@@ -3716,6 +3831,9 @@ int infer_init(void)
     return 0;
 }
 
+/* Generation */
+/*------------*/
+
 static int gen_stop[INFER_STOP_MAX], gen_nstop;
 
 void infer_set_stop(const int *ids, int n)
@@ -3734,10 +3852,25 @@ static int gen_is_stop(int tok)
 static uint32_t gen_serial;   // Bumped per generation: a continuation must follow its own.
 static struct infer_prefill_profile last_prefill;
 
-int infer_kv_resident(void) { return n_pos; }
-uint32_t infer_gen_serial(void) { return gen_serial; }
-int infer_context_capacity(void) { return max_ctx; }
-const struct infer_prefill_profile *infer_last_prefill(void) { return &last_prefill; }
+int infer_kv_resident(void)
+{
+    return n_pos;
+}
+
+uint32_t infer_gen_serial(void)
+{
+    return gen_serial;
+}
+
+int infer_context_capacity(void)
+{
+    return max_ctx;
+}
+
+const struct infer_prefill_profile *infer_last_prefill(void)
+{
+    return &last_prefill;
+}
 
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {
@@ -3754,9 +3887,8 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
 {
     memset(&last_prefill, 0, sizeof(last_prefill));
     // An id past the vocabulary makes the embedding fetch read a row that does not exist -
-    // an engine stall only reconfiguring the FPGA clears (e.g. two ids merged by characters
-    // the console dropped from a long `tok` line). Refuse the request instead; the console
-    // commands report it as GEN ERR.
+    // an engine stall only reconfiguring the FPGA clears. Refuse the request instead; the
+    // console commands report it as GEN ERR.
     if (!H || H->magic != BONS_MAGIC || n_layer == 0) {
         printf(" [no model: hdrload first]");
         return -1;
@@ -3810,9 +3942,8 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
         if (gen_is_stop(tok))
             break;
         // The forward after the LAST emitted token computes a successor nobody emits and
-        // stores a KV row nobody reads (every caller restarts at n_pos = 0), so skip it:
-        // one full forward per request, ~1.5% of a 64-token reply. bench 64 therefore runs
-        // 66 forwards.
+        // stores a KV row nobody reads (a continuation forwards that token itself), so skip
+        // it.
         if (i + 1 < max_new)
             tok = forward(tok, 1);
     }

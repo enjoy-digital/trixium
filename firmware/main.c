@@ -1,24 +1,44 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// TriXium firmware: console shell, self-tests and the inference entry points. At boot, runs
-// the self-test sequence (deterministic checksums that the simulation harness verifies),
-// then drops to the shell.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium firmware main: console shell, self-tests and inference entry points
+ *
+ * At boot, runs the self-test sequence (deterministic checksums that the simulation harness
+ * verifies), then drops to the shell.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <irq.h>
-#include <libbase/uart.h>
-#include <libbase/console.h>
 #include <generated/csr.h>
 #include <generated/soc.h>
 
+#include <irq.h>
+#include <libbase/uart.h>
+#include <libbase/console.h>
+
 #include "bons.h"
 #include "ddr.h"
+#include "engine.h"
+#include "model.h"
+#include "infer.h"
+#include "ops.h"
+#include "perf.h"
+#include "bench.h"
+#include "seq.h"
+#include "resident.h"
+#include "hybrid.h"
+#include "vec.h"
+#include "progs.h"
+#include "static_memory.h"
+
+/* Checks */
+/*--------*/
 
 #ifdef TRIXIUM_N_MEMCTRL
 // ddr.c reaches controller k's registers as controller 0's shifted by k*STRIDE: the target
@@ -41,22 +61,9 @@ _Static_assert(CSR_DDRPHY3_BASE - CSR_DDRPHY_BASE == 3*TRIXIUM_DDR_CSR_STRIDE, "
 #endif
 #endif
 #endif
-#include "engine.h"
-#include "model.h"
-#include "infer.h"
-#include "ops.h"
-#include "perf.h"
-#include "bench.h"
-#include "seq.h"
-#include "resident.h"
-#include "hybrid.h"
-#include "vec.h"
-#include "progs.h"
-#include "static_memory.h"
 
-/*-----------------------------------------------------------------------*/
-/* Console                                                               */
-/*-----------------------------------------------------------------------*/
+/* Console */
+/*---------*/
 
 static char *readstr(void)
 {
@@ -108,9 +115,8 @@ static char *get_token(char **str)
     return d;
 }
 
-/*-----------------------------------------------------------------------*/
-/* Helpers                                                               */
-/*-----------------------------------------------------------------------*/
+/* Helpers */
+/*---------*/
 
 static uint32_t fnv1a(const volatile uint8_t *data, uint32_t len)
 {
@@ -134,12 +140,10 @@ static void fill_x_pattern(uint32_t xsrc, uint32_t n)
     }
 }
 
-/*-----------------------------------------------------------------------*/
-/* Commands                                                              */
-/*-----------------------------------------------------------------------*/
+/* Commands */
+/*----------*/
 
 static void emit_token(int tok);
-static int  gen_emit_to_pbuf;
 static int  parse_int(const char *s);
 
 static void help(void)
@@ -205,6 +209,9 @@ static void hwops_cmd(char *args)
     }
     hwops_print();
 }
+
+/* Bench */
+/*-------*/
 
 static struct bench_samples bench_samples;
 
@@ -278,11 +285,14 @@ static void bench_cmd(char *args)
     puts("");
 }
 
+/* Prompt Buffer */
+/*---------------*/
+
 static int gen_emit_to_pbuf;
-// Chunked prompt buffer (tok/genb) - main_ram static window, not .bss (sram is tight;
-// see firmware/linker.ld). TRIXIUM_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000)
-// and ek_undo (+0x90000); the heap starts at +0x100000. Sized to the KV budget (the image's
-// max_ctx, 2048 for the 1.7B): a conversation can use the whole context.
+// Chunked prompt buffer (tok/genb), in the main_ram static window (static_memory.h), not
+// .bss: TRIXIUM_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000) and the KV undo
+// (+0x90000). Sized to the KV budget (the image's max_ctx, 2048 for the 1.7B): a
+// conversation can use the whole context.
 #define PBUF_N 2048
 static int *const pbuf = (int *)(TRIXIUM_HDR_ADDR + 0xA0000); // [PBUF_N]
 static int pbuf_n;
@@ -295,6 +305,9 @@ static void emit_token(int tok)
     if (gen_emit_to_pbuf && pbuf_n < PBUF_N)
         pbuf[pbuf_n++] = tok;
 }
+
+/* Header Load */
+/*-------------*/
 
 // Copy the BONS header+table from the HBM staging area (engine channel 0, uploaded there by
 // trixium_load) into the CPU-visible header location, then re-init inference.
@@ -360,6 +373,9 @@ static void hdrload(void)
     if (infer_init() == 0)
         puts("hdrload: inference ready");
 }
+
+/* Diagnostics */
+/*-------------*/
 
 // Fetch one beat from (channel, HBM byte address) through the engine and dump it. Ground
 // truth for "did the host's upload land where the engine looks for it?" - the two sides
@@ -448,6 +464,9 @@ static int parse_int(const char *s)
         v = v*10 + (*s++ - '0');
     return v;
 }
+
+/* Generation */
+/*------------*/
 
 static void tokclr_cmd(void)
 {
@@ -538,6 +557,9 @@ static void gen_cmd(char *args)
         engine_recover();
 }
 
+/* Self-tests */
+/*------------*/
+
 static void sptest(void)
 {
     volatile uint32_t *sp = (volatile uint32_t *)SCRATCHPAD_BASE;
@@ -591,9 +613,8 @@ static void selftest(void)
     puts("SELFTEST DONE");
 }
 
-/*-----------------------------------------------------------------------*/
-/* Main                                                                  */
-/*-----------------------------------------------------------------------*/
+/* Console Service */
+/*-----------------*/
 
 static void console_service(void)
 {
@@ -636,8 +657,7 @@ static void console_service(void)
         infer_get_sampling(&t, &p, &r);
         printf("SAMPLE temp=%d.%03d top_p=%d.%03d rep=%d.%03d (x1000: sample 700 900 1100 [seed])\n",
                (int)t, (int)(t*1000) % 1000, (int)p, (int)(p*1000) % 1000, (int)r, (int)(r*1000) % 1000);
-    }
-    else if (strcmp(token, "attnchunk") == 0)
+    } else if (strcmp(token, "attnchunk") == 0)
         infer_attn_chunk(parse_int(str));
     else if (strcmp(token, "engreset") == 0)
         engine_recover();
@@ -645,8 +665,7 @@ static void console_service(void)
     else if (strcmp(token, "ddrinit") == 0) {
         char *arg = get_token(&str);
         if (arg && *arg) ddr_init(parse_int(arg)); else ddr_init_all();
-    }
-    else if (strcmp(token, "ddrtest") == 0) {
+    } else if (strcmp(token, "ddrtest") == 0) {
         char *arg = get_token(&str);
         ddr_test((arg && *arg) ? parse_int(arg) : -1);
     }
@@ -665,19 +684,16 @@ static void console_service(void)
             puts("WEDGE: recovered - self-test follows");
             selftest();
         }
-    }
-    else if (strcmp(token, "dbg") == 0) {
+    } else if (strcmp(token, "dbg") == 0) {
         int n = (*str) ? parse_int(str) : 1;
         infer_dbg(n);
         printf("DBG armed for %d forwards\n", n);
-    }
-    else if (strcmp(token, "stats") == 0) {
+    } else if (strcmp(token, "stats") == 0) {
         if (strncmp(str, "reset", 5) == 0)
             perf_reset();
         else
             perf_print();
-    }
-    else if (strcmp(token, "bench") == 0)
+    } else if (strcmp(token, "bench") == 0)
         bench_cmd(str);
     else if (strcmp(token, "fprof") == 0) {
         extern int fprof_use; extern void fprof_reset(void), fprof_print(void);
@@ -685,8 +701,7 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) fprof_use = 0;
         if (strncmp(str, "print", 5) == 0) fprof_print();
         printf("FPROF %s\n", fprof_use ? "on" : "off");
-    }
-    else if (strcmp(token, "tprof") == 0) {
+    } else if (strcmp(token, "tprof") == 0) {
         if (strncmp(str, "arm", 3) == 0) {
             const char *p = str + 3;
             while (*p == ' ') p++;
@@ -699,68 +714,61 @@ static void console_service(void)
         if (str[0] == 0)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
-    }
-    else if (strcmp(token, "seq") == 0) {
+    } else if (strcmp(token, "seq") == 0) {
         if (strncmp(str, "on", 2) == 0)
             infer_seq(1);
         else if (strncmp(str, "off", 3) == 0)
             infer_seq(0);
         printf("SEQ %s (off runs the same ops CPU-dispatched per head, ~20%% slower)\n",
                seq_use ? "on" : "off");
-    }
-    else if (strcmp(token, "lmchunk") == 0) {
+    } else if (strcmp(token, "lmchunk") == 0) {
         uint32_t rows = (uint32_t)strtoul(str, NULL, 0);
         hybrid_lm_chunk(rows);
         printf("LMCHUNK %lu (LM head list chunk cap in rows, 0 = automatic)\n", (unsigned long)rows);
-    }
-    else if (strcmp(token, "hwargmax") == 0) {
+    } else if (strcmp(token, "hwargmax") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);
         printf("HWARGMAX %s (the LM head list's restore-unit argmax; off: the CPU loop over the logits)\n",
                hybrid_hwargmax_enabled() ? "on" : "off");
-    }
-    else if (strcmp(token, "attnstream") == 0) {
+    } else if (strcmp(token, "attnstream") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_attnstream_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_attnstream_enable(0);
         printf("ATTNSTREAM %s (attention scores/values on engine op 6; takes effect at the next reset)\n",
                hybrid_attnstream_enabled() ? "on" : "off");
-    }
-    else if (strcmp(token, "dnstream") == 0) {
+    } else if (strcmp(token, "dnstream") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_dnstream_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_dnstream_enable(0);
         printf("DNSTREAM %s (DeltaNet heads as one engine op per layer; takes effect at the next reset)\n",
                hybrid_dnstream_enabled() ? "on" : "off");
-    }
-    else if (strcmp(token, "dnres") == 0) {
+    } else if (strcmp(token, "dnres") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_dnres_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_dnres_enable(0);
         printf("DNRES %s (DeltaNet layers as scratchpad lists)\n", hybrid_dnres_enabled() ? "on" : "off");
-    }
-    else if (strcmp(token, "silu") == 0) {
+    } else if (strcmp(token, "silu") == 0) {
         if (strncmp(str, "on", 2) == 0)  resident_silu_enable(1);
         if (strncmp(str, "off", 3) == 0) resident_silu_enable(0);
         printf("SILU %s (FFN activation through the unit 11 SiLU-multiply list)\n",
                resident_silu_active() ? "on" : "off");
-    }
-    else if (strcmp(token, "resident") == 0) {
+    } else if (strcmp(token, "resident") == 0) {
         if (strncmp(str, "on", 2) == 0)  resident_enable(1);
         if (strncmp(str, "off", 3) == 0) resident_enable(0);
         printf("RESIDENT %s (27B projections through scratchpad quantize/rotate/restore "
                "lists; hardware %s)\n", resident_active() ? "on" : "off",
                resident_available() ? "present" : "absent");
-    }
-    else if (strcmp(token, "engdiag") == 0) {
+    } else if (strcmp(token, "engdiag") == 0) {
         if (strncmp(str, "on", 2) == 0)  engine_diag = 1;
         if (strncmp(str, "off", 3) == 0) engine_diag = 0;
         printf("ENGDIAG %s (per-op stall snapshots, ~2k cycles/op)\n",
                engine_diag ? "on" : "off");
-    }
-    else if (strcmp(token, "hdrload") == 0)
+    } else if (strcmp(token, "hdrload") == 0)
         hdrload();
     else if (strlen(token))
         puts("unknown command");
     printf("trixium> ");
 }
+
+/* Main */
+/*------*/
 
 int main(void)
 {
@@ -856,17 +864,16 @@ int main(void)
     if (infer_init() == 0) {
         // Boot generation demo (deterministic; checked by the sim harness).
         static const int prompt[3] = {1, 2, 3};
-        // The legs that only exist for the gate are skipped on big models: on the 1.7B
-        // the all-CPU reference alone is 3.2 G cycles (~15 s), and the tiny sim model still
-        // runs every leg. GEN-HW stays: two tokens through the hardware path cost 35 ms and
-        // prove the units are alive.
+        // The legs that only exist for the gate are skipped on big models (the all-CPU
+        // reference alone takes seconds on the 1.7B); the tiny sim model runs every leg.
+        // GEN-HW stays: two tokens through the hardware path are cheap and prove the units
+        // are alive.
         const int big_model = model_header()->n_layer > 8;
         if (!big_model) {
-            // Harness hook for the simulation tools that need only the console: on the 1k
-            // tiny model the legs cost tens of minutes of Verilator time. Offered here, after
-            // the firmware is running (an early key would reach the LiteX BIOS, where Q aborts
-            // the boot); 2 M cycles is ~30 s of simulation and 13 ms on a board. With no key,
-            // or any other key, the legs run.
+            // Harness hook for the simulation tools that need only the console (the legs
+            // cost tens of minutes of Verilator time). Offered here, after the firmware is
+            // running: an early key would reach the LiteX BIOS, where Q aborts the boot.
+            // With no key within 2M cycles, or any other key, the legs run.
             puts("BOOT-LEGS (q to skip)");
             uint64_t t_wait = perf_now64();
             while (perf_now64() - t_wait < 2000000u) {

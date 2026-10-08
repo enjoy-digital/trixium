@@ -1,9 +1,12 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// BonsaiVectorUnit driver: program upload at init, one VECRUN at a time.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium vector unit driver: program upload at init, one VECRUN at a time
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #ifndef VEC_H
 #define VEC_H

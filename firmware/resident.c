@@ -1,26 +1,33 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// See resident.h. Two lists per projection group:
-//
-//   prepare:  FETCH src -> [4] per-block Q8 + e8 -> [3] raw int32 rotation + absmax
-//             -> [5] whole-vector Q8 + e8            (or [4] alone when not rotated)
-//   matvec:   [1] engine matvec per K-segment -> [2] int32 segment sum -> [8] FP32 restore
-//             -> STORE dst
-//
-// The scratchpad map below is the 27B hybrid's own. Regions the resident lists only use
-// transiently may overlap the legacy 27B regions (SP_X, SP_Y..SP_H, SP_FET), which other
-// hybrid ops (LM head, embeddings) keep using between lists; what must survive between a
-// prepare and its matvecs (the Q8 vector, its exponent) and across the forward (the sign
-// bits) sits where no legacy hybrid op writes: [0x32000, 0x3D000).
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium resident FP32 projections and descriptor list builder
+ *
+ * Two lists per projection group:
+ *
+ *   prepare:  FETCH src -> [4] per-block Q8 + e8 -> [3] raw int32 rotation + absmax
+ *             -> [5] whole-vector Q8 + e8            (or [4] alone when not rotated)
+ *   matvec:   [1] engine matvec per K-segment -> [2] int32 segment sum -> [8] FP32 restore
+ *             -> STORE dst
+ *
+ * The scratchpad map below is the 27B hybrid's own. Regions the resident lists only use
+ * transiently may overlap the legacy 27B regions (SP_X, SP_Y..SP_H, SP_FET), which other
+ * hybrid ops (LM head, embeddings) keep using between lists; what must survive between a
+ * prepare and its matvecs (the Q8 vector, its exponent) and across the forward (the sign
+ * bits) sits where no legacy hybrid op writes: [0x32000, 0x3D000).
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include <stdio.h>
 #include <string.h>
 
 #include <generated/csr.h>
 #include <generated/soc.h>
 #include <generated/mem.h>
+
 #include <system.h>
 
 #include "resident.h"
@@ -34,7 +41,12 @@
 #include "static_memory.h"
 #include "fastmath.h"
 
-#if defined(TRIXIUM_HAS_HADAMARD) && defined(TRIXIUM_HAS_ACTIVATION_QUANTIZE) && defined(TRIXIUM_HAS_PROJECTION_RESTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE) && defined(HAS_FLUSH_CPU_DCACHE_RANGE) && defined(HAS_CLEAN_CPU_DCACHE_RANGE)
+/* Parameters */
+/*------------*/
+
+#if defined(TRIXIUM_HAS_HADAMARD) && defined(TRIXIUM_HAS_ACTIVATION_QUANTIZE) && \
+    defined(TRIXIUM_HAS_PROJECTION_RESTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE) && \
+    defined(HAS_FLUSH_CPU_DCACHE_RANGE) && defined(HAS_CLEAN_CPU_DCACHE_RANGE)
 #define RESIDENT_BUILT 1
 #else
 #define RESIDENT_BUILT 0
@@ -53,8 +65,8 @@
 
 #define RS_ROWS_MAX  24576u    // int32 results per chunk that fit RS_Y.
 #define RS_WIDTH_MAX 17408u    // FP32 source that fits RS_F (and Q8 that fits RS_Q8B/RS_XW).
-#define RS_DESC0     0         // Descriptor slots 0..15: the hybrid path builds no other list.
-#define RS_DESC_MAX  64u      // of the 192 slots in SP_DESC.
+#define RS_DESC0     0         // First descriptor slot: the hybrid path builds no other list.
+#define RS_DESC_MAX  64u       // Slots used, of the 192 in SP_DESC.
 
 // Unit 11 (SiLU-multiply). The FFN activation runs gate -> RS_F, up -> RS_Y (restored in
 // place), SiLU in place over RS_F; its fixup bitmap lands in RS_Q8B, which only a prepare
@@ -65,6 +77,9 @@
 #define SILU_BUILT 0
 #endif
 #define RS_FIXMAP RS_Q8B
+
+/* State */
+/*-------*/
 
 void resident_listprof_reset(void);
 static uint8_t initialized;   // The window struct is not BSS: zero it once, here.
@@ -118,6 +133,9 @@ int resident_active(void)
 
 #if RESIDENT_BUILT
 
+/* Descriptors */
+/*-------------*/
+
 static inline uint32_t eng_addr(const void *p)
 {
     return (uint32_t)((uintptr_t)p - MAIN_RAM_BASE + TRIXIUM_MEM_CPU_OFFSET);
@@ -143,11 +161,12 @@ static void desc_store(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_
     seq_desc_engine(idx, &op);
 }
 
-// Run a list and report the resident units' failures at once instead of after the
-// sequencer's stall timeout: a failed unit parks the list busy until the engine reset.
+/* List Profile */
+/*--------------*/
+
 // Per-descriptor list profile (console `stats`): cycles from one completed descriptor to
 // the next, accumulated per list name (the `what` pointer) and descriptor index. The
-// completion poll below reads the sequencer anyway; one timer read per poll is the cost.
+// completion poll reads the sequencer anyway; one timer read per poll is the cost.
 struct list_prof {
     const char *what;
     uint32_t calls, n;
@@ -185,6 +204,9 @@ static struct list_prof *listprof_slot(const char *what)
     return 0;
 }
 
+/* List Run */
+/*----------*/
+
 // A list in flight (run_list_start .. run_list_wait): the CPU may work in between, on
 // anything but the descriptor slots, the list's scratchpad regions and the engine.
 static struct {
@@ -212,6 +234,8 @@ static int run_list_start(uint32_t count, const char *what)
     return 0;
 }
 
+// Report the resident units' failures at once instead of after the sequencer's stall
+// timeout: a failed unit parks the list busy until the engine reset.
 static int run_list_wait(void)
 {
     struct resident_state *R = resident_state();
@@ -269,6 +293,9 @@ static int run_list(uint32_t count, const char *what)
         return -1;
     return run_list_wait();
 }
+
+/* Projections */
+/*-------------*/
 
 static int width_index(const struct bons_header *H, uint32_t width)
 {
@@ -484,6 +511,9 @@ int resident_matvec(const struct bons_entry *e, float *dst)
     return rc;
 }
 
+/* List Builder */
+/*--------------*/
+
 // General lists (resident.h, "list builder"): hybrid.c composes whole-layer lists from
 // these. Every main-RAM transfer does its own cache maintenance; stores are invalidated
 // after a successful run.
@@ -648,6 +678,9 @@ int rl_wait(void)
             invd_cpu_dcache_range(RL.inv[i], RL.inv_bytes[i]);
     return rc;
 }
+
+/* SiLU Unit */
+/*-----------*/
 
 #if SILU_BUILT
 
@@ -854,6 +887,9 @@ int resident_silu_active(void)
     return resident_active() && R->silu_ready && R->silu_enabled;
 }
 
+/* Attention Gate */
+/*----------------*/
+
 int resident_gate_init(const float *sig_lut, uint32_t *image)
 {
     struct resident_state *R = resident_state();
@@ -955,6 +991,9 @@ uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, f
     return patched;
 }
 
+/* FFN Activation */
+/*----------------*/
+
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)
 {
@@ -977,8 +1016,7 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     desc_words(n++, &d);
     // act != NULL: the activation also goes to main RAM (the traces, and a caller that wants
     // the CPU fallback's input); fixup lanes are patched in both copies below. NULL: it
-    // stays in RS_F only - the store (70 KB: a cache flush and invalidate plus the DMA) costs
-    // ~13k cycles per 27B layer.
+    // stays in RS_F only, saving the store (70 KB per 27B layer: cache flush, invalidate, DMA).
     if (act)
         store_out(&n, act, rows, RS_F);
     seq_desc_stop(n++);
@@ -1003,8 +1041,10 @@ decline:
     return -1;
 }
 
+#else  // !SILU_BUILT
 
-#else
+/* Stubs */
+/*-------*/
 
 int resident_silu_init(const float *lut, uint32_t *stage)
 {
@@ -1042,9 +1082,12 @@ uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, f
     (void)fixmap_sp; (void)g_sp; (void)m_sp; (void)dst; (void)n; return 0;
 }
 
-#endif
+#endif  // SILU_BUILT
 
 #else  // !RESIDENT_BUILT
+
+/* Stubs */
+/*-------*/
 
 void resident_listprof_reset(void) {}
 void resident_listprof_print(uint32_t forwards) { (void)forwards; }
@@ -1119,4 +1162,4 @@ uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, f
     (void)fixmap_sp; (void)g_sp; (void)m_sp; (void)dst; (void)n; return 0;
 }
 
-#endif
+#endif  // RESIDENT_BUILT

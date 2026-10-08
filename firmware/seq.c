@@ -1,7 +1,12 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium descriptor sequencer driver
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <stdio.h>
 
@@ -12,6 +17,8 @@
 #include "engine.h"
 #include "perf.h"
 
+/* Descriptors */
+/*-------------*/
 
 static volatile uint32_t *desc_w(uint32_t idx)
 {
@@ -23,11 +30,11 @@ void seq_desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_
     seq_desc_vec_seed(idx, pc, args, n, srcs, 0);
 }
 
-// seed_abs: take the S7 seed from the ENGINE ABSMAX rather than the previous program's res6.
-// Needed once cmd.xred does the cross-channel sum in hardware: the absmax of the summed
-// vector then lives in the engine tracker instead of a reduce_acc's res6. spill ends with
-// SMOV s6, s7, so the value also lands in res6 and a following norm_i32 on KRES6 sees
-// exactly what the reduce chain used to hand it.
+// seed_abs: take the S7 seed from the engine absmax rather than the previous program's res6.
+// With cmd.xred the engine does the cross-channel sum, so the absmax of the summed vector lives
+// in the engine tracker instead of a reduce_acc's res6. spill ends with SMOV s6, s7, so the
+// value also lands in res6 and a following norm_i32 on KRES6 sees what a reduce chain would
+// have handed it.
 void seq_desc_vec_seed(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_t srcs,
                        int seed_abs)
 {
@@ -74,15 +81,18 @@ void seq_desc_stop(uint32_t idx)
     desc_w(idx)[0] = 0;
 }
 
+/* Lists */
+/*-------*/
+
 int seq_wedged; // Sticky: a list never finished, so the engine state is not trustworthy.
 
 uint32_t seq_poll_spins, seq_poll_waits;
 
-// Split form (per-cycle sideband slot): start a list and return; the CPU
-// may then patch OTHER lists' descriptors or do host-memory work while it runs, and
-// seq_join() polls completion. On bitstreams without TRIXIUM_SP_SB_SLOT the first
-// scratchpad access after seq_list_start() simply stalls until the list finishes -
-// correct either way, only the overlap is lost.
+// Split form (per-cycle sideband slot): seq_list_start() starts a list and returns; the CPU
+// may then patch other lists' descriptors or do main_ram work while it runs, and seq_join()
+// polls completion. Without TRIXIUM_SP_SB_SLOT the first scratchpad access after
+// seq_list_start() stalls until the list finishes: correct either way, only the overlap is
+// lost.
 void seq_join(void)
 {
     if (seq_wedged)
@@ -112,15 +122,16 @@ void seq_join(void)
 }
 
 // Traced run: like seq_run, but records perf_now() at every dcount transition
-// (seq_status[8:...]) into ts[0..max-1]; ts[0] at start, last entry at done. Returns
-// entries used. ~70-cycle CSR-poll resolution vs multi-thousand-cycle descriptors.
+// (seq_status[8:...]) into ts[0..max-1]; ts[0] at start, last entry at done. Returns the
+// entries used. Resolution is one CSR poll (~70 cycles).
 int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
 {
     if (seq_wedged)
         return 0;
     int n = 0;
     uint32_t last = 0xFFFFFFFF, spins = 0;
-    if (n < max) ts[n++] = perf_now();
+    if (n < max)
+        ts[n++] = perf_now();
     trixium_seq_base_write(SP_DESC + idx0*64);
     trixium_seq_count_write(count);
     trixium_seq_start_write(1);
@@ -129,7 +140,8 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
         uint32_t dc = st >> 8;
         if (dc != last) {
             last = dc;
-            if (n < max) ts[n++] = perf_now();
+            if (n < max)
+        ts[n++] = perf_now();
         }
         if (!(st & 1))
             break;
@@ -140,7 +152,8 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
             break;
         }
     }
-    if (n < max) ts[n++] = perf_now();
+    if (n < max)
+        ts[n++] = perf_now();
     return n;
 }
 

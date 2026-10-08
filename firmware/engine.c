@@ -1,9 +1,12 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Engine CSR driver: program one op, submit, poll completion.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium engine driver: program one op, submit, poll completion
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <stdio.h>
 
@@ -11,16 +14,21 @@
 #include <generated/soc.h>
 
 #include "engine.h"
-
 #include "perf.h"
+
+/* Variables */
+/*-----------*/
 
 int engine_wedged; // Sticky: an op never completed, so engine results are not trustworthy.
 
-// Soft reset of the engine cluster (engine, loader, sequencer, vector unit) - the `eng`
-// clock domain, gateware/engreset.py. The HBM ports stay whole behind their AXI shims;
-// the scratchpad, the vector programs and the descriptor lists survive. Returns 0 when
-// the ports drained, -1 when a port never answers (the shim's `stuck`: the FPGA needs a
-// reconfigure after all) or the drain timed out.
+/* Recovery */
+/*----------*/
+
+// Soft reset of the engine cluster (engine, loader, sequencer, vector unit): the `eng` clock
+// domain, trixium/core/reset.py. The HBM ports stay whole behind their AXI shims; the
+// scratchpad, the vector programs and the descriptor lists survive. Returns 0 when the ports
+// drained, -1 when a port never answers (the shim's `stuck`: the FPGA needs a reconfigure) or
+// the drain timed out.
 int engine_recover(void)
 {
     trixium_engine_csr_soft_reset_write(1);
@@ -44,23 +52,24 @@ int engine_recover(void)
     puts("ENGRESET ok");
     return 0;
 }
+
+/* Submit / Join */
+/*---------------*/
+
 // Per-op stall diagnostics (pre-op beat snapshots, result-slot markers) cost ~2k cycles of
-// CSR/scratchpad traffic per engine op - ~1.3M cycles per forward at ~760 ops - so they are
-// opt-in (`engdiag on`). The stall printout itself stays: without the snapshot it shows
-// absolute beat counters, which still names the channel that came up short.
+// CSR/scratchpad traffic per engine op, so they are opt-in (`engdiag on`). The stall printout
+// itself stays: without the snapshot it shows absolute beat counters, which still name the
+// channel that came up short.
 int engine_diag;
 
-// Completion-poll census (spins x ~70cy CSR read = the IRQ opportunity, upper bound).
+// Completion-poll census (spins x ~70 cycles per CSR read: the IRQ opportunity, upper bound).
 uint32_t eng_poll_spins, eng_poll_waits;
 
-// Shadow of the last-written op CSRs: a CSR access costs ~70 cycles on this SoC (measured
-// via vbench: a minimal vec_run of ~8 accesses is ~570 cycles), and the token loop issues
-// ~760 engine ops per forward whose fields mostly repeat - consecutive KV stores differ
-// only in wbase/chan, a layer's matvecs share every shape field. Writing only what changed
-// cuts an op's programming cost from ~13 accesses to the few that moved. The shadow starts
-// invalid (force = every field written once) and the CSRs are only ever written here or by
-// the sequencer mux - which drives the engine's command wires directly, not the CSRs - so
-// the shadow cannot go stale.
+// Shadow of the last-written op CSRs: a CSR access costs ~70 cycles and consecutive ops mostly
+// repeat their fields (KV stores differ only in wbase/chan, a layer's matvecs share every
+// shape field), so only the fields that changed are written. The shadow starts invalid (every
+// field written once) and the CSRs are only written here (the sequencer drives the engine's
+// command wires directly, not the CSRs), so it cannot go stale.
 static struct engine_op eng_shadow;
 static int eng_shadow_valid;
 
@@ -70,15 +79,14 @@ static int eng_shadow_valid;
         eng_shadow.field = op->field; \
     } } while (0)
 
-// Submit/join split: engine_submit programs and launches the op, returning the
-// done_count to hand to engine_join; the caller may run INDEPENDENT vector-unit work
-// in between (the scratchpad ports arbitrate per cycle - docs/overlap-design.md).
-// Rules for the window between submit and join:
-//  - do not read engine absmax/argmax (they belong to the streaming op),
+// engine_submit programs and launches the op and returns the done_count to hand to
+// engine_join; the caller may run independent vector-unit work in between (the scratchpad
+// ports arbitrate per cycle, docs/overlap-design.md). Between submit and join:
+//  - do not read the engine absmax/argmax (they belong to the streaming op),
 //  - do not submit another engine op,
 //  - only touch scratchpad regions disjoint from the op's xsrc/dst,
-//  - CPU sideband scratchpad access stalls until the engine idles, so keep the
-//    in-between work on the vector unit (op_on_hw), not CPU loops.
+//  - CPU sideband scratchpad accesses stall until the engine idles, so keep the in-between
+//    work on the vector unit (op_on_hw), not in CPU loops.
 static uint32_t eng_beats0[TRIXIUM_N_CHANNELS];
 static uint32_t eng_nslot;
 
@@ -112,12 +120,12 @@ uint32_t engine_submit(const struct engine_op *op)
     ENG_WR(sstride);
 #endif
 #ifdef CSR_TRIXIUM_ENGINE_CSR_XRED_ADDR
-    // Must be written unconditionally, not only when set: the CSR is sticky, so an op that
-    // left xred=1 would silently reshape the next AXPY's result layout.
+    // Written on every op, not only when set: the CSR is sticky, so an op that left xred=1
+    // would silently reshape the next AXPY's result layout.
     ENG_WR(xred);
 #endif
-    // Snapshot each reader's beat counter before the op: on a stall the deltas say exactly
-    // which channel came up short, which is the one fact the status bits cannot give.
+    // Snapshot each reader's beat counter before the op: on a stall the deltas say which
+    // channel came up short, which the status bits cannot tell.
     // Expected delta per channel = wlen + (chan < rem ? sbeats + cbeats : 0).
     if (engine_diag) {
         for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
@@ -130,11 +138,11 @@ uint32_t engine_submit(const struct engine_op *op)
     }
 
     // Mark the result slots so a stall shows which ones were retired. The interleaved
-    // gather writes slot = row*n_channels + chan, so the pattern says exactly which
-    // (row, channel) never produced a result.
+    // gather writes slot = row*n_channels + chan, so the pattern names the (row, channel)
+    // that never produced a result.
     volatile uint32_t *rslot = (volatile uint32_t *)(SCRATCHPAD_BASE + op->dst);
     eng_nslot = 0;
-    if (engine_diag && op->kind == 1 && op->ilv) {
+    if (engine_diag && op->kind == ENGINE_KIND_Q8 && op->ilv) {
         eng_nslot = op->rows*TRIXIUM_N_CHANNELS + op->rem;
         if (eng_nslot > 64) eng_nslot = 64;
         for (uint32_t i = 0; i < eng_nslot; i++)
@@ -154,10 +162,8 @@ void engine_join(uint32_t done)
     uint32_t *beats0 = eng_beats0;
 
     // Spin-capped poll: a wedged op names itself (status + stream counters) instead of
-    // hanging the boot silently.
-    // The report threshold scales with the op: 200k spins (~4 M cycles) covers every op at
-    // the HBM's rate, but the 8B's LM head streams 322k beats per channel and at ~23
-    // cycles/beat on DDR4 that is 7.4 M cycles of legitimate work.
+    // hanging silently. 200k spins (~4M cycles) covers every op at the HBM's rate; ops
+    // streaming more than 100k beats per channel (an 8B LM head on DDR4) scale the threshold.
     uint32_t spin_limit = 200000u;
     if (op->wlen > 100000u)
         spin_limit = op->wlen*2u;
@@ -168,9 +174,8 @@ void engine_join(uint32_t done)
         if (++spins < spin_limit)
             continue;
         spins = 0;
-        // The op's own parameters, because a stall is nearly always a parameter the
-        // firmware computed rather than the datapath: the same shapes pass the Migen tests
-        // when the parameters are supplied by construction.
+        // Print the op's own parameters: a stall is nearly always a parameter the firmware
+        // computed rather than the datapath.
         printf("ENGSTALL st=%02lx seq=%02lx kind=%d rows=%lu rem=%lu cols=%lu wlen=%lu "
                "wbase=%08lx sb=%lu cb=%lu bias=%ld rsh=%ld ilv=%d qn=%d xsrc=%lx dst=%lx",
                (unsigned long)trixium_engine_csr_status_read(),
@@ -194,10 +199,8 @@ void engine_join(uint32_t done)
                 printf("%c", (rslot[i] == 0xDEADBEEFu) ? 'X' : '.');
         }
         printf("\n");
-        // Give up rather than spin forever. A stuck op holds the scratchpad grant, so the
-        // CPU's own scratchpad reads return garbage from here on and nothing downstream is
-        // trustworthy - but spinning turns that into a card that answers nothing at all,
-        // and only reconfiguring the FPGA recovers either way.
+        // Give up rather than spin forever: a stuck op holds the scratchpad grant, so nothing
+        // downstream is trustworthy, and spinning would leave a card that answers nothing.
         if (++reports == 8) {
             engine_wedged = 1;
             puts("ENGSTALL: giving up - the generation aborts and the engine is soft-reset "
@@ -213,6 +216,9 @@ void engine_run(const struct engine_op *op)
     engine_join(engine_submit(op));
     perf_exit(OP_ENGINE_WAIT);
 }
+
+/* Fetch / Store */
+/*---------------*/
 
 void engine_fetch(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t dst)
 {

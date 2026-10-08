@@ -1,30 +1,39 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// The hybrid models (Bonsai 2 = Qwen3.5: Gated DeltaNet layers, gated attention with partial
-// RoPE, PrismML's rotated weight basis). The CPU path does float math over main_ram with the
-// engine for every matvec (the projections and the rotation blocks): the golden's semantics
-// (trixium/model/golden.py) transliterated, gated on the tiny hybrid model in the Verilator
-// sim, and the reference the hardware paths are checked against. Where the bitstream has the
-// units, the same layers run as scratchpad descriptor lists (resident.c), the DeltaNet stream
-// (engine op 5) and the attention stream (engine op 6) - bit-exact with the CPU path.
-//
-// What a hybrid image adds (BONS v3, layout.py): per layer either the attention tensors
-// (attn_q carries [q | gate] per head when the header says attn_gated) or the DeltaNet set
-// (attn_qkv = [q | k | v], attn_gate = z, ssm_beta/ssm_alpha as Q8 head projections, the
-// conv taps, A = -exp(A_log), the dt bias, the head norm, ssm_out); post_attention_norm as the
-// FFN norm; the ROLE_HADAMARD block tensors R diag(s) per input width; the emb16 rows already
-// restored to the plain basis (HYB_EMB16_RESTORED - the ternary embedding table stays
-// rotated and cannot be decoded row by row).
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium hybrid models forward (Bonsai 2: Gated DeltaNet + gated attention + rotated basis)
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
-#include <generated/csr.h>
-#include <generated/soc.h>
+/*
+ * The hybrid models (Bonsai 2 = Qwen3.5: Gated DeltaNet layers, gated attention with partial
+ * RoPE, PrismML's rotated weight basis). The CPU path does float math over main_ram with the
+ * engine for every matvec (the projections and the rotation blocks): the golden's semantics
+ * (trixium/model/golden.py) transliterated, gated on the tiny hybrid model in the Verilator
+ * sim, and the reference the hardware paths are checked against. Where the bitstream has the
+ * units, the same layers run as scratchpad descriptor lists (resident.c), the DeltaNet stream
+ * (engine op 5) and the attention stream (engine op 6) - bit-exact with the CPU path.
+ *
+ * What a hybrid image adds (BONS v3, layout.py): per layer either the attention tensors
+ * (attn_q carries [q | gate] per head when the header says attn_gated) or the DeltaNet set
+ * (attn_qkv = [q | k | v], attn_gate = z, ssm_beta/ssm_alpha as Q8 head projections, the
+ * conv taps, A = -exp(A_log), the dt bias, the head norm, ssm_out); post_attention_norm as the
+ * FFN norm; the ROLE_HADAMARD block tensors R diag(s) per input width; the emb16 rows already
+ * restored to the plain basis (HYB_EMB16_RESTORED - the ternary embedding table stays
+ * rotated and cannot be decoded row by row).
+ */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+
+#include <generated/csr.h>
+#include <generated/soc.h>
+
 #include <system.h>
 
 #include "bons.h"
@@ -33,20 +42,27 @@
 #include "infer.h"
 #include "hybrid.h"
 #include "trixium_sequence.h"
+#include "perf.h"
+#include "fastmath.h"
+#include "resident.h"
+#include "static_memory.h"
+
+/* Configuration */
+/*---------------*/
 
 // The resident DeltaNet layer needs units 11 (SiLU), 12 (norm) and 13 (conv).
 #if defined(TRIXIUM_HAS_NORM) && defined(TRIXIUM_HAS_CONV) && defined(TRIXIUM_HAS_SILU)
 #define DNRES_BUILT 1
 #endif
+
 // The DeltaNet state in engine DDR, updated by the stream op (TRIXIUM_HAS_DNSTREAM): the
 // heads run only there (`dnstream off` then stops with DNSTALL).
 #if defined(TRIXIUM_HAS_DNSTREAM)
 #define DN_STATE_HW 1
 #endif
-#include "perf.h"
-#include "fastmath.h"
-#include "resident.h"
-#include "static_memory.h"
+
+/* Variables */
+/*-----------*/
 
 static const struct bons_header *H;
 static int n_ch, n_embd, n_head, n_kv_head, head_dim, ffn_dim, n_layer, q_dim, kv_dim, n_rep;
@@ -67,8 +83,8 @@ static uint8_t *dn_conv_pos;         // Oldest causal-convolution plane per Delt
 static int dn_conv_w;                // Window ring slots: conv_k - 1.
 static float *kc, *vc;               // [n_attn][ctx_cap][kv_dim]
 // Rows [0, kc_rows[a]) of attention slot a are in kc/vc. With the attention stream the rows
-// live in engine DDR and main RAM's copy (~77k cycles per 27B layer: both sides miss the
-// cache) is skipped; the CPU loop restores the missing rows before it runs (attn_kv_main).
+// live in engine DDR and main RAM's copy (both sides miss the cache) is skipped; the CPU loop
+// restores the missing rows before it runs (attn_kv_main).
 static uint16_t *kc_rows;
 static float *rope_c, *rope_s, *rope_freq;
 static int    rope_pos_cached;
@@ -85,13 +101,16 @@ static float *at_buf;
 static uint32_t dn_hbm_base;
 // DeltaNet slots whose state is still the reset's zero (bit s): with the stream layout the
 // layer's op 5 takes it as +0.0 (TRIXIUM_DNSTREAM_ZERO) instead of hybrid_reset clearing the
-// 144 MiB in engine DDR (34 M cycles of every generation's first token on the 27B).
+// 144 MiB in engine DDR at every generation's first token.
 static uint64_t dn_state_zero;
 
 static inline float *dn_conv_slot(int s, int p, int C)
 {
     return dn_conv + ((uint64_t)p*(uint64_t)n_dn + (uint64_t)s)*(uint64_t)C;
 }
+
+/* Profiling */
+/*-----------*/
 
 // Stage cycle counters: rdcycle is cheap enough to bracket every stage without perturbing
 // the datapath; per-forward averages keep the 32-bit minimal printf sufficient even for a
@@ -101,16 +120,17 @@ static uint64_t dn_cyc_heads, dn_cyc_gate, dn_cyc_outproj;
 static uint64_t hyb_cyc_embed, hyb_cyc_anorm, hyb_cyc_dn, hyb_cyc_attn;
 static uint64_t hyb_cyc_resid, hyb_cyc_fprep, hyb_cyc_fproj, hyb_cyc_fact;
 static uint64_t hyb_cyc_fdown, hyb_cyc_logits;
-// Attention sub-stages (sum = hyb_cyc_attn): prepare, Q/K/V projections, per-head norms +
-// RoPE, scores/softmax/values/gate (incl. the KV write), output projection.
-// Weight beats one forward streams per channel (every matvec tensor once, K-segments
-// included, the LM head once): the bandwidth floor is this many cycles at one 32-byte
-// beat per channel per clock. New profile counters live here, in the main_ram static
-// window: the 8 KiB SRAM's .bss is at its 4 KiB stack floor (48 more bytes broke the link).
+// Profile counters and console switches, in the main_ram static window: the 8 KiB SRAM's
+// .bss has no room left above its 4 KiB stack floor, so new counters go here.
 struct hyb_prof {
+    // Attention sub-stages (sum = hyb_cyc_attn): prepare, Q/K/V projections, per-head norms +
+    // RoPE, scores/softmax/values/gate (incl. the KV write), output projection.
     uint64_t at_prep, at_qkv, at_rope, at_core, at_out;
     uint64_t at_sub[6];              // inside at_core: kv copy, list 1 build+run, softmax,
                                      // list 2 build+run, fixups, the rest
+    // Weight beats one forward streams per channel (every matvec tensor once, K-segments
+    // included, the LM head once): the bandwidth floor is this many cycles at one 32-byte
+    // beat per channel per clock.
     uint64_t fwd_weight_beats;
     uint8_t dnres_enabled;           // console `dnres on|off`: the resident DeltaNet layer
     uint8_t xres_enabled;            // the resident residual stream (set at init)
@@ -127,11 +147,18 @@ struct hyb_prof {
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
 static uint32_t hyb_forwards_profiled;
 
+/* Activation Tables */
+/*-------------------*/
+
 // The 27B evaluates SiLU about 1.9 million times per forward.  Even the range-reduced
 // polynomial in fastmath.h is limited by its dependent FMA chain and FP divide.  Linear
 // interpolation at 1/128 spacing has <4.4e-6 absolute error over [-16, 16], while this
 // 16 KiB table and the activations' much smaller hot interval fit the 32 KiB D-cache.
 static float *silu_lut;
+static float *sigmoid_lut;
+
+/* DeltaNet State In Engine DDR */
+/*------------------------------*/
 
 #ifdef DN_STATE_HW
 #define DN_SP_STATE 0x00000u
@@ -146,12 +173,6 @@ static float *silu_lut;
 // order, n_dn*nv head matrices per layer set; the layout is chosen at hybrid_reset
 // (HP->dnstream_active) and only the resident layer runs it.
 #define DN_STREAM_BEATS (DN_HEAD_BEATS/(uint32_t)n_ch)   // per channel per head
-
-static uint32_t f32_bits(float x)
-{
-    union { float f; uint32_t u; } v = { .f = x };
-    return v.u;
-}
 
 static void dn_hw_reset(void)
 {
@@ -185,6 +206,9 @@ static void dn_hw_reset(void)
     }
 }
 #endif
+
+/* Controls */
+/*----------*/
 
 void hybrid_dnres_enable(int on) { HP->dnres_enabled = on ? 1 : 0; }
 void hybrid_dnstream_enable(int on)
@@ -224,11 +248,11 @@ int hybrid_present(void)
         && (h->layer_types[0] || h->layer_types[1] || h->hadamard_block);
 }
 
-// Helpers -------------------------------------------------------------------------------------
+/* Helpers */
+/*---------*/
 
-static float *sigmoid_lut;
 static float sigmoidf(float x) { return trixium_sigmoid_lookup(x, sigmoid_lut); }
-static float softplusf(float x){ return x > 20.0f ? x : log1pf(expf(x)); }
+static float softplusf(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
 static void silu_lut_init(void)
 {
@@ -354,7 +378,7 @@ static int rotate_quantize_legacy(const float *src, int width)
 
 // Resident preparation (resident.c: units 4/3/5 in the scratchpad) with the legacy CPU
 // path as fallback. The prepared source is remembered so a matvec the resident path
-// declines (LM head rows, a failed list) can requantize on the CPU and go the old way.
+// declines (LM head rows, a failed list) can requantize and take the CPU path.
 #define E8_RESIDENT 0x40000001
 
 static int prepare_f(const float *src, int width, int rotate)
@@ -433,7 +457,8 @@ static void rope_apply_partial(float *vh)   // one head: the first rope_n dims, 
     }
 }
 
-// Init ------------------------------------------------------------------------------------------
+/* Init */
+/*------*/
 
 int hybrid_init(void)
 {
@@ -603,7 +628,9 @@ int hybrid_init(void)
             if (conv_w[l])             // the resident conv fetches the taps raw
                 clean_cpu_dcache_range(conv_w[l], (size_t)(2*nq + nvh)*conv_k*4);
             if (!norm_ssm[l] || !ssm_a[l] || !ssm_dt[l] || !conv_w[l]) {
-                printf("hybrid: layer %d DeltaNet tables missing\n", l); return -2; }
+                printf("hybrid: layer %d DeltaNet tables missing\n", l);
+                return -2;
+            }
             norm_q[l] = norm_k[l] = NULL;
         } else {
             norm_q[l] = fetch_f32(model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_F32));
@@ -614,7 +641,7 @@ int hybrid_init(void)
         }
     }
     // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; v3 images carry the
-    // scaling fields when a model needs them - none does today).
+    // scaling fields for models that need them).
     rope_c = infer_halloc((rope_n/2)*4, 0); rope_s = infer_halloc((rope_n/2)*4, 0);
     rope_freq = infer_halloc((rope_n/2)*4, 0);
     for (int i = 0; i < rope_n/2; i++)
@@ -692,10 +719,13 @@ int hybrid_init(void)
     return 0;
 }
 
+/* Reset */
+/*-------*/
+
 // The conv window (5.9 MB on the 27B) zeroed by the engine: 31-packet STOREs of one zeroed
-// 4 KB scratchpad block. The CPU memset through cold lines plus the flush was 28 M cycles of
-// every generation's first token. The window is device-owned (the CPU path flushes around
-// its own use), so no cache maintenance. 0 = done; -1: the caller's memset.
+// 4 KB scratchpad block, much faster than a CPU memset through cold lines plus the flush.
+// The window is device-owned (the CPU path flushes around its own use), so no cache
+// maintenance. 0 = done; -1: the caller's memset.
 static int dn_conv_zero(void)
 {
 #ifdef DNRES_BUILT
@@ -763,6 +793,9 @@ void hybrid_reset(void)
     if (kc_rows) memset(kc_rows, 0, (size_t)n_attn*2);
     hybrid_stats_reset();
 }
+
+/* Profiling Report */
+/*------------------*/
 
 void hybrid_stats_reset(void)
 {
@@ -863,7 +896,8 @@ void hybrid_stats_print(void)
 int hybrid_pos(void) { return pos; }
 int hybrid_context_capacity(void) { return ctx_cap; }
 
-// Layers ----------------------------------------------------------------------------------------
+/* DeltaNet Layer */
+/*----------------*/
 
 // Four rows have no data dependency between them.  Keep their FP32 operation and accumulation
 // order exactly the same as the scalar reference, but expose four independent chains to the
@@ -1014,7 +1048,7 @@ static void deltanet_layer(int l, const float *h, float *out)
         float *oh = ob + hh*hv;
         // One pass over the state: row j's delta depends on row j alone, so the decay,
         // the k dot, the update and the q dot happen while the row (512 B) is in the
-        // D$ - the two-loop form streamed the 64 KB head twice through a 32 KB cache.
+        // D$ (a two-loop form streams the 64 KB head twice through the 32 KB cache).
         // Same operations in the same order per element: bit-identical results.
         int j = 0;
         for (; j + 3 < hv; j += 4)
@@ -1042,12 +1076,16 @@ static void deltanet_layer(int l, const float *h, float *out)
     dn_cyc_outproj += perf_now64() - t0;
 }
 
+/* Resident DeltaNet Layer */
+/*-------------------------*/
+
 #ifdef DNRES_BUILT
-static uint32_t f32_bits_any(float x)
+static uint32_t f32_bits(float x)
 {
     union { float f; uint32_t u; } v = { .f = x };
     return v.u;
 }
+
 // The resident DeltaNet layer: the whole layer in scratchpad lists (units 1/3/4/5/8 for the
 // projections, 13 conv, 11 SiLU, 12 norms, engine op 5 for the heads), the CPU doing
 // only the per-head scalars and the rare SiLU fixups. Bit-exact with deltanet_layer (the
@@ -1059,7 +1097,6 @@ static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 #ifdef TRIXIUM_HAS_DNSTREAM
 // The stream op's records: one per head in processing order at slot0 (q, k, v, out byte
 // addresses; decay, beta, scale), from betab/gb.
-
 static void dn_stream_records(uint32_t slot0, uint32_t ho, float scale, int rep)
 {
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + slot0);
@@ -1092,7 +1129,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     uint32_t SLOT0 = (NW + dnr_align(4*(uint32_t)hv) + 1023u) & ~1023u, Z2 = SLOT0;
     // The stream op needs no head-state slots: its records sit at SLOT0 and the heads'
     // outputs right above them, so z stays at Z for the gated norm (no park in main RAM,
-    // no fetch back - ~6k cycles per 27B layer).
+    // no fetch back).
     int z_stays = 0;
 #ifdef TRIXIUM_HAS_DNSTREAM
     if (dn_hw && HP->dnstream_active &&
@@ -1103,7 +1140,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     }
 #endif
     const uint32_t CH = 2048, W = RS_F_ADDR, X = RS_F_ADDR + 16*CH;
-    uint32_t eps = f32_bits_any(rms_eps);
+    uint32_t eps = f32_bits(rms_eps);
     if (!HP->dnres_enabled || !resident_silu_active() || !H->hadamard_block || conv_k != 4 ||
         Z2 + 4u*(uint32_t)nvh > RS_F_ADDR || C % 8 || hv % 8 || hk % 8 ||
         (trixium_seq_silu_abi_read() & 0xffff) < 1 || (trixium_seq_norm_abi_read() >> 16) != 1 ||
@@ -1117,9 +1154,9 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
 
     // A: projections. qkv and z restored in place where they will be used.
     // With the stream op, beta/alpha go first and the CPU computes the per-head scalars and
-    // the op's records from the scratchpad while qkv and z stream (~42k cycles per 27B
-    // layer, hidden). Needs qkv and z in one K-segment each: several would stage partials
-    // above their regions, over BA/AL and the records.
+    // the op's records from the scratchpad while qkv and z stream (hidden behind the list).
+    // Needs qkv and z in one K-segment each: several would stage partials above their
+    // regions, over BA/AL and the records.
     const struct bons_entry *e_qkv = model_entry(ROLE_ATTN_QKV, l), *e_z = model_entry(ROLE_ATTN_ZGATE, l);
     int early = 0;
 #ifdef TRIXIUM_HAS_DNSTREAM
@@ -1299,32 +1336,18 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         goto fatal;
     if (trixium_seq_silu_fixups_read())
         resident_silu_patch(Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, (uint32_t)hv, (uint32_t)nk, (uint32_t)rep);
-    // og stays in RS_F for the out projection's prepare (its store was a list of its own,
-    // ~6k cycles per layer): a failure past this point invalidates the token anyway - the
-    // layer's window and state have moved.
-    int og_stored = 0;
-    if (og_stored) {
-        rl_begin();
-        rl_store(og, dnr_align(4*(uint32_t)nvh), RS_F_ADDR);
-        if (rl_run("deltanet og out"))
-            goto fatal;
-    }
+    // og stays in RS_F for the out projection's prepare (never stored to main RAM): a failure
+    // past this point invalidates the token anyway - the layer's window and state have moved.
     dn_cyc_gate += perf_now64() - t0;
 
     t0 = perf_now64();
     struct resident_state *R = resident_state();
     R->prep_src = og; R->prep_width = nvh; R->prep_rotate = 1;
     resident_mark_act();
-    if (resident_prepare(NULL, (uint32_t)nvh, 1) == 0) {
-        if (og_stored)
-            matvec_q(model_entry(ROLE_SSM_OUT, l), E8_RESIDENT, out);
-        else if (resident_matvec(model_entry(ROLE_SSM_OUT, l), out))
-            goto fatal;
-    } else {
-        if (!og_stored)
-            goto fatal;
-        proj_f(model_entry(ROLE_SSM_OUT, l), og, out);
-    }
+    if (resident_prepare(NULL, (uint32_t)nvh, 1) != 0)
+        goto fatal;
+    if (resident_matvec(model_entry(ROLE_SSM_OUT, l), out))
+        goto fatal;
     dn_cyc_outproj += perf_now64() - t0;
     return 0;
 fatal:
@@ -1334,6 +1357,9 @@ fatal:
     return -2;
 }
 #endif
+
+/* Resident Residual Stream */
+/*--------------------------*/
 
 #ifdef DNRES_BUILT
 // The resident residual stream: x lives in the scratchpad at XRES_SP for the whole forward;
@@ -1369,7 +1395,7 @@ static int xres_list(const float *y, const float *w, int load, int sync)
         rl_store(xb, bytes, XRES_SP);
     if (w) {
         rl_fetch_raw(w, bytes, wsp);                  // a norm weight: cleaned at load
-        bns_seq_desc_norm(&d, 0, XRES_SP, RS_F_ADDR, wsp, n, 1, f32_bits_any(rms_eps));
+        bns_seq_desc_norm(&d, 0, XRES_SP, RS_F_ADDR, wsp, n, 1, f32_bits(rms_eps));
         rl_desc(&d);
         rl_store(hb, bytes, RS_F_ADDR);
     }
@@ -1380,6 +1406,9 @@ static int xres_list(const float *y, const float *w, int load, int sync)
     return 0;
 }
 #endif
+
+/* Attention Stream */
+/*------------------*/
 
 #ifdef TRIXIUM_HAS_ATTNSTREAM
 // Attention stream (engine op 6, gateware/attn_stream.py). Scratchpad while the attention
@@ -1435,7 +1464,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     if (fits) {
         uint32_t w0 = nq << 8 | (nq/nkv) << 16 | nkv << 24;
         rec[0] = w0 | 0;  rec[1] = (uint32_t)T; rec[2] = hd; rec[3] = QB; rec[4] = qstride*4u;
-        rec[5] = AT_SP;   rec[6] = Tp*4u; rec[7] = f32_bits_any(scale);
+        rec[5] = AT_SP;   rec[6] = Tp*4u; rec[7] = f32_bits(scale);
         rec[8] = w0 | 1;  rec[9] = (uint32_t)T; rec[10] = hd; rec[11] = AT_SP; rec[12] = Tp*4u;
         rec[13] = AT_O;   rec[14] = hd*4u; rec[15] = 0;
         if (!qsp)
@@ -1499,6 +1528,9 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
 }
 #endif
 
+/* Attention Layer */
+/*-----------------*/
+
 // Rows [0, T) of slot a in kc/vc for the CPU loop: rows [kc_rows[a], T - 1) come back from
 // the stream's copy in engine DDR (position t on channel t % n_ch), row T - 1 from kb/vb.
 // -1 when a row cannot be brought back (the loop must not run on stale rows).
@@ -1560,7 +1592,7 @@ static void attention_layer(int l, const float *h, float *out)
     if (H->hadamard_block && resident_active() && HP->dnres_enabled && head_dim % 8 == 0 &&
         NK + 4u*(uint32_t)head_dim <= RS_F_ADDR && (trixium_seq_norm_abi_read() & 0xffff) >= 1) {
         struct bns_seq_descriptor d;
-        uint32_t eps = f32_bits_any(rms_eps), hb8 = (uint32_t)head_dim/8;
+        uint32_t eps = f32_bits(rms_eps), hb8 = (uint32_t)head_dim/8;
         // With the attention stream and norm ABI 1.2 the RoPE runs on unit 12 too and q, k
         // and v stay in the scratchpad for op 6 (no stores, no CPU RoPE, no fetches back):
         // the cos/sin of this position go behind the k norm weight.
@@ -1575,8 +1607,8 @@ static void attention_layer(int l, const float *h, float *out)
             rope_prepare(pos);
             volatile uint32_t *tab = (volatile uint32_t *)(SCRATCHPAD_BASE + RT);
             for (int i = 0; i < rope_n/2; i++) {
-                tab[i] = f32_bits_any(rope_c[i]);
-                tab[rope_n/2 + i] = f32_bits_any(rope_s[i]);
+                tab[i] = f32_bits(rope_c[i]);
+                tab[rope_n/2 + i] = f32_bits(rope_s[i]);
             }
         }
         rl_begin();
@@ -1607,18 +1639,17 @@ static void attention_layer(int l, const float *h, float *out)
     if (normed) {
         t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
     } else {
-    if (H->hadamard_block) {
-        // Q/K/V share the input and folded basis: rotate once, not once per projection.
-        // This removes another 32 full-width rotations per 27B forward.
-        e8 = rotate_quantize_f(h, n_embd);
-    } else {
-        e8 = quantize_f(h, n_embd);
-    }
-    t1 = perf_now64(); HP->at_prep += t1 - t0; t0 = t1;
-    matvec_q(model_entry(ROLE_ATTN_Q, l), e8, gated ? qfull : qb);
-    matvec_q(model_entry(ROLE_ATTN_K, l), e8, kb);
-    matvec_q(model_entry(ROLE_ATTN_V, l), e8, vb);
-    t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
+        if (H->hadamard_block) {
+            // Q/K/V share the input and folded basis: rotate once, not once per projection.
+            e8 = rotate_quantize_f(h, n_embd);
+        } else {
+            e8 = quantize_f(h, n_embd);
+        }
+        t1 = perf_now64(); HP->at_prep += t1 - t0; t0 = t1;
+        matvec_q(model_entry(ROLE_ATTN_Q, l), e8, gated ? qfull : qb);
+        matvec_q(model_entry(ROLE_ATTN_K, l), e8, kb);
+        matvec_q(model_entry(ROLE_ATTN_V, l), e8, vb);
+        t1 = perf_now64(); HP->at_qkv += t1 - t0; t0 = t1;
     }
     // The stream reads the q heads where they are (inside [q | gate] when gated, the
     // unit's lane stride); the CPU loop wants them contiguous in qb, copied only if it runs.
@@ -1629,24 +1660,24 @@ static void attention_layer(int l, const float *h, float *out)
     float *qheads = q_in_place ? qfull : qb;
     int qstride = q_in_place ? 2*head_dim : head_dim;
     if (!rope_hw) {                        // else normed and rotated on unit 12, resident
-    if (gated && !q_in_place) // [q | gate] per head
-        for (int hh = 0; hh < n_head; hh++)
-            memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
-    rope_prepare(pos);
-    for (int hh = 0; hh < n_head; hh++) {
-        float *qh = qheads + hh*qstride;
-        if (!normed)
-            rmsnorm_fv(qh, qh, norm_q[l], head_dim);
-        rope_apply_partial(qh);
-    }
-    for (int hh = 0; hh < n_kv_head; hh++) {
-        if (!normed)
-            rmsnorm_fv(kb + hh*head_dim, kb + hh*head_dim, norm_k[l], head_dim);
-        rope_apply_partial(kb + hh*head_dim);
-    }
+        if (gated && !q_in_place)          // [q | gate] per head
+            for (int hh = 0; hh < n_head; hh++)
+                memcpy(qb + hh*head_dim, qfull + hh*2*head_dim, (size_t)head_dim*4);
+        rope_prepare(pos);
+        for (int hh = 0; hh < n_head; hh++) {
+            float *qh = qheads + hh*qstride;
+            if (!normed)
+                rmsnorm_fv(qh, qh, norm_q[l], head_dim);
+            rope_apply_partial(qh);
+        }
+        for (int hh = 0; hh < n_kv_head; hh++) {
+            if (!normed)
+                rmsnorm_fv(kb + hh*head_dim, kb + hh*head_dim, norm_k[l], head_dim);
+            rope_apply_partial(kb + hh*head_dim);
+        }
     }
     t1 = perf_now64(); HP->at_rope += t1 - t0; t0 = t1;
-    int   T = pos + 1;
+    int T = pos + 1;
     int stream_on = 0;
 #ifdef TRIXIUM_HAS_ATTNSTREAM
     stream_on = HP->attnstream_active && kc_rows;
@@ -1688,35 +1719,35 @@ static void attention_layer(int l, const float *h, float *out)
     for (int hh = 0; hh < n_head; hh++) {
         float *oh = attnb + hh*head_dim;
         if (!streamed) {
-        int kvh = hh/n_rep;
-        const float *qh = qb + hh*head_dim;
-        float mx = -1e30f;
-        for (int t = 0; t < T; t++) {
-            const float *kt = K + (uint64_t)t*kv_dim + kvh*head_dim;
-            float sc = 0;
-            int i = 0;
-            // Keep the reference's sequential FP32 sum, with less loop control.
-            for (; i + 3 < head_dim; i += 4) {
-                sc += qh[i + 0]*kt[i + 0]; sc += qh[i + 1]*kt[i + 1];
-                sc += qh[i + 2]*kt[i + 2]; sc += qh[i + 3]*kt[i + 3];
+            int kvh = hh/n_rep;
+            const float *qh = qb + hh*head_dim;
+            float mx = -1e30f;
+            for (int t = 0; t < T; t++) {
+                const float *kt = K + (uint64_t)t*kv_dim + kvh*head_dim;
+                float sc = 0;
+                int i = 0;
+                // Keep the reference's sequential FP32 sum, with less loop control.
+                for (; i + 3 < head_dim; i += 4) {
+                    sc += qh[i + 0]*kt[i + 0]; sc += qh[i + 1]*kt[i + 1];
+                    sc += qh[i + 2]*kt[i + 2]; sc += qh[i + 3]*kt[i + 3];
+                }
+                for (; i < head_dim; i++) sc += qh[i]*kt[i];
+                scores[t] = sc*scale;
+                if (scores[t] > mx) mx = scores[t];
             }
-            for (; i < head_dim; i++) sc += qh[i]*kt[i];
-            scores[t] = sc*scale;
-            if (scores[t] > mx) mx = scores[t];
-        }
-        float sum = 0;
-        for (int t = 0; t < T; t++) { scores[t] = trixium_softmax_exp(scores[t] - mx); sum += scores[t]; }
-        for (int i = 0; i < head_dim; i++) oh[i] = 0;
-        for (int t = 0; t < T; t++) {
-            const float *vt = V + (uint64_t)t*kv_dim + kvh*head_dim;
-            float p = scores[t]/sum;
-            int i = 0;
-            for (; i + 3 < head_dim; i += 4) {
-                oh[i + 0] += p*vt[i + 0]; oh[i + 1] += p*vt[i + 1];
-                oh[i + 2] += p*vt[i + 2]; oh[i + 3] += p*vt[i + 3];
+            float sum = 0;
+            for (int t = 0; t < T; t++) { scores[t] = trixium_softmax_exp(scores[t] - mx); sum += scores[t]; }
+            for (int i = 0; i < head_dim; i++) oh[i] = 0;
+            for (int t = 0; t < T; t++) {
+                const float *vt = V + (uint64_t)t*kv_dim + kvh*head_dim;
+                float p = scores[t]/sum;
+                int i = 0;
+                for (; i + 3 < head_dim; i += 4) {
+                    oh[i + 0] += p*vt[i + 0]; oh[i + 1] += p*vt[i + 1];
+                    oh[i + 2] += p*vt[i + 2]; oh[i + 3] += p*vt[i + 3];
+                }
+                for (; i < head_dim; i++) oh[i] += p*vt[i];
             }
-            for (; i < head_dim; i++) oh[i] += p*vt[i];
-        }
         }
         if (gated && streamed != 2) {
             const float *g = qfull + hh*2*head_dim + head_dim;
@@ -1733,6 +1764,9 @@ static void attention_layer(int l, const float *h, float *out)
     HP->at_out += perf_now64() - t0;
 }
 
+/* LM Head */
+/*---------*/
+
 // LM head chunk: the rows that fit RS_F (restored FP32) and the int32 staging below it, a
 // multiple of 8*n_ch; `lmchunk` caps it (the tiny simulation model's head is one chunk
 // otherwise, so the cap is how the sim exercises the 27B's multi-chunk path).
@@ -1740,7 +1774,7 @@ static uint32_t lm_chunk_rows(void)
 {
     uint32_t unit = 8u*(uint32_t)n_ch, room = (0x32000u - RS_F_ADDR)/4;
     uint32_t chunk = (room < 24576u ? room : 24576u)/unit*unit;
-    if (HP->lm_chunk && HP->lm_chunk/unit*unit && HP->lm_chunk/unit*unit < chunk)
+    if (HP->lm_chunk && HP->lm_chunk/unit*unit != 0 && HP->lm_chunk/unit*unit < chunk)
         chunk = HP->lm_chunk/unit*unit;
     return chunk;
 }
@@ -1790,9 +1824,9 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
     float bv = 0.0f;
     uint32_t brow = 0;
     // The chunks' stores carry no cache maintenance (a flush and an invalidate over ~1 MB
-    // per chunk: ~175k cycles, 2.1 M per 27B token): the buffer is flushed once while the
-    // CPU has written it, and only what the CPU reads is invalidated first (the rare scan
-    // below; the trace, hybrid_forward).
+    // per chunk would cost millions of cycles per 27B token): the buffer is flushed once
+    // while the CPU has written it, and only what the CPU reads is invalidated first (the
+    // rare scan below; the trace, hybrid_forward).
     if (!HP->logits_clean) {
         flush_cpu_dcache_range(dst, (size_t)H->vocab*4 + 64u*nch*4u);
         HP->logits_clean = 1;
@@ -1857,9 +1891,11 @@ static int head_argmax(uint64_t t0)
     }
 #endif
     int head_done = lm_head_list(head, logits) == 0;
+#ifdef CSR_TRIXIUM_SEQ_RESTORE_ARGMAX_IDX_ADDR
     // The restore unit's argmax indexes the list's (channel-major) order: the model's row
     // order only when the head is one chunk (several: lm_head_argmax above, or the loop).
     int one_chunk = head && head->rows <= lm_chunk_rows();
+#endif
     if (!head_done) {
         proj_f(head, hb, logits);
         HP->logits_clean = 0;            // CPU-written: lm_head_argmax flushes it first
@@ -1882,6 +1918,9 @@ static int head_argmax(uint64_t t0)
     return best;
 }
 
+/* FFN */
+/*-----*/
+
 // The FFN of hb (ffn-normed, the token's residual in xb) into tmp_h; t0: the fprep start.
 static void ffn_tok(int l, uint64_t t0)
 {
@@ -1895,24 +1934,21 @@ static void ffn_tok(int l, uint64_t t0)
     const struct bons_entry *down = model_entry(ROLE_FFN_DOWN, l);
     // Resident FFN: gate, up and act = up*silu(gate) in one scratchpad list, the act
     // then prepared for the down projection where it already is (no FETCH). The gate
-    // and up projections reach main RAM only when traced.
-    // The activation stays in RS_F for the down projection's prepare (a store to main
-    // RAM costs ~13k cycles per 27B layer): the trace reads it there, and a failed
-    // down projection recomputes it on the CPU path.
-    int fused = 0, act_stored = 0;
+    // and up projections reach main RAM only when traced. The activation stays in RS_F
+    // (never stored to main RAM): the trace reads it there, and a failed down projection
+    // recomputes it on the CPU path.
+    int fused = 0;
     if (e8 == E8_RESIDENT && H->hadamard_block && resident_silu_active() &&
         infer_matvec_cols(down) == (uint32_t)ffn_dim) {
         int traced = infer_dbg_armed();
         fused = resident_ffn_act(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l),
-                                 act_stored ? actb : NULL, traced ? gateb : NULL,
-                                 traced ? upb : NULL) == 0;
+                                 NULL, traced ? gateb : NULL, traced ? upb : NULL) == 0;
     }
     if (fused) {
         hyb_cyc_fproj += perf_now64() - t0;
         infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
         infer_dbg_f32("ffn_up", l, upb, ffn_dim);
-        infer_dbg_f32("ffn_act", l, act_stored ? actb :
-                      (const float *)(SCRATCHPAD_BASE + RS_F_ADDR), ffn_dim);
+        infer_dbg_f32("ffn_act", l, (const float *)(SCRATCHPAD_BASE + RS_F_ADDR), ffn_dim);
         t0 = perf_now64();
         struct resident_state *R = resident_state();
         R->prep_src = actb; R->prep_width = ffn_dim; R->prep_rotate = 1;
@@ -1921,21 +1957,14 @@ static void ffn_tok(int l, uint64_t t0)
         if (resident_prepare(NULL, (uint32_t)ffn_dim, 1) == 0) {
             uint64_t tm = perf_now64();
             HP->fd_prep += tm - tf;
-            if (act_stored) {
-                matvec_q(down, E8_RESIDENT, tmp_h);
-                down_done = 1;
-            } else {
-                down_done = resident_matvec(down, tmp_h) == 0;
-            }
+            down_done = resident_matvec(down, tmp_h) == 0;
             HP->fd_mv += perf_now64() - tm;
         }
         if (!down_done) {
-            if (!act_stored) {
-                int e8c = rotate_quantize_legacy(hb, n_embd);
-                matvec_q(model_entry(ROLE_FFN_GATE, l), e8c, gateb);
-                matvec_q(model_entry(ROLE_FFN_UP, l), e8c, upb);
-                silu_mul_fv(gateb, upb, actb, ffn_dim);
-            }
+            int e8c = rotate_quantize_legacy(hb, n_embd);
+            matvec_q(model_entry(ROLE_FFN_GATE, l), e8c, gateb);
+            matvec_q(model_entry(ROLE_FFN_UP, l), e8c, upb);
+            silu_mul_fv(gateb, upb, actb, ffn_dim);
             proj_f(down, actb, tmp_h);
         }
         hyb_cyc_fdown += perf_now64() - t0;
@@ -1955,6 +1984,9 @@ static void ffn_tok(int l, uint64_t t0)
     }
 }
 
+/* Forward */
+/*---------*/
+
 int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
@@ -1966,7 +1998,8 @@ int hybrid_forward(int token, int want_logits)
 #ifdef DNRES_BUILT
     xres = xres_ok();
 #endif
-    int traced = infer_dbg_armed();
+    int traced = infer_dbg_armed();       // the resident residual stream syncs xb when traced
+    (void)traced;
     for (int l = 0; l < n_layer; l++) {
         t0 = perf_now64();
         if (xres) {

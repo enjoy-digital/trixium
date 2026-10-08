@@ -1,7 +1,12 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium vector unit driver
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <stdio.h>
 
@@ -11,18 +16,19 @@
 #include "vec.h"
 #include "engine.h"
 #include "perf.h"
-
-
 #include "progs.h"
 
-// The microcode encoding must be the bitstream's (model.asm docstring). The Makefile
-// regenerates progs.h per build tree; this catches a stale header before it costs a boot.
+// The microcode encoding must be the bitstream's (trixium/model/asm.py). The Makefile
+// regenerates progs.h per build tree; this catches a stale header at build time.
 #ifndef TRIXIUM_VEC_VREGS
 #define TRIXIUM_VEC_VREGS 8
 #endif
 #if TRIXIUM_PROGS_VREGS != TRIXIUM_VEC_VREGS
 #error "progs.h was emitted for a different vector register count than this bitstream"
 #endif
+
+/* Programs */
+/*----------*/
 
 void vec_init(void)
 {
@@ -31,22 +37,26 @@ void vec_init(void)
         trixium_vecunit_prog_write(trixium_progs[i]);
 }
 
+/* Run */
+/*-----*/
+
 uint32_t vec_poll_spins, vec_poll_waits;
 
 uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
 {
     static void (* const wr[8])(uint32_t) = {
-        trixium_vecunit_arg0_write, trixium_vecunit_arg1_write, trixium_vecunit_arg2_write, trixium_vecunit_arg3_write,
-        trixium_vecunit_arg4_write, trixium_vecunit_arg5_write, trixium_vecunit_arg6_write, trixium_vecunit_arg7_write,
+        trixium_vecunit_arg0_write, trixium_vecunit_arg1_write,
+        trixium_vecunit_arg2_write, trixium_vecunit_arg3_write,
+        trixium_vecunit_arg4_write, trixium_vecunit_arg5_write,
+        trixium_vecunit_arg6_write, trixium_vecunit_arg7_write,
     };
     uint32_t done = trixium_vecunit_done_count_read();
     for (int i = 0; i < n_args; i++)
         wr[i]((uint32_t)args[i]);
     trixium_vecunit_pc_write(pc);
     trixium_vecunit_submit_write(1);
-    // Spin-capped like engine_run/seq_run: a program that never finishes must say so,
-    // rather than a sim (or card) that just stops printing. The status CSR's bad_op field
-    // also names a corrupted/unknown instruction directly.
+    // Spin-capped like engine_run/seq_run: a program that never finishes says so instead of
+    // silently hanging. The status CSR's bad_op field names a corrupted/unknown instruction.
     uint32_t spins = 0, reports = 0;
     vec_poll_waits++;
     while (trixium_vecunit_done_count_read() == done) {
@@ -58,7 +68,7 @@ uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
                pc, (unsigned long)trixium_vecunit_status_read());
         if (++reports == 8) {
             puts("VECSTALL: giving up (results from here are garbage).");
-            engine_wedged = 1;   // one flag: the generation aborts and engine_recover runs
+            engine_wedged = 1; // One flag: the generation aborts and engine_recover runs.
             break;
         }
     }
