@@ -14,9 +14,9 @@ firmware binary and the BONS header+table are baked into main_ram at elaboration
 payloads into the HBM models (CHAN_WEIGHT_BASE = 0 in sim).
 
 Flow (from the repo root):
-  python3 sim/bonsai_sim.py --build-software          # headers + BIOS (no gateware)
+  python3 trixium/targets/sim.py --build-software          # headers + BIOS (no gateware)
   make -C firmware BUILD_DIR=../build/sim             # firmware/bonsai.bin
-  python3 sim/bonsai_sim.py --run                     # elaborate + verilate + run
+  python3 trixium/targets/sim.py --run                     # elaborate + verilate + run
 """
 
 import argparse
@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
@@ -43,7 +43,7 @@ from litex.soc.integration.builder import Builder
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 from trixium.model.bons import BONSReader
 
 # Constants ----------------------------------------------------------------------------------------
@@ -195,7 +195,7 @@ class BonsaiSimSoC(SoCCore):
         else:
             chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
         # Same integration as both hardware targets; only memory/physical policy differs.
-        from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
+        from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
         def memory_description():
             from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
             if mem == 'hbm':
@@ -230,7 +230,7 @@ class BonsaiSimSoC(SoCCore):
                 if attn_geometry else ())
         add_bonsai_cluster(self, axis, config)
         if with_capabilities:
-            from trixium.gateware.capabilities import add_capabilities
+            from trixium.core.capabilities import add_capabilities
             regions, reservations = memory_description()
             self.bonsai_capabilities = add_capabilities(self, config, axis, regions, reservations,
                                                        sys_hz=int(self.sys_clk_freq))
@@ -319,10 +319,10 @@ class BonsaiSimSoC(SoCCore):
                                with_soc_interconnect=False)
             self.sdrams.append(getattr(self, f"sdram{sfx}"))
         if self.ddr_split:
-            from trixium.gateware.ddr_domain import add_ddr_domain_controllers
+            from trixium.memory.ddr import add_ddr_domain_controllers
             add_ddr_domain_controllers(self, split_phys, split_modules, int(100e6), MAIN_RAM_SIZE,
                                        8192, DDR4_SIM_CSR_WINDOW)
-        from trixium.gateware.ddr_port import engine_ddr_port
+        from trixium.memory.ddr import engine_ddr_port
         for k in range(n_memctrl):
             core = self.sdrams[k]
             for j in range(chan_mod):
@@ -346,7 +346,7 @@ def attn_geometry(text):
 
 
 def main():
-    from trixium.gateware.migen_fast import install as install_migen_fast
+    from trixium.migen_fast import install as install_migen_fast
     install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
     parser.add_argument("--image",          default="models/tiny/bonsai-tiny-n2.img")
@@ -365,7 +365,7 @@ def main():
     parser.add_argument("--update-repo", default="no", choices=["no", "recommended", "latest"],
                         help="VexiiRiscv source update policy (default: no, for reproducible runs)")
     parser.add_argument("--pc-profile",     action="store_true",
-                        help="compile the VexRiscv PC profiler in (sim/pc_profiler.cpp); "
+                        help="compile the VexRiscv PC profiler in (trixium/targets/sim_pc_profiler.cpp); "
                              "writes pcprof-*.txt into build/sim/gateware")
     parser.add_argument("--trace",          action="store_true", help="Enable FST tracing.")
     parser.add_argument("--hbm-latency",    default=16, type=int)
@@ -421,7 +421,7 @@ def main():
 
     soc     = BonsaiSimSoC(image=args.image, firmware=args.firmware, **soc_kwargs)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
-    # --pc-profile compiles sim/pc_profiler.cpp into the verilated binary, where it overrides
+    # --pc-profile compiles trixium/targets/sim_pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the
     # VexRiscv retired PC every cycle. That is the only way to attribute the ~69% of a token
     # in which neither the engine nor the vector unit is busy; perf_print's buckets are

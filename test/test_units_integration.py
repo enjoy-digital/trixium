@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 from migen import Memory, Module, run_simulation
 
-from trixium.gateware.integration import BonsaiClusterConfig
-from trixium.gateware.sequencer import BonsaiSequencer
+from trixium.core.core import BonsaiClusterConfig
+from trixium.core.sequencer import BonsaiSequencer
 from trixium.model.activation import (scratchpad_conv_descriptor, scratchpad_norm_descriptor,
                                            scratchpad_silu_descriptor)
 from test_hadamard_integration import install_list

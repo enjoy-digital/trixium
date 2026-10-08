@@ -21,13 +21,13 @@ from operator import or_
 
 from migen import C, ClockDomainsRenamer
 
-from trixium.gateware.scratchpad import BonsaiScratchpad, BonsaiScratchpadArbiter
-from trixium.gateware.engreset import BonsaiEngineResetDomain
-from trixium.gateware.vector import BonsaiVectorUnit
-from trixium.gateware.sequencer import BonsaiSequencer
-from trixium.gateware.matvec import BonsaiMatVecEngine
-from trixium.gateware.csr_front import BonsaiEngineCSR
-from trixium.gateware.loader import BonsaiHBMLoader
+from trixium.core.scratchpad import BonsaiScratchpad, BonsaiScratchpadArbiter
+from trixium.core.reset import BonsaiEngineResetDomain
+from trixium.core.vector import BonsaiVectorUnit
+from trixium.core.sequencer import BonsaiSequencer
+from trixium.core.engine import BonsaiMatVecEngine
+from trixium.core.csr import BonsaiEngineCSR
+from trixium.memory.loader import BonsaiHBMLoader
 
 
 @dataclass(frozen=True)
@@ -133,20 +133,20 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
     base_busy = [vecunit.busy] if vecunit is not None else []
     extensions = []
     if config.with_hadamard:
-        from trixium.gateware.hadamard_sp import BonsaiHadamardScratchpad
+        from trixium.units.hadamard import BonsaiHadamardScratchpad
         soc.hadamard = ClockDomainsRenamer("eng")(BonsaiHadamardScratchpad(config.scratchpad_size))
         sp_clients.append(soc.hadamard)
         extensions.append(("hadamard", soc.hadamard))
         soc.add_constant("BONSAI_HAS_HADAMARD")
         soc.add_constant("BONSAI_HADAMARD_BLOCK", 1024)
     if config.with_activation_quantize:
-        from trixium.gateware.activation_sp import BonsaiActivationScratchpad
+        from trixium.units.activation import BonsaiActivationScratchpad
         soc.activation_quantize = ClockDomainsRenamer("eng")(BonsaiActivationScratchpad(config.scratchpad_size))
         sp_clients.append(soc.activation_quantize)
         extensions.append(("activation_quantize", soc.activation_quantize))
         soc.add_constant("BONSAI_HAS_ACTIVATION_QUANTIZE")
     if config.with_projection_restore:
-        from trixium.gateware.projection_restore_sp import BonsaiProjectionRestoreScratchpad
+        from trixium.units.restore import BonsaiProjectionRestoreScratchpad
         soc.projection_restore = ClockDomainsRenamer("eng")(BonsaiProjectionRestoreScratchpad(config.scratchpad_size))
         sp_clients.append(soc.projection_restore)
         extensions.append(("projection_restore", soc.projection_restore))
@@ -158,20 +158,20 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         ]
         soc.add_constant("BONSAI_HAS_PROJECTION_RESTORE")
     if config.with_silu:
-        from trixium.gateware.silu_sp import BonsaiSiluScratchpad
+        from trixium.units.silu import BonsaiSiluScratchpad
         soc.silu = ClockDomainsRenamer("eng")(BonsaiSiluScratchpad(config.scratchpad_size))
         sp_clients.append(soc.silu)
         extensions.append(("silu", soc.silu))
         soc.comb += seq.silu_unit_fixups.eq(soc.silu.fixups)
         soc.add_constant("BONSAI_HAS_SILU")
     if config.with_norm:
-        from trixium.gateware.norm_sp import BonsaiNormScratchpad
+        from trixium.units.norm import BonsaiNormScratchpad
         soc.norm = ClockDomainsRenamer("eng")(BonsaiNormScratchpad(config.scratchpad_size))
         sp_clients.append(soc.norm)
         extensions.append(("norm", soc.norm))
         soc.add_constant("BONSAI_HAS_NORM")
     if config.with_conv:
-        from trixium.gateware.conv_sp import BonsaiConvScratchpad
+        from trixium.units.conv import BonsaiConvScratchpad
         soc.conv = ClockDomainsRenamer("eng")(BonsaiConvScratchpad(config.scratchpad_size))
         sp_clients.append(soc.conv)
         extensions.append(("conv", soc.conv))

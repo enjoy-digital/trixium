@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_idelayctrl_reset_releases_sys():
-    from trixium_xcu1525 import _IDELAYCTRL
+    from trixium.targets.xcu1525 import _IDELAYCTRL
 
     class _DUT(Module):
         def __init__(self):
@@ -65,7 +65,7 @@ def test_idelayctrl_reset_releases_sys():
 def test_idelayctrl_reset_waits_for_mmcm_lock():
     """RST stays asserted while the MMCM is unlocked, drops reset_cycles after lock, and
     comes back (counter reloaded) if lock is lost - UG571's "reset after REFCLK is stable"."""
-    from trixium_xcu1525 import _IDELAYCTRL
+    from trixium.targets.xcu1525 import _IDELAYCTRL
 
     class _DUT(Module):
         def __init__(self):
@@ -106,7 +106,7 @@ def test_idelayctrl_reset_waits_for_mmcm_lock():
 @pytest.mark.parametrize("fast_clock_buffer", ["bufgce", "bufgce-div"])
 def test_serializer_clock_group_uses_related_buffer_outputs(fast_clock_buffer):
     from litex_boards.platforms.sqrl_xcu1525 import Platform
-    from trixium_xcu1525 import _CRG
+    from trixium.targets.xcu1525 import _CRG
     platform = Platform()
     crg = _CRG(platform, 150e6, fast_clock_buffer=fast_clock_buffer)
     groups = [(command, signals) for command, signals in platform.constraint_manager.platform_commands
@@ -124,7 +124,7 @@ def test_serializer_clock_group_uses_related_buffer_outputs(fast_clock_buffer):
 def test_serializer_buffers_share_mmcm_output_and_preserve_fabric_clock(fast_clock_buffer):
     """Structural test, not a primitive simulation or a routed timing result."""
     from litex_boards.platforms.sqrl_xcu1525 import Platform
-    from trixium_xcu1525 import _CRG
+    from trixium.targets.xcu1525 import _CRG
 
     kwargs = {} if fast_clock_buffer is None else {"fast_clock_buffer": fast_clock_buffer}
     crg = _CRG(Platform(), 150e6, **kwargs)
@@ -154,7 +154,7 @@ def test_serializer_buffers_share_mmcm_output_and_preserve_fabric_clock(fast_clo
 
 
 def test_serializer_rejects_unknown_buffer_before_requesting_platform_resources():
-    from trixium_xcu1525 import _CRG
+    from trixium.targets.xcu1525 import _CRG
 
     with pytest.raises(ValueError, match="fast_clock_buffer"):
         _CRG(None, 150e6, fast_clock_buffer="unknown")

@@ -18,8 +18,8 @@ from migen.fhdl import verilog
 from litex.gen import LiteXModule
 from migen import Signal, Mux
 
-from trixium.gateware.scratchpad import BonsaiScratchpad
-from trixium.gateware.silu_sp import BonsaiSiluScratchpad, LOAD_BEATS, OP_LOAD, OP_RUN, SILU_COMMAND
+from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.units.silu import BonsaiSiluScratchpad, LOAD_BEATS, OP_LOAD, OP_RUN, SILU_COMMAND
 from trixium.model.silu_hw import LUT_N, silu_mul_fixed, tables
 from test_silu_mul_rtl import stress_vectors
 

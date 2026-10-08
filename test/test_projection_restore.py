@@ -11,7 +11,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.gateware.projection_restore import I32ToFp32Scaled
+from trixium.units.restore import I32ToFp32Scaled
 
 
 def bits(value):

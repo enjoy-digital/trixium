@@ -30,7 +30,7 @@ from migen.genlib.fifo import SyncFIFO
 from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
-from trixium.gateware.fp32_exact import FP32Add, FP32DivSqrt, FP32Mul, _lzc, _shift_left
+from trixium.units.fp32 import FP32Add, FP32DivSqrt, FP32Mul, _lzc, _shift_left
 
 NORM_COMMAND = [("op", 1), ("src", 24), ("dst", 24), ("weight", 24), ("n", 16), ("nseg", 16),
                 ("eps", 32), ("src_stride", 16), ("dst_stride", 16),

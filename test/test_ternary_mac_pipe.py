@@ -16,7 +16,7 @@ from migen import *
 from trixium import layout
 from trixium.model import bitexact as bx
 from trixium.model.bons import TensorSpec, encode_rows
-from trixium.gateware.ternary_mac import BonsaiChannelPipe, KIND_OP_AXPY
+from trixium.core.pipe import BonsaiChannelPipe, KIND_OP_AXPY
 
 
 def _beats(payload):

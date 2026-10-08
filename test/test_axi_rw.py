@@ -16,9 +16,9 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.axi_reader import BonsaiAXIReader
-from trixium.gateware.axi_writer import BonsaiAXIWriter
-from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.memory.axi import BonsaiAXIReader
+from trixium.memory.axi import BonsaiAXIWriter
+from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 MEM_SIZE = 16*1024 # 512 beats.
 

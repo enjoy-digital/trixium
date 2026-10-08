@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 from migen.fhdl import verilog
 
-from trixium.gateware.deltanet_stream import (
+from trixium.units.deltanet_stream import (
     BonsaiDeltaNetStream, lanes_to_state, reference, state_to_lanes)
 
 f32 = np.float32

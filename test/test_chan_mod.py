@@ -21,10 +21,10 @@ from migen import *
 from litex.soc.interconnect.axi import AXIInterface
 
 from trixium import layout
-from trixium.gateware.scratchpad import BonsaiScratchpad
-from trixium.gateware.matvec import BonsaiMatVecEngine
-from trixium.gateware.loader import BonsaiHBMLoader
-from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.core.engine import BonsaiMatVecEngine
+from trixium.memory.loader import BonsaiHBMLoader
+from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
 

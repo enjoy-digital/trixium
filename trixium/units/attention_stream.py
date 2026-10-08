@@ -40,7 +40,7 @@ from migen import *
 from litex.gen import *
 from litex.soc.interconnect import stream
 
-from trixium.gateware.fp32_exact import ExactFP32Add, ExactFP32Mul
+from trixium.units.fp32 import ExactFP32Add, ExactFP32Mul
 
 MODE_SCORES = 0
 MODE_VALUES = 1

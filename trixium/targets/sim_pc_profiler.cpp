@@ -46,7 +46,7 @@ namespace {
 
 struct Region { uint32_t base, size; uint64_t *cyc, *ret; };
 
-// Matches MAIN_RAM_BASE/SIZE and integrated_rom_size in sim/bonsai_sim.py. A PC outside both
+// Matches MAIN_RAM_BASE/SIZE and integrated_rom_size in trixium/targets/sim.py. A PC outside both
 // lands in g_oor, which the dump header reports - so a layout change shouts instead of
 // silently mis-attributing.
 Region   g_rom = { 0x00000000u, 0x00020000u, nullptr, nullptr };

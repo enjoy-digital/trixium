@@ -16,7 +16,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.gateware.silu_mul import SiluMulKernel
+from trixium.units.silu import SiluMulKernel
 from trixium.model.silu_hw import LUT_N, f32_bits, silu_mul_firmware, silu_mul_fixed, tables
 
 

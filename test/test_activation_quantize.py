@@ -11,7 +11,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.gateware.activation_quantize import Fp32AbsmaxWord, Fp32ToQ8
+from trixium.units.activation import Fp32AbsmaxWord, Fp32ToQ8
 
 
 def bits(value):

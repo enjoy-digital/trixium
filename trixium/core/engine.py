@@ -28,8 +28,8 @@ from litex.gen import *
 from litex.soc.interconnect import stream
 
 from trixium.layout import BEAT_BYTES
-from trixium.gateware.axi_reader import BonsaiAXIReader
-from trixium.gateware.ternary_mac import BonsaiChannelPipe
+from trixium.memory.axi import BonsaiAXIReader
+from trixium.core.pipe import BonsaiChannelPipe
 
 # BonsaiMatVecEngine -------------------------------------------------------------------------------
 
@@ -281,7 +281,7 @@ class BonsaiMatVecEngine(LiteXModule):
         # (same wbase/wlen on every channel, the readers' per-channel offsets).
         self.with_dnstream = dnstream
         if dnstream:
-            from trixium.gateware.deltanet_stream import BonsaiDeltaNetStream
+            from trixium.units.deltanet_stream import BonsaiDeltaNetStream
             # dnstream=True: the 27B geometry on the exact operators; a dict overrides the
             # unit's arguments (tests: a small geometry on integer operators).
             opts = dict(dnstream) if isinstance(dnstream, (dict, tuple)) else {}
@@ -292,7 +292,7 @@ class BonsaiMatVecEngine(LiteXModule):
 
         self.with_attnstream = attnstream
         if attnstream:
-            from trixium.gateware.attn_stream import BonsaiAttnStream
+            from trixium.units.attention_stream import BonsaiAttnStream
             opts = dict(attnstream) if isinstance(attnstream, (dict, tuple)) else {}
             self.submodules.attnstream = at = BonsaiAttnStream(adr_bits=len(scratchpad.fill.adr), **opts)
 

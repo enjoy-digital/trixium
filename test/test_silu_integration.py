@@ -3,8 +3,8 @@
 import pytest
 from migen import Memory, Module, run_simulation
 
-from trixium.gateware.integration import BonsaiClusterConfig
-from trixium.gateware.sequencer import BonsaiSequencer
+from trixium.core.core import BonsaiClusterConfig
+from trixium.core.sequencer import BonsaiSequencer
 from trixium.model.activation import scratchpad_silu_descriptor, silu_table_image
 from trixium.model.silu_hw import tables
 from test_hadamard_integration import install_list

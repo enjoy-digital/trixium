@@ -26,7 +26,7 @@ from migen import *
 
 from litex.gen import *
 
-from trixium.gateware.axi_shim import AXIResetShim
+from trixium.memory.axi import AXIResetShim
 
 # BonsaiEngineResetDomain --------------------------------------------------------------------------
 

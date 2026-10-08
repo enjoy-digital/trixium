@@ -9,8 +9,8 @@ from migen import *
 from migen.fhdl import verilog
 from litex.gen import LiteXModule
 
-from trixium.gateware.projection_restore_sp import BonsaiProjectionRestoreScratchpad
-from trixium.gateware.scratchpad import BonsaiScratchpad
+from trixium.units.restore import BonsaiProjectionRestoreScratchpad
+from trixium.core.scratchpad import BonsaiScratchpad
 from test_projection_restore import expected
 
 

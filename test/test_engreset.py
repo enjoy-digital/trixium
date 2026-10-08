@@ -22,11 +22,11 @@ from litex.soc.interconnect.axi import AXIInterface
 from trixium import layout
 from trixium.model import bitexact as bx
 from trixium.model.bons import TensorSpec, encode_rows
-from trixium.gateware.scratchpad import BonsaiScratchpad
-from trixium.gateware.matvec import BonsaiMatVecEngine
-from trixium.gateware.loader import BonsaiHBMLoader
-from trixium.gateware.engreset import BonsaiEngineResetDomain
-from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.core.engine import BonsaiMatVecEngine
+from trixium.memory.loader import BonsaiHBMLoader
+from trixium.core.reset import BonsaiEngineResetDomain
+from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 
 def test_compiled_system_reset_reaches_registered_engine_domain(tmp_path):

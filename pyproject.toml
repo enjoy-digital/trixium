@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "trixium"
 version = "0.1.0"
-description = "Ternary LLM inference on FPGA + HBM (LiteX/Migen): model converter, host client, tools"
+description = "TriXium: PrismML Bonsai ternary LLMs on FPGAs (LiteX/Migen): gateware, firmware, model converter, host tools"
 readme = "README.md"
 license = {text = "BSD-2-Clause"}
 requires-python = ">=3.10"
@@ -20,7 +20,7 @@ dev  = ["pytest", "huggingface_hub"]
 # The gateware itself needs Migen/LiteX from the LiteX installer, not from PyPI.
 
 [project.scripts]
-bonsai = "trixium.cli:main"
+trixium = "trixium.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["trixium*"]

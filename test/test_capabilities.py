@@ -17,8 +17,8 @@ from trixium.capabilities import (
     Access, Capabilities, Feature, HEADER, MAGIC, MemoryKind, MemoryRegion,
     REGION, RESERVATION, RegionAddress, Reservation, ReservationKind, read_capabilities,
 )
-from trixium.gateware.capabilities import BonsaiCapabilitiesCSR, add_capabilities
-from trixium.gateware.integration import BonsaiClusterConfig
+from trixium.core.capabilities import BonsaiCapabilitiesCSR, add_capabilities
+from trixium.core.core import BonsaiClusterConfig
 from litex.gen import LiteXModule
 
 ROOT = Path(__file__).resolve().parents[1]

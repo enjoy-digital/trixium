@@ -107,7 +107,7 @@ def cmd_console(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="bonsai", description=__doc__,
+    ap = argparse.ArgumentParser(prog="trixium", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from migen.fhdl import verilog
 
-from trixium.gateware.attn_stream import (
+from trixium.units.attention_stream import (
     BonsaiAttnStream, MODE_SCORES, MODE_VALUES, scores_reference, values_reference)
 
 f32 = np.float32

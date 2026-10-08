@@ -5,8 +5,8 @@ import pytest
 from migen import *
 from litex.gen import LiteXModule
 
-from trixium.gateware.hadamard_sp import BonsaiHadamardScratchpad
-from trixium.gateware.scratchpad import BonsaiScratchpad
+from trixium.units.hadamard import BonsaiHadamardScratchpad
+from trixium.core.scratchpad import BonsaiScratchpad
 from test_hadamard import dense, packed, unpacked
 
 

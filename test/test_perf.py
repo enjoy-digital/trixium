@@ -8,9 +8,9 @@ import pytest
 from migen import Module, Constant, run_simulation
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.csr_front import BonsaiEngineCSR
-from trixium.gateware.matvec import BonsaiMatVecEngine
-from trixium.gateware.scratchpad import BonsaiScratchpad
+from trixium.core.csr import BonsaiEngineCSR
+from trixium.core.engine import BonsaiMatVecEngine
+from trixium.core.scratchpad import BonsaiScratchpad
 
 
 ROOT = Path(__file__).resolve().parents[1]

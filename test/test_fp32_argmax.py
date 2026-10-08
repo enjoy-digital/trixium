@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from migen import run_simulation
 
-from trixium.gateware.fp32_exact import FP32ArgmaxTracker
+from trixium.units.fp32 import FP32ArgmaxTracker
 
 f32 = np.float32
 

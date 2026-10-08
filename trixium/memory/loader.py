@@ -22,7 +22,7 @@ from litex.gen import *
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import *
 
-from trixium.gateware.axi_writer import BonsaiAXIWriter
+from trixium.memory.axi import BonsaiAXIWriter
 
 # One 256-bit beat the host prefixes to a transfer so the loader can find the start of the
 # payload in a stream it does not otherwise control. Repeated 32-bit word so it is trivial to

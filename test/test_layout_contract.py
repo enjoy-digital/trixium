@@ -116,7 +116,7 @@ def test_targets_use_one_cluster_implementation():
     import ast
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
-    for fname in ("trixium.py", "trixium_xcu1525.py", "sim/bonsai_sim.py"):
+    for fname in ("trixium/targets/fk33.py", "trixium/targets/xcu1525.py", "trixium/targets/sim.py"):
         tree = ast.parse((root / fname).read_text())
         calls = [node.func.id for node in ast.walk(tree)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]

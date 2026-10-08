@@ -126,7 +126,7 @@ class BonsaiSequencer(LiteXModule):
         ])
         extension_errors = []
         if with_hadamard:
-            from trixium.gateware.hadamard_sp import HADAMARD_COMMAND
+            from trixium.units.hadamard import HADAMARD_COMMAND
             self.hadamard_cmd = stream.Endpoint(HADAMARD_COMMAND)
             self.hadamard_done = Signal()
             self.hadamard_failed = Signal(8)
@@ -136,7 +136,7 @@ class BonsaiSequencer(LiteXModule):
                 "bit2 output overlaps descriptor list, bits8..15 rotation-unit error.")
             extension_errors.append(self.hadamard_error)
         if with_activation_quantize:
-            from trixium.gateware.activation_sp import ACTIVATION_COMMAND
+            from trixium.units.activation import ACTIVATION_COMMAND
             self.activation_quantize_cmd = stream.Endpoint(ACTIVATION_COMMAND)
             self.activation_quantize_done = Signal()
             self.activation_quantize_failed = Signal(8)
@@ -147,7 +147,7 @@ class BonsaiSequencer(LiteXModule):
                 "bit15 rejects invalid rotation metadata/raw values).")
             extension_errors.append(self.activation_quantize_error)
         if with_projection_restore:
-            from trixium.gateware.projection_restore_sp import RESTORE_COMMAND
+            from trixium.units.restore import RESTORE_COMMAND
             self.projection_restore_cmd = stream.Endpoint(RESTORE_COMMAND)
             self.projection_restore_done = Signal()
             self.projection_restore_failed = Signal(8)
@@ -158,7 +158,7 @@ class BonsaiSequencer(LiteXModule):
             extension_errors.append(self.projection_restore_error)
         if with_silu:
             # Append-only, after every other optional block.
-            from trixium.gateware.silu_sp import SILU_COMMAND
+            from trixium.units.silu import SILU_COMMAND
             self.silu_cmd = stream.Endpoint(SILU_COMMAND)
             self.silu_done = Signal()
             self.silu_failed = Signal(8)
@@ -171,7 +171,7 @@ class BonsaiSequencer(LiteXModule):
                 'Fixup elements flagged by unit 11 since the last list start (all its RUN descriptors).')
             extension_errors.append(self.silu_error)
         if with_norm:
-            from trixium.gateware.norm_sp import NORM_COMMAND
+            from trixium.units.norm import NORM_COMMAND
             self.norm_cmd = stream.Endpoint(NORM_COMMAND)
             self.norm_done, self.norm_failed = Signal(), Signal(8)
             self.norm_abi = CSRStatus(32, reset=0x00010002)
@@ -180,7 +180,7 @@ class BonsaiSequencer(LiteXModule):
                 'bits8..15 norm-client error (bit14 protects the full descriptor list).')
             extension_errors.append(self.norm_error)
         if with_conv:
-            from trixium.gateware.conv_sp import CONV_COMMAND
+            from trixium.units.conv import CONV_COMMAND
             self.conv_cmd = stream.Endpoint(CONV_COMMAND)
             self.conv_done, self.conv_failed = Signal(), Signal(8)
             self.conv_abi = CSRStatus(32, reset=0x00010000)
@@ -254,7 +254,7 @@ class BonsaiSequencer(LiteXModule):
         #     stays safe.
         #  2. A patch store is in the FIFO before the `start` CSR write is issued - i.e.
         #     the CPU's descriptor stores are ordered ahead of the start. The scratchpad
-        #     window is mapped cached=False (trixium.py) and the core is in-order, so
+        #     window is mapped cached=False (trixium/targets/fk33.py) and the core is in-order, so
         #     this holds. NOT a new requirement: a store still sitting in a CPU-side buffer
         #     never raised sbw_pending either, so the old fetch interlock needed it too.
         #     What is new is only (1).

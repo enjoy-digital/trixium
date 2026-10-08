@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from trixium.gateware.conv_sp import CONV_COMMAND, BonsaiConvScratchpad
+from trixium.units.conv import CONV_COMMAND, BonsaiConvScratchpad
 from rtl_client import build_client, run_client
 
 f32 = np.float32

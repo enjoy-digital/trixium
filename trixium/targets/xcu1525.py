@@ -15,7 +15,7 @@
 #
 # Build (from the repo root):
 #   tools/build_xcu1525.sh <name>          # the recipe that ships; or by hand:
-#   ./trixium_xcu1525.py --engine-channels 16 --with-vecunit --build
+#   ./trixium/targets/xcu1525.py --engine-channels 16 --with-vecunit --build
 #
 # The whole SoC - CPU, engine cluster, the four controllers - runs in one `sys` domain at
 # the DDR4 controller clock (125 MHz with the USPDDRPHY: 4:1, DDR4-1000). No clock-domain
@@ -213,7 +213,7 @@ class BonsaiXCU1525SoC(SoCCore):
                                     l2_size, memory_sizes):
         """The four controllers and PHYs in the ddr domain: trixium/gateware/ddr_domain.py
         (shared with the simulation's --ddr-split)."""
-        from trixium.gateware.ddr_domain import add_ddr_domain_controllers
+        from trixium.memory.ddr import add_ddr_domain_controllers
         phys, modules = [], []
         for i in range(n):
             phy = usddrphy.USPDDRPHY(
@@ -313,7 +313,7 @@ class BonsaiXCU1525SoC(SoCCore):
         # bursts (128 beats), so a channel is never throttled by the bridge.
         # The port itself: trixium/gateware/ddr_port.py (512-bit ports by default since
         # v6 - the 256-bit port's native up-converter costs ~5 cycles per controller word).
-        from trixium.gateware.ddr_port import engine_ddr_port
+        from trixium.memory.ddr import engine_ddr_port
         engine_axis = []
         for c in range(engine_channels):
             core = self.sdrams[c//chan_mod]
@@ -333,7 +333,7 @@ class BonsaiXCU1525SoC(SoCCore):
 
         # CPU bus monitor (split builds: v27's CPU never printed; tools/cpumon.py reads it).
         if ddr_split:
-            from trixium.gateware.cpu_monitor import CPUBusMonitor
+            from trixium.targets.common import CPUBusMonitor
             self.cpumon = CPUBusMonitor(self.cpu)
             self.csr.add("cpumon", 31)  # pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console)
         if cpu_slr is not None:
@@ -386,8 +386,8 @@ class BonsaiXCU1525SoC(SoCCore):
         cluster_weight_base    = HBM_WEIGHT_BASE
         # One portable wiring implementation; board policy stays here.
         if with_bonsai:
-            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
-            from trixium.gateware.xilinx_constraints import add_cluster_constraints
+            from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
+            from trixium.targets.common import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
             def memory_description():
                 from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
@@ -436,7 +436,7 @@ class BonsaiXCU1525SoC(SoCCore):
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
 
             if with_capabilities:
-                from trixium.gateware.capabilities import add_capabilities
+                from trixium.core.capabilities import add_capabilities
                 regions, reservations = memory_description()
                 sys_pll = self.crg.syspll if self.crg.split else self.crg.pll
                 configured_sys_hz = round(sys_pll.compute_config()['clkout0_freq']/(1 if self.crg.split else 4))
@@ -449,7 +449,7 @@ class BonsaiXCU1525SoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    from trixium.gateware.migen_fast import install as install_migen_fast
+    from trixium.migen_fast import install as install_migen_fast
     install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
     parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform,

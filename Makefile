@@ -64,29 +64,29 @@ test-slow:
 
 .PHONY: sim
 sim:
-	$(PYTHON) sim/bonsai_sim.py
+	$(PYTHON) trixium/targets/sim.py
 
 # Gateware ---------------------------------------------------------------------------------------
 
 .PHONY: gateware-a gateware-b gateware-c
 gateware-a: df-check
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=a --build"
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=a --build"
 
 gateware-b: df-check
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=b --build"
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=b --build"
 
 gateware-c: df-check
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=c --build"
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=c --build"
 
 .PHONY: load-a load-b load-c
 load-a:
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=a --load"
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=a --load"
 
 load-b:
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=b --load"
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=b --load"
 
 load-c:
-	bash -c "source $(VIVADO_SETTINGS) && python3 trixium.py --variant=c --load"
+	bash -c "source $(VIVADO_SETTINGS) && python3 trixium/targets/fk33.py --variant=c --load"
 
 # Software ---------------------------------------------------------------------------------------
 

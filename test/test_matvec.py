@@ -16,9 +16,9 @@ from litex.soc.interconnect.axi import AXIInterface
 from trixium import layout
 from trixium.model import bitexact as bx
 from trixium.model.bons import TensorSpec, encode_rows
-from trixium.gateware.scratchpad import BonsaiScratchpad
-from trixium.gateware.matvec import BonsaiMatVecEngine
-from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
+from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.core.engine import BonsaiMatVecEngine
+from trixium.memory.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 class _EngineDUT(Module):
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
@@ -311,7 +311,7 @@ def test_engine_csr_single_run_per_submit():
     # the command was accepted on the submit cycle itself, replaying every op once the
     # engine returned to idle (identical results, but the replay's command accept reset
     # the absmax tracker mid-read and doubled the stream time).
-    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.core.csr import BonsaiEngineCSR
 
     n_channels, rows_per_chan, cols, seed = 2, 8, 256, 11
     rng    = np.random.default_rng(seed)
@@ -374,7 +374,7 @@ def test_engine_store_roundtrip(chan_stride):
     # its own HBM window - the AXI switch makes the address, not the port, select the
     # pseudo-channel) while this test only ever ran at 0. On hardware the KV STORE wedges the
     # engine mid-token, and an untested address path is the first suspect.
-    from trixium.gateware.loader import BonsaiHBMLoader
+    from trixium.memory.loader import BonsaiHBMLoader
 
     n_channels = 2
     rng   = np.random.default_rng(17)
@@ -700,7 +700,7 @@ def test_sequencer_start_drains_posted_writes():
     # has no teeth: sbw_gnt is blocked only by a vec store or a full write FIFO, so on
     # any quiet cycle the patch lands within a cycle or two and a broken design passes
     # by luck. Holding sbw_pending here makes the contract the only thing under test.
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.sequencer import BonsaiSequencer
 
     class _DUT(Module):
         def __init__(self):
@@ -741,9 +741,9 @@ def test_sequencer_v2_chaining():
     #   res6 preserved) -> norm_i32 with k from src=3 (k(res6)) -> reduce_acc over a
     #   crafted buffer (res6 = sum p8, standing in for softmax8's S6) -> engine AXPY with
     #   rshift_rpre=1 (rshift = bitlen(res6)+5 from the sequencer, w7 rshift left 0).
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.csr_front import BonsaiEngineCSR
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.sequencer import BonsaiSequencer
     from trixium.model import asm as vasm
 
     n_channels, cols, T, seed = 2, 64, 5, 83
@@ -885,9 +885,9 @@ def test_sequencer_mixed_list():
     # Descriptor list: vec quant8 -> engine ternary matvec -> vec norm_i32 with the k
     # auto-arg from the engine absmax tracker -> stop. Results must match the individually
     # computed goldens; numerics are the same as CPU-dispatched ops by construction.
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.csr_front import BonsaiEngineCSR
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.sequencer import BonsaiSequencer
     from trixium.model import asm as vasm
 
     n_channels, rows_per_chan, cols, seed = 2, 4, 128, 71
@@ -1022,11 +1022,11 @@ def test_sequencer_q8_scores_ragged():
     with a tiny model sharded 8 ways (the n2 sim does not reach a failing shape):
 
       .venv/bin/python -m trixium.model.tinygen --channels 8
-      .venv/bin/python sim/bonsai_sim.py --image models/tiny/bonsai-tiny-n8.img --run
+      .venv/bin/python trixium/targets/sim.py --image models/tiny/bonsai-tiny-n8.img --run
     """
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.csr_front import BonsaiEngineCSR
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.sequencer import BonsaiSequencer
     from trixium.model import asm as vasm
 
     vec_words = vasm.assemble(vasm.PROGRAMS["quant8"]())
@@ -1358,9 +1358,9 @@ def test_sequencer_xred_absmax_spill():
     # engine-level test passed, and a 12-minute Verilator run is the wrong place to debug
     # a three-descriptor question.
     import trixium.model.asm as vasm
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.sequencer import BonsaiSequencer
-    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.csr import BonsaiEngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(97)
 
@@ -1486,9 +1486,9 @@ def test_sequencer_kreg_capture_and_add():
     # is bitlen(summed absmax) - 14, i.e. exactly what SEQ_SRC_KABS would give the very next
     # op - but here it survives an arbitrary distance and combines with an immediate.
     import trixium.model.asm as vasm
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.sequencer import BonsaiSequencer
-    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.csr import BonsaiEngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(131)
     ev     = rng.integers(-9, -4, T)
@@ -1619,9 +1619,9 @@ def test_sequencer_lut_arg():
     # same rmsnorm with the immediate the LUT holds must match bit for bit, and an index
     # past the table clamps to entry 31 rather than reading past it.
     import trixium.model.asm as vasm
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.sequencer import BonsaiSequencer
-    from trixium.gateware.csr_front import BonsaiEngineCSR
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.sequencer import BonsaiSequencer
+    from trixium.core.csr import BonsaiEngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(137)
     ev     = rng.integers(-9, -4, T)
@@ -1771,7 +1771,7 @@ class _OverlapDUT(Module):
     # two are launched concurrently - the per-cycle port arbitration is what keeps
     # both results bit-exact.
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8):
-        from trixium.gateware.vector import BonsaiVectorUnit
+        from trixium.core.vector import BonsaiVectorUnit
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
         self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
@@ -2194,9 +2194,9 @@ def test_sequencer_nowait_overlap():
     # WHILE the matvec streams; the next descriptor (norm_i32 with A4 = KABS) trips the
     # hazard interlock and waits for the in-flight op. All three results bit-exact,
     # real overlap measured, and the interlock's k matches the serial golden.
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.csr_front import BonsaiEngineCSR
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.sequencer import BonsaiSequencer
     from trixium.model import asm as vasm
 
     n_channels, rows_per_chan, cols, seed = 2, 32, 128, 57
@@ -2318,9 +2318,9 @@ def test_sequencer_kadd_interlock_precise():
     # B's stream (real overlap), while a norm reading kreg1 must wait for B's capture
     # (done+2) and see the right k. The register-blind interlock serialized the FFN
     # list's norm-under-stream on the card (13.60M vs 13.45M cycles/token, 2026-08-29).
-    from trixium.gateware.vector import BonsaiVectorUnit
-    from trixium.gateware.csr_front import BonsaiEngineCSR
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.vector import BonsaiVectorUnit
+    from trixium.core.csr import BonsaiEngineCSR
+    from trixium.core.sequencer import BonsaiSequencer
     from trixium.model import asm as vasm
 
     n_channels, rows_per_chan, cols = 2, 32, 128
@@ -2436,7 +2436,7 @@ def test_engine_multi_store(chan_stride):
     # xsrc + r*sstride beats to HBM wbase + r*dstride beats - the per-layer KV append as
     # a single dispatch. Fetch every region back and compare; a wrong stride or a packet
     # count off by one shows as a mismatch in exactly one region.
-    from trixium.gateware.loader import BonsaiHBMLoader
+    from trixium.memory.loader import BonsaiHBMLoader
 
     n_channels = 2
     rng   = np.random.default_rng(29)
@@ -2514,7 +2514,7 @@ def test_engine_n16_ternary_and_store_window():
     # address: channel 15's port-matched window is 0x1_0400_0000 (PC16, stack 1), which
     # a 32-bit write path silently wraps into PC0. The AW address on channel 15's AXI is
     # captured and checked against the full 33-bit value.
-    from trixium.gateware.loader import BonsaiHBMLoader
+    from trixium.memory.loader import BonsaiHBMLoader
     from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
     n_channels, rows_per_chan, cols, seed = 16, 4, 256, 173

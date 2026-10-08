@@ -10,7 +10,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.gateware.hadamard import IntegerHadamard
+from trixium.units.hadamard import IntegerHadamard
 
 
 def dense(values, signs, inverse=False):

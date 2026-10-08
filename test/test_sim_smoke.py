@@ -21,7 +21,7 @@ from trixium.model.bons import BONSReader
 
 SIM_DIR = "build/sim/gateware"
 # Override to gate against a different channel count (rebuild the sim with the same
-# image first: BONSAI_SIM_IMAGE=... python3 sim/bonsai_sim.py).
+# image first: BONSAI_SIM_IMAGE=... python3 trixium/targets/sim.py).
 IMAGE   = os.environ.get("BONSAI_SIM_IMAGE", "models/tiny/bonsai-tiny-n2.img")
 
 def fnv1a(data):

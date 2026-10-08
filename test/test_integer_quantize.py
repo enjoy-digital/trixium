@@ -4,7 +4,7 @@ import random
 import pytest
 from migen import run_simulation
 
-from trixium.gateware.integer_quantize import IntegerToQ8
+from trixium.units.activation import IntegerToQ8
 
 
 def expected(value, exponent):

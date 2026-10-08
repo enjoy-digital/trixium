@@ -29,7 +29,7 @@ from litex.soc.integration.builder import *
 from litepcie.phy.usppciephy import USPHBMPCIEPHY
 from litepcie.software import generate_litepcie_software
 
-from trixium.gateware.platform_fk33 import Platform
+from trixium.targets.platform_fk33 import Platform
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -133,8 +133,8 @@ class BonsaiSoC(SoCCore):
         cluster_weight_base    = HBM_WEIGHT_BASE  # +64 MB into it (port-matched, CPU-safe).
         # One portable wiring implementation; board policy stays here.
         if with_bonsai:
-            from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
-            from trixium.gateware.xilinx_constraints import add_cluster_constraints
+            from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
+            from trixium.targets.common import add_cluster_constraints
             from litex.soc.integration.soc import SoCRegion
             def memory_description():
                 from trixium.capabilities import MemoryRegion, MemoryKind, Reservation, ReservationKind
@@ -182,7 +182,7 @@ class BonsaiSoC(SoCCore):
                 self.add_constant("BONSAI_N_MEMCTRL", cluster_n_memctrl)
 
             if with_capabilities:
-                from trixium.gateware.capabilities import add_capabilities
+                from trixium.core.capabilities import add_capabilities
                 regions, reservations = memory_description()
                 configured_sys_hz = round(self.crg.pll.compute_config()['clkout0_freq'])
                 self.bonsai_capabilities = add_capabilities(self, config, engine_axis, regions, reservations,
@@ -191,7 +191,7 @@ class BonsaiSoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    from trixium.gateware.migen_fast import install as install_migen_fast
+    from trixium.migen_fast import install as install_migen_fast
     install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
     parser = LiteXArgumentParser(platform=Platform, description="TriXium SoC on FK33.")

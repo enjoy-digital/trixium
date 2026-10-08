@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from trixium.gateware.norm_sp import NORM_COMMAND, OP_L2, OP_RMS, BonsaiNormScratchpad
+from trixium.units.norm import NORM_COMMAND, OP_L2, OP_RMS, BonsaiNormScratchpad
 from rtl_client import build_client, run_client
 
 f32 = np.float32

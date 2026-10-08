@@ -6,8 +6,8 @@ from migen import run_simulation
 from litex.gen import LiteXModule
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.integration import BonsaiClusterConfig, add_bonsai_cluster
-from trixium.gateware.hbm_model import BonsaiHBMChannelModel
+from trixium.core.core import BonsaiClusterConfig, add_bonsai_cluster
+from trixium.memory.hbm_model import BonsaiHBMChannelModel
 from trixium.model import asm
 
 

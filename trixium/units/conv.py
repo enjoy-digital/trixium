@@ -29,7 +29,7 @@ from migen.genlib.fifo import SyncFIFO
 from litex.gen import LiteXModule
 from litex.soc.interconnect import stream
 
-from trixium.gateware.fp32_exact import FP32Add, FP32Mul
+from trixium.units.fp32 import FP32Add, FP32Mul
 
 CONV_COMMAND = [("op", 1), ("x0", 24), ("x1", 24), ("x2", 24), ("x3", 24), ("w", 24), ("dst", 24),
                 ("channels", 16), ("protect_start", 24), ("protect_end", 24)]

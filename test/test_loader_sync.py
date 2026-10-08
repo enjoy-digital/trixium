@@ -20,8 +20,8 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.gateware.hbm_model import BonsaiHBMChannelModel
-from trixium.gateware.loader import BonsaiHBMLoader, SYNC_MAGIC
+from trixium.memory.hbm_model import BonsaiHBMChannelModel
+from trixium.memory.loader import BonsaiHBMLoader, SYNC_MAGIC
 
 MEM_SIZE = 64*1024
 

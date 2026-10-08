@@ -15,7 +15,7 @@ from migen import Module, Signal, Mux, run_simulation
 
 from litex.gen import LiteXModule
 
-from trixium.gateware.scratchpad import BonsaiScratchpadArbiter
+from trixium.core.scratchpad import BonsaiScratchpadArbiter
 
 # Reference: the nested 2:1 client mux the arbiter replaced.
 class BonsaiScratchpadClientMux(LiteXModule):

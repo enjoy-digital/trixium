@@ -7,8 +7,8 @@ import pytest
 from migen import *
 from litex.gen import LiteXModule
 
-from trixium.gateware.activation_sp import BonsaiActivationScratchpad
-from trixium.gateware.scratchpad import BonsaiScratchpad
+from trixium.units.activation import BonsaiActivationScratchpad
+from trixium.core.scratchpad import BonsaiScratchpad
 from test_activation_quantize import bits, expected
 
 

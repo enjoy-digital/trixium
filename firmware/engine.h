@@ -18,7 +18,7 @@
 #define ENGINE_KIND_DNSTREAM 5 // DeltaNet stream (BONSAI_HAS_DNSTREAM): rows = heads,
                               // xsrc = head records, wbase/wlen = state span
 
-// Scratchpad CPU window (uncached region defined in trixium.py / bonsai_sim.py).
+// Scratchpad CPU window (uncached region defined in trixium/targets/fk33.py / bonsai_sim.py).
 #define SCRATCHPAD_BASE 0xa0000000UL
 
 struct engine_op {

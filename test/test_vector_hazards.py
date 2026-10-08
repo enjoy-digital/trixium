@@ -22,9 +22,9 @@ import pytest
 from migen import *
 
 from trixium.model import asm
-from trixium.gateware.scratchpad import BonsaiScratchpad
-from trixium.gateware.vector import BonsaiVectorUnit
-from trixium.gateware.hbm_model import words_from_bytes
+from trixium.core.scratchpad import BonsaiScratchpad
+from trixium.core.vector import BonsaiVectorUnit
+from trixium.memory.hbm_model import words_from_bytes
 
 SP_SIZE = 16*1024
 SRC0, SRC1, DST = 0x0000, 0x0800, 0x1000

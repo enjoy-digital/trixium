@@ -12,7 +12,7 @@ import pytest
 from migen import run_simulation
 from litex.gen import LiteXModule
 
-from trixium.gateware.integration import BonsaiClusterConfig
+from trixium.core.core import BonsaiClusterConfig
 from test_integration import SoC, write
 
 MASK = 0xFFFFFFFF

@@ -8,7 +8,7 @@ import pytest
 from migen import C, Cat, Memory, Module, Signal, run_simulation
 from migen.fhdl import verilog
 
-from trixium.gateware.integration import BonsaiClusterConfig
+from trixium.core.core import BonsaiClusterConfig
 from trixium.model.activation import scratchpad_quantize_descriptor, scratchpad_requantize_descriptor
 from test_activation_sp import bits, pack, reference
 from test_hadamard_integration import install_list
@@ -38,7 +38,7 @@ def test_activation_descriptor_and_configuration():
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
 def test_quantization_only_profile_validates_full_list_before_fetch(base, count):
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.sequencer import BonsaiSequencer
     dut = BonsaiSequencer(with_activation_quantize=True, scratchpad_size=16*1024)
     def run():
         yield from write(dut.base, base)
@@ -53,7 +53,7 @@ def test_quantization_only_profile_validates_full_list_before_fetch(base, count)
 
 @pytest.mark.parametrize('failure', [0, 128])
 def test_requantization_dispatch_without_hadamard_and_completion_publication(failure):
-    from trixium.gateware.sequencer import BonsaiSequencer
+    from trixium.core.sequencer import BonsaiSequencer
     dut = Module()
     dut.submodules.seq = seq = BonsaiSequencer(with_activation_quantize=True)
     words = scratchpad_requantize_descriptor(src=0x10000, dst=0x8000, exponents=0x800,
