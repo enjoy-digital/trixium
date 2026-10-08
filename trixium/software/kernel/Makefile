@@ -1,6 +1,6 @@
-# Makefile for the TriXium kernel modules (LitePCIe-derived).
-# trixium.ko: PCIe driver (/dev/trixiumN, DMA, CSR access).
-# liteuart.ko: crossover UART console over PCIe (/dev/ttyLXU0).
+# Makefile for the TriXium kernel modules (derived from LitePCIe's).
+#   trixium.ko:  PCIe driver (/dev/trixiumN: CSR access, DMA).
+#   liteuart.ko: firmware console over PCIe (/dev/ttyLXUN, the crossover UART).
 KERNEL_VERSION:=$(shell uname -r)
 KERNEL_PATH?=/lib/modules/$(KERNEL_VERSION)/build
 ARCH?=$(shell uname -m)

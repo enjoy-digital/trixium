@@ -1,19 +1,27 @@
-#!/bin/sh
-# Load trixium.ko + liteuart.ko and open up the device nodes (`make install` sets up udev
-# and modules-load.d for the persistent version of this).
+#!/bin/bash
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Load trixium.ko + liteuart.ko and open up the device nodes (`make install` sets up udev and
+# modules-load.d for the persistent version of this).
 
 cd "$(dirname "$0")"
 
+# Check if trixium module is already installed.
 if lsmod | grep -q '^trixium '; then
     echo "trixium module already installed."
     exit 0
 fi
 
-# liteuart binds on top of trixium; reload it after the PCIe driver.
+# liteuart binds on top of trixium: reload it after the PCIe driver.
 if lsmod | grep -q '^liteuart '; then
     rmmod liteuart
 fi
 
+# Install trixium module.
 INS=$(insmod trixium.ko 2>&1)
 if [ "$?" != "0" ] ; then
     ERR=$(echo $INS | sed -s "s/.*trixium.ko: //")
@@ -44,8 +52,10 @@ if [ "$?" != "0" ] ; then
     esac
 fi
 
+# Install liteuart module.
 insmod liteuart.ko
 
-for i in `seq 0 16` ; do
+# Change permissions on trixium/liteuart created devices.
+for i in $(seq 0 16) ; do
     chmod 666 /dev/trixium$i /dev/ttyLXU$i > /dev/null 2>&1
 done

@@ -1,25 +1,25 @@
-/* This file is part of TriXium.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium chat: configure the accelerator, then talk to the model
+ *
+ * This file is part of TriXium.
  *
  * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
- * SPDX-License-Identifier: BSD-2-Clause
  *
- * trixium_chat: one-stop host tool - configure the accelerator, then talk to the model.
+ *   1. (-m) Upload a BONS weight image through the BAR0 loader (same path as trixium_load).
+ *   2. (-k) Boot the firmware: CPU reset, loader copy into main_ram, BIOS `boot` (-K: the
+ *           LiteX serial-boot protocol on the console UART).
+ *   3.      `hdrload` so the firmware picks up the staged BONS header/table.
+ *   4.      REPL: text -> BPE ids -> `tok`/`genb` -> ids back -> text.
  *
- *   1. (-m) upload a BONS weight image through the BAR0 loader (same path as trixium_load)
- *   2. (-k) boot the firmware: CPU reset, loader copy into main_ram, BIOS `boot` (-K: the
- *           LiteX serial-boot protocol on the console UART)
- *   3.      `hdrload` so the firmware picks up the staged BONS header/table
- *   4.      REPL: your text -> BPE ids -> `tok`/`genb` -> ids back -> text
+ * The model runs entirely on the card; this tool only tokenizes, drives the console and
+ * detokenizes. The tokenizer data comes from tools/export_tokenizer.py (raw-byte vocab + merge
+ * ranks), so no JSON or Unicode tables are needed here.
  *
- * The model runs entirely on the card; this tool only tokenises, drives the console and
- * detokenises. Tokeniser data comes from tools/export_tokenizer.py (raw-byte vocab +
- * merge ranks), so no JSON or unicode tables are needed here.
- *
- * Usage:
- *   trixium_chat -T                                   # tokeniser self-test, no hardware
+ *   trixium_chat -T                                   # Tokenizer self-test, no hardware.
  *   trixium_chat -m models/bons/bonsai-1p7b-n8.img \
- *               -k firmware/trixium.bin               # full bring-up, then chat
- *   trixium_chat                                      # attach to an already-configured card
+ *                -k firmware/trixium.bin              # Full bring-up, then chat.
+ *   trixium_chat                                      # Attach to an already-configured card.
  */
 
 #include <ctype.h>
@@ -36,24 +36,37 @@
 #include <sys/file.h>
 #include <sys/time.h>
 
-#include "liblitepcie.h"
 #include "soc.h"
 #include "mem.h"
 #include "trixium_loader.h"
 
-/* Firmware load/jump address: the BIOS serialboot target is main_ram (HBM channel 0 on
- * hardware). ROM_BOOT_ADDRESS only exists in the simulation SoC. */
+/* Parameters */
+/*------------*/
+
+/* Firmware load/jump address: the BIOS serialboot target is main_ram. ROM_BOOT_ADDRESS only
+ * exists in the simulation SoC. */
 #ifndef ROM_BOOT_ADDRESS
 #define ROM_BOOT_ADDRESS MAIN_RAM_BASE
 #endif
 
-#define HDR_STAGING  (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
-#define DMA_CHUNK    8192
-#define PAD(b)       (((uint64_t)(b) + DMA_CHUNK - 1) & ~(uint64_t)(DMA_CHUNK - 1))
+/* Variables */
+/*-----------*/
 
-/*---------------------------------------------------------------------------------------*/
-/* Tokeniser: byte-level BPE over the exported vocab (raw bytes) + merge ranks.           */
-/*---------------------------------------------------------------------------------------*/
+/* -r: 0 = raw completion, the text goes to the model as typed. */
+static int g_chat = 1;
+
+/* -y: a system turn ahead of the first user turn. */
+static const char *g_system = NULL;
+
+/* -W: seconds to wait for the firmware prompt (the XCU1525 firmware calibrates three DDR4
+ * controllers before it prints one: minutes). */
+static double g_prompt_wait = 120.0;
+
+/* -R: the BIOS is already at its prompt (a host-side DDR training ran after its calibration). */
+static int g_no_cpu_reset;
+
+/* Tokenizer: byte-level BPE over the exported vocab (raw bytes) + merge ranks */
+/*-----------------------------------------------------------------------------*/
 
 struct tok_entry { uint32_t len; const uint8_t *bytes; };
 
@@ -114,7 +127,7 @@ static int tok_load(const char *path)
     if (fread(magic, 4, 1, f) != 1 || memcmp(magic, "BTOK", 4) ||
         fread(&ver, 4, 1, f) != 1 || fread(&nvocab, 4, 1, f) != 1 ||
         fread(&nmerges, 4, 1, f) != 1) {
-        fprintf(stderr, "%s: not a BTOK tokeniser (run tools/export_tokenizer.py)\n", path);
+        fprintf(stderr, "%s: not a BTOK tokenizer (run tools/export_tokenizer.py)\n", path);
         fclose(f); return -1;
     }
 
@@ -166,7 +179,7 @@ static int tok_load(const char *path)
 /* BPE over one pre-token: start from single bytes, repeatedly merge the best-ranked pair. */
 static int bpe_chunk(const uint8_t *s, size_t n, int *out, int max)
 {
-    static int   ids[4096];
+    static int ids[4096];
     if (n == 0 || n > sizeof(ids)/sizeof(ids[0])) return 0;
     size_t cnt = 0;
     for (size_t i = 0; i < n; i++) {
@@ -190,7 +203,10 @@ static int bpe_chunk(const uint8_t *s, size_t n, int *out, int max)
     return w;
 }
 
-/* Minimal UTF-8 decode: returns the codepoint and advances *len. */
+/* Pre-tokenizer */
+/*---------------*/
+
+/* Minimal UTF-8 decode: returns the codepoint and sets *len. */
 static uint32_t utf8_cp(const uint8_t *s, size_t n, int *len)
 {
     if (n == 0) { *len = 0; return 0; }
@@ -204,7 +220,7 @@ static uint32_t utf8_cp(const uint8_t *s, size_t n, int *len)
 }
 
 /* \p{L} approximation: good enough to separate letters (incl. accented, Greek, Cyrillic,
- * CJK) from symbols/emoji, which is what the pre-tokeniser split actually depends on. */
+ * CJK) from symbols/emoji, which is what the pre-tokenizer split actually depends on. */
 static int cp_is_letter(uint32_t cp)
 {
     if (cp < 0x80)    return isalpha((int)cp) != 0;
@@ -220,7 +236,7 @@ static int cp_is_space(uint32_t cp)
     return cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n' || cp == 0x0b || cp == 0x0c;
 }
 
-/* Follows the Qwen/GPT-2 pre-tokeniser alternation, in order:
+/* Follows the Qwen/GPT-2 pre-tokenizer alternation, in order:
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}
  *   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
  * Order matters: a symbol run absorbs one leading space, so " + " is [" +"][" "].
@@ -299,8 +315,8 @@ static int tok_encode(const char *text, int *out, int max)
     return w;
 }
 
-static int g_chat = 1;   /* 0 = raw completion (-r): the text goes to the model as typed. */
-static const char *g_system = NULL;   /* -y: a system turn ahead of the first user turn. */
+/* Chat template */
+/*---------------*/
 
 /* One user turn in the Qwen3 chat template, as the HF tokenizer would encode it (it splits
  * at the added tokens and BPE-encodes the runs between - same ids as this, piece by piece):
@@ -340,19 +356,18 @@ static int encode_turn(const char *text, int *out, int max, int first, int prev_
     return n;
 }
 
+/* Console UART */
+/*--------------*/
 
-/*---------------------------------------------------------------------------------------*/
-/* Console UART: serial boot + line protocol                                              */
-/*---------------------------------------------------------------------------------------*/
-
-static int   g_tty = -1;
+static int g_tty = -1;
 
 static const char sfl_magic_req[] = "sL5DdSMmkekro\n";
 static const char sfl_magic_ack[] = "z6IHG7cYDID6o\n";
 #define SFL_CMD_LOAD 0x01
 #define SFL_CMD_JUMP 0x02
 
-static uint16_t crc16(const uint8_t *d, int n) /* CRC-16/XMODEM, as litex_term uses. */
+/* CRC-16/XMODEM, as litex_term uses. */
+static uint16_t crc16(const uint8_t *d, int n)
 {
     uint16_t crc = 0;
     for (int i = 0; i < n; i++) {
@@ -368,8 +383,7 @@ static int tty_open(const char *path)
     int fd = open(path, O_RDWR | O_NOCTTY);
     if (fd < 0) { perror(path); return -1; }
     /* One console session at a time: the firmware reads one byte stream, and two readers
-     * split its replies between them (an idle trixium_chat left at its prompt did exactly
-     * that, 2026-09-14). Advisory lock, shared by every console tool. */
+     * split its replies between them. Advisory lock, shared by every console tool. */
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
         fprintf(stderr, "%s is in use by another console session (trixium_chat, pcie_console.py, "
                         "the Python client, litex_term?) - close it first\n", path);
@@ -407,11 +421,8 @@ static int tty_expect(const char *needle, double timeout, char *cap, size_t capm
     double t0 = now_s();
     size_t w = 0;
     size_t nl = strlen(needle);
-    /* Match against a private sliding window, NOT the caller's capture buffer. Keying the
-     * comparison off `cap` meant every tty_expect(..., NULL, 0, ...) could never match - the
-     * prompt sync is exactly that call, so attaching to a running card always burned the full
-     * 120 s and reported "firmware not running" for a perfectly healthy board. It also failed
-     * once a capture buffer filled, because w stops advancing there. */
+    /* Match against a private sliding window, not the caller's capture buffer: that one may be
+     * NULL (the prompt sync) or full (w stops advancing). */
     char win[128];
     size_t ww = 0;
     if (nl >= sizeof(win)) nl = sizeof(win) - 1;
@@ -433,6 +444,9 @@ static int tty_expect(const char *needle, double timeout, char *cap, size_t capm
     }
     return 0;
 }
+
+/* Serial boot */
+/*-------------*/
 
 static int sfl_frame(uint8_t cmd, const uint8_t *payload, int len)
 {
@@ -506,29 +520,24 @@ static int serialboot(const char *fw)
     return 0;
 }
 
-/*---------------------------------------------------------------------------------------*/
-/* Weight upload and firmware boot, through the shared loader (trixium_loader.c)            */
-/*---------------------------------------------------------------------------------------*/
+/* Weight upload and fast boot, through the shared loader (trixium_loader.c) */
+/*----------------------------------------------------------------------------*/
 
-static int upload_model(int devnum, const char *path)
+/* BAR0 is mapped once in main() for every loader use. */
+static int upload_model(const char *path)
 {
-    (void)devnum; /* BAR0 is mapped once in main() for every loader use. */
     printf("[load] %s\n", path);
     return loader_upload_image(path, 0) ? 0 : -1;
 }
 
-/* Fast boot: CPU reset -> BIOS prompt -> firmware into main_ram through the loader ->
- * BIOS `boot`. The serial-boot protocol moves 100 KB in 64-byte acked frames (23-44 s, with
- * occasional NAKs); the loader does it in about a millisecond. Cache coherency: the BIOS memtest/memspeed
- * stream 2 MB through the 32 KB write-back D$ before the prompt, so no line of the
- * firmware's first 100 KB is left in it (dirty or clean) when the loader writes past the
- * cache, and the BIOS never executes from main_ram (no stale I$ lines). */
-static double g_prompt_wait = 120.0;   /* -W: seconds to wait for the firmware prompt (the
-                                          XCU1525's firmware calibrates three DDR4 controllers
-                                          before it prints one: minutes). */
-static int g_no_cpu_reset;   /* -R: the BIOS is already at its prompt (a host-side DDR
-                                training ran between its calibration and the boot). */
-
+/* Fast boot: CPU reset -> BIOS prompt -> firmware into main_ram through the loader -> BIOS
+ * `boot`. The serial-boot protocol moves 100 KB in 64-byte acked frames (23-44 s, with
+ * occasional NAKs); the loader does it in about a millisecond.
+ *
+ * Cache coherency: the BIOS memtest/memspeed stream 2 MB through the 32 KB write-back D$
+ * before the prompt, so no line of the firmware's first 100 KB is left in it (dirty or clean)
+ * when the loader writes past the cache, and the BIOS never executes from main_ram (no stale
+ * I$ lines). */
 static int fastboot(const char *fw)
 {
     if (g_no_cpu_reset)
@@ -554,9 +563,8 @@ static int fastboot(const char *fw)
     return 0;
 }
 
-/*---------------------------------------------------------------------------------------*/
-/* Chat                                                                                   */
-/*---------------------------------------------------------------------------------------*/
+/* Chat protocol */
+/*---------------*/
 
 /* Console lines go out in small chunks, each acknowledged by its echo before the next.
  *
@@ -624,9 +632,10 @@ static int utf8_len(unsigned char c)
 
 /* Read the generation as it arrives and print each token the moment it lands.
  *
- * The firmware emits one printf per token. The only real work here is UTF-8: the vocabulary is byte-level BPE, so a single token can end
- * halfway through a multi-byte character. Bytes are held back until the character is
- * complete, otherwise the terminal shows replacement junk mid-word.
+ * The firmware emits one printf per token. The only real work here is UTF-8: the vocabulary
+ * is byte-level BPE, so a single token can end halfway through a multi-byte character. Bytes
+ * are held back until the character is complete, otherwise the terminal shows replacement
+ * junk mid-word.
  *
  * Returns the token count, or -1 on timeout. *first_dt gets the time to the first token,
  * which is the latency a user actually feels. */
@@ -657,9 +666,8 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
         }
         if (strstr(win, "GEN DONE")) break;
 
-        /* Ids are printed as " %d" after "GEN:". Digits reached any other way - inside
-         * a stray message ("(14 descriptors)") - are not ids: the firmware once printed
-         * such a line inside the stream and its 14 became a "/" in every reply. */
+        /* Ids are printed as " %d" after "GEN:". Digits reached any other way, inside a
+         * stray firmware message ("(14 descriptors)"), are not ids. */
         if (isdigit(c)) {
             if (acc >= 0 || prev == ' ' || prev == ':')
                 acc = (acc < 0 ? 0 : acc)*10 + (c - '0');
@@ -696,6 +704,8 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
     return (now_s() - t0 < timeout) ? n : -1;
 }
 
+/* Tokenizer self-test */
+/*---------------------*/
 
 static int self_test(const char *tests_path)
 {
@@ -763,38 +773,59 @@ static int self_test(const char *tests_path)
         }
     }
     fclose(f);
-    printf("tokeniser self-test: %d passed, %d failed\n", pass, fail);
+    printf("tokenizer self-test: %d passed, %d failed\n", pass, fail);
     return fail ? 1 : 0;
 }
 
+/* Help */
+/*------*/
+
 static void usage(void)
 {
-    printf("usage: trixium_chat [options]\n"
-           "  -c N       PCIe device number (default 0)\n"
-           "  -t TTY     console tty (default /dev/ttyLXU0)\n"
-           "  -m IMAGE   upload a BONS weight image to HBM first\n"
-           "  -k FW      boot this firmware first (CPU reset, loader into main_ram, BIOS boot)\n"
-           "  -C         clear the staged BONS header (before a boot on a new memory layout)\n"
-           "  -R         with -k: no CPU reset - the BIOS is at its prompt already (a host-side\n"
-           "             DDR training ran after its calibration; tools/xcu1525_rdlevel.py)\n"
-           "  -W SECS    wait this long for the firmware prompt (default 120; the XCU1525's\n"
-           "             firmware calibrates three DDR4 controllers first)\n"
-           "  -K FW      boot it the old way (serial-boot frames over the console, 30-45 s)\n"
-           "  -z FILE    tokeniser (default models/1.7b/tokenizer.bin)\n"
-           "  -n N       reply cap in tokens (default 256; the reply ends at <|im_end|> anyway,\n"
-           "             the cap is for runaways; the card holds 2048 tokens of conversation)\n"
-           "  -r         raw completion: no chat template, the text continues as typed\n"
-           "  -S T,P,R   sampling: temperature (0 = greedy), top-p, repetition penalty, e.g.\n"
-           "             -S 0.7,0.9,1.1 (greedy loops on lists; 1.1 alone already breaks them)\n"
-           "  -s SEED    sampling PRNG seed (reproducible runs)\n"
-           "  -y TEXT    system prompt (a system turn ahead of the conversation)\n"
-           "In the chat a line ending in a backslash continues on the next line.\n"
-           "  -T [FILE]  tokeniser self-test against reference encodings, then exit\n"
-           "  -E TEXT    print the ids one chat turn of TEXT sends (template included), exit\n"
-           "In the chat: /reset clears the conversation, /sample T,P,R changes the sampling,\n"
-           "/cmd <line> runs a firmware console\n"
-           "command (e.g. /cmd stats, /cmd hwops), /stats and /help are shortcuts.\n");
+    printf("TriXium chat\n"
+           "usage: trixium_chat [options]\n"
+           "\n"
+           "options:\n"
+           "-h             Help.\n"
+           "-c device_num  Select the device (default = 0).\n"
+           "-t tty         Console tty (default = /dev/ttyLXU0).\n"
+           "-z file        Tokenizer (default = models/1.7b/tokenizer.bin).\n"
+           "\n"
+           "bring-up:\n"
+           "-m image       Upload a BONS weight image first.\n"
+           "-k firmware    Boot this firmware first (CPU reset, loader into main_ram, boot).\n"
+           "-K firmware    Boot it over serial-boot frames on the console instead (30-45 s).\n"
+           "-R             With -k: no CPU reset, the BIOS is already at its prompt (a host-side\n"
+           "               DDR training ran after its calibration; tools/xcu1525_rdlevel.py).\n"
+           "-W seconds     Firmware prompt timeout (default = 120; the XCU1525 firmware\n"
+           "               calibrates three DDR4 controllers first).\n"
+           "-C             Clear the staged BONS header and exit (before a boot on a new\n"
+           "               memory layout).\n"
+           "-U firmware    Upload the firmware into main_ram and exit.\n"
+           "\n"
+           "generation:\n"
+           "-n tokens      Reply cap (default = 256; a reply ends at <|im_end|> anyway, the cap\n"
+           "               is for runaways; the card holds 2048 tokens of conversation).\n"
+           "-r             Raw completion: no chat template, the text continues as typed.\n"
+           "-S T,P,R       Sampling: temperature (0 = greedy), top-p, repetition penalty,\n"
+           "               e.g. -S 0.7,0.9,1.1 (1.1 alone already breaks greedy list loops).\n"
+           "-s seed        Sampling PRNG seed (reproducible runs).\n"
+           "-y text        System prompt (a system turn ahead of the conversation).\n"
+           "\n"
+           "tokenizer checks:\n"
+           "-T[file]       Tokenizer self-test against reference encodings, then exit.\n"
+           "-E text        Print the ids of one chat turn of text (template included), then exit.\n"
+           "\n"
+           "chat commands:\n"
+           "/reset         Clear the conversation.\n"
+           "/sample T,P,R  Change the sampling.\n"
+           "/cmd line      Run a firmware console command (e.g. /cmd stats, /cmd hwops).\n"
+           "/stats, /help  Shortcuts for /cmd stats, /cmd help.\n"
+           "A line ending in a backslash continues on the next line.\n");
 }
+
+/* Main */
+/*------*/
 
 int main(int argc, char **argv)
 {
@@ -814,7 +845,7 @@ int main(int argc, char **argv)
         case 'm': img = optarg; break;
         case 'k': fw  = optarg; break;
         case 'K': fw_serial = optarg; break;
-        case 'U': /* Upload the firmware through the loader and exit (bring-up aid). */
+        case 'U': /* Upload the firmware through the loader and exit. */
             loader_bar_map(devnum);
             printf("%llu bytes\n", (unsigned long long)loader_upload_firmware(optarg));
             return 0;
@@ -850,7 +881,7 @@ int main(int argc, char **argv)
 
     if (img || fw)
         loader_bar_map(devnum);
-    if (img && upload_model(devnum, img) < 0) return 1;
+    if (img && upload_model(img) < 0) return 1;
 
     g_tty = tty_open(tty);
     if (g_tty < 0) return 1;
@@ -864,12 +895,14 @@ int main(int argc, char **argv)
      * calibrates its DDR4 controllers first - and waiting too briefly reports "firmware not
      * running" for a board that is merely busy, eating the startup log on the way out. */
     send_line("");
-    if (!tty_expect("trixium>", g_prompt_wait, NULL, 0, 1)) { /* echo: show the self-tests as they run */
+    /* Echo: show the self-tests as they run. */
+    if (!tty_expect("trixium>", g_prompt_wait, NULL, 0, 1)) {
         fprintf(stderr,
             "no 'trixium>' prompt on %s after %.0f s (-W to wait longer).\n"
             "  - firmware not running? re-run with -k firmware/trixium.bin\n"
             "  - self-test wedged? watch the console directly and look for ENGSTALL\n"
-            "  - wrong console? try -t /dev/ttyLXU0 (PCIe) or use litex_term crossover\n", tty, g_prompt_wait);
+            "  - wrong console? try -t /dev/ttyLXU0 (PCIe) or use litex_term crossover\n",
+            tty, g_prompt_wait);
         return 1;
     }
     printf("[init] firmware is up; loading the model header\n");
@@ -939,7 +972,12 @@ int main(int argc, char **argv)
             free(more);
         }
         if (ln == 0) continue;
-        if (!strcmp(linebuf, "/reset")) { fresh = 1; prev_closed = 1; printf("[context cleared]\n"); continue; }
+        if (!strcmp(linebuf, "/reset")) {
+            fresh = 1;
+            prev_closed = 1;
+            printf("[context cleared]\n");
+            continue;
+        }
         if (!strcmp(linebuf, "/help"))  { strcpy(linebuf, "/cmd help"); }
         if (!strcmp(linebuf, "/stats")) { strcpy(linebuf, "/cmd stats"); }
         if (!strncmp(linebuf, "/cmd ", 5)) {
@@ -956,19 +994,24 @@ int main(int argc, char **argv)
         if (!strncmp(linebuf, "/sample", 7)) {           /* /sample T,P,R  or  /sample T P R */
             double t = 0, pp = 1, r = 1;
             if (sscanf(linebuf + 7, "%lf%*[ ,]%lf%*[ ,]%lf", &t, &pp, &r) < 1) {
-                printf("[usage: /sample temp,top_p,rep  e.g. /sample 0.7,0.9,1.1]\n"); continue;
+                printf("[usage: /sample temp,top_p,rep  e.g. /sample 0.7,0.9,1.1]\n");
+                continue;
             }
-            send_line("sample %d %d %d 0", (int)(t*1000 + 0.5), (int)(pp*1000 + 0.5), (int)(r*1000 + 0.5));
+            send_line("sample %d %d %d 0", (int)(t*1000 + 0.5), (int)(pp*1000 + 0.5),
+                      (int)(r*1000 + 0.5));
             if (tty_expect("trixium>", 5.0, cap, sizeof(cap), 0)) {
                 char *nl = strchr(cap, '\n');
                 fputs(nl ? nl + 1 : cap, stdout);
             }
             continue;
         }
-        if (linebuf[0] == '/') { printf("[unknown: /reset /sample /cmd <line> /stats /help]\n"); continue; }
+        if (linebuf[0] == '/') {
+            printf("[unknown: /reset /sample /cmd <line> /stats /help]\n");
+            continue;
+        }
 
         int n = encode_turn(linebuf, ids, 2048, fresh, prev_closed);
-        if (n == 0) { printf("[empty after tokenising]\n"); continue; }
+        if (n == 0) { printf("[empty after tokenizing]\n"); continue; }
 
         double t0 = now_s();
         if (fresh) {
@@ -979,9 +1022,13 @@ int main(int argc, char **argv)
             char line[900]; int i = 0;
             while (i < n) {
                 int w = snprintf(line, sizeof(line), "tok");
-                while (i < n && w < 850) w += snprintf(line + w, sizeof(line) - w, " %d", ids[i++]);
+                while (i < n && w < 850)
+                    w += snprintf(line + w, sizeof(line) - w, " %d", ids[i++]);
                 send_line("%s", line);
-                if (!tty_expect("TOK ", 10.0, NULL, 0, 0)) { fprintf(stderr, "tok failed\n"); return 1; }
+                if (!tty_expect("TOK ", 10.0, NULL, 0, 0)) {
+                    fprintf(stderr, "tok failed\n");
+                    return 1;
+                }
                 tty_expect("\n", 2.0, NULL, 0, 0);
             }
         }
