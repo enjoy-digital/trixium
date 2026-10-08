@@ -30,24 +30,20 @@ Scores are written as whole beats of 8 positions (a row of ceil(T/8) beats per l
 padding positions hold junk), outputs as hd/8 beats per lane.
 """
 
-from functools import reduce
-from operator import and_
-
 import numpy as np
 
 from migen import *
 
 from litex.gen import *
+
 from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import ExactFP32Add, ExactFP32Mul
-
 
 # Constants ----------------------------------------------------------------------------------------
 
 MODE_SCORES = 0
 MODE_VALUES = 1
-
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -65,7 +61,6 @@ def scores_reference(q, K, scale):
             s[l] = (acc*f32(scale)).astype(f32)
     return s
 
-
 def values_reference(p, V):
     """p [nq, T], V [T, nkv, hd]: hybrid.c's weighted-V loop (oh = 0; oh += p*v, t order)."""
     f32 = np.float32
@@ -78,10 +73,11 @@ def values_reference(p, V):
                 o[l] = (o[l] + (p[l, t]*V[t, l//n_rep]).astype(f32)).astype(f32)
     return o
 
-
 # Attention Stream ---------------------------------------------------------------------------------
 
 class AttentionStream(LiteXModule):
+    """Streaming attention passes (scores, values) over `lanes` query heads; see the module
+    docstring for the record layout and the arithmetic."""
     def __init__(self, lanes=24, groups=4, hb_max=32, t_max=2048, adr_bits=13,
                  add_factory=ExactFP32Add, mul_factory=ExactFP32Mul):
         L, P = lanes, 8
@@ -94,11 +90,14 @@ class AttentionStream(LiteXModule):
         pw = max(hbb, tb)                       # Per-lane parameter memory address width.
         self.lanes, self.groups, self.hb_max, self.t_max = L, groups, hb_max, t_max
 
+        # Control.
         self.start = Signal()
         self.rec   = Signal(adr_bits)          # Scratchpad beat address of the record.
         self.busy  = Signal()
         self.done  = Signal()
         self.sink  = stream.Endpoint([("data", 256)])
+
+        # Scratchpad client ports.
         self.sp_rd_ok  = Signal(reset=1)
         self.sp_rd_req = Signal()
         self.sp_rd_adr = Signal(adr_bits)
@@ -108,6 +107,8 @@ class AttentionStream(LiteXModule):
         self.sp_wr_we  = Signal(8)
         self.sp_wr_dat = Signal(256)
         self.sp_wr_gnt = Signal()
+
+        # Status.
         self.error = Signal()                  # Sticky: the record is outside the geometry.
 
         # # #
@@ -214,7 +215,7 @@ class AttentionStream(LiteXModule):
         # Row buffers: one per kv head, two halves of 8 rows (mode 0: a group of 8
         # positions; mode 1: one position per half) ------------------------------------------------
         rb_bits = hbb + 3 + 1
-        rowmems, rowrd = [], []
+        rowrd = []
         fill_beat = Signal(12)          # Beat within the row.
         fill_row = Signal(16)           # Rows accepted.
         fill_units = Signal(2)          # Completed units (groups or rows), mod 4.
@@ -314,7 +315,6 @@ class AttentionStream(LiteXModule):
             setattr(self.submodules, f"add{l}", adds[l])
 
         # Per-lane operand memory: q (mode 0, hd/8 words) or p (mode 1, ceil(T/8) words).
-        opmems = []
         kv_of = [Signal(max=max(2, groups), name=f"attn_kv{l}") for l in range(L)]
         acc0 = [[Signal(32, name=f"attn_acc{l}_{p}") for p in range(P)] for l in range(L)]
         snap = [[[Signal(32, name=f"attn_snap{b}_{l}_{p}") for p in range(P)] for l in range(L)]

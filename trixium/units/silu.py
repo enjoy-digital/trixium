@@ -59,8 +59,9 @@ from litex.gen import LiteXModule
 
 from litex.soc.interconnect import stream
 
+from trixium.units.fp32 import _lzc
 
-# SiLU Mul Kernel ----------------------------------------------------------------------------------
+# Constants ----------------------------------------------------------------------------------------
 
 LUT_N = 4096
 IN_LAYOUT = [("g", 32), ("m", 32)]
@@ -68,34 +69,34 @@ OUT_LAYOUT = [("r", 32), ("fixup", 1), ("g", 32)]   # g: the input gate, for fix
 
 KIND_TABLE, KIND_PASS, KIND_NEGZERO, KIND_FIXUP = range(4)
 
-
-def _lzc(value, width):
-    """Leading-zero count of `value` (width bits), combinational. Later statements win in
-    Migen, so scanning from bit 0 upwards leaves the count of the highest set bit."""
-    count = Signal(max=width + 1)
-    stmts = [count.eq(width)]
-    for bit in range(width):
-        stmts.append(If(value[bit], count.eq(width - 1 - bit)))
-    return count, stmts
-
+# SiLU Mul Kernel ----------------------------------------------------------------------------------
 
 class SiluMulKernel(LiteXModule):
+    """r = m * siluf(g), one element per clock, LATENCY stages (see the module docstring).
+
+    tables=(lut, dlut) preloads the memories (simulation/tests); hardware loads them through the
+    write ports. sets > 1: that many resident table pairs (the SiLU's and the attention gate's
+    sigmoid), written through lut_set, read through table_sel.
+    """
     LATENCY = 9
 
     def __init__(self, tables=None, sets=1):
-        # tables=(lut, dlut) preloads the memories (simulation/tests); hardware loads them
-        # through the write ports. sets > 1: that many resident table pairs (the SiLU's and
-        # the attention gate's sigmoid), written through lut_set, read through table_sel.
-        self.sink = sink = stream.Endpoint(IN_LAYOUT)
+        # Streams.
+        self.sink   = sink   = stream.Endpoint(IN_LAYOUT)
         self.source = source = stream.Endpoint(OUT_LAYOUT)
+
+        # Table write ports and selection (table_only/table_sel held for a whole run;
+        # table_only turns the pass-through and -0 kinds into fixups).
         self.lut_we, self.lut_adr, self.lut_dat = Signal(), Signal(13), Signal(32)
-        # Held for a whole run: the pass-through and -0 kinds are fixups instead (any table).
         self.table_only = Signal()
         sb = max(1, (sets - 1).bit_length())
-        self.table_sel = Signal(sb)     # Held for a whole run: the table pair it reads.
-        self.lut_set = Signal(sb)       # The pair lut_we/dlut_we write.
+        self.table_sel = Signal(sb) # Table pair read.
+        self.lut_set   = Signal(sb) # Table pair written by lut_we/dlut_we.
         self.dlut_we, self.dlut_adr, self.dlut_dat = Signal(), Signal(12), Signal(32)
 
+        # # #
+
+        # Tables.
         if sets > 1:
             # Set s at [s*8192, s*8192 + 4097) and [s*4096, (s+1)*4096): a set bit on top.
             lut = Memory(32, sets*2*LUT_N, init=list(tables[0]) if tables else None)
@@ -395,7 +396,6 @@ class SiluMulKernel(LiteXModule):
         # fixup lane, so the CPU can recompute that element from the original inputs.
         self.comb += [source.r.eq(out_r), source.fixup.eq(out_fix), source.g.eq(g[n])]
 
-
 # SiLU Scratchpad ----------------------------------------------------------------------------------
 
 SILU_COMMAND = [("op", 1), ("src_g", 24), ("src_m", 24), ("dst", 24), ("fixmap", 24),
@@ -404,21 +404,26 @@ SILU_COMMAND = [("op", 1), ("src_g", 24), ("src_m", 24), ("dst", 24), ("fixmap",
 OP_RUN, OP_LOAD = 0, 1
 LOAD_BEATS = 513 + 512
 
-
 class SiluScratchpad(LiteXModule):
+    """Resident SiLU-multiply over the shared scratchpad, `ways` kernels in lockstep (see the
+    module docstring)."""
     def __init__(self, scratchpad_size=256*1024, tables=None, sets=2, ways=4):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client "
                              "address space")
+        # Command / status.
         self.cmd = stream.Endpoint(SILU_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
-        self.error = Signal(8)
+        self.error  = Signal(8)
         self.fixups = Signal(16)
         self.read_beats, self.output_beats = Signal(32), Signal(32)
+
+        # Scratchpad client ports.
         self.sp_rd_req, self.sp_wr_req, self.sp_wr_gnt = Signal(), Signal(), Signal()
         self.sp_rd_adr, self.sp_wr_adr = Signal(13), Signal(13)
         self.sp_rd_dat, self.sp_wr_dat = Signal(256), Signal(256)
         self.sp_wr_we = Signal(8)
+
         # ways kernels in lockstep (same valid, same ready, their own table copies loaded
         # together): `ways` elements per clock. 4 = the read port's pace (a g and an m beat
         # per 8 elements); 1 element per clock cost ~1.9M cycles per 27B forward.
@@ -431,6 +436,9 @@ class SiluScratchpad(LiteXModule):
             setattr(self.submodules, f"kernel{k}", kern)
         self.sets, self.ways = sets, ways
 
+        # # #
+
+        # Command capture and validation.
         IDLE, VALIDATE, LOAD, RUN, FINISH, FAILED = range(6)
         state = Signal(3, reset=IDLE)
         cap = {name: Signal(width) for name, width in SILU_COMMAND}

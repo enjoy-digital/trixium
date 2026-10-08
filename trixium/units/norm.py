@@ -47,7 +47,6 @@ from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import FP32Add, FP32DivSqrt, FP32Mul, _lzc, _shift_left
 
-
 # Constants ----------------------------------------------------------------------------------------
 
 NORM_COMMAND = [("op", 1), ("src", 24), ("dst", 24), ("weight", 24), ("n", 16), ("nseg", 16),
@@ -59,7 +58,6 @@ WMAX = 8192                     # largest n (27B: n_embd 5120)
 HB_MAX = 16                     # RoPE: half the rotated dims, in beats (<= 128 elements)
 F32_ONE = 0x3F800000
 
-
 # Helpers ------------------------------------------------------------------------------------------
 
 def _delay(module, value, cycles, name):
@@ -70,23 +68,29 @@ def _delay(module, value, cycles, name):
         prev = r
     return prev
 
-
 # Norm Scratchpad ----------------------------------------------------------------------------------
 
 class NormScratchpad(LiteXModule):
+    """Resident RMSNorm / L2 norm with optional RoPE (see the module docstring)."""
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client "
                              "address space")
+        # Command / status.
         self.cmd = stream.Endpoint(NORM_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
         self.read_beats, self.output_beats = Signal(32), Signal(32)
+
+        # Scratchpad client ports.
         self.sp_rd_req, self.sp_wr_req, self.sp_wr_gnt = Signal(), Signal(), Signal()
         self.sp_rd_adr, self.sp_wr_adr = Signal(13), Signal(13)
         self.sp_rd_dat, self.sp_wr_dat = Signal(256), Signal(256)
         self.sp_wr_we = Signal(8)
 
+        # # #
+
+        # Command capture and validation.
         cap = {name: Signal(width, name=f"cap_{name}") for name, width in NORM_COMMAND}
         rms = cap["op"] == OP_RMS
         nbeats = Signal(13)                          # beats per segment
@@ -139,7 +143,6 @@ class NormScratchpad(LiteXModule):
 
         # The 64 partials: P[8*slot + lane].
         P = [Signal(32, name=f"part{k}") for k in range(64)]
-        Pa = Array(P)
 
         # Weight buffer: one 256-bit word per beat.
         wbuf = Memory(256, WMAX//8, name="norm_wbuf")
@@ -150,7 +153,6 @@ class NormScratchpad(LiteXModule):
         # Output FIFO (pass 2) with credits for the in-flight beats.
         FIFO_DEPTH = 32
         self.submodules.ofifo = ofifo = ResetInserter()(SyncFIFO(width=256 + 13, depth=FIFO_DEPTH))
-        P2_LAT = 1 + L_MUL + L_MUL                   # read -> m1 -> m2
         inflight = Signal(max=FIFO_DEPTH + 1)
 
         # Control ----------------------------------------------------------------------------------
