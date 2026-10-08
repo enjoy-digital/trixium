@@ -123,7 +123,7 @@ static inline void trixium_engine_csr_perf_snapshot_write(uint32_t v) {
     exe = tmp_path / "perf_test"
     subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DTRIXIUM_PERF_TEST",
                     *flags, "-I" + str(tmp_path), "-I" + str(ROOT / "firmware"),
-                    str(ROOT / "firmware/perf.c"), str(ROOT / "firmware/traffic.c"),
+                    str(ROOT / "firmware/perf.c"),
                     str(ROOT / "test/perf_host.c"),
                     "-o", str(exe)], check=True, capture_output=True, text=True)
     output = subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout
