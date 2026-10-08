@@ -1,14 +1,21 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """AttentionStream against hybrid.c's attention loops, compiled (Verilator).
 
 The K/V rows stream in with random gaps, the scratchpad read and write grants are random;
 scores and outputs must equal the float32 reference of the firmware loops bit for bit.
 """
+
 import shutil
 import subprocess
 
 import numpy as np
 import pytest
+
 from migen.fhdl import verilog
 
 from trixium.units.attention_stream import (

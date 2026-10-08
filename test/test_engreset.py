@@ -1,3 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
 """The engine soft reset: a wedged op is recovered without touching the HBM ports' state.
 
 A ternary matvec runs; the HBM model of channel 1 then freezes mid-stream (a port that
@@ -7,12 +13,13 @@ port answers again later, the shims drain the late beats, and the same matvec th
 again with bit-exact results. The scratchpad and the loader's ports are untouched.
 """
 
-import numpy as np
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
+import numpy as np
 import pytest
+
 from migen import *
 from migen.sim import run_simulation
 

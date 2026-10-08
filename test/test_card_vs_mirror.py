@@ -1,8 +1,13 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Trace validation must fail closed, including absent/malformed board output."""
 
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,12 +18,16 @@ EMBED = "DBG pos=0 l=-1 embed e=-12 1234abcd amax=42 v0..3=1,2,3,4\n"
 ARGMAX = "DBG pos=0 l=-1 argmax e=0 00000003\n"
 
 
+# Helpers ------------------------------------------------------------------------------------------
+
 def compare(tmp_path, mirror, card):
     a = SimpleNamespace(mirror=tmp_path / "mirror", card=tmp_path / "card", verbose=True)
     a.mirror.write_text(mirror)
     a.card.write_text(card)
     return cmd_compare(a)
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_matching_trace_with_chatter(tmp_path):
     assert compare(tmp_path, EMBED + ARGMAX, "boot chatter\n" + EMBED + ARGMAX) == 0

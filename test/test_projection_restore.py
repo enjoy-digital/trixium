@@ -1,18 +1,27 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """IEEE binary32 scalar oracle, independent of the RTL normalization/shifts."""
+
 import math
-from pathlib import Path
 import random
 import shutil
 import struct
 import subprocess
+from pathlib import Path
 
 import pytest
+
 from migen import run_simulation
 from migen.fhdl import verilog
 
 from trixium.units.restore import I32ToFp32Scaled
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def bits(value):
     try:
@@ -120,6 +129,8 @@ def exercise(dut, inputs, stalls=True, cancels=()):
             return cycle + 1
     raise AssertionError('projection restoration did not drain')
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_projection_restore_all_exponents_rounding_boundaries():
     dut = I32ToFp32Scaled()

@@ -1,16 +1,25 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 import math
 import random
 import struct
 
 import pytest
+
 from migen import *
+
 from litex.gen import LiteXModule
 
 from trixium.units.activation import ActivationScratchpad
 from trixium.core.scratchpad import Scratchpad
 from test_activation_quantize import bits, expected
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 class QuantSP(LiteXModule):
     def __init__(self, size=8192):
@@ -92,6 +101,8 @@ def valid_command(dut, arrays, stall=True):
     assert (yield dut.sp.mem[(0x1800 + len(words))//32]) == sentinel
     yield
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_resident_quantization_per_block_and_whole_vector_reuse():
     dut = QuantSP()

@@ -22,7 +22,7 @@ import pytest
 
 from trixium.model import asm as vasm
 
-# Pre-hoist programs, verbatim as they were before loop-invariant work was moved out. ---------
+# Pre-hoist programs (verbatim, before loop-invariant code motion) ---------------------------------
 
 def _norm_i32_before():
     return [
@@ -89,7 +89,7 @@ def _softmax8_before():
 
 
 def _silu_mul_before():
-    # 2026-08-29: the two clamp constants (-15*2^15, 14*2^15) were rebuilt in v4 every
+    # The two clamp constants (-15*2^15, 14*2^15) were rebuilt in v4 every
     # iteration (MOVSI/BCAST/VSHLI x2 = 6 of 27 body instructions) because no vreg was free.
     C_LOG2E = 739
     return [
@@ -157,7 +157,7 @@ def test_optimized_program_matches_the_one_it_replaced(name):
         sp_old, sp_new = _seeded_sp(seed), _seeded_sp(seed)
         args = list(args)
         if name == "norm_i32":
-            # In-contract k only (asm.py, 2026-08-29): k = bitlen(absmax) - 14 of the data
+            # In-contract k only (asm.py): k = bitlen(absmax) - 14 of the data
             # the program will read. The pre-hoist program saturated out-of-contract
             # inputs; the current one carries no clamp because the contract makes it dead.
             n_src = 2*args[3]*8

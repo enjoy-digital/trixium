@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """The hardware SiLU-multiply fast path must equal the firmware wherever it does not flag.
 
 Three layers: the integer-exact binary32 add/multiply/FMA helpers against the host FPU
@@ -6,6 +11,7 @@ and IEEE fmaf; the fast path (what the RTL implements) against hybrid.c's silu_m
 semantics (rv32_math.silu_rv32, itself checked against the target libm under QEMU and
 the compiled FPU SoC); and the fixup set against its documented definition.
 """
+
 import random
 
 import numpy as np

@@ -28,6 +28,8 @@ from trixium.memory.loader import Loader
 MEM_SIZE = 64*1024
 
 
+# Helpers ------------------------------------------------------------------------------------------
+
 class _DUT(Module):
     def __init__(self, n=2, latency=100, stall_rate=8):
         axis = []
@@ -85,6 +87,8 @@ def _store(nbeats, chan=0, addr=0x400, latency=100, stall_rate=8, gap=0):
     run_simulation(dut, [driver()])
     return bool(done), got, payload
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("nbeats", [1, 5, 16, 17, 64])
 def test_store_completes_under_slow_hbm(nbeats):

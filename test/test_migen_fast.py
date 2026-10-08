@@ -1,9 +1,17 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
 from migen import If, Signal
 from migen.fhdl import tools as fhdl_tools
 from migen.fhdl.namer import build_namespace
 
 from trixium.migen_fast import linear_group_by_targets, linear_topological_sort
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def _component_signature(groups):
     return {
@@ -12,6 +20,8 @@ def _component_signature(groups):
         for targets, statements in groups
     }
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_linear_statement_grouping_matches_migen_components():
     a, b, c, d, e = [Signal(name=name) for name in "abcde"]

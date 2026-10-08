@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""Random-program hazard stress for the pipelined vector unit (V1, 2026-08-29).
+"""Random-program hazard stress for the pipelined vector unit.
 
 The stock programs (test_vector.py) exercise each op, but a 1-instruction/cycle pipeline
 is only correct if EVERY dependency distance forwards or stalls right: RAW on V at
@@ -19,6 +19,7 @@ import random
 
 import numpy as np
 import pytest
+
 from migen import *
 
 from trixium.model import asm
@@ -33,6 +34,8 @@ SRC0, SRC1, DST = 0x0000, 0x0800, 0x1000
 # The constant register is the top vreg; random operands span the rest (ISA rev 2: 16).
 VCONST = f"v{asm.VREGS - 1}"
 VMAX   = asm.VREGS - 2
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def gen_program(rng):
     """One random program. v7 holds a positive constant (LUTRECIP operands must be
@@ -242,6 +245,8 @@ def _check(seed, withhold):
     assert got["s7"] == (S[7] & m48), (seed, prog, "s7", got["s7"], S[7] & m48)
     assert got["bad"] == 0 and got["dc"] == 1, (seed, prog, got["bad"], got["dc"])
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("seed", list(range(24)))
 def test_random_program_matches_interpreter(seed):

@@ -1,13 +1,22 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """FP32ArgmaxTracker against the firmware's greedy argmax loop."""
+
 import numpy as np
 import pytest
+
 from migen import run_simulation
 
 from trixium.units.fp32 import FP32ArgmaxTracker
 
 f32 = np.float32
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def cpu_argmax(x):
     best, idx = x[0], 0
@@ -44,6 +53,8 @@ def run_tracker(values, chunks):
     run_simulation(dut, gen())
     return out
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("case", ["random", "ties", "zeros", "nan_first", "nan_inside", "neg"])
 def test_tracker_equals_the_cpu_loop(case):

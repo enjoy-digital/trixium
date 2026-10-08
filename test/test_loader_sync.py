@@ -123,7 +123,7 @@ def test_without_sync_the_garbage_is_written():
     assert _run(garbage_beats=5, payload=payload, use_sync=False) != payload
 
 
-# CSR upload path ------------------------------------------------------------------------------
+# CSR upload path ----------------------------------------------------------------------------------
 #
 # The host poking words through BAR0 instead of streaming over DMA. Slower - a posted PCIe
 # write per 32 bits - but nothing can be dropped, reordered or invented on the way, so it needs

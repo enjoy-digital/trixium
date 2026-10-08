@@ -1,7 +1,13 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
 """Pipe-level AXPY test: one ChannelPipe driven directly, bit-exact vs bx.axpy_rows.
 
-Written for the 2026-09-10 area/timing changes in ternary_mac.py (registered shift
-amounts, ONE accumulate adder per lane shared by the four groups): the engine-level AXPY
+Covers ternary_mac.py's area/timing structure (registered shift amounts, ONE accumulate
+adder per lane shared by the four groups): the engine-level AXPY
 tests all use cols=64 (two groups) with lockstep readers and no stalls, so they could not
 see a wrong bank select, a stale shift amount held across a gap, or the two-beat minimum
 distance between updates of the same bank (cols=32: one code beat per row, one scale beat
@@ -9,8 +15,10 @@ between rows). This test drives every beat position with random valid gaps and r
 source.ready toggling, covers cols in {32, 64, 128} (1..4 banks), rows in {1, 2, 5} with
 distinct per-row exponents.
 """
+
 import numpy as np
 import pytest
+
 from migen import *
 
 from trixium import layout
@@ -18,6 +26,8 @@ from trixium.model import bitexact as bx
 from trixium.model.bons import TensorSpec, encode_rows
 from trixium.core.pipe import ChannelPipe, KIND_OP_AXPY
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def _beats(payload):
     assert len(payload) % 32 == 0
@@ -111,6 +121,8 @@ def _run_pipe(cols, T, seed, gaps=True):
     gotA = np.array([got[c] for c in range(cols)], dtype=np.int64)
     assert np.array_equal(gotA, expA), (cols, T, gotA[:8], expA[:8])
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cols", [32, 64, 128])
 @pytest.mark.parametrize("T", [1, 2, 5])

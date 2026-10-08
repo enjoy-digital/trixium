@@ -9,6 +9,7 @@
 # (the interpreter is the golden model).
 
 import numpy as np
+
 from migen import *
 
 from trixium.model import asm
@@ -277,7 +278,7 @@ def test_rtl_silu_q8():
 
 
 def test_rtl_silu_gate_and_mul_q8():
-    # The FFN SiLU split (2026-09-07): both halves, x1 and x2, RTL vs interpreter over the
+    # The FFN SiLU split: both halves, x1 and x2, RTL vs interpreter over the
     # whole scratchpad, run in place the way the FFN list runs them (A2 == A0).
     rng = np.random.default_rng(46)
     n = 256

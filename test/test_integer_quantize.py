@@ -1,11 +1,19 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 import random
 
 import pytest
+
 from migen import run_simulation
 
 from trixium.units.activation import IntegerToQ8
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def expected(value, exponent):
     # Exact rational rounding, independent of any finite-width barrel shifter.
@@ -52,6 +60,8 @@ def exercise(dut, vectors, stalls=True):
             return
     raise AssertionError('integer quantizer did not drain')
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize('lanes,width', [(1, 2), (2, 8), (8, 19), (16, 32)])
 def test_integer_q8_all_exponents_extremes_backpressure_and_cancel(lanes, width):

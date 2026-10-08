@@ -1,10 +1,16 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """SiluMulKernel (portable RTL) against the bit-exact model, compiled with Verilator.
 
 The chain of evidence: hybrid.c == silu_mul_fast == silu_mul_fixed (test_silu_hw.py),
 and here RTL == silu_mul_fixed on every element, with random input gaps and output
 stalls. A smaller Migen-simulated run checks the same kernel without Verilator.
 """
+
 import random
 import shutil
 import struct
@@ -13,12 +19,15 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
 from migen import run_simulation
 from migen.fhdl import verilog
 
 from trixium.units.silu import SiluMulKernel
 from trixium.model.silu_hw import LUT_N, f32_bits, silu_mul_firmware, silu_mul_fixed, tables
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def stress_vectors(seed=3, n_random=120000):
     rng = np.random.default_rng(seed)
@@ -94,6 +103,8 @@ def write_vectors(path, gates, mults, want):
         for g, m, (r, fix) in zip(gates, mults, want):
             f.write(struct.pack("<4I", g, m, r, fix))
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_compiled_kernel_equals_the_model(tmp_path, compiled):
     gates, mults = stress_vectors()

@@ -1,18 +1,27 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 import random
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
+
 from migen import *
 from migen.fhdl import verilog
+
 from litex.gen import LiteXModule
 
 from trixium.units.restore import ProjectionRestoreScratchpad
 from trixium.core.scratchpad import Scratchpad
 from test_projection_restore import expected
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def pack(words):
     return sum((word & 0xffffffff) << (32*i) for i, word in enumerate(words))
@@ -91,6 +100,8 @@ def valid(dut, words, *, exponent=0, adjustment=0, inplace=False, dst=None):
         assert (yield dut.sp.mem[dst//32 + beats]) == output_sentinel
     yield
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize('inplace', [False, True])
 def test_restore_sp_stalls_tail_scales_and_reuse(inplace):

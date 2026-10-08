@@ -1,3 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
 """AXIResetShim: the HBM port's protocol survives a master reset mid-transaction.
 
 A reader and a writer behind the shim, in a ResetInserter domain; the HBM model can freeze
@@ -19,6 +25,8 @@ from trixium.memory.axi import AXIReader
 from trixium.memory.axi import AXIWriter
 from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 class _DUT(Module):
     def __init__(self, init):
@@ -65,6 +73,8 @@ def _soft_reset(dut, timeout=5000):
         yield
     return False
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_shim_read_reset_then_late_beats():
     rng  = random.Random(1)
@@ -210,8 +220,8 @@ import pytest
 def test_shim_writes_under_every_slave_handshake_order(order):
     """The shim in front of a slave that takes AW first (the legacy model), W first
     (LiteDRAM's bridge: W into a FIFO ahead of a one-deep AW buffer) or AW only after
-    WVALID (a slave that waits for data - what the HBM IP's behaviour on the card implied,
-    2026-09-18). Three multi-burst stores back to back, then a read-back: exact bytes, one
+    WVALID (a slave that waits for data - what the HBM IP's behaviour on the card implied).
+    Three multi-burst stores back to back, then a read-back: exact bytes, one
     B per AW (the writer goes idle), no dependence of any W handshake on the AW one
     (the aw_after_w slave would deadlock a master that had one)."""
     import numpy as np

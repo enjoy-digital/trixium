@@ -1,21 +1,30 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """The flat scratchpad arbiter must be the nested 2:1 client-mux chain, bit for bit.
 
-ScratchpadArbiter replaces one ScratchpadClientMux per attached unit (the
-v11 VCU build failed setup on those serial mux levels). It is only safe to swap in if
+ScratchpadArbiter replaces one ScratchpadClientMux per attached unit (serial mux levels
+fail setup timing on the full SoC). It is only safe to swap in if
 every output toward the scratchpad and every return toward every client is identical to
 the chain's, for every combination of busy bits - including two units busy at once,
 which the sequencer never does but a manual CSR start could. Checked exhaustively over
 the busy combinations for one to six attached clients, with random payloads.
 """
+
 import random
 
 import pytest
+
 from migen import Module, Signal, Mux, run_simulation
 
 from litex.gen import LiteXModule
 
 from trixium.core.scratchpad import ScratchpadArbiter
+
+# Helpers ------------------------------------------------------------------------------------------
 
 # Reference: the nested 2:1 client mux the arbiter replaced.
 class ScratchpadClientMux(LiteXModule):
@@ -77,6 +86,8 @@ class DUT(Module):
         self.comb += [self.chain_top.sp_rd_dat.eq(self.rd_dat), self.chain_top.sp_wr_gnt.eq(self.wr_gnt),
                       self.arb.sp_rd_dat.eq(self.rd_dat), self.arb.sp_wr_gnt.eq(self.wr_gnt)]
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 6])
 def test_flat_arbiter_equals_the_nested_chain(n):

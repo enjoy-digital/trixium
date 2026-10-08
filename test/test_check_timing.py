@@ -1,6 +1,11 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
-import subprocess
+
 import sys
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,6 +17,8 @@ PASS = "0.083 0.000 0 1154468 0.009 0.000 0 1154465 0.003 0.000 0 314334"
 V8 = "0.083 0.000 0 1154468 0.009 0.000 0 1154465 -0.003 -0.036 16 314334"
 ROOT = Path(__file__).resolve().parents[1]
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def report_row(row, trailer=""):
     import tempfile
@@ -26,6 +33,8 @@ def report(tmp_path, row=PASS, trailer=""):
     path.write_text("Design Timing Summary\n --- header ---\n" + row + "\n" + trailer)
     return path
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_v8_serializer_violations_rejected(tmp_path):
     parsed = parse_full(report(tmp_path, V8, "Timing constraints are not met.\n"))

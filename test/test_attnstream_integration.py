@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Engine op 6 through the shared cluster: position-striped rows -> merge -> attention lanes.
 
 Plumbing, on integer operators (the arithmetic is qualified bit for bit on the exact
@@ -6,6 +11,7 @@ operators in test_attn_stream.py): CSR submit, the rows/rem split of T positions
 channels with per-channel offsets, the round-robin merge back to position order, the unit's
 record/operand reads and result writes on the engine's scratchpad ports, completion.
 """
+
 import numpy as np
 import pytest
 

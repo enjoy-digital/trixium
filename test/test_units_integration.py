@@ -1,7 +1,14 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Sequencer units 11 (options), 12 (norm) and 13 (conv): decode, and lists on the cluster."""
+
 import numpy as np
 import pytest
+
 from migen import Memory, Module, run_simulation
 
 from trixium.core.core import TriXiumConfig
@@ -16,6 +23,8 @@ from test_conv_sp import reference as conv_reference
 
 f32 = np.float32
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def fixture(descriptors, **units):
     dut = Module()
@@ -45,6 +54,8 @@ def dispatch_fields(dut, cmd, count=1):
     run_simulation(dut, run())
     return fields
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_silu_options_decode():
     d = scratchpad_silu_descriptor(src_g=0x100, src_m=0x200, dst=0x300, fixmap=0x400, elements=6144,

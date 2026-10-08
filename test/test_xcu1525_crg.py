@@ -6,9 +6,9 @@
 
 """The XCU1525's IDELAYCTRL reset sequence releases the sys domain.
 
-The v2 bitstream held the whole SoC in reset forever (PCIe up, every CSR 0xffffffff): its
-reset counter lived in `sys`, which LiteX holds in reset until the IDELAYCTRL is ready,
-which needs the counter to release RST. This models the IDELAYCTRL (RDY a few cycles after
+A reset counter in `sys` would deadlock (the whole SoC held in reset, PCIe up, every CSR
+0xffffffff): LiteX holds `sys` in reset until the IDELAYCTRL is ready, which needs the counter
+to release RST. This models the IDELAYCTRL (RDY a few cycles after
 RST drops) and checks that RST drops on its own and sys.rst follows.
 """
 

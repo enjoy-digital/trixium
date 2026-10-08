@@ -1,6 +1,14 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Sequencer unit 11 (SiLU-multiply): descriptor ABI, dispatch, and a list on the shared cluster."""
+
+import numpy as np
 import pytest
+
 from migen import Memory, Module, run_simulation
 
 from trixium.core.core import TriXiumConfig
@@ -11,8 +19,6 @@ from test_hadamard_integration import install_list
 from test_integration import SoC, write
 from test_silu_mul_rtl import stress_vectors
 from test_silu_sp import SENTINEL, pack, reference, run_cmd, table_image
-
-import numpy as np
 
 
 def descriptor(**changes):

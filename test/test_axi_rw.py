@@ -8,10 +8,11 @@
 # exact data/last sequences under latency + R-stall jitter + consumer backpressure,
 # streamer utilization on the clean model, write-then-readback integrity.
 
-import pytest
 import random
 
 import numpy as np
+import pytest
+
 from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
@@ -168,14 +169,13 @@ def test_writer_readback():
     run_simulation(dut, [driver()])
 
 
-# AXI3 burst-length cap -----------------------------------------------------------------------
+# AXI3 burst-length cap ----------------------------------------------------------------------------
 #
 # The HBM controller's ports are AXI3: AXI_nn_AxLEN is 4 bits (see ip/hbm*/hbm_*_stub.v), so a
 # burst can never exceed 16 beats. LiteX's AXIInterface carries an 8-bit `len` and the upper
 # bits are dropped where it meets the IP, which is silent and ugly: reads stall forever waiting
-# for beats the IP will not send, and writes place WLAST late and corrupt memory. This is how
-# the first engine fetch on real hardware wedged (ENGSTALL, 32 of 128 beats delivered), so the
-# limit is pinned here rather than left to a comment.
+# for beats the IP will not send, and writes place WLAST late and corrupt memory (on hardware:
+# ENGSTALL, 32 of 128 beats delivered), so the limit is pinned here.
 
 @pytest.mark.parametrize("cls", [AXIReader, AXIWriter])
 def test_burst_beats_capped_at_axi3_limit(cls):
@@ -207,7 +207,7 @@ def test_hbm_model_flags_axlen_overflow():
 
     run_simulation(dut, [driver()])
 
-# Multi-ARID reads --------------------------------------------------------------------------------
+# Multi-ARID reads ---------------------------------------------------------------------------------
 #
 # The Xilinx HBM controller strictly serializes same-ARID reads: measured on the FK33, a
 # single port streamed 33.7 cycles/beat (one 16-beat burst per round trip) while the same

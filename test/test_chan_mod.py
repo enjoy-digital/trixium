@@ -28,6 +28,8 @@ from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
 
+# Helpers ------------------------------------------------------------------------------------------
+
 class _DUT(Module):
     def __init__(self, n_channels, chan_mod, chan_skew=0):
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
@@ -82,6 +84,8 @@ def _probe(axi, chan, out, key):
             out.setdefault(("ar", key), []).append((yield axi.ar.addr))
         yield
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("chan_mod, chan_skew", [(0, 0), (4, 0), (4, 0x2000)])
 def test_chan_mod_addresses_every_path(chan_mod, chan_skew):

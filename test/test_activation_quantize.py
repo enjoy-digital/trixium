@@ -1,18 +1,27 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Scalar IEEE float/math oracle, independent of the hardware bit/shift path."""
+
 import math
 import random
 import struct
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
+
 from migen import run_simulation
 from migen.fhdl import verilog
 
 from trixium.units.activation import Fp32AbsmaxWord, Fp32ToQ8
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def bits(value):
     return struct.unpack('<I', struct.pack('<f', value))[0]
@@ -85,6 +94,8 @@ def exercise(dut, vectors, stalls=True, cancels=()):
             return cycle + 1
     raise AssertionError('quantizer did not drain')
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize('lanes', [1, 2, 8, 16])
 def test_fp32_q8_exact_random_stalls_and_cancellation(lanes):

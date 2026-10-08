@@ -1,12 +1,19 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
 """The pre-dequantized embedding table (ROLE_TOK_EMB16 / _EXP) is bit-exact with the
 firmware's integer decode.
 
 bons.embed_bfp_rows is a vectorized transcription of embed_row_bfp (firmware/infer.c) - the
 scalar reference below is the sim's embed_bfp_int (test_sim_smoke.py) lifted verbatim. The
 table lets the card fetch a token's residual row with two engine fetches instead of ~47k
-cycles of CPU decode (-2.6%/token, 2026-09-08); a mismatch here would be a silent numerics
+cycles of CPU decode (-2.6%/token); a mismatch here would be a silent numerics
 change that the tiny-model token gate could only see for the tokens it happens to use.
 """
+
 import types
 
 import numpy as np
@@ -16,6 +23,8 @@ from trixium import layout
 from trixium.model import bitexact as bx
 from trixium.model.bons import embed_bfp_rows
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def embed_bfp_int_ref(codes, scales):
     """Scalar reference (test_sim_smoke.embed_bfp_int) for one row."""
@@ -54,6 +63,8 @@ def _rows(rng, n, cols):
     scales[5, :] = np.float16(1.0)
     return codes, scales
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cols", [256, 2048])
 def test_embed_bfp_rows_matches_scalar_reference(cols):

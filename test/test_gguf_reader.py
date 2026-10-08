@@ -15,6 +15,8 @@ from trixium.model.gguf_reader import GGUFReader
 
 ALIGNMENT = 32
 
+# Helpers ------------------------------------------------------------------------------------------
+
 def _string(s):
     return struct.pack("<Q", len(s)) + s.encode()
 
@@ -55,6 +57,8 @@ def write_tiny_gguf(path):
 
     with open(path, "wb") as f:
         f.write(blob)
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_gguf_reader(tmp_path):
     path = tmp_path/"tiny.gguf"

@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """SiluScratchpad: table LOAD and in-scratchpad SiLU-multiply RUN, against the model.
 
 The kernel itself is proven element-exact in test_silu_mul_rtl.py; here the questions are
@@ -6,6 +11,7 @@ the client's: every element lands in its lane, fixup lanes carry g, the bitmap h
 word written and no stale bit, tails and neighbours are untouched, in place works, write
 payloads hold under stall, bad commands never touch memory, cancel recovers.
 """
+
 import random
 import shutil
 import subprocess
@@ -13,10 +19,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
 from migen import run_simulation
 from migen.fhdl import verilog
-from litex.gen import LiteXModule
 from migen import Signal, Mux
+
+from litex.gen import LiteXModule
 
 from trixium.core.scratchpad import Scratchpad
 from trixium.units.silu import SiluScratchpad, LOAD_BEATS, OP_LOAD, OP_RUN, SILU_COMMAND
@@ -66,7 +74,7 @@ def run_cmd(**changed):
     return cmd
 
 
-# Migen -----------------------------------------------------------------------------------------
+# Migen --------------------------------------------------------------------------------------------
 
 SIZE = 64*1024
 
@@ -254,7 +262,7 @@ def test_invalid_physical_sizes():
             SiluScratchpad(size)
 
 
-# Compiled ---------------------------------------------------------------------------------------
+# Compiled -----------------------------------------------------------------------------------------
 
 def test_compiled_full_scratchpad_image(tmp_path):
     from rtl_client import build_client, run_client

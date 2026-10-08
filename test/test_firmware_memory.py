@@ -1,8 +1,14 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """The actual firmware linker must enforce stack headroom, not just document it."""
-from pathlib import Path
+
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 

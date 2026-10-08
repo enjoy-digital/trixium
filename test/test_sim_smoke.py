@@ -233,8 +233,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
             # Regions sized to the vector: the 8 KB slots were fine for the tiny model
             # (ffn 512) and silently overlapped on the 1.7B (ffn 6144: the up vector
             # overwrote the last third of the gate vector, so the mirror's silu was wrong
-            # for elements 4096.. of every layer - found 2026-09-14 by the card-vs-mirror
-            # dump, where the CARD was right).
+            # for elements 4096.. of every layer).
             slot = ((2*n + 2047)//2048)*2048
             sp = bytearray(3*slot)
             sp[0:2*n]         = gm.astype("<i2").tobytes()

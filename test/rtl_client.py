@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Compiled (Verilator) driver for any resident scratchpad client.
 
 A client exposes `cmd` (a stream.Endpoint), cancel/busy/done/error and the one-cycle
@@ -8,11 +13,13 @@ list of commands - reads answered one clock later, a random write grant whose pa
 hold while ungranted - and returns the final image and one stats line per command.
 Rejected commands (expected error bits != 0) must never touch memory; they are cancelled.
 """
+
 import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
+
 from migen.fhdl import verilog
 
 _CPP = r'''

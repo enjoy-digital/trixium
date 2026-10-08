@@ -1,5 +1,11 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """NormScratchpad (unit 12) against the firmware's definitions, compiled."""
+
 import numpy as np
 import pytest
 
@@ -10,6 +16,8 @@ f32 = np.float32
 EPS = f32(1e-6)
 SIZE = 256*1024
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def canon(bits):
     bits = np.asarray(bits, dtype=np.uint32).copy()
@@ -89,6 +97,8 @@ def activations(rng, n, kind):
         x = rng.normal(0, 1, n).astype(f32); x[n//3] = np.nan; return x
     raise ValueError(kind)
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_compiled_norms_equal_the_firmware_definition(tmp_path, binary):
     rng = np.random.default_rng(12)

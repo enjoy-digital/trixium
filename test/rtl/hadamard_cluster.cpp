@@ -1,9 +1,13 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Real sequencer, shared engine port arbitration, two-port scratchpad and Wishbone sideband.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Real sequencer, shared engine port arbitration, two-port scratchpad and Wishbone sideband.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include "Vhadamard_cluster.h"
 #include "verilated.h"
 #include <algorithm>
