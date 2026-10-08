@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  *
- * LitePCIe util
+ * TriXium util (LitePCIe util on the /dev/trixiumN device)
  *
- * This file is part of LitePCIe.
+ * This file is part of TriXium, derived from LitePCIe.
  *
  * Copyright (C) 2018-2023 / EnjoyDigital  / florent@enjoy-digital.fr
  *
@@ -474,45 +474,6 @@ end:
     litepcie_dma_cleanup(&dma);
 }
 
-/* HBM BIST */
-/*----------*/
-
-#ifdef CSR_BIST_BASE
-static void bist_run(int fd, int chan, uint32_t length, uint32_t seed, uint32_t mode)
-{
-    litepcie_writel(fd, CSR_BIST_CHAN_ADDR,   chan);
-    litepcie_writel(fd, CSR_BIST_BASE_ADDR,   0);
-    litepcie_writel(fd, CSR_BIST_LENGTH_ADDR, length);
-    litepcie_writel(fd, CSR_BIST_SEED_ADDR,   seed);
-    litepcie_writel(fd, CSR_BIST_MODE_ADDR,   mode);
-    litepcie_writel(fd, CSR_BIST_START_ADDR,  1);
-    usleep(1000);
-    while (!(litepcie_readl(fd, CSR_BIST_STATUS_ADDR) & 1))
-        usleep(1000);
-}
-
-static void hbm_test(int chan, uint32_t length)
-{
-    int fd;
-    fd = open(litepcie_device, O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "Could not init driver\n");
-        exit(1);
-    }
-    printf("HBM channel %d, %u beats (%.1f MB):\n", chan, length, length*32/1e6);
-    bist_run(fd, chan, length, 42, 0); /* Write. */
-    uint32_t wcycles = litepcie_readl(fd, CSR_BIST_CYCLES_ADDR);
-    bist_run(fd, chan, length, 42, 2); /* Read + check. */
-    uint32_t rcycles = litepcie_readl(fd, CSR_BIST_CYCLES_ADDR);
-    uint32_t errors  = litepcie_readl(fd, CSR_BIST_ERRORS_ADDR);
-    double f = CONFIG_CLOCK_FREQUENCY;
-    printf("  write: %7.2f GB/s\n", (double)length*32*f/wcycles/1e9);
-    printf("  read : %7.2f GB/s\n", (double)length*32*f/rcycles/1e9);
-    printf("  check: %u errors -> %s\n", errors, errors ? "FAIL" : "OK");
-    close(fd);
-}
-#endif
-
 /* Help */
 /*------*/
 
@@ -535,7 +496,6 @@ static void help(void)
            "\n"
            "dma_test                          Test DMA.\n"
            "scratch_test                      Test Scratch register.\n"
-           "hbm_test [chan] [beats]           HBM channel bandwidth/integrity test (BIST).\n"
            "\n"
 #ifdef CSR_FLASH_BASE
            "flash_write filename [offset]     Write file contents to SPI Flash.\n"
@@ -648,17 +608,6 @@ int main(int argc, char **argv)
             litepcie_data_width,
             litepcie_auto_rx_delay,
             test_duration);
-
-#ifdef CSR_BIST_BASE
-    /* HBM cmds. */
-    else if (!strcmp(cmd, "hbm_test")) {
-        int      chan = 1;
-        uint32_t len  = 0x100000; /* 32 MB default. */
-        if (optind < argc) chan = strtoul(argv[optind++], NULL, 0);
-        if (optind < argc) len  = strtoul(argv[optind++], NULL, 0);
-        hbm_test(chan, len);
-    }
-#endif
 
     /* Show help otherwise. */
     else

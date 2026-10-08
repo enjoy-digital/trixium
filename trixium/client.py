@@ -31,7 +31,7 @@ import fcntl
 DEFAULT_TTY       = "/dev/ttyLXU0"
 DEFAULT_TOKENIZER = "models/1.7b/tokenizer.json"
 PROMPT            = b"trixium> "
-PBUF_TOKENS       = 2048  # firmware/main.c PBUF_N: the on-card conversation buffer (= max_ctx).
+PBUF_TOKENS       = 2048  # On-card conversation buffer (firmware/main.c PBUF_N, = max_ctx).
 LINE_MAX          = 850   # Firmware console line buffer is 1024 B; leave slack.
 
 # TriXium Client -----------------------------------------------------------------------------------
@@ -47,7 +47,8 @@ class TriXium:
         """chat_template=False sends the text raw (completion style, like trixium_chat).
         temperature 0 = greedy (bit-exact, the default); repeat_penalty 1.1 alone already
         stops the list loops greedy decoding falls into."""
-        import serial                          # Imported here: only the client needs it.
+        # Optional dependencies, imported on use.
+        import serial
         from tokenizers import Tokenizer
         self.ser = serial.Serial(tty, 115200, timeout=0.05)
         # One console session at a time (see tools/pcie_console.py): advisory lock on the tty.
@@ -56,14 +57,14 @@ class TriXium:
         except OSError:
             self.ser.close()
             raise TriXiumError(f"{tty} is in use by another console session (trixium_chat, "
-                              "pcie_console.py, litex_term?) - close it first")
-        self.tok = Tokenizer.from_file(tokenizer)
+                               "pcie_console.py, litex_term?) - close it first")
+        self.tok           = Tokenizer.from_file(tokenizer)
         self.chat_template = chat_template
-        self.system = system                  # A system turn ahead of the first user turn.
-        self.timeout = timeout
-        self.turns = 0                        # Tokens currently in the on-card buffer.
-        self.im_end = self.tok.token_to_id("<|im_end|>") if chat_template else None
-        self._closed = True                   # Did the last reply end with <|im_end|>?
+        self.system        = system  # A system turn ahead of the first user turn.
+        self.timeout       = timeout
+        self.turns         = 0       # Tokens currently in the on-card buffer.
+        self.im_end        = self.tok.token_to_id("<|im_end|>") if chat_template else None
+        self._closed       = True    # Did the last reply end with <|im_end|>?
         self._sync()
         if temperature or top_p != 1.0 or repeat_penalty != 1.0 or seed:
             self.set_sampling(temperature, top_p, repeat_penalty, seed)
@@ -167,7 +168,7 @@ class TriXium:
     def _send_ids(self, ids):
         if self.turns + len(ids) > PBUF_TOKENS:
             raise TriXiumError(f"conversation would exceed the on-card buffer ({PBUF_TOKENS} "
-                              "tokens); call reset()")
+                               "tokens); call reset()")
         i = 0
         while i < len(ids):
             line = "tok"
@@ -189,10 +190,10 @@ class TriXium:
         # model runs on past its answer until max_tokens.
         stop = f" {self.im_end}" if self.im_end is not None else ""
         pending = self._write_paced(f"genb {max_tokens}{stop}\n".encode()).decode(errors="replace")
-        ids = []
+        ids          = []
         decoded_upto = 0
-        deadline = time.time() + self.timeout
-        done = False
+        deadline     = time.time() + self.timeout
+        done         = False
         while not done and time.time() < deadline:
             chunk = self.ser.read(4096)
             if not chunk:

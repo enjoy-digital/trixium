@@ -1,12 +1,13 @@
-# Point BUILD_DIR at the gateware build whose bitstream is loaded: the generated headers
+# Makefile for the TriXium user tools (derived from LitePCIe's).
+#
+# BUILD_DIR selects the gateware build whose bitstream is loaded: the generated headers
 # (TRIXIUM_N_CHANNELS, CSR map) differ per build and a mismatch silently misconfigures the
-# card. Defaults to build/xcu1525 (tools/build_xcu1525.sh xcu1525).
+# card. Host code compiles against the driver-flavour headers (csr.h/soc.h/mem.h without the
+# <generated/...> includes) the build scripts generate next to the build.
 BUILD_DIR ?= ../../../build/xcu1525
-# The driver-flavour headers (csr.h/soc.h/mem.h without the <generated/...> includes) are
-# what host code compiles against; the deploy script regenerates them next to the build.
 GEN_INC   := $(BUILD_DIR)/driver/kernel
 
-CFLAGS=-O2 -Wall -g -I$(GEN_INC) -I$(BUILD_DIR)/software/include -I../kernel -Iliblitepcie -I../lib -MMD -fPIC
+CFLAGS=-O2 -Wall -g -I$(GEN_INC) -I$(BUILD_DIR)/software/include -I../kernel -Iliblitepcie -MMD -fPIC
 LDFLAGS=-g
 CC=$(CROSS_COMPILE)gcc
 AR=ar
@@ -22,11 +23,11 @@ liblitepcie/liblitepcie.a: liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash
 trixium_util: liblitepcie/liblitepcie.a trixium_util.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
-trixium_load: liblitepcie/liblitepcie.a trixium_loader.o trixium_load.o
-	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
+trixium_load: trixium_loader.o trixium_load.o
+	$(CC) $(LDFLAGS) -o $@ $^
 
-trixium_chat: liblitepcie/liblitepcie.a trixium_loader.o trixium_chat.o
-	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
+trixium_chat: trixium_loader.o trixium_chat.o
+	$(CC) $(LDFLAGS) -o $@ $^
 
 clean:
 	rm -f $(PROGS) *.o *.a *.d *~ liblitepcie/*.a liblitepcie/*.o liblitepcie/*.d
@@ -39,10 +40,9 @@ liblitepcie/%.o: liblitepcie/%.c
 
 -include $(wildcard *.d)
 
-# Switching maps must rebuild host objects even when the selected headers are
-# OLDER than the previous build's objects. Do not reuse a utility with stale CSR
-# addresses. A content-sensitive stamp changes only when the configuration does;
-# no deletion of unrelated objects/artifacts is needed.
+# Switching builds must rebuild the host objects even when the selected headers are older than
+# the previous build's objects: a tool with stale CSR addresses must never be reused. The stamp
+# content changes only when the configuration does.
 BUILD_STAMP := .build_config
 BUILD_KEY := $(abspath $(BUILD_DIR))|$(CC)|$(CFLAGS)|$(LDFLAGS)
 ifneq ($(strip $(file <$(BUILD_STAMP))),$(strip $(BUILD_KEY)))

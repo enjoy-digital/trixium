@@ -1,10 +1,13 @@
-/* This file is part of TriXium.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium loader: host-side weight and firmware upload through BAR0 (see trixium_loader.h)
+ *
+ * This file is part of TriXium.
  *
  * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
- * SPDX-License-Identifier: BSD-2-Clause
  *
- * Host-side weight loader (see trixium_loader.h).
  */
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -18,24 +21,24 @@
 
 #include "trixium_loader.h"
 
-/* Keep in sync with trixium/layout.py and the generated soc.h / csr.h. */
+/* Generated SoC headers (memory layout from trixium/layout.py). */
 #include "soc.h"
 #include "csr.h"
 #include "mem.h"
+
+/* Definitions */
+/*-------------*/
+
 #ifndef TRIXIUM_CHAN_WEIGHT_BASE
 #error "SoC headers lack TRIXIUM_CHAN_WEIGHT_BASE (not a TriXium build?)"
 #endif
 #define HDR_STAGING (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
 
-/* main_ram: the CPU's HBM window passes the CPU address through unmodified
- * (add_usphbm2_pseudochannels -> AXILiteOffset(offset=0)), so main_ram is HBM global address
- * MAIN_RAM_BASE = 0x4000_0000 (pseudo-channel 4), and the loader's own port reaches it
- * because the HBM AXI switch routes by address, not by port (layout.py, "port-matched
- * addressing"). */
-/* Where the firmware goes: the ENGINE-side address of main_ram's origin. On the FK33 the CPU
- * window passes through 1:1 (HBM address = CPU address); on the XCU1525 main_ram is
- * controller 0's local address 0 and the SoC exports it (TRIXIUM_MEM_CPU_OFFSET = 0) - DRAM
- * 0x40000000 there is in channel 1's window. */
+/* Where the firmware goes: the engine-side address of main_ram's origin. On the FK33 the CPU
+ * window passes through 1:1 (HBM address = CPU address, the HBM AXI switch routes by address
+ * so the loader's port reaches it); on the XCU1525 main_ram is controller 0's local address 0
+ * and the SoC exports it (TRIXIUM_MEM_CPU_OFFSET = 0): DRAM 0x40000000 there is in channel 1's
+ * window. */
 #ifdef TRIXIUM_MEM_CPU_OFFSET
 #define FW_HBM_ADDR ((uint32_t)TRIXIUM_MEM_CPU_OFFSET)
 #else
@@ -50,9 +53,12 @@ struct bons_header {
     uint64_t payload_beats;
 } __attribute__((packed));
 
-/* liblitepcie's litepcie_writel() is an ioctl - a syscall per 32-bit word - which for a
- * gigabyte upload is hundreds of millions of syscalls. BAR0 is mapped uncached through
- * sysfs instead: each store is its own posted write, exactly what a FIFO register wants. */
+/* BAR0 access */
+/*-------------*/
+
+/* liblitepcie's litepcie_writel() is an ioctl, a syscall per 32-bit word: hundreds of millions
+ * of syscalls for a gigabyte upload. BAR0 is mapped uncached through sysfs instead: each store
+ * is its own posted write, exactly what a FIFO register wants. */
 static volatile uint32_t *bar;
 #define BAR_W(a, v) do { bar[((a) - CSR_BASE)/4] = (v); } while (0)
 #define BAR_R(a)    (bar[((a) - CSR_BASE)/4])
@@ -91,6 +97,9 @@ void loader_bar_map(int devnum)
     bar = (volatile uint32_t *)m;
 }
 
+/* CPU reset */
+/*-----------*/
+
 void loader_cpu_reset(void)
 {
     /* Bit 1 = cpu_rst. Bit 0 (soc_rst) would take the PCIe endpoint down with it. */
@@ -98,6 +107,9 @@ void loader_cpu_reset(void)
     usleep(50000);
     BAR_W(CSR_CTRL_RESET_ADDR, 0);
 }
+
+/* Transfers */
+/*-----------*/
 
 static void loader_wait(int chan, uint32_t base, uint64_t beats)
 {
@@ -117,8 +129,8 @@ static void loader_wait(int chan, uint32_t base, uint64_t beats)
 static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, uint64_t beats);
 
 /* The gateware loader counts a transfer in 24 bits of beats (512 MB), less than the 27B's
- * 641 MB channel payloads (a wrapped count leaves the host spinning on a full FIFO).
- * Chunk at 128 MB; each chunk is its own armed transfer at the advanced base. */
+ * 641 MB channel payloads (a wrapped count leaves the host spinning on a full FIFO). Chunk at
+ * 128 MB; each chunk is its own armed transfer at the advanced base. */
 void loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t beats)
 {
     const uint64_t chunk = 4u << 20;   /* beats: 128 MB */
@@ -152,6 +164,9 @@ static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, ui
     }
     loader_wait(chan, base, beats);
 }
+
+/* Image upload */
+/*--------------*/
 
 #define BEATS(bytes) (((uint64_t)(bytes) + 31)/32)
 
@@ -199,9 +214,8 @@ uint64_t loader_upload_image(const char *path, int verbose)
         printf("  header+table -> ch0 staging (%u KB)\n", meta_bytes/1024);
     loader_transfer(0, HDR_STAGING, buf, BEATS(meta_bytes));
 
-    /* Channel payloads, each to its own window: the HBM AXI switch makes the address
-     * select the pseudo-channel, so one shared base put every payload on top of the last
-     * (confirmed on hardware, 2026-08-03). */
+    /* Channel payloads, each to its own window: the HBM AXI switch makes the address select
+     * the pseudo-channel, so a shared base would put every payload on top of the last. */
     for (uint32_t c = 0; c < hdr.n_channels; c++) {
         fseek(f, (uint64_t)hdr.payload_offset + c*chan_bytes, SEEK_SET);
         if (fread(buf, 1, chan_bytes, f) != chan_bytes) { perror("fread"); exit(1); }
@@ -228,16 +242,22 @@ uint64_t loader_upload_image(const char *path, int verbose)
     return (uint64_t)hdr.n_channels*chan_bytes;
 }
 
+/* Staging clear */
+/*---------------*/
+
 void loader_clear_staging(void)
 {
     /* Zeros with a "cleared" marker in the magic's place: the firmware then also drops a
-       header main_ram kept from an earlier session (it would stream weights that are not
-       there). The simulation stages nothing and keeps its preloaded header. */
+     * header main_ram kept from an earlier session (it would stream weights that are not
+     * there). The simulation stages nothing and keeps its preloaded header. */
     static uint8_t zeros[4096];
     const uint32_t cleared = 0x44524c43u; /* "CLRD", firmware/bons.h BONS_STAGING_CLEARED */
     memcpy(zeros, &cleared, 4);
     loader_transfer(0, HDR_STAGING, zeros, BEATS(sizeof(zeros)));
 }
+
+/* Firmware upload */
+/*-----------------*/
 
 uint64_t loader_upload_firmware(const char *path)
 {

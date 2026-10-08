@@ -1,17 +1,27 @@
-TriXium PCIe drivers
+TriXium PCIe drivers (derived from LitePCIe's)
 
-  trixium.ko    /dev/trixiumN: BAR0 (CSRs, the HBM loader) and the DMA rings.
-  liteuart.ko  /dev/ttyLXUN: the firmware console over PCIe (the crossover UART).
+  trixium.ko    /dev/trixiumN: BAR0 (CSRs, the weight loader) and the DMA rings.
+  liteuart.ko   /dev/ttyLXUN: the firmware console over PCIe (the crossover UART).
 
-The headers next to the sources (csr.h, soc.h, mem.h, flags.h, config.h) are generated per
-SoC build - they must come from the build whose bitstream is on the card: the build scripts
-generate them (--driver) in build/<name>/driver/kernel/, and the bring-up scripts copy them
-here.
+csr.h, soc.h and mem.h are generated per SoC build and must come from the build whose
+bitstream is on the card: the build scripts generate them (--driver) in
+build/<name>/driver/kernel/ and the bring-up scripts copy them here.
 
-  make                 build both modules
-  sudo ./init.sh       insmod both and make the device nodes world-writable
-  make install         copy them to /lib/modules/.../extra + modules-load.d + a udev rule
-  sudo rmmod trixium liteuart
+- Build both modules:
+
+  make
+
+- Load both modules and make the device nodes world-writable:
+
+  sudo ./init.sh
+
+- Install them persistently (/lib/modules/.../extra, modules-load.d and a udev rule):
+
+  make install
+
+- Remove the drivers:
+
+  sudo rmmod liteuart trixium
 
 Secure Boot refuses unsigned modules ("Lockdown: insmod: unsigned module loading is
 restricted"); disable it in the BIOS.

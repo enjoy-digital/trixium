@@ -954,8 +954,7 @@ static int litepcie_alloc_chdev(struct litepcie_device *s)
 
 	index = litepcie_minor_idx;
 	for (i = 0; i < s->channels; i++) {
-		/* Node name must match what the user tools open (/dev/trixium<N>), and the rest of
-		   the driver already brands itself LITEPCIE_NAME = "trixium". */
+		/* /dev/trixium<N>: the node the user tools open. */
 		dev_info(&s->dev->dev, "Creating /dev/" LITEPCIE_NAME "%d\n", index);
 		if (!device_create(litepcie_class, NULL, MKDEV(litepcie_major, index), NULL,
 				   LITEPCIE_NAME "%d", index)) {
