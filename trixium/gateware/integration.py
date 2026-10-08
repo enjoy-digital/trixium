@@ -187,7 +187,7 @@ def add_bonsai_cluster(soc, memory_ports, config=BonsaiClusterConfig()):
         sp_client = soc.sparb
     soc.engine = ClockDomainsRenamer("eng")(
         BonsaiMatVecEngine(soc.scratchpad, axis, vecunit=sp_client,
-                          seq=seq, dual=False, **placement,
+                          seq=seq, **placement,
                           dnstream=config.with_dnstream and (config.dnstream_options or True),
                           attnstream=config.with_attnstream and (config.attnstream_options or True)))
     if config.with_attnstream:

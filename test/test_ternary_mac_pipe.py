@@ -7,7 +7,7 @@ see a wrong bank select, a stale shift amount held across a gap, or the two-beat
 distance between updates of the same bank (cols=32: one code beat per row, one scale beat
 between rows). This test drives every beat position with random valid gaps and random
 source.ready toggling, covers cols in {32, 64, 128} (1..4 banks), rows in {1, 2, 5} with
-distinct per-row exponents, and the dual pipe with qn=1 and a second pre-shift.
+distinct per-row exponents.
 """
 import numpy as np
 import pytest
@@ -24,37 +24,28 @@ def _beats(payload):
     return [int.from_bytes(payload[i:i+32], "little") for i in range(0, len(payload), 32)]
 
 
-def _run_pipe(cols, T, seed, dual=False, qn=0, gaps=True):
+def _run_pipe(cols, T, seed, gaps=True):
     rng = np.random.default_rng(seed)
     ev  = rng.integers(-9, -4, T)
     scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
     v8  = rng.integers(-127, 128, (T, cols), dtype=np.int8)
     p8  = rng.integers(0, 128, T, dtype=np.int8)
-    p8b = rng.integers(0, 128, T, dtype=np.int8)      # Head B probs (dual).
+    rng.integers(0, 128, T, dtype=np.int8)            # (Keeps the seeds' draw sequence.)
     _, e16 = bx.fp16_decompose(scales)
     B     = 12 - int(e16.max())
     Rpre  = bx.axpy_rpre(int(p8.astype(np.int64).sum()))
-    Rpre2 = bx.axpy_rpre(int(p8b.astype(np.int64).sum())) if qn else Rpre
-    if qn and Rpre2 == Rpre:
-        Rpre2 = max(0, Rpre - 1)                      # Make head B's pre-shift differ.
     spec = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8, T, cols,
                       scales=scales, values=v8)
     payload = encode_rows(spec, 0, T).tobytes()
     expA = bx.axpy_rows(scales, v8, p8, B, Rpre)
-    expB = bx.axpy_rows(scales, v8, p8b, B, Rpre2) if qn else None
 
-    # x buffer: probs byte t at index t (n_channels=1, chan_id=0). Dual interleaves
-    # 32-byte groups: head A's byte t at (t>>5)*64 + (t&31), head B's at +32.
+    # x buffer: probs byte t at index t (n_channels=1, chan_id=0).
     xb = bytearray(128)                               # One 1024-bit x word (T <= 32).
     assert T <= 32
     for t in range(T):
-        if qn:
-            xb[(t >> 5)*64 + (t & 31)]      = int(p8[t])
-            xb[(t >> 5)*64 + (t & 31) + 32] = int(p8b[t])
-        else:
-            xb[t] = int(p8[t])
+        xb[t] = int(p8[t])
 
-    pipe = BonsaiChannelPipe(xbuf_groups=8, chan_id=0, n_channels=1, dual=dual)
+    pipe = BonsaiChannelPipe(xbuf_groups=8, chan_id=0, n_channels=1)
     beats = _beats(payload)
     sbeats = layout.scale_beats(cols, layout.KIND_Q8)
     cbeats = layout.code_beats(cols, layout.KIND_Q8)
@@ -75,15 +66,13 @@ def _run_pipe(cols, T, seed, dual=False, qn=0, gaps=True):
         yield pipe.code_beats.eq(cbeats)
         yield pipe.bias.eq(B)
         yield pipe.rshift.eq(Rpre)
-        yield pipe.rshift2.eq(Rpre2)
-        yield pipe.qn.eq(qn)
         yield
         yield pipe.start.eq(1)
         yield
         yield pipe.start.eq(0)
         for _ in range(6):
             yield
-        out = {0: {}, 1: {}}
+        out = {}
         i = 0
         cycles = 0
         drain_seen = 0
@@ -104,13 +93,13 @@ def _run_pipe(cols, T, seed, dual=False, qn=0, gaps=True):
             if (yield pipe.source.valid) and (yield pipe.source.ready):
                 assert (yield pipe.source.wide) == 1
                 row  = (yield pipe.source.row)
-                head = (yield pipe.source.head)
+                assert (yield pipe.source.head) == 0
                 data = (yield pipe.source.data)
                 for k in range(8):
                     w = (data >> (32*k)) & 0xFFFFFFFF
-                    out[head][row + k] = w - (1 << 32) if w & (1 << 31) else w
+                    out[row + k] = w - (1 << 32) if w & (1 << 31) else w
                 drain_seen += 1
-            want = (cols//8)*(2 if qn else 1)
+            want = cols//8
             if i == len(beats) and drain_seen == want:
                 break
         else:
@@ -119,25 +108,16 @@ def _run_pipe(cols, T, seed, dual=False, qn=0, gaps=True):
         got.update(out)
 
     run_simulation(pipe, [driver()])
-    gotA = np.array([got[0][c] for c in range(cols)], dtype=np.int64)
-    assert np.array_equal(gotA, expA), (cols, T, qn, gotA[:8], expA[:8])
-    if qn:
-        gotB = np.array([got[1][c] for c in range(cols)], dtype=np.int64)
-        assert np.array_equal(gotB, expB), (cols, T, "head B", gotB[:8], expB[:8])
+    gotA = np.array([got[c] for c in range(cols)], dtype=np.int64)
+    assert np.array_equal(gotA, expA), (cols, T, gotA[:8], expA[:8])
 
 
 @pytest.mark.parametrize("cols", [32, 64, 128])
 @pytest.mark.parametrize("T", [1, 2, 5])
 def test_pipe_axpy_single(cols, T):
-    _run_pipe(cols, T, seed=100 + cols + T, dual=False)
-
-
-@pytest.mark.parametrize("cols", [32, 128])
-@pytest.mark.parametrize("T", [2, 5])
-def test_pipe_axpy_dual_qn(cols, T):
-    _run_pipe(cols, T, seed=300 + cols + T, dual=True, qn=1)
+    _run_pipe(cols, T, seed=100 + cols + T)
 
 
 def test_pipe_axpy_no_gaps():
     # Dense stream: the minimum two-beat distance between same-bank updates at cols=32.
-    _run_pipe(32, 5, seed=7, dual=False, gaps=False)
+    _run_pipe(32, 5, seed=7, gaps=False)

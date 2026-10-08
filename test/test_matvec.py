@@ -22,7 +22,7 @@ from trixium.gateware.hbm_model import BonsaiHBMChannelModel, words_from_bytes
 
 class _EngineDUT(Module):
     def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
-                 dual=True, xbuf_groups=32, reorder_ids=0):
+                 xbuf_groups=32, reorder_ids=0):
         # latency/stall_rate may be a per-channel list: real HBM channels do not respond in
         # lockstep, and several engine bugs only appear once the readers desynchronize.
         lat = latency if isinstance(latency, (list, tuple)) else [latency]*n_channels
@@ -31,7 +31,7 @@ class _EngineDUT(Module):
                 for _ in range(n_channels)]
         self.submodules.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
         self.submodules.engine     = BonsaiMatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=xbuf_groups, dual=dual)
+                                                        xbuf_groups=xbuf_groups)
         for i, axi in enumerate(axis):
             model = BonsaiHBMChannelModel(axi, size=64*1024,
                 init=words_from_bytes(chan_payloads[i]), latency=lat[i], stall_rate=stl[i],
@@ -71,8 +71,7 @@ def _run_engine(dut, cmd, n_results, dst, absmax=False):
     arr = np.array(results, dtype=np.int64)
     return (arr, extra["absmax"]) if absmax else arr
 
-def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed,
-                  dual=True):
+def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed):
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
     G      = cols//layout.GROUP_TERNARY
@@ -95,7 +94,7 @@ def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed,
     xsrc, dst = 0, 0x4000
     sp_init   = words_from_bytes(x8.tobytes())
 
-    dut = _EngineDUT(n_channels, payloads, sp_init, latency, stall_rate, dual=dual)
+    dut = _EngineDUT(n_channels, payloads, sp_init, latency, stall_rate)
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
@@ -120,50 +119,10 @@ def test_matvec_ternary_n4_gather_pressure():
     # boot hang of 2026-07-30).
     _case_ternary(n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=9)
 
-def test_matvec_ternary_dual_x():
-    # S6 enabler: one ternary weight stream verifies two speculated tokens (qn=1, two x
-    # vectors word-interleaved in the x-buffer via its second read port). Chan-major dsts,
-    # head B at dst + 4*qstride; bit-exact vs two independent references.
-    cols, seed = 256, 91
-    for (n_channels, rows_per_chan), lat in [((2, 4), 8), ((4, 3), 8),
-                                             ((2, 4), 2), ((4, 6), 2)]:
-        rng    = np.random.default_rng(seed + n_channels)
-        M      = n_channels*rows_per_chan
-        G      = cols//layout.GROUP_TERNARY
-        scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
-        codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
-        xa     = rng.integers(-127, 128, cols, dtype=np.int8)
-        xb     = rng.integers(-127, 128, cols, dtype=np.int8)
-
-        _, e16 = bx.fp16_decompose(scales)
-        B = bx.choose_scale_bias(e16)
-        R = bx.choose_result_shift(scales, B)
-        exp_a = bx.matvec_ternary(scales, codes, xa, B, R)
-        exp_b = bx.matvec_ternary(scales, codes, xb, B, R)
-
-        spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
-                          scales=scales, values=codes)
-        payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
-                    for c in range(n_channels)]
-
-        qstride = 64
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(xa.tobytes() + xb.tobytes()),
-                         lat, 0)
-        cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
-                   wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
-                   sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
-                   cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
-                   bias=B, rshift=R, xsrc=0, dst=0x4000, qn=1, qstride=qstride)
-        got = _run_engine(dut, cmd, qstride + M, 0x4000)
-        assert np.array_equal(got[:M], exp_a), f"N={n_channels} head A"
-        assert np.array_equal(got[qstride:qstride + M], exp_b), f"N={n_channels} head B"
-
 def test_matvec_slim_no_dual():
-    # Hardware builds without the head-B datapath (--with-dual off): the engine is half
-    # the area and every non-qn op must be bit-identical. Ternary + Q8 + striped/ilv
-    # scores + AXPY, all with dual=False.
+    # Ternary + Q8 + striped/ilv scores + AXPY on one engine configuration.
     _case_ternary(n_channels=4, rows_per_chan=8, cols=256, latency=8, stall_rate=2,
-                  seed=31, dual=False)
+                  seed=31)
 
     cols, T, n_channels, seed = 128, 6, 2, 33
     rng    = np.random.default_rng(seed)
@@ -183,7 +142,7 @@ def test_matvec_slim_no_dual():
         payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
     maxlen = max(len(p) for p in payloads)
     payloads = [p.ljust(maxlen, b"\0") for p in payloads]
-    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0, dual=False)
+    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0)
     rb  = layout.row_beats(cols, layout.KIND_Q8)
     cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                sbeats=layout.scale_beats(cols, layout.KIND_Q8),
@@ -212,7 +171,7 @@ def test_matvec_slim_no_dual():
     payloads = [p.ljust(maxlen, b"\0") for p in payloads]
     expected = np.concatenate(expected)
     dut = _EngineDUT(n_channels, payloads, words_from_bytes(p8.tobytes().ljust(32, b"\0")),
-                     8, 0, dual=False)
+                     8, 0)
     rb  = layout.row_beats(cols, layout.KIND_Q8)
     cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                sbeats=layout.scale_beats(cols, layout.KIND_Q8),
@@ -520,55 +479,6 @@ def test_matvec_q8_striped_interleave():
         got = _run_engine(dut, cmd, T, 0x4000)
         assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
 
-def test_matvec_q8_dual_head():
-    # Dual-Q GQA scores: one K stream serves two Q-heads (qn=1). x holds both vectors
-    # contiguously (head B at xsrc + cols); results land position-major per head, head B
-    # offset by qstride words. Bit-exact vs two independent matvec_q8 references.
-    cols, seed = 128, 57
-    # 8 channels is the shipping configuration; T=9,10,17 are the ragged cases (rows>=1
-    # with rem>=1) where the card's sequencer attention wedges.
-    for (n_channels, T), lat in [((2, 5), 8), ((2, 8), 8), ((4, 3), 8), ((4, 9), 8),
-                                 ((2, 8), 2), ((4, 9), 2),
-                                 ((8, 8), 8), ((8, 9), 8), ((8, 10), 8), ((8, 17), 8),
-                                 ((8, 9), 2), ((8, 17), 2)]:
-        rng    = np.random.default_rng(seed + 16*n_channels + T)
-        scales = rng.uniform(0.005, 0.02, (T, cols//layout.GROUP_Q8)).astype(np.float16)
-        q8w    = rng.integers(-127, 128, (T, cols), dtype=np.int8)
-        xa     = rng.integers(-127, 128, cols, dtype=np.int8)
-        xb     = rng.integers(-127, 128, cols, dtype=np.int8)
-
-        _, e16 = bx.fp16_decompose(scales)
-        B = bx.choose_scale_bias(e16)
-        R = bx.choose_result_shift(scales, B, gs_max=bx.GS_MAX_Q8)
-        exp_a = bx.matvec_q8(scales, q8w, xa, B, R)
-        exp_b = bx.matvec_q8(scales, q8w, xb, B, R)
-
-        rows, rem = T//n_channels, T % n_channels
-        payloads = []
-        for c in range(n_channels):
-            pos = [t for t in range(T) if t % n_channels == c]
-            spec_c = TensorSpec("kv", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
-                                max(len(pos), 1), cols,
-                                scales=scales[pos] if pos else scales[:1],
-                                values=q8w[pos] if pos else q8w[:1])
-            payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes() if pos else b"")
-        maxlen = max(len(p) for p in payloads)
-        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
-
-        qstride = 64 # Head-B result offset in words.
-        x_init  = xa.tobytes() + xb.tobytes()
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), lat, 0)
-        rb  = layout.row_beats(cols, layout.KIND_Q8)
-        cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
-                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
-                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
-                   bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1,
-                   qn=1, qstride=qstride)
-        got = _run_engine(dut, cmd, qstride + T, 0x4000)
-        assert np.array_equal(got[:T], exp_a), f"N={n_channels} T={T} head A"
-        assert np.array_equal(got[qstride:qstride + T], exp_b), \
-            f"N={n_channels} T={T} head B"
-
 def test_engine_axpy():
     # Weighted-V: kind-4 op accumulates p8-weighted V rows per lane; each channel emits
     # cols partial sums (chan-major), bit-exact vs bx.axpy_rows on its position stripe.
@@ -673,58 +583,6 @@ def test_engine_axpy_xred():
         # whose absmax is not the absmax of their sum.
         assert got[1] == int(np.abs(expected.astype(np.int64)).max()), \
             f"xred absmax N={n_channels} T={T}"
-
-def test_engine_axpy_dual_head():
-    # Dual-Q GQA weighted-V: one V stream serves two heads' AXPYs (qn=1). p8 vectors
-    # contiguous at xsrc (head B at +pad32(T)); per-head Rpre via rshift/rshift2; head B
-    # partials land at dst + 4*qstride. Bit-exact vs two independent axpy_rows refs.
-    cols, seed = 64, 67
-    for n_channels, T in [(2, 3), (2, 8), (4, 5), (8, 9), (8, 17)]:
-        rng = np.random.default_rng(seed + 16*n_channels + T)
-        ev  = rng.integers(-9, -4, T)
-        scales = np.array([[2.0**int(e)]*(cols//32) for e in ev], dtype=np.float16)
-        v8  = rng.integers(-127, 128, (T, cols), dtype=np.int8)
-        p8a = rng.integers(1, 128, T, dtype=np.int8)
-        p8b = rng.integers(1, 128, T, dtype=np.int8)
-
-        _, e16 = bx.fp16_decompose(scales)
-        B     = 12 - int(e16.max())
-        Rpre_a = bx.axpy_rpre(int(p8a.astype(np.int64).sum()))
-        Rpre_b = bx.axpy_rpre(int(p8b.astype(np.int64).sum()) + 1000) # Force different Rpre.
-
-        rows, rem = T//n_channels, T % n_channels
-        payloads, exp_a, exp_b = [], [], []
-        for c in range(n_channels):
-            pos = [t for t in range(T) if t % n_channels == c]
-            if pos:
-                spec_c = TensorSpec("v", layout.ROLE_ATTN_Q, 0, layout.KIND_Q8,
-                                    len(pos), cols, scales=scales[pos], values=v8[pos])
-                payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
-                exp_a.append(bx.axpy_rows(scales[pos], v8[pos], p8a[pos], B, Rpre_a))
-                exp_b.append(bx.axpy_rows(scales[pos], v8[pos], p8b[pos], B, Rpre_b))
-            else:
-                payloads.append(b"")
-                exp_a.append(np.zeros(cols, dtype=np.int32))
-                exp_b.append(np.zeros(cols, dtype=np.int32))
-        maxlen   = max(len(p) for p in payloads)
-        payloads = [p.ljust(maxlen, b"\0") for p in payloads]
-        exp_a, exp_b = np.concatenate(exp_a), np.concatenate(exp_b)
-
-        # Words; must cover the n_channels*cols head-A partials, so it has to scale with the
-        # channel count - a fixed 256 silently overlapped the two heads at 8 channels.
-        qstride = n_channels*cols
-        x_init  = p8a.tobytes().ljust(32, b"\0") + p8b.tobytes().ljust(32, b"\0")
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
-        rb  = layout.row_beats(cols, layout.KIND_Q8)
-        cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
-                   sbeats=layout.scale_beats(cols, layout.KIND_Q8),
-                   cbeats=layout.code_beats(cols, layout.KIND_Q8),
-                   bias=B, rshift=Rpre_a, rshift2=Rpre_b, qn=1, qstride=qstride,
-                   xsrc=0, dst=0x4000, rem=rem)
-        got = _run_engine(dut, cmd, qstride + n_channels*cols, 0x4000)
-        assert np.array_equal(got[:n_channels*cols], exp_a), f"N={n_channels} T={T} head A"
-        assert np.array_equal(got[qstride:qstride + n_channels*cols], exp_b), \
-            f"N={n_channels} T={T} head B"
 
 def test_engine_argmax_tap_and_suppress():
     # Argmax tap: value + global index (ties to smallest index) over a suppressed-write
@@ -2773,7 +2631,7 @@ def test_matvec_packed_writes():
         payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
                     for c in range(n_channels)]
         dst = 0x4000
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0, dual=False)
+        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0)
         cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                    wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                    sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),

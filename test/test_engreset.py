@@ -63,7 +63,7 @@ class _DUT(LiteXModule):
         self.scratchpad = BonsaiScratchpad(size=64*1024, init=sp_init)
         self.engrst = BonsaiEngineResetDomain(axis, hold_cycles=16, stuck_cycles=4000)
         self.engine = ClockDomainsRenamer("eng")(
-            BonsaiMatVecEngine(self.scratchpad, self.engrst.masters, dual=False))
+            BonsaiMatVecEngine(self.scratchpad, self.engrst.masters))
         self.loader = ClockDomainsRenamer("eng")(BonsaiHBMLoader(self.engrst.masters))
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
