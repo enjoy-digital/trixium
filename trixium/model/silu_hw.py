@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Bit-level model of the hardware SiLU-multiply kernel, and its exactness contract.
 
 The firmware's hybrid path computes `dst[i] = mul[i] * siluf(gate[i])` (hybrid.c
@@ -39,7 +44,7 @@ F32_NEG_ZERO = 0x80000000
 LUT_N = 4096          # 2 * 16 * 128 intervals, 4,097 points
 
 
-# Exact binary32 <-> (sign, integer significand, power of two) -------------------------------
+# Exact binary32 <-> (sign, integer significand, power of two) -------------------------------------
 
 def decode(bits):
     """(sign, N, E, kind) with value (-1)**sign * N * 2**E; kind in normal/subnormal/zero/inf/nan."""
@@ -127,7 +132,7 @@ def bits_f32(b):
     return np.uint32(b).view(np.float32)
 
 
-# Tables -------------------------------------------------------------------------------------
+# Tables -------------------------------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def tables():
@@ -138,7 +143,7 @@ def tables():
     return lut, dlut
 
 
-# The two sides of the contract ---------------------------------------------------------------
+# The two sides of the contract --------------------------------------------------------------------
 
 def silu_mul_firmware(g, m):
     """What hybrid.c computes for finite inputs: mul * siluf(gate), as bits."""
@@ -190,7 +195,7 @@ def silu_mul_fast(g, m, lut=None, dlut=None):
     return r, False
 
 
-# The RTL's arithmetic structure --------------------------------------------------------------
+# The RTL's arithmetic structure -------------------------------------------------------------------
 #
 # In the table range the FP32 sum a = RNE(g + 16) is always a multiple of 2**-20: on
 # [16, 32) the binary32 grid is 2**-19, on [8, 16) it is 2**-20, and below 8 (g in

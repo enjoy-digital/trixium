@@ -24,13 +24,17 @@ Requires pyserial and tokenizers (`pip install -e .` from the repository root).
 
 import re
 import time
+import fcntl
+
+# Constants ----------------------------------------------------------------------------------------
 
 DEFAULT_TTY       = "/dev/ttyLXU0"
 DEFAULT_TOKENIZER = "models/1.7b/tokenizer.json"
 PROMPT            = b"trixium> "
-PBUF_TOKENS       = 2048       # firmware/main.c PBUF_N: the on-card conversation buffer (= max_ctx).
-LINE_MAX          = 850        # Firmware console line buffer is 1024 B; leave slack.
+PBUF_TOKENS       = 2048  # firmware/main.c PBUF_N: the on-card conversation buffer (= max_ctx).
+LINE_MAX          = 850   # Firmware console line buffer is 1024 B; leave slack.
 
+# TriXium Client -----------------------------------------------------------------------------------
 
 class TriXiumError(RuntimeError):
     pass
@@ -47,7 +51,6 @@ class TriXium:
         from tokenizers import Tokenizer
         self.ser = serial.Serial(tty, 115200, timeout=0.05)
         # One console session at a time (see tools/pcie_console.py): advisory lock on the tty.
-        import fcntl
         try:
             fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -65,7 +68,7 @@ class TriXium:
         if temperature or top_p != 1.0 or repeat_penalty != 1.0 or seed:
             self.set_sampling(temperature, top_p, repeat_penalty, seed)
 
-    # -- console -------------------------------------------------------------------------------
+    # Console --------------------------------------------------------------------------------------
 
     def close(self):
         self.ser.close()
@@ -100,8 +103,8 @@ class TriXium:
     # console loop drains one byte per iteration and echoes each through a TX ring the host
     # driver empties on a poll timer. A long `tok` line written in one burst loses characters
     # (two ids merge into one past the vocabulary -> the engine fetches a row that does not
-    # exist -> ENGSTALL, reconfigure the FPGA; 2026-09-11). So lines go out in chunks, each
-    # acknowledged by its echo, byte for byte, before the next.
+    # exist -> ENGSTALL, reconfigure the FPGA). So lines go out in chunks, each acknowledged by
+    # its echo, byte for byte, before the next.
     PACE_CHUNK = 48
 
     def _write_paced(self, data):
@@ -140,7 +143,7 @@ class TriXium:
     def stats(self, reset=False):
         return self.command("stats reset" if reset else "stats")
 
-    # -- generation ----------------------------------------------------------------------------
+    # Generation -----------------------------------------------------------------------------------
 
     def reset(self):
         """Clear the on-card conversation."""
@@ -197,10 +200,10 @@ class TriXium:
             pending += chunk.decode(errors="replace")
             if "GEN DONE" in pending:
                 done = True
-            # Token ids stream after "GEN:" as " %d" pieces. Take only digit runs that
-            # sit between separators (a stray firmware message inside the stream once
-            # contributed its "(14 descriptors)" as a token; the anchored form then
-            # dropped every id after the message).
+            # Token ids stream after "GEN:" as " %d" pieces. Take only digit runs that sit
+            # between separators: a stray firmware message inside the stream must neither
+            # contribute its numbers (e.g. "(14 descriptors)") as tokens nor hide the ids
+            # that follow it.
             if "GEN:" in pending:
                 seg = pending.split("GEN:", 1)[1].split("GEN DONE", 1)[0]
                 ids = [int(t) for t in re.findall(r"(?:^|(?<=[ \r\n]))(\d+)(?=[ \r\n]|$)", seg)]

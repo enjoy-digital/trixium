@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Board-independent sequencer descriptor encoding; not a model execution profile."""
 
 

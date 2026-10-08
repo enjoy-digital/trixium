@@ -35,27 +35,31 @@ from litex.gen import *
 from litex.gen.genlib.misc import *
 
 from litex.build.io import CRG
+from litex.build.generic_platform import Pins, Subsignal
 from litex.build.sim.config import SimConfig
 from litex.tools.litex_sim import Platform
 
+from litex.soc.cores.cpu.vexiiriscv.core import VexiiRiscv
 from litex.soc.integration.common import *
 from litex.soc.integration.soc_core import SoCCore
 from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.builder import Builder
-
 from litex.soc.interconnect.axi import AXIInterface
 
+from litedram.modules import MT40A512M8
+from litedram.phy.model import SDRAMPHYModel
+
+from trixium.layout import HDR_CPU_OFFSET
+from trixium.core.core import TriXiumConfig, TriXiumCore
+from trixium.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
 from trixium.model.bons import BONSReader
 
 # Constants ----------------------------------------------------------------------------------------
 
 MAIN_RAM_BASE = 0x4000_0000
-MAIN_RAM_SIZE = 0x0080_0000 # 8 MB.
-from trixium.layout import HDR_CPU_OFFSET
+MAIN_RAM_SIZE = 0x0080_0000    # 8 MB.
 HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared with hardware).
-
-# SimSoC -------------------------------------------------------------------------------------
 
 # The DDR4 flavour of the sim (--mem ddr4): the XCU1525's memory plumbing on LiteDRAM's PHY
 # model - main_ram on controller 0 through the BIOS's own sdram_init(), the engine channels
@@ -65,15 +69,18 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 # reference as the HBM-model sim. Sizes: main_ram is 8 MB (0..8 MB of controller 0), the
 # windows start at 12 MB so the header staging area (window - 1 MB) and the round-trip test
 # (window - 2 MB) stay above main_ram; 4 MB per window holds the tiny payload and its KV.
-DDR4_SIM_WEIGHT_BASE = 0x00C0_0000  # 12 MB.
-DDR4_SIM_CHAN_STRIDE = 0x0040_0000  # 4 MB.
-DDR4_SIM_CHAN_SKEW   = 0xA000       # 40 KB: a bank skew IN THE SIM'S GEOMETRY (ncols 128 puts the
-                                    # bank bits at byte bits 10..13, so the board's 32 KB would be
-                                    # a row bit here); the address arithmetic is what the gate checks.
-DDR4_SIM_CSR_WINDOW  = 0xF0020000   # --ddr-split: the target's DDR_CSR_WINDOW.
-DDR_SPLIT_CLK_RATIO  = 2            # --ddr-split: ddr clock / sys clock in the simulation.
-DDR4_SIM_CSR_PAGE0   = 8            # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
+# The channel skew is a bank skew IN THE SIM'S GEOMETRY (ncols 128 puts the bank bits at byte
+# bits 10..13, so the board's 32 KB would be a row bit here); the address arithmetic is what
+# the gate checks.
+DDR4_SIM_WEIGHT_BASE = 0x00C0_0000 # 12 MB.
+DDR4_SIM_CHAN_STRIDE = 0x0040_0000 # 4 MB.
+DDR4_SIM_CHAN_SKEW   = 0xA000      # 40 KB.
+DDR4_SIM_CSR_WINDOW  = 0xF0020000  # The target's DDR_CSR_WINDOW.
+DDR_SPLIT_CLK_RATIO  = 2           # ddr clock / sys clock in the simulation.
+DDR4_SIM_CSR_PAGE0   = 8           # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
+
+# TriXiumSimSoC ------------------------------------------------------------------------------------
 
 class TriXiumSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
@@ -106,14 +113,12 @@ class TriXiumSimSoC(SoCCore):
         # hold the hot loop, and the PC profiler measures ~49% of CPU cycles retiring nothing.
         # 64 sets x 4 ways x 64 B lines = 16 KB, which covers forward() with room to spare.
         if cpu_type == "vexiiriscv":
-            import argparse as _ap
-            from litex.soc.cores.cpu.vexiiriscv.core import VexiiRiscv
             # VexiiRiscv reads a pile of class attributes (soc_args, soc_keys, update_repo,
             # vexii_args, ...) that LiteX normally populates from its CLI. Constructing
             # SoCCore directly bypasses that, so drive the real API with a defaults-only
             # parser instead of hand-setting attributes - hand-setting works until the next
             # LiteX bump adds a key, and then fails as an AttributeError deep in codegen.
-            _p = _ap.ArgumentParser()
+            _p = argparse.ArgumentParser()
             VexiiRiscv.args_fill(_p)
             _va = _p.parse_args([])
             _va.cpu_variant = "standard"
@@ -123,23 +128,22 @@ class TriXiumSimSoC(SoCCore):
             # so "--with-rvf" gives an FPU the firmware actually uses.
             _va.vexii_args  = vexii_extra
             VexiiRiscv.args_read(_va)
-            # LiteX builds --with-isa from a set, whose process-random iteration order used
-            # to give the same CPU a different netlist hash on successive runs and needlessly
-            # invoke SBT again.  Canonicalise only that comma list; the option order remains
-            # otherwise untouched.
+            # LiteX builds --with-isa from a set, whose process-random iteration order gives
+            # the same CPU a different netlist hash on successive runs and needlessly invokes
+            # SBT again. Canonicalise only that comma list; the option order remains otherwise
+            # untouched.
             _canon = []
             for _arg in VexiiRiscv.vexii_args.split():
                 if _arg.startswith("--with-isa="):
                     _arg = "--with-isa=" + ",".join(sorted(_arg.split("=", 1)[1].split(",")))
                 _canon.append(_arg)
             VexiiRiscv.vexii_args = " ".join(_canon)
-            # Now override just the fetch cache. 64 sets x 4 ways x 64 B = 16 KB, against a
-            # 12 KB forward() that a 4 KB VexRiscv cache cannot hold.
+            # Now override just the fetch cache.
             sets = max(16, (icache_kb*1024)//(4*64)) if icache_kb else 64
             VexiiRiscv.vexii_args = (VexiiRiscv.vexii_args
                                      .replace("--fetch-l1-ways=2", "--fetch-l1-ways=4")
                                      + f" --fetch-l1-sets={sets}")
-            print(f"[bonsai] VexiiRiscv args: {VexiiRiscv.vexii_args}")
+            print(f"[trixium] VexiiRiscv args: {VexiiRiscv.vexii_args}")
 
         SoCCore.__init__(self, platform,
             clk_freq                 = int(1e6),
@@ -153,8 +157,6 @@ class TriXiumSimSoC(SoCCore):
         if ddr_split:
             # The controllers in their own `ddr` domain on a second sim clock
             # (DDR_SPLIT_CLK_RATIO x sys), as on the XCU1525.
-            from litex.build.generic_platform import Pins
-            from migen.genlib.resetsync import AsyncResetSynchronizer
             platform.add_extension([("ddr_clk", 0, Pins(1))])
             self.cd_ddr = ClockDomain()
             self.comb += self.cd_ddr.clk.eq(platform.request("ddr_clk"))
@@ -165,7 +167,6 @@ class TriXiumSimSoC(SoCCore):
         # for the Perfetto timeline. A pad, not __PVT__ names: Verilator's internal names are
         # not a stable contract (__PVT__vecunit_busy is already folded away in this build),
         # while requested pads are emitted verbatim.
-        from litex.build.generic_platform import Subsignal, Pins
         platform.add_extension([("prof", 0,
             Subsignal("eng_busy", Pins(1)),
             Subsignal("vec_busy", Pins(1)),
@@ -196,7 +197,6 @@ class TriXiumSimSoC(SoCCore):
         else:
             chan_mod = self._add_ddr4(n_channels, n_memctrl, ram, img, axis)
         # Same integration as both hardware targets; only memory/physical policy differs.
-        from trixium.core.core import TriXiumConfig, TriXiumCore
         config = TriXiumConfig(with_sp_csr=False,
             chan_stride=DDR4_SIM_CHAN_STRIDE if mem == "ddr4" else 0,
             chan_mod=chan_mod, chan_skew=DDR4_SIM_CHAN_SKEW if mem == "ddr4" else 0,
@@ -231,7 +231,7 @@ class TriXiumSimSoC(SoCCore):
         else:
             # The XCU1525's geometry, scaled to the tiny model: the same constants the
             # firmware reads on the board (TRIXIUM_CHAN_MOD, TRIXIUM_MEM_CPU_OFFSET,
-            # TRIXIUM_N_MEMCTRL, TRIXIUM_DDR_CSR_STRIDE) with 2 MB windows from 12 MB.
+            # TRIXIUM_N_MEMCTRL, TRIXIUM_DDR_CSR_STRIDE) with 4 MB windows from 12 MB.
             self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", DDR4_SIM_WEIGHT_BASE)
             self.add_constant("TRIXIUM_CHAN_STRIDE",      DDR4_SIM_CHAN_STRIDE)
             self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
@@ -246,17 +246,13 @@ class TriXiumSimSoC(SoCCore):
 
     def _add_ddr4(self, n_channels, n_memctrl, ram, img, axis):
         """The XCU1525's memory system on LiteDRAM's PHY model; returns chan_mod."""
-        from litedram.modules import MT40A512M8
-        from litedram.phy.model import SDRAMPHYModel
-        from litedram.frontend.axi import LiteDRAMAXI2Native
-
         assert n_channels % n_memctrl == 0, "channels shard evenly over the controllers"
         chan_mod = n_channels//n_memctrl
         assert chan_mod & (chan_mod - 1) == 0
 
         class _SimDDR4(MT40A512M8):
             # The board's part with 2048 rows x 128 columns: 32 MB per x64 controller, enough
-            # for main_ram (8 MB) and up to four 2 MB windows from 12 MB, small enough to
+            # for main_ram (8 MB) and up to four 4 MB windows from 12 MB, small enough to
             # initialise from Python and hold in the verilated memory. (The PHY model needs
             # at least 11 address bits for the A10 precharge-all decode: rows, not columns.)
             nrows = 2048
@@ -283,10 +279,8 @@ class TriXiumSimSoC(SoCCore):
             module = _SimDDR4(int(100e6), "1:4") # 100 MHz timings, as litex_sim does.
             phy = SDRAMPHYModel(module=module, data_width=64, clk_freq=int(100e6), init=words)
             split_phys.append(phy); split_modules.append(module)
-        from trixium.memory.ddr import add_ddr_domain_controllers
         add_ddr_domain_controllers(self, split_phys, split_modules, int(100e6), MAIN_RAM_SIZE,
                                    8192, DDR4_SIM_CSR_WINDOW)
-        from trixium.memory.ddr import engine_ddr_port
         for k in range(n_memctrl):
             core = self.sdrams[k]
             for j in range(chan_mod):
@@ -295,7 +289,7 @@ class TriXiumSimSoC(SoCCore):
                 for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port")):
                     setattr(self, f"engport{c}_{jj}", m)
                 axis.append(axi)
-        # VexiiRiscv enforces execute permission from region.mode (the FK33 target's lesson).
+        # VexiiRiscv builds its memory map from region.mode and enforces execute permission.
         for _rn, _r in self.bus.regions.items():
             if _r.origin == MAIN_RAM_BASE and not _r.linker:
                 _r.mode = "rwx"
@@ -320,19 +314,19 @@ def main():
     from trixium.migen_fast import install as install_migen_fast
     install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
-    parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS), help="Hardware to mirror.")
-    parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img", help="BONS image to bake in.")
-    parser.add_argument("--firmware",       default="firmware/trixium.bin", help="Firmware binary to bake in.")
-    parser.add_argument("--build-software", action="store_true", help="Generate headers + BIOS only (to build the firmware against).")
-    parser.add_argument("--run",            action="store_true", help="Build and run the simulation.")
-    parser.add_argument("--out-dir",        default=None,  help="Build directory (default: build/sim_<board>).")
-    parser.add_argument("--cpu-type",       default=None,  choices=["vexriscv", "vexiiriscv"], help="Override the board's CPU (vexriscv: the PC profiler).")
-    parser.add_argument("--update-repo",    default="no",  choices=["no", "recommended", "latest"], help="VexiiRiscv source update policy.")
-    parser.add_argument("--pc-profile",     action="store_true", help="Compile the VexRiscv PC profiler in (sim_pc_profiler.cpp).")
-    parser.add_argument("--trace",          action="store_true", help="Enable FST tracing.")
-    parser.add_argument("--hbm-latency",    default=16, type=int, help="--board fk33: HBM model read latency.")
-    parser.add_argument("--hbm-stall-rate", default=0,  type=int, help="--board fk33: HBM model stall rate.")
-    parser.add_argument("--threads",        default=4,  type=int, help="Verilator threads.")
+    parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS),              help="Hardware to mirror.")
+    parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img",     help="BONS image to bake in.")
+    parser.add_argument("--firmware",       default="firmware/trixium.bin",                         help="Firmware binary to bake in.")
+    parser.add_argument("--build-software", action="store_true",                                    help="Generate headers + BIOS only (to build the firmware against).")
+    parser.add_argument("--run",            action="store_true",                                    help="Build and run the simulation.")
+    parser.add_argument("--out-dir",        default=None,                                           help="Build directory (default: build/sim_<board>).")
+    parser.add_argument("--cpu-type",       default=None, choices=["vexriscv", "vexiiriscv"],      help="Override the board's CPU (vexriscv: the PC profiler).")
+    parser.add_argument("--update-repo",    default="no", choices=["no", "recommended", "latest"], help="VexiiRiscv source update policy.")
+    parser.add_argument("--pc-profile",     action="store_true",                                    help="Compile the VexRiscv PC profiler in (sim_pc_profiler.cpp).")
+    parser.add_argument("--trace",          action="store_true",                                    help="Enable FST tracing.")
+    parser.add_argument("--hbm-latency",    default=16, type=int,                                   help="--board fk33: HBM model read latency.")
+    parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                   help="--board fk33: HBM model stall rate.")
+    parser.add_argument("--threads",        default=4,  type=int,                                   help="Verilator threads.")
     args = parser.parse_args()
     out_dir = args.out_dir or f"build/sim_{args.board}"
     board   = dict(BOARDS[args.board])
@@ -356,9 +350,9 @@ def main():
 
     soc     = TriXiumSimSoC(image=args.image, firmware=args.firmware, **soc_kwargs)
     builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
-    # --pc-profile compiles trixium/targets/sim_pc_profiler.cpp into the verilated binary, where it overrides
+    # --pc-profile compiles sim_pc_profiler.cpp into the verilated binary, where it overrides
     # LiteX's weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the
-    # VexRiscv retired PC every cycle. That is the only way to attribute the ~69% of a token
+    # VexRiscv retired PC every cycle. That is the only way to attribute the part of a token
     # in which neither the engine nor the vector unit is busy; perf_print's buckets are
     # op-class wall time that already contains the CPU glue.
     #

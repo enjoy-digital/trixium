@@ -16,12 +16,14 @@ blocks in a different (deterministic) order.
 Call :func:`install` once, before the SoC is converted; the targets and the simulation do.
 """
 
-import collections
 import heapq
+import collections
 
-from litex.gen.fhdl import verilog
 from migen.fhdl import tools as fhdl_tools
 
+from litex.gen.fhdl import verilog
+
+# Topological Sort ---------------------------------------------------------------------------------
 
 def linear_topological_sort(targets, deps, ns):
     """Return dependency-first targets, or ``None`` when the graph has a cycle."""
@@ -48,6 +50,7 @@ def linear_topological_sort(targets, deps, ns):
                 heapq.heappush(heap, (ns.get_name(user), id(user), user))
     return ordered if len(ordered) == len(targets) else None
 
+# Group By Targets ---------------------------------------------------------------------------------
 
 def linear_group_by_targets(statements):
     """Group statements into target-sharing connected components in source order."""
@@ -87,8 +90,10 @@ def linear_group_by_targets(statements):
         result.append((targets, [flat[index] for index in sorted(indices)]))
     return result
 
+# Install ------------------------------------------------------------------------------------------
 
 def install():
+    """Replace the quadratic steps in Migen/LiteX with the linear-time versions above."""
     verilog._topological_sort_targets = linear_topological_sort
     verilog.group_by_targets          = linear_group_by_targets
     fhdl_tools.group_by_targets       = linear_group_by_targets

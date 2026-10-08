@@ -15,10 +15,13 @@ streams, so golden results computed from it are bit-faithful to what the engine 
 
 import json
 import zlib
+import struct
 
 import numpy as np
 
 from trixium import layout
+from trixium.model import bitexact as bx
+from trixium.model.golden import hadamard_restore, rope_tables
 from trixium.layout import BONS_NAME_BYTES
 from trixium.layout import (
     BEAT_BYTES, GROUP_TERNARY, GROUP_Q8, SCALES_PER_BEAT,
@@ -48,15 +51,14 @@ class TensorSpec:
         self.flags  = flags
         self.kseg   = kseg          # K-segment index (with FLAG_KSEG), see layout.FLAG_KSEG.
         # loader: a callable returning `values` on demand, for the streaming writer - the
-        # 1.7B's codes are 1.7 GB and the whole image another 1.1, and the old writer held
-        # both plus every temporary (14.5 GB peak); the 8B could not convert at all.
+        # 1.7B's codes are 1.7 GB and the whole image another 1.1, so holding both plus every
+        # temporary does not scale (the 8B would not convert at all).
         self.loader = loader
         if kind in (KIND_TERNARY, KIND_Q8):
             group = layout.KIND_GROUP[kind]
             assert cols % group == 0
             assert scales.shape == (rows, cols//group), (name, scales.shape)
             # Per-tensor accumulator scale bias / result shift (bitexact contract).
-            from trixium.model import bitexact as bx
             _, e16      = bx.fp16_decompose(np.asarray(scales, dtype=np.float16))
             gs_max      = bx.GS_MAX if kind == KIND_TERNARY else bx.GS_MAX_Q8
             self.bias   = bx.choose_scale_bias(e16)
@@ -176,7 +178,6 @@ def decode_rows(spec_entry, payload):
 # Writer -------------------------------------------------------------------------------------------
 
 def embed_bfp_rows(spec):
-    from trixium.model import bitexact as bx
     """Every embedding row in the firmware's int16 BFP form: (mantissas int16 (rows, cols),
     exponents int32 (rows,)). Vectorized transcription of embed_row_bfp (firmware/infer.c)
     and the sim reference embed_bfp_int (test_sim_smoke.py): per group g the fp16 scale
@@ -220,7 +221,6 @@ def restored_bfp_rows(scales, codes, signs, hblock):
     """A rotated embedding block (PrismML's basis) dequantized, restored to the plain basis
     (e = s * (R z), golden.hadamard_restore) and quantized to the firmware's int16 BFP rows:
     per row the exponent puts the absmax in [2^14, 2^15), mantissas rounded to nearest."""
-    from trixium.model.golden import hadamard_restore
     rows, cols = codes.shape
     G = cols//layout.GROUP_TERNARY
     z = (codes.astype(np.float32).reshape(rows, G, layout.GROUP_TERNARY) - 1.0) \
@@ -299,7 +299,6 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
     # halves (Q14 absorbs YaRN's mscale > 1), computed with golden.rope_tables (float64
     # numpy) - the image is the single source of truth, so the firmware and every mirror
     # use bit-identical tables with no libm coupling.
-    from trixium.model.golden import rope_tables
     if getattr(cfg, "max_ctx", 0) and getattr(cfg, "head_dim", 0):
         cos, sin = rope_tables(cfg, np.arange(cfg.max_ctx), dtype=np.float64)
         tab = np.concatenate([cos, sin], axis=1)
@@ -413,11 +412,10 @@ class _TruncTolerantNames(dict):
 class BONSReader:
     def __init__(self, path):
         self.data   = np.memmap(path, dtype=np.uint8, mode="r")
-        # Explicit even under python -O: v4 is a logical container, never a legacy
-        # channel-major upload image. Do not reinterpret its unrelated offsets.
-        import struct
+        # Explicit even under python -O: never reinterpret the offsets of an image version
+        # this reader does not know.
         if len(self.data) < 8 or struct.unpack_from('<I', self.data, 4)[0] not in layout.BONS_VERSIONS_OK:
-            raise ValueError('legacy BONSReader accepts v2/v3 only; use bons4.Reader for v4')
+            raise ValueError('BONSReader accepts BONS v2/v3 images only')
         self.header = layout.unpack_header(bytes(self.data[:layout.BONS_HEADER_SIZE]))
         self.entries = []
         table_off = self.header["table_offset"]
@@ -445,7 +443,7 @@ class BONSReader:
 
     def entry_channel_bytes(self, e, channel):
         """By entry, not by name: the 24-byte entry names collide (`post_attention_norm.
-        weight` and its `.w16` companion truncate to the same string, 2026-09-18)."""
+        weight` and its `.w16` companion truncate to the same string)."""
         ch = self.channel_payload(channel)
         return ch[e["chan_base_beats"]*BEAT_BYTES:
                   (e["chan_base_beats"] + e["chan_len_beats"])*BEAT_BYTES]

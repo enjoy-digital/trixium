@@ -44,7 +44,7 @@ def q2_0_unpack(raw):
 def q2_0_scales(raw):
     """Raw Q2_0 bytes -> scales float16 (nb,) only - the 2 bytes of every 34, no code
     unpacking. The converter's metadata pass needs the scales (bias/rshift) for every
-    tensor while the codes stream one tensor at a time (2026-09-11)."""
+    tensor while the codes stream one tensor at a time."""
     raw = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) else raw
     assert raw.size % BLOCK_Q2_0 == 0, f"Q2_0 payload not a multiple of {BLOCK_Q2_0} bytes"
     return raw.reshape(-1, BLOCK_Q2_0)[:, 0:2].copy().view(np.float16).reshape(-1)
@@ -81,7 +81,7 @@ def q2_0_dequant(raw):
     scales, codes = q2_0_unpack(raw)
     return ((codes.astype(np.int32) - 1)*scales.astype(np.float32)[:, None]).reshape(-1)
 
-# PTQ1_0 (g128, dense trits) ----------------------------------------------------------------------
+# PTQ1_0 (g128, dense trits) -----------------------------------------------------------------------
 
 QK_PTQ1_0    = 128
 BLOCK_PTQ1_0 = 24 + 2 + 2 # 28 bytes: qs[24] (5 trits each), qh[2] (4 trits each), fp16 scale.
@@ -197,9 +197,8 @@ def q1_0_dequant(raw):
     return (w*scales.astype(np.float32)[:, None]).reshape(-1)
 
 def q1_0_to_ternary_codes(raw):
-    """Bridge for the existing ternary engine: 1-bit weights as ternary codes (0 -> -1 -> code
-    0, 1 -> +1 -> code 2). Stored at 2.125 bpw instead of 1.125 - functional today; a native
-    Q1 unpacker mode (phase 2) halves the streamed bytes."""
+    """Bridge for the ternary engine: 1-bit weights as ternary codes (0 -> -1 -> code 0,
+    1 -> +1 -> code 2). Stored at 2.125 bpw instead of 1.125."""
     scales, bits = q1_0_unpack(raw)
     return scales, (bits.astype(np.uint8)*2)
 
@@ -272,33 +271,3 @@ DEQUANT = {
     GGML_PQ2_0:  q2_0_dequant,
     GGML_PTQ1_0: ptq1_0_dequant,
 }
-
-# Native device row layout ------------------------------------------------------------------------
-#
-# The native weight reader (gateware/native_reader.py) streams 32-byte beats and frames
-# every row on beat boundaries: a row of `groups` blocks occupies ceil(groups*block/32)
-# beats and the tail of its last beat is padding the decoder never looks at. Row offsets
-# and strides must be multiples of 32. This is the device placement contract; the BONS v4
-# artifact itself stays contiguous. Only the FFN-down K-segments of the 27B (68 groups =
-# 1904 bytes, half a beat short) actually gain padding: 0.8% on that tensor.
-
-NATIVE_BEAT = 32
-NATIVE_BLOCK_BYTES = {143: 28, 8: 34}  # GGML type -> bytes per block (PTQ1_0, Q8_0)
-
-def native_row_beats(groups, block_bytes):
-    """Beats one row of `groups` native blocks occupies on the device."""
-    return (groups*block_bytes + NATIVE_BEAT - 1)//NATIVE_BEAT
-
-def native_row_span(groups, block_bytes):
-    """Bytes one row occupies on the device, padding included (the minimum stride)."""
-    return native_row_beats(groups, block_bytes)*NATIVE_BEAT
-
-def pad_native_rows(rows, fill=b'\xa5'):
-    """Concatenate `rows` (bytes objects) padding each to a beat boundary.
-
-    The fill byte is deliberately nonzero: padding must be ignored, not decoded as zero."""
-    out = bytearray()
-    for row in rows:
-        out += row
-        out += fill*((-len(row)) % NATIVE_BEAT)
-    return bytes(out)
