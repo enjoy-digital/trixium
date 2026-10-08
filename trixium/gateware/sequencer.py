@@ -268,15 +268,11 @@ class BonsaiSequencer(LiteXModule):
 
         # # #
 
-        # Explicit names (d0/d1 and the other name='with_*'/'native_pipes' signals below): the
-        # Verilog net names stay those of the v30b board build. Migen's tracer names closure
-        # (cell) variables after unrelated locals on Python 3.10, so these used to come from
-        # constructor parameters that no longer exist.
         dptr   = Signal(13) # Beat index of the current descriptor.
         left   = Signal(16)
         dcount = Signal(16)
-        d0     = Signal(256, name='with_projection_restore')
-        d1     = Signal(256, name='with_embedding_restore')
+        d0     = Signal(256)
+        d1     = Signal(256)
 
         def w(beat, i): # Word i of a captured beat.
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
@@ -429,10 +425,10 @@ class BonsaiSequencer(LiteXModule):
         # (the engine's cmd.ready is an IDLE-state signal, one cycle after done), so the
         # set/clear priority below is safe.
         eng_disp     = Signal()
-        eng_inflight = Signal(name='with_region_fetch')
+        eng_inflight = Signal()
         # Capture target of the IN-FLIGHT op (for the per-register kadd hazard below).
-        infl_cap_en  = Signal(name='with_silu')
-        infl_cap_sel = Signal(2, name='with_norm')
+        infl_cap_en  = Signal()
+        infl_cap_sel = Signal(2)
         self.sync += [
             If(eng_disp & nowait,
                 eng_inflight.eq(1),
@@ -505,10 +501,9 @@ class BonsaiSequencer(LiteXModule):
         cap_d   = Signal(2)
         cap_en  = Signal()
         cap_acc = Signal()
-        cap_sel = Signal(2, name='native_pipes')
+        cap_sel = Signal(2)
         self.sync += [
-            # C(1, 1): the retired native manual-drain gate (unchanged Verilog).
-            cap_d.eq(Cat(self.busy & self.eng_done & C(1, 1), cap_d[0])),
+            cap_d.eq(Cat(self.busy & self.eng_done, cap_d[0])),
             # Latched at the DISPATCH handshake: with NOWAIT the descriptor buffer holds a
             # LATER descriptor when done pulses. Serial lists latch identical values (the
             # buffer does not move during WAIT_ENG).
@@ -559,7 +554,7 @@ class BonsaiSequencer(LiteXModule):
         # d0/d1) and the word select runs off that register a cycle later.
         lut_adr_r  = Signal(13)
         lut_sel_r  = Signal(3)
-        lut_beat_r = Signal(256, name='with_conv')
+        lut_beat_r = Signal(256)
         self.comb += [
             lut_mode.eq((unit == 2) & w(0, 0)[12]),
             lut_base.eq(w(1, 10)[0:13]),
@@ -642,8 +637,7 @@ class BonsaiSequencer(LiteXModule):
         )
         fsm.act("SBDRAIN", # Let every patch posted for this list land before fetching it.
             self.busy.eq(1),
-            # The C(1, 1) terms stand in for retired drain conditions (unchanged Verilog).
-            If(~self.sbw_pending & C(1, 1) & C(1, 1),
+            If(~self.sbw_pending,
                 NextState("FETCH0"),
             ),
         )
@@ -741,12 +735,7 @@ class BonsaiSequencer(LiteXModule):
             ).Elif(unit == 3, *(had_dispatch if with_hadamard else unknown_unit)
             ).Elif(unit == 4, *(quant_dispatch if with_activation_quantize else unknown_unit)
             ).Elif(unit == 5, *(quant_dispatch if with_activation_quantize else unknown_unit)
-            # Units 6, 7, 9 and 10 are retired; their explicit rejects keep the Verilog unchanged.
-            ).Elif(unit == 6, *unknown_unit
-            ).Elif(unit == 7, *unknown_unit
             ).Elif(unit == 8, *(restore_dispatch if with_projection_restore else unknown_unit)
-            ).Elif(unit == 9, *unknown_unit
-            ).Elif(unit == 10, *unknown_unit
             ).Elif(unit == 11, *(silu_dispatch if with_silu else unknown_unit)
             ).Elif(unit == 12, *(norm_dispatch if with_norm else unknown_unit)
             ).Elif(unit == 13, *(conv_dispatch if with_conv else unknown_unit)

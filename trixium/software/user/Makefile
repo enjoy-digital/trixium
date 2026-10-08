@@ -22,22 +22,16 @@ liblitepcie/liblitepcie.a: liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash
 bonsai_util: liblitepcie/liblitepcie.a bonsai_util.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
-bonsai_load: liblitepcie/liblitepcie.a bonsai_loader.o region_upload.o region_read.o bonsai_load.o
+bonsai_load: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_load.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
-bonsai_chat: liblitepcie/liblitepcie.a bonsai_loader.o region_upload.o region_read.o bonsai_chat.o
+bonsai_chat: liblitepcie/liblitepcie.a bonsai_loader.o bonsai_chat.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
 bonsai_caps: liblitepcie/liblitepcie.a bonsai_caps.o caps_parser.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
 caps_parser.o: ../lib/bonsai_caps.c ../lib/bonsai_caps.h
-	$(CC) -c $(CFLAGS) -o $@ $<
-
-region_upload.o: ../lib/bonsai_region_upload.c ../lib/bonsai_region_upload.h
-	$(CC) -c $(CFLAGS) -o $@ $<
-
-region_read.o: ../lib/bonsai_region_read.c ../lib/bonsai_region_read.h
 	$(CC) -c $(CFLAGS) -o $@ $<
 
 clean:

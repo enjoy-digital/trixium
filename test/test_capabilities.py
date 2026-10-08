@@ -139,8 +139,8 @@ def test_remote_register_reader_fails_closed():
 
 @pytest.mark.parametrize('config, expected', [
     (BonsaiClusterConfig(with_vecunit=False), Feature.SOFT_RESET | Feature.COHERENT_OVERLAP),
-    (BonsaiClusterConfig(with_dual=True, with_dnrec=True), Feature.SOFT_RESET |
-     Feature.COHERENT_OVERLAP | Feature.VECTOR | Feature.SEQUENCER | Feature.DUAL_Q | Feature.DELTANET_FP32),
+    (BonsaiClusterConfig(), Feature.SOFT_RESET |
+     Feature.COHERENT_OVERLAP | Feature.VECTOR | Feature.SEQUENCER),
 ])
 def test_shared_feature_derivation(config, expected):
     soc = LiteXModule()

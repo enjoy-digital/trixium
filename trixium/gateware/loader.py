@@ -146,16 +146,12 @@ class BonsaiHBMLoader(LiteXModule):
         beats = Signal(24)
         chan  = self.chan.storage
 
-        # Explicit names (here, src and mst_cmd_done below): the Verilog net names stay those
-        # of the v30b board build. Migen's tracer names closure (cell) variables after
-        # unrelated locals on Python 3.10, so these used to come from the retired region
-        # upload parameters/locals.
-        st_chan = Signal(5, name='poke_ratio')
-        st_addr  = Signal(33, name='conv')
-        st_len  = Signal(24, name='poke_sr')
-        st_cnt  = Signal(24)
-        mst_addr = Signal(33, name='endpoints')
-        mst_len  = Signal(24, name='RegionSpanValidator')
+        st_chan  = Signal(5)
+        st_addr  = Signal(33)
+        st_len   = Signal(24)
+        st_cnt   = Signal(24)
+        mst_addr = Signal(33)
+        mst_len  = Signal(24)
 
         # Stream resynchronisation.
         #
@@ -175,8 +171,7 @@ class BonsaiHBMLoader(LiteXModule):
         sync_seen = Signal()
 
         # Upload source seen by the transfer FSM: DMA (via the width converter) or CSR pokes.
-        # Named and unpacked so its Verilog names stay those of the v30b build (see above).
-        src, = [stream.Endpoint([("data", 256)], name="n")]
+        src = stream.Endpoint([("data", 256)])
         self.comb += If(self.src_sel.storage,
             poke_fifo.source.connect(src),
         ).Else(
@@ -221,7 +216,7 @@ class BonsaiHBMLoader(LiteXModule):
             def chan_off(i): # The engine's per-reader constant (matvec.py _chan_off).
                 local = (i % chan_mod) if chan_mod else i
                 return local*chan_stride + local*chan_skew
-            mst_cmd_done = Signal(n, name='with_mstore')
+            mst_cmd_done = Signal(n)
             mst_cnt = [Signal(24, name=f"mst_cnt{i}") for i in range(n)]
             mst_left = [Signal(name=f"mst_left{i}") for i in range(n)]
             all_cmd = Signal()

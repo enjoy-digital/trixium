@@ -137,34 +137,11 @@ def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
 
 
-@pytest.mark.parametrize('native', [False, True])
-def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path, native):
+def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path):
     verilator = shutil.which('verilator')
     if not verilator:
         pytest.skip('Verilator required for full resident conversion/rotation check')
-    options = {}
-    if native:
-        from test_native_reader import region
-        options = dict(native_regions=(region(7, size=256*1024),), native_endpoints=(0,))
-    dut = SoC(BonsaiClusterConfig(with_hadamard=True, with_activation_quantize=True,
-                                 with_projection_restore=native, **options), n=1)
-    if native:
-        import numpy as np
-        from trixium.model.qformats import ptq1_0_pack
-        # Three complete compact rows, placed as the device layout requires: each
-        # 68-group segment padded to a beat boundary (1904 -> 1920 bytes), so a
-        # row spans 3840 bytes and segment 1 starts at +1920. The segments consume
-        # the resident Q8 slices without host IO.
-        from trixium.model.qformats import native_row_span
-        segment_span = native_row_span(68, 28)
-        raw = bytearray(256*1024)
-        for row in range(3):
-            codes = np.array([(i*7 + i//13 + row) % 3 for i in range(17408)], dtype=np.uint8)
-            payload = ptq1_0_pack(np.ones(136, dtype=np.float16), codes.reshape(136, 128)).tobytes()
-            for segment in range(2):
-                base = 0x10000 + row*2*segment_span + segment*segment_span
-                raw[base:base + 68*28] = payload[segment*68*28:(segment+1)*68*28]
-        dut.models[0].mem.init = [int.from_bytes(raw[i:i+32], 'little') for i in range(0, len(raw), 32)]
+    dut = SoC(BonsaiClusterConfig(with_hadamard=True, with_activation_quantize=True), n=1)
     bus = dut.scratchpad.add_wishbone_port()
     status = Signal(24)
     dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
@@ -176,18 +153,6 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path, nati
         reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
         quant_blocks=dut.activation_quantize.blocks_done, quant_reads=dut.activation_quantize.read_beats,
         quant_writes=dut.activation_quantize.output_beats)
-    if native:
-        signals.update(native_error=dut.seq.native_error.status, engine_done=dut.engine_csr.done_count.status,
-                       engine_busy=dut.engine.busy, restore_error=dut.seq.projection_restore_error.status,
-                       restore_busy=dut.projection_restore.busy,
-                       restore_reads=dut.projection_restore.read_beats,
-                       restore_writes=dut.projection_restore.output_beats,
-                       prog_value=dut.vecunit.prog.storage, prog_re=dut.vecunit.prog.re,
-                       prog_address=dut.vecunit.prog_adr.storage, prog_address_re=dut.vecunit.prog_adr.re)
-        from trixium.model import asm
-        import struct
-        program = asm.assemble(asm.prog_reduce_acc())
-        (tmp_path / 'reduce_program.bin').write_bytes(struct.pack('<' + 'I'*len(program), *program))
     for name, signal in signals.items():
         signal.name_override = name
     rtl = tmp_path / 'activation_cluster.v'
@@ -199,7 +164,7 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path, nati
     harness = Path(__file__).parent / 'rtl/activation_cluster.cpp'
     built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
                             '--Mdir', str(obj), '--top-module', 'activation_cluster',
-                            str(rtl), str(harness.resolve())] + (['-CFLAGS', '-DNATIVE_CHAIN'] if native else []),
+                            str(rtl), str(harness.resolve())],
                            capture_output=True, text=True, timeout=240)
     assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
     result = subprocess.run([str(obj / 'Vactivation_cluster')], cwd=tmp_path,
