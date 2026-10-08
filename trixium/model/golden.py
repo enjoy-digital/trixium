@@ -95,24 +95,11 @@ def config_from_gguf(reader):
     return cfg
 
 def check_engine_support(cfg):
-    """What the engine can run today. Raises SystemExit with the reason otherwise."""
-    if cfg.n_dn_layers:
-        raise SystemExit(
-            f"{cfg.name}: {cfg.n_dn_layers} of {cfg.n_layer} layers are Gated DeltaNet "
-            f"({cfg.dn_num_v_heads} value heads x {cfg.dn_v_head_dim}, {cfg.dn_num_k_heads} "
-            f"key heads x {cfg.dn_k_head_dim}, conv kernel {cfg.dn_conv_kernel}); the engine "
-            f"has no recurrent unit for them yet - the projections are ordinary matvecs, the "
-            f"state update is not. See docs/xcu1525.md (the 27B).")
+    """What the engine can run. Raises SystemExit with the reason otherwise."""
     for name, dim in (("n_embd", cfg.n_embd), ("ffn_dim", cfg.ffn_dim), ("head_dim", cfg.head_dim)):
         if dim % 128:
             raise SystemExit(f"{cfg.name}: {name} = {dim} is not a multiple of the 128-wide "
                              f"ternary group")
-    if cfg.hadamard_block:
-        raise SystemExit(
-            f"{cfg.name}: the weights are stored in PrismML's rotated basis (Hadamard block "
-            f"{cfg.hadamard_block}, sign vectors for widths {sorted(cfg.hadamard_signs)}): the "
-            f"runtime has to rotate every projection's input activation and un-rotate the "
-            f"embedding rows, which the engine does not do yet (docs/xcu1525.md, the 27B).")
 
 class LazyTernary:
     """A ternary matrix kept as its int8 codes and fp16 scales (1 byte per weight instead of

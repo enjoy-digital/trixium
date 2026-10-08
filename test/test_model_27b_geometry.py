@@ -95,22 +95,9 @@ def test_27b_layer_pattern_and_dimensions():
     assert layout.deltanet_state_bytes_per_channel(cfg, 16) == 144*128*128*4
 
 
-def test_27b_is_refused_with_the_reason_and_the_8b_is_not():
-    cfg = config_from_gguf(_bonsai2_27b())
-    with pytest.raises(SystemExit) as e:
-        check_engine_support(cfg)
-    msg = str(e.value)
-    assert "48 of 64 layers are Gated DeltaNet" in msg and "48 value heads x 128" in msg
-    check_engine_support(BONSAI_8B)   # The models that run: no exception.
-
-
-def test_27b_rotation_is_refused_on_its_own():
-    # Even with the DeltaNet layers out of the way, the rotated basis alone refuses.
-    cfg = config_from_gguf(_bonsai2_27b())
-    cfg.layer_types = tuple("attn" for _ in range(cfg.n_layer))
-    with pytest.raises(SystemExit) as e:
-        check_engine_support(cfg)
-    assert "rotated basis" in str(e.value) and "1024" in str(e.value)
+def test_27b_and_8b_are_supported():
+    check_engine_support(config_from_gguf(_bonsai2_27b()))
+    check_engine_support(BONSAI_8B)
 
 
 def test_qwen3_models_have_no_layer_types():
