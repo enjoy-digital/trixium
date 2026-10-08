@@ -24,7 +24,6 @@ int engine_wedged; // Sticky: an op never completed, so engine results are not t
 // soft reset: -2.
 int engine_recover(void)
 {
-#ifdef BONSAI_HAS_ENGRESET
     engine_csr_soft_reset_write(1);
     engine_csr_soft_reset_write(0);
     uint32_t spins = 0;
@@ -45,10 +44,6 @@ int engine_recover(void)
     // The op CSRs live in the never-reset CSR front, so the shadow stays valid.
     puts("ENGRESET ok");
     return 0;
-#else
-    puts("ENGRESET: this bitstream has no soft reset - reconfigure the FPGA");
-    return -2;
-#endif
 }
 // Per-op stall diagnostics (pre-op beat snapshots, result-slot markers) cost ~2k cycles of
 // CSR/scratchpad traffic per engine op - ~1.3M cycles per forward at ~760 ops. They were
@@ -211,13 +206,8 @@ void engine_join(uint32_t done)
         // and only reconfiguring the FPGA recovers either way.
         if (++reports == 8) {
             engine_wedged = 1;
-#ifdef BONSAI_HAS_ENGRESET
             puts("ENGSTALL: giving up - the generation aborts and the engine is soft-reset "
                  "(engreset); the weights stay.");
-#else
-            puts("ENGSTALL: giving up. Reconfigure the FPGA to recover (a CPU reset will "
-                 "not do it), and reupload the weights - HBM is wiped with it.");
-#endif
             break;
         }
     }

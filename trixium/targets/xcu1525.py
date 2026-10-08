@@ -449,6 +449,8 @@ class BonsaiXCU1525SoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
+    from trixium.gateware.migen_fast import install as install_migen_fast
+    install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
     parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform,
                                  description="TriXium SoC on the SQRL XCU1525.")

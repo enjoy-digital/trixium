@@ -347,6 +347,8 @@ def attn_geometry(text):
 
 
 def main():
+    from trixium.gateware.migen_fast import install as install_migen_fast
+    install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
     parser.add_argument("--image",          default="models/tiny/bonsai-tiny-n2.img")
     parser.add_argument("--firmware",       default="firmware/bonsai.bin")

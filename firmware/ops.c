@@ -53,24 +53,14 @@ const char *op_name(enum perf_op op)
 uint32_t hw_caps(void)
 {
     uint32_t caps = 0;
-#ifdef BONSAI_HAS_VECUNIT
     caps |= (1 << OP_SILU_MUL) | (1 << OP_QUANT8) | (1 << OP_NORM_I32) | (1 << OP_RESID_ADD);
-#endif
-#ifdef BONSAI_HAS_VECUNIT2
     caps |= (1 << OP_RMSNORM);
-#endif
-#ifdef BONSAI_HAS_KVSTORE
     // KVQUANT/SCORES/WV all ride the KV regions + engine (AXPY is in the base engine).
     caps |= (1 << OP_KVQUANT) | (1 << OP_SCORES) | (1 << OP_WV);
-#endif
-#ifdef BONSAI_HAS_TOPK
     caps |= (1 << OP_LMHEAD);
-#endif
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     // Fused resident attention: softmax8 + AXPY + reduce, and the resident front
     // (qk-norm/rope on the vector unit, image rope tables, resident kv-pack).
     caps |= (1 << OP_SOFTMAX) | (1 << OP_QKNORM) | (1 << OP_ROPE);
-#endif
     return caps;
 }
 

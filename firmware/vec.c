@@ -10,7 +10,6 @@
 #include "engine.h"
 #include "perf.h"
 
-#ifdef CSR_VECUNIT_BASE
 
 #include "progs.h"
 
@@ -65,4 +64,3 @@ uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
     return vecunit_res6_read();
 }
 
-#endif

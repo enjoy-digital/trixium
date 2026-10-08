@@ -191,6 +191,8 @@ class BonsaiSoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
+    from trixium.gateware.migen_fast import install as install_migen_fast
+    install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
     parser = LiteXArgumentParser(platform=Platform, description="TriXium SoC on FK33.")
     parser.add_target_argument("--sys-clk-freq", default=225e6, type=float, help="System clock frequency (= HBM AXI clock, 225-450 MHz).")

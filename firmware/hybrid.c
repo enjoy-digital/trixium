@@ -41,7 +41,7 @@
 // The DeltaNet state in engine DDR: the per-head recurrence unit (BONSAI_HAS_DNREC) or the
 // stream op (BONSAI_HAS_DNSTREAM). A bitstream without the per-head unit runs the heads
 // only on the stream (`dnstream off` then stops with DNSTALL).
-#if defined(BONSAI_HAS_DNREC) || defined(BONSAI_HAS_DNSTREAM)
+#if defined(BONSAI_HAS_DNSTREAM)
 #define DN_STATE_HW 1
 #endif
 #include "perf.h"
@@ -242,87 +242,12 @@ static void dn_hw_head(uint32_t global_head, const float *qh, const float *kh,
                        const float *vh, float decay, float beta, float scale, float *oh,
                        int load_qk, int next_head)
 {
-#ifndef BONSAI_HAS_DNREC
     (void)global_head; (void)qh; (void)kh; (void)vh; (void)decay; (void)beta; (void)scale;
     (void)oh; (void)load_qk; (void)next_head;
     if (!engine_wedged)
         puts("DNSTALL: no per-head recurrence unit in this bitstream");
     engine_wedged = 1;
     return;
-#else
-    if (HP->dnstream_active) {
-        // The state is in the stream layout; only the resident layer's op 5 may touch it.
-        if (!engine_wedged)
-            puts("DNSTALL: per-head recurrence with the stream layout (dnres changed without a reset?)");
-        engine_wedged = 1;
-        return;
-    }
-    uint8_t chan = global_head % (uint32_t)n_ch;
-    uint64_t t0 = perf_now64();
-    if (dn_pipe_prefetched == (int)global_head) {
-        dn_pipe_join();                 // The prefetched state is in the scratchpad once both landed.
-        dn_pipe_prefetched = -1;
-    } else {
-        dn_pipe_join();                 // Never let a FETCH race an unjoined STORE.
-        dn_pipe_prefetched = -1;
-        engine_fetch(chan, dn_head_addr(global_head), DN_HEAD_BEATS, dn_sp_state);
-    }
-    dn_cyc_fetch += perf_now64() - t0;
-
-    t0 = perf_now64();
-    volatile float *sq = (volatile float *)(SCRATCHPAD_BASE + DN_SP_Q);
-    volatile float *sk = (volatile float *)(SCRATCHPAD_BASE + DN_SP_K);
-    volatile float *sv = (volatile float *)(SCRATCHPAD_BASE + DN_SP_V);
-    // qh == NULL: the caller pointed the unit's q/k/v bases at scratchpad data (resident
-    // layer); nothing to copy.
-    if (qh && load_qk)
-        for (uint32_t i = 0; i < DN_HW_COLS; i++) { sq[i] = qh[i]; sk[i] = kh[i]; }
-    if (qh)
-        for (uint32_t i = 0; i < DN_HW_ROWS; i++) sv[i] = vh[i];
-
-    dnunit_decay_write(f32_bits(decay));
-    dnunit_beta_write(f32_bits(beta));
-    dnunit_scale_write(f32_bits(scale));
-    dn_cyc_params += perf_now64() - t0;
-
-    t0 = perf_now64();
-    uint32_t done = dnunit_done_count_read();
-    dnunit_submit_write(1);
-    uint32_t spins = 0;
-    while (dnunit_done_count_read() == done && ++spins < 100000u) {}
-    if (dnunit_done_count_read() == done) {
-        puts("DNSTALL: recurrence command did not complete");
-        engine_wedged = 1;
-        return;
-    }
-    dn_cyc_core += perf_now64() - t0;
-
-    t0 = perf_now64();
-    if (dn_pipe_use && !engine_wedged) {
-        struct engine_op st = {0};
-        st.kind = ENGINE_KIND_STORE; st.chan = chan;
-        st.wbase = dn_head_waddr(global_head); st.wlen = DN_HEAD_BEATS; st.xsrc = dn_sp_state;
-        dn_pipe_done0 = engine_submit(&st);
-        dn_pipe_store_open = 1;
-        if (next_head >= 0) {
-            struct engine_op ft = {0};
-            ft.kind = ENGINE_KIND_FETCH; ft.chan = (uint8_t)((uint32_t)next_head % (uint32_t)n_ch);
-            ft.wbase = dn_head_addr((uint32_t)next_head); ft.wlen = DN_HEAD_BEATS; ft.dst = dn_sp_state;
-            engine_submit(&ft);         // Queued behind the STORE; joined by the next head.
-            dn_pipe_prefetched = next_head;
-        }
-    } else {
-        engine_store(chan, dn_head_waddr(global_head), DN_HEAD_BEATS, dn_sp_state);
-    }
-    dn_cyc_store += perf_now64() - t0;
-
-    t0 = perf_now64();
-    volatile float *so = (volatile float *)(SCRATCHPAD_BASE + DN_SP_OUT);
-    if (oh)                                // NULL: the output base is the resident layer's
-        for (uint32_t i = 0; i < DN_HW_ROWS; i++) oh[i] = so[i];
-    dn_cyc_output += perf_now64() - t0;
-    dn_heads_profiled++;
-#endif
 }
 
 static void dn_hw_reset(void)
@@ -385,9 +310,6 @@ void hybrid_prefetch_enable(int on)
 {
     HP->pf_enabled = on ? 1 : 0;
     HP->pf_state = 0;
-#ifdef BONSAI_HAS_PREFETCH
-    engine_csr_pf_mode_write(0);
-#endif
 }
 int hybrid_prefetch_enabled(void) { return HP->pf_enabled; }
 
@@ -397,21 +319,7 @@ int hybrid_prefetch_enabled(void) { return HP->pf_enabled; }
 // a forward that reads differently only costs the prefetch until the next start.
 static void prefetch_forward_start(int want_logits)
 {
-#ifdef BONSAI_HAS_PREFETCH
-    if (!HP->pf_enabled)
-        return;
-    if (HP->pf_state == 1)
-        HP->pf_state = 2;                      // the recorded forward is over
-    if (HP->pf_state == 0 && want_logits) {
-        engine_csr_pf_mode_write(1);
-        HP->pf_state = 1;
-    } else if (HP->pf_state == 2) {
-        engine_csr_pf_mode_write(2);
-    }
-    engine_csr_pf_start_write(1);
-#else
     (void)want_logits;
-#endif
 }
 void hybrid_lm_chunk(uint32_t rows) { HP->lm_chunk = rows; }
 int hybrid_hwargmax_enabled(void) { return HP->hwargmax; }
@@ -703,13 +611,6 @@ int hybrid_init(void)
         }
         HP->dn_state_sp = DN_SP_STATE;
         HP->dnres_enabled = 1;
-#ifdef BONSAI_HAS_DNREC
-        dnunit_state_base_write(DN_SP_STATE);
-        dnunit_q_base_write(DN_SP_Q);
-        dnunit_k_base_write(DN_SP_K);
-        dnunit_v_base_write(DN_SP_V);
-        dnunit_out_base_write(DN_SP_OUT);
-#endif
     }
 #endif
 #ifdef BONSAI_HAS_ATTNSTREAM
@@ -883,9 +784,6 @@ int hybrid_init(void)
     HP->hwargmax = 1;
     HP->pf_enabled = 1;
     HP->pf_state = 0;              // a new image: the schedule is recorded again
-#ifdef BONSAI_HAS_PREFETCH
-    engine_csr_pf_mode_write(0);
-#endif
     HP->lm_chunk = 0;
     HP->at_fail = 0;
     HP->logits_clean = 0;
@@ -1095,13 +993,6 @@ void hybrid_stats_print(void)
                    (unsigned long)(HP->at_rope/hyb_forwards_profiled),
                    (unsigned long)(HP->at_core/hyb_forwards_profiled),
                    (unsigned long)(HP->at_out/hyb_forwards_profiled));
-#ifdef BONSAI_HAS_PREFETCH
-        printf("hybprof prefetch: %s state %d recorded %lu hits %lu served %lu misses %lu synced %08lx\n",
-               HP->pf_enabled ? "on" : "off", HP->pf_state,
-               (unsigned long)engine_csr_pf_recorded_read(), (unsigned long)engine_csr_pf_hits_read(),
-               (unsigned long)engine_csr_pf_served_read(), (unsigned long)engine_csr_pf_misses_read(),
-               (unsigned long)engine_csr_pf_synced_read());
-#endif
         if (hyb_cyc_fdown)
             printf("hybprof fdown: avg cycles/fwd prepare %lu matvec %lu\n",
                    (unsigned long)(HP->fd_prep/hyb_forwards_profiled),
@@ -1381,11 +1272,7 @@ static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 // indices go to unit 0's table, the odd ones behind them to unit 1's.
 static int dn_rec_slot(int hi)
 {
-#ifdef BONSAI_DNSTREAM_PAIR
-    return hi % 2 ? (nv + 1)/2 + hi/2 : hi/2;
-#else
     return hi;
-#endif
 }
 
 static void dn_stream_records(uint32_t slot0, uint32_t ho, float scale, int rep)
@@ -1579,68 +1466,9 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     } else
 #endif
     if (dn_hw) {
-#ifdef BONSAI_HAS_DNREC
-        // Two state slots: the FETCH of head i+1 runs on the engine while the unit
-        // computes head i; the STORE of head i follows. The engine runs ops in order and
-        // holds one pending behind the running one, so a submit first waits for at most
-        // one outstanding op, and a slot is reused only behind its own STORE.
-        uint32_t slot[2] = {SLOT0, SLOT0 + DN_HEAD_BYTES};
-        dn_pipe_join();
-        uint32_t done0 = engine_csr_done_count_read(), sub = 0, fetched[2] = {0, 0};
-#define DNR_WAIT(k) do { uint32_t sp_ = 0; \
-            while ((uint32_t)(engine_csr_done_count_read() - done0) < (k)) \
-                if (++sp_ > 4000000u) { puts("DNSTALL: head state transfer"); engine_wedged = 1; goto fatal; } \
-        } while (0)
-#define DNR_OP(kind_, head_, slot_) do { \
-            if (sub > 1) DNR_WAIT(sub - 1); \
-            struct engine_op o_ = {0}; uint32_t g_ = (uint32_t)(head_); \
-            o_.kind = (kind_); o_.chan = (uint8_t)(g_ % (uint32_t)n_ch); \
-            o_.wbase = (kind_) == ENGINE_KIND_STORE ? dn_head_waddr(g_) : dn_head_addr(g_); \
-            o_.wlen = DN_HEAD_BEATS; o_.dst = (slot_); o_.xsrc = (slot_); \
-            engine_submit(&o_); sub++; \
-        } while (0)
-        int hh_of[64];
-        for (int hi = 0; hi < nv && hi < 64; hi++) {
-            int kh = hi/rep, r = hi - kh*rep;
-            hh_of[hi] = r*nk + kh;
-        }
-        DNR_OP(ENGINE_KIND_FETCH, (uint32_t)s*nv + hh_of[0], slot[0]);
-        fetched[0] = sub;
-        for (int hi = 0; hi < nv; hi++) {
-            int hh = hh_of[hi], kh = hi/rep, b = hi & 1;
-            DNR_WAIT(fetched[b]);
-            dnunit_state_base_write(slot[b]);
-            dnunit_q_base_write(DNR_QKV + 4u*(uint32_t)(kh*hk));
-            dnunit_k_base_write(DNR_QKV + 4u*(uint32_t)(nq + kh*hk));
-            dnunit_v_base_write(DNR_QKV + 4u*(uint32_t)(2*nq + hh*hv));
-            dnunit_out_base_write(HO + 4u*(uint32_t)(hh*hv));
-            dnunit_decay_write(f32_bits(bonsai_decay_exp(gb[hh])));
-            dnunit_beta_write(f32_bits(betab[hh]));
-            dnunit_scale_write(f32_bits(scale));
-            uint32_t udone = dnunit_done_count_read();
-            dnunit_submit_write(1);
-            if (hi + 1 < nv) {
-                DNR_OP(ENGINE_KIND_FETCH, (uint32_t)s*nv + hh_of[hi + 1], slot[b ^ 1]);
-                fetched[b ^ 1] = sub;
-            }
-            uint32_t spins = 0;
-            while (dnunit_done_count_read() == udone)
-                if (++spins > 4000000u) { puts("DNSTALL: recurrence command did not complete"); engine_wedged = 1; goto fatal; }
-            DNR_OP(ENGINE_KIND_STORE, (uint32_t)s*nv + hh, slot[b]);
-        }
-        DNR_WAIT(sub);
-#undef DNR_OP
-#undef DNR_WAIT
-        dnunit_state_base_write(DN_SP_STATE);
-        dnunit_q_base_write(DN_SP_Q); dnunit_k_base_write(DN_SP_K);
-        dnunit_v_base_write(DN_SP_V); dnunit_out_base_write(DN_SP_OUT);
-        if (engine_wedged)
-            goto fatal;
-#else
         puts("DNSTALL: no per-head recurrence unit in this bitstream (dnstream off?)");
         engine_wedged = 1;
         goto fatal;
-#endif
     } else {
         // No recurrence unit (a simulation without --with-dnrec): the CPU recurrence on
         // the normalised q/k/v, then its outputs back into the scratchpad.
@@ -2554,11 +2382,7 @@ void hybrid_nbatch_stats(uint32_t *batched, uint32_t *declined)
 }
 int hybrid_nbatch_enabled(void)
 {
-#ifdef BONSAI_HAS_NBATCH
-    return spec.nbatch && n_dn && resident_silu_active();
-#else
     return 0;
-#endif
 }
 
 // nb (<= 2) speculative forwards of tok[0..nb-1] at pos.., layer by layer: every token's
@@ -2577,12 +2401,6 @@ int hybrid_forward_batch(const int *tok, int nb, int *ys, float *hs)
         if (!spec.bx[b] || !spec.bn[b] || !spec.ba[b] || !spec.bo[b]) { spec.bx[1] = NULL; return -1; }
     }
     if (!spec.out_norm) spec.out_norm = fetch_f32(model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32));
-#ifdef BONSAI_HAS_PREFETCH
-    if (HP->pf_enabled && HP->pf_state) {   // the recorded schedule is one forward's read order
-        engine_csr_pf_mode_write(0);
-        HP->pf_state = 0;
-    }
-#endif
     float *xsave = xb;
     int p0 = pos, n0 = spec.n, rc = -1;
     for (int b = 0; b < nb; b++) {

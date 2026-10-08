@@ -817,7 +817,6 @@ static void console_service(void)
         printf("QKVL %s (q/k/v projections + norms as one sequencer list)\n",
                qkvl_use ? "on" : "off");
     }
-#ifdef CSR_SEQ_BASE
     else if (strcmp(token, "sbdrain") == 0) {
         if (!seq_sbmode_available())
             puts("SBDRAIN unsupported on this bitstream (no sbmode CSR)");
@@ -829,7 +828,6 @@ static void console_service(void)
                                    : "legacy: descriptor fetch stalls on any posted write");
         }
     }
-#endif
     else if (strcmp(token, "lovl") == 0) {
         extern int lovl_use;
         if (strncmp(str, "on", 2) == 0)  lovl_use = 1;
@@ -1034,9 +1032,7 @@ int main(void)
     uart_init();
     perf_init();
     infer_static_init();
-#ifdef CSR_VECUNIT_BASE
     vec_init();
-#endif
 
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
 #ifdef BONSAI_N_MEMCTRL
@@ -1049,7 +1045,6 @@ int main(void)
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
     model_info();
     sptest();
-#ifdef CSR_VECUNIT_BASE
     { // Vec unit smoke test: quant8 of a known ramp via the CSR dispatch path. Catches
       // emission-level datapath breaks that Migen-sim unit tests cannot see (the VCLAMP8
       // unsigned-literal emission bug shipped through six token-gated milestones).
@@ -1122,7 +1117,6 @@ int main(void)
             }
         }
     }
-#endif
     selftest();
     hwops_init();
     if (infer_init() == 0) {

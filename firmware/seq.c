@@ -12,7 +12,6 @@
 #include "engine.h"
 #include "perf.h"
 
-#ifdef CSR_SEQ_BASE
 
 static volatile uint32_t *desc_w(uint32_t idx)
 {
@@ -132,14 +131,8 @@ void seq_join(void)
         if (++reports == 8) {
             seq_wedged = 1;
             engine_wedged = 1;
-#ifdef BONSAI_HAS_ENGRESET
             puts("SEQSTALL: giving up - the generation aborts and the engine cluster is "
                  "soft-reset (engreset); the weights stay.");
-#else
-            puts("SEQSTALL: giving up. The engine is stuck mid-op and holds the scratchpad;\n"
-                 "results from here are garbage. Reconfigure the FPGA to recover (a CPU\n"
-                 "reset will not do it) - and note this wipes HBM, so reupload the weights.");
-#endif
             return;
         }
     }
@@ -216,17 +209,10 @@ void seq_run(uint32_t idx0, uint32_t count)
         if (++reports == 8) {
             seq_wedged = 1;
             engine_wedged = 1;
-#ifdef BONSAI_HAS_ENGRESET
             puts("SEQSTALL: giving up - the generation aborts and the engine cluster is "
                  "soft-reset (engreset); the weights stay.");
-#else
-            puts("SEQSTALL: giving up. The engine is stuck mid-op and holds the scratchpad;\n"
-                 "results from here are garbage. Reconfigure the FPGA to recover (a CPU\n"
-                 "reset will not do it) - and note this wipes HBM, so reupload the weights.");
-#endif
             return;
         }
     }
 }
 
-#endif

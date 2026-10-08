@@ -317,7 +317,6 @@ COLD static int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
 // (position t -> channel t % n_ch, local row t / n_ch). All groups of a row share one
 // power-of-two scale 2^ek, stored as an exactly-representable fp16 ((ek+15)<<10), so the
 // engine's Q8 scale path applies it bit-exactly and the exponent algebra stays integer.
-#ifdef BONSAI_HAS_KVSTORE
 static uint32_t kv_base;    // Per-channel byte address of the KV region (4 KB aligned).
 static uint32_t kv_rb;      // Beats per KV row packet (cols = head_dim, Q8).
 static uint32_t kv_region;  // Beats per (layer, kv-head, K|V) region.
@@ -483,7 +482,6 @@ static void kv_scores_br(int l, int kvh, int kind, int *B, int *R)
     *B = 22 - kv_ekmax[kv_ek_idx(l, kvh, kind)];
     *R = kv_br_r;
 }
-#endif
 
 // Hybrid float-result staging.  CPU reads of the scratchpad use a registered 32-bit
 // Wishbone sideband (several round trips per word).  On the XCU1525 the engine can STORE
@@ -515,7 +513,7 @@ static const volatile int32_t *stage_i32_results_to(uint32_t sp_src, uint32_t co
                                                      int dma_result, int32_t *stage)
 {
     const volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + sp_src);
-#if defined(BONSAI_HAS_KVSTORE) && defined(HAS_INVD_CPU_DCACHE_RANGE)
+#if defined(HAS_INVD_CPU_DCACHE_RANGE)
     if (dma_result) {
         uint32_t eng_addr = (uint32_t)((uintptr_t)stage - MAIN_RAM_BASE
                                       + BONSAI_MEM_CPU_OFFSET);
@@ -678,7 +676,7 @@ static void pack_rotated_range(uint32_t c0, uint32_t n, uint32_t sp_dst)
 
 int infer_rotate_quantize_f(const float *src, uint32_t width)
 {
-#if !defined(BONSAI_HAS_KVSTORE) || !defined(HAS_INVD_CPU_DCACHE_RANGE)
+#if !defined(HAS_INVD_CPU_DCACHE_RANGE)
     (void)src;
     (void)width;
     return INFER_ROTATE_UNSUPPORTED;
@@ -814,7 +812,6 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
     int e8 = f32_quant_e8(src, cols);
     float is = ldexpf(1.0f, -e8);
     uint32_t c0 = 0;
-#ifdef CSR_VECUNIT_BASE
     // The 27B's two FFN-down segments each produce one 20 KiB int32 vector.  Keep both
     // inside the two scratchpad result banks, add later segments into the first with the
     // existing 8-lane vector program, then DMA/convert only the final sum.  This removes
@@ -851,7 +848,6 @@ void infer_matvec_f(const struct bons_entry *e, const float *src, float *dst)
         perf_exit(OP_NORM_I32);
         return;
     }
-#endif
     for (int k = 0; k < nseg; k++) {
         const struct bons_entry *seg = model_entry_kseg(e, k);
         // The old path wrote the whole quantised vector to kseg_x8, read it back to copy
@@ -1020,7 +1016,6 @@ COLD static void rope_apply(float *vec, int n_heads_v, int pos)
     }
 }
 
-#ifdef CSR_VECUNIT_BASE
 // Score padding granule: softmax8's x2 unroll (ISA rev 2 microcode) walks two 16-entry
 // blocks per iteration and has no odd-tail form, so scores are padded to a 32-multiple
 // with INT32_MIN there (those entries emit p8 = 0 - the sum and the AXPY do not change).
@@ -1030,7 +1025,6 @@ COLD static void rope_apply(float *vec, int n_heads_v, int pos)
 #define SC_PAD 16
 #endif
 #define SC_PADN(cnt) ((SC_PAD - ((cnt) & (SC_PAD - 1))) & (SC_PAD - 1))
-#endif
 
 // Resident-BFP op layer: every op has a CPU implementation (float math over the int16
 // scratchpad regions - the always-available fallback) and, when the vector unit exists,
@@ -1094,7 +1088,6 @@ static int eps_for(int esrc)
 COLD static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
                               const struct bons_entry *w16, int n, uint32_t dst)
 {
-#if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
     if (op_on_hw(OP_RMSNORM) && w16) {
         engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + w16->chan_base_beats*32,
                      w16->chan_len_beats, SP_FET);
@@ -1106,7 +1099,6 @@ COLD static void op_rmsnorm_sp(uint32_t src, int esrc, const float *w,
         vec_run(PROG_RMSNORM, args, 7);
         return;
     }
-#endif
     volatile int16_t *ps = sp16(src);
     volatile int16_t *pd = sp16(dst);
     float es = ldexpf(1.0f, esrc);
@@ -1182,7 +1174,6 @@ static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
                             const struct bons_entry *w16, int n, uint32_t dst16,
                             uint32_t dst8)
 {
-#if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
     if (op_on_hw(OP_RMSNORM) && op_on_hw(OP_QUANT8) && w16) {
         if (rq8_prefetched)
             rq8_prefetched = 0;                  // Row already in SP_FET (resid_add_pf).
@@ -1199,7 +1190,6 @@ static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
         perf_exit(OP_RMSNORM);
         return quant8_shift(amax);
     }
-#endif
     perf_enter(OP_RMSNORM);
     op_rmsnorm_sp(src, esrc, w, w16, n, dst16);
     perf_exit(OP_RMSNORM);
@@ -1213,7 +1203,6 @@ static int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
 static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n);
 static int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, uint32_t dst8)
 {
-#ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
         int32_t args[8] = {(int32_t)gsrc, (int32_t)usrc, (int32_t)gsrc, n/16,
                            eg + 6, 0, -15, (int32_t)dst8};
@@ -1222,7 +1211,6 @@ static int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, ui
         perf_exit(OP_SILU_MUL);
         return quant8_shift(amax);
     }
-#endif
     perf_enter(OP_SILU_MUL);
     op_silu_mul_sp(gsrc, eg, usrc, eu, n);
     perf_exit(OP_SILU_MUL);
@@ -1234,12 +1222,10 @@ static int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, ui
 
 COLD static int op_quant8_sp(uint32_t src, uint32_t dst, int n)
 {
-#ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_QUANT8)) {
         int32_t args[4] = {(int32_t)src, 1, (int32_t)dst, n/16}; // A1 = 1: measure.
         return quant8_shift((uint32_t)vec_run(PROG_QUANT8, args, 4)); // S6 = source absmax.
     }
-#endif
     volatile int16_t *ps = sp16(src);
     volatile int8_t  *pd = sp8(dst);
     uint32_t amax = 0;
@@ -1270,13 +1256,11 @@ static int op_norm_i32_sp_a(uint32_t src, uint32_t dst, int n, uint32_t amax,
     int k = 0;
     while ((amax >> k) > 16383u) k++;
     if (omax) *omax = amax >> k;
-#ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_NORM_I32)) {
         int32_t args[5] = {(int32_t)src, 0, (int32_t)dst, n/16, k};
         vec_run(PROG_NORM_I32, args, 5);
         return k;
     }
-#endif
     volatile int32_t *ps = sp32(src);
     volatile int16_t *pd = sp16(dst);
     for (int i = 0; i < n; i++) {
@@ -1314,14 +1298,12 @@ static inline int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
 // silu_mul: SP int16(gate,eg) x SP int16(up,eu) -> SP int16(gate) at eg+eu+15.
 COLD static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n)
 {
-#ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_SILU_MUL)) {
         int32_t args[7] = {(int32_t)gsrc, (int32_t)usrc, (int32_t)gsrc, n/16,
                            eg + 6, 0, -15}; // A4 = direct shift (VSHLS convention 2026-08-28).
         vec_run(PROG_SILU_MUL, args, 7);
         return;
     }
-#endif
     volatile int16_t *pg = sp16(gsrc);
     volatile int16_t *pu = sp16(usrc);
     float gs = ldexpf(1.0f, eg), us = ldexpf(1.0f, eu);
@@ -1355,13 +1337,11 @@ static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
     while ((bound >> k) > 32767) k++;
     int eo = emin + k;
     int sa = eo - ea, sb = eo - eb;
-#ifdef CSR_VECUNIT_BASE
     if (op_on_hw(OP_RESID_ADD)) {
         int32_t args[6] = {(int32_t)a, (int32_t)b, (int32_t)a, n/16, -sa, -sb};
         *amax_io = (uint32_t)vec_run(PROG_RESID_ADD, args, 6); // S6 = output absmax.
         return eo;
     }
-#endif
     volatile int16_t *pa = sp16(a);
     volatile int16_t *pb = sp16(b);
     uint32_t omax = 0;
@@ -1379,7 +1359,6 @@ static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
     return eo;
 }
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
 // Resident attention front (all attention hwops on): q/k/v live in the scratchpad as
 // int16 from the matvec on; qk-norm/rope/kv-pack run on the vector unit; the CPU float
 // K/V cache is not maintained (attention op bits are latched per generation - flipping
@@ -1496,7 +1475,6 @@ static void kv_store_row_res(int l, int kvh, int kind, int t)
     op.xsrc  = kvp_slot(kvh, kind);
     engine_run(&op);
 }
-#endif
 
 // Integer embedding: fetch the ternary row, dequantize with exact fp16 decomposition
 // ((q-1)*m11 aligned to the smallest group exponent), then normalize to int16 BFP.
@@ -1603,7 +1581,6 @@ int infer_embed_f(int token, float *dst)
     return 0;
 }
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
 // Sequencer descriptor list for the per-head qk-norm + rope loops. Addresses are
 // head-relative inside SP_Q/SP_K, so the list is layer-independent; per layer only the
 // rmsnorm eps_int args (A5 = descriptor word 7) change. Built once at init.
@@ -1644,11 +1621,7 @@ static int kv_pipe_active = 0;  // What the built list uses.
 // Emit the per-slot KV-pack quant8 descriptors that PROG_KVPACK_H makes redundant (see
 // the loop below). Only useful to A/B the two list shapes in one boot; without LOOPS2
 // there is no kvpack_h descriptor and they are the real thing, so it is forced on.
-#ifdef BONSAI_VEC_LOOPS2
 static int kvq_redundant = 0;
-#else
-static const int kvq_redundant = 1;
-#endif
 // One in-list MULTI-STORE for all 2*n_kv_head slots instead of 16 NOWAIT store ops
 // (2026-09-08): the staging slots are 0x200 B apart and a layer's (kvh, kind) regions
 // kv_region beats apart, so the engine's rep/dstride/sstride store (F1-1) scatters them
@@ -1669,7 +1642,6 @@ extern int qkvl_use;          // Defined with the other toggles below.
 extern int seq_use;
 static int qkvx_possible(void)
 {
-#if defined(BONSAI_SEQ_LUT) && defined(BONSAI_VEC_LOOPS2) && !defined(BONSAI_HAS_DUALQ)
     // The K chain lives inside the qkv list, so qkvx only holds while that list runs:
     // with `qkvl off` or `seq off` the qkr list (built without the K chain) ran alone,
     // K was never normed and the q-norm's A6 never patched - a different token than the
@@ -1679,9 +1651,6 @@ static int qkvx_possible(void)
         && model_entry_kind(ROLE_ATTN_Q_NORM, 0, KIND_NORM16) != 0
         && model_entry_kind(ROLE_ATTN_K_NORM, 0, KIND_NORM16) != 0
         && kv_pipe && kv_mstore && 2*n_kv_head <= 31 && qkr_reorder && qfix_use;
-#else
-    return 0;
-#endif
 }
 
 static void seq_build_qkr(void)
@@ -1691,7 +1660,6 @@ static void seq_build_qkr(void)
     int ln = 0;
     while ((1 << ln) < head_dim) ln++;
     uint32_t di = 0;
-#ifdef BONSAI_VEC_LOOPS2
     // Whole-tensor per-head programs (2026-08-30): the 2*(n_head+n_kv_head) rmsnorm/rope
     // descriptors and the 2*n_kv_head KV-pack ones become one program each - the
     // per-descriptor fixed cost was 8-12x the work at V1 rates (qknorm 749k, kvquant 514k
@@ -1727,7 +1695,6 @@ static void seq_build_qkr(void)
         }
     }
     if (0)
-#endif
     for (int hh = 0; hh < n_head + n_kv_head; hh++) {
         int      is_q = hh < n_head;
         uint32_t sp   = is_q ? (SP_Q + hh*head_dim*2)
@@ -1794,7 +1761,6 @@ static void seq_build_qkr(void)
         kv_mstore_active = 1;
         di++;
     }
-#ifdef BONSAI_VEC_LOOPS2
     if (qkr_reorder) { // Q chain behind the (NOWAIT) store: absorbs its write-latency tail.
         seq_qkr_di_qn = (int)di;
         if (qkvx_ok) { // A5 = LUTQ[sx8 + kreg0], kreg0 captured by the qkv list's q matvec.
@@ -1804,14 +1770,12 @@ static void seq_build_qkr(void)
             seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);              // q-norm (A5 patched)
         seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                     // q-rope
     }
-#endif
     // F0-5: ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB
     // post-increments 16 B, so head j lands at +j*head_dim); the attention list's
     // per-head quant8 descriptor is gone and its scores read x from there. The region
     // is dead during attention: softmax p8 lives at SP_X[0, ctx) and nothing else
     // touches SP_X until the FFN quant8 overwrites it.
     {
-#ifdef BONSAI_VEC_LOOPS2
         if (qfix_use) {
             // Fixed shift only (2026-09-08): PROG_QUANT8 with A1 = 0 still runs its absmax
             // pass over all 128 beats before the fixed >>8 pass, and nothing reads the
@@ -1821,7 +1785,6 @@ static void seq_build_qkr(void)
                                 (n_head*head_dim)/16, 0, 0, 0, 1};
             seq_desc_vec(di++, PROG_KVPACK_H, fargs, 8, 0);
         } else
-#endif
         {
             int32_t qargs[4] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
                                 (n_head*head_dim)/16};
@@ -2125,9 +2088,6 @@ static int ffn_di_down = 7; // Down matvec's descriptor (b + 7 fused, b + 8 spli
 static int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
 static void seq_build_ffn(void)
 {
-#ifdef BONSAI_HAS_DUALQ
-    return; // Dual builds use attn2 lists; FFN list only wired on the shipping non-dual path.
-#else
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
     int len = ffn_split ? 10 : 9;
     if (di + len > 192 || seq_attn_heads == 0)
@@ -2200,7 +2160,6 @@ static void seq_build_ffn(void)
     ffn_di_down = d - di;
     d++;
     seq_desc_stop(d);
-#endif
 }
 
 
@@ -2212,7 +2171,6 @@ static void seq_build_ffn(void)
 static int seq_scale8_base = -1;
 static void seq_build_scale8(void)
 {
-#ifndef BONSAI_HAS_DUALQ
     // Invalidate first, like seq_build_qkv does with its own base. Both early returns below
     // used to leave a STALE base behind, and seq_build_qkv derives seq_qkv_base from it - so
     // a stale (smaller) value could place the qkv list on top of the FFN list's descriptors.
@@ -2235,7 +2193,6 @@ static void seq_build_scale8(void)
         seq_desc_vec(di + hh, PROG_SCALE8, sa, 5, 0);
     }
     seq_desc_stop(di + n_head);
-#endif
 }
 
 // QKV projection list (2026-09-02, "qkvl"): the three attention projections and their
@@ -2257,7 +2214,6 @@ static int seq_qkv_base = -1;
 static int qkv_prepped  = -1; // Layer whose projections are currently in the slots.
 static void seq_build_qkv(void)
 {
-#ifndef BONSAI_HAS_DUALQ
     seq_qkv_base = -1;
     qkv_prepped  = -1;
     if (seq_scale8_base < 0)
@@ -2331,7 +2287,6 @@ static void seq_build_qkv(void)
     seq_desc_vec_seed(di + 7, PROG_SPILL, &pv, 1, 0, 1);
     seq_desc_vec(di + 8, PROG_NORM_I32, nv, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
     seq_desc_stop(di + 9);
-#endif
 }
 
 static void qkv_prep_layer(int l)
@@ -2405,98 +2360,9 @@ static int seq_at2_p1dn, seq_at2_p2dn;
 static void seq_build_attn2(void)
 {
     seq_at2_kvchunk = 0;
-#ifndef BONSAI_HAS_DUALQ
     return; // Engine built without the head-B datapath: use the v1 single-head lists.
-#else
-    if (n_ch < 2 || n_head != 2*n_kv_head)
-        return;
-    int p1dn = 7;            // q8A q8B scores smA spA smB spB.
-    int p2dn = 2*n_ch + 3;   // axpy redA* spA normA redB* spB normB.
-    int cap  = (192 - seq_qkr_count)/(p1dn + p2dn);
-    if (cap <= 0)
-        return;
-    int chunk = (cap < n_kv_head) ? cap : n_kv_head;
-    int lg = 0;
-    while ((1 << lg) < head_dim) lg++;
-    int Ceff = (lg & 1) ? 523 : 739;
-    seq_at2_base    = seq_qkr_count;
-    seq_at2_p1dn    = p1dn;
-    seq_at2_p2dn    = p2dn;
-    seq_at2_p1n     = chunk*p1dn;
-    seq_at2_p2n     = chunk*p2dn;
-    seq_at2_kvchunk = chunk;
-    uint32_t qs2 = (uint32_t)n_ch*head_dim; // AXPY head-B partial offset (words).
-    for (int j = 0; j < chunk; j++) {
-        int hA = 2*j, hB = 2*j + 1;
-        uint32_t d1 = (uint32_t)seq_at2_base + (uint32_t)j*p1dn;
-        int32_t qa[4] = {(int32_t)(SP_Q + (uint32_t)hA*head_dim*2), 0,
-                         (int32_t)SP_X, head_dim/16};
-        seq_desc_vec(d1 + 0, PROG_QUANT8, qa, 4, 0);
-        int32_t qb[4] = {(int32_t)(SP_Q + (uint32_t)hB*head_dim*2), 0,
-                         (int32_t)(SP_X + head_dim), head_dim/16};
-        seq_desc_vec(d1 + 1, PROG_QUANT8, qb, 4, 0);
-        struct engine_op sc = {0};
-        sc.kind    = ENGINE_KIND_Q8;
-        sc.ilv     = 1;
-        sc.cols    = head_dim;
-        sc.sbeats  = 1;
-        sc.cbeats  = head_dim/32;
-        sc.xsrc    = SP_X;
-        sc.dst     = SP_Y;
-        sc.qn      = 1;
-        sc.qstride = 0x800;
-        seq_desc_engine(d1 + 2, &sc);
-        int32_t sa[7] = {(int32_t)SP_Y, Ceff, (int32_t)SP_X, 0, -11, 0,
-                         (int32_t)(SP_A2P8 + (uint32_t)hA*32)};
-        seq_desc_vec(d1 + 3, PROG_SOFTMAX8, sa, 7, 0);
-        int32_t pa = (int32_t)(SP_A2P8 + (uint32_t)hA*32);
-        seq_desc_vec(d1 + 4, PROG_SPILL, &pa, 1, 0);
-        int32_t sb[7] = {(int32_t)SP_SCB, Ceff, 0, 0, -11, 0,     // A2 (p8B dst) per token.
-                         (int32_t)(SP_A2P8 + (uint32_t)hB*32)};
-        seq_desc_vec(d1 + 5, PROG_SOFTMAX8, sb, 7, 0);
-        int32_t pb = (int32_t)(SP_A2P8 + (uint32_t)hB*32);
-        seq_desc_vec(d1 + 6, PROG_SPILL, &pb, 1, 0);
-
-        uint32_t d2 = (uint32_t)seq_at2_base + (uint32_t)seq_at2_p1n + (uint32_t)j*p2dn;
-        struct engine_op wv = {0};
-        wv.kind    = ENGINE_KIND_AXPY;
-        wv.cols    = head_dim;
-        wv.sbeats  = 1;
-        wv.cbeats  = head_dim/32;
-        wv.xsrc    = SP_X;
-        wv.dst     = SP_AW2;
-        wv.qn      = 1;
-        wv.qstride = (uint16_t)qs2;
-        seq_desc_engine(d2 + 0, &wv);
-        for (int c = 1; c < n_ch; c++) {
-            int32_t ra[4] = {(int32_t)SP_AW2, (int32_t)(SP_AW2 + (uint32_t)c*head_dim*4),
-                             (int32_t)SP_AW2, head_dim/8};
-            seq_desc_vec(d2 + c, PROG_REDUCE_ACC, ra, 4, 0);
-        }
-        int32_t ma = (int32_t)(SP_A2AM + (uint32_t)hA*32);
-        seq_desc_vec(d2 + n_ch, PROG_SPILL, &ma, 1, 0);
-        int32_t na[5] = {(int32_t)SP_AW2, 0, (int32_t)(SP_H + (uint32_t)hA*head_dim*2),
-                         head_dim/16, 0};
-        seq_desc_vec(d2 + n_ch + 1, PROG_NORM_I32, na, 5,
-                     (uint16_t)(SEQ_SRC_KRES6 << 8));
-        uint32_t b2 = SP_AW2 + 4*qs2;
-        for (int c = 1; c < n_ch; c++) {
-            int32_t rb2[4] = {(int32_t)b2, (int32_t)(b2 + (uint32_t)c*head_dim*4),
-                              (int32_t)b2, head_dim/8};
-            seq_desc_vec(d2 + n_ch + 1 + c, PROG_REDUCE_ACC, rb2, 4, 0);
-        }
-        int32_t mb = (int32_t)(SP_A2AM + (uint32_t)hB*32);
-        seq_desc_vec(d2 + 2*n_ch + 1, PROG_SPILL, &mb, 1, 0);
-        int32_t nb[5] = {(int32_t)b2, 0, (int32_t)(SP_H + (uint32_t)hB*head_dim*2),
-                         head_dim/16, 0};
-        seq_desc_vec(d2 + 2*n_ch + 2, PROG_NORM_I32, nb, 5,
-                     (uint16_t)(SEQ_SRC_KRES6 << 8));
-    }
-#endif
 }
-#endif
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
 // One layer of dual-Q sequencer attention (S3): shared by forward() and
 // forward_pair(). Fills aw_c[] and raises *aw_hmax.
 static void attn_seq2_layer(int l, int pos, float *aw_c, float *aw_hmax)
@@ -2597,7 +2463,6 @@ static void attn_seq2_layer(int l, int pos, float *aw_c, float *aw_hmax)
     perf_exit(OP_WV);
 }
 
-#endif
 
 // Speculative-decode state: successor draft table + acceptance counters (the
 // counters exist on every build; the machinery only under the full-HW guard).
@@ -2605,302 +2470,9 @@ static int       spec_on, spec_acc, spec_rej;
 static uint16_t *spec_succ;
 static uint8_t  *spec_succ_v;
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
-// S6 speculative decode: forward TWO positions through ONE weight stream per matvec
-// (dual-x ternary, model_matvec2). Positions are independent along the residual; the only
-// coupling is attention, which runs per position in-order (store KV p0 -> attn p0 ->
-// store KV p1 -> attn p1) so each position's Bk/Rk view matches the non-speculative
-// mirror exactly. Greedy speculation is lossless: accepted streams are token-identical
-// to plain decode, so the existing gate references validate this path.
-//
-// Per-position regions: residual XR + p*0x1000; x8 pairs contiguous at SP_X (+p*width);
-// matvec results A/B at dst + p*4*rows; SP_Q/SP_K staging halves; V p1 staged in the
-// KV-pack region; FFN G/U halves; SP_D halves. kv_ekmax entries touched by p1's stores
-// are captured per layer for exact rollback on draft rejection.
-// Undo records: (index, value) pairs.
-static int     ek_undo_n;
-// In the main_ram static window, not .bss: sram is 8 KB *including the stack*, and these
-// 3 KB were a third of it. Same window as model.c's entry cache (BONSAI_HDR_ADDR + 0x80000
-// + 4 KB); data accesses to main_ram are the norm here - the heap is next door.
-#define EK_UNDO_BASE (BONSAI_HDR_ADDR + 0x90000)
-static int16_t *const ek_undo_idx = (int16_t *)EK_UNDO_BASE;
-static int8_t  *const ek_undo_val = (int8_t  *)(EK_UNDO_BASE + sizeof(int16_t)*64*8*2);
-static void ek_capture(int l)
-{
-    for (int h = 0; h < n_kv_head; h++)
-        for (int k = 0; k < 2; k++) {
-            int idx = kv_ek_idx(l, h, k);
-            ek_undo_idx[ek_undo_n] = (int16_t)idx;
-            ek_undo_val[ek_undo_n] = kv_ekmax[idx];
-            ek_undo_n++;
-        }
-}
-static void ek_restore(void)
-{
-    for (int i = 0; i < ek_undo_n; i++)
-        kv_ekmax[ek_undo_idx[i]] = ek_undo_val[i];
-    ek_undo_n = 0;
-}
-
-// Forward positions n_pos (token t0) and n_pos+1 (token t1); returns argmaxes for both.
-// Returns 0 on success, -1 if the argmax tap hit a padding row (caller falls back).
-static int forward_pair(int t0, int t1, int *am0, int *am1)
-{
-    const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
-    const struct bons_entry *rt  = model_entry_kind(ROLE_ROPE_TAB, 0, KIND_NORM16);
-    int   kv_dim = n_kv_head*head_dim;
-    int   q_dim  = n_head*head_dim;
-    int   pos    = n_pos;
-    int   ex_st[2];
-    float aw_cp[2][32];
-    uint32_t xr[2]  = {SP_XR, SP_XR + 0x1000};
-    uint32_t vst[2] = {SP_V, SP_KVP + 0x1000};
-    ek_undo_n = 0;
-
-    perf_enter(OP_EMBED);
-    uint32_t xa_st[2] = {X_AMAX_AFTER_EMBED, X_AMAX_AFTER_EMBED};
-    ex_st[0] = embed_row_bfp(emb, t0, xr[0]);
-    ex_st[1] = embed_row_bfp(emb, t1, xr[1]);
-    perf_exit(OP_EMBED);
-
-    for (int l = 0; l < n_layer; l++) {
-        const struct bons_entry *eqt = model_entry(ROLE_ATTN_Q, l);
-        const struct bons_entry *ekt = model_entry(ROLE_ATTN_K, l);
-        const struct bons_entry *evt = model_entry(ROLE_ATTN_V, l);
-        // Attention rmsnorm + quant8 per position -> x8 pair.
-        int sx8[2];
-        for (int p = 0; p < 2; p++) {
-            perf_enter(OP_RMSNORM);
-            op_rmsnorm_sp(xr[p], ex_st[p], attn_norm[l],
-                          model_entry_kind(ROLE_ATTN_NORM, l, KIND_NORM16), n_embd, SP_H);
-            perf_exit(OP_RMSNORM);
-            perf_enter(OP_QUANT8);
-            sx8[p] = op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
-            perf_exit(OP_QUANT8);
-        }
-        // q/k/v: one weight stream each, both positions.
-        perf_enter(OP_NORM_I32);
-        int eq_r[2], ek_r[2], ev_r[2];
-        model_matvec2(eqt, SP_X, SP_Y, (uint16_t)eqt->rows);
-        for (int p = 0; p < 2; p++) {
-            int kq = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eqt->rows,
-                                    SP_Q + (uint32_t)p*q_dim*2, q_dim);
-            eq_r[p] = (E_NORM + sx8[p]) - (int)eqt->bias + (int)eqt->rshift + kq;
-        }
-        model_matvec2(ekt, SP_X, SP_Y, (uint16_t)ekt->rows);
-        for (int p = 0; p < 2; p++) {
-            int kk = op_norm_i32_sp(SP_Y + (uint32_t)p*4*ekt->rows,
-                                    SP_K + (uint32_t)p*kv_dim*2, kv_dim);
-            ek_r[p] = (E_NORM + sx8[p]) - (int)ekt->bias + (int)ekt->rshift + kk;
-        }
-        model_matvec2(evt, SP_X, SP_Y, (uint16_t)evt->rows);
-        for (int p = 0; p < 2; p++) {
-            int kv2 = op_norm_i32_sp(SP_Y + (uint32_t)p*4*evt->rows, vst[p], kv_dim);
-            ev_r[p] = (E_NORM + sx8[p]) - (int)evt->bias + (int)evt->rshift + kv2;
-        }
-        perf_exit(OP_NORM_I32);
-        // qk-norm weight rows (shared by both positions).
-        const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
-        const struct bons_entry *kn16 = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
-        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + qn16->chan_base_beats*32,
-                     qn16->chan_len_beats, SP_FET);
-        engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
-                     kn16->chan_len_beats, SP_FET2);
-        uint32_t rb = (2u*head_dim + 31)/32;
-        float aw_hmaxp[2] = {0, 0};
-        int   ea8p[2] = {0, 0};
-        for (int p = 0; p < 2; p++) {
-            // Stage this position's K into SP_K[0..) and V into SP_V (the qkr list and
-            // kv-pack operate on the fixed regions).
-            if (p == 1) {
-                volatile uint32_t *d = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_K);
-                volatile uint32_t *s2 = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_K
-                                                              + (uint32_t)kv_dim*2);
-                for (int i = 0; i < kv_dim/2; i++) d[i] = s2[i];
-                volatile uint32_t *dv = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_V);
-                volatile uint32_t *sv = (volatile uint32_t *)(SCRATCHPAD_BASE + vst[1]);
-                for (int i = 0; i < kv_dim/2; i++) dv[i] = sv[i];
-                volatile uint32_t *dq = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_Q);
-                volatile uint32_t *sq = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_Q
-                                                              + (uint32_t)q_dim*2);
-                for (int i = 0; i < q_dim/2; i++) dq[i] = sq[i];
-            }
-            perf_enter(OP_QKNORM);
-            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE
-                            + (rt->chan_base_beats + (uint64_t)(pos + p)*rb)*32,
-                         rb, SP_TAB);
-            int epq = seq_eps_int(eq_r[p]), epk = seq_eps_int(ek_r[p]);
-#ifdef BONSAI_VEC_LOOPS2
-            seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);
-            seq_patch((uint32_t)seq_qkr_di_kn, 7, (uint32_t)epk);
-            seq_patch((uint32_t)seq_qkr_di_qn, 8, (uint32_t)w16_shift(qn16));
-            seq_patch((uint32_t)seq_qkr_di_kn, 8, (uint32_t)w16_shift(kn16));
-#else
-            for (int hh = 0; hh < n_head + n_kv_head; hh++) {
-                seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
-                seq_patch(2*hh, 8, (uint32_t)w16_shift((hh < n_head) ? qn16 : kn16));
-            }
-#endif
-            seq_run(0, seq_qkr_count);
-            perf_exit(OP_QKNORM);
-            perf_enter(OP_KVQUANT);
-            if (p == 1)
-                ek_capture(l);
-            for (int hh = 0; hh < n_kv_head; hh++) {   // Pack every head first...
-                kv_pack_row_res(l, hh, 0, SP_K + hh*head_dim*2, E_NORM);
-                kv_pack_row_res(l, hh, 1, SP_V + hh*head_dim*2, ev_r[p]);
-            }
-            for (int hh = 0; hh < n_kv_head; hh++) {   // ...then hand the port to the engine.
-                kv_store_row_res(l, hh, 0, pos + p);
-                kv_store_row_res(l, hh, 1, pos + p);
-            }
-            perf_exit(OP_KVQUANT);
-            attn_seq2_layer(l, pos + p, aw_cp[p], &aw_hmaxp[p]);
-            // Head outputs -> int8 at the position's x8 slot.
-            perf_enter(OP_QUANT8);
-            int ea8 = 0;
-            if (aw_hmaxp[p] > 0) { frexpf(aw_hmaxp[p], &ea8); ea8 -= 7; }
-            for (int hh = 0; hh < n_head; hh++) {
-                int32_t Mh = (int32_t)lroundf(ldexpf(aw_cp[p][hh], 15 - ea8));
-                if (Mh > 32767) Mh = 32767;
-                if (Mh < 0)     Mh = 0;
-                int32_t sa2[5] = {(int32_t)(SP_H + hh*head_dim*2), 0,
-                                  (int32_t)(SP_X + 0x800 + (uint32_t)p*q_dim
-                                            + hh*head_dim),
-                                  head_dim/16, Mh};
-                vec_run(PROG_SCALE8, sa2, 5);
-            }
-            perf_exit(OP_QUANT8);
-            ea8p[p] = ea8;
-        }
-        // Output projection: one stream, both positions.
-        {
-            const struct bons_entry *eo = model_entry(ROLE_ATTN_OUT, l);
-            // x pair sits above the attention scratch (position 1's head quant8 writes
-            // SP_X[0, head_dim) while position 0's staged vector must survive).
-            model_matvec2(eo, SP_X + 0x800, SP_Y, (uint16_t)eo->rows);
-            for (int p = 0; p < 2; p++) {
-                perf_enter(OP_NORM_I32);
-                uint32_t dmax = 0;
-                int kk = op_norm_i32_sp_m(SP_Y + (uint32_t)p*4*eo->rows,
-                                          SP_D + (uint32_t)p*n_embd*2, n_embd, &dmax);
-                perf_exit(OP_NORM_I32);
-                int ed = ea8p[p] - (int)eo->bias + (int)eo->rshift + kk;
-                perf_enter(OP_RESID_ADD);
-                ex_st[p] = op_resid_add_sp(xr[p], ex_st[p],
-                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd,
-                                           dmax, &xa_st[p]);
-                perf_exit(OP_RESID_ADD);
-            }
-        }
-        // FFN: norm/quant per position, gate/up/down shared streams.
-        {
-            const struct bons_entry *eg_t = model_entry(ROLE_FFN_GATE, l);
-            const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
-            const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
-            int fx8[2];
-            for (int p = 0; p < 2; p++) {
-                perf_enter(OP_RMSNORM);
-                op_rmsnorm_sp(xr[p], ex_st[p], ffn_norm[l],
-                              model_entry_kind(ROLE_FFN_NORM, l, KIND_NORM16), n_embd, SP_H);
-                perf_exit(OP_RMSNORM);
-                perf_enter(OP_QUANT8);
-                fx8[p] = E_NORM + op_quant8_sp(SP_H, SP_X + (uint32_t)p*n_embd, n_embd);
-                perf_exit(OP_QUANT8);
-            }
-            int eg[2], eu[2];
-            model_matvec2(eg_t, SP_X, SP_Y, (uint16_t)eg_t->rows);
-            perf_enter(OP_NORM_I32);
-            for (int p = 0; p < 2; p++) {
-                int kg = op_norm_i32_sp(SP_Y + (uint32_t)p*4*eg_t->rows,
-                                        SP_G + (uint32_t)p*ffn_dim*2, ffn_dim);
-                eg[p] = fx8[p] - (int)eg_t->bias + (int)eg_t->rshift + kg;
-            }
-            perf_exit(OP_NORM_I32);
-            model_matvec2(eu_t, SP_X, SP_YU, (uint16_t)eu_t->rows);
-            perf_enter(OP_NORM_I32);
-            for (int p = 0; p < 2; p++) {
-                int ku = op_norm_i32_sp(SP_YU + (uint32_t)p*4*eu_t->rows,
-                                        SP_U + (uint32_t)p*ffn_dim*2, ffn_dim);
-                eu[p] = fx8[p] - (int)eu_t->bias + (int)eu_t->rshift + ku;
-            }
-            perf_exit(OP_NORM_I32);
-            int es8[2];
-            for (int p = 0; p < 2; p++) {
-                perf_enter(OP_SILU_MUL);
-                op_silu_mul_sp(SP_G + (uint32_t)p*ffn_dim*2, eg[p],
-                               SP_U + (uint32_t)p*ffn_dim*2, eu[p], ffn_dim);
-                perf_exit(OP_SILU_MUL);
-                perf_enter(OP_QUANT8);
-                int ss = op_quant8_sp(SP_G + (uint32_t)p*ffn_dim*2,
-                                      SP_X + (uint32_t)p*ffn_dim, ffn_dim);
-                perf_exit(OP_QUANT8);
-                es8[p] = eg[p] + eu[p] + 15 + ss;
-            }
-            model_matvec2(ed_t, SP_X, SP_Y, (uint16_t)ed_t->rows);
-            for (int p = 0; p < 2; p++) {
-                perf_enter(OP_NORM_I32);
-                uint32_t dmax = 0;
-                int kd = op_norm_i32_sp_m(SP_Y + (uint32_t)p*4*ed_t->rows,
-                                          SP_D + (uint32_t)p*n_embd*2, n_embd, &dmax);
-                perf_exit(OP_NORM_I32);
-                int ed = es8[p] - (int)ed_t->bias + (int)ed_t->rshift + kd;
-                perf_enter(OP_RESID_ADD);
-                ex_st[p] = op_resid_add_sp(xr[p], ex_st[p],
-                                           SP_D + (uint32_t)p*n_embd*2, ed, n_embd,
-                                           dmax, &xa_st[p]);
-                perf_exit(OP_RESID_ADD);
-            }
-        }
-    }
-    n_pos += 2;
-
-    // Final norm + LM head per position (argmax tap; vocab-padding edge bails out).
-    const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
-    if (!head)
-        head = model_entry(ROLE_TOK_EMB, 0);
-    uint32_t rpc  = head->rows/n_ch;
-    uint32_t hrb  = bons_row_beats(head->cols, head->kind, head->group);
-    int am[2];
-    for (int p = 0; p < 2; p++) {
-        perf_enter(OP_RMSNORM);
-        op_rmsnorm_sp(xr[p], ex_st[p], out_norm,
-                      model_entry_kind(ROLE_OUT_NORM, 0, KIND_NORM16), n_embd, SP_H);
-        perf_exit(OP_RMSNORM);
-        perf_enter(OP_QUANT8);
-        op_quant8_sp(SP_H, SP_X, n_embd);
-        perf_exit(OP_QUANT8);
-        perf_enter(OP_LMHEAD);
-        struct engine_op op = {0};
-        op.kind   = ENGINE_KIND_TERNARY;
-        op.rows   = rpc;
-        op.cols   = head->cols;
-        op.wbase  = BONSAI_CHAN_WEIGHT_BASE + head->chan_base_beats*32;
-        op.wlen   = rpc*hrb;
-        op.sbeats = bons_scale_beats(head->cols, head->group);
-        op.cbeats = bons_code_beats(head->cols, head->kind);
-        op.bias   = head->bias;
-        op.rshift = head->rshift;
-        op.xsrc   = SP_X;
-        op.dst    = SP_Y;
-        op.supw   = 1;
-        engine_run(&op);
-        uint32_t idx = engine_csr_argmax_idx_read();
-        perf_exit(OP_LMHEAD);
-        if (idx >= H->vocab)
-            return -1;
-        am[p] = (int)idx;
-    }
-    *am0 = am[0];
-    *am1 = am[1];
-    return 0;
-}
-#endif
 
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
 // Token-invariant words of the attention list, patched ONCE per forward instead of once
 // per layer per head (F0-2 patch hygiene, 2026-08-29): rowsw/wlen (scores + AXPY) and the
 // softmax block count depend on pos only, and the score-slot padding survives across heads
@@ -2923,7 +2495,6 @@ int infer_kv_pipe_state(void) { return kv_pipe_active; }
 // base shifts as kovl, so the same five rebuilds.
 void infer_kvq_redundant(int on)
 {
-#ifdef BONSAI_VEC_LOOPS2
     kvq_redundant = on ? 1 : 0;
     seq_ffn_base = -1;
     seq_build_qkr();
@@ -2931,9 +2502,6 @@ void infer_kvq_redundant(int on)
     seq_build_ffn();
     seq_build_scale8();
     seq_build_qkv();
-#else
-    (void)on;
-#endif
 }
 int infer_kvq_redundant_state(void) { return kvq_redundant; }
 
@@ -3145,7 +2713,6 @@ static void attn_list_prep_token(int pos)
     }
     attn_prep_pos = pos;
 }
-#endif
 
 static int fold_nrep_sh = 1; // log2(n_head/n_kv_head) when a power of two (set at init).
 // The per-head fold from its two hardware results (softmax8's p8 sum, the AXPY absmax),
@@ -3397,14 +2964,12 @@ static int forward(int token, int want_logits)
         tprof_begin(); // armed=N traces the Nth generated token; disarms itself.
     rq8_prefetched = 0; // A logits-less forward leaves the out-norm row prefetched; drop it.
     perf_enter(OP_EMBED);
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     if (likely(attn_all_hw())) {
         ex_state = embed_row_fetch(emb, token, SP_XR);
         x_amax   = X_AMAX_AFTER_EMBED;
         perf_exit(OP_EMBED);
         goto embed_done;
     }
-#endif
     embed_row_f(emb, token, x);
     // Residual stream lives in the scratchpad as int16 BFP from here on.
     {
@@ -3423,9 +2988,7 @@ static int forward(int token, int want_logits)
         x_amax   = X_AMAX_AFTER_EMBED;
     }
     perf_exit(OP_EMBED);
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
 embed_done: ;
-#endif
     dbg_sum("emb", -1, SP_XR, 2*n_embd, ex_state);
 
     int   kv_dim = n_kv_head*head_dim;
@@ -3433,7 +2996,6 @@ embed_done: ;
     float scale  = 1.0f/sqrtf((float)head_dim);
     int   pos    = n_pos;
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     int attn_hw = attn_all_hw();
     if (likely(attn_hw)) {
         // Rope table row for this position ([c14 | s14], Q14, from the image).
@@ -3441,15 +3003,12 @@ embed_done: ;
         uint32_t rb = (2u*head_dim + 31)/32;
         engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + (rt->chan_base_beats + (uint64_t)pos*rb)*32,
                      rb, SP_TAB);
-#ifdef CSR_SEQ_BASE
         if (likely(seq_use)) {
             perf_enter(OP_SCORES);
             attn_list_prep_token(pos);
             perf_exit(OP_SCORES);
         }
-#endif
     }
-#endif
 
     for (int l = 0; l < n_layer; l++) {
         if (unlikely(tprof_active))
@@ -3460,7 +3019,6 @@ embed_done: ;
                                    n_embd, SP_H, SP_X);
         dbg_sum("attn_in_x8", l, SP_X, n_embd, E_NORM + sx8);
         int eq_res = 0, ev_res = 0;
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
         if (likely(attn_hw)) {
             // q/k/v: engine matvec -> vec norm_i32 -> int16 resident; qk-norm + rope on
             // the vector unit; K/V packed and stored to HBM. No CPU floats anywhere.
@@ -3469,12 +3027,10 @@ embed_done: ;
             const struct bons_entry *evt = model_entry(ROLE_ATTN_V, l);
             perf_enter(OP_NORM_I32);
             int kq, kk2, kv2;
-#ifdef CSR_SEQ_BASE
             // Resident q/k norm rows (qres): one-time fetch of every layer's row. Ahead of
             // the qkv list since qkvx runs the k-norm INSIDE that list (2026-09-09); the
             // fetch used to sit in the qkr section below, after the list.
             int qres = 0;
-#ifdef BONSAI_VEC_LOOPS2
             {
                 const struct bons_entry *qn16r = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
                 const struct bons_entry *kn16r = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
@@ -3491,7 +3047,6 @@ embed_done: ;
                 }
                 qkn_resident = 1;
             }
-#endif
             if (likely(qkvl_use && seq_use && seq_qkv_base >= 0 && op_on_hw(OP_NORM_I32))) {
                 // One sequencer run for q/k/v + norms (seq_build_qkv). The engine words
                 // were posted under the previous FFN list (or the LM-head stream); the
@@ -3529,7 +3084,6 @@ embed_done: ;
                 kk2 = (bitlen32(ak) > 14) ? bitlen32(ak) - 14 : 0;
                 kv2 = (bitlen32(av) > 14) ? bitlen32(av) - 14 : 0;
             } else
-#endif
 #if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
             if (ovl_use && op_on_hw(OP_NORM_I32)) {
                 cold_path(); // Dead on the card: the qkv list above runs instead.
@@ -3592,13 +3146,11 @@ embed_done: ;
                 engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
                              kn16->chan_len_beats, SP_FET2);
             }
-#ifdef CSR_SEQ_BASE
             {
                 // One sequencer run replaces the 2*(n_head+n_kv) per-head dispatches;
                 // only the eps args change per layer (descriptor word 7 = A5).
                 if (qtr) qt[qtn++] = perf_now(); // [1] fetches + entry lookups done.
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
-#ifdef BONSAI_VEC_LOOPS2
                 if (!qkvx_ok) { // qkvx: the sequencer reads both from the layer's LUTs,
                                 // and qkv_prep_layer patched both A6s.
                     seq_patch((uint32_t)seq_qkr_di_qn, 7, (uint32_t)epq);   // rmsnorm_h A5 (q heads).
@@ -3607,12 +3159,6 @@ embed_done: ;
                     seq_patch((uint32_t)seq_qkr_di_kn, 8, (uint32_t)w16_shift(kn16));
                 }
                 (void)epq; (void)epk;
-#else
-                for (int hh = 0; hh < n_head + n_kv_head; hh++) {
-                    seq_patch(2*hh, 7, (hh < n_head) ? epq : epk);
-                    seq_patch(2*hh, 8, (uint32_t)w16_shift((hh < n_head) ? qn16 : kn16));
-                }
-#endif
                 if (kv_pipe_active) {
                     // In-list stores: the scale beats must exist before the list runs
                     // (the store streams them), and each store's target row moves per
@@ -3657,7 +3203,6 @@ embed_done: ;
                                  kn16->chan_len_beats, SP_FET2);
                 }
                 if (qtr) qt[qtn++] = perf_now(); // [2] kv scale-preps + store patches done.
-#ifdef BONSAI_SP_SB_SLOT
                 if (likely(prep_ovl && seq_use && seq_attn_heads >= n_head
                     && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
                     // Overlap (sideband slot): the attention list's per-layer patches
@@ -3682,42 +3227,18 @@ embed_done: ;
                                (unsigned long)(qt[5]-qt[4]));
                     }
                 } else
-#endif
                 seq_run(0, seq_qkr_count);
             }
             perf_exit(OP_QKNORM);
-#else
-            if (fovl_use && !qres) {
-                engine_join(dqn);
-                engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
-                             kn16->chan_len_beats, SP_FET2);
-            }
-            for (int hh = 0; hh < n_head; hh++)
-                vec_rmsnorm_head(SP_Q + hh*head_dim*2, eq_r, SP_FET, head_dim, w16_shift(qn16));
-            for (int hh = 0; hh < n_kv_head; hh++)
-                vec_rmsnorm_head(SP_K + hh*head_dim*2, ek_r, SP_FET2, head_dim, w16_shift(kn16));
-            perf_exit(OP_QKNORM);
-            perf_enter(OP_ROPE);
-            for (int hh = 0; hh < n_head; hh++)
-                vec_rope_head(SP_Q + hh*head_dim*2, head_dim);
-            for (int hh = 0; hh < n_kv_head; hh++)
-                vec_rope_head(SP_K + hh*head_dim*2, head_dim);
-            perf_exit(OP_ROPE);
-#endif
             dbg_sum("q16", l, SP_Q, 2*q_dim, E_NORM);      // q heads normed + roped
             dbg_sum("k16", l, SP_K, 2*kv_dim, E_NORM);     // k heads normed + roped
             dbg_sum("v16", l, SP_V, 2*kv_dim, ev_res);     // v after norm_i32
             perf_enter(OP_KVQUANT);
             for (int hh = 0; hh < n_kv_head && !kv_pipe_active; hh++) {
-#ifdef CSR_SEQ_BASE
                 // ...the quant8s already ran inside the qkr list (F0-4); prep only.
                 // (With kovl the prep AND the stores already ran with the list.)
                 kv_pack_prep_res(l, hh, 0, E_NORM);
                 kv_pack_prep_res(l, hh, 1, ev_res);
-#else
-                kv_pack_row_res(l, hh, 0, SP_K + hh*head_dim*2, E_NORM);
-                kv_pack_row_res(l, hh, 1, SP_V + hh*head_dim*2, ev_res);
-#endif
             }
 #ifdef CSR_ENGINE_CSR_REP_ADDR
             // The !kv_pipe_active guard was on the #else twin below but not here, so with
@@ -3751,7 +3272,6 @@ embed_done: ;
             (void)eq_res;
             goto attn_scores;
         }
-#endif
         {
         float sx = ldexpf(1.0f, E_NORM + sx8);
         matvec_rows_f(model_entry(ROLE_ATTN_Q, l), 0, q_dim/n_ch,  sx, q, 0, 0, 0);
@@ -3799,7 +3319,6 @@ embed_done: ;
             }
         }
 cpu_kv_full: ;
-#ifdef BONSAI_HAS_KVSTORE
         // Dual-KV: also append Q8 row packets to HBM for the engine scores path.
         if (op_on_hw(OP_KVQUANT)) {
             for (int h = 0; h < n_kv_head; h++) {
@@ -3807,10 +3326,8 @@ cpu_kv_full: ;
                 kv_store_row(l, h, 1, pos, v + h*head_dim);
             }
         }
-#endif
         perf_exit(OP_KVQUANT);
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
 attn_scores: ;
         // Resident attention output: per-head int16 in SP_H + per-head value scales,
         // aligned to a common ea8 and scale8-ed into SP_X after the head loop.
@@ -3818,10 +3335,8 @@ attn_scores: ;
         float aw_hmax = 0;
         aw_hvalid = 0; // Both fold forms start empty for every path below (the list paths
                        // reset it again where they fold; the op-by-head path relies on this).
-#endif
         // Attention (CPU, GQA).
         int n_rep = n_head/n_kv_head;
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
         if (seq_use && attn_hw && seq_at2_kvchunk > 0
             && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV)) {
             attn_seq2_layer(l, pos, aw_c, &aw_hmax);
@@ -3922,13 +3437,11 @@ attn_scores: ;
             perf_exit(OP_WV);
             goto attn_heads_done;
         }
-#endif
         cold_path(); // Dead on the card: the attention list above runs instead.
         for (int hh = 0; hh < n_head; hh++) {
             int kvh = hh/n_rep;
             const float *qh = q + hh*head_dim;
             float smax = -1e30f;
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
             if (likely(op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
                 // Fused resident path: scores (engine) -> softmax8 (vec, p8 + exact sum)
                 // -> weighted-V (engine AXPY) -> cross-channel reduce (vec). Scores never
@@ -4020,9 +3533,7 @@ attn_scores: ;
                 perf_exit(OP_WV);
                 continue;
             }
-#endif
             perf_enter(OP_SCORES);
-#ifdef BONSAI_HAS_KVSTORE
             if (likely(op_on_hw(OP_SCORES))) {
                 // q head -> int8 @ 2^eq in SP_X, one striped+interleaved Q8 op over the
                 // K region: int32 scores land position-major in SP_SC.
@@ -4052,7 +3563,6 @@ attn_scores: ;
                     if (sc > smax) smax = sc;
                 }
             } else
-#endif
             { // The whole CPU fallback. This brace used to be missing: the else bound only
               // to the context-limit check below and the CPU score loop ran after HARDWARE
               // scores too, overwriting them from a k_cache the HW path never fills and
@@ -4084,7 +3594,6 @@ attn_scores: ;
             float inv = 1.0f/sum;
             perf_enter(OP_WV);
             float *ah = attn + hh*head_dim;
-#ifdef BONSAI_HAS_KVSTORE
             if (likely(op_on_hw(OP_WV))) {
                 // Probs -> int8 @ 2^ep (position-major in SP_X), one AXPY op over the V
                 // region; each channel lands head_dim int32 partials chan-major in SP_SC.
@@ -4135,7 +3644,6 @@ attn_scores: ;
                 perf_exit(OP_WV);
                 continue;
             }
-#endif
             for (int d = 0; d < head_dim; d++) ah[d] = 0;
             for (int t = 0; t <= pos; t++) {
                 const int8_t *vt = v_cache + ((uint64_t)l*cpu_kv_ctx + t)*kv_dim + kvh*head_dim;
@@ -4144,15 +3652,12 @@ attn_scores: ;
             }
             perf_exit(OP_WV);
         }
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE)
 attn_heads_done: ;
-#endif
 
         // Output projection + residual (resident).
         {
             const struct bons_entry *eo = model_entry(ROLE_ATTN_OUT, l);
             int ea8;
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
             if (likely(attn_hw)) {
                 perf_enter(OP_QUANT8);
                 ea8 = 0;
@@ -4170,23 +3675,18 @@ attn_heads_done: ;
                         if (Mh > 32767) Mh = 32767;
                         if (Mh < 0)     Mh = 0;
                     }
-#ifdef CSR_SEQ_BASE
                     if (likely(seq_use && seq_scale8_base >= 0)) {
                         seq_patch((uint32_t)(seq_scale8_base + hh), 6, (uint32_t)Mh);
                         continue;                       // One list run below (F0-6).
                     }
-#endif
                     int32_t sa2[5] = {(int32_t)(SP_H + hh*head_dim*2), 0,
                                       (int32_t)(SP_X + hh*head_dim), head_dim/16, Mh};
                     vec_run(PROG_SCALE8, sa2, 5);
                 }
-#ifdef CSR_SEQ_BASE
                 if (likely(seq_use && seq_scale8_base >= 0))
                     seq_run((uint32_t)seq_scale8_base, (uint32_t)n_head);
-#endif
                 perf_exit(OP_QUANT8);
             } else
-#endif
             ea8 = quantize_f_pow2(attn, q_dim, SP_X);
             dbg_sum("attn_x8", l, SP_X, q_dim, ea8);
             // The attention list's per-head spills (int32 as int16 pairs: the low half of
@@ -4215,8 +3715,6 @@ attn_heads_done: ;
                                                 n_embd, SP_H, SP_X);
             dbg_sum("ffn_x8", l, SP_X, n_embd, ex8);
 
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && !defined(BONSAI_HAS_DUALQ)
             if (likely(seq_use && seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
                 && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8))) {
                 // One list for gate->norm->up->norm->silu->quant8->down (see seq_build_ffn).
@@ -4241,14 +3739,10 @@ attn_heads_done: ;
                         seq_run((uint32_t)seq_ffn_base, (uint32_t)seq_ffn_len);
                     perf_ovl_acc(fprof_acc_list); fprof_nlist++;
                 } else {
-#ifdef BONSAI_SP_SB_SLOT
                     seq_list_start((uint32_t)seq_ffn_base, (uint32_t)seq_ffn_len);
                     if (likely(qkvl_use) && l + 1 < n_layer)
                         qkv_prep_layer(l + 1); // Next layer's projections, under this stream.
                     seq_join();
-#else
-                    seq_run((uint32_t)seq_ffn_base, (uint32_t)seq_ffn_len);
-#endif
                 }
                 perf_exit(OP_SILU_MUL);
                 // Recover the folds the removed round-trips produced - identical values:
@@ -4273,7 +3767,6 @@ attn_heads_done: ;
                 dbg_sum("ffn_res", l, SP_XR, 2*n_embd, ex_state);
                 goto ffn_done;
             }
-#endif
             cold_path(); // Dead on the card: the FFN list above runs instead.
             if (unlikely(fprof_use)) {
                 perf_ovl_mark();
@@ -4282,7 +3775,7 @@ attn_heads_done: ;
             model_matvec(eg_t, SP_X, SP_Y);
             if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int kg;
-#if defined(CSR_ENGINE_CSR_ABSMAX_ADDR) && defined(CSR_VECUNIT_BASE)
+#if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
             if (ovl_use && op_on_hw(OP_NORM_I32)) {
                 // Overlap: the up stream runs UNDER the gate norm. Gate absmax is read
                 // BEFORE the submit (the tracker resets on accept); regions are disjoint
@@ -4333,10 +3826,7 @@ attn_heads_done: ;
             ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
                                     next_norm16(l));
             dbg_sum("ffn_res", l, SP_XR, 2*n_embd, ex_state);
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && !defined(BONSAI_HAS_DUALQ)
             ffn_done: ;
-#endif
         }
     }
     if (dbg_armed && !want_logits)
@@ -4358,7 +3848,6 @@ attn_heads_done: ;
     uint32_t chunk_rpc = 0x20000/(4*n_ch); // 128 KB of int32 results per chunk.
     if (chunk_rpc > rpc) chunk_rpc = rpc;
 
-#ifdef BONSAI_HAS_TOPK
     if (op_on_hw(OP_LMHEAD) && smp_on()) {
         // Sampling: SMP_SLICES row-range ops, one candidate per slice from the tap.
         uint32_t rb = bons_row_beats(head->cols, head->kind, head->group);
@@ -4388,13 +3877,11 @@ attn_heads_done: ;
                 nc++;
             }
         }
-#ifdef CSR_SEQ_BASE
         if (likely(lovl_use && seq_use)) {   // the same next-token prep the greedy path posts
             attn_list_prep_token(n_pos);
             if (likely(qkvl_use))
                 qkv_prep_layer(0);
         }
-#endif
         perf_exit(OP_LMHEAD);
         if (unlikely(tprof_active))
             tprof_end();
@@ -4425,7 +3912,6 @@ attn_heads_done: ;
         op.xsrc   = SP_X;
         op.dst    = SP_Y;
         op.supw   = 1;
-#ifdef CSR_SEQ_BASE
         if (likely(lovl_use && seq_use)) {
             // C2-3: the next forward's per-token list prep (score padding + the
             // rowsw/wlen/blocks patches) depends only on the position, never on the
@@ -4437,7 +3923,6 @@ attn_heads_done: ;
                 qkv_prep_layer(0);   // Next forward's layer-0 projections ride here too.
             engine_join(dl);
         } else
-#endif
         engine_run(&op);
         uint32_t idx = engine_csr_argmax_idx_read();
         if (idx < H->vocab) {
@@ -4451,7 +3936,6 @@ attn_heads_done: ;
             return (int)idx;
         }
     }
-#endif
     int32_t best = -0x7FFFFFFF;
     int     best_tok = 0;
     volatile int32_t *y = (volatile int32_t *)(SCRATCHPAD_BASE + SP_Y);
@@ -4633,14 +4117,7 @@ int infer_init(void)
     // keeps its own KV in HBM at full context); cap it so it fits the high heap window
     // above engine channel 3's weight tail. Without HW attention it is the primary cache
     // and keeps the full context.
-#ifdef BONSAI_HAS_KVSTORE
     cpu_kv_ctx = (max_ctx < CPU_KV_CTX) ? max_ctx : CPU_KV_CTX;
-#else
-    cpu_kv_ctx = max_ctx;
-    heap_hi_base = 0x40000000u + 0x09000000u;           // no engine windows to dodge
-    heap_hi = (MAIN_RAM_SIZE >= 0x0A000000) ? (uint8_t *)heap_hi_base : 0;
-#endif
-#ifdef BONSAI_HAS_KVSTORE
     // KV region: above the per-channel weight payload, 4 KB aligned.
     kv_base   = (uint32_t)((BONSAI_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);
     kv_rb     = 1 + head_dim/32; // One scale beat + code beats (cols = head_dim, Q8).
@@ -4683,26 +4160,18 @@ int infer_init(void)
     }
     kv_ekmax  = halloc(n_layer*n_kv_head*2);
     for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
-#ifdef CSR_SEQ_BASE
     seq_build_qkr();
     seq_build_attn();
     seq_build_ffn();
     seq_build_scale8();
     seq_build_qkv();
     seq_build_attn2();
-#endif
     infer_qkvx_report();
-#endif
     k_cache = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*kv_dim);
     v_cache = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*kv_dim);
     k_scale = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*n_kv_head*sizeof(float));
     v_scale = halloc_hi((uint64_t)n_layer*cpu_kv_ctx*n_kv_head*sizeof(float));
     scores  = halloc(max_ctx*sizeof(float));
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
-    spec_succ   = halloc((uint64_t)H->vocab*2);
-    spec_succ_v = halloc(H->vocab);
-#endif
     n_pos   = 0;
     eps_init();
     rope_init();
@@ -4758,7 +4227,6 @@ void infer_vbench(void)
     printf("VB clk=%d MHz  (cycles, avg over reps)\n",
            (int)(CONFIG_CLOCK_FREQUENCY/1000000));
 
-#ifdef CSR_VECUNIT_BASE
     { // Vec dispatch floor: smallest real program run (resid_add, 1 beat).
         int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 1, 0, -1};
         t0 = perf_now();
@@ -4774,7 +4242,6 @@ void infer_vbench(void)
         printf("VB sp_write_64w     %8lu  (per store %lu)\n", (unsigned long)dt,
                (unsigned long)(dt/64));
     }
-#ifdef CSR_SEQ_BASE
     { // One-descriptor sequencer list (spill): the in-list dispatch floor.
         int32_t pa = (int32_t)SP_FET;
         seq_desc_vec(187, PROG_SPILL, &pa, 1, 0);
@@ -4796,8 +4263,6 @@ void infer_vbench(void)
                (unsigned long)((dt - t1)/(8*31)), (unsigned long)(dt/8), (unsigned long)(t1/8));
         seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
     }
-#endif
-#if defined(BONSAI_HAS_KVSTORE)
     { // KV scale-beat prep with a forced exponent change every call.
         t0 = perf_now();
         for (int i = 0; i < 16; i++) kv_store_scale_prep(0, 0, (i & 1) ? -20 : -21);
@@ -4805,7 +4270,6 @@ void infer_vbench(void)
         kvp_scale_e8[0] = -9999; // Leave the slot marked stale for the next real pack.
         printf("VB scale_prep       %8lu\n", (unsigned long)(dt/16));
     }
-#endif
     { // Vec throughput: resid_add over n_embd (128 beats, ~1.3k instructions).
         int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 128, 0, -1};
         t0 = perf_now();
@@ -4813,7 +4277,6 @@ void infer_vbench(void)
         dt = perf_now() - t0;
         printf("VB vec_resid_128b   %8lu\n", (unsigned long)(dt/16));
     }
-#endif
     { // Engine fetch: 128 beats from channel 0 (per-op latency + short stream).
         t0 = perf_now();
         for (int i = 0; i < 16; i++)
@@ -4846,7 +4309,6 @@ void infer_vbench(void)
             op_rmsnorm_sp(SP_XR, -15, attn_norm[0], an, n_embd, SP_H);
         dt = perf_now() - t0;
         printf("VB rmsnorm_full     %8lu\n", (unsigned long)(dt/8));
-#if defined(CSR_VECUNIT_BASE) && defined(BONSAI_HAS_VECUNIT2)
         if (an) {
             t0 = perf_now();
             for (int i = 0; i < 8; i++)
@@ -4866,7 +4328,6 @@ void infer_vbench(void)
             dt = perf_now() - t0;
             printf("VB rmsnorm_vecrun   %8lu\n", (unsigned long)(dt/8));
         }
-#endif
     }
     { // Big weight stream: ffn_gate matvec (the shape the token loop lives in), with the
       // per-channel stream counters around it: AR-stall cycles say whether the HBM side
@@ -4901,7 +4362,6 @@ void infer_vbench(void)
         printf("VB matvec_q         %8lu  (%lu beats/chan)\n",
                (unsigned long)(dt/8), (unsigned long)eq->chan_len_beats);
     }
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2)
     { // KV store: the pair the token loop runs 448 times per forward (kvquant is 16% of it).
       // Split so the engine STORE and the vec quant8 that feeds it are separated - the whole
       // pair measures ~8.5k cycles in `stats` and only ~3.6k of that is accounted for by the
@@ -4955,7 +4415,6 @@ void infer_vbench(void)
         printf("VB kv_pair_alt      %8lu  (%d pack+store pairs, interleaved)\n",
                (unsigned long)dt, 2*n_kv_head);
     }
-#endif
     { // perf_now itself (measurement overhead per probe pair).
         t0 = perf_now();
         for (int i = 0; i < 64; i++) (void)perf_now();
@@ -4987,12 +4446,6 @@ void infer_spec(int on)
 {
     spec_on  = on;
     spec_acc = spec_rej = 0;
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
-    if (on && spec_succ_v)
-        for (uint32_t i = 0; i < H->vocab; i++)
-            spec_succ_v[i] = 0;
-#endif
 }
 
 void infer_spec_stats(int *acc, int *rej)
@@ -5089,7 +4542,6 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
     if (resident == 0) {
         n_pos = 0; // Reset the KV cache (fresh generation).
         if (hybrid_present()) hybrid_reset();
-#ifdef BONSAI_HAS_KVSTORE
         // ...and its exponent ratchet. kv_ekmax is the running max over every row ever
         // stored in a region and picks the KV scale bias (B = 22 - ekmax), so without this
         // a generation inherited the previous request's maxima: its arithmetic depended on
@@ -5097,7 +4549,6 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
         // (2026-09-07, from the external review). Rows are overwritten from position 0 anyway.
         if (kv_ekmax)
             for (int i = 0; i < n_layer*n_kv_head*2; i++) kv_ekmax[i] = -128;
-#endif
     }
     last_prefill.reset_cycles = perf_now64() - reset_start;
     if (resident == n) {
@@ -5124,51 +4575,6 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
         count++;
         if (gen_is_stop(tok))
             break;
-#if defined(BONSAI_HAS_KVSTORE) && defined(BONSAI_HAS_VECUNIT2) && defined(CSR_SEQ_BASE) \
-    && defined(BONSAI_HAS_TOPK) && defined(BONSAI_HAS_DUALQ)
-        // Speculative decode: draft the successor seen last time this token appeared;
-        // one dual-x pair-forward verifies the draft and computes the next token. On
-        // accept, two tokens per weight-stream pass. Greedy -> lossless (token stream
-        // identical to plain decode). Rejection restores the kv_ekmax entries the
-        // speculated position touched; its KV rows are overwritten by the re-forward.
-        if (spec_on && seq_use && attn_all_hw() && seq_at2_kvchunk > 0 && spec_succ != 0
-            && n_pos + 2 <= max_ctx && i + 1 < max_new) {
-            int draft = spec_succ_v[tok] ? (int)spec_succ[tok] : -1;
-            if (draft >= 0) {
-                int am0 = -1, am1 = -1;
-                int save_pos = n_pos;
-                if (forward_pair(tok, draft, &am0, &am1) == 0) {
-                    if (am0 == draft) {
-                        spec_acc++;
-                        spec_succ[tok] = (uint16_t)draft; spec_succ_v[tok] = 1;
-                        emit(draft);
-                        count++; i++;
-                        spec_succ[draft] = (uint16_t)am1; spec_succ_v[draft] = 1;
-                        tok = am1;
-                        if (gen_is_stop(draft))
-                            break;
-                        continue;
-                    }
-                    // Reject: keep position n_pos-2 (t0 accepted), drop the draft's.
-                    spec_rej++;
-                    ek_restore();
-                    n_pos = save_pos + 1;
-                    spec_succ[tok] = (uint16_t)am0; spec_succ_v[tok] = 1;
-                    tok = am0;
-                    continue;
-                }
-                n_pos = save_pos; // Padding-row bail: redo plainly.
-                ek_restore();
-            }
-        }
-        if (spec_on && spec_succ != 0) {
-            // Track successors even on the plain path so drafts warm up.
-            int nt = forward(tok, 1);
-            spec_succ[tok] = (uint16_t)nt; spec_succ_v[tok] = 1;
-            tok = nt;
-            continue;
-        }
-#endif
         // The forward after the LAST emitted token computes a successor nobody emits and
         // stores a KV row nobody reads (every caller restarts at n_pos = 0), so skip it:
         // one full forward per request, ~1.5% of a 64-token reply. bench 64 therefore runs
