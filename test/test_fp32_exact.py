@@ -1,11 +1,18 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """gateware/fp32_exact.py against IEEE float32 (numpy), NaNs canonical as on RV32F."""
+
 import shutil
 import subprocess
 from pathlib import Path
 
 import numpy as np
 import pytest
+
 from migen import Module, Signal, run_simulation
 from migen.fhdl import verilog
 
@@ -13,6 +20,8 @@ from trixium.units.fp32 import CANONICAL_NAN, FP32Add, FP32DivSqrt, FP32Mul
 
 f32 = np.float32
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def canon(x):
     x = np.asarray(x, dtype=f32)
@@ -82,6 +91,8 @@ def compiled(tmp_path_factory):
     assert built.returncode == 0, built.stdout[-4000:] + built.stderr[-4000:]
     return tmp / "obj/Vfp32x"
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("op,n", [("mul", 400000), ("add", 400000), ("div", 60000), ("sqrt", 60000)])
 def test_compiled_operator_equals_ieee(tmp_path, compiled, op, n):

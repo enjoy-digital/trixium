@@ -25,8 +25,10 @@ from trixium.model import bitexact as bx
 E_NORM = -11
 
 
-# Reference implementations - the same rules firmware applies (infer.c: op_quant8_sp,
-# op_resid_add_sp) and the mirror applies (test_sim_smoke.hybrid_generate).
+# Reference implementations ------------------------------------------------------------------------
+#
+# The same rules firmware applies (infer.c: op_quant8_sp, op_resid_add_sp) and the mirror
+# applies (test_sim_smoke.hybrid_generate).
 
 def quant8_shift(amax):
     return 8 if amax == 0 else int(amax).bit_length() - 7
@@ -55,6 +57,8 @@ def mantissa_bits(m):
     a = int(np.abs(m).max())
     return a.bit_length()
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_programs_fit_the_instruction_bram():
     """The upload wraps instead of failing: overflow silently overwrites program 0.

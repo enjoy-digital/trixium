@@ -1,17 +1,26 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Independent dense integer oracle; no floating-point butterfly reference."""
+
 import random
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest
+
 from migen import run_simulation
 from migen.fhdl import verilog
 
 from trixium.units.hadamard import IntegerHadamard
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def dense(values, signs, inverse=False):
     size = len(values)
@@ -94,6 +103,8 @@ def command(dut, values, signs, inverse=False, stalls=True, seed=7):
         assert not (yield dut.cmd.ready), "second command accepted while busy"
     raise AssertionError(f"stalled: sent {sent} words, received {len(received)} values")
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("size,lanes,width", [(4, 2, 8), (4, 2, 32), (16, 2, 8), (16, 8, 8),
                                                (128, 4, 16), (1024, 8, 8)])

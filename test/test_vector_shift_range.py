@@ -1,14 +1,26 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+
 """The rmsnorm programs' A6 (gamma-exponent shift) over the range the per-tensor NORM16
 exponents produce (layout.norm16_exp: the 1.7B spans -15..-7, i.e. A6 from -19 to -11),
 RTL against the interpreter. The suites only ever ran A6 = -17 (the old fixed -13)."""
+
+import os
+import sys
+
 import numpy as np
 import pytest
-import sys, os
+
 sys.path.insert(0, os.path.dirname(__file__))
-from test_vector import _compare, _compare_words, SP_SIZE
+
 from trixium.model import asm
+from test_vector import _compare, _compare_words, SP_SIZE
 
 E_NORM = -11
+
 
 @pytest.mark.parametrize("e16", [-15, -14, -13, -10, -8, -7])
 def test_rtl_rmsnorm_shift_range(e16):

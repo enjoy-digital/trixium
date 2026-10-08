@@ -6,22 +6,23 @@
 
 """The XCU1525's engine port path: the engine's AXI over LiteDRAM's bridge and converter.
 
-Memory note (measured 2026-09-23 with tools/run_tests_guarded.py): each test that builds a
-real LiteDRAMCore peaks about 9.5 GB in Migen's simulator (an earlier "5.5 GB" was where a
-6 GB address-space cap killed it), and pytest keeps that between parametrizations, so running
-the whole file in one process reached 21 GB and starved a concurrent Vivado run. Building
-the core and PHY model costs only 30 MB - the cost is the simulator's state over tens of
-thousands of cycles, not the design or the simulated DRAM (4.2M words = 33.5 MB). Run this
-file one test per process when anything else needs the machine.
+Memory note (measured with tools/run_tests_guarded.py): each test that builds a real
+LiteDRAMCore peaks about 9.5 GB in Migen's simulator, and pytest keeps that between
+parametrizations, so the whole file in one process reaches 21 GB. Building the core and PHY
+model costs only 30 MB - the cost is the simulator's state over tens of thousands of cycles,
+not the design or the simulated DRAM (4.2M words = 33.5 MB). Run this file one test per
+process when anything else needs the machine.
 
 On the FK33 the engine's 256-bit AXI ports meet the HBM controller directly. On the XCU1525
 they meet a 512-bit DDR4 controller through LiteDRAMAXI2Native and the crossbar's 256 -> 512
 native-port up-converter. This test drives the engine's own reader and the loader's own
 writer (16-beat INCR bursts, 8 outstanding) through exactly that chain onto LiteDRAM's
 native-port memory model, so a stall or a data mix-up is found here in seconds rather than
-in a 30-minute Verilator run (where the first DDR4 sim stalled every op at zero beats,
-2026-09-18).
+in a 30-minute Verilator run.
 """
+
+import os
+import sys
 
 import numpy as np
 import pytest
@@ -38,9 +39,10 @@ from litedram.frontend.adapter import LiteDRAMNativePortConverter
 from trixium.memory.axi import AXIReader
 from trixium.memory.axi import AXIWriter
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "litex", "litedram"))
-from test.common import DRAMMemory  # LiteDRAM's native-port memory model.
+# LiteDRAM's native-port memory model, from the LiteDRAM repository's test package.
+import litedram
+sys.path.insert(0, os.path.dirname(os.path.dirname(litedram.__file__)))
+from test.common import DRAMMemory
 
 
 class _DUT(Module):
@@ -217,7 +219,7 @@ def test_engine_port_path_streams_at_rate(port_width):
     near one beat per cycle. LiteDRAM's native up-converter (the 256-bit port on the 512-bit
     controller) used to hold one controller word in flight - a read had to return before the
     next was accepted - and the XCU1525 streamed weights at 23 cycles/beat (5.6 tok/s on the
-    1.7B, 2026-09-19). The patched converter keeps 8 reads in flight; this pins the rate."""
+    1.7B). The patched converter keeps 8 reads in flight; this pins the rate."""
     from litedram.core import LiteDRAMCore
     from litedram.modules import MT40A512M8
     from litedram.phy.model import SDRAMPHYModel

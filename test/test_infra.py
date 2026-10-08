@@ -8,6 +8,7 @@
 # (host stream -> HBM).
 
 import numpy as np
+
 from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface

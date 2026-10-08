@@ -1,9 +1,13 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Independent dense parity oracle, including full signed-byte range and RAM reuse.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Independent dense parity oracle, including full signed-byte range and RAM reuse.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include "Vinteger_hadamard.h"
 #include "verilated.h"
 #include <algorithm>

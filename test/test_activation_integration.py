@@ -1,10 +1,16 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 import math
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
+
 from migen import C, Cat, Memory, Module, Signal, run_simulation
 from migen.fhdl import verilog
 

@@ -1,9 +1,13 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Compiled client with one-cycle reads, masked writes and an IEEE FP32 oracle.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Compiled client with one-cycle reads, masked writes and an IEEE FP32 oracle.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include "Vprojection_restore_sp.h"
 #include "verilated.h"
 #include <array>

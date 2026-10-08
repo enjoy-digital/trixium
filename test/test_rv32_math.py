@@ -1,9 +1,15 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Independent host profile vs the target libm and actual firmware math helpers."""
-from pathlib import Path
+
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest

@@ -1,10 +1,14 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// The firmware's separate int->float cast, ldexpf scale, and FP32 multiply.
-// Linux syscalls only, so both RV32 ilp32f and soft-float ilp32 link target libm.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * The firmware's separate int->float cast, ldexpf scale, and FP32 multiply.
+ * Linux syscalls only, so both RV32 ilp32f and soft-float ilp32 link target libm.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include <math.h>
 #include <stdint.h>
 

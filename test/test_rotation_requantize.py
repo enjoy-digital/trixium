@@ -1,9 +1,16 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Exact post-Hadamard whole-vector scaling through the shared scratchpad."""
+
 import math
 import random
 
 import pytest
+
 from migen import run_simulation
 
 from test_activation_sp import QuantSP, bits, pack, reference, submit
@@ -13,6 +20,8 @@ FIELDS = dict(src=0x1000, dst=0xc000, exponents=0x400, maxima=0x440,
               result_exponent=0x480, elements=1024, requantize=1, protect_start=0, protect_end=128)
 SENTINEL = pack([0xdeadbeef]*8, 32)
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def prepare(dut, arrays, exponents, maxima=None):
     for index, array in enumerate(arrays):
@@ -70,6 +79,8 @@ def verify(dut, arrays, exponents, stalls=True):
         assert (yield dut.sp.mem[addr//32]) == SENTINEL
     yield
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_requantization_global_scale_negative_ties_nine_blocks_and_zero_reuse():
     dut = QuantSP(size=65536)

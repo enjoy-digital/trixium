@@ -1,10 +1,16 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 import random
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
+
 from migen import C, Cat, Signal, run_simulation
 from migen.fhdl import verilog
 
@@ -13,6 +19,8 @@ from trixium.model.hadamard import scratchpad_rotation_descriptor
 from test_hadamard import dense, packed, unpacked
 from test_integration import SoC, write
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def install_list(dut, descriptors):
     for index, words in enumerate(descriptors):
@@ -23,6 +31,8 @@ def install_list(dut, descriptors):
     yield from write(dut.seq.count, len(descriptors))
     yield from write(dut.seq.start, 1)
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports():
     dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)

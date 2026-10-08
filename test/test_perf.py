@@ -1,11 +1,19 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Rollover, atomicity and legacy compatibility for actual RTL/C profiling code."""
-from pathlib import Path
+
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
+
 from migen import Module, Constant, run_simulation
+
 from litex.soc.interconnect.axi import AXIInterface
 
 from trixium.core.csr import EngineCSR
@@ -17,10 +25,14 @@ ROOT = Path(__file__).resolve().parents[1]
 NAMES = ("total", "eng", "vec", "both")
 
 
+# Helpers ------------------------------------------------------------------------------------------
+
 def make_engine(sp):
     return MatVecEngine(sp, [AXIInterface(data_width=256, address_width=33,
                                               id_width=6)], xbuf_groups=8)
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_snapshot_is_atomic_and_stable():
     class DUT(Module):

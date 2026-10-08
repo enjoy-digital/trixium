@@ -9,6 +9,7 @@
 # trixium.model.bitexact.matvec_ternary()/matvec_q8().
 
 import numpy as np
+
 from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
@@ -115,8 +116,7 @@ def test_matvec_ternary_n4():
 def test_matvec_ternary_n4_gather_pressure():
     # 4 channels x 2-beat rows demand 2 results/cycle against the 1/cycle gather drain:
     # pipes must throttle beat intake on result-FIFO headroom instead of dropping results
-    # (pre-backpressure this overflowed out_fifo and the op never completed - the n4 SoC
-    # boot hang of 2026-07-30).
+    # (without backpressure out_fifo overflows and the op never completes).
     _case_ternary(n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=9)
 
 def test_matvec_slim_no_dual():
@@ -690,7 +690,7 @@ def _desc_stop():
     return (0).to_bytes(4, "little")*16
 
 def test_sequencer_start_drains_posted_writes():
-    # The list-start ordering contract (2026-09-06). CPU patches reach the scratchpad
+    # The list-start ordering contract. CPU patches reach the scratchpad
     # through a posted-write FIFO; the descriptor fetch no longer waits on that FIFO
     # cycle by cycle (matvec.py sp_gnt), so the guarantee that a list sees its own
     # patches rests entirely on this: START must not fetch descriptor 0 while any
@@ -1612,7 +1612,7 @@ def test_sequencer_kreg_capture_and_add():
 
 
 def test_sequencer_lut_arg():
-    # A5 from a scratchpad LUT indexed by imm5 + kreg (w0[12], 2026-09-09): the one arg
+    # A5 from a scratchpad LUT indexed by imm5 + kreg (w0[12]): the one arg
     # the k/v chain could not derive in-sequencer was rmsnorm's eps, a per-layer table
     # indexed by the exponent shift the sequencer already holds in a kreg. Shape: the
     # kreg-capture test's AXPY (k -> kreg0), then rmsnorm with A5 = LUT[3 + kreg0]; the

@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Engine op 5 through the shared cluster: channel readers -> stream lanes -> loader writers.
 
 The plumbing test. A small geometry on integer operators (the unit's arithmetic is
@@ -6,10 +11,12 @@ qualified bit for bit on the exact operators in test_deltanet_stream.py) through
 integration: CSR submit, per-channel reader offsets, the unit's scratchpad reads and
 writes on the engine's ports, the loader's multi-channel store and the op's completion.
 """
+
 import numpy as np
 import pytest
 
 from migen import run_simulation
+
 from litex.gen import LiteXModule
 
 from trixium.core.core import TriXiumConfig
@@ -17,6 +24,8 @@ from test_integration import SoC, write
 
 MASK = 0xFFFFFFFF
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 class _IntAdd5(LiteXModule):
     latency = 5
@@ -64,6 +73,8 @@ def int_reference(m, q, k, v, decay, beta, scale):
         out.append((o*scale) & MASK)
     return m, out
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
 def test_dnstream_op_through_the_cluster(placement):

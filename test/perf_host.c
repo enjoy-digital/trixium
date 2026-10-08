@@ -1,9 +1,13 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Native harness for the production profiler, with deterministic clock/CSR injection.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Native harness for the production profiler, with deterministic clock/CSR injection.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>

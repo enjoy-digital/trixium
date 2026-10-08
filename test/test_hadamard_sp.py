@@ -1,14 +1,23 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 import random
 
 import pytest
+
 from migen import *
+
 from litex.gen import LiteXModule
 
 from trixium.units.hadamard import HadamardScratchpad
 from trixium.core.scratchpad import Scratchpad
 from test_hadamard import dense, packed, unpacked
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 class RotationSP(LiteXModule):
     def __init__(self, size=8192, block_size=256):
@@ -75,6 +84,8 @@ def run_command(dut, blocks=3, inverse=False, size=256, seed=3):
     assert (yield dut.sp.mem[dst//32 - 1]) == sentinel
     assert (yield dut.sp.mem[(dst + blocks*size*4)//32]) == sentinel
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize('inverse', [False, True])
 def test_hadamard_shared_scratchpad_words_signs_bounds_and_reuse(inverse):

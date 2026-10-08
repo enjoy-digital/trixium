@@ -1,14 +1,23 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """The real shared integration, including public CSRs and reset-domain wiring."""
+
 import pytest
 
 from migen import run_simulation
+
 from litex.soc.interconnect.axi import AXIInterface
 
 from trixium.core.core import TriXiumConfig, TriXiumCore
 from trixium.memory.hbm_model import HBMChannelModel
 from trixium.model import asm
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 class SoC(TriXiumCore):
     """The core with an HBM channel model on each memory port."""
@@ -43,6 +52,8 @@ def submit(dut, **fields):
         yield
     raise AssertionError('shared-cluster CSR command timed out')
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize('config', [
     TriXiumConfig(with_vecunit=False, scratchpad_size=16*1024),

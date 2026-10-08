@@ -1,11 +1,17 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """Shared C encoders must match Python and never publish partial descriptors."""
-import ctypes as ct
-from pathlib import Path
+
 import random
 import shutil
 import struct
 import subprocess
+import ctypes as ct
+from pathlib import Path
 
 import pytest
 
@@ -14,11 +20,12 @@ from trixium.model.activation import (
     scratchpad_silu_descriptor, scratchpad_norm_descriptor, scratchpad_conv_descriptor,
     scratchpad_add_descriptor,
 )
-
 from trixium.model.hadamard import scratchpad_rotation_descriptor
 
 LIB = Path(__file__).resolve().parents[1] / 'trixium/software/lib'
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def _norm_py(l2, src, dst, weight, n, nseg, eps):
     return scratchpad_norm_descriptor(src=src, dst=dst, weight=weight, n=n, nseg=nseg, eps=eps, l2=l2)
@@ -78,6 +85,8 @@ def base(name):
         'add': dict(a=0, b=32, dst=0, n=5120),
     }[name]
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize('name', SCHEMAS)
 def test_c_matches_python_for_boundary_and_random_descriptors(encoder, name):

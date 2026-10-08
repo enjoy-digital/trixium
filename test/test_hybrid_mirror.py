@@ -31,6 +31,8 @@ from trixium.model.bons import BONSReader
 f32 = np.float32
 
 
+# Hybrid mirror ------------------------------------------------------------------------------------
+
 def _fsum32(v):
     acc = f32(0.0)
     for e in np.asarray(v, dtype=f32):
@@ -483,6 +485,8 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
             tok = forward(tok, pos); pos += 1
     return out
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_mirror_agrees_with_the_fp32_golden_on_the_tiny_hybrid():
     """The mirror's structure against the fp32 golden: run exact (fp32 weights, no activation

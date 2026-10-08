@@ -1,5 +1,11 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 import pytest
+
 from migen import Memory, Module, run_simulation
 
 from trixium.core.core import TriXiumConfig
@@ -11,6 +17,8 @@ from test_projection_restore_sp import pack
 from test_hadamard_integration import install_list
 from test_integration import SoC, write
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def descriptor(**changes):
     fields = dict(src=0x800, dst=0x1000, exponents=0x700, elements=17, adjustment=-13)
@@ -34,6 +42,8 @@ def start(seq, count):
     yield from write(seq.count, count)
     yield from write(seq.start, 1)
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_restoration_descriptor_and_configuration():
     assert descriptor() == [8, 0x800, 0x1000, 0x700, 17, 0xfffffff3] + [0]*10

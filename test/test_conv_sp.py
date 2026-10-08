@@ -1,5 +1,11 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """ConvScratchpad (unit 13) against hybrid.c's 4-tap causal conv, compiled."""
+
 import numpy as np
 import pytest
 
@@ -9,6 +15,8 @@ from rtl_client import build_client, run_client
 f32 = np.float32
 SIZE = 256*1024
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 def canon(bits):
     bits = np.asarray(bits, dtype=np.uint32).copy()
@@ -43,6 +51,8 @@ def command(x0, x1, x2, x3, w, dst, channels, **extra):
 def binary(tmp_path_factory):
     return build_client(ConvScratchpad(SIZE), CONV_COMMAND, tmp_path_factory.mktemp("conv"), "conv_sp")
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_compiled_conv_equals_the_firmware(tmp_path, binary):
     rng = np.random.default_rng(5)

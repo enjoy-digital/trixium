@@ -1,10 +1,14 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Standalone Linux-syscall harness for qemu-riscv32. Link the SAME RV32F libm
-// archive as the firmware; do not substitute the workstation's expf.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Standalone Linux-syscall harness for qemu-riscv32. Link the SAME RV32F libm
+ * archive as the firmware; do not substitute the workstation's expf.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include <stdint.h>
 #include "fastmath.h"
 

@@ -11,8 +11,8 @@ layers and 16 gated-attention layers (every fourth), hidden 5120, FFN 17408, a 2
 vocabulary; attention 24 query / 4 KV heads at head dim 256 with a per-head output gate
 and partial RoPE over 64 dims; DeltaNet 48 value heads over 16 key heads at 128, conv
 kernel 4. Its ternary matrices are stored in PrismML's rotated basis (Hadamard block 1024,
-one sign vector per input width). The metadata here is what the real file declared on
-2026-09-18 (models/27b); the sign vectors are shortened. What is pinned: the layer pattern,
+one sign vector per input width). The metadata here is what the real file declares
+(models/27b); the sign vectors are shortened. What is pinned: the layer pattern,
 the dimensions the engine shards (multiples of 128 and of 16 channels), the gate detection
 from the q projection's shape, the Hadamard bookkeeping, and that the converter refuses the
 model with the reason instead of building a wrong image.
@@ -23,6 +23,8 @@ import pytest
 from trixium.model.configs import BONSAI_8B
 from trixium.model.golden import config_from_gguf, check_engine_support
 
+
+# Helpers ------------------------------------------------------------------------------------------
 
 class _Tensor:
     def __init__(self, shape):
@@ -69,6 +71,8 @@ def _bonsai2_27b():
                "blk.3.attn_k.weight": _Tensor([1024, 5120])}
     return _Reader(md, tensors)
 
+
+# Tests --------------------------------------------------------------------------------------------
 
 def test_27b_layer_pattern_and_dimensions():
     cfg = config_from_gguf(_bonsai2_27b())

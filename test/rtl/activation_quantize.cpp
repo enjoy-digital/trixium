@@ -1,9 +1,13 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Independent binary32 multiply + std::lround (not the RTL's significand shifts).
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Independent binary32 multiply + std::lround (not the RTL's significand shifts).
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #include "Vactivation_quantize.h"
 #include "verilated.h"
 #include <array>

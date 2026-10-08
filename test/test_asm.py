@@ -60,8 +60,8 @@ def test_norm_i32():
     expect = np.clip(v.astype(np.int64) >> k, -32767, 32767)
     assert np.array_equal(got, expect)
     # The program's contract (asm.py): k = bitlen(absmax) - 14 keeps every lane inside
-    # 2^14, so the clip above is a no-op and the program carries no clamp. S6 is 0 since
-    # 2026-08-29 (the output-absmax REDMAX had no consumer).
+    # 2^14, so the clip above is a no-op and the program carries no clamp. S6 is 0 (the
+    # output-absmax REDMAX had no consumer).
     assert int(np.abs(v.astype(np.int64) >> k).max()) < 2**14
     assert S[6] == 0
 
@@ -78,7 +78,7 @@ def test_silu_mul_accuracy():
     sp = bytearray(8192)
     sp[0:2*n]         = g16.tobytes()
     sp[2048:2048+2*n] = u16.tobytes()
-    # A4 = eg + 6, the DIRECT (negative = right) shift for f (2026-08-28 VSHLS convention).
+    # A4 = eg + 6, the DIRECT (negative = right) shift for f (VSHLS convention).
     a4 = eg + 6
     a6 = -15 # (mg*sig>>15)*mu >> 15; output exponent eo = eg+eu+15.
     _run("silu_mul", sp, [0, 2048, 4096, n//16, a4, 0, a6])
@@ -276,7 +276,7 @@ def test_scale8():
 
 
 def test_nested_loops_loops2():
-    # LOOPS2/LOOPE2 (2026-08-30): an outer loop over "heads" around an inner loop over
+    # LOOPS2/LOOPE2: an outer loop over "heads" around an inner loop over
     # beats, the shape the whole-tensor per-head programs use. Inner count re-initialises
     # on every outer iteration; the counters are independent.
     import numpy as np
@@ -403,7 +403,7 @@ def test_silu_q8_matches_silu_then_quant8():
 
 
 def test_silu_split_matches_fused():
-    """The FFN SiLU split (2026-09-07): prog_silu_gate then prog_mul_q8 must leave the
+    """The FFN SiLU split: prog_silu_gate then prog_mul_q8 must leave the
     scratchpad and res6 byte-identical to the fused prog_silu_q8, in place (A2 == A0, as
     the FFN list runs it), for every shift the firmware can hand it and at the int16
     extremes - x1 and x2 flavours alike. The split's only new rounding boundary is the

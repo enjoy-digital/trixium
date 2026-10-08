@@ -1,4 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
 """DeltaNetStream against the firmware's recurrence loop, compiled (Verilator).
 
 Every lane's state stream is fed with random gaps, every output stream drained with
@@ -6,11 +11,13 @@ random back-pressure, the scratchpad read and write grants are random: the state
 cycle count come back from the compiled netlist and must equal the float32 reference bit
 for bit.
 """
+
 import shutil
 import subprocess
 
 import numpy as np
 import pytest
+
 from migen.fhdl import verilog
 
 from trixium.units.deltanet_stream import (
