@@ -34,8 +34,11 @@ from litepcie.software import generate_litepcie_software
 
 from trixium.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
 from trixium.core.core import TriXiumConfig, TriXiumCore
-from trixium.targets.common import add_cluster_constraints
+from trixium.targets.common import add_cluster_constraints, add_zbb_constant
+from trixium.targets.common import set_main_ram_executable
 from trixium.targets.platform_fk33 import Platform
+
+# Constants ----------------------------------------------------------------------------------------
 
 # The HBM IP configurations, one directory per stack clock (their Vivado support files share
 # names, among them the memory files that encode the PLL divider).
@@ -44,6 +47,7 @@ IP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "i
 # CRG ----------------------------------------------------------------------------------------------
 
 class _CRG(LiteXModule):
+    """Clocks: sys (CPU, TriXium core, HBM AXI), the HBM reference and the HBM APB clock."""
     def __init__(self, platform, sys_clk_freq):
         self.rst        = Signal()
         self.cd_sys     = ClockDomain()
@@ -58,8 +62,7 @@ class _CRG(LiteXModule):
         pll.create_clkout(self.cd_sys,     sys_clk_freq)
         pll.create_clkout(self.cd_hbm_ref, 100e6)
         pll.create_clkout(self.cd_apb,     100e6)
-        # Ignore sys_clk to pll.clkin path created by SoC's rst.
-        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin)
+        platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
 # TriXiumFK33SoC -----------------------------------------------------------------------------------
 
@@ -86,8 +89,8 @@ class TriXiumFK33SoC(SoCCore):
         self.add_constant("TRIXIUM_VARIANT", ord("b"))
 
         # HBM --------------------------------------------------------------------------------------
-        # 32 pseudo-channels: channel 0 is the CPU's main_ram, channels 1..N the engine's
-        # memory ports (their own AXI ports: the SoC bus bridges do not burst).
+        # 32 pseudo-channels: channel 0 is the CPU's main_ram, channels 1..N the TriXium memory
+        # ports (their own AXI ports: the SoC bus bridges do not burst).
         hbm_ip = "hbm_0" if hbm_tck == 900 else f"hbm_{hbm_tck}"
         hbm = USPHBM2(platform, hbm_ip_name=hbm_ip)
         # USPHBM2 adds <cwd>/ip/hbm/<name>.xci: use this stack clock's own directory instead.
@@ -95,16 +98,16 @@ class TriXiumFK33SoC(SoCCore):
             os.path.join(IP_DIR, f"hbm{hbm_tck}", hbm_ip + ".xci"))
         self.hbm = hbm = ClockDomainsRenamer({"axi": "sys"})(hbm)
         add_usphbm2_pseudochannels(soc=self, hbm=hbm, channels=(0,), main_channel=0)
-        # VexiiRiscv builds its memory map from region.mode and enforces execute permission.
-        for _rn, _r in self.bus.regions.items():
-            if _r.origin == 0x4000_0000 and not _r.linker:
-                _r.mode = "rwx"
+        set_main_ram_executable(self)
         # The apb<->sys crossings (HBM AXI resets driven from the apb domain, apb_complete
         # status into CSRs) are quasi-static: false paths.
         platform.add_false_path_constraints(self.crg.cd_sys.clk, self.crg.cd_apb.clk)
         # The HBM IP embeds HBM monitor debug cores: the auto-inserted debug hub needs its
         # clock connected explicitly (opt_design: "dbg_hub/clk has 1 unconnected channels").
         platform.add_platform_command("connect_debug_port dbg_hub/clk [get_nets apb_clk]")
+
+        # TriXium Memory Ports ---------------------------------------------------------------------
+        # Engine channel c -> HBM pseudo-channel c + 1, on an AXI port of its own.
         memory_ports = [hbm.axi[1 + i] for i in range(engine_channels)]
 
         # PCIe -------------------------------------------------------------------------------------
@@ -121,6 +124,8 @@ class TriXiumFK33SoC(SoCCore):
         # TriXium ----------------------------------------------------------------------------------
         # One flat HBM address space: channel c's window is pseudo-channel c + 1's, at
         # HBM_WEIGHT_BASE + c*HBM_CHAN_STRIDE (256 MB per pseudo-channel, port-matched).
+
+        # Core: engine, sequencer and vector unit (no scratchpad units).
         config = TriXiumConfig(scratchpad_xpm=True,
             chan_stride = HBM_CHAN_STRIDE,
             chan_mod    = 0,
@@ -129,8 +134,12 @@ class TriXiumFK33SoC(SoCCore):
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
         add_cluster_constraints(platform)
+
+        # Scratchpad on the SoC bus (CPU access).
         self.bus.add_slave("scratchpad", self.trixium.bus,
             SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
+
+        # PCIe DMA0 (host -> FPGA) -> TriXium upload stream.
         self.comb += self.pcie_dma0.source.connect(self.trixium.upload,
             keep={"valid", "ready", "data"})
 
@@ -145,13 +154,13 @@ class TriXiumFK33SoC(SoCCore):
 
 def main():
     from trixium.migen_fast import install as install_migen_fast
-    install_migen_fast()  # Linear-time Verilog conversion (minutes -> seconds).
+    install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
     parser = LiteXArgumentParser(platform=Platform, description="TriXium on the SQRL FK33.")
-    parser.add_target_argument("--sys-clk-freq",    default=212.5e6, type=float, help="System clock frequency (= HBM AXI clock).")
-    parser.add_target_argument("--hbm-tck",         default=800,     type=int, choices=[800, 900], help="HBM stack clock (MHz).")
-    parser.add_target_argument("--engine-channels", default=16,      type=int,   help="Engine channels (HBM pseudo-channels 1..N, max 31).")
-    parser.add_target_argument("--driver",          action="store_true",         help="Generate LitePCIe driver headers.")
+    parser.add_target_argument("--sys-clk-freq",    default=212.5e6, type=float,                     help="System clock frequency (= HBM AXI clock).")
+    parser.add_target_argument("--hbm-tck",         default=800,     type=int,   choices=[800, 900], help="HBM stack clock (MHz).")
+    parser.add_target_argument("--engine-channels", default=16,      type=int,                       help="Engine channels (HBM pseudo-channels 1..N, max 31).")
+    parser.add_target_argument("--driver",          action="store_true",                             help="Generate PCIe driver.")
     args = parser.parse_args()
 
     soc = TriXiumFK33SoC(
@@ -159,12 +168,7 @@ def main():
         hbm_tck         = args.hbm_tck,
         engine_channels = args.engine_channels,
         **parser.soc_argdict)
-
-    # Zbb in the CPU (--vexii-args ... --with-rvZbb): the toolchain (GCC 10.1) predates the
-    # extension, so the firmware reaches clz through a .insn encoding behind this.
-    if "--with-rvZbb" in (getattr(args, "vexii_args", "") or "") or \
-       "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
-        soc.add_constant("TRIXIUM_HAS_ZBB")
+    add_zbb_constant(soc, args)
 
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
@@ -177,8 +181,10 @@ def main():
             builder.compile_software = False
             builder.compile_gateware = False
         builder.build(**parser.toolchain_argdict)
+
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
+
     if args.load:
         prog = soc.platform.create_programmer()
         prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))

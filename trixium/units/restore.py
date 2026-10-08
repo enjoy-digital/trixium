@@ -22,7 +22,6 @@ from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import FP32ArgmaxTracker
 
-
 # I32 To FP32 Scaled -------------------------------------------------------------------------------
 
 class I32ToFp32Scaled(LiteXModule):
@@ -55,12 +54,15 @@ class I32ToFp32Scaled(LiteXModule):
     def __init__(self, lanes=8):
         if not isinstance(lanes, int) or lanes < 1 or lanes > 16 or lanes & (lanes - 1):
             raise ValueError("lanes must be a power of two in [1, 16]")
-        self.lanes = lanes
-        self.sink = stream.Endpoint([("data", lanes*32), ("exponent", 10)])
+        self.lanes  = lanes
+        self.sink   = stream.Endpoint([("data", lanes*32), ("exponent", 10)])
         self.source = stream.Endpoint([("data", lanes*32), ("exponent", 10),
                                        ("error", lanes + 1)])
         self.cancel = Signal()
 
+        # # #
+
+        # Elastic stage handshake.
         valid = [Signal() for _ in range(4)]
         ready = [Signal() for _ in range(4)]
         for stage in range(4):
@@ -69,6 +71,7 @@ class I32ToFp32Scaled(LiteXModule):
         self.comb += [self.sink.ready.eq(ready[0] & ~self.cancel),
                       self.source.valid.eq(valid[3] & ~self.cancel)]
 
+        # Per-stage updates: metadata, then the per-lane datapath.
         metadata = [[Signal((10, True)), Signal(), Signal(), Signal()] for _ in range(3)]
         signs = [Signal(lanes) for _ in range(3)]
         zeros = [Signal(lanes) for _ in range(3)]
@@ -137,13 +140,11 @@ class I32ToFp32Scaled(LiteXModule):
             for stage in range(4)
         ])
 
-
 # Projection Restore Scratchpad --------------------------------------------------------------------
 
 RESTORE_COMMAND = [("src", 24), ("dst", 24), ("exponents", 24),
                    ("elements", 16), ("adjustment", 32),
                    ("protect_start", 24), ("protect_end", 24)]
-
 
 class ProjectionRestoreScratchpad(LiteXModule):
     """Read resident signed e8, then restore int32 -> FP32 with exponent e8+R-B.
@@ -175,23 +176,31 @@ class ProjectionRestoreScratchpad(LiteXModule):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client "
                              "address space")
+        # Command / status.
         self.cmd = stream.Endpoint(RESTORE_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
         self.read_beats, self.output_beats = Signal(32), Signal(32)
         self.exponent = Signal((10, True))
+
+        # Scratchpad client ports.
         self.sp_rd_req, self.sp_wr_req, self.sp_wr_gnt = Signal(), Signal(), Signal()
         self.sp_rd_adr, self.sp_wr_adr = Signal(13), Signal(13)
         self.sp_rd_dat, self.sp_wr_dat = Signal(256), Signal(256)
         self.sp_wr_we = Signal(8)
-        self.restore = restore = I32ToFp32Scaled()
+
+        # Submodules: converter, read-response FIFO, argmax tracker.
+        self.restore   = restore   = I32ToFp32Scaled()
         self.responses = responses = ResetInserter()(SyncFIFO(width=258, depth=2))
         # The greedy argmax of everything this unit writes, across commands, until
         # argmax_clear (the sequencer's list start): the LM head's token without the CPU
         # reading the logits back (the firmware loop's semantics, see FP32ArgmaxTracker).
-        self.argmax = argmax = FP32ArgmaxTracker()
+        self.argmax       = argmax = FP32ArgmaxTracker()
         self.argmax_clear = Signal()
 
+        # # #
+
+        # Command capture and validation.
         IDLE, VALIDATE, META_REQ, META_CAPTURE, META_CHECK, RUN, DRAIN, FINISH, FAILED = range(9)
         state = Signal(4, reset=IDLE)
         captured = {name: Signal(width) for name, width in RESTORE_COMMAND}
@@ -199,8 +208,10 @@ class ProjectionRestoreScratchpad(LiteXModule):
         issued, retired = Signal(14), Signal(14)
         ends = {name: Signal(64) for name in ("src", "dst", "exponents")}
         geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
+
         def overlap(a, b):
             return (captured[a] < ends[b]) & (captured[b] < ends[a])
+
         self.comb += [
             ends["src"].eq(captured["src"] + (count << 5)),
             ends["dst"].eq(captured["dst"] + (count << 5)),
@@ -225,6 +236,7 @@ class ProjectionRestoreScratchpad(LiteXModule):
         self.comb += [adjustment.eq(captured["adjustment"]), combined.eq(metadata + adjustment),
                       exponent_bad.eq((combined < -149) | (combined > 127))]
 
+        # Datapath: scratchpad reads -> response FIFO -> converter -> masked writes + argmax.
         active, clear, read_pending, read_first, read_last = (Signal() for _ in range(5))
         pop, credit_error, conversion_error, overflow, failed, written = (
             Signal() for _ in range(6))
@@ -268,6 +280,7 @@ class ProjectionRestoreScratchpad(LiteXModule):
         self.sync += If(clear, read_pending.eq(0)).Else(
             read_pending.eq(self.sp_rd_req),
             If(self.sp_rd_req, read_first.eq(issued == 0), read_last.eq(issued == count - 1)))
+        # Control.
         self.sync += If(self.cancel,
             state.eq(IDLE), self.error.eq(0), self.done.eq(0),
             self.exponent.eq(0), self.read_beats.eq(0), self.output_beats.eq(0),

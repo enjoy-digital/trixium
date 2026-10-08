@@ -40,13 +40,11 @@ from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import FP32Add, FP32Mul
 
-
 # Constants ----------------------------------------------------------------------------------------
 
 CONV_COMMAND = [("op", 1), ("x0", 24), ("x1", 24), ("x2", 24), ("x3", 24), ("w", 24),
                 ("dst", 24), ("channels", 16), ("protect_start", 24), ("protect_end", 24)]
 OP_CONV, OP_ADD = 0, 1
-
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -58,23 +56,29 @@ def _delay(module, value, cycles, name):
         prev = r
     return prev
 
-
 # Conv Scratchpad ----------------------------------------------------------------------------------
 
 class ConvScratchpad(LiteXModule):
+    """Resident DeltaNet causal convolution / residual add (see the module docstring)."""
     def __init__(self, scratchpad_size=256*1024):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client "
                              "address space")
+        # Command / status.
         self.cmd = stream.Endpoint(CONV_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
         self.read_beats, self.output_beats = Signal(32), Signal(32)
+
+        # Scratchpad client ports.
         self.sp_rd_req, self.sp_wr_req, self.sp_wr_gnt = Signal(), Signal(), Signal()
         self.sp_rd_adr, self.sp_wr_adr = Signal(13), Signal(13)
         self.sp_rd_dat, self.sp_wr_dat = Signal(256), Signal(256)
         self.sp_wr_we = Signal(8)
 
+        # # #
+
+        # Command capture and validation.
         cap = {name: Signal(width, name=f"cap_{name}") for name, width in CONV_COMMAND}
         groups = Signal(13)
         vbytes, wbytes = Signal(24), Signal(24)
@@ -86,6 +90,7 @@ class ConvScratchpad(LiteXModule):
 
         def disjoint(a, b):
             return (cap[a] >= ends[b]) | (cap[b] >= ends[a])
+
         self.comb += [
             groups.eq(cap["channels"][3:16]),
             vbytes.eq(cap["channels"] << 2), wbytes.eq(cap["channels"] << 4),
@@ -178,6 +183,7 @@ class ConvScratchpad(LiteXModule):
             If(last_lane, cbank.eq(~cbank), cgrp.eq(cgrp + 1)))
 
         bank_sel = [Array([banks[0][i], banks[1][i]])[cbank] for i in range(8)]
+
         def lane_word(beat, idx):
             return Array([beat[32*j:32*j + 32] for j in range(8)])[idx]
         xs = [lane_word(bank_sel[i], lane) for i in range(4)]
@@ -236,6 +242,7 @@ class ConvScratchpad(LiteXModule):
         self.sync += If(clear, wgrp.eq(0)).Elif(ofifo.re,
             wgrp.eq(wgrp + 1), self.output_beats.eq(self.output_beats + 1))
 
+        # Control.
         self.sync += [
             self.done.eq(0),
             If(self.cancel, state.eq(S["IDLE"]), self.error.eq(0)).Else(Case(state, {

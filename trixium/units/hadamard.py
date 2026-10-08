@@ -25,7 +25,6 @@ from litex.gen import LiteXModule
 
 from litex.soc.interconnect import stream
 
-
 # Integer Hadamard ---------------------------------------------------------------------------------
 
 class IntegerHadamard(LiteXModule):
@@ -63,15 +62,21 @@ class IntegerHadamard(LiteXModule):
         word_bits = words.bit_length() - 1
         width = self.output_width = input_width + stages + 1
         self.block_size, self.lanes, self.input_width = block_size, lanes, input_width
-        self.cmd = stream.Endpoint([("inverse", 1)])
-        self.sink = stream.Endpoint([("data", lanes*input_width), ("negate", lanes)])
+
+        # Streams.
+        self.cmd    = stream.Endpoint([("inverse", 1)])
+        self.sink   = stream.Endpoint([("data", lanes*input_width), ("negate", lanes)])
         self.source = stream.Endpoint([("data", lanes*width)])
-        self.cancel = Signal()
-        self.busy = Signal()
-        self.done = Signal()
-        self.error = Signal()
+
+        # Control / status.
+        self.cancel    = Signal()
+        self.busy      = Signal()
+        self.done      = Signal()
+        self.error     = Signal()
         self.cancelled = Signal()
-        self.absmax = Signal(width)
+        self.absmax    = Signal(width)
+
+        # # #
 
         IDLE, LOAD, RUN, DRAIN, OUTPUT, FAILED, FINISH = range(7)
         state = Signal(3, reset=IDLE)
@@ -86,6 +91,7 @@ class IntegerHadamard(LiteXModule):
         output_index = Signal(word_bits)
         output_valid, output_read = Signal(), Signal()
 
+        # Ping-pong banks and the per-word sign bits.
         memories = [Memory(lanes*width, words, name=f"hadamard_bank{i}") for i in range(2)]
         # Explicit registered-data/no-change ports infer true dual-port RAM.
         # Migen's default WRITE_FIRST emits registered addresses + asynchronous
@@ -99,6 +105,7 @@ class IntegerHadamard(LiteXModule):
         self.specials += memories + [p for group in ports for p in group] + [
             signs, sign_write, sign_read]
 
+        # Input load (sign applied on the way in for the forward transform).
         self.comb += [
             self.cmd.ready.eq((state == IDLE) & ~self.cancel),
             self.sink.ready.eq((state == LOAD) & ~self.cancel),
@@ -120,7 +127,7 @@ class IntegerHadamard(LiteXModule):
                           signed.eq(Mux(~inverse & self.sink.negate[lane], -value, value))]
             incoming.append(signed)
 
-        # Insert the high-stage butterfly bit into the sequential pair index.
+        # Butterflies: insert the high-stage butterfly bit into the sequential pair index.
         addresses = {}
         for number in range(stages):
             if number < lane_bits:
@@ -187,6 +194,7 @@ class IntegerHadamard(LiteXModule):
                     ),
                 )
 
+        # Output (sign applied on the way out for the inverse) and absmax tree.
         magnitudes = []
         for lane in range(lanes):
             value = Signal((width, True))
@@ -219,6 +227,7 @@ class IntegerHadamard(LiteXModule):
             magnitudes = level
             maximum_valid, maximum_last = valid, last
 
+        # Control.
         self.sync += If(self.cancel,
             state.eq(IDLE), calc_valid.eq(0), output_valid.eq(0),
             self.done.eq(0), self.error.eq(0), self.cancelled.eq(1), self.absmax.eq(0),
@@ -260,12 +269,10 @@ class IntegerHadamard(LiteXModule):
             }),
         )
 
-
 # Hadamard Scratchpad ------------------------------------------------------------------------------
 
 HADAMARD_COMMAND = [("src", 24), ("signs", 24), ("dst", 24), ("stats", 24),
                     ("blocks", 16), ("inverse", 1)]
-
 
 class HadamardScratchpad(LiteXModule):
     """Transform complete int8 blocks into raw signed int32 scratchpad vectors.
@@ -293,26 +300,35 @@ class HadamardScratchpad(LiteXModule):
         # per word): ~1.5k -> ~0.4k clocks per 1,024-element block.
         if lanes not in (8, 16, 32):
             raise ValueError("lanes must be 8, 16 or 32")
-        self.cmd = stream.Endpoint(HADAMARD_COMMAND)
-        self.cancel = Signal()
-        self.busy = Signal()
-        self.done = Signal()
-        self.error = Signal(8)  # bit0 config, bit1 bounds, bit2 overlap, bit3 core.
-        self.blocks_done = Signal(16)
+
+        # Command / status.
+        self.cmd          = stream.Endpoint(HADAMARD_COMMAND)
+        self.cancel       = Signal()
+        self.busy         = Signal()
+        self.done         = Signal()
+        self.error        = Signal(8) # bit0 config, bit1 bounds, bit2 overlap, bit3 core.
+        self.blocks_done  = Signal(16)
         self.output_beats = Signal(24)
+
+        # Scratchpad client ports.
         self.sp_rd_req = Signal()
         self.sp_rd_adr = Signal(13)
         self.sp_rd_dat = Signal(256)
         self.sp_wr_req = Signal()
         self.sp_wr_adr = Signal(13)
-        self.sp_wr_we = Signal(8)
+        self.sp_wr_we  = Signal(8)
         self.sp_wr_dat = Signal(256)
         self.sp_wr_gnt = Signal()
+
+        # # #
+
+        # Kernel.
         self.core = core = IntegerHadamard(block_size=block_size, lanes=lanes)
         L = lanes
         wpb, wps = 32//L, 256//L      # core words per data beat, per sign beat
         bpw = L//8                    # output beats per core word
 
+        # Command capture and validation.
         (IDLE, START, SIGN_REQ, SIGN_CAP, DATA_REQ, DATA_CAP, SEND, OUTPUT, STATS, NEXT, FINISH,
          FAILED) = range(12)
         state = Signal(4, reset=IDLE)
@@ -343,6 +359,7 @@ class HadamardScratchpad(LiteXModule):
             overlaps.append((getattr(self.cmd, a) < ends[b]) & (getattr(self.cmd, b) < ends[a]))
         self.comb += overlap_bad.eq(reduce(or_, overlaps))
 
+        # Datapath: scratchpad reads -> kernel -> int32 output beats and the block absmax.
         self.comb += [
             self.cmd.ready.eq((state == IDLE) & ~self.cancel),
             self.busy.eq(state != IDLE),
@@ -377,6 +394,7 @@ class HadamardScratchpad(LiteXModule):
                           wide.eq(value),
                           self.sp_wr_dat[32*lane:32*(lane+1)].eq(
                               Mux(state == STATS, core.absmax, wide))]
+        # Control.
         self.sync += If(self.cancel,
             state.eq(IDLE), self.done.eq(0), self.error.eq(0),
             self.blocks_done.eq(0), self.output_beats.eq(0),

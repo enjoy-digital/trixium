@@ -22,7 +22,6 @@ from litex.gen import LiteXModule
 
 from litex.soc.interconnect import stream
 
-
 # Integer To Q8 ------------------------------------------------------------------------------------
 
 class IntegerToQ8(LiteXModule):
@@ -40,13 +39,17 @@ class IntegerToQ8(LiteXModule):
     """
     def __init__(self, lanes=8, input_width=19):
         if not isinstance(lanes, int) or lanes < 1 or lanes > 16 or lanes & (lanes - 1):
-            raise ValueError('lanes must be a power of two in [1, 16]')
+            raise ValueError("lanes must be a power of two in [1, 16]")
         if not isinstance(input_width, int) or not 2 <= input_width <= 32:
-            raise ValueError('input_width must be in [2, 32]')
+            raise ValueError("input_width must be in [2, 32]")
         self.lanes, self.input_width = lanes, input_width
-        self.sink = stream.Endpoint([('data', lanes*input_width), ('e8', 10)])
-        self.source = stream.Endpoint([('data', lanes*8), ('e8', 10)])
+        self.sink   = stream.Endpoint([("data", lanes*input_width), ("e8", 10)])
+        self.source = stream.Endpoint([("data", lanes*8), ("e8", 10)])
         self.cancel = Signal()
+
+        # # #
+
+        # Elastic stage handshake: capture, shift/round, finish.
         valid, ready = [Signal() for _ in range(3)], [Signal() for _ in range(3)]
         self.comb += [ready[2].eq(~valid[2] | self.source.ready),
                       ready[1].eq(~valid[1] | ready[2]), ready[0].eq(~valid[0] | ready[1]),
@@ -60,6 +63,8 @@ class IntegerToQ8(LiteXModule):
         right_amount = Signal(max=max(2, input_width))
         left_amount = Signal(3)
         self.comb += [right_amount.eq(exponents[0] - 1), left_amount.eq(-exponents[0])]
+
+        # Per-lane datapath, split over the three stages.
         capture = [exponents[0].eq(self.sink.e8), first[0].eq(self.sink.first),
                    last[0].eq(self.sink.last)]
         shift = [exponents[1].eq(exponents[0]), first[1].eq(first[0]), last[1].eq(last[0]),
@@ -93,7 +98,6 @@ class IntegerToQ8(LiteXModule):
             If(ready[2], valid[2].eq(valid[1]), If(valid[1], *finish)),
         )
 
-
 # FP32 Absmax Word ---------------------------------------------------------------------------------
 
 class Fp32AbsmaxWord(LiteXModule):
@@ -107,9 +111,12 @@ class Fp32AbsmaxWord(LiteXModule):
     def __init__(self, lanes=8):
         if not isinstance(lanes, int) or lanes < 1 or lanes > 16 or lanes & (lanes - 1):
             raise ValueError("lanes must be a power of two in [1, 16]")
-        self.sink = stream.Endpoint([("data", lanes*32)])
+        self.sink   = stream.Endpoint([("data", lanes*32)])
         self.source = stream.Endpoint([("absmax", 31), ("error", 1)])
         self.cancel = Signal()
+
+        # # #
+
         levels = max(1, lanes.bit_length() - 1)
         valid, ready = [Signal() for _ in range(levels)], [Signal() for _ in range(levels)]
         first, last = [Signal() for _ in range(levels)], [Signal() for _ in range(levels)]
@@ -121,6 +128,8 @@ class Fp32AbsmaxWord(LiteXModule):
             self.comb += [bad.eq(word[23:31] == 255), value.eq(Mux(bad, 0, word[:31]))]
             values.append(value)
             errors.append(bad)
+
+        # Pairwise maximum tree, one elastic stage per level.
         for level in range(levels):
             nxt_values = [Signal(31) for _ in range(max(1, len(values)//2))]
             nxt_errors = [Signal() for _ in nxt_values]
@@ -141,7 +150,6 @@ class Fp32AbsmaxWord(LiteXModule):
                       self.source.valid.eq(valid[-1] & ~self.cancel),
                       self.source.absmax.eq(values[0]), self.source.error.eq(errors[0]),
                       self.source.first.eq(first[-1]), self.source.last.eq(last[-1])]
-
 
 # FP32 To Q8 ---------------------------------------------------------------------------------------
 
@@ -171,11 +179,14 @@ class Fp32ToQ8(LiteXModule):
     def __init__(self, lanes=8):
         if not isinstance(lanes, int) or lanes < 1 or lanes > 16 or lanes & (lanes - 1):
             raise ValueError("lanes must be a power of two in [1, 16]")
-        self.lanes = lanes
-        self.sink = stream.Endpoint([("data", lanes*32), ("e8", 10)])
+        self.lanes  = lanes
+        self.sink   = stream.Endpoint([("data", lanes*32), ("e8", 10)])
         self.source = stream.Endpoint([("data", lanes*8), ("e8", 10), ("error", lanes + 1)])
         self.cancel = Signal()
 
+        # # #
+
+        # Elastic stage handshake: capture, shift/round, finish.
         valid = [Signal() for _ in range(3)]
         ready = [Signal() for _ in range(3)]
         self.comb += [
@@ -196,6 +207,7 @@ class Fp32ToQ8(LiteXModule):
         self.comb += [exponent.eq(self.sink.e8),
                       bad_scale.eq((exponent < -127) | (exponent > 121))]
 
+        # Per-lane datapath, split over the three stages.
         capture = [metadata[0][0].eq(self.sink.e8), metadata[0][1].eq(self.sink.first),
                    metadata[0][2].eq(self.sink.last), metadata[0][3].eq(Cat(nonfinite, bad_scale))]
         shift = [dst.eq(src) for dst, src in zip(metadata[1], metadata[0])]
@@ -232,14 +244,12 @@ class Fp32ToQ8(LiteXModule):
             If(ready[2], valid[2].eq(valid[1]), If(valid[1], *finish)),
         )
 
-
 # Activation Scratchpad ----------------------------------------------------------------------------
 
 ACTIVATION_COMMAND = [("src", 24), ("dst", 24), ("exponents", 24),
                       ("elements", 16), ("blocks", 16),
                       ("requantize", 1), ("maxima", 24), ("result_exponent", 24),
                       ("protect_start", 24), ("protect_end", 24)]
-
 
 class ActivationScratchpad(LiteXModule):
     """Scan, select e8, reread and pack each independent FP32 block into Q8.
@@ -273,23 +283,31 @@ class ActivationScratchpad(LiteXModule):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client "
                              "address space")
+        # Command / status.
         self.cmd = stream.Endpoint(ACTIVATION_COMMAND)
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
-        self.error = Signal(8)
-        self.blocks_done = Signal(16)
-        self.read_beats = Signal(32)
+        self.error        = Signal(8)
+        self.blocks_done  = Signal(16)
+        self.read_beats   = Signal(32)
         self.output_beats = Signal(32)
-        self.absmax = Signal(31)
-        self.exponent = Signal((10, True))
+        self.absmax       = Signal(31)
+        self.exponent     = Signal((10, True))
+
+        # Scratchpad client ports.
         self.sp_rd_req, self.sp_wr_req, self.sp_wr_gnt = Signal(), Signal(), Signal()
         self.sp_rd_adr, self.sp_wr_adr = Signal(13), Signal(13)
         self.sp_rd_dat, self.sp_wr_dat = Signal(256), Signal(256)
         self.sp_wr_we = Signal(8)
-        self.scan = scan = Fp32AbsmaxWord()
-        self.quantize = quantize = Fp32ToQ8()
-        self.integer_quantize = integer_quantize = IntegerToQ8()
-        self.responses = responses = ResetInserter()(SyncFIFO(width=258, depth=2))
 
+        # # #
+
+        # Submodules: absmax scan, FP32/integer quantizers, read-response FIFO.
+        self.scan             = scan = Fp32AbsmaxWord()
+        self.quantize         = quantize = Fp32ToQ8()
+        self.integer_quantize = integer_quantize = IntegerToQ8()
+        self.responses        = responses = ResetInserter()(SyncFIFO(width=258, depth=2))
+
+        # Command capture and validation.
         (IDLE, VALIDATE, SCAN, SCAN_DRAIN, CHOOSE, CONVERT, CONVERT_DRAIN, EXPONENT,
          NEXT, FINISH, FAILED, META_E_REQ, META_E_CAPTURE, META_A_REQ, META_A_CAPTURE,
          META_CHECK, GLOBAL_CHOOSE, CACHE_READ, CACHE_CAPTURE, RESULT) = range(20)
@@ -307,8 +325,10 @@ class ActivationScratchpad(LiteXModule):
         cache_rd = cache.get_port()
         self.specials += cache, cache_wr, cache_rd
         config_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
+
         def overlaps(a, b):
             return (captured[a] < ends[b]) & (captured[b] < ends[a])
+
         def protected_span(a):
             return (captured[a] < captured["protect_end"]) & (captured["protect_start"] < ends[a])
         self.comb += [
@@ -339,6 +359,7 @@ class ActivationScratchpad(LiteXModule):
                                              protected_span("exponents")))),
         ]
 
+        # Datapath: scratchpad reads -> scan/quantize -> packed output beats and exponents.
         block = Signal(16)
         src_base, dst_base = Signal(13), Signal(13)
         issued, output_index = Signal(14), Signal(14)
@@ -450,6 +471,7 @@ class ActivationScratchpad(LiteXModule):
                                       for index in range(4)}),
                    packed_index.eq(packed_index + 1),
                    If(packed_index == 3, packed_pending.eq(1), packed_last.eq(selected_last))]
+        # Control.
         self.sync += If(self.cancel,
             state.eq(IDLE), self.error.eq(0), self.done.eq(0), self.blocks_done.eq(0),
             self.read_beats.eq(0), self.output_beats.eq(0), packed_pending.eq(0),

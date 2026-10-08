@@ -4,11 +4,12 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""Target-side pieces shared by the Xilinx UltraScale+ boards.
+"""Target-side pieces shared by the boards and the simulation.
 
-The physical constraints of the TriXium core and the CPU bus monitor. The constraints are NOT a
-timing waiver: new integrations need routed timing and selector coverage checks. In particular
-a signal-name refactor is not physically neutral (the constraints match cell names).
+The physical constraints of the TriXium core, the CPU integration helpers and the CPU bus
+monitor. The constraints are NOT a timing waiver: new integrations need routed timing and
+selector coverage checks. In particular a signal-name refactor is not physically neutral (the
+constraints match cell names).
 """
 
 from migen import *
@@ -16,6 +17,23 @@ from migen import *
 from litex.gen import LiteXModule
 
 from litex.soc.interconnect.csr import CSRStatus
+
+# CPU Helpers --------------------------------------------------------------------------------------
+
+def set_main_ram_executable(soc, origin=0x4000_0000):
+    """Mark main_ram executable: VexiiRiscv builds its memory map from region.mode and enforces
+    execute permission."""
+    for region in soc.bus.regions.values():
+        if region.origin == origin and not region.linker:
+            region.mode = "rwx"
+
+def add_zbb_constant(soc, args):
+    """TRIXIUM_HAS_ZBB when the CPU has Zbb (--vexii-args ... --with-rvZbb): the toolchain
+    (GCC 10.1) predates the extension, so the firmware reaches clz through a .insn encoding
+    behind this constant."""
+    if "--with-rvZbb" in (getattr(args, "vexii_args", "") or "") or \
+       "zbb" in (getattr(soc.cpu, "isa_map", None) or []):
+        soc.add_constant("TRIXIUM_HAS_ZBB")
 
 # Xilinx Constraints -------------------------------------------------------------------------------
 
@@ -55,7 +73,12 @@ class CPUBusMonitor(LiteXModule):
     """
     def __init__(self, cpu):
         self.cpu_reset = CSRStatus(1, description="The CPU's reset input.")
+
+        # # #
+
         self.comb += self.cpu_reset.status.eq(cpu.reset)
+
+        # Per bus: handshake counters, then the last AR/AW addresses (CSRs added in that order).
         buses = [("p", cpu.pbus)] + [("m", b) for b in getattr(cpu, "memory_buses", [])[:1]]
         for name, bus in buses:
             for ch in ("ar", "r", "aw", "b"):

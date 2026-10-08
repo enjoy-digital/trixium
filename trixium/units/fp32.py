@@ -27,11 +27,11 @@ from migen import *
 
 from litex.gen import LiteXModule
 
+# Constants ----------------------------------------------------------------------------------------
+
 CANONICAL_NAN = 0x7FC00000
 
-
 # Helpers ------------------------------------------------------------------------------------------
-
 
 def _shift_right_sticky(value, width, amount, amount_max, out_width):
     """Combinational (value >> amount) truncated to out_width bits, plus a sticky bit that
@@ -56,8 +56,9 @@ def _shift_right_sticky(value, width, amount, amount_max, out_width):
     stmts += [q.eq(Mux(over, 0, cur)), sticky.eq(Mux(over, value != 0, st))]
     return q, sticky, stmts
 
-
 def _shift_left(value, amount, amount_max, out_width):
+    """Combinational (value << amount) truncated to out_width bits, 0 above amount_max: the same
+    logarithmic barrel shifter as _shift_right_sticky."""
     out = Signal(out_width)
     bits = max(1, amount_max.bit_length())
     stmts = []
@@ -72,27 +73,30 @@ def _shift_left(value, amount, amount_max, out_width):
     stmts.append(out.eq(Mux(amount > amount_max, 0, cur)))
     return out, stmts
 
-
 def _lzc(value, width):
+    """Combinational leading-zero count of `value` (width bits); later statements win, so
+    scanning from bit 0 upwards leaves the count of the highest set bit."""
     count = Signal(max=width + 1)
     stmts = [count.eq(width)]
     for bit in range(width):
         stmts.append(If(value[bit], count.eq(width - 1 - bit)))
     return count, stmts
 
-
 # Unpack -------------------------------------------------------------------------------------------
 
-class _Unpack(Module):
+class _Unpack(LiteXModule):
     """Classify and expose a binary32 word: significand with hidden bit, effective biased
     exponent (1 for subnormals), flags."""
     def __init__(self, x):
         self.sign = x[31]
-        self.exp = Signal(8)
+        self.exp  = Signal(8)
         self.frac = Signal(23)
-        self.man = Signal(24)
-        self.eff = Signal(8)
+        self.man  = Signal(24)
+        self.eff  = Signal(8)
         self.is_nan, self.is_inf, self.is_zero = Signal(), Signal(), Signal()
+
+        # # #
+
         self.comb += [
             self.exp.eq(x[23:31]), self.frac.eq(x[0:23]),
             self.man.eq(Cat(self.frac, self.exp != 0)),
@@ -101,7 +105,6 @@ class _Unpack(Module):
             self.is_inf.eq((self.exp == 0xFF) & (self.frac == 0)),
             self.is_zero.eq((self.exp == 0) & (self.frac == 0)),
         ]
-
 
 # FP32 Mul -----------------------------------------------------------------------------------------
 
@@ -113,6 +116,8 @@ class FP32Mul(LiteXModule):
     def __init__(self):
         self.a, self.b, self.r = Signal(32), Signal(32), Signal(32)
         self.ce = Signal(reset=1)
+
+        # # #
 
         # S1: unpack, special cases.
         ua, ub = _Unpack(self.a), _Unpack(self.b)
@@ -156,7 +161,7 @@ class FP32Mul(LiteXModule):
         # S4: shift to 24 bits + guard + sticky.
         rs = Signal(6)
         self.comb += rs.eq(Mux(s3_s < 0, 0, Mux(s3_s > 50, 50, s3_s[:6])))
-        sh = Signal(49)                          # [0] guard, [1:25] kept significand
+        # sh_q: [0] guard, [1:25] kept significand.
         sh_q, sh_sticky, sh_case = _shift_right_sticky(Cat(C(0, 1), s3_p), 49, rs, 50, 25)
         ls = Signal(5)
         self.comb += ls.eq(Mux(s3_s < 0, -s3_s, 0))
@@ -170,19 +175,21 @@ class FP32Mul(LiteXModule):
             s4_s.eq(s3_s), s4_sign.eq(s3_sign), s4_special.eq(s3_special),
             s4_sval.eq(s3_sval), s4_esum.eq(s3_esum))
         # S5: round, renormalise, pack.
-        self.submodules.pack = pack = _RoundPack(s4_sign, s4_q[:24], s4_g, s4_st,
-                                                  s4_esum, s4_s, bias=-150)
+        self.pack = pack = _RoundPack(s4_sign, s4_q[:24], s4_g, s4_st,
+                                       s4_esum, s4_s, bias=-150)
         self.sync += If(self.ce, self.r.eq(Mux(s4_special, s4_sval, pack.word)))
-
 
 # Round Pack ---------------------------------------------------------------------------------------
 
-class _RoundPack(Module):
+class _RoundPack(LiteXModule):
     """RNE-round a 24-bit significand q (plus guard g and sticky st) whose lsb weighs
     2**(esum + s + bias - 127 ... ) and pack: exponent field = esum + s + bias when q is
     normal (bit 23 set) after rounding, 0 for a subnormal; overflow to infinity."""
     def __init__(self, sign, q, g, st, esum, s, bias):
         self.word = Signal(32)
+
+        # # #
+
         up = Signal()
         q1 = Signal(25)
         e = Signal((12, True))
@@ -202,7 +209,6 @@ class _RoundPack(Module):
             ),
         ]
 
-
 # FP32 Add -----------------------------------------------------------------------------------------
 
 class FP32Add(LiteXModule):
@@ -212,8 +218,12 @@ class FP32Add(LiteXModule):
     def __init__(self):
         self.a, self.b, self.r = Signal(32), Signal(32), Signal(32)
         self.ce = Signal(reset=1)
+
+        # # #
+
         ua, ub = _Unpack(self.a), _Unpack(self.b)
         self.submodules += ua, ub
+
         # S1: order by magnitude, specials, alignment distance.
         swap = Signal()
         self.comb += swap.eq(self.b[:31] > self.a[:31])
@@ -286,11 +296,10 @@ class FP32Add(LiteXModule):
             s4_bs.eq(s3_bs), s4_special.eq(s3_special), s4_sval.eq(s3_sval),
             s4_zero.eq(s3_sum == 0), s4_zsign.eq(s3_zsign))
         # S5: round (n = 24-bit significand, guard, round|sticky) and pack.
-        self.submodules.pack = pack = _RoundPack(s4_bs, s4_n[3:27], s4_n[2], s4_n[1] | s4_n[0],
-                                                  s4_e, C(0, 2), bias=0)
+        self.pack = pack = _RoundPack(s4_bs, s4_n[3:27], s4_n[2], s4_n[1] | s4_n[0],
+                                       s4_e, C(0, 2), bias=0)
         self.sync += If(self.ce, self.r.eq(
             Mux(s4_special, s4_sval, Mux(s4_zero, Cat(C(0, 31), s4_zsign), pack.word))))
-
 
 # FP32 Div/Sqrt ------------------------------------------------------------------------------------
 
@@ -312,6 +321,9 @@ class FP32DivSqrt(LiteXModule):
         self.start, self.busy, self.done = Signal(), Signal(), Signal()
         self.r = Signal(32)
 
+        # # #
+
+        # Operand normalization.
         ua, ub = _Unpack(self.a), _Unpack(self.b)
         self.submodules += ua, ub
         lza, lza_s = _lzc(ua.man, 24)
@@ -326,6 +338,7 @@ class FP32DivSqrt(LiteXModule):
             e_sq.eq(ex_a - 127),
         ]
 
+        # Iteration state.
         op, sign, special = Signal(), Signal(), Signal()
         sval = Signal(32)
         rem = Signal(30)
@@ -377,11 +390,12 @@ class FP32DivSqrt(LiteXModule):
         )
         shift_used = Signal((12, True))
         self.comb += shift_used.eq(Mux(s_sel < 0, s_sel, rsh))
-        # The count/shift and the round/pack are split over two clocks (PACK, PACK2): as
-        # one they were the norm unit's critical path (26 logic levels).
+        # The count/shift and the round/pack are split over two clocks (PACK, PACK2) for timing:
+        # as one they are ~26 logic levels.
         r_q, r_g, r_st, r_s = Signal(24), Signal(), Signal(), Signal((12, True))
-        self.submodules.pack = pack = _RoundPack(sign, r_q, r_g, r_st, l0, r_s, bias=150)
+        self.pack = pack = _RoundPack(sign, r_q, r_g, r_st, l0, r_s, bias=150)
 
+        # Control.
         self.sync += [
             self.done.eq(0),
             Case(state, {
@@ -440,7 +454,6 @@ class FP32DivSqrt(LiteXModule):
             }),
         ]
 
-
 # Valid Adapters -----------------------------------------------------------------------------------
 
 class _ValidAdapter(LiteXModule):
@@ -449,7 +462,10 @@ class _ValidAdapter(LiteXModule):
     def __init__(self, op_cls):
         self.a, self.b, self.valid = Signal(32), Signal(32), Signal()
         self.result, self.result_valid = Signal(32), Signal()
-        self.submodules.op = op = op_cls()
+
+        # # #
+
+        self.op = op = op_cls()
         self.comb += [op.a.eq(self.a), op.b.eq(self.b), self.result.eq(op.r)]
         prev = self.valid
         for i in range(op_cls.LATENCY):
@@ -458,20 +474,17 @@ class _ValidAdapter(LiteXModule):
             prev = v
         self.comb += self.result_valid.eq(prev)
 
-
 class ExactFP32Add(_ValidAdapter):
     latency = FP32Add.LATENCY
 
     def __init__(self):
         _ValidAdapter.__init__(self, FP32Add)
 
-
 class ExactFP32Mul(_ValidAdapter):
     latency = FP32Mul.LATENCY
 
     def __init__(self):
         _ValidAdapter.__init__(self, FP32Mul)
-
 
 # FP32 Argmax Tracker ------------------------------------------------------------------------------
 
@@ -491,6 +504,9 @@ class FP32ArgmaxTracker(LiteXModule):
         self.clear = Signal()
         self.valid, self.data, self.mask = Signal(), Signal(256), Signal(8)
         self.best_valid, self.best_val, self.best_idx = Signal(), Signal(32), Signal(32)
+
+        # # #
+
         count = Signal(32)
         # S0: register the beat with its base index and whether it starts the stream.
         s0_v, s0_d, s0_m, s0_base, s0_first = Signal(), Signal(256), Signal(8), Signal(32), Signal()

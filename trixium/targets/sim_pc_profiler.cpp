@@ -1,36 +1,34 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// VexRiscv PC profiler for the Verilator sim: a `perf record` for the softcore.
-//
-// Why. Measured on the card, a token is engine-busy 7%, vector-busy 22%, both 0%, and
-// NEITHER 69%. That 69% is the softcore running firmware and nothing in the system could
-// attribute it - perf_print's buckets are op-class wall time that already includes the CPU
-// glue, so they cannot separate "computing" from "polling" from "stalled".
-//
-// This samples the retired-instruction PC every cycle and buckets it. Two counters per PC:
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * VexRiscv PC profiler for the Verilator simulation: a `perf record` for the softcore.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
+/* Overview */
+/*----------*/
+
+// Samples the retired-instruction PC every cycle and buckets it, to attribute the time in
+// which neither the engine nor the vector unit is busy (the CPU's firmware glue, which
+// perf_print's op-class wall time cannot separate). Two counters per PC:
 //
 //   cycles[pc]   incremented when the writeback stage holds this instruction (lastStageIsValid)
 //   retired[pc]  incremented when it actually retires    (lastStageIsFiring)
 //
-// so cycles/retired is per-PC CPI, which is the difference between "this code is slow because
-// there is a lot of it" and "this code is slow because it is stalled on a cache miss". A plain
-// histogram cannot tell those apart and they need opposite fixes.
+// so cycles/retired is the per-PC CPI: "slow because there is a lot of it" vs "slow because it
+// stalls" (e.g. on a cache miss), which a plain histogram cannot tell apart.
 //
-// Mechanism. LiteX declares three weak hooks in build/sim/core/veril.cpp; litex_sim_eval()
-// calls pre/post around every model eval. Defining the strong symbol here overrides the weak
-// default at link time - no sim_config entry, no Python-side module. (The dlopen'd sim module
-// pattern in build/sim/core/modules/ is NOT usable for this: those only get `pad` pointers and
-// never see the Vsim*, so they cannot reach a CPU-internal signal at all.)
+// Mechanism: LiteX declares weak hooks in build/sim/core/veril.cpp and litex_sim_eval() calls
+// them around every model eval; the strong symbols here override them at link time (no
+// sim_config entry, no Python-side module). The dlopen'd sim modules cannot do this: they only
+// get pad pointers, never the Vsim*, so they cannot reach a CPU-internal signal.
 //
-// The signal path is `sim->sim->VexRiscv->lastStagePc`, verified against the generated
-// obj_dir/Vsim_VexRiscv.h (lastStageIsFiring:155, lastStagePc:252, lastStageIsValid:339,
-// CsrPlugin_inWfi:501) and obj_dir/Vsim.h:43 / Vsim_sim.h:18 for the cell pointers. VexRiscv
-// escapes inlining precisely because those carry /* verilator public */, which is also why the
-// names are unmangled. If a Verilator upgrade changes that, this fails to COMPILE rather than
-// silently mis-sampling - which is the failure mode we want.
+// The signal path is `sim->sim->VexRiscv->lastStagePc` (obj_dir/Vsim.h, Vsim_sim.h,
+// Vsim_VexRiscv.h). VexRiscv's signals carry /* verilator public */, hence unmangled names; if a
+// Verilator upgrade changes that, this fails to compile rather than silently mis-sampling.
 
 #include <cstdint>
 #include <cstdio>
@@ -41,6 +39,9 @@
 #include "Vsim.h"
 #include "Vsim_sim.h"
 #include "Vsim_VexRiscv.h"
+
+/* Profiler State */
+/*----------------*/
 
 namespace {
 
@@ -165,6 +166,9 @@ inline void uart_sniff(Vsim *sim) {
 }
 
 } // namespace
+
+/* LiteX Sim Hooks */
+/*-----------------*/
 
 extern "C" void litex_sim_user_init(void *vsim) {
     (void)vsim;

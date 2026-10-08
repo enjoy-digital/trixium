@@ -46,17 +46,17 @@ a cleared state: +0 * decay = +0); the state streams are still consumed.
 """
 
 from functools import reduce
-from operator import and_, or_
+from operator import and_
 
 import numpy as np
 
 from migen import *
 
 from litex.gen import *
+
 from litex.soc.interconnect import stream
 
 from trixium.units.fp32 import ExactFP32Add, ExactFP32Mul
-
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -68,14 +68,12 @@ def state_to_lanes(states, lanes):
     s = states.view(np.uint32).reshape(h, r, lanes, g, 8)
     return np.ascontiguousarray(s.transpose(2, 0, 3, 1, 4).reshape(lanes, -1))
 
-
 def lanes_to_state(words, lanes, rows, cols):
     words = np.asarray(words, dtype=np.uint32).reshape(lanes, -1)
     r, g = rows//lanes, cols//8
     h = words.shape[1]//(g*r*8)
     s = words.reshape(lanes, h, g, r, 8).transpose(1, 3, 0, 2, 4)
     return np.ascontiguousarray(s.reshape(h, rows, cols)).view(np.float32)
-
 
 def reference(state, q, k, v, decay, beta, scale):
     """One head, the firmware loop (hybrid.c), vectorised over rows. Returns (state, out)."""
@@ -95,10 +93,11 @@ def reference(state, q, k, v, decay, beta, scale):
         out = (o*f32(scale)).astype(f32)
     return m, out
 
-
 # DeltaNet Stream ----------------------------------------------------------------------------------
 
 class DeltaNetStream(LiteXModule):
+    """Streaming DeltaNet recurrence, one command per layer, `lanes` row-striped state streams
+    (see the module docstring for the layout and the arithmetic)."""
     def __init__(self, lanes=16, rows=128, cols=128, slots=4, adr_bits=13,
                  add_factory=ExactFP32Add, mul_factory=ExactFP32Mul,
                  negate=lambda x: x ^ 0x80000000, fifo_depth=8):
@@ -115,16 +114,20 @@ class DeltaNetStream(LiteXModule):
         self.lanes, self.rows, self.cols, self.rows_per_lane = L, rows, cols, R
         self.beats_per_head = G*R   # Per lane.
 
+        # Command / status.
         self.start = Signal()
         self.heads = Signal(16)
         self.table = Signal(adr_bits)   # Scratchpad beat address of the head records.
         # Sampled with start: the incoming state is taken as +0.0 (the stream is still read and
         # discarded), so a generation's first token needs no 144 MiB clear of the DDR state.
-        self.zero  = Signal()
-        self.busy  = Signal()
-        self.done  = Signal()           # Pulse: every head's outputs and state written.
+        self.zero = Signal()
+        self.busy = Signal()
+        self.done = Signal()           # Pulse: every head's outputs and state written.
+
+        # State streams, one per lane.
         self.sinks   = [stream.Endpoint([("data", 256)], name=f"dns_sink{l}") for l in range(L)]
         self.sources = [stream.Endpoint([("data", 256)], name=f"dns_source{l}") for l in range(L)]
+
         # Scratchpad client ports. Reads: sp_rd_req/sp_rd_adr come from flops and hold until
         # a cycle with sp_rd_ok (the grant); the data is on sp_rd_dat one clock later.
         # Writes: held until granted.
@@ -137,6 +140,8 @@ class DeltaNetStream(LiteXModule):
         self.sp_wr_we  = Signal(8)
         self.sp_wr_dat = Signal(256)
         self.sp_wr_gnt = Signal()
+
+        # Progress.
         self.heads_done = Signal(16)
 
         # # #
