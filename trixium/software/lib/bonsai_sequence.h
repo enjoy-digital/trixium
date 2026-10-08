@@ -19,8 +19,8 @@ enum bns_seq_desc_result { BNS_SEQ_DESC_OK=0, BNS_SEQ_DESC_INVALID=-1 };
  * Before submission the caller must check each optional unit's hardware ABI,
  * physical capacity/profile, placement, numerical admission and full-list
  * ownership. These functions check field encoding, not execution validity.
- * Addresses are scratchpad-relative bytes except region-relative uint64_t
- * offsets/strides. Hardware checks full spans/list protection. Live descriptors
+ * Addresses are scratchpad-relative bytes. Hardware checks full spans/list
+ * protection. Live descriptors
  * and input buffers must remain immutable; failure invalidates output prefixes
  * and requires common reset/drain. There is no implicit quantization fallback.
  */
@@ -36,31 +36,9 @@ int bns_seq_desc_quantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t
 int bns_seq_desc_requantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t dst,
                            uint32_t exponents, uint32_t maxima, uint32_t result_exponent,
                            uint32_t blocks);
-/* Unit 6, native ABI 1: full 64-bit row offset/stride, both multiples of 32 (device rows are
- * beat-aligned; the reader rejects unaligned values as a configuration error). */
-int bns_seq_desc_native_pipe(struct bns_seq_descriptor *out, uint32_t pipe, uint32_t region,
-                            uint64_t offset, uint64_t stride);
-struct bns_seq_projection {
-    uint32_t kind, rows, rem, groups, bias, rshift, xsrc, dst;
-    uint32_t interleaved, suppress_writes, dual, qstride;
-};
-/* Unit 7, native ABI 1: kind 0 PTQ1_0 or 1 Q8_0; flags exactly 0/1.
- * Keep whole-matrix B/R and one whole-activation exponent across K segments;
- * reduce wrapping int32 segment outputs before restoring FP32 scale. */
-int bns_seq_desc_native_projection(struct bns_seq_descriptor *out,
-                                  const struct bns_seq_projection *projection);
 /* Unit 8, projection_restore ABI 1: int32 -> FP32 using resident e8 + (R-B). */
 int bns_seq_desc_restore(struct bns_seq_descriptor *out, uint32_t src, uint32_t dst,
                         uint32_t exponents, uint32_t elements, int32_t adjustment);
-/* Unit 9, embedding_restore ABI 1 and admitted limits/profile. Groups 8..512
- * encode the generic kernel range; the shared hardware currently allows <=64. */
-int bns_seq_desc_embedding(struct bns_seq_descriptor *out, uint32_t src, uint32_t signs,
-                          uint32_t dst, uint32_t groups);
-/* Unit 10, region_fetch ABI 1: positive full 32-byte beats, aligned offset/dst.
- * Region READ access, reservations and endpoint/address width are checked in
- * hardware. Read success alone does not publish a valid model allocation. */
-int bns_seq_desc_region_fetch(struct bns_seq_descriptor *out, uint32_t region,
-                             uint64_t offset, uint32_t length, uint32_t dst);
 /* Unit 11, silu ABI 1: dst[i] = m[i]*silu(g[i]) bit-exact with the firmware's
  * lookup; fixup elements keep g in dst and set bit i of the fixmap bitmap
  * (ceil(elements/32) words, all written). dst == src_g or disjoint. */

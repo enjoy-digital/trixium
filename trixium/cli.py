@@ -48,41 +48,8 @@ def cmd_convert(a):
 
 
 def cmd_verify(a):
-    import struct
-    with open(a.image, 'rb') as f:
-        prefix = f.read(8)
-    if prefix == struct.pack('<4sI', b'BONS', 4):
-        from trixium.model.bons4 import Reader
-        image = Reader(a.image)
-        image.verify()
-        print(f'BONS v4: {len(image.entries)} tensors, all payload SHA256 checks pass')
-        return
     from trixium.model.convert import verify
     sys.exit(0 if verify(a.image) else 1)
-
-
-def cmd_pack(a):
-    import json
-    from trixium.model.pack_native import pack
-    result = pack(a.gguf, a.out, tokenizer=a.tokenizer, check=a.check,
-                  progress=lambda name: print(f'  {name}', flush=True))
-    print(json.dumps(result, indent=2))
-
-
-def cmd_place(a):
-    import json
-    from pathlib import Path
-    from trixium.capabilities import Capabilities
-    from trixium.model.bons4 import Reader
-    from trixium.placement import plan_weights
-    image = Reader(a.image)
-    image.verify()
-    caps = Capabilities.from_bytes(Path(a.capabilities).read_bytes())
-    plan = plan_weights(image, caps, topology_only=a.topology_only)
-    with open(a.out, 'x') as f:
-        json.dump(plan.to_dict(), f, indent=2)
-        f.write('\n')
-    print(f'{a.out}: weights-only placement, {len(plan.spans)} spans; no device I/O')
 
 
 def cmd_tokenizer(a):
@@ -155,21 +122,7 @@ def main(argv=None):
                    help="leave out the int16 embedding table (-622 MB, ~2.6%% slower per token)")
     p.set_defaults(fn=cmd_convert)
 
-    p = sub.add_parser("pack", help="lossless GGUF -> board-independent BONS v4 (not a legacy upload image)")
-    p.add_argument("gguf")
-    p.add_argument("--out", required=True, help="new output file; refuses overwrite")
-    p.add_argument("--tokenizer", help="tokenizer file to hash (otherwise explicitly unpinned)")
-    p.add_argument("--check", action="store_true", help="verify every written payload SHA256")
-    p.set_defaults(fn=cmd_pack)
-
-    p = sub.add_parser("place", help="offline BONS v4 whole-row placement; weights only, no upload")
-    p.add_argument("image")
-    p.add_argument("--capabilities", required=True, help="BNCP capability blob")
-    p.add_argument("--out", required=True, help="new placement JSON; refuses overwrite")
-    p.add_argument("--topology-only", action="store_true", help="capacity estimate even without region I/O hardware")
-    p.set_defaults(fn=cmd_place)
-
-    p = sub.add_parser("verify", help="verify every tensor of a v2/v3/v4 image")
+    p = sub.add_parser("verify", help="verify every tensor of a v2/v3 image")
     p.add_argument("image")
     p.set_defaults(fn=cmd_verify)
 

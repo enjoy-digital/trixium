@@ -30,7 +30,6 @@ from trixium.layout import (
     ROLE_ATTN_NORM, ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
     ROLE_ATTN_Q_NORM, ROLE_ATTN_K_NORM,
     ROLE_FFN_NORM, ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN,
-    ROLE_MTP_EH, ROLE_MTP_ENORM, ROLE_MTP_HNORM, ROLE_MTP_HEAD_NORM,
 )
 from trixium.model import qformats
 from trixium.model.gguf_reader import GGUFReader, inspect as gguf_inspect
@@ -67,11 +66,6 @@ _BLK_ROLES = {
     "ssm_a"       : (ROLE_SSM_A,       True),
     "ssm_dt"      : (ROLE_SSM_DT,      True),
     "ssm_norm"    : (ROLE_SSM_NORM,    True),
-    # The MTP head (Qwen3.5 nextn block, --mtp): its decoder block uses the names above.
-    "nextn.eh_proj"          : (ROLE_MTP_EH,        False),
-    "nextn.enorm"            : (ROLE_MTP_ENORM,     True),
-    "nextn.hnorm"            : (ROLE_MTP_HNORM,     True),
-    "nextn.shared_head_norm" : (ROLE_MTP_HEAD_NORM, True),
 }
 
 _DN_LAYER_TENSORS = ("attn_norm", "attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha", "ssm_conv1d",
@@ -79,8 +73,6 @@ _DN_LAYER_TENSORS = ("attn_norm", "attn_qkv", "attn_gate", "ssm_beta", "ssm_alph
                      "ffn_gate", "ffn_up", "ffn_down")
 _ATTN_LAYER_TENSORS_Q35 = ("attn_norm", "attn_q", "attn_k", "attn_v", "attn_q_norm", "attn_k_norm",
                            "attn_output", "post_attention_norm", "ffn_gate", "ffn_up", "ffn_down")
-_MTP_TENSORS = _ATTN_LAYER_TENSORS_Q35 + ("nextn.eh_proj", "nextn.enorm", "nextn.hnorm",
-                                          "nextn.shared_head_norm")
 
 def _name_role(name):
     if name in _GLOBAL_ROLES:
@@ -170,8 +162,7 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
                           flags=FLAG_REPLICATED)
 
     if t.type_name == "Q8_0":
-        # Q8_0 is the engine's Q8 row format as it is: one fp16 scale per 32 int8 weights
-        # (the MTP head at Q8, --mtp).
+        # Q8_0 is the engine's Q8 row format as it is: one fp16 scale per 32 int8 weights.
         rows, cols = t.shape
         raw = np.frombuffer(reader.tensor_bytes(name), dtype=np.uint8).reshape(rows, cols//32, 34)
         scales = np.ascontiguousarray(raw[:, :, :2]).view(np.float16).reshape(rows, cols//32)
@@ -198,13 +189,9 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
             max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None,
-            window_reserve=0, kseg_max=layout.KSEG_MAX, mtp_path=None):
-    """mtp_path: an MTP-only GGUF (tools/speculative/mk_rotated.py + llama-quantize): its
-    blk.<n_layer>.* decoder block and nextn tensors go in at layer n_layer; its embedding,
-    LM head and output norm are not used (the head shares the model's)."""
+            window_reserve=0, kseg_max=layout.KSEG_MAX):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
-    cfg.mtp_layers = 0
     try:
         check_engine_support(cfg)
     except SystemExit as e:
@@ -234,15 +221,6 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
         names.append("output.weight")
 
     specs = [_spec_from_gguf(reader, name, n_channels, vocab_pad) for name in names]
-    if mtp_path:
-        mreader = GGUFReader(mtp_path)
-        L = cfg.n_layer
-        mnames = [f"blk.{L}.{base}.weight" for base in _MTP_TENSORS]
-        missing = [n for n in mnames if n not in mreader.tensors]
-        if missing:
-            raise SystemExit(f"{mtp_path}: no MTP block at layer {L} ({missing[0]} missing)")
-        specs += [_spec_from_gguf(mreader, name, n_channels, vocab_pad) for name in mnames]
-        cfg.mtp_layers = 1
     if cfg.hadamard_block:
         specs += _hadamard_specs(cfg)
     # Matvecs wider than one engine op (the 27B's FFN down projection, K = 17408) become
@@ -270,7 +248,7 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     window   = chan_stride - (weight_base % chan_stride) - 0x1000 - window_reserve  # The last 4 KB: the
     # firmware's DDR round-trip test (ddr.c) writes them on boards with several controllers.
     kv_rb    = 1 + cfg.head_dim//32
-    kv_bytes = (cfg.n_layer + cfg.mtp_layers)*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
+    kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
     dn_bytes = layout.deltanet_state_bytes_per_channel(cfg, n_channels)
     weights  = sum(_tensor_beats(t, n_channels) for t in specs)*32
     emb16_b  = 0
@@ -367,8 +345,6 @@ def main():
                         "((chan_mod-1)*BONSAI_CHAN_SKEW: 96 KB on the XCU1525).")
     p.add_argument("--weight-base", default=None, type=lambda x: int(x, 0),
                    help="The target's weight base (BONSAI_CHAN_WEIGHT_BASE; default: the FK33's).")
-    p.add_argument("--mtp", default=None,
-                   help="MTP-only GGUF whose head goes in at layer n_layer (speculative decoding).")
 
     p = sub.add_parser("verify")
     p.add_argument("--image", required=True)
@@ -381,7 +357,7 @@ def main():
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
                 args.layers, args.check, emb16=not args.no_emb16,
                 chan_stride=args.chan_stride, weight_base=args.weight_base,
-                window_reserve=args.window_reserve, kseg_max=args.kseg_max, mtp_path=args.mtp)
+                window_reserve=args.window_reserve, kseg_max=args.kseg_max)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 
