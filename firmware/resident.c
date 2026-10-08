@@ -1032,13 +1032,6 @@ decline:
     return -1;
 }
 
-int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
-                       const struct bons_entry *down, int nb, const float *const *in,
-                       float *const *act, float *const *out)
-{
-    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
-    return -1;
-}
 
 #else
 
@@ -1052,13 +1045,6 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
 {
     (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
     return 0;
-}
-int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
-                       const struct bons_entry *down, int nb, const float *const *in,
-                       float *const *act, float *const *out)
-{
-    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
-    return -1;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)
@@ -1137,13 +1123,6 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
 {
     (void)g_sp; (void)m_sp; (void)dst_sp; (void)fixmap_sp; (void)n; (void)seg; (void)perm_a; (void)perm_b;
     return 0;
-}
-int resident_ffn_batch(const struct bons_entry *gate, const struct bons_entry *up,
-                       const struct bons_entry *down, int nb, const float *const *in,
-                       float *const *act, float *const *out)
-{
-    (void)gate; (void)up; (void)down; (void)nb; (void)in; (void)act; (void)out;
-    return -1;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                      float *act, float *gate_out, float *up_out)

@@ -12,8 +12,6 @@ int  infer_init(void);   // Load norms etc; returns 0 on success.
 // Feed prompt ids then generate up to max_new tokens (greedy); calls emit() per new token.
 // Returns the number of generated tokens.
 int  infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok));
-int  infer_mtp_generate(const int *prompt, int n_prompt, int max_new, int k, int batched,
-                        void (*emit)(int tok), uint64_t *stats);  // MTP head drafts (mtpgen)
 // Same, continuing a conversation: buf[0..resident) are in the KV cache from the previous
 // call (check infer_gen_serial() has not moved), the rest is new. resident 0 = fresh.
 int  infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok));
@@ -68,8 +66,6 @@ void infer_ffn_split(int on);     // FFN SiLU split: gate half under the up stre
 int  infer_ffn_split_state(void);
 int  infer_kvq_redundant_state(void);
 int  infer_attn_pipe_state(void);
-void infer_spec(int on);                    // Speculative decode on/off (lossless, greedy).
-void infer_spec_stats(int *acc, int *rej);  // Accepted / rejected draft counts.
 
 // The hybrid CPU path's primitives (hybrid.c): the engine matvec on a float vector (row
 // order out), main_ram allocation (big = the high heap when there is one), the room left,

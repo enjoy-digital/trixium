@@ -54,7 +54,7 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
     d[0]  = 1;
     d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9)
                      | ((uint32_t)op->rshift_rpre << 10) | ((uint32_t)op->qn << 11)
-                     | ((uint32_t)op->xred << 12) | ((uint32_t)(op->nb & 3) << 13);
+                     | ((uint32_t)op->xred << 12);
     d[2]  = op->rows | ((uint32_t)op->rem << 16);
     d[3]  = op->cols;
     d[4]  = op->wbase;

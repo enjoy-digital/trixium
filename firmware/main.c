@@ -156,13 +156,8 @@ static void help(void)
     puts("peek c addr     - dump one HBM beat via the engine (hex addr)");
     puts("mvtest idx      - matvec tensor <idx> with the test pattern, print checksum");
     puts("selftest        - engine self-tests (matvec + fetch checksums)");
-    puts("spec [on|off]   - speculative decode toggle + acc/rej counters");
     puts("seq [on|off]    - sequencer attention lists (on by default; off: CPU-dispatched)");
     puts("tokclr/tok/genb - chunked prompt buffer + generate [stop ids] (host chat tools)");
-    puts("mtpgen n k ids  - speculative decoding with the image's MTP head (k drafts)");
-    puts("mtpspec n k ids - the same, passes as speculative forwards with state rollback");
-    puts("mtporacle ids   - override drafts by position (- = the head's), none clears");
-    puts("nbatch [on|off] - mtpspec k=1 passes as one batched forward (engine cmd.nb)");
     puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
     puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("stats [reset]   - per-op cycle profile");
@@ -549,65 +544,6 @@ static void gen_cmd(char *args)
         engine_recover();
 }
 
-// mtpgen <n> <k> <ids...>: speculative decoding with the image's MTP head, k drafts per
-// pass, verified by the main model one forward at a time. mtpspec: the same with each pass
-// run as speculative forwards (all k + 1, the state rolled back past the accepted ones -
-// the batched verify's state handling). The tokens are the greedy ones; MTPSTATS: passes,
-// drafted, accepted (the mirror's counts, bit-exact), the head's cycles.
-static void mtpgen_cmd(char *args, int batched)
-{
-    int *const prompt = (int *)BONSAI_CONSOLE_PROMPT_ADDR;
-    int n = parse_int(get_token(&args));
-    int k = parse_int(get_token(&args));
-    int np = 0;
-    while (np < 64) {
-        char *tok = get_token(&args);
-        if (*tok == 0)
-            break;
-        prompt[np++] = parse_int(tok);
-    }
-    if (n <= 0 || k <= 0 || np == 0) {
-        puts("usage: mtpgen|mtpspec n k id id ...");
-        return;
-    }
-    uint64_t st[4] = {0, 0, 0, 0};
-    uint64_t t0 = perf_now64();
-    printf("GEN:");
-    int r = infer_mtp_generate(prompt, np, n, k, batched, emit_token, st);
-    uint64_t dt = perf_now64() - t0;
-    puts(r < 0 ? "\nGEN ERR" : "\nGEN DONE");
-    if (batched)
-    {
-        uint32_t fb, fd;
-        hybrid_nbatch_stats(&fb, &fd);
-        printf("MTPSPEC versions=%d nbatch=%d ffn_batched=%lu ffn_declined=%lu\n", hybrid_spec_max() + 1,
-               hybrid_nbatch_enabled(), (unsigned long)fb, (unsigned long)fd);
-    }
-    printf("MTPSTATS k=%d passes=%lu drafted=%lu accepted=%lu head_cycles=%lu total_cycles=%lu\n", k,
-           (unsigned long)st[0], (unsigned long)st[1], (unsigned long)st[2],
-           (unsigned long)st[3], (unsigned long)dt);
-    printf("MTPDRAFTS");
-    for (int i = 0; i < hybrid_mtp_ndrafts; i++) printf(" %d", hybrid_mtp_drafts[i]);
-    puts("");
-    if (engine_wedged)
-        engine_recover();
-}
-
-// mtporacle [ids...]: the draft of the token at position p becomes ids[p] ("-": the head's
-// own); no ids clears it. A test's way through the accept path (the mirror's mtp_hook).
-static void mtporacle_cmd(char *args)
-{
-    int n = 0;
-    while (n < 256) {
-        char *tok = get_token(&args);
-        if (*tok == 0)
-            break;
-        hybrid_mtp_oracle[n++] = *tok == '-' ? -1 : parse_int(tok);
-    }
-    hybrid_mtp_noracle = n;
-    printf("MTPORACLE %d\n", n);
-}
-
 static void sptest(void)
 {
     volatile uint32_t *sp = (volatile uint32_t *)SCRATCHPAD_BASE;
@@ -693,19 +629,6 @@ static void console_service(void)
         tok_cmd(str);
     else if (strcmp(token, "tokclr") == 0)
         tokclr_cmd();
-    else if (strcmp(token, "mtpgen") == 0)
-        mtpgen_cmd(str, 0);
-    else if (strcmp(token, "mtpspec") == 0)
-        mtpgen_cmd(str, 1);
-    else if (strcmp(token, "mtporacle") == 0)
-        mtporacle_cmd(str);
-    else if (strcmp(token, "mtpdbg") == 0)
-        hybrid_mtpdbg_enable(strcmp(get_token(&str), "on") == 0);
-    else if (strcmp(token, "nbatch") == 0) {
-        char *v = get_token(&str);
-        if (*v) hybrid_nbatch_enable(strcmp(v, "on") == 0);
-        printf("NBATCH %s\n", hybrid_nbatch_enabled() ? "on" : "off");
-    }
     else if (strcmp(token, "genb") == 0)
         genb_cmd(str);
     else if (strcmp(token, "hwops") == 0)
@@ -769,15 +692,6 @@ static void console_service(void)
     }
     else if (strcmp(token, "bench") == 0)
         bench_cmd(str);
-    else if (strcmp(token, "spec") == 0) {
-        if (strncmp(str, "on", 2) == 0)
-            infer_spec(1);
-        else if (strncmp(str, "off", 3) == 0)
-            infer_spec(0);
-        int acc, rej;
-        infer_spec_stats(&acc, &rej);
-        printf("SPEC acc=%d rej=%d\n", acc, rej);
-    }
     else if (strcmp(token, "ffnseq") == 0) {
         extern int seq_ffn_use;
         if (strncmp(str, "on", 2) == 0)  seq_ffn_use = 1;
@@ -1129,7 +1043,7 @@ int main(void)
         const int big_model = model_header()->n_layer > 8;
         if (!big_model) {
             // Harness hook for the simulation tools (sim_resident_gate/bench): they need only
-            // the console, and on the 1k tiny model the three legs cost ~70 minutes of
+            // the console, and on the 1k tiny model the legs cost tens of minutes of
             // Verilator time. Offer the skip here, after the firmware is running - an early
             // key would reach the LiteX BIOS, where Q aborts the boot. Only tiny models get
             // here; 2 M cycles is ~30 s of simulation wall time and 13 ms on a board. With
@@ -1167,29 +1081,6 @@ int main(void)
             infer_generate(prompt, 3, 2, emit_token);
             puts("\nGEN-HW DONE");
             perf_print();
-            // Speculative-decode leg: greedy spec is lossless, so the tokens must match
-            // the same references; the acc/rej counters show the machinery engaged.
-            //
-            // Skipped on big models at boot purely for boot time - six more 1.7B tokens.
-            // (It used to be skipped because the sequencer stalled here; that was the
-            // interleaved-gather bug, now fixed.) `spec on` reaches it deliberately, and
-            // the sim's tiny model still runs the leg so the gate keeps checking it.
-            if (big_model) {
-                puts("GEN-SP skipped at boot on this model size (use `spec on` to run it)");
-                goto boot_demo_done;
-            }
-            infer_spec(1);
-            printf("GEN-SP:");
-            perf_reset();
-            infer_generate(prompt, 3, 6, emit_token);
-            puts("\nGEN-SP DONE");
-            {
-                int acc, rej;
-                infer_spec_stats(&acc, &rej);
-                printf("SPEC acc=%d rej=%d\n", acc, rej);
-            }
-            perf_print();
-            infer_spec(0);
         }
     }
 boot_demo_done:

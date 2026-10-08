@@ -2463,14 +2463,6 @@ static void attn_seq2_layer(int l, int pos, float *aw_c, float *aw_hmax)
     perf_exit(OP_WV);
 }
 
-
-// Speculative-decode state: successor draft table + acceptance counters (the
-// counters exist on every build; the machinery only under the full-HW guard).
-static int       spec_on, spec_acc, spec_rej;
-static uint16_t *spec_succ;
-static uint8_t  *spec_succ_v;
-
-
 // Forward one token; returns argmax token id (only meaningful when wanted). ------------------
 
 // Token-invariant words of the attention list, patched ONCE per forward instead of once
@@ -4442,18 +4434,6 @@ void infer_vbench(void)
     puts("VB done");
 }
 
-void infer_spec(int on)
-{
-    spec_on  = on;
-    spec_acc = spec_rej = 0;
-}
-
-void infer_spec_stats(int *acc, int *rej)
-{
-    *acc = spec_acc;
-    *rej = spec_rej;
-}
-
 static int gen_stop[INFER_STOP_MAX], gen_nstop;
 
 void infer_set_stop(const int *ids, int n)
@@ -4480,32 +4460,6 @@ const struct infer_prefill_profile *infer_last_prefill(void) { return &last_pref
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {
     return infer_generate_from(prompt, n_prompt, 0, max_new, emit);
-}
-
-// Speculative decoding with the image's MTP head (console `mtpgen`): a fresh generation,
-// the hybrid's loop (hybrid_mtp_generate). stats: passes, drafted, accepted, head cycles.
-int infer_mtp_generate(const int *prompt, int n_prompt, int max_new, int k, int batched,
-                       void (*emit)(int tok), uint64_t *stats)
-{
-    if (!H || H->magic != BONS_MAGIC || n_layer == 0 || !hybrid_present() || !hybrid_mtp_present()) {
-        printf(" [no model with an MTP head]");
-        return -1;
-    }
-    for (int i = 0; i < n_prompt; i++)
-        if (prompt[i] < 0 || (uint32_t)prompt[i] >= H->vocab) {
-            printf(" [bad token id %d at %d]", prompt[i], i);
-            return -1;
-        }
-    if (n_prompt + max_new + k > max_ctx) {
-        printf(" [%d tokens exceed the KV budget of %d]", n_prompt + max_new + k, max_ctx);
-        return -1;
-    }
-    gen_serial++;
-    n_pos = 0;
-    hybrid_reset();
-    int r = hybrid_mtp_generate(prompt, n_prompt, max_new, k, batched, emit, stats);
-    n_pos = hybrid_pos();
-    return r;
 }
 
 // buf[0..resident) are already in the KV cache from the previous call (n_pos == resident:
