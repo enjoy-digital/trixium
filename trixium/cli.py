@@ -4,17 +4,17 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""`bonsai`: the one entry point for the model path.
+"""`trixium`: the one entry point for the model path.
 
-    bonsai convert   models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf  # -> models/bons/bonsai-1p7b-n16.img
-    bonsai convert   models/8b/Ternary-Bonsai-8B-PQ2_0.gguf      # -> models/bons/bonsai-8b-n16.img
-    bonsai verify    models/bons/bonsai-1p7b-n16.img
-    bonsai tokenizer models/1.7b/tokenizer.json                 # -> models/1.7b/tokenizer.bin
-    bonsai deploy    n16_212_v15b                               # bitstream + weights + boot
-    bonsai chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
-    bonsai console   "stats" "bench 64"                         # raw firmware commands
+    trixium convert   models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf  # -> models/bons/bonsai-1p7b-n16.img
+    trixium convert   models/8b/Ternary-Bonsai-8B-PQ2_0.gguf      # -> models/bons/bonsai-8b-n16.img
+    trixium verify    models/bons/bonsai-1p7b-n16.img
+    trixium tokenizer models/1.7b/tokenizer.json                 # -> models/1.7b/tokenizer.bin
+    trixium deploy    xcu1525 [--board xcu1525|fk33]              # bitstream + boot
+    trixium chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
+    trixium console   "stats" "bench 64"                         # raw firmware commands
 
-`deploy` drives the lab board from the workstation (tools/fk33_bringup.sh with
+`deploy` drives the lab board from the workstation (tools/<board>_bringup.sh with
 tools/board.env); `chat` and `console` run where the card's /dev/ttyLXU0 is.
 """
 
@@ -59,7 +59,7 @@ def cmd_tokenizer(a):
 
 
 def cmd_deploy(a):
-    sys.exit(_run([os.path.join(REPO, "tools", "fk33_bringup.sh"), a.build]))
+    sys.exit(_run([os.path.join(REPO, "tools", f"{a.board}_bringup.sh"), a.build]))
 
 
 def cmd_chat(a):
@@ -132,7 +132,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_tokenizer)
 
     p = sub.add_parser("deploy", help="configure the lab board with a build and boot it (tools/board.env)")
-    p.add_argument("build", nargs="?", default="n16_212_v15b", help="build/<name> (default n16_212_v15b)")
+    p.add_argument("build", nargs="?", default="xcu1525", help="build/<name> (default xcu1525)")
+    p.add_argument("--board", default="xcu1525", choices=["xcu1525", "fk33"])
     p.set_defaults(fn=cmd_deploy)
 
     p = sub.add_parser("chat", help="chat REPL on the machine with the card")
