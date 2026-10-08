@@ -1964,7 +1964,7 @@ static void ffn_tok(int l, uint64_t t0)
             int e8c = rotate_quantize_legacy(hb, n_embd);
             matvec_q(model_entry(ROLE_FFN_GATE, l), e8c, gateb);
             matvec_q(model_entry(ROLE_FFN_UP, l), e8c, upb);
-            silu_mul_fv(gateb, upb, actb, ffn_dim);
+            silu_mul_fv(actb, upb, gateb, ffn_dim);
             proj_f(down, actb, tmp_h);
         }
         hyb_cyc_fdown += perf_now64() - t0;
