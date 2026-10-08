@@ -101,11 +101,10 @@ SECTIONS
 }
 
 /* The stack lives at the top of sram and takes whatever .data/.bss leave it. That number
- * MUST stay >= ~4 KB: at 1 KB deep call paths overflowed into .bss and the firmware died by
- * silent corruption at a location that moved with every relink. The fix is keeping large
- * arrays OUT of .bss (they live in the main_ram static window instead - grep ECACHE_BASE),
- * NOT moving the stack to main_ram: on the card main_ram is the HBM channel-0 window, and
- * the one firmware built with its stack there coincided with back-to-back host crashes.
+ * MUST stay >= ~4 KB: deep call paths overflow into .bss and corrupt it silently, at a
+ * location that moves with every relink. Keep large arrays OUT of .bss (they live in the
+ * main_ram static window instead - see static_memory.h), rather than moving the stack to
+ * main_ram (on the FK33, main_ram is the HBM channel-0 window).
  * Check after adding statics:  riscv64-unknown-elf-nm trixium.elf | grep -E "_ebss|_fstack" */
 PROVIDE(_fstack = ORIGIN(sram) + LENGTH(sram));
 ASSERT(_fstack - _ebss >= 4096, "firmware must leave at least 4 KiB of SRAM for stack")

@@ -1,4 +1,8 @@
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
+//
 // Independent native binary32 cast and multiply, not RTL significand shifts.
 #include "Vprojection_restore.h"
 #include "verilated.h"

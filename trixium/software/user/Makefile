@@ -48,5 +48,5 @@ BUILD_KEY := $(abspath $(BUILD_DIR))|$(CC)|$(CFLAGS)|$(LDFLAGS)
 ifneq ($(strip $(file <$(BUILD_STAMP))),$(strip $(BUILD_KEY)))
 $(file >$(BUILD_STAMP),$(BUILD_KEY))
 endif
-$(PROGS:%=%.o) trixium_loader.o caps_parser.o region_upload.o region_read.o \
+$(PROGS:%=%.o) trixium_loader.o \
 liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash.o liblitepcie/litepcie_helpers.o: $(BUILD_STAMP)

@@ -1,4 +1,8 @@
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
+//
 // Ready-to-ready timing, kept independent of the clock/console for native tests.
 #ifndef TRIXIUM_BENCH_H
 #define TRIXIUM_BENCH_H

@@ -10,8 +10,8 @@
 int  hybrid_present(void);                  // The loaded image is a hybrid (BONS v3 fields).
 int  hybrid_init(void);                     // After the header checks; 0 on success.
 void hybrid_reset(void);                    // New generation: states and position to zero.
-void hybrid_stats_reset(void);              // Reset exact-recurrence stage cycle counters.
-void hybrid_stats_print(void);              // Print averages when the recurrence HW is active.
+void hybrid_stats_reset(void);              // Reset the per-stage cycle counters.
+void hybrid_stats_print(void);              // Print the per-stage averages (hybprof).
 void hybrid_dnres_enable(int on);             // Console `dnres`: the resident DeltaNet layer.
 int  hybrid_dnres_enabled(void);
 void hybrid_dnstream_enable(int on);          // Console `dnstream`: op 5 heads (at next reset).

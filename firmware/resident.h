@@ -12,7 +12,7 @@
 // int32->FP32 then a power-of-two scale), so the typed-checkpoint gate must stay 87/87.
 //
 // Needs a bitstream with TRIXIUM_HAS_HADAMARD, TRIXIUM_HAS_ACTIVATION_QUANTIZE (ABI 1.1) and
-// TRIXIUM_HAS_PROJECTION_RESTORE (v11+). On any other bitstream resident_available() is 0
+// TRIXIUM_HAS_PROJECTION_RESTORE. On any other bitstream resident_available() is 0
 // and hybrid.c keeps its existing path; a failed list disables the path for the session
 // after an engine soft reset (the weights stay).
 #ifndef RESIDENT_H
@@ -62,8 +62,8 @@ void rl_fetch(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store(void *dst, uint32_t bytes, uint32_t sp);
 // No cache maintenance, for main-RAM spans the CPU holds no dirty line of (constants cleaned
 // once, device-owned buffers): rl_fetch cleans its source and rl_store flushes and then
-// invalidates its destination, ~5 cycles per line - the DeltaNet conv's 320 KB per layer
-// cost 1.5M cycles per 27B forward (v17 board, 2026-09-25).
+// invalidates its destination, ~5 cycles per line (the DeltaNet conv's 320 KB per layer
+// cost 1.5M cycles per 27B forward that way).
 void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp);
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);

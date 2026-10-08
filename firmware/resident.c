@@ -813,9 +813,8 @@ int resident_silu_init(const float *lut, uint32_t *stage)
     // The table image the unit loads: lut[0..4096] (lut[4096] alone in beat 512) and the
     // interpolation slopes lut[i+1] - lut[i], one FP32 subtraction each - exactly what
     // trixium_silu_lookup computes per element. Built in main RAM and DMA-fetched into RS_F
-    // in the same list as the LOAD, like every other bulk transfer, then read back: a bad
-    // image is reported as such instead of as self-test mismatches. (v13's 82 self-test
-    // mismatches were the kernel tables exported over the CSR bus - see silu_mul.py.)
+    // in the same list as the LOAD, like every other bulk transfer (not over the CSR bus),
+    // then read back: a bad image is reported as such instead of as self-test mismatches.
     union { float f; uint32_t u; } v;
     for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++) stage[i] = 0;
     for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) { v.f = lut[i]; stage[i] = v.u; }
@@ -978,8 +977,8 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     desc_words(n++, &d);
     // act != NULL: the activation also goes to main RAM (the traces, and a caller that wants
     // the CPU fallback's input); fixup lanes are patched in both copies below. NULL: it
-    // stays in RS_F only - the store (70 KB: a cache flush and invalidate plus the DMA) was
-    // ~13k cycles per 27B layer on v17.
+    // stays in RS_F only - the store (70 KB: a cache flush and invalidate plus the DMA) costs
+    // ~13k cycles per 27B layer.
     if (act)
         store_out(&n, act, rows, RS_F);
     seq_desc_stop(n++);

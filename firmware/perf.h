@@ -39,7 +39,7 @@ void     perf_exit(enum perf_op op);
 void     perf_print(void); // Dump per-op {calls, cycles} table + engine counters.
 void     perf_print_u64(uint64_t v); // LiteX printf does not implement %llu.
 void     perf_print_overlap(void);
-void     perf_ovl_mark(void);               // C2-1a: overlap-window start.
+void     perf_ovl_mark(void);               // Overlap-window start.
 void     perf_ovl_acc(uint64_t acc[4]);     // Zero-init; acc[0] == UINT64_MAX means invalid.
 void     perf_ovl_report(const char *tag, const uint64_t acc[4]);
 

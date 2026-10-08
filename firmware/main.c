@@ -3,9 +3,9 @@
 // Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
 //
-// TriXium firmware: console shell + engine self-tests (token loop lands with the
-// vector unit). At boot, runs the self-test sequence (deterministic checksums that the
-// simulation harness verifies), then drops to the shell.
+// TriXium firmware: console shell, self-tests and the inference entry points. At boot, runs
+// the self-test sequence (deterministic checksums that the simulation harness verifies),
+// then drops to the shell.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -145,31 +145,36 @@ static int  parse_int(const char *s);
 static void help(void)
 {
     puts("TriXium firmware");
-    puts("help            - this message");
-    puts("info            - model info (BONS header)");
-    puts("hdrload         - copy BONS header+table staged by trixium_load to CPU memory");
-    puts("sptest          - scratchpad bus read/write test");
+    puts("Inference:");
+    puts("  info              - model info (BONS header)");
+    puts("  hdrload           - copy the BONS header+table staged by trixium_load to CPU memory");
+    puts("  tokclr/tok/genb   - chunked prompt buffer + generate [stop ids] (host chat tools)");
+    puts("  gen n id id ...   - generate n tokens from prompt ids");
+    puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
+    puts("  bench [n]         - profiled generation benchmark (default 4 tokens)");
+    puts("Hardware vs CPU reference (default: the hardware path where the bitstream has it):");
+    puts("  hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
+    puts("  seq resident silu dnres dnstream attnstream hwargmax [on|off]");
+    puts("                    - unit or list path vs its CPU reference (prints the state)");
+    puts("  lmchunk rows      - LM head list chunk cap in rows (0 = automatic)");
+    puts("  attnchunk n       - cap the heads per attention list");
+    puts("Diagnostics:");
+    puts("  stats [reset]     - per-op cycle profile");
+    puts("  fprof on|off|print, tprof arm [n]|dump, engdiag on|off");
+    puts("                    - FFN windows, token timeline, per-op engine stall snapshots");
+    puts("  dbg [n]           - checksum the next n forwards' intermediates (vs the Python mirror)");
+    puts("  selftest          - engine self-tests (matvec + fetch checksums)");
+    puts("  sptest            - scratchpad bus read/write test");
+    puts("  peek c addr       - dump one weight-memory beat of channel c via the engine (hex addr)");
+    puts("  mvtest role [layer] - matvec one tensor with the test pattern, print checksum");
+    puts("  mvbw role [layer] [reps] - engine streaming efficiency on one tensor");
 #ifdef TRIXIUM_N_MEMCTRL
-    puts("ddrinit [k]     - re-init DDR4 controller k (default: 1..N-1, as at boot)");
-    puts("ddrtest [c]     - engine store/fetch round trip through channel c's window (all)");
+    puts("  ddrinit [k]       - re-init DDR4 controller k (default: 1..N-1, as at boot)");
+    puts("  ddrtest [c]       - engine store/fetch round trip through channel c's window (all)");
 #endif
-    puts("peek c addr     - dump one HBM beat via the engine (hex addr)");
-    puts("mvtest idx      - matvec tensor <idx> with the test pattern, print checksum");
-    puts("selftest        - engine self-tests (matvec + fetch checksums)");
-    puts("seq [on|off]    - sequencer attention lists (on by default; off: CPU-dispatched)");
-    puts("tokclr/tok/genb - chunked prompt buffer + generate [stop ids] (host chat tools)");
-    puts("gen n id id ... - generate n tokens (greedy) from prompt ids");
-    puts("hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
-    puts("stats [reset]   - per-op cycle profile");
-    puts("bench [n]       - profiled generation benchmark (default 4 tokens)");
-    puts("sample T P R [S] - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
-    puts("engreset        - soft reset of the engine cluster (automatic after a stall)");
-    puts("wedge           - stall the engine on purpose, recover, rerun the self-test");
-    puts("dbg [n]         - checksum the next n forwards' intermediates (vs the Python mirror)");
-    puts("Hardware/reference toggles (`name on|off`, each printing its state): the unit");
-    puts("or list path (default where the bitstream has it) vs its CPU reference:");
-    puts("  resident silu dnres dnstream attnstream hwargmax (and seq above)");
-    puts("  fprof tprof engdiag - profiling: FFN windows, token timeline, engine diagnostics");
+    puts("  engreset          - soft reset of the engine cluster (automatic after a stall)");
+    puts("  wedge             - stall the engine on purpose, recover, rerun the self-test");
+    puts("  help              - this message");
 }
 
 static void hwops_cmd(char *args)
@@ -244,8 +249,8 @@ static void bench_cmd(char *args)
                (unsigned long)((((uint64_t)CONFIG_CLOCK_FREQUENCY*count*1000)/dt) % 1000),
                (unsigned long)(CONFIG_CLOCK_FREQUENCY/1000000));
     }
-    // Per FORWARD: the comparable figure across the 2026-09-07 change that stopped
-    // running the unused final forward (bench 64 = 3 prompt + 63 = 66 forwards, was 67).
+    // Per FORWARD: the figure that stays comparable across prompt and token counts
+    // (bench 64 = 3 prompt + 63 = 66 forwards: the last token needs no forward).
     if (fwd > 0) {
         printf(", %lu forwards, ", (unsigned long)fwd);
         perf_print_u64(dt/fwd);
@@ -295,12 +300,10 @@ static void emit_token(int tok)
 // trixium_load) into the CPU-visible header location, then re-init inference.
 #define HDR_STAGING (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
 // The staged copy (channel 0, uploaded with every image by trixium_load) is the truth about
-// what is in HBM; the main_ram copy is derived from it. The boot used to trust main_ram: a
-// CPU reset after `trixium_load` of a DIFFERENT model then ran the boot demo with the
-// previous model's tables - the 1.7B's KV addresses, which on the 8B point into layer 18's
-// weights - and the two demo tokens overwrote them (2026-09-18: mvtest of blk.18.attn_v
-// wrong until re-uploaded, the corruption starting exactly at the 1.7B's kv_base). Now the
-// boot refreshes main_ram from the staged header when the two differ.
+// what is in HBM; the main_ram copy is derived from it. Trusting main_ram after a CPU reset
+// that followed the upload of a DIFFERENT model would run the boot demo with the previous
+// model's tables (its KV addresses point into the new model's weights, and the demo tokens
+// overwrite them), so the boot refreshes main_ram from the staged header when they differ.
 static int hdrload_staged(int quiet)
 {
     // First fetch just the header to learn the table size.
@@ -313,9 +316,8 @@ static int hdrload_staged(int quiet)
                    (unsigned long)sh->magic);
         // Staging cleared by the host (trixium_chat -C writes this marker before a board
         // boot): a header left in main_ram by an earlier session describes weights that are
-        // not there - the boot demo then streamed them from controllers not yet trained and
-        // the engine stalled (v22 restore, 2026-10-02). The simulation stages nothing and
-        // keeps the header it preloaded into main_ram.
+        // not there, and the boot demo would stream them from controllers not yet trained.
+        // The simulation stages nothing and keeps the header it preloaded into main_ram.
         struct bons_header *mh = (struct bons_header *)TRIXIUM_HDR_ADDR;
         if (sh->magic == BONS_STAGING_CLEARED && mh->magic == BONS_MAGIC) {
             mh->magic = 0;
@@ -384,9 +386,8 @@ static void peek_cmd(char *str)
 }
 
 // Matvec one tensor (by role and layer) with the deterministic x pattern and report its
-// checksum. selftest only ever covered blk.0.attn_q; the 1.7B model has several other shapes
-// - cols 6144 for ffn_down, rows 1024 for attn_k/v, the tied LM head - and none of them had
-// been checked on silicon, while the sim token gate runs the tiny model's small dimensions.
+// checksum. selftest only covers blk.0.attn_q; the real models have other shapes (cols 6144
+// for ffn_down, rows 1024 for attn_k/v, the tied LM head) that the tiny sim model lacks.
 //   mvtest <role> <layer>      roles: 4 attn_q  5 attn_k  6 attn_v  7 attn_out
 //                                    11 ffn_gate 12 ffn_up 13 ffn_down  2 lm_head
 static void mvtest_cmd(char *str)
@@ -784,14 +785,11 @@ int main(void)
     model_info();
     sptest();
     { // Vec unit smoke test: quant8 of a known ramp via the CSR dispatch path. Catches
-      // emission-level datapath breaks that Migen-sim unit tests cannot see (the VCLAMP8
-      // unsigned-literal emission bug shipped through six token-gated milestones).
+      // emission-level datapath breaks that Migen-sim unit tests cannot see.
         volatile int16_t *pi = (volatile int16_t *)(SCRATCHPAD_BASE + 0x100);
         volatile int8_t  *po = (volatile int8_t  *)(SCRATCHPAD_BASE + 0x200);
-        // TWO beats: quant8 is x2-unrolled (asm.py, 2026-08-31) and processes beats in
-        // pairs, so a 1-beat call also read 0x120-0x13F - zero after a reconfigure, the
-        // previous session's data after a warm boot, which failed this test on every
-        // serialboot after inference had run (found 2026-09-09; tokens never affected).
+        // TWO beats: quant8 is x2-unrolled (asm.py) and processes beats in pairs, so a
+        // 1-beat call would also read 0x120-0x13F - whatever a previous session left there.
         for (int i = 0; i < 32; i++) pi[i] = (int16_t)((i & 15)*1000 - 8000);
         for (int i = 0; i < 32; i++) po[i] = 0x5A;
         int32_t va[4] = {0x100, 1, 0x200, 2}; // A1 = 1: measured shift.
@@ -820,9 +818,8 @@ int main(void)
                 sp32b[i] = seed;
             }
             // `dst` is explicit because it is not always A2: rope takes A2 as its *cos
-            // table* and writes via A5/A6, so checksumming A2 was reading an input, and
-            // clearing it corrupted the table - which also broke reduce, whose A1 source is
-            // that same region.
+            // table* and writes via A5/A6; clearing A2 would corrupt that table (and reduce's
+            // A1 source, the same region).
             struct { const char *name; uint16_t pc; int32_t a[8]; int na; uint32_t dst; }
             progs[] = {
                 {"quant8",   PROG_QUANT8,   {0x8000, 1, 0xA000, 8}, 4, 0xA000},  // A1 = 1.
@@ -841,9 +838,8 @@ int main(void)
                 volatile uint32_t *dst = (volatile uint32_t *)(SCRATCHPAD_BASE
                                           + progs[pi2].dst);
                 // Clear the CRC window first. Programs write less than 128 words, so
-                // otherwise the checksum folds in whatever was left in the scratchpad -
-                // deterministic in a fresh sim, but history-dependent on a card that has
-                // run before, which made the hardware CRCs incomparable to the interpreter.
+                // otherwise the checksum folds in whatever was left in the scratchpad
+                // (history-dependent on a card, incomparable to the interpreter).
                 for (int i = 0; i < 128; i++)
                     dst[i] = 0;
                 uint64_t r6 = vec_run(progs[pi2].pc, progs[pi2].a, progs[pi2].na);
@@ -861,17 +857,16 @@ int main(void)
         // Boot generation demo (deterministic; checked by the sim harness).
         static const int prompt[3] = {1, 2, 3};
         // The legs that only exist for the gate are skipped on big models: on the 1.7B
-        // the all-CPU reference alone is 3.2 G cycles - 15 s of what was a 16 s boot -
-        // and the tiny sim model (2 layers) still runs every leg. GEN-HW stays: two
-        // tokens through the hardware path cost 35 ms and prove the units are alive.
+        // the all-CPU reference alone is 3.2 G cycles (~15 s), and the tiny sim model still
+        // runs every leg. GEN-HW stays: two tokens through the hardware path cost 35 ms and
+        // prove the units are alive.
         const int big_model = model_header()->n_layer > 8;
         if (!big_model) {
-            // Harness hook for the simulation tools (sim_resident_gate/bench): they need only
-            // the console, and on the 1k tiny model the legs cost tens of minutes of
-            // Verilator time. Offer the skip here, after the firmware is running - an early
-            // key would reach the LiteX BIOS, where Q aborts the boot. Only tiny models get
-            // here; 2 M cycles is ~30 s of simulation wall time and 13 ms on a board. With
-            // no key, or any other key, the legs run exactly as before.
+            // Harness hook for the simulation tools that need only the console: on the 1k
+            // tiny model the legs cost tens of minutes of Verilator time. Offered here, after
+            // the firmware is running (an early key would reach the LiteX BIOS, where Q aborts
+            // the boot); 2 M cycles is ~30 s of simulation and 13 ms on a board. With no key,
+            // or any other key, the legs run.
             puts("BOOT-LEGS (q to skip)");
             uint64_t t_wait = perf_now64();
             while (perf_now64() - t_wait < 2000000u) {

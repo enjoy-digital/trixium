@@ -1,4 +1,8 @@
+// This file is part of TriXium.
+//
+// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 // SPDX-License-Identifier: BSD-2-Clause
+
 #include "Vbf16_resident.h"
 #include "verilated.h"
 #include <cstdint>

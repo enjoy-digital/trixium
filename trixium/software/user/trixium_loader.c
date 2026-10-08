@@ -1,4 +1,10 @@
-/* Host-side HBM loader (see trixium_loader.h). */
+/* This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Host-side weight loader (see trixium_loader.h).
+ */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,7 +23,7 @@
 #include "csr.h"
 #include "mem.h"
 #ifndef TRIXIUM_CHAN_WEIGHT_BASE
-#error "SoC headers lack TRIXIUM_CHAN_WEIGHT_BASE (build with variant b)"
+#error "SoC headers lack TRIXIUM_CHAN_WEIGHT_BASE (not a TriXium build?)"
 #endif
 #define HDR_STAGING (TRIXIUM_CHAN_WEIGHT_BASE - 0x100000)
 
@@ -25,12 +31,11 @@
  * (add_usphbm2_pseudochannels -> AXILiteOffset(offset=0)), so main_ram is HBM global address
  * MAIN_RAM_BASE = 0x4000_0000 (pseudo-channel 4), and the loader's own port reaches it
  * because the HBM AXI switch routes by address, not by port (layout.py, "port-matched
- * addressing"). Read back through the BIOS to confirm on 2026-09-11: address 0 was not it. */
+ * addressing"). */
 /* Where the firmware goes: the ENGINE-side address of main_ram's origin. On the FK33 the CPU
  * window passes through 1:1 (HBM address = CPU address); on the XCU1525 main_ram is
- * controller 0's local address 0 and the SoC exports it (TRIXIUM_MEM_CPU_OFFSET = 0) - the
- * first XCU1525 boot put the firmware at DRAM 0x40000000, in channel 1's window, and the BIOS
- * jumped into the memtest's leftovers (2026-09-19). */
+ * controller 0's local address 0 and the SoC exports it (TRIXIUM_MEM_CPU_OFFSET = 0) - DRAM
+ * 0x40000000 there is in channel 1's window. */
 #ifdef TRIXIUM_MEM_CPU_OFFSET
 #define FW_HBM_ADDR ((uint32_t)TRIXIUM_MEM_CPU_OFFSET)
 #else
@@ -111,8 +116,8 @@ static void loader_wait(int chan, uint32_t base, uint64_t beats)
 
 static void loader_transfer_one(int chan, uint32_t base, const uint8_t *data, uint64_t beats);
 
-/* The gateware loader counts a transfer in 24 bits of beats (512 MB); the 27B's 641 MB
- * channel payloads wrapped it and the host spun forever on a full FIFO (2026-09-19).
+/* The gateware loader counts a transfer in 24 bits of beats (512 MB), less than the 27B's
+ * 641 MB channel payloads (a wrapped count leaves the host spinning on a full FIFO).
  * Chunk at 128 MB; each chunk is its own armed transfer at the advanced base. */
 void loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t beats)
 {
