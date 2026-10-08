@@ -25,8 +25,8 @@ from litex.soc.interconnect.csr import *
 
 class EngineCSR(LiteXModule):
     def __init__(self, engine, seq=None):
-        self.kind    = CSRStorage(3,  description=
-            "Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
+        # Op.
+        self.kind    = CSRStorage(3,  description="Op kind: 0 ternary, 1 q8, 2 fetch, 3 store, 4 axpy.")
         self.rows    = CSRStorage(16, description="Rows per channel.")
         self.cols    = CSRStorage(14, description="Columns (K).")
         self.wbase   = CSRStorage(32, description="Per-channel weight byte address.")
@@ -40,41 +40,41 @@ class EngineCSR(LiteXModule):
         self.chan    = CSRStorage(5,  description="Fetch source / store destination channel.")
         self.rem     = CSRStorage(5,  description="Channels < rem stream one extra row.")
         self.ilv     = CSRStorage(1,  description="Interleaved (position-major) gather.")
-        self.supw    = CSRStorage(1,  description=
-            "Suppress scratchpad result writes (argmax-only ops).")
+        self.supw    = CSRStorage(1,  description="Suppress scratchpad result writes (argmax-only ops).")
         self.qn      = CSRStorage(1,  description="Dual-Q GQA mode (2 heads per K/V stream).")
         self.xred    = CSRStorage(1,  description="AXPY: sum the per-channel partials in hardware.")
         self.qstride = CSRStorage(16, description="Head-B result offset in words.")
         self.rshift2 = CSRStorage(6,  description="Head-B AXPY pre-shift.")
         self.rep     = CSRStorage(5,  description="STORE: packets per op (0/1 = one).")
-        self.dstride = CSRStorage(24, description="STORE: HBM beats between packets.")
+        self.dstride = CSRStorage(24, description="STORE: memory beats between packets.")
         self.sstride = CSRStorage(8,  description="STORE: scratchpad beats between source slots.")
         self.submit  = CSRStorage(1,  description="Write 1 to submit the op.")
+
+        # Soft reset.
         self.soft_reset = CSRStorage(1, description="Write 1: reset the engine, loader, sequencer "
-                                        "and vector unit (their HBM ports drain cleanly).")
+                                                    "and vector unit (their memory ports drain cleanly).")
         self.rst_status = CSRStatus(fields=[
             CSRField("busy",  size=1, description="Reset or port drain in progress: wait."),
             CSRField("stuck", size=1, description="A port did not drain (burst never answered): "
                                                   "reconfigure the FPGA."),
         ])
-        self.rst_trigger = Signal()   # -> the reset domain
-        self.rst_busy    = Signal()   # <- the reset domain
-        self.rst_stuck   = Signal()
-        self.status  = CSRStatus(fields=[
-            CSRField("busy",     size=1),
-            CSRField("error",    size=1, description="Sticky reserved-code error."),
-            CSRField("pending",  size=1, description="Submitted op not yet accepted."),
+        self.rst_trigger = Signal() # To the reset domain.
+        self.rst_busy    = Signal() # From the reset domain.
+        self.rst_stuck   = Signal() # From the reset domain.
+
+        # Status.
+        self.status = CSRStatus(fields=[
+            CSRField("busy",     size=1,             description="Op in progress."),
+            CSRField("error",    size=1,             description="Sticky reserved-code error."),
+            CSRField("pending",  size=1,             description="Submitted op not yet accepted."),
             # FSM state bits: a wedged op says where it is wedged (loader not taking the
             # command, scratchpad not delivering beats, B responses never coming).
-            CSRField("st_cmd",   size=1, offset=4,
-                description="STORE: loader has not taken the command."),
-            CSRField("st_run",   size=1, offset=5,
-                description="STORE: streaming beats from the scratchpad."),
-            CSRField("st_drain", size=1, offset=6,
-                description="STORE: waiting for the writer's B responses."),
-            CSRField("fill",     size=1, offset=7, description="Broadcasting x into the pipes."),
-            CSRField("run",      size=1, offset=8, description="Streaming weights."),
-            CSRField("sp_grant", size=1, offset=9, description="Engine holds the scratchpad."),
+            CSRField("st_cmd",   size=1, offset=4,  description="STORE: loader has not taken the command."),
+            CSRField("st_run",   size=1, offset=5,  description="STORE: streaming beats from the scratchpad."),
+            CSRField("st_drain", size=1, offset=6,  description="STORE: waiting for the writer's B responses."),
+            CSRField("fill",     size=1, offset=7,  description="Broadcasting x into the pipes."),
+            CSRField("run",      size=1, offset=8,  description="Streaming weights."),
+            CSRField("sp_grant", size=1, offset=9,  description="Engine holds the scratchpad."),
             CSRField("st_busy",  size=1, offset=10, description="Loader is running our store."),
             CSRField("vec_busy", size=1, offset=11, description="Vector unit busy."),
         ])
@@ -83,14 +83,14 @@ class EngineCSR(LiteXModule):
         self.argmax_val = CSRStatus(32, description="Max signed result of the last matvec.")
         self.argmax_idx = CSRStatus(24, description="Global row index of argmax (ties: smallest).")
 
-        # Perf counters, muxed by perf_chan.
-        self.perf_chan  = CSRStorage(5)
+        # Per-reader perf counters, muxed by perf_chan.
+        self.perf_chan  = CSRStorage(5,  description="Reader selected for the perf_* counters.")
         self.perf_beats = CSRStatus(32, description="Beats delivered by selected reader.")
         self.perf_ar    = CSRStatus(32, description="AR stall cycles of selected reader.")
         self.perf_r     = CSRStatus(32, description="R stall cycles of selected reader.")
 
-        # Free-running low-word counters (neither-busy time includes CPU arithmetic, not
-        # just dispatch).
+        # Free-running overlap counters, low words (neither-busy time includes CPU arithmetic,
+        # not just dispatch).
         self.cyc_total  = CSRStatus(32, description="Free-running cycles.")
         self.cyc_eng    = CSRStatus(32, description="Cycles with the engine busy.")
         self.cyc_vec    = CSRStatus(32, description="Cycles with the vector unit busy.")
@@ -98,13 +98,15 @@ class EngineCSR(LiteXModule):
 
         # 64-bit snapshot: one strobe freezes all counters on the same edge (a 64-bit CSR
         # read takes several bus transactions on RV32). Stable until the next snapshot.
-        self.perf_snapshot = CSRStorage(1, description=
-            "Write 1: atomically latch 64-bit overlap counters.")
+        self.perf_snapshot = CSRStorage(1,  description="Write 1: atomically latch 64-bit overlap counters.")
         self.snap_total    = CSRStatus(64, description="Snapshot: total cycles.")
         self.snap_eng      = CSRStatus(64, description="Snapshot: engine-busy cycles.")
-        self.snap_vec      = CSRStatus(64, description=
-            "Snapshot: vector/DeltaNet-client busy cycles.")
+        self.snap_vec      = CSRStatus(64, description="Snapshot: vector/DeltaNet-client busy cycles.")
         self.snap_both     = CSRStatus(64, description="Snapshot: both clients busy.")
+
+        # # #
+
+        # Overlap counters snapshot.
         self.sync += If(self.perf_snapshot.re & self.perf_snapshot.storage,
             self.snap_total.status.eq(engine.cyc_total),
             self.snap_eng.status.eq(engine.cyc_eng),
@@ -112,12 +114,11 @@ class EngineCSR(LiteXModule):
             self.snap_both.status.eq(engine.cyc_both),
         )
 
-        # # #
-
-        pending = Signal()
+        # Op submission: an idle engine accepts the command on the submit cycle itself (accept
+        # beats submit); latching pending anyway would replay the op (resetting the absmax
+        # tracker).
+        pending        = Signal()
         manual_request = self.submit.re & self.submit.storage
-        # Accept beats submit: an idle engine accepts the command on the submit cycle itself;
-        # latching pending anyway would replay the op (resetting the absmax tracker).
         self.comb += [
             self.rst_trigger.eq(self.soft_reset.re & self.soft_reset.storage),
             self.rst_status.fields.busy.eq(self.rst_busy),
@@ -135,8 +136,8 @@ class EngineCSR(LiteXModule):
                 self.done_count.status.eq(self.done_count.status + 1),
             ),
         ]
-        # `submit.re` fires on CSR write; latched as cmd.valid until accepted. While the
-        # sequencer runs it owns the command interface (firmware never mixes the two).
+        # Command mux: `submit.re` fires on CSR write and is latched as cmd.valid until accepted.
+        # While the sequencer runs it owns the command interface (firmware never mixes the two).
         seq_own = Signal()
         if seq is not None:
             self.comb += [
@@ -215,6 +216,7 @@ class EngineCSR(LiteXModule):
             self.argmax_idx.status.eq(engine.argmax_idx),
         ]
 
+        # Perf counters.
         beats = Array([r.total_beats for r in engine.readers])
         ars   = Array([r.ar_stalls   for r in engine.readers])
         rs    = Array([r.r_stalls    for r in engine.readers])

@@ -34,9 +34,9 @@ csr.h / csr.csv say).
 """
 
 import math
-from functools import reduce
-from operator import or_
 from types import SimpleNamespace
+from operator import or_
+from functools import reduce
 
 from migen import *
 from migen.fhdl.simplify import FullMemoryWE
@@ -53,7 +53,6 @@ from litedram.frontend.wishbone import LiteDRAMWishbone2Native
 
 from trixium.memory.axi import AXIWide
 
-
 # AXI Crossing -------------------------------------------------------------------------------------
 
 class AXICrossing(LiteXModule):
@@ -66,26 +65,31 @@ class AXICrossing(LiteXModule):
     data once the ddr clock outruns sys. The AXI R channel has a ready; the bridge then sits
     in the ddr domain on a native port with no CDC at all."""
     def __init__(self, master, slave, cd_from, cd_to, depth=16):
+        # # #
+
         for ch, a, b in (("aw", cd_from, cd_to), ("w", cd_from, cd_to), ("ar", cd_from, cd_to),
                          ("b", cd_to, cd_from), ("r", cd_to, cd_from)):
             src, dst = (master, slave) if a == cd_from else (slave, master)
             cdc = stream.ClockDomainCrossing(getattr(src, ch).description, a, b,
                                              depth=depth, buffered=True)
             self.add_module(f"{ch}_cdc", cdc)
-            self.comb += [getattr(src, ch).connect(cdc.sink),
-                          cdc.source.connect(getattr(dst, ch))]
-
+            self.comb += [
+                getattr(src, ch).connect(cdc.sink),
+                cdc.source.connect(getattr(dst, ch)),
+            ]
 
 # Engine DDR Port ----------------------------------------------------------------------------------
 
 def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
                     r_buffer_depth=256, clock_domain="sys"):
-    """Returns the list of modules (to register as submodules) that connect `axi` (the
-    engine channel's 256-bit AXI) to a crossbar port of `core` of `port_width` bits.
-    merge: on a wider port, merge the read bursts two beats per word (AXIWide)
-    instead of one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic).
-    clock_domain: the port's side when the controller runs in its own domain (the crossbar
-    inserts the native-port CDC; see the XCU1525 target's --ddr-clk-freq)."""
+    """Return the modules (to register as submodules) that connect `axi` (the engine channel's
+    256-bit AXI) to a `port_width`-bit crossbar port of `core`.
+
+    merge:        on a wider port, merge the read bursts two beats per word (AXIWide) instead of
+                  one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic).
+    clock_domain: the port's side when the controller runs in its own `ddr` domain (the AXI
+                  then crosses with AXICrossing; see the XCU1525 target's --ddr-clk-freq).
+    """
     split = clock_domain != "sys"
     # Split: a native port on the controller's own side (the core renames its sys to ddr),
     # the bridge there too, and the AXI crossing into it (AXICrossing).
@@ -109,10 +113,9 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
     mods.append(ClockDomainsRenamer("ddr")(bridge) if split else bridge)
     return mods
 
-
 # DDR CSR ------------------------------------------------------------------------------------------
 
-class PipelinedDDRCSR(Module):
+class PipelinedDDRCSR(LiteXModule):
     """Wishbone -> the ddr-domain CSR banks, one registered bus copy per controller.
 
     A shared CSR bus decoded straight into the PHYs' IDELAY/ODELAY CE pins of four
@@ -121,9 +124,14 @@ class PipelinedDDRCSR(Module):
     every hop is one register to the next: an access takes 4 cycles instead of 2 (the
     controllers' CSRs are only touched by calibration and the BIOS)."""
     def __init__(self, wb, groups, address_width, data_width):
+        assert wb.data_width == data_width and wb.addressing == "word"
+
+        # # #
+
+        # Registered request, one copy per controller group; registered read data back.
         adr, dat_w = Signal(address_width), Signal(data_width)
-        we, re = Signal(), Signal()
-        rdats = []
+        we, re     = Signal(), Signal()
+        rdats      = []
         for buses in groups:
             s = csr_bus.Interface(address_width=address_width, data_width=data_width)
             rd = Signal(data_width)
@@ -134,38 +142,53 @@ class PipelinedDDRCSR(Module):
             rdats.append(rd)
         rdat = Signal(data_width)
         self.comb += rdat.eq(reduce(or_, rdats))
-        assert wb.data_width == data_width and wb.addressing == "word"
-        self.submodules.fsm = fsm = FSM(reset_state="IDLE")
+
+        # Wishbone FSM: request, 3 cycles of pipeline, ack with the registered read data.
+        self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(wb.cyc & wb.stb,
-                NextValue(adr, wb.adr),
+                NextValue(adr,   wb.adr),
                 NextValue(dat_w, wb.dat_w),
-                NextValue(we, wb.we & (wb.sel != 0)),
-                NextValue(re, ~wb.we & (wb.sel != 0)),
-                NextState("S0")))
-        fsm.act("S0", NextValue(we, 0), NextValue(re, 0), NextState("S1"))
-        fsm.act("S1", NextState("S2"))
-        fsm.act("S2", NextState("ACK"))
-        fsm.act("ACK", wb.ack.eq(1), wb.dat_r.eq(rdat), NextState("IDLE"))
-
+                NextValue(we,    wb.we  & (wb.sel != 0)),
+                NextValue(re,    ~wb.we & (wb.sel != 0)),
+                NextState("S0"),
+            )
+        )
+        fsm.act("S0",
+            NextValue(we, 0),
+            NextValue(re, 0),
+            NextState("S1"),
+        )
+        fsm.act("S1",
+            NextState("S2"),
+        )
+        fsm.act("S2",
+            NextState("ACK"),
+        )
+        fsm.act("ACK",
+            wb.ack.eq(1),
+            wb.dat_r.eq(rdat),
+            NextState("IDLE"),
+        )
 
 class _DDRCSRHolder(Module):
     """A plain Module: the SoC's CSR scan does not look inside it, the ddr-domain
     CSRBankArray does (its attributes sdram, ddrphy, sdram1, ... are the bank names)."""
 
-
 # DDR Domain Controllers ---------------------------------------------------------------------------
 
 def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_size,
                                csr_window, phy_renames={"sys": "ddr"}):
-    """phys/modules: one per controller (controller 0 carries main_ram). Fills soc.sdrams;
-    returns the per-controller memory sizes."""
-    n = len(phys)
-    holder = _DDRCSRHolder()
+    """Add one LiteDRAM controller per phy/module in the `ddr` domain (controller 0 carries
+    main_ram). Fills soc.sdrams; returns the per-controller memory sizes."""
+    n            = len(phys)
+    holder       = _DDRCSRHolder()
     memory_sizes = []
+
+    # Controllers.
     for i, (phy, module) in enumerate(zip(phys, modules)):
         sfx = "" if i == 0 else str(i)
-        g = module.geom_settings
+        g   = module.geom_settings
         memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits)) *
                             phy.settings.nranks*phy.settings.databits//8)
         core = LiteDRAMCore(phy=phy, geom_settings=module.geom_settings,

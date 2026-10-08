@@ -24,7 +24,6 @@ from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter, BURST_INCR
 
 from trixium.layout import BEAT_BYTES
 
-
 # AXIReader ----------------------------------------------------------------------------------------
 
 class AXIReader(LiteXModule):
@@ -89,10 +88,12 @@ class AXIReader(LiteXModule):
         ]
 
         # Burst length: min(burst_beats, beats_left, beats to next 4 KB boundary).
-        boundary_full  = Signal(13) # Full-width intermediate: Migen emits narrow-context
-        boundary_beats = Signal(8)  # arithmetic inside shifts otherwise. 0 encodes 128.
+        # boundary_full is a full-width intermediate: Migen emits narrow-context arithmetic inside
+        # shifts otherwise.
+        boundary_full  = Signal(13)
+        boundary_beats = Signal(8)  # 0 encodes 128.
         b_tmp          = Signal(25)
-        burst_len      = Signal(8) # 1..burst_beats, 0 encodes 128 in b_tmp path (never here).
+        burst_len      = Signal(8)  # 1..burst_beats.
         self.comb += [
             boundary_full.eq(4096 - (cur_addr & 4095)),
             boundary_beats.eq(boundary_full >> beat_shift),
@@ -117,7 +118,7 @@ class AXIReader(LiteXModule):
         # Per-burst info in issue order (which ID it went out on, last burst of command?).
         idbits = max(1, log2_int(n_ids)) if n_ids > 1 else 1
         info = stream.SyncFIFO([("cmd_last", 1), ("bid", idbits)], max_bursts)
-        self.submodules += info
+        self += info
 
         id_rr = Signal(idbits)
         self.comb += [
@@ -185,7 +186,7 @@ class AXIReader(LiteXModule):
 
         # Data FIFO --------------------------------------------------------------------------------
         fifo = stream.SyncFIFO([("data", 256)], fifo_depth, buffered=True)
-        self.submodules += fifo
+        self += fifo
 
         if n_ids == 1:
             self.comb += [
@@ -203,8 +204,7 @@ class AXIReader(LiteXModule):
             # outstanding cap (max_bursts/n_ids bursts of burst_beats each).
             perid_depth = (max_bursts//n_ids)*burst_beats
             # (`last` is a built-in endpoint flag - SyncFIFO carries it through.)
-            perid = [stream.SyncFIFO([("data", 256)], perid_depth)
-                     for _ in range(n_ids)]
+            perid = [stream.SyncFIFO([("data", 256)], perid_depth) for _ in range(n_ids)]
             self.submodules += perid
             for i, p in enumerate(perid):
                 self.comb += [
@@ -250,10 +250,9 @@ class AXIReader(LiteXModule):
             If(axi.r.valid & ~axi.r.ready,   self.r_stalls.eq(self.r_stalls + 1)),
         ]
 
-        # Idle indication (all issued data consumed, no command in flight).
+        # Idle (all issued data consumed, no command in flight).
         self.idle = Signal()
         self.comb += self.idle.eq(~active & (reserved == 0) & ~source.valid)
-
 
 # AXIWriter ----------------------------------------------------------------------------------------
 
@@ -282,7 +281,7 @@ class AXIWriter(LiteXModule):
 
         beat_shift = log2_int(BEAT_BYTES)
 
-        # Burst splitter (mirror of the reader's).
+        # Burst splitter (mirror of the reader's) --------------------------------------------------
         cur_addr   = Signal(axi.address_width)
         beats_left = Signal(24)
         active     = Signal()
@@ -318,13 +317,14 @@ class AXIWriter(LiteXModule):
 
         # Issued-burst queue: W beats stream only for accepted AWs.
         winfo = stream.SyncFIFO([("len", 8)], 8)
-        self.submodules += winfo
+        self += winfo
         outstanding = Signal(8)
         self.outstanding = outstanding
 
-        self.comb += [axi.aw.valid.eq(active & winfo.sink.ready),
-                      winfo.sink.valid.eq(axi.aw.valid & axi.aw.ready)]
-
+        self.comb += [
+            axi.aw.valid.eq(active & winfo.sink.ready),
+            winfo.sink.valid.eq(axi.aw.valid & axi.aw.ready),
+        ]
         self.comb += [
             axi.aw.addr.eq(cur_addr),
             axi.aw.len.eq(burst_len - 1),
@@ -343,9 +343,10 @@ class AXIWriter(LiteXModule):
             )
         ]
 
-        # W data path: pop winfo, stream len beats with wlast - through an output skid
-        # so the HBM macro's W-READY pin never gates fabric FIFO pops combinationally
-        # (macro-boundary register slice, same reasoning as the reader's R slice).
+        # W data path ------------------------------------------------------------------------------
+        # Pop winfo, stream len beats with wlast - through an output skid so the HBM macro's
+        # W-READY pin never gates fabric FIFO pops combinationally (macro-boundary register
+        # slice, same reasoning as the reader's R slice).
         w_left   = Signal(8)
         w_active = Signal()
         wi_valid = Signal()
@@ -397,8 +398,9 @@ class AXIWriter(LiteXModule):
             ),
         ]
 
-        # B responses (valid sampled through a register: no comb path off the macro pin).
-        b_valid_r   = Signal()
+        # B responses ------------------------------------------------------------------------------
+        # Valid sampled through a register: no comb path off the macro pin.
+        b_valid_r = Signal()
         self.comb += axi.b.ready.eq(1)
         ack = axi.b.valid
         self.sync += [
@@ -408,10 +410,9 @@ class AXIWriter(LiteXModule):
                 - Mux(b_valid_r, 1, 0)),
         ]
 
-        # C(1, 1): constant-true term (kept: the generated Verilog depends on it).
+        # Idle. C(1, 1): constant-true term (kept: the generated Verilog depends on it).
         self.comb += self.idle.eq(~active & ~w_active & (outstanding == 0) & ~winfo.source.valid
                                  & C(1, 1))
-
 
 # AXIResetShim -------------------------------------------------------------------------------------
 
@@ -419,12 +420,12 @@ class AXIResetShim(LiteXModule):
     """Keeps one HBM port's AXI protocol whole while the master behind it is reset.
 
     The engine, the loader, the sequencer and the vector unit live in a soft-resettable clock
-    domain (the `engreset` CSR) so a wedged op - a stalled sequencer, a fetch of a row that does
-    not exist - costs a few microseconds instead of an FPGA reconfigure and a host reboot. A
-    reset in the middle of an AXI transaction, though, would leave the HBM controller with a
-    burst nobody drains (R beats for a reader that is gone), an accepted AW whose W beats never
-    come, or a `valid` that vanished before its `ready`; every one of those wedges the port for
-    good, which is the very thing the reset is for.
+    domain (the engine soft-reset CSR) so a wedged op - a stalled sequencer, a fetch of a row
+    that does not exist - costs a few microseconds instead of an FPGA reconfigure and a host
+    reboot. A reset in the middle of an AXI transaction, though, would leave the HBM controller
+    with a burst nobody drains (R beats for a reader that is gone), an accepted AW whose W beats
+    never come, or a `valid` that vanished before its `ready`; every one of those wedges the
+    port for good, which is the very thing the reset is for.
 
     So the shim sits between the port and the master, in the never-reset `sys` domain, and owns
     the protocol:
@@ -452,18 +453,18 @@ class AXIResetShim(LiteXModule):
         self.master = master = AXIInterface(data_width=port.data_width,
                                             address_width=port.address_width,
                                             id_width=port.id_width)
-        self.hold  = Signal()   # Assert while the master domain is in reset.
-        self.busy  = Signal()   # Draining: the master must not be released yet.
-        self.stuck = Signal()   # A drain that will not finish (sticky until the next hold).
+        self.hold  = Signal() # Assert while the master domain is in reset.
+        self.busy  = Signal() # Draining: the master must not be released yet.
+        self.stuck = Signal() # A drain that will not finish (sticky until the next hold).
 
         # # #
 
         # Read side --------------------------------------------------------------------------------
         drain_r = Signal()
-        out_r   = Signal(16)   # Bursts issued to the port, not yet fully returned.
+        out_r   = Signal(16) # Bursts issued to the port, not yet fully returned.
 
         # AR skid: one request held valid until the port takes it.
-        ar_v = Signal()
+        ar_v     = Signal()
         ar_addr  = Signal(port.address_width)
         ar_len   = Signal(8)
         ar_size  = Signal(3)
@@ -515,13 +516,15 @@ class AXIResetShim(LiteXModule):
 
         # Write side -------------------------------------------------------------------------------
         drain_w = Signal()
-        out_b   = Signal(16)   # Write bursts issued, B not yet seen.
-        w_due   = Signal(24)   # W beats promised by accepted AWs, not yet delivered.
+        out_b   = Signal(16) # Write bursts issued, B not yet seen.
+        w_due   = Signal(24) # W beats promised by accepted AWs, not yet delivered.
 
-        wq     = stream.SyncFIFO([("len", 8)], 16)   # accepted AWs' lengths, issue order
-        self.submodules += wq
+        # Accepted AWs' lengths, in issue order.
+        wq = stream.SyncFIFO([("len", 8)], 16)
+        self += wq
 
-        aw_v = Signal()
+        # AW skid.
+        aw_v     = Signal()
         aw_addr  = Signal(port.address_width)
         aw_len   = Signal(8)
         aw_size  = Signal(3)
@@ -529,7 +532,7 @@ class AXIResetShim(LiteXModule):
         aw_id    = Signal(port.id_width)
         aw_fire  = Signal()
         self.comb += [
-            port.aw.valid.eq(aw_v & wq.sink.ready),   # never more AWs than the W queue holds
+            port.aw.valid.eq(aw_v & wq.sink.ready), # Never more AWs than the W queue holds.
             port.aw.addr.eq(aw_addr),
             port.aw.len.eq(aw_len),
             port.aw.size.eq(aw_size),
@@ -556,26 +559,26 @@ class AXIResetShim(LiteXModule):
         # handshake depends on the AW one: AXI forbids a master to wait for AWREADY before
         # WVALID, and a slave may wait for WVALID before AWREADY - the HBM IP does something
         # of the kind (a W gated on the accepted-AW queue cost ~3k cycles per KV-store
-        # packet, 7% of a token), while LiteDRAM's bridge takes W
-        # into a FIFO ahead of its one-deep AW buffer, so W beats may fire before their AW
-        # and whole bursts may complete before it. The queue of accepted AW lengths serves
-        # only the drain: padding the rest of a burst the master abandoned, and whole
-        # bursts whose AW fired without any W - one B per AW either way. Bursts that
-        # completed ahead of their AW (`ahead`) skip the queue when the AW fires.
-        w_v    = Signal()
-        w_data = Signal(port.data_width)
-        w_strb = Signal(port.data_width//8)
-        w_last = Signal()
-        w_fire = Signal()
-        pad    = Signal()
-        w_cnt  = Signal(8)
-        w_lastc = Signal()
+        # packet), while LiteDRAM's bridge takes W into a FIFO ahead of its one-deep AW
+        # buffer, so W beats may fire before their AW and whole bursts may complete before it.
+        # The queue of accepted AW lengths serves only the drain: padding the rest of a burst
+        # the master abandoned, and whole bursts whose AW fired without any W - one B per AW
+        # either way. Bursts that completed ahead of their AW (`ahead`) skip the queue when the
+        # AW fires.
+        w_v       = Signal()
+        w_data    = Signal(port.data_width)
+        w_strb    = Signal(port.data_width//8)
+        w_last    = Signal()
+        w_fire    = Signal()
+        pad       = Signal()
+        w_cnt     = Signal(8)
+        w_lastc   = Signal()
         last_fire = Signal()
-        lf_nq     = Signal()   # A last beat fired with no AW entry for it (yet).
-        ahead     = Signal(4)  # Bursts complete before their AW fired at the port.
-        aw_match  = Signal()   # This AW's burst already completed: no queue entry.
+        lf_nq     = Signal()  # A last beat fired with no AW entry for it (yet).
+        ahead     = Signal(4) # Bursts complete before their AW fired at the port.
+        aw_match  = Signal()  # This AW's burst already completed: no queue entry.
         self.comb += [
-            w_lastc.eq(w_cnt == wq.source.len),        # len = beats - 1 (pad beats only)
+            w_lastc.eq(w_cnt == wq.source.len), # len = beats - 1 (pad beats only).
             pad.eq(drain_w & ~w_v & (w_due != 0) & wq.source.valid),
             port.w.valid.eq(w_v | pad),
             port.w.data.eq(Mux(w_v, w_data, 0)),
@@ -649,7 +652,6 @@ class AXIResetShim(LiteXModule):
             ),
         ]
 
-
 # AXIReadMerge -------------------------------------------------------------------------------------
 
 class AXIReadMerge(LiteXModule):
@@ -671,13 +673,15 @@ class AXIReadMerge(LiteXModule):
         dw_to   = len(axi_to.r.data)
         assert dw_to == 2*dw_from, "two narrow beats per wide word"
         bytes_from = dw_from//8
-        lsb = log2_int(bytes_from)          # The narrow beat's address bit selects the half.
+        lsb        = log2_int(bytes_from) # The narrow beat's address bit selects the half.
+
+        # # #
 
         # AR: one wide burst per narrow burst. The wide length covers the words the narrow
         # beats touch: first word = addr >> (lsb+1),
         # last word = (addr + (len+1)*bytes - 1) >> (lsb+1).
         info = stream.SyncFIFO([("id", axi_from.id_width), ("nbeats", 9), ("upper", 1)], depth)
-        self.submodules += info
+        self += info
         ar = axi_from.ar
         nbeats     = Signal(9)
         first_word = Signal(len(ar.addr))
@@ -704,10 +708,10 @@ class AXIReadMerge(LiteXModule):
         # R: each wide word yields its lower half then its upper half, except that the first
         # word of a burst starting in the upper half yields only that, and the burst stops
         # after nbeats narrow beats (the last word's upper half may go unused).
-        r     = axi_to.r
-        half  = Signal()          # 0: lower half of the current word, 1: upper.
-        count = Signal(9)         # Narrow beats delivered in this burst.
-        first = Signal(reset=1)   # At the first word of the burst.
+        r        = axi_to.r
+        half     = Signal()        # 0: lower half of the current word, 1: upper.
+        count    = Signal(9)       # Narrow beats delivered in this burst.
+        first    = Signal(reset=1) # At the first word of the burst.
         cur_half = Signal()
         self.comb += [
             cur_half.eq(Mux(first & info.source.upper, 1, half)),
@@ -717,7 +721,7 @@ class AXIReadMerge(LiteXModule):
             axi_from.r.id.eq(info.source.id),
             axi_from.r.last.eq(count == info.source.nbeats - 1),
         ]
-        done_word = Signal()   # This narrow beat is the last one taken from the wide word.
+        done_word = Signal() # This narrow beat is the last one taken from the wide word.
         self.comb += done_word.eq(cur_half | axi_from.r.last)
         self.comb += [
             r.ready.eq(axi_from.r.ready & info.source.valid & done_word),
@@ -725,14 +729,15 @@ class AXIReadMerge(LiteXModule):
         ]
         self.sync += If(axi_from.r.valid & axi_from.r.ready,
             If(axi_from.r.last,
-                count.eq(0), half.eq(0), first.eq(1)
+                count.eq(0),
+                half.eq(0),
+                first.eq(1),
             ).Else(
                 count.eq(count + 1),
                 first.eq(0),
                 half.eq(~cur_half),
             )
         )
-
 
 # AXIWide ------------------------------------------------------------------------------------------
 
@@ -745,8 +750,8 @@ class AXIWide(LiteXModule):
         w_from = AXIInterface(data_width=len(axi_from.r.data),
                               address_width=axi_from.address_width,
                               id_width=axi_from.id_width)
-        self.submodules.writes = AXIUpConverter(w_from, w_to)
-        self.submodules.reads  = AXIReadMerge(axi_from, axi_to)
+        self.writes = AXIUpConverter(w_from, w_to)
+        self.reads  = AXIReadMerge(axi_from, axi_to)
         self.comb += [
             axi_from.aw.connect(w_from.aw),
             axi_from.w.connect(w_from.w),
@@ -755,5 +760,6 @@ class AXIWide(LiteXModule):
             w_to.w.connect(axi_to.w),
             axi_to.b.connect(w_to.b),
             # The converter's own read channels stay idle.
-            w_from.ar.valid.eq(0), w_to.r.ready.eq(0),
+            w_from.ar.valid.eq(0),
+            w_to.r.ready.eq(0),
         ]

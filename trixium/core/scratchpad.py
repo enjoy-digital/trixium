@@ -19,8 +19,8 @@ it is free (`units_idle` or `sbr_allow`) and the FIFO is empty.
 Addresses are in 256-bit words; the gather facade addresses int32 slots.
 """
 
-from functools import reduce
 from operator import or_
+from functools import reduce
 
 from migen import *
 from migen.genlib.fifo import SyncFIFO
@@ -33,14 +33,16 @@ from litex.soc.interconnect.csr import *
 # Helpers ------------------------------------------------------------------------------------------
 
 class _Facade:
-    pass
+    """Attribute container standing in for a Memory port (adr/dat_r/dat_w/we)."""
 
 # Scratchpad ---------------------------------------------------------------------------------------
 
 class Scratchpad(LiteXModule):
+    """256-bit scratchpad memory: engine fill/gather ports plus a CPU/host sideband."""
     def __init__(self, size=256*1024, init=None, xpm=False):
         self.size = size
         depth     = size//32
+
         # The raw Memory must not be auto-exported over the CSR bus (AutoCSR scans Memory
         # attributes of LiteXModules and would add an unwanted CSR-bus port + page register).
         self.autocsr_exclude = {"mem"}
@@ -73,18 +75,48 @@ class Scratchpad(LiteXModule):
             port_w.adr, port_w.dat_w, port_w.we = Signal(aw), Signal(256), Signal(32)
             self.mem = None
             self.specials += Instance("xpm_memory_sdpram",
-                p_ADDR_WIDTH_A=aw, p_ADDR_WIDTH_B=aw, p_BYTE_WRITE_WIDTH_A=8,
-                p_CLOCKING_MODE="common_clock", p_ECC_MODE="no_ecc",
-                p_MEMORY_INIT_FILE="none", p_MEMORY_INIT_PARAM="0", p_USE_MEM_INIT=0,
-                p_MEMORY_PRIMITIVE="block", p_MEMORY_SIZE=depth*256,
-                p_MESSAGE_CONTROL=0, p_AUTO_SLEEP_TIME=0, p_WAKEUP_TIME="disable_sleep",
-                p_READ_DATA_WIDTH_B=256, p_READ_LATENCY_B=1, p_READ_RESET_VALUE_B="0",
-                p_RST_MODE_A="SYNC", p_RST_MODE_B="SYNC", p_WRITE_DATA_WIDTH_A=256,
-                p_WRITE_MODE_B="read_first",
-                i_clka=ClockSignal("sys"), i_clkb=ClockSignal("sys"),
-                i_ena=1, i_wea=port_w.we, i_addra=port_w.adr, i_dina=port_w.dat_w,
-                i_enb=1, i_addrb=port_r.adr, o_doutb=port_r.dat_r, i_rstb=0, i_regceb=1,
-                i_sleep=0, i_injectsbiterra=0, i_injectdbiterra=0)
+                # Memory.
+                p_MEMORY_PRIMITIVE    = "block",
+                p_MEMORY_SIZE         = depth*256,
+                p_CLOCKING_MODE       = "common_clock",
+                p_ECC_MODE            = "no_ecc",
+                p_MEMORY_INIT_FILE    = "none",
+                p_MEMORY_INIT_PARAM   = "0",
+                p_USE_MEM_INIT        = 0,
+                p_MESSAGE_CONTROL     = 0,
+                p_AUTO_SLEEP_TIME     = 0,
+                p_WAKEUP_TIME         = "disable_sleep",
+                p_RST_MODE_A          = "SYNC",
+                p_RST_MODE_B          = "SYNC",
+
+                # Port A (write).
+                p_ADDR_WIDTH_A        = aw,
+                p_BYTE_WRITE_WIDTH_A  = 8,
+                p_WRITE_DATA_WIDTH_A  = 256,
+                i_clka                = ClockSignal("sys"),
+                i_ena                 = 1,
+                i_wea                 = port_w.we,
+                i_addra               = port_w.adr,
+                i_dina                = port_w.dat_w,
+
+                # Port B (read).
+                p_ADDR_WIDTH_B        = aw,
+                p_READ_DATA_WIDTH_B   = 256,
+                p_READ_LATENCY_B      = 1,
+                p_READ_RESET_VALUE_B  = "0",
+                p_WRITE_MODE_B        = "read_first",
+                i_clkb                = ClockSignal("sys"),
+                i_enb                 = 1,
+                i_addrb               = port_r.adr,
+                o_doutb               = port_r.dat_r,
+                i_rstb                = 0,
+                i_regceb              = 1,
+
+                # Unused.
+                i_sleep               = 0,
+                i_injectsbiterra      = 0,
+                i_injectdbiterra      = 0,
+            )
         else:
             self.mem = mem = Memory(256, depth, init=init, name="trixium_scratchpad")
             self.specials += mem
@@ -99,29 +131,29 @@ class Scratchpad(LiteXModule):
         self.gather = _Facade()
         self.gather.adr   = Signal(max=depth)
         self.gather.dat_w = Signal(256)
-        self.gather.we    = Signal(8)   # int32 lane enables (expanded to bytes below).
+        self.gather.we    = Signal(8) # int32 lane enables (expanded to bytes below).
 
         # Sideband slots: 0 = wishbone (priority), 1 = CSR peek/poke. Each carries one
         # 32-bit access.
-        self._sb_req  = [Signal(name=f"sb{i}_req")  for i in range(2)]
-        self._sb_we   = [Signal(name=f"sb{i}_we")   for i in range(2)]
-        self._sb_adr  = [Signal(max=depth, name=f"sb{i}_adr") for i in range(2)]
-        self._sb_sel  = [Signal(3, name=f"sb{i}_sel")  for i in range(2)]
-        self._sb_bsel = [Signal(4, name=f"sb{i}_bsel") for i in range(2)]
-        self._sb_wdat = [Signal(32, name=f"sb{i}_wdat") for i in range(2)]
-        self._sb_gnt  = [Signal(name=f"sb{i}_gnt")  for i in range(2)]
+        self._sb_req  = [Signal(           name=f"sb{i}_req")  for i in range(2)]
+        self._sb_we   = [Signal(           name=f"sb{i}_we")   for i in range(2)]
+        self._sb_adr  = [Signal(max=depth, name=f"sb{i}_adr")  for i in range(2)]
+        self._sb_sel  = [Signal(3,         name=f"sb{i}_sel")  for i in range(2)]
+        self._sb_bsel = [Signal(4,         name=f"sb{i}_bsel") for i in range(2)]
+        self._sb_wdat = [Signal(32,        name=f"sb{i}_wdat") for i in range(2)]
+        self._sb_gnt  = [Signal(           name=f"sb{i}_gnt")  for i in range(2)]
         self._sb_rdat = Signal(256) # port_r.dat_r, valid the cycle after a granted read.
 
         # Posted-write FIFO: two push slots (0 = wishbone, priority; 1 = CSR poke).
         aw = len(self._sb_adr[0])
-        self._sbw_req  = [Signal(name=f"sbw{i}_req") for i in range(2)]
-        self._sbw_ok   = [Signal(name=f"sbw{i}_ok")  for i in range(2)]
-        self._sbw_adr  = [Signal(aw, name=f"sbw{i}_adr") for i in range(2)]
-        self._sbw_sel  = [Signal(3, name=f"sbw{i}_sel") for i in range(2)]
-        self._sbw_bsel = [Signal(4, name=f"sbw{i}_bsel") for i in range(2)]
+        self._sbw_req  = [Signal(    name=f"sbw{i}_req")  for i in range(2)]
+        self._sbw_ok   = [Signal(    name=f"sbw{i}_ok")   for i in range(2)]
+        self._sbw_adr  = [Signal(aw, name=f"sbw{i}_adr")  for i in range(2)]
+        self._sbw_sel  = [Signal(3,  name=f"sbw{i}_sel")  for i in range(2)]
+        self._sbw_bsel = [Signal(4,  name=f"sbw{i}_bsel") for i in range(2)]
         self._sbw_wdat = [Signal(32, name=f"sbw{i}_wdat") for i in range(2)]
         sbw = SyncFIFO(width=aw + 3 + 4 + 32, depth=4)
-        self.submodules += sbw
+        self += sbw
         dr_adr  = Signal(aw)
         dr_sel  = Signal(3)
         dr_bsel = Signal(4)
@@ -137,6 +169,8 @@ class Scratchpad(LiteXModule):
             self.sbw_pending.eq(sbw.readable),
             sbw.re.eq(self.sbw_gnt),
         ]
+
+        # Port muxing: posted-write drain, sideband reads, engine fill/gather.
         gather_bwe = Signal(32)
         self.comb += [
             gather_bwe.eq(Cat(*[Replicate(self.gather.we[i], 4) for i in range(8)])),
@@ -212,7 +246,8 @@ class Scratchpad(LiteXModule):
                 )
             )
         )
-        fsm.act("WPUSH", # Posted: ack as soon as the write is in the sbw FIFO.
+        fsm.act("WPUSH",
+            # Posted: ack as soon as the write is in the sbw FIFO.
             self._sbw_req[0].eq(1),
             If(self._sbw_ok[0],
                 NextState("ACK"),
@@ -237,20 +272,20 @@ class Scratchpad(LiteXModule):
 # Scratchpad CSR -----------------------------------------------------------------------------------
 
 class _ScratchpadCSR(LiteXModule):
+    """CSR peek/poke onto the scratchpad sideband (slot 1)."""
     def __init__(self, scratchpad):
-        self.adr    = CSRStorage(24, description=
-            "Byte address (4-aligned). Writing triggers a read.")
+        self.adr    = CSRStorage(24, description="Byte address (4-aligned). Writing triggers a read.")
         self.data_r = CSRStatus(32,  description="Read data for the last triggered read.")
         self.data_w = CSRStorage(32, description="Writing stores 32 bits at adr.")
 
         # # #
 
-        sp    = scratchpad
-        sel_r = Signal(3)
-        rd_p  = Signal() # Read pending (adr written, not yet granted).
-        wr_p  = Signal() # Write pending.
-        cap   = Signal() # Capture read data this cycle.
-        reset_read = C(0, 1) # Read-reset hook, tied off.
+        sp         = scratchpad
+        sel_r      = Signal(3)
+        rd_p       = Signal() # Read pending (adr written, not yet granted).
+        wr_p       = Signal() # Write pending.
+        cap        = Signal() # Capture read data this cycle.
+        reset_read = C(0, 1)  # Read-reset hook, tied off (kept: the generated Verilog depends on it).
         self.comb += [
             sp._sb_adr[1].eq(self.adr.storage[5:]),
             sp._sb_sel[1].eq(self.adr.storage[2:5]),
@@ -293,7 +328,6 @@ class ScratchpadArbiter(LiteXModule):
     and the outputs are one AND-OR level, so the logic depth on the BRAM address/data/enable
     pins grows with log2 of the client count (a serial mux chain failed timing).
     """
-
     def __init__(self, base, clients):
         clients = list(clients)
         self.busy      = Signal()
@@ -312,7 +346,7 @@ class ScratchpadArbiter(LiteXModule):
         # One-hot select: client i wins when busy and no LATER client is busy.
         n = len(clients)
         later    = [Signal(name=f"arb_later{i}") for i in range(n)]
-        sel      = [Signal(name=f"arb_sel{i}") for i in range(n)]
+        sel      = [Signal(name=f"arb_sel{i}")   for i in range(n)]
         base_sel = Signal()
         for i in range(n):
             self.comb += later[i].eq(reduce(or_, [c.busy for c in clients[i + 1:]], C(0, 1)))
@@ -324,8 +358,9 @@ class ScratchpadArbiter(LiteXModule):
             self.busy.eq(base.busy | any_aux),
         ]
 
+        # One AND-OR level per output.
         def pick(field):
-            terms = [Mux(base_sel, getattr(base, field), 0)]
+            terms  = [Mux(base_sel, getattr(base, field), 0)]
             terms += [Mux(sel[i], getattr(clients[i], field), 0) for i in range(n)]
             return reduce(or_, terms)
 

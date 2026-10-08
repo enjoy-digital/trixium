@@ -31,7 +31,7 @@ from trixium.memory.axi import AXIResetShim
 
 class EngineResetDomain(LiteXModule):
     def __init__(self, axis, hold_cycles=64, stuck_cycles=1 << 20):
-        self.cd_eng  = ClockDomain("eng")
+        self.cd_eng = ClockDomain("eng")
         # The reset register implements its own reset equation below: Migen's sys reset
         # insertion would append eng_rst <= 0 and override eng_rst <= sys_rst | holding.
         self.cd_eng.rst.reset_less = True

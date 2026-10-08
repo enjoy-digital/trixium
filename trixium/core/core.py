@@ -103,6 +103,8 @@ class TriXiumCore(LiteXModule):
             if getattr(port, "clock_domain", "sys") != "sys":
                 raise ValueError("memory ports need target-side CDC into sys")
 
+        # # #
+
         # Scratchpad / Engine reset domain.
         self.scratchpad = Scratchpad(size=config.scratchpad_size, xpm=config.scratchpad_xpm)
         sp_csr = None
@@ -140,8 +142,8 @@ class TriXiumCore(LiteXModule):
                 self.add_constant(name)
             self.add_constant("TRIXIUM_VEC_VREGS", vecunit.vregs)
 
-        # Scratchpad units. Scratchpad clients besides the vector unit, in attach order: the
-        # last busy one owns the port. One flat ScratchpadArbiter is built after all of them,
+        # Scratchpad units: scratchpad clients besides the vector unit, in attach order (the
+        # last busy one owns the port). One flat ScratchpadArbiter is built after all of them,
         # so the BRAM address/data/enable see log2(clients) levels instead of one serial mux
         # per unit (timing).
         sp_clients = []
@@ -199,12 +201,14 @@ class TriXiumCore(LiteXModule):
                                  "client")
             self.sparb = ScratchpadArbiter(vecunit, sp_clients)
             sp_client = self.sparb
-        self.engine = ClockDomainsRenamer("eng")(
-            MatVecEngine(self.scratchpad, axis, vecunit=sp_client,
-                seq        = seq,
-                **placement,
-                dnstream   = config.with_dnstream and (config.dnstream_options or True),
-                attnstream = config.with_attnstream and (config.attnstream_options or True)))
+        self.engine = ClockDomainsRenamer("eng")(MatVecEngine(
+            scratchpad = self.scratchpad,
+            hbm_axis   = axis,
+            vecunit    = sp_client,
+            seq        = seq,
+            dnstream   = config.with_dnstream   and (config.dnstream_options   or True),
+            attnstream = config.with_attnstream and (config.attnstream_options or True),
+            **placement))
         if config.with_attnstream:
             at = self.engine.attnstream
             self.add_constant("TRIXIUM_HAS_ATTNSTREAM")
@@ -246,9 +250,11 @@ class TriXiumCore(LiteXModule):
         ]
 
         # Loader.
-        self.loader = ClockDomainsRenamer("eng")(
-            Loader(axis, data_width=config.loader_data_width, **placement,
-                with_mstore=config.with_dnstream))
+        self.loader = ClockDomainsRenamer("eng")(Loader(
+            hbm_axis    = axis,
+            data_width  = config.loader_data_width,
+            with_mstore = config.with_dnstream,
+            **placement))
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
             self.engine.store_data.connect(self.loader.store_data),
@@ -256,8 +262,7 @@ class TriXiumCore(LiteXModule):
         ]
         if config.with_dnstream:
             self.comb += self.engine.mstore_cmd.connect(self.loader.mstore_cmd)
-            self.comb += [d.connect(w)
-                for d, w in zip(self.engine.mstore_data, self.loader.mstore_data)]
+            self.comb += [d.connect(w) for d, w in zip(self.engine.mstore_data, self.loader.mstore_data)]
         units_idle = ~self.engine.sp_busy
         if sp_client is not None:
             units_idle = units_idle & ~sp_client.busy
@@ -266,7 +271,7 @@ class TriXiumCore(LiteXModule):
         self.comb += self.scratchpad.units_idle.eq(units_idle)
         for name in ("TRIXIUM_HAS_KVSTORE", "TRIXIUM_HAS_TOPK"):
             self.add_constant(name)
-        self.add_constant("TRIXIUM_SP_SB_SLOT", 1)
+        self.add_constant("TRIXIUM_SP_SB_SLOT",  1)
         self.add_constant("TRIXIUM_SP_SB_RSLOT", 1)
 
         # Standard interfaces.
@@ -274,5 +279,6 @@ class TriXiumCore(LiteXModule):
         self.upload = self.loader.sink
 
     def add_constant(self, name, value=None):
+        """Record a firmware-visible constant (exported by the target with soc.add_constant)."""
         assert name not in self.constants, name
         self.constants[name] = value

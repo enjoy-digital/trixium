@@ -19,8 +19,8 @@ per-channel address space. Other kinds: fetch (memory row -> scratchpad), store 
 DeltaNet (5) and attention (6) stream units. Driven by the sequencer or the CSR front-end.
 """
 
-from functools import reduce
 from operator import and_, or_
+from functools import reduce
 
 from migen import *
 from migen.genlib.fifo import SyncFIFO
@@ -30,15 +30,19 @@ from litex.gen import *
 
 from litex.soc.interconnect import stream
 
-from trixium.layout import BEAT_BYTES
 from trixium.memory.axi import AXIReader
 from trixium.core.pipe import ChannelPipe
 from trixium.units.deltanet_stream import DeltaNetStream
 from trixium.units.attention_stream import AttentionStream
 
+# Helpers ------------------------------------------------------------------------------------------
+
+def reduce_or(sigs):
+    return reduce(or_, sigs)
+
 # Result Packer ------------------------------------------------------------------------------------
 
-class _ResultPacker(Module):
+class _ResultPacker(LiteXModule):
     """The per-pipe relay register in front of the gather, which in plain-matvec mode also
     coalesces a channel's consecutive results into full 8-lane beats.
 
@@ -73,19 +77,22 @@ class _ResultPacker(Module):
 
         # # #
 
-        p_v     = Signal()
-        p_row   = Signal(16)
-        p_dat   = Signal(256)
-        p_wide  = Signal()
-        p_head  = Signal()
-        p_slot  = Signal(24)
-        p_lanes = Signal(8)
-        last_seen = Signal()        # The pipe's final result has been consumed.
+        # Held entry.
+        p_v       = Signal()
+        p_row     = Signal(16)
+        p_dat     = Signal(256)
+        p_wide    = Signal()
+        p_head    = Signal()
+        p_slot    = Signal(24)
+        p_lanes   = Signal(8)
+        last_seen = Signal() # The pipe's final result has been consumed.
+
+        # Merge / emit / accept decisions.
 
         in_v     = Signal()
         lane     = Signal(3)
-        merge    = Signal()         # Same beat as the held one: add a lane.
-        displace = Signal()         # A new entry that cannot merge: emit the held one.
+        merge    = Signal() # Same beat as the held one: add a lane.
+        displace = Signal() # A new entry that cannot merge: emit the held one.
         full     = Signal()
         is_last  = Signal()
         accept   = Signal()
@@ -112,6 +119,8 @@ class _ResultPacker(Module):
             accept.eq(in_v & (~p_v | merge | self.source.ready)),
             self.sink.ready.eq(accept),
         ]
+
+        # Held entry update.
         load = Signal()
         self.comb += load.eq(accept & ~merge)
         self.sync += [
@@ -145,6 +154,7 @@ class _ResultPacker(Module):
 # MatVec Engine ------------------------------------------------------------------------------------
 
 class MatVecEngine(LiteXModule):
+    """N-channel matvec engine: one AXIReader + ChannelPipe per memory channel (see module doc)."""
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False):
         # chan_stride: byte distance between consecutive channels' weight regions. With the
@@ -167,6 +177,7 @@ class MatVecEngine(LiteXModule):
         # banks: with power-of-two strides they would all stream through the same bank and
         # thrash its row.
         assert chan_skew == 0 or chan_mod, "chan_skew needs chan_mod"
+
         def _chan_off(i): # Python int: per-reader constant.
             local = (i % chan_mod) if chan_mod else i
             return local*chan_stride + local*chan_skew
@@ -185,7 +196,7 @@ class MatVecEngine(LiteXModule):
         self.cyc_eng   = Signal(64)
         self.cyc_vec   = Signal(64)
         self.cyc_both  = Signal(64)
-        self.busy      = Signal()      # Declared early: the counters below need it.
+        self.busy      = Signal() # Declared early: the counters below need it.
         self.sync += [
             self.cyc_total.eq(self.cyc_total + 1),
             If(self.busy,          self.cyc_eng.eq(self.cyc_eng + 1)),
@@ -232,12 +243,12 @@ class MatVecEngine(LiteXModule):
             ("dstride", 24), # STORE: memory beats between consecutive packets.
             ("sstride", 8),  # STORE: scratchpad beats between consecutive source slots.
         ])
-        self.sp_busy = Signal() # busy + 1 cycle: the registered write stage's last beat
-                                # lands the cycle after busy drops; sideband arbitration
-                                # (scratchpad.units_idle) must wait for it.
-        self.done   = Signal() # Pulse.
-        self.error  = Signal()
-        self.absmax = Signal(32) # |int32| max over the last matvec's gathered results.
+        # sp_busy: busy + 1 cycle. The registered write stage's last beat lands the cycle after
+        # busy drops; sideband arbitration (scratchpad.units_idle) must wait for it.
+        self.sp_busy = Signal()
+        self.done    = Signal()   # Pulse.
+        self.error   = Signal()
+        self.absmax  = Signal(32) # |int32| max over the last matvec's gathered results.
         # Argmax tap over the gathered results (matvec kinds only): value + global row
         # index (grant*rows + row), ties to the smallest index (matches np.argmax across
         # the round-robin arrival order). Reset on command accept.
@@ -260,7 +271,7 @@ class MatVecEngine(LiteXModule):
             # dnstream=True: the 27B geometry on the exact operators; a dict overrides the
             # unit's arguments (tests: a small geometry on integer operators).
             opts = dict(dnstream) if isinstance(dnstream, (dict, tuple)) else {}
-            self.submodules.dnstream = dn = DeltaNetStream(
+            self.dnstream = dn = DeltaNetStream(
                 lanes=len(hbm_axis), adr_bits=len(scratchpad.fill.adr), **opts)
             self.mstore_cmd  = stream.Endpoint([("addr", 33), ("len", 24)])
             self.mstore_data = dn.sources
@@ -268,23 +279,22 @@ class MatVecEngine(LiteXModule):
         self.with_attnstream = attnstream
         if attnstream:
             opts = dict(attnstream) if isinstance(attnstream, (dict, tuple)) else {}
-            self.submodules.attnstream = at = AttentionStream(
+            self.attnstream = at = AttentionStream(
                 adr_bits=len(scratchpad.fill.adr), **opts)
 
         # # #
 
-        # Channels ----------------------------------------------------------------------------
+        # Channels ---------------------------------------------------------------------------------
         fetch_mode = Signal() # kind == 2 for the latched command.
         fetch_chan = Signal(5)
 
         self.readers = []
         self.pipes   = []
         read_cmds = []
-        # Per-cycle port arbitration state. rd_free: the engine
-        # may put an address on the scratchpad R port this cycle. fetch_rdy: the gather
-        # write FIFO has headroom for a fetch beat. gw_pending: engine writes queued but
-        # not yet in RAM (done waits on it). All default to the serial behavior when no
-        # vector unit is integrated.
+        # Per-cycle port arbitration state. rd_free: the engine may put an address on the
+        # scratchpad R port this cycle. fetch_rdy: the gather write FIFO has headroom for a
+        # fetch beat. gw_pending: engine writes queued but not yet in RAM (done waits on it).
+        # All default to the serial behavior when no vector unit is integrated.
         rd_free    = Signal()
         fetch_rdy  = Signal()
         gw_pending = Signal()
@@ -301,12 +311,12 @@ class MatVecEngine(LiteXModule):
             # per round trip); round-robin ARIDs let it pipeline.
             reader = AXIReader(axi, n_ids=4)
             pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
-            setattr(self.submodules, f"reader{i}", reader)
-            setattr(self.submodules, f"pipe{i}",   pipe)
+            setattr(self, f"reader{i}", reader)
+            setattr(self, f"pipe{i}",   pipe)
             # Relay register between the reader (its FIFO sits at the memory port) and the
             # pipe, for timing (route). Latency only.
             rbuf = stream.Buffer([("data", 256)])
-            setattr(self.submodules, f"rbuf{i}", rbuf)
+            setattr(self, f"rbuf{i}", rbuf)
             self.comb += reader.source.connect(rbuf.sink)
             read_cmds.append(reader.sink)
             rsrc = rbuf.source
@@ -345,7 +355,7 @@ class MatVecEngine(LiteXModule):
             self.readers.append(reader)
             self.pipes.append(pipe)
 
-        # Latched command ---------------------------------------------------------------------
+        # Latched command --------------------------------------------------------------------------
         cmd_r = {}
         for name in (("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
                      "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
@@ -391,7 +401,7 @@ class MatVecEngine(LiteXModule):
         self.comb += self.error.eq(reduce_or(pipe_errors)
                                   | ((at_mode & at.error) if attnstream else 0))
 
-        # x-fill ------------------------------------------------------------------------------
+        # x-fill -----------------------------------------------------------------------------------
         fill_beat  = Signal(10)
         fill_total = Signal(10)
         fill_half  = Signal(10) # Beats per head (dual-Q reads 2x: A then B, contiguous).
@@ -422,7 +432,7 @@ class MatVecEngine(LiteXModule):
         self.comb += xsrc_w.eq(cmd_r["xsrc"] >> 5)
         # STORE stream through a 4-deep prefetch FIFO: reads are issued ahead (whenever the
         # R port is ours and credit remains), so the stream runs at one beat per clock.
-        self.submodules.st_fifo = st_fifo = ResetInserter()(stream.SyncFIFO([("data", 256)], 4))
+        self.st_fifo = st_fifo = ResetInserter()(stream.SyncFIFO([("data", 256)], 4))
         st_run   = Signal()    # fsm.ongoing("ST_RUN"), assigned once the FSM exists.
         st_iss   = Signal(13)  # Beats read in the current packet.
         st_pend  = Signal()    # A read issued last cycle: its data is on fill.dat_r now.
@@ -486,9 +496,9 @@ class MatVecEngine(LiteXModule):
                 pipe.xw_we.eq(fa2),
             ]
 
-        # Gather ------------------------------------------------------------------------------
+        # Gather -----------------------------------------------------------------------------------
         self.rr = rr = RoundRobin(n, SP_CE)
-        result_cnt  = Signal(32)
+        result_cnt = Signal(32)
         # Interleaved (position-major) ops merge every pipe whose head falls in the same
         # scratchpad beat as the granted head: slot = row*N + chan, so within one beat all
         # lanes map to distinct pipes (N power-of-2) and up to 8 results retire per cycle,
@@ -514,7 +524,7 @@ class MatVecEngine(LiteXModule):
         # (_ResultPacker above). pack_en excludes every mode with its own retirement path.
         pack_en = Signal()
         self.comb += pack_en.eq(~fetch_mode & ~store_mode & ~axpy_mode & ~ilv_mode)
-        gsrc = []
+        gsrc  = []
         packs = []
         for i, pipe in enumerate(self.pipes):
             # Registered input stage: the slot arithmetic below is computed from the pipe
@@ -522,9 +532,9 @@ class MatVecEngine(LiteXModule):
             # compare starts from registers.
             ib = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
                                 ("slot", 24)])
-            setattr(self.submodules, f"gin{i}", ib)
+            setattr(self, f"gin{i}", ib)
             pk = _ResultPacker()
-            setattr(self.submodules, f"pack{i}", pk)
+            setattr(self, f"pack{i}", pk)
             rows_last_i = Signal(16)
             self.sync += rows_last_i.eq(cmd_r["rows"] - 1 + (i < cmd_r["rem"]))
             self.comb += [
@@ -568,7 +578,7 @@ class MatVecEngine(LiteXModule):
         # beats regardless of `rem` (rem varies the number of positions a channel accumulates,
         # not the length of its output), and the drain runs after the reader has finished, so
         # a stalled axw_fifo cannot deadlock against an in-flight read.
-        xred_all  = Signal()
+        xred_all = Signal()
         self.comb += xred_all.eq(xred_mode & reduce(and_, [g.valid for g in gsrc]))
         xred_dat = Signal(256)
         def _addtree(sigs):
@@ -648,10 +658,10 @@ class MatVecEngine(LiteXModule):
         # levels, one per cycle - and then the running compare. Invalid lanes enter as
         # (INT32_MIN, 0xFFFFFF), which no valid lane loses to. `done` waits for this
         # pipeline to empty (am_busy), so no reader can see a stale argmax.
-        am_v_r  = Signal()
-        am_l_r  = Signal(8)
-        am_d_r  = Signal(256)
-        am_b_r  = Signal(24)
+        am_v_r = Signal()
+        am_l_r = Signal(8)
+        am_d_r = Signal(256)
+        am_b_r = Signal(24)
         self.sync += [
             am_v_r.eq(is_matvec & ~ilv_mode & grant_valid & ~grant_wide),
             am_l_r.eq(grant_lanes),
@@ -704,7 +714,7 @@ class MatVecEngine(LiteXModule):
                     | ((am_s_r == self.argmax_val) & (am_i_r < self.argmax_idx))),
                 self.argmax_val.eq(am_s_r),
                 self.argmax_idx.eq(am_i_r),
-            )
+            ),
         ]
 
         # Fetch datapath: selected channel's beats -> scratchpad (256-bit writes).
@@ -807,7 +817,7 @@ class MatVecEngine(LiteXModule):
                 eng_gw_adr_c.eq(slot[3:]),
                 eng_gw_dat_c.eq(grant_data),
                 eng_gw_we_c.eq(Mux(grant_valid, grant_lanes, 0)),
-            )
+            ),
         ]
 
         # Result absmax tracker, write-stage (norm_i32's shift argument; reset on command
@@ -841,7 +851,7 @@ class MatVecEngine(LiteXModule):
                 self.absmax.eq(0),
             ).Elif(~fetch_mode & ~dn_mode & ~at_mode & (wr_absmax > self.absmax),
                 self.absmax.eq(wr_absmax),
-            )
+            ),
         ]
 
         # The engine's R-port address: the fill/STORE counter, or a stream unit's registered
@@ -885,18 +895,18 @@ class MatVecEngine(LiteXModule):
             # holds (sp_wr_gnt). Deadlock-free: the engine never waits on the vec unit
             # mid-op, so the FIFO always drains. Depth 8 suffices: input is <= 1 write/cycle,
             # and above the mark drain matches input.
-            grant_seq = Signal()
-            vec_rd    = Signal()
-            vec_wr    = Signal()
+            grant_seq     = Signal()
+            vec_rd        = Signal()
+            vec_wr        = Signal()
             sb_headroom_r = Signal() # Registered W-FIFO headroom for the sideband grant.
             # Engine-local copy of seq.sbmode (see sequencer.py): a rarely-changing CSR
             # bit re-registered here so the fetch-grant cone stays engine-local.
             sbmode_r = Signal()
             if seq is not None:
                 self.sync += sbmode_r.eq(seq.sbmode.storage)
-            gw_w      = len(scratchpad.gather.adr) + 8 + 256
-            wr_fifo   = SyncFIFO(width=gw_w, depth=8)
-            self.submodules += wr_fifo
+            gw_w    = len(scratchpad.gather.adr) + 8 + 256
+            wr_fifo = SyncFIFO(width=gw_w, depth=8)
+            self += wr_fifo
             f_adr = Signal(len(scratchpad.gather.adr))
             f_we  = Signal(8)
             f_dat = Signal(256)
@@ -953,7 +963,7 @@ class MatVecEngine(LiteXModule):
             if seq is not None:
                 self.comb += seq.sp_dat.eq(scratchpad.fill.dat_r)
 
-        # Control FSM -------------------------------------------------------------------------
+        # Control FSM ------------------------------------------------------------------------------
         self.fsm = fsm = FSM(reset_state="IDLE")
         self.comb += st_run.eq(fsm.ongoing("ST_RUN"))
         start_pulse = Signal()
@@ -975,7 +985,7 @@ class MatVecEngine(LiteXModule):
         if attnstream:
             # The merge: position t is channel t % n's next row, sbeats + cbeats beats each.
             at_rowbeats = Signal(9)
-            at_beat = Signal(9)
+            at_beat     = Signal(9)
             self.comb += [
                 at_rowbeats.eq(cmd_r["sbeats"] + cmd_r["cbeats"]),
                 at.start.eq(start_pulse & at_mode),
@@ -1025,7 +1035,7 @@ class MatVecEngine(LiteXModule):
         )
         # STORE targets the one channel in cmd.chan, so it needs the same per-channel
         # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
-        # Built term by term so that chan_skew=0 emits exactly the expression it always did.
+        # Built term by term: with chan_skew=0 the expression has no skew term.
         _store_addr = st_addr_r + (
             _chan_sel(cmd_r["chan"]) << chan_shift if chan_stride else 0)
         if chan_skew:
@@ -1053,7 +1063,8 @@ class MatVecEngine(LiteXModule):
                 )
             )
         )
-        fsm.act("ST_DRAIN", # Wait for the loader's B-channel drain: data is then readable.
+        fsm.act("ST_DRAIN",
+            # Wait for the loader's B-channel drain: data is then readable.
             self.busy.eq(1),
             If(~self.store_busy,
                 self.done.eq(1),
@@ -1080,7 +1091,8 @@ class MatVecEngine(LiteXModule):
                 )
             )
         )
-        fsm.act("FILL_LAST", # Drain the registered fill write.
+        fsm.act("FILL_LAST",
+            # Drain the registered fill write.
             self.busy.eq(1),
             NextState("ISSUE"),
         )
@@ -1094,8 +1106,8 @@ class MatVecEngine(LiteXModule):
                 + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
               for i, c in enumerate(read_cmds)],
             # Waits on readers[0] alone. A reader only accepts while idle, so a reader still
-            # draining could in principle miss its command; this was never observed on
-            # hardware, and a per-reader wait costs timing.
+            # draining could in principle miss its command; not observed on hardware, and a
+            # per-reader wait costs timing.
             If(read_cmds[0].ready,
                 NextState("RUN"),
             )
@@ -1132,7 +1144,7 @@ class MatVecEngine(LiteXModule):
             )
         )
 
-        # Fill write-stage delay + result counting.
+        # Fill write-stage delay, STORE counters and result counting.
         self.sync += [
             fill_active_d.eq(fsm.ongoing("FILL") & rd_free),
             fill_beat_d.eq(fill_beat),
@@ -1175,8 +1187,3 @@ class MatVecEngine(LiteXModule):
                 )
             ),
         ]
-
-# Helpers ------------------------------------------------------------------------------------------
-
-def reduce_or(sigs):
-    return reduce(or_, sigs)
