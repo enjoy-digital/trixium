@@ -12,7 +12,6 @@
 #define BONSAI_CONSOLE_LINE_ADDR   (BONSAI_HDR_ADDR + 0xc0000)
 #define BONSAI_CONSOLE_LINE_SIZE   1024
 #define BONSAI_CONSOLE_PROMPT_ADDR (BONSAI_HDR_ADDR + 0xc0400) // 64 int32s
-#define BONSAI_ATRACE_BUFFER_ADDR  (BONSAI_HDR_ADDR + 0xc0500) // 192 uint32s
 #define BONSAI_FPROF_BUFFER_ADDR   (BONSAI_HDR_ADDR + 0xc0800) // 160 bytes, diagnostic only
 #define BONSAI_RESIDENT_STATE_ADDR (BONSAI_HDR_ADDR + 0xc0900) // struct resident_state (resident.h)
 #define BONSAI_HYBPROF_ADDR        (BONSAI_HDR_ADDR + 0xc0a00) // struct hyb_prof (hybrid.c), 256 B

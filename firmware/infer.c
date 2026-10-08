@@ -375,15 +375,14 @@ COLD static void kv_store_row(int l, int kvh, int kind, int t, const float *vec)
 // AXPY pre-shift keeping the int32 lane accumulators safe (bitexact.axpy_rpre):
 // pure bit-length form so the descriptor sequencer can compute it in hardware.
 // F1-5 (2026-08-29): the per-head attention fold in integers, emulating the float32 path
-// bit-for-bit so tokens stay byte-identical. The float path (kept below `ifold_use`) is
-// soft-float on VexiiRiscv - a divide, ldexpf, a multiply and frexpf per head, then
-// lroundf(ldexpf()) per head for the scale8 multiplier: ~1.4k cycles per head, 448 per token.
+// bit-for-bit so tokens stay byte-identical. The float form was soft-float on VexiiRiscv -
+// a divide, ldexpf, a multiply and frexpf per head, then lroundf(ldexpf()) per head for
+// the scale8 multiplier: ~1.4k cycles per head, 448 per token.
 //   q  = RN24(1.0f / (float)P8)            -> (qm, qe): q = qm * 2^qe, qm in [2^23, 2^24)
 //   c2 = ldexpf(q, E1)                     -> (qm, qe + E1), no rounding
 //   hm = (float)(am >> k2) * c2            -> RN24 of the product: (m2, e2)
 //   ea8 = frexpf(max hm) - 7               -> e2max + 24 - 7
 //   Mh  = lroundf(ldexpf(c2, 15 - ea8))    -> qm * 2^(qe + E1 + 15 - ea8), half away from 0
-int ifold_use = 1; // Second version (2026-08-30): 32-bit hardware divides + clz.
 #ifdef BONSAI_HAS_ZBB
 // Zbb clz (v12+ bitstreams). GCC 10.1 knows no Zb*, so the encoding is spelled out:
 // .insn i 0x13, 1, rd, rs1, 0x600 == clz rd, rs1 (0x60059513 for a0, a1). Defined for 0
@@ -1137,11 +1136,10 @@ static int quant8_shift(uint32_t amax)
 // quant8's absmax pass at every norm->x8 site. Returns the quant8 shift like op_quant8_sp;
 // falls back to the two ops when either is off the hardware or the NORM16 row is absent.
 static int op_quant8_sp(uint32_t src, uint32_t dst, int n);
-// fovl (2026-09-02): the norm-weight row fetch that opens every rmsnorm_q8 used to be a
-// blocking engine op between two vector ops (tprof: 4k cycles x 56 per token of glue
-// with both units idle). The caller submits it BEFORE the preceding resid_add so it
-// streams underneath, joins, and flags it; the op then skips its own fetch.
-int fovl_use = 1;
+// The norm-weight row fetch that opens every rmsnorm_q8 used to be a blocking engine op
+// between two vector ops (2026-09-02, tprof: 4k cycles x 56 per token of glue with both
+// units idle). The caller submits it BEFORE the preceding resid_add so it streams
+// underneath, joins, and flags it; the op then skips its own fetch.
 static int rq8_prefetched;
 static uint32_t norm_fetch_submit(const struct bons_entry *w16)
 {
@@ -1154,14 +1152,14 @@ static uint32_t norm_fetch_submit(const struct bons_entry *w16)
 }
 static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
                            uint32_t bmax, uint32_t *amax_io);
-// resid_add with the NEXT norm's weight row streaming underneath (fovl). SP_FET is
+// resid_add with the NEXT norm's weight row streaming underneath. SP_FET is
 // idle here (its last reader, the previous rmsnorm or the qkr list, has finished) and
 // the engine is idle (the preceding matvec/list joined) - same numerics either way.
 static int resid_add_pf(uint32_t src, int esrc, uint32_t d, int ed, int n, uint32_t dmax,
                         uint32_t *xamax, const struct bons_entry *next_w16)
 {
     uint32_t df = 0;
-    int pf = fovl_use && next_w16 && op_on_hw(OP_RMSNORM) && op_on_hw(OP_QUANT8);
+    int pf = next_w16 && op_on_hw(OP_RMSNORM) && op_on_hw(OP_QUANT8);
     if (pf) df = norm_fetch_submit(next_w16);
     perf_enter(OP_RESID_ADD);
     int e = op_resid_add_sp(src, esrc, d, ed, n, dmax, xamax);
@@ -1429,7 +1427,7 @@ static void kv_store_scale_prep(int kvh, int kind, int e8)
     // Only the words that carry a scale change with the exponent - ceil(groups/2) = 2 of
     // 8 on the 1.7B (head_dim 128 -> 4 groups). The other six are constant zero and
     // nothing else ever writes the scale beat, so they are staged once per slot epoch (a
-    // sentinel in kvp_scale_e8: init, vbench) and left alone after: 6 posted stores per
+    // sentinel in kvp_scale_e8 at init) and left alone after: 6 posted stores per
     // exponent change, V changes every layer (2026-09-07, from the external review).
     volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + kvp_slot(kvh, kind));
     int groups = head_dim/32;
@@ -1484,8 +1482,7 @@ static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst);
 // with embed_row_bfp below - bons.py embed_bfp_rows): one 128-beat engine fetch straight
 // into the residual buffer plus one beat for the exponent, instead of ~47k cycles of CPU
 // decode and 1,024 uncached scratchpad stores (2026-09-08). Falls back to the decode when
-// the image predates the table. `embf` toggles it.
-static int embfetch_use = 1;
+// the image predates the table.
 // Both entries resolved once at init (norm16_cache_build): the lookups are HBM-backed
 // table walks, and this runs once per forward.
 static const struct bons_entry *emb16_ent, *emb16x_ent;
@@ -1493,7 +1490,7 @@ static int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
     const struct bons_entry *e16 = emb16_ent;
     const struct bons_entry *ee  = emb16x_ent;
-    if (!embfetch_use || !e16 || !ee || e16->kind != KIND_NORM16 || ee->kind != KIND_NORM16
+    if (!e16 || !ee || e16->kind != KIND_NORM16 || ee->kind != KIND_NORM16
         || (uint32_t)e16->cols != (uint32_t)e->cols || row < 0 || (uint32_t)row >= e16->rows)
         return embed_row_bfp(e, row, sp_dst);
     uint32_t rb  = bons_row_beats(e16->cols, e16->kind, e16->group); // 128 at cols 2048.
@@ -1592,36 +1589,27 @@ static int seq_qkr_di_qn = 0, seq_qkr_di_kn = 1;
 // quant8. The q-side work (rmsnorm_h/rope_h over 16 heads, ~3k cycles) is independent of
 // K/V, so behind the store it absorbs the store's ~1k tail that the stop descriptor used
 // to wait out (16 packets at ~65 cycles of write latency each, per-descriptor trace).
-// Same ops, same numerics. Toggle qkro selects the old order for a same-boot A/B.
-static int qkr_reorder = 1;
-static int qfix_use = 1;     // Console toggle (qfix): scan-free fixed-shift Q quant8.
+// Same ops, same numerics.
 // qkvx (2026-09-09, BONSAI_SEQ_LUT bitstreams): the K chain (rmsnorm_h, rope_h, pack) and
 // the V pack move INTO the qkv list, under the q projection's stream, in v-k-q order; the
 // qkr list keeps the multi-store and the Q chain. What kept them out was rmsnorm's eps -
 // a per-layer constant scaled by the norm shift the sequencer holds in a kreg - which
 // the sequencer now reads from a 32-entry table (seq_desc_vec_lut) the CPU fills per
 // layer under the previous FFN list. Same programs, same eps values: byte-identical.
-// Requires the resident norm rows (qres), the multi-store and the reordered Q chain.
-int        qkvx_use = 1;
+// Requires the resident norm rows, the multi-store and the reordered Q chain.
 static int qkvx_ok  = 0;      // What the built lists use.
 static int qkvx_blocked = 0;  // The 14-descriptor qkv list did not fit: rebuilt without.
 static int seq_qkv_len = 10;
 static int seq_qkv_di_kn = -1;
 #define SP_LUTQ (SP_DESC + 188*64) // 32 x int32 eps for the q norm (descriptor slots
-#define SP_LUTK (SP_LUTQ + 128)    // 188-191, past every list; vbench stays below 188).
+#define SP_LUTK (SP_LUTQ + 128)    // 188-191, past every list).
 // In-list KV stores (probe-1 follow-up, 2026-08-31): each (kvh, kind) staging slot's
 // engine STORE rides the qkr list as a NOWAIT descriptor right after the pack quant8
 // that fills the slot - the next head's quant8 (vec) runs under the store's stream, so
 // the ~9k cycles/layer of serial CPU-dispatched stores hide under vector work the layer
 // does anyway. Needs the scale-beat prep to run BEFORE the list (the store streams the
-// scale beat), which is equally correct in the CPU-store layout. kovl on|off rebuilds
-// the four lists (the attention/FFN/scale8 bases shift with the 2*n_kv_head extras).
-static int kv_pipe = 1;         // Requested (kovl console toggle).
+// scale beat), which is equally correct in the CPU-store layout.
 static int kv_pipe_active = 0;  // What the built list uses.
-// Emit the per-slot KV-pack quant8 descriptors that PROG_KVPACK_H makes redundant (see
-// the loop below). Only useful to A/B the two list shapes in one boot; without LOOPS2
-// there is no kvpack_h descriptor and they are the real thing, so it is forced on.
-static int kvq_redundant = 0;
 // One in-list MULTI-STORE for all 2*n_kv_head slots instead of 16 NOWAIT store ops
 // (2026-09-08): the staging slots are 0x200 B apart and a layer's (kvh, kind) regions
 // kv_region beats apart, so the engine's rep/dstride/sstride store (F1-1) scatters them
@@ -1629,7 +1617,7 @@ static int kvq_redundant = 0;
 // patches -> 1 on the CPU side - and the qkr window is the one where both sides are the
 // long pole within ~850 cycles of each other (qtrace, v11). Needs the multi-store CSR.
 #ifdef CSR_ENGINE_CSR_REP_ADDR
-static int kv_mstore = 1;
+static const int kv_mstore = 1;
 #else
 static const int kv_mstore = 0;
 #endif
@@ -1637,20 +1625,18 @@ static int kv_mstore_active = 0; // What the built list uses.
 static uint8_t seq_kvst_di[32]; // Descriptor index of the store for slot (kvh*2 + kind).
 // What the store descriptors' constant words currently hold (~0 = unknown/rebuilt).
 static uint32_t kvst_rb_set = 0xFFFFFFFFu, kvst_chan_set = 0xFFFFFFFFu;
-extern int qres_use;
-extern int qkvl_use;          // Defined with the other toggles below.
 extern int seq_use;
 static int qkvx_possible(void)
 {
     // The K chain lives inside the qkv list, so qkvx only holds while that list runs:
-    // with `qkvl off` or `seq off` the qkr list (built without the K chain) ran alone,
-    // K was never normed and the q-norm's A6 never patched - a different token than the
-    // default path on the 1.7B (2026-09-14, card_vs_mirror: q16 saturated, k16 raw).
-    return qkvx_use && !qkvx_blocked && qres_use && qkvl_use && seq_use
+    // with `seq off` the qkr list (built without the K chain) ran alone, K was never
+    // normed and the q-norm's A6 never patched - a different token than the default path
+    // on the 1.7B (2026-09-14, card_vs_mirror: q16 saturated, k16 raw).
+    return !qkvx_blocked && seq_use
         && (uint32_t)n_layer*head_dim*2 <= 0x1C00
         && model_entry_kind(ROLE_ATTN_Q_NORM, 0, KIND_NORM16) != 0
         && model_entry_kind(ROLE_ATTN_K_NORM, 0, KIND_NORM16) != 0
-        && kv_pipe && kv_mstore && 2*n_kv_head <= 31 && qkr_reorder && qfix_use;
+        && kv_mstore && 2*n_kv_head <= 31;
 }
 
 static void seq_build_qkr(void)
@@ -1671,10 +1657,6 @@ static void seq_build_qkr(void)
                      (int32_t)(SP_TAB + head_dim), (head_dim/2)/16, (int32_t)SP_Q,
                      head_dim, n_head};
     {
-        if (!qkr_reorder) {
-            seq_qkr_di_qn = (int)di;
-            seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);              // q-norm (A5 patched)
-        }
         int32_t nk[8] = {(int32_t)SP_K, (int32_t)SP_FET2, (int32_t)SP_K, head_dim/16,
                          -ln, 1, 0, n_kv_head};                // A5, A6 patched per layer
         int32_t rk[8] = {(int32_t)SP_K, (int32_t)(SP_K + head_dim), (int32_t)SP_TAB,
@@ -1687,8 +1669,6 @@ static void seq_build_qkr(void)
         if (!qkvx_ok) { // qkvx: the K chain and both packs ride the qkv list instead.
             seq_qkr_di_kn = (int)di;
             seq_desc_vec(di++, PROG_RMSNORM_H, nk, 8, 0);              // k-norm (A5 patched)
-            if (!qkr_reorder)
-                seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);             // q-rope
             seq_desc_vec(di++, PROG_ROPE_H, rk, 8, 0);                 // k-rope
             seq_desc_vec(di++, PROG_KVPACK_H, pk, 8, 0);               // 4: K packs
             seq_desc_vec(di++, PROG_KVPACK_H, pv, 8, 0);               // 5: V packs
@@ -1711,26 +1691,16 @@ static void seq_build_qkr(void)
     // F0-4 (2026-08-29): the 2*n_kv_head fixed-shift KV-pack quant8s ride the same list.
     // K's pack follows K's rope in list order; V is resident before the list runs. The
     // CPU keeps only the scale-beat prep and the kv_ekmax ratchet (kv_pack_prep_res).
-    // An in-list descriptor measures ~50 cycles against ~420 for a CPU vec_run.
-    // The per-slot quant8s above were meant to disappear under BONSAI_VEC_LOOPS2 - the
-    // whole-tensor PROG_KVPACK_H descriptors 4/5 already pack every kv head - but the
-    // `if (0)` that should have guarded this loop landed on the `kv_pipe_active = 0`
-    // statement that was later inserted between it and the loop, so on v8 all 16 ran and
-    // redid work descriptor 4/5 had just done (2026-09-06). Proven redundant in the
-    // interpreter: kvpack_h over n_kv_head heads and the 8 per-slot quant8s leave a
-    // byte-identical scratchpad. The ENGINE STORES in this loop are NOT redundant, which
-    // is why the loop still runs and only the quant8 is skipped.
-    // Note kv_pipe_active must be reset unconditionally: leaving it stale is what made
-    // `kovl off` patch descriptors that had become the attention list's.
+    // An in-list descriptor measures ~50 cycles against ~420 for a CPU vec_run. The
+    // whole-tensor PROG_KVPACK_H descriptors 4/5 pack every kv head; the per-slot quant8s
+    // they replaced are gone (proven redundant in the interpreter: a byte-identical
+    // scratchpad). The ENGINE STORES below are still needed without the multi-store.
+    // Note kv_pipe_active must be reset unconditionally: leaving it stale made a list
+    // rebuild patch descriptors that had become the attention list's.
     kv_pipe_active = 0;
     for (int kvh = 0; kvh < n_kv_head; kvh++)
         for (int kind = 0; kind < 2; kind++) {
-            uint32_t src = (kind ? SP_V : SP_K) + (uint32_t)kvh*head_dim*2;
-            int32_t qargs[4] = {(int32_t)src, 0, (int32_t)(kvp_slot(kvh, kind) + 32),
-                                head_dim/16};                       // A1 = 0: fixed >>8.
-            if (kvq_redundant)
-                seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
-            if (kv_pipe && !kv_mstore && 2*n_kv_head <= 32) {
+            if (!kv_mstore && 2*n_kv_head <= 32) {
                 // NOWAIT store of the slot just packed; wbase/wlen/chan patched per
                 // layer/forward (kv_rb is set after the first build).
                 struct engine_op st = {0};
@@ -1744,7 +1714,7 @@ static void seq_build_qkr(void)
             }
         }
     kv_mstore_active = 0;
-    if (kv_pipe && kv_mstore && 2*n_kv_head <= 31) {
+    if (kv_mstore && 2*n_kv_head <= 31) {
         // ONE NOWAIT multi-store for every slot (see kv_mstore): rep packets, kv_rb beats
         // each, from kvp_slot(0,0) stepping 0x200 B, to kv_region_addr(l,0,0) + rowoff
         // stepping kv_region beats. Word 4 (base) is patched per layer, 5/10 on change.
@@ -1761,35 +1731,27 @@ static void seq_build_qkr(void)
         kv_mstore_active = 1;
         di++;
     }
-    if (qkr_reorder) { // Q chain behind the (NOWAIT) store: absorbs its write-latency tail.
-        seq_qkr_di_qn = (int)di;
-        if (qkvx_ok) { // A5 = LUTQ[sx8 + kreg0], kreg0 captured by the qkv list's q matvec.
-            int32_t nql[8] = {nq[0], nq[1], nq[2], nq[3], nq[4], 0, nq[6], nq[7]};
-            seq_desc_vec_lut(di++, PROG_RMSNORM_H, nql, 8, 0, SP_LUTQ/32, 1);
-        } else
-            seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);              // q-norm (A5 patched)
-        seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                     // q-rope
-    }
+    // Q chain behind the (NOWAIT) store: absorbs its write-latency tail.
+    seq_qkr_di_qn = (int)di;
+    if (qkvx_ok) { // A5 = LUTQ[sx8 + kreg0], kreg0 captured by the qkv list's q matvec.
+        int32_t nql[8] = {nq[0], nq[1], nq[2], nq[3], nq[4], 0, nq[6], nq[7]};
+        seq_desc_vec_lut(di++, PROG_RMSNORM_H, nql, 8, 0, SP_LUTQ/32, 1);
+    } else
+        seq_desc_vec(di++, PROG_RMSNORM_H, nq, 8, 0);                  // q-norm (A5 patched)
+    seq_desc_vec(di++, PROG_ROPE_H, rq, 8, 0);                         // q-rope
     // F0-5: ONE fixed-shift quant8 over all of resident q -> SP_X + 0x1000 (STB
     // post-increments 16 B, so head j lands at +j*head_dim); the attention list's
     // per-head quant8 descriptor is gone and its scores read x from there. The region
     // is dead during attention: softmax p8 lives at SP_X[0, ctx) and nothing else
     // touches SP_X until the FFN quant8 overwrites it.
     {
-        if (qfix_use) {
-            // Fixed shift only (2026-09-08): PROG_QUANT8 with A1 = 0 still runs its absmax
-            // pass over all 128 beats before the fixed >>8 pass, and nothing reads the
-            // absmax it returns here. PROG_KVPACK_H with one "head" is the same LDV / VRNE 8
-            // / VCLAMP8 / STB chain without the scan - byte-identical, half the loads.
-            int32_t fargs[8] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
-                                (n_head*head_dim)/16, 0, 0, 0, 1};
-            seq_desc_vec(di++, PROG_KVPACK_H, fargs, 8, 0);
-        } else
-        {
-            int32_t qargs[4] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
-                                (n_head*head_dim)/16};
-            seq_desc_vec(di++, PROG_QUANT8, qargs, 4, 0);
-        }
+        // Fixed shift only (2026-09-08): PROG_QUANT8 with A1 = 0 still runs its absmax
+        // pass over all 128 beats before the fixed >>8 pass, and nothing reads the
+        // absmax it returns here. PROG_KVPACK_H with one "head" is the same LDV / VRNE 8
+        // / VCLAMP8 / STB chain without the scan - byte-identical, half the loads.
+        int32_t fargs[8] = {(int32_t)SP_Q, 0, (int32_t)(SP_X + 0x1000),
+                            (n_head*head_dim)/16, 0, 0, 0, 1};
+        seq_desc_vec(di++, PROG_KVPACK_H, fargs, 8, 0);
     }
     seq_desc_stop(di++);
     seq_qkr_count = di;
@@ -1848,13 +1810,10 @@ static int seq_attn_base, seq_attn_dph, seq_attn_heads;
 // the spill in list order), and norm(j-1)+softmax8(j) execute under scores(j+1)'s
 // stream. The engine idles only for the ~20-cycle spill instead of spill+norm, and the
 // vector unit fills the scores streams completely. Non-chunked only.
-static int attn_pipe = 1;        // What the NEXT build will use (see attn_pipe_req).
-static int attn_pipe_req = 1;    // Requested (aovl console toggle). attn_list_prep_token
-                                 // clears attn_pipe when the context outgrows the second
-                                 // scores buffer and restores it when it fits again; the
-                                 // request itself must survive that, or one long generation
-                                 // would leave aovl off for every generation after it.
-static int attn_prep_pos = -1;   // Position attn_list_prep_token last ran for (lovl dedup).
+static int attn_pipe = 1;        // What the NEXT build will use. attn_list_prep_token
+                                 // clears it when the context outgrows the second scores
+                                 // buffer and restores it when it fits again.
+static int attn_prep_pos = -1;   // Position attn_list_prep_token last ran for (dedup).
 static int attn_pipe_active = 0; // What the built list uses.
 static int attn_chunk_cap = 0;   // Debug: cap the heads per list (0 = as many as fit).
 // The second scores buffer (odd heads, deep layout) sits at SP_SC + 0x3800 and resident K
@@ -2082,14 +2041,13 @@ static int ffn_shape_base = -1; // seq_ffn_base the FFN engine shape images were
 // identical norm_u 2,133 idle), so norm_g alone filled the window and silu_gate ran after
 // the stream. The v11 result packer (gateware/matvec.py _ResultPacker) removed that
 // throttle - norm_g under the stream is 2,108 on v11 - and the split is now worth
-// -4.07% same-boot (2,477,618 vs 2,582,600 cycles/token, 3 pairs, 2026-09-08). Default ON.
-static int ffn_split = 1;
-static int ffn_di_down = 7; // Down matvec's descriptor (b + 7 fused, b + 8 split).
+// -4.07% same-boot (2,477,618 vs 2,582,600 cycles/token, 3 pairs, 2026-09-08).
+static int ffn_di_down = 7; // Down matvec's descriptor (seq_build_ffn).
 static int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
 static void seq_build_ffn(void)
 {
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
-    int len = ffn_split ? 10 : 9;
+    int len = 10;
     if (di + len > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
@@ -2124,7 +2082,7 @@ static void seq_build_ffn(void)
     int32_t na[5] = {(int32_t)SP_Y, 0, (int32_t)SP_G, ffn_dim/16, 0};
     seq_desc_vec(di + 3, PROG_NORM_I32, na, 5, (uint16_t)(SEQ_SRC_KRES6 << 8));
     int d = di + 4; // Next free descriptor.
-    if (ffn_split) {
+    {
         // 4: silu_gate SP_G -> SP_G in place [A4 = imm + kreg0], still UNDER the up
         //    stream. kreg0 was captured by desc 0 (long done) and the per-register
         //    interlock lets a kreg0 consumer dispatch under kreg1's NOWAIT stream
@@ -2142,18 +2100,11 @@ static void seq_build_ffn(void)
     int32_t nb[5] = {(int32_t)SP_YU, 0, (int32_t)SP_U, ffn_dim/16, 0};
     seq_desc_vec(d, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KRES6 << 8)); // norm_u
     d++;
-    if (ffn_split) {
+    {
         // mul_q8: (silu * up) << A6, clamp, absmax (res6 for the CPU), quant8 -> SP_X.
         int32_t ma[8] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
                          (int32_t)SP_X};
         seq_desc_vec(d, PROG_MUL_Q8, ma, 8, 0);
-    } else {
-        int32_t sa[8] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
-                         (int32_t)SP_X};
-        seq_desc_vec(d, PROG_SILU_Q8, sa, 8, 0);
-        seq_patch(d, 1, (uint32_t)PROG_SILU_Q8 | (1u << (16 + 2*4))); // A4 kreg0 term...
-        seq_patch(d, 0, 2u | (1u << 11)); // ...ADDS (w0[11]): A4 = imm + kg (VSHLS conv).
-        ffn_di_a4 = d - di;
     }
     d++;
     seq_desc_engine(d, &z);                                               // down mv
@@ -2274,7 +2225,7 @@ static void seq_build_qkv(void)
         // toggles with the context), and anything printed between "GEN:" and "GEN DONE"
         // is parsed as token ids by the chat tools - this line's "(14 descriptors)"
         // became a stray "/" (token 14) at the start of replies (2026-09-14). The state
-        // is reported once by infer_init and by the qkvx toggle instead.
+        // is reported once by infer_init instead.
         return;
     }
     seq_desc_engine(di + 0, &z);
@@ -2342,18 +2293,16 @@ static void qkv_prep_layer(int l)
 }
 
 int seq_use = 1;
-// FFN descriptor list: DEFAULT ON since C2-1b/1c (2026-09-01). History, kept because it
+// The FFN descriptor list (since C2-1b/1c, 2026-09-01) - history, kept because it
 // carries two lessons: the list was default-off first for a 1.7B tokens failure (fixed
 // long ago by the silu rewrite) and then because it measured +8.5% SLOWER - but that
 // comparison was never like-for-like (the list ran the UNFUSED silu_mul+quant8 pair
 // while the op path ran the fused silu_q8). With the fused descriptor the same-boot
 // windowed counters read list 12.03M vs ops 14.32M per bench-8 (neither-busy 4% vs 19%)
-// and bench-64 is -2.0%/token. `ffnseq off` selects the op-by-op path.
-int seq_ffn_use = 1;
-// Engine/vec overlap (docs/overlap-design.md): run the FFN up-projection stream UNDER the
-// gate-norm vector program (disjoint regions; gate absmax captured before the submit, so
-// numerics are byte-identical by construction). `ovl off` for same-binary A/B.
-int ovl_use = 1;
+// and bench-64 is -2.0%/token. `seq off` selects the op-by-op path.
+// The op-by-op path overlaps the engine and the vector unit (docs/overlap-design.md): the
+// FFN up-projection stream runs UNDER the gate-norm vector program (disjoint regions; gate
+// absmax captured before the submit, so numerics are byte-identical by construction).
 
 static int seq_at2_base, seq_at2_p1n, seq_at2_p2n, seq_at2_kvchunk;
 static int seq_at2_p1dn, seq_at2_p2dn;
@@ -2470,73 +2419,9 @@ static void attn_seq2_layer(int l, int pos, float *aw_c, float *aw_hmax)
 // softmax block count depend on pos only, and the score-slot padding survives across heads
 // and layers because only the scores op writes SP_SC (exactly cnt slots). Same values as
 // before, written 28x less often - uncached scratchpad stores are ~25-70 cycles each.
-// Console toggle (kovl): the qkr list length changes, so every downstream base shifts.
-void infer_kv_pipe(int on)
+void infer_seq(int on)
 {
-    kv_pipe = on ? 1 : 0;
-    seq_ffn_base = -1;
-    seq_build_qkr();
-    seq_build_attn();
-    seq_build_ffn();
-    seq_build_scale8();
-    seq_build_qkv();
-}
-int infer_kv_pipe_state(void) { return kv_pipe_active; }
-
-// Console toggle (kvq): re-emit the redundant per-slot KV-pack quant8 descriptors. Same
-// base shifts as kovl, so the same five rebuilds.
-void infer_kvq_redundant(int on)
-{
-    kvq_redundant = on ? 1 : 0;
-    seq_ffn_base = -1;
-    seq_build_qkr();
-    seq_build_attn();
-    seq_build_ffn();
-    seq_build_scale8();
-    seq_build_qkv();
-}
-int infer_kvq_redundant_state(void) { return kvq_redundant; }
-
-// Console toggle (kvms): in-list multi-store vs 16 per-slot stores. Same rebuilds as kovl.
-void infer_kv_mstore(int on)
-{
-#ifdef CSR_ENGINE_CSR_REP_ADDR
-    kv_mstore = on ? 1 : 0;
-    seq_ffn_base = -1;
-    seq_build_qkr();
-    seq_build_attn();
-    seq_build_ffn();
-    seq_build_scale8();
-    seq_build_qkv();
-#else
-    (void)on;
-#endif
-}
-int infer_kv_mstore_state(void) { return kv_mstore_active; }
-
-// Console toggle (qkro): qkr list order. Same base shifts as kovl (count unchanged, but
-// the norm indices move), so the same five rebuilds.
-void infer_qkr_reorder(int on)
-{
-    qkr_reorder = on ? 1 : 0;
-    seq_ffn_base = -1;
-    seq_build_qkr();
-    seq_build_attn();
-    seq_build_ffn();
-    seq_build_scale8();
-    seq_build_qkv();
-}
-int infer_qkr_reorder_state(void) { return qkr_reorder; }
-void infer_qfix(int on)
-{
-    qfix_use = on ? 1 : 0;
-    seq_ffn_base = -1;
-    seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
-}
-int infer_qfix_state(void) { return qfix_use; }
-void infer_qkvx(int on)
-{
-    qkvx_use = on ? 1 : 0;
+    seq_use = on ? 1 : 0;
     qkvx_blocked = 0;
     seq_ffn_base = -1;
     seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
@@ -2546,25 +2431,8 @@ void infer_qkvx_report(void)
     if (qkvx_ok)
         puts("qkvx: K chain + V pack in the qkv list (14 descriptors), eps via LUT");
 }
-int infer_qkvx_state(void) { return qkvx_ok; }
-// `qkvl`/`seq` change what the lists must contain (qkvx_possible): rebuild them too.
-void infer_qkvl(int on) { qkvl_use = on ? 1 : 0; infer_qkvx(qkvx_use); }
-void infer_seq(int on)  { seq_use  = on ? 1 : 0; infer_qkvx(qkvx_use); }
-void infer_embfetch(int on) { embfetch_use = on ? 1 : 0; }
-int  infer_embfetch_state(void) { return embfetch_use && emb16_ent != 0; }
 
-// Console toggle (fsplit): same base shifts as the other list toggles.
-void infer_ffn_split(int on)
-{
-    ffn_split = on ? 1 : 0;
-    seq_ffn_base = -1;
-    seq_build_ffn();
-    seq_build_scale8();
-    seq_build_qkv();
-}
-int infer_ffn_split_state(void) { return ffn_split; }
-
-// Console toggle (aovl): rebuild the three dependent lists in either layout.
+// Console `attnchunk N` (debug): cap the heads per attention list, rebuild the lists.
 void infer_attn_chunk(int cap)
 {
     attn_chunk_cap = cap;
@@ -2573,18 +2441,6 @@ void infer_attn_chunk(int cap)
     printf("ATTNCHUNK cap %d: list holds %d of %d heads, pipelined %d\n", cap, seq_attn_heads,
            n_head, attn_pipe_active);
 }
-void infer_attn_pipe(int on)
-{
-    attn_pipe_req = on ? 1 : 0;
-    attn_pipe = attn_pipe_req;
-    seq_ffn_base = -1;
-    seq_build_attn();
-    seq_build_ffn();
-    seq_build_scale8();
-    seq_build_qkv();
-}
-int infer_attn_pipe_state(void) { return attn_pipe_active; }
-
 // Per-layer attention slot patches, extracted so they can run UNDER the qkr list
 // (per-cycle sideband slot): the sequencer is executing qkr descriptors and never
 // dispatches attention ones, so patching them mid-list is safe; every input
@@ -2592,13 +2448,7 @@ int infer_attn_pipe_state(void) { return attn_pipe_active; }
 // started. attn_prepatched tells the attention section its work is already done.
 static int attn_prepatched;
 static int ffn_prepatched;
-int eovl_use = 1; // C2-2: fold head j under the still-running attention list (needs RSLOT).
-int lovl_use = 1; // C2-3: next forward's list prep posts under the LM-head argmax stream.
-int qkvl_use = 1; // QKV projections + norms as one sequencer list (seq_build_qkv).
-int qres_use = 1; // Resident qk-norm rows (SP_QNW/SP_KNW) instead of per-layer fetches.
 static int qkn_resident;   // 1 once every layer's q/k norm rows sit in SP_QNW/SP_KNW.
-int atrace_use;   // Diagnostic: =N traces layer 0's attention list (per-descriptor deltas)
-                  // on the Nth generated token, one-shot, serial folds for that layer.
 // List-relative dcount ("descriptors completed") threshold after which head j's fold
 // inputs (softmax8's AWP8 self-spill and spill(j)'s AWAM) are certainly written: one
 // past norm(j), whose producers are all earlier vec descriptors in the same list.
@@ -2608,7 +2458,7 @@ static inline uint32_t attn_fold_ready(int j, int chunk) {
     return (uint32_t)(1 + (j + 1)*5 + 3);
 }
 // Per-layer FFN list rebuild (three engine descriptors + their flag words), extracted so
-// it can POST under the qkr list in the povl window (all inputs are layer-known: model
+// it can POST under the qkr list (all inputs are layer-known: model
 // entries and static scratchpad addresses; only the silu A4 imm needs ex8 and stays at
 // FFN time). The sequencer-fetch interlock orders these writes before the FFN list runs.
 static inline void ffn_patch_lw(uint32_t di, const struct engine_op *mo)
@@ -2637,7 +2487,6 @@ static void ffn_prep_layer(int l)
     else ffn_patch_lw(b + (uint32_t)ffn_di_down, &mo);
     ffn_shape_base = seq_ffn_base;
 }
-int prep_ovl = 1; // povl console toggle: patch-under-list overlap (needs BONSAI_SP_SB_SLOT).
 static void attn_patch_slots(int l, int h0, int nh, int chunked)
 {
     int lg = 0;
@@ -2671,14 +2520,14 @@ static void attn_list_prep_token(int pos)
     if (seq_attn_heads <= 0)
         return;
     if (pos == attn_prep_pos)
-        return; // Already posted under the previous forward's LM-head stream (lovl).
+        return; // Already posted under the previous forward's LM-head stream.
     int cnt  = pos + 1;
     int padn = SC_PADN(cnt);
     // The deep layout needs the padded score count to fit the second buffer's REAL
     // capacity (SC_B_CAP_BYTES, see above). Beyond it fall back to the plain list, and
     // come back to the deep one as soon as a new generation fits again - both directions
     // shift the FFN/scale8/qkv bases with the prologue, so all four lists rebuild.
-    int want_pipe = attn_pipe_req && SP_SCB2 != 0 && ((uint32_t)(cnt + padn)*4u <= SC_B_CAP_BYTES);
+    int want_pipe = SP_SCB2 != 0 && ((uint32_t)(cnt + padn)*4u <= SC_B_CAP_BYTES);
     if (want_pipe != attn_pipe) {
         attn_pipe = want_pipe;
         seq_ffn_base = -1;
@@ -2708,11 +2557,10 @@ static void attn_list_prep_token(int pos)
 
 static int fold_nrep_sh = 1; // log2(n_head/n_kv_head) when a power of two (set at init).
 // The per-head fold from its two hardware results (softmax8's p8 sum, the AXPY absmax),
-// in whichever form the output projection will consume (ifold_use). ONE producer for
-// both the list path (spilled values, attn_fold_head) and the seq-off op-by-op path:
-// the latter used to fill only the float fold while the consumer read the integer one
-// under the default ifold_use, so `seq off` ran the projection on stale or zero fold
-// state (2026-09-07, from the external review).
+// in the integer form the output projection consumes. ONE producer for both the list
+// path (spilled values, attn_fold_head) and the seq-off op-by-op path: the latter used to
+// fill only a float fold while the consumer read the integer one, so `seq off` ran the
+// projection on stale or zero fold state (2026-09-07, from the external review).
 static void attn_fold_vals(int l, int hh, uint32_t P8, uint32_t am,
                            float *aw_c, float *aw_hmax_p)
 {
@@ -2721,26 +2569,20 @@ static void attn_fold_vals(int l, int hh, uint32_t P8, uint32_t am,
     int Rpre = axpy_rpre_c(P8 ? P8 : 1);
     int k2 = (bitlen32(am) > 14) ? bitlen32(am) - 14 : 0; // == the >16383 scan, via clz.
     int E1 = Rpre - Bv + k2;
-    if (ifold_use) {
-        // Integer emulation of the float32 fold (F1-5): same bits, no soft-float.
-        uint32_t qm; int qe;
-        attn_f32_recip(P8 ? P8 : 1, &qm, &qe);
-        aw_qm[hh] = qm;
-        aw_qe[hh] = qe + E1;
-        uint32_t a = am >> k2;
-        if (a) {
-            uint32_t m2; int e2;
-            attn_f32_mul(a, qm, qe + E1, &m2, &e2);
-            if (!aw_hvalid || e2 > aw_he2 || (e2 == aw_he2 && m2 > aw_hm2)) {
-                aw_hm2 = m2; aw_he2 = e2; aw_hvalid = 1;
-            }
+    // Integer emulation of the float32 fold (F1-5): same bits, no soft-float.
+    uint32_t qm; int qe;
+    attn_f32_recip(P8 ? P8 : 1, &qm, &qe);
+    aw_qm[hh] = qm;
+    aw_qe[hh] = qe + E1;
+    uint32_t a = am >> k2;
+    if (a) {
+        uint32_t m2; int e2;
+        attn_f32_mul(a, qm, qe + E1, &m2, &e2);
+        if (!aw_hvalid || e2 > aw_he2 || (e2 == aw_he2 && m2 > aw_hm2)) {
+            aw_hm2 = m2; aw_he2 = e2; aw_hvalid = 1;
         }
-    } else {
-        float c2 = ldexpf(1.0f/(float)(P8 ? P8 : 1), E1);
-        aw_c[hh] = c2;
-        float hm2 = (float)(am >> k2)*c2;
-        if (hm2 > *aw_hmax_p) *aw_hmax_p = hm2;
     }
+    (void)aw_c; (void)aw_hmax_p;
 }
 static void attn_fold_head(int l, int hh, float *aw_c, float *aw_hmax_p)
 {
@@ -3019,14 +2861,14 @@ embed_done: ;
             const struct bons_entry *evt = model_entry(ROLE_ATTN_V, l);
             perf_enter(OP_NORM_I32);
             int kq, kk2, kv2;
-            // Resident q/k norm rows (qres): one-time fetch of every layer's row. Ahead of
-            // the qkv list since qkvx runs the k-norm INSIDE that list (2026-09-09); the
-            // fetch used to sit in the qkr section below, after the list.
+            // Resident q/k norm rows: one-time fetch of every layer's row. Ahead of the qkv
+            // list since qkvx runs the k-norm INSIDE that list (2026-09-09); the fetch used
+            // to sit in the qkr section below, after the list.
             int qres = 0;
             {
                 const struct bons_entry *qn16r = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
                 const struct bons_entry *kn16r = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
-                qres = qres_use && (uint32_t)n_layer*head_dim*2 <= 0x1C00 && qn16r && kn16r;
+                qres = (uint32_t)n_layer*head_dim*2 <= 0x1C00 && qn16r && kn16r;
             }
             if (qres && !qkn_resident) {
                 for (int ll = 0; ll < n_layer; ll++) {
@@ -3039,7 +2881,7 @@ embed_done: ;
                 }
                 qkn_resident = 1;
             }
-            if (likely(qkvl_use && seq_use && seq_qkv_base >= 0 && op_on_hw(OP_NORM_I32))) {
+            if (likely(seq_use && seq_qkv_base >= 0 && op_on_hw(OP_NORM_I32))) {
                 // One sequencer run for q/k/v + norms (seq_build_qkv). The engine words
                 // were posted under the previous FFN list (or the LM-head stream); the
                 // call below is a no-op then. kq/kk/kv from the spilled absmaxes, the
@@ -3077,7 +2919,7 @@ embed_done: ;
                 kv2 = (bitlen32(av) > 14) ? bitlen32(av) - 14 : 0;
             } else
 #if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
-            if (ovl_use && op_on_hw(OP_NORM_I32)) {
+            if (op_on_hw(OP_NORM_I32)) {
                 cold_path(); // Dead on the card: the qkv list above runs instead.
                 // Overlap: each norm runs UNDER the next projection's stream. Distinct
                 // result buffers inside the SP_Y region (q 16 KB max, then k/v) keep the
@@ -3116,10 +2958,6 @@ embed_done: ;
             ev_res = (E_NORM + sx8) - (int)evt->bias + (int)evt->rshift + kv2;
             perf_exit(OP_NORM_I32);
             perf_enter(OP_QKNORM);
-            uint32_t qt[8]; int qtn = 0;
-            // qtrace piggybacks on the atrace arm: fires at layer 1 one forward early.
-            int qtr = (atrace_use == 1 && l == 1);
-            if (qtr) qt[qtn++] = perf_now();
             const struct bons_entry *qn16 = model_entry_kind(ROLE_ATTN_Q_NORM, l, KIND_NORM16);
             const struct bons_entry *kn16 = model_entry_kind(ROLE_ATTN_K_NORM, l, KIND_NORM16);
             uint32_t dqn = 0;
@@ -3130,18 +2968,12 @@ embed_done: ;
             } else if (qres) {
                 seq_patch((uint32_t)seq_qkr_di_qn, 3, SP_QNW + (uint32_t)l*head_dim*2); // rmsnorm_h A1 (q).
                 seq_patch((uint32_t)seq_qkr_di_kn, 3, SP_KNW + (uint32_t)l*head_dim*2); // rmsnorm_h A1 (k).
-            } else if (fovl_use) {  // fovl: the q-norm row streams under the eps/KV prep below.
+            } else {  // The q-norm row streams under the eps/KV prep below.
                 dqn = norm_fetch_submit(qn16);
-            } else {
-                engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + qn16->chan_base_beats*32,
-                             qn16->chan_len_beats, SP_FET);
-                engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
-                             kn16->chan_len_beats, SP_FET2);
             }
             {
                 // One sequencer run replaces the 2*(n_head+n_kv) per-head dispatches;
                 // only the eps args change per layer (descriptor word 7 = A5).
-                if (qtr) qt[qtn++] = perf_now(); // [1] fetches + entry lookups done.
                 int epq = seq_eps_int(eq_r), epk = seq_eps_int(ek_r);
                 if (!qkvx_ok) { // qkvx: the sequencer reads both from the layer's LUTs,
                                 // and qkv_prep_layer patched both A6s.
@@ -3189,13 +3021,12 @@ embed_done: ;
                     kvst_rb_set   = (uint32_t)kv_rb;
                     kvst_chan_set = chan;
                 }
-                if (fovl_use && !qres) {
+                if (!qres) {
                     engine_join(dqn);
                     engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + kn16->chan_base_beats*32,
                                  kn16->chan_len_beats, SP_FET2);
                 }
-                if (qtr) qt[qtn++] = perf_now(); // [2] kv scale-preps + store patches done.
-                if (likely(prep_ovl && seq_use && seq_attn_heads >= n_head
+                if (likely(seq_use && seq_attn_heads >= n_head
                     && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
                     // Overlap (sideband slot): the attention list's per-layer patches
                     // run while the sequencer executes the qkr list. Without the slot
@@ -3203,21 +3034,12 @@ embed_done: ;
                     seq_list_start(0, seq_qkr_count);
                     attn_patch_slots(l, 0, n_head, 0);
                     attn_prepatched = 1;
-                    if (qtr) qt[qtn++] = perf_now(); // [3] attn_patch_slots done.
-                    if (seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
+                    if (seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
                         && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
                         ffn_prep_layer(l); // C2-1c: the FFN rebuild rides the same window.
                         ffn_prepatched = 1;
                     }
-                    if (qtr) qt[qtn++] = perf_now(); // [4] ffn_prep_layer done.
                     seq_join();
-                    if (qtr) {
-                        qt[qtn++] = perf_now(); // [5] qkr list joined.
-                        printf("QTRACE fetch+kv %lu %lu attnpatch %lu ffnprep %lu join %lu\n",
-                               (unsigned long)(qt[1]-qt[0]), (unsigned long)(qt[2]-qt[1]),
-                               (unsigned long)(qt[3]-qt[2]), (unsigned long)(qt[4]-qt[3]),
-                               (unsigned long)(qt[5]-qt[4]));
-                    }
                 } else
                 seq_run(0, seq_qkr_count);
             }
@@ -3228,7 +3050,7 @@ embed_done: ;
             perf_enter(OP_KVQUANT);
             for (int hh = 0; hh < n_kv_head && !kv_pipe_active; hh++) {
                 // ...the quant8s already ran inside the qkr list (F0-4); prep only.
-                // (With kovl the prep AND the stores already ran with the list.)
+                // (With the in-list stores the prep AND the stores already ran with the list.)
                 kv_pack_prep_res(l, hh, 0, E_NORM);
                 kv_pack_prep_res(l, hh, 1, ev_res);
             }
@@ -3347,30 +3169,8 @@ attn_scores: ;
             // whenever the list holds every head (hh == j); they are re-patched only in
             // the chunked case, where a slot serves several heads.
             int chunked = (seq_attn_heads < n_head);
-            if (unlikely(atrace_use) && l == 0 && !chunked && --atrace_use == 0) {
-                // One-shot per-descriptor wall-clock of the attention list: run it under
-                // seq_run_trace (tight dcount poll, no folds) and fold serially after.
-                // Numerics identical - only this layer's fold overlap is lost.
-                if (!attn_prepatched)
-                    attn_patch_slots(l, 0, n_head, 0);
-                attn_prepatched = 0;
-                uint32_t *const ats = (uint32_t *)BONSAI_ATRACE_BUFFER_ADDR;
-                int an = seq_run_trace((uint32_t)seq_attn_base,
-                                       (uint32_t)attn_list_len(n_head), ats, 192);
-                printf("ATRACE %d marks (deltas):", an);
-                for (int i = 1; i < an; i++)
-                    printf(" %lu", (unsigned long)(ats[i] - ats[i-1]));
-                printf("\n");
-                perf_exit(OP_SCORES);
-                perf_enter(OP_WV);
-                aw_hvalid = 0;
-                for (int hh = 0; hh < n_head; hh++)
-                    attn_fold_head(l, hh, aw_c, &aw_hmax);
-                perf_exit(OP_WV);
-                goto attn_heads_done;
-            }
 #ifdef BONSAI_SP_SB_RSLOT
-            if (likely(eovl_use && !chunked)) {
+            if (likely(!chunked)) {
                 // C2-2: fold head j while heads j+2.. still execute. The read slot lets
                 // the spill reads grant mid-list; dcount ("descriptors completed")
                 // past norm(j) proves j's spills are written. The fold work and the
@@ -3382,10 +3182,6 @@ attn_scores: ;
                 perf_exit(OP_SCORES);
                 perf_enter(OP_WV);
                 aw_hvalid = 0;
-                // etrace: one-shot split of this loop into wait vs fold time (piggybacks
-                // the atrace arm at layer 2, one forward early - like qtrace).
-                int etr = (atrace_use == 1 && l == 2);
-                uint32_t et0 = etr ? perf_now() : 0, et_fold = 0, et_spins = 0;
                 for (int hh = 0; hh < n_head; hh++) {
                     uint32_t ready = attn_fold_ready(hh, n_head), spins = 0;
                     for (;;) {
@@ -3395,19 +3191,11 @@ attn_scores: ;
                             break;
                         if (++spins > 4000000u) break; // seq_join below reports the wedge.
                     }
-                    et_spins += spins;
-                    uint32_t f0 = etr ? perf_now() : 0;
                     attn_fold_head(l, hh, aw_c, &aw_hmax);
-                    if (etr) et_fold += perf_now() - f0;
                 }
                 perf_exit(OP_WV);
                 perf_enter(OP_SCORES);
-                uint32_t j0 = etr ? perf_now() : 0;
                 seq_join();
-                if (etr)
-                    printf("ETRACE loop %lu fold16 %lu spins %lu join %lu\n",
-                           (unsigned long)(j0 - et0), (unsigned long)et_fold,
-                           (unsigned long)et_spins, (unsigned long)(perf_now() - j0));
                 perf_exit(OP_SCORES);
                 goto attn_heads_done;
             }
@@ -3653,20 +3441,9 @@ attn_heads_done: ;
             if (likely(attn_hw)) {
                 perf_enter(OP_QUANT8);
                 ea8 = 0;
-                if (likely(ifold_use)) {
-                    if (aw_hvalid) ea8 = aw_he2 + 24 - 7;   // frexpf exponent of max hm, -7.
-                } else {
-                    if (aw_hmax > 0) { frexpf(aw_hmax, &ea8); ea8 -= 7; }
-                }
+                if (aw_hvalid) ea8 = aw_he2 + 24 - 7;   // frexpf exponent of max hm, -7.
                 for (int hh = 0; hh < n_head; hh++) {
-                    int32_t Mh;
-                    if (likely(ifold_use)) {
-                        Mh = attn_mh_int(aw_qm[hh], aw_qe[hh] + 15 - ea8);
-                    } else {
-                        Mh = (int32_t)lroundf(ldexpf(aw_c[hh], 15 - ea8));
-                        if (Mh > 32767) Mh = 32767;
-                        if (Mh < 0)     Mh = 0;
-                    }
+                    int32_t Mh = attn_mh_int(aw_qm[hh], aw_qe[hh] + 15 - ea8);
                     if (likely(seq_use && seq_scale8_base >= 0)) {
                         seq_patch((uint32_t)(seq_scale8_base + hh), 6, (uint32_t)Mh);
                         continue;                       // One list run below (F0-6).
@@ -3707,7 +3484,7 @@ attn_heads_done: ;
                                                 n_embd, SP_H, SP_X);
             dbg_sum("ffn_x8", l, SP_X, n_embd, ex8);
 
-            if (likely(seq_use && seq_ffn_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
+            if (likely(seq_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
                 && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8))) {
                 // One list for gate->norm->up->norm->silu->quant8->down (see seq_build_ffn).
                 // Whole-list time is charged to OP_SILU_MUL: per-op shares are documented as
@@ -3732,7 +3509,7 @@ attn_heads_done: ;
                     perf_ovl_acc(fprof_acc_list); fprof_nlist++;
                 } else {
                     seq_list_start((uint32_t)seq_ffn_base, (uint32_t)seq_ffn_len);
-                    if (likely(qkvl_use) && l + 1 < n_layer)
+                    if (l + 1 < n_layer)
                         qkv_prep_layer(l + 1); // Next layer's projections, under this stream.
                     seq_join();
                 }
@@ -3768,7 +3545,7 @@ attn_heads_done: ;
             if (unlikely(fprof_use) && l == 0 && fprof_nsteps < 8) fprof_steps[fprof_nsteps++] = perf_now();
             int kg;
 #if defined(CSR_ENGINE_CSR_ABSMAX_ADDR)
-            if (ovl_use && op_on_hw(OP_NORM_I32)) {
+            if (op_on_hw(OP_NORM_I32)) {
                 // Overlap: the up stream runs UNDER the gate norm. Gate absmax is read
                 // BEFORE the submit (the tracker resets on accept); regions are disjoint
                 // (up: SP_X -> SP_YU, norm: SP_Y -> SP_G). Same kg, same program, same
@@ -3869,10 +3646,9 @@ attn_heads_done: ;
                 nc++;
             }
         }
-        if (likely(lovl_use && seq_use)) {   // the same next-token prep the greedy path posts
+        if (likely(seq_use)) {   // the same next-token prep the greedy path posts
             attn_list_prep_token(n_pos);
-            if (likely(qkvl_use))
-                qkv_prep_layer(0);
+            qkv_prep_layer(0);
         }
         perf_exit(OP_LMHEAD);
         if (unlikely(tprof_active))
@@ -3904,15 +3680,14 @@ attn_heads_done: ;
         op.xsrc   = SP_X;
         op.dst    = SP_Y;
         op.supw   = 1;
-        if (likely(lovl_use && seq_use)) {
+        if (likely(seq_use)) {
             // C2-3: the next forward's per-token list prep (score padding + the
             // rowsw/wlen/blocks patches) depends only on the position, never on the
             // token this argmax is about to pick - post it under the argmax stream.
             // supw=1 leaves the W port idle, so the posted writes drain freely.
             uint32_t dl = engine_submit(&op);
             attn_list_prep_token(n_pos);
-            if (likely(qkvl_use))
-                qkv_prep_layer(0);   // Next forward's layer-0 projections ride here too.
+            qkv_prep_layer(0);   // Next forward's layer-0 projections ride here too.
             engine_join(dl);
         } else
         engine_run(&op);
@@ -4047,9 +3822,8 @@ int infer_init(void)
 
     if (hybrid_present()) {
         // The hybrid models run on their own CPU path (hybrid.c) - none of the Qwen3
-        // lists, caches or resident regions below apply. The embedding must come from the
-        // restored emb16 rows, so the fetch path is forced on.
-        embfetch_use = 1;
+        // lists, caches or resident regions below apply. The embedding comes from the
+        // restored emb16 rows (embed_row_fetch).
         emb16_ent  = model_entry(ROLE_TOK_EMB16, 0);
         emb16x_ent = model_entry(ROLE_TOK_EMB16_EXP, 0);
         max_ctx = H->max_ctx;
@@ -4208,230 +3982,6 @@ int infer_init(void)
         }
     }
     return 0;
-}
-
-// Microbenchmark: time each stage of the stack in isolation, so "where do the cycles go"
-// is measured on the card instead of argued about. Run after hdrload.
-void infer_vbench(void)
-{
-    if (!n_layer) { puts("vbench: run hdrload first"); return; }
-    uint32_t t0, dt;
-    printf("VB clk=%d MHz  (cycles, avg over reps)\n",
-           (int)(CONFIG_CLOCK_FREQUENCY/1000000));
-
-    { // Vec dispatch floor: smallest real program run (resid_add, 1 beat).
-        int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 1, 0, -1};
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++) vec_run(PROG_RESID_ADD, a, 6);
-        dt = perf_now() - t0;
-        printf("VB vec_1beat        %8lu\n", (unsigned long)(dt/16));
-    }
-    { // Uncached scratchpad word stores: the cost of every seq_patch / scale-prep write.
-        volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_FET);
-        t0 = perf_now();
-        for (int i = 0; i < 64; i++) pw[i] = (uint32_t)i;
-        dt = perf_now() - t0;
-        printf("VB sp_write_64w     %8lu  (per store %lu)\n", (unsigned long)dt,
-               (unsigned long)(dt/64));
-    }
-    { // One-descriptor sequencer list (spill): the in-list dispatch floor.
-        int32_t pa = (int32_t)SP_FET;
-        seq_desc_vec(187, PROG_SPILL, &pa, 1, 0);
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++) seq_run(187, 1);
-        dt = perf_now() - t0;
-        printf("VB seq_1desc        %8lu\n", (unsigned long)(dt/16));
-    }
-    { // In-list per-descriptor cost: 32 one-beat resid_adds vs 1 (2026-09-09). Uses the
-      // top of the descriptor region; nothing is running. The difference over 31 is the
-      // sequencer fetch/dispatch plus the vector unit's fixed per-program cost.
-        int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 1, 0, -1};
-        for (int i = 0; i < 32; i++) seq_desc_vec((uint32_t)(150 + i), PROG_RESID_ADD, a, 6, 0);
-        seq_desc_stop(182);
-        uint32_t t1;
-        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(181, 2); t1 = perf_now() - t0;
-        t0 = perf_now(); for (int i = 0; i < 8; i++) seq_run(150, 33); dt = perf_now() - t0;
-        printf("VB seq_desc_step    %8lu  (list of 32: %lu, of 1: %lu)\n",
-               (unsigned long)((dt - t1)/(8*31)), (unsigned long)(dt/8), (unsigned long)(t1/8));
-        seq_build_qkr(); seq_build_attn(); seq_build_ffn(); seq_build_scale8(); seq_build_qkv();
-    }
-    { // KV scale-beat prep with a forced exponent change every call.
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++) kv_store_scale_prep(0, 0, (i & 1) ? -20 : -21);
-        dt = perf_now() - t0;
-        kvp_scale_e8[0] = -9999; // Leave the slot marked stale for the next real pack.
-        printf("VB scale_prep       %8lu\n", (unsigned long)(dt/16));
-    }
-    { // Vec throughput: resid_add over n_embd (128 beats, ~1.3k instructions).
-        int32_t a[6] = {(int32_t)SP_H, (int32_t)SP_D, (int32_t)SP_H, 128, 0, -1};
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++) vec_run(PROG_RESID_ADD, a, 6);
-        dt = perf_now() - t0;
-        printf("VB vec_resid_128b   %8lu\n", (unsigned long)(dt/16));
-    }
-    { // Engine fetch: 128 beats from channel 0 (per-op latency + short stream).
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++)
-            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE, 128, SP_FET);
-        dt = perf_now() - t0;
-        printf("VB fetch_128b       %8lu\n", (unsigned long)(dt/16));
-    }
-    { // Engine fetch: 1 beat (pure per-op overhead + HBM latency).
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++)
-            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE, 1, SP_FET);
-        dt = perf_now() - t0;
-        printf("VB fetch_1b         %8lu\n", (unsigned long)(dt/16));
-    }
-    { // Long single-channel fetch: sustained per-beat read rate of ONE port. The 8-channel
-      // matvec streams run at ~4.6 cycles/beat with zero AR stalls; if one port alone
-      // sustains ~1 cycle/beat the loss is contention in the HBM AXI switch, if one port
-      // alone is also slow it is a per-port burst-gap problem.
-        t0 = perf_now();
-        for (int i = 0; i < 4; i++)
-            engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE, 512, SP_Y); // 16 KB into SP_Y.
-        dt = perf_now() - t0;
-        printf("VB fetch_512b       %8lu  (%lu.%02lu cyc/beat)\n", (unsigned long)(dt/4),
-               (unsigned long)(dt/4/512), (unsigned long)((dt/4*100/512) % 100));
-    }
-    { // rmsnorm, staged: the op is fetch + eps glue + one vec program.
-        const struct bons_entry *an = model_entry_kind(ROLE_ATTN_NORM, 0, KIND_NORM16);
-        t0 = perf_now();
-        for (int i = 0; i < 8; i++)
-            op_rmsnorm_sp(SP_XR, -15, attn_norm[0], an, n_embd, SP_H);
-        dt = perf_now() - t0;
-        printf("VB rmsnorm_full     %8lu\n", (unsigned long)(dt/8));
-        if (an) {
-            t0 = perf_now();
-            for (int i = 0; i < 8; i++)
-                engine_fetch(0, BONSAI_CHAN_WEIGHT_BASE + an->chan_base_beats*32,
-                             an->chan_len_beats, SP_FET);
-            dt = perf_now() - t0;
-            printf("VB rmsnorm_fetch    %8lu  (%lu beats)\n",
-                   (unsigned long)(dt/8), (unsigned long)an->chan_len_beats);
-            int eps_int = (int)lroundf(H->rms_eps*ldexpf(1.0f, -2*(-15)));
-            if (eps_int < 1) eps_int = 1;
-            int ln = 0;
-            while ((1 << ln) < n_embd) ln++;
-            int32_t a[7] = {(int32_t)SP_XR, (int32_t)SP_FET, (int32_t)SP_H, n_embd/16,
-                            -ln, eps_int, w16_shift(an)};
-            t0 = perf_now();
-            for (int i = 0; i < 8; i++) vec_run(PROG_RMSNORM, a, 7);
-            dt = perf_now() - t0;
-            printf("VB rmsnorm_vecrun   %8lu\n", (unsigned long)(dt/8));
-        }
-    }
-    { // Big weight stream: ffn_gate matvec (the shape the token loop lives in), with the
-      // per-channel stream counters around it: AR-stall cycles say whether the HBM side
-      // limits, near-zero everywhere says the engine's own drain does.
-        const struct bons_entry *eg = model_entry(ROLE_FFN_GATE, 0);
-        uint32_t b0[32], a0[32];
-        uint32_t r0[32];
-        for (int c = 0; c < n_ch && c < 32; c++) {
-            engine_csr_perf_chan_write(c);
-            b0[c] = engine_csr_perf_beats_read();
-            a0[c] = engine_csr_perf_ar_read();
-            r0[c] = engine_csr_perf_r_read();
-        }
-        t0 = perf_now();
-        for (int i = 0; i < 4; i++) model_matvec(eg, SP_X, SP_Y);
-        dt = perf_now() - t0;
-        printf("VB matvec_gate      %8lu  (%lu beats/chan)\n",
-               (unsigned long)(dt/4), (unsigned long)eg->chan_len_beats);
-        for (int c = 0; c < n_ch && c < 32; c += 4) {
-            engine_csr_perf_chan_write(c);
-            printf("VB   ch%d beats %lu arstall %lu rstall %lu\n", c,
-                   (unsigned long)((engine_csr_perf_beats_read() - b0[c])/4),
-                   (unsigned long)((engine_csr_perf_ar_read()   - a0[c])/4),
-                   (unsigned long)((engine_csr_perf_r_read()    - r0[c])/4));
-        }
-    }
-    { // Small weight stream: attn_q matvec.
-        const struct bons_entry *eq = model_entry(ROLE_ATTN_Q, 0);
-        t0 = perf_now();
-        for (int i = 0; i < 8; i++) model_matvec(eq, SP_X, SP_Y);
-        dt = perf_now() - t0;
-        printf("VB matvec_q         %8lu  (%lu beats/chan)\n",
-               (unsigned long)(dt/8), (unsigned long)eq->chan_len_beats);
-    }
-    { // KV store: the pair the token loop runs 448 times per forward (kvquant is 16% of it).
-      // Split so the engine STORE and the vec quant8 that feeds it are separated - the whole
-      // pair measures ~8.5k cycles in `stats` and only ~3.6k of that is accounted for by the
-      // op floor plus the pack, so the remainder has to be named before it can be attacked.
-        int32_t qa[4] = {(int32_t)SP_K, 0, (int32_t)(SP_KVP + 32), head_dim/16};
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++) vec_run(PROG_QUANT8, qa, 4);
-        dt = perf_now() - t0;
-        printf("VB kv_pack_quant8   %8lu\n", (unsigned long)(dt/16));
-
-        struct engine_op op = {0};
-        op.kind  = ENGINE_KIND_STORE;
-        op.chan  = 0;
-        op.wbase = kv_region_addr(0, 0, 0);
-        op.wlen  = kv_rb;
-        op.xsrc  = kvp_slot(0, 0);
-        t0 = perf_now();
-        for (int i = 0; i < 16; i++) engine_run(&op);
-        dt = perf_now() - t0;
-        printf("VB kv_store_1region %8lu\n", (unsigned long)(dt/16));
-
-        // Faithful to the token loop: 16 stores spread over the (kvh, kind) regions of a
-        // layer, not the same address 16 times. If this is much dearer than the single-region
-        // loop, the cost is in the scatter (row/bank behaviour), not the op.
-        t0 = perf_now();
-        for (int h = 0; h < n_kv_head; h++)
-            for (int kind = 0; kind < 2; kind++) {
-                op.wbase = kv_region_addr(0, h, kind);
-                op.xsrc  = kvp_slot(h, kind);
-                engine_run(&op);
-            }
-        dt = perf_now() - t0;
-        printf("VB kv_store_layer   %8lu  (%d stores)\n",
-               (unsigned long)dt, 2*n_kv_head);
-
-        // The token loop ALTERNATES pack/store; the two loops above run them in phases. The
-        // vector unit and the engine share the scratchpad port, so alternating may cost
-        // arbitration that phase-separated batches do not. Same 16 pairs either way, so the
-        // difference is the interleaving alone.
-        t0 = perf_now();
-        for (int h = 0; h < n_kv_head; h++)
-            for (int kind = 0; kind < 2; kind++) {
-                int32_t qq[4] = {(int32_t)((kind ? SP_V : SP_K) + (uint32_t)h*head_dim*2), 0,
-                                 (int32_t)(kvp_slot(h, kind) + 32), head_dim/16};
-                vec_run(PROG_QUANT8, qq, 4);
-                op.wbase = kv_region_addr(0, h, kind);
-                op.xsrc  = kvp_slot(h, kind);
-                engine_run(&op);
-            }
-        dt = perf_now() - t0;
-        printf("VB kv_pair_alt      %8lu  (%d pack+store pairs, interleaved)\n",
-               (unsigned long)dt, 2*n_kv_head);
-    }
-    { // perf_now itself (measurement overhead per probe pair).
-        t0 = perf_now();
-        for (int i = 0; i < 64; i++) (void)perf_now();
-        dt = perf_now() - t0;
-        printf("VB perf_now         %8lu\n", (unsigned long)(dt/64));
-    }
-    { // CSR write cost by bank: engine op field vs timer vs a scratchpad posted word.
-        t0 = perf_now();
-        for (int i = 0; i < 64; i++) engine_csr_rows_write((uint32_t)(i & 1));
-        dt = perf_now() - t0;
-        printf("VB csr_wr_engine    %8lu\n", (unsigned long)(dt/64));
-        t0 = perf_now();
-        for (int i = 0; i < 64; i++) timer0_load_write(0xFFFFFFFFu - (uint32_t)(i & 1));
-        dt = perf_now() - t0;
-        printf("VB csr_wr_timer     %8lu\n", (unsigned long)(dt/64));
-        t0 = perf_now();
-        for (int i = 0; i < 64; i++) (void)engine_csr_status_read();
-        dt = perf_now() - t0;
-        printf("VB csr_rd_engine    %8lu\n", (unsigned long)(dt/64));
-        t0 = perf_now();
-        for (int i = 0; i < 64; i++) (void)seq_status_read();
-        dt = perf_now() - t0;
-        printf("VB csr_rd_seq       %8lu\n", (unsigned long)(dt/64));
-    }
-    puts("VB done");
 }
 
 static int gen_stop[INFER_STOP_MAX], gen_nstop;

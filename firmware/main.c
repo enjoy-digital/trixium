@@ -166,17 +166,10 @@ static void help(void)
     puts("engreset        - soft reset of the engine cluster (automatic after a stall)");
     puts("wedge           - stall the engine on purpose, recover, rerun the self-test");
     puts("dbg [n]         - checksum the next n forwards' intermediates (vs the Python mirror)");
-    puts("vbench          - stage-by-stage cycle microbenchmark");
-    puts("Experiment toggles (all `name on|off`, each printing its state; defaults ship):");
-    puts("  ffnseq fsplit     - FFN as one sequencer list; SiLU split under the up stream");
-    puts("  qkvl qkvx qkro    - QKV projections as a list; K chain inside it; Q chain last");
-    puts("  qfix kvms kvq     - fixed-shift Q quant8; one KV multi-store; redundant KV quant8");
-    puts("  aovl kovl povl lovl eovl ovl fovl - overlap windows (attention, KV, patches,");
-    puts("                      LM head, early fold, op-by-op norms, norm-row prefetch)");
-    puts("  qres ifold embf sbdrain - resident qk-norm rows; integer folds; int16 embedding");
-    puts("                      table; sideband drain-at-start (needs the sbmode CSR)");
-    puts("  fprof tprof atrace engdiag - profiling: FFN windows, token timeline, attention");
-    puts("                      list trace (atrace N arms), engine diagnostics");
+    puts("Hardware/reference toggles (`name on|off`, each printing its state): the unit");
+    puts("or list path (default where the bitstream has it) vs its CPU reference:");
+    puts("  resident silu dnres dnstream attnstream hwargmax (and seq above)");
+    puts("  fprof tprof engdiag - profiling: FFN windows, token timeline, engine diagnostics");
 }
 
 static void hwops_cmd(char *args)
@@ -692,63 +685,6 @@ static void console_service(void)
     }
     else if (strcmp(token, "bench") == 0)
         bench_cmd(str);
-    else if (strcmp(token, "ffnseq") == 0) {
-        extern int seq_ffn_use;
-        if (strncmp(str, "on", 2) == 0)  seq_ffn_use = 1;
-        if (strncmp(str, "off", 3) == 0) seq_ffn_use = 0;
-        printf("FFNSEQ %s (whole-layer FFN list; default on since C2-1c)\n",
-               seq_ffn_use ? "on" : "off");
-    }
-    else if (strcmp(token, "povl") == 0) {
-        extern int prep_ovl;
-        if (strncmp(str, "on", 2) == 0)  prep_ovl = 1;
-        if (strncmp(str, "off", 3) == 0) prep_ovl = 0;
-        printf("POVL %s (attention patches under the qkr list)\n", prep_ovl ? "on" : "off");
-    }
-    else if (strcmp(token, "eovl") == 0) {
-        extern int eovl_use;
-        if (strncmp(str, "on", 2) == 0)  eovl_use = 1;
-        if (strncmp(str, "off", 3) == 0) eovl_use = 0;
-        printf("EOVL %s (fold heads under the running attention list)\n",
-               eovl_use ? "on" : "off");
-    }
-    else if (strcmp(token, "qres") == 0) {
-        extern int qres_use;
-        if (strncmp(str, "on", 2) == 0)  qres_use = 1;
-        if (strncmp(str, "off", 3) == 0) qres_use = 0;
-        printf("QRES %s (resident qk-norm rows)\n", qres_use ? "on" : "off");
-    }
-    else if (strcmp(token, "fovl") == 0) {
-        extern int fovl_use;
-        if (strncmp(str, "on", 2) == 0)  fovl_use = 1;
-        if (strncmp(str, "off", 3) == 0) fovl_use = 0;
-        printf("FOVL %s (norm-row fetches under resid_add / KV prep)\n", fovl_use ? "on" : "off");
-    }
-    else if (strcmp(token, "qkvl") == 0) {
-        extern int qkvl_use;
-        if (strncmp(str, "on", 2) == 0)  infer_qkvl(1);
-        if (strncmp(str, "off", 3) == 0) infer_qkvl(0);
-        printf("QKVL %s (q/k/v projections + norms as one sequencer list)\n",
-               qkvl_use ? "on" : "off");
-    }
-    else if (strcmp(token, "sbdrain") == 0) {
-        if (!seq_sbmode_available())
-            puts("SBDRAIN unsupported on this bitstream (no sbmode CSR)");
-        else {
-            if (strncmp(str, "on", 2) == 0)  seq_sbmode_set(1);
-            if (strncmp(str, "off", 3) == 0) seq_sbmode_set(0);
-            printf("SBDRAIN %s (%s)\n", seq_sbdrain_use ? "on" : "off",
-                   seq_sbdrain_use ? "posted patches drained at list start only"
-                                   : "legacy: descriptor fetch stalls on any posted write");
-        }
-    }
-    else if (strcmp(token, "lovl") == 0) {
-        extern int lovl_use;
-        if (strncmp(str, "on", 2) == 0)  lovl_use = 1;
-        if (strncmp(str, "off", 3) == 0) lovl_use = 0;
-        printf("LOVL %s (next-token list prep under the LM-head stream)\n",
-               lovl_use ? "on" : "off");
-    }
     else if (strcmp(token, "fprof") == 0) {
         extern int fprof_use; extern void fprof_reset(void), fprof_print(void);
         if (strncmp(str, "on", 2) == 0)  { fprof_use = 1; fprof_reset(); }
@@ -770,80 +706,6 @@ static void console_service(void)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
     }
-    else if (strcmp(token, "atrace") == 0) {
-        extern int atrace_use;
-        int n = parse_int(str);
-        atrace_use = n > 0 ? n : 1;
-        printf("ATRACE armed: layer 0 of generated token #%d traces per-descriptor\n",
-               atrace_use);
-    }
-    else if (strcmp(token, "kovl") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_kv_pipe(1);
-        if (strncmp(str, "off", 3) == 0) infer_kv_pipe(0);
-        printf("KOVL %s (in-list NOWAIT KV stores under the pack quant8s)\n",
-               infer_kv_pipe_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "fsplit") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_ffn_split(1);
-        if (strncmp(str, "off", 3) == 0) infer_ffn_split(0);
-        printf("FSPLIT %s (gate-only SiLU under the up stream; mul+quant8 after)\n",
-               infer_ffn_split_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "embf") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_embfetch(1);
-        if (strncmp(str, "off", 3) == 0) infer_embfetch(0);
-        printf("EMBF %s (embedding row fetched pre-dequantized)\n",
-               infer_embfetch_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "qkvx") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_qkvx(1);
-        if (strncmp(str, "off", 3) == 0) infer_qkvx(0);
-        printf("QKVX %s (K chain and V pack inside the qkv list, eps via LUT)\n",
-               infer_qkvx_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "qfix") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_qfix(1);
-        if (strncmp(str, "off", 3) == 0) infer_qfix(0);
-        printf("QFIX %s (scan-free fixed-shift Q quant8)\n", infer_qfix_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "qkro") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_qkr_reorder(1);
-        if (strncmp(str, "off", 3) == 0) infer_qkr_reorder(0);
-        printf("QKRO %s (qkr list: Q chain behind the KV store)\n",
-               infer_qkr_reorder_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "kvms") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_kv_mstore(1);
-        if (strncmp(str, "off", 3) == 0) infer_kv_mstore(0);
-        printf("KVMS %s (one in-list multi-store for all KV slots vs 16 stores)\n",
-               infer_kv_mstore_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "kvq") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_kvq_redundant(1);
-        if (strncmp(str, "off", 3) == 0) infer_kvq_redundant(0);
-        printf("KVQ %s (per-slot KV-pack quant8s; kvpack_h already does them)\n",
-               infer_kvq_redundant_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "aovl") == 0) {
-        if (strncmp(str, "on", 2) == 0)  infer_attn_pipe(1);
-        if (strncmp(str, "off", 3) == 0) infer_attn_pipe(0);
-        printf("AOVL %s (pipelined attention list: next head's scores stream under softmax)\n",
-               infer_attn_pipe_state() ? "on" : "off");
-    }
-    else if (strcmp(token, "ifold") == 0) {
-        extern int ifold_use;
-        if (strncmp(str, "on", 2) == 0)  ifold_use = 1;
-        if (strncmp(str, "off", 3) == 0) ifold_use = 0;
-        printf("IFOLD %s (integer emulation of the per-head float fold)\n",
-               ifold_use ? "on" : "off");
-    }
-    else if (strcmp(token, "ovl") == 0) {
-        extern int ovl_use;
-        if (strncmp(str, "on", 2) == 0)  ovl_use = 1;
-        if (strncmp(str, "off", 3) == 0) ovl_use = 0;
-        printf("OVL %s (engine/vec overlap - off serializes for A/B)\n",
-               ovl_use ? "on" : "off");
-    }
     else if (strcmp(token, "seq") == 0) {
         if (strncmp(str, "on", 2) == 0)
             infer_seq(1);
@@ -859,11 +721,6 @@ static void console_service(void)
         printf("DNPIPE %s (DeltaNet head state store/fetch under the CPU's head work)\n",
                dn_pipe_use ? "on" : "off");
     }
-    else if (strcmp(token, "xres") == 0) {
-        if (strncmp(str, "on", 2) == 0)  hybrid_xres_enable(1);
-        if (strncmp(str, "off", 3) == 0) hybrid_xres_enable(0);
-        printf("XRES %s (the residual stream and its norms resident)\n", hybrid_xres_enabled() ? "on" : "off");
-    }
     else if (strcmp(token, "lmcheck") == 0) {
         hybrid_lm_check();
     }
@@ -871,12 +728,6 @@ static void console_service(void)
         uint32_t rows = (uint32_t)strtoul(str, NULL, 0);
         hybrid_lm_chunk(rows);
         printf("LMCHUNK %lu (LM head list chunk cap in rows, 0 = automatic)\n", (unsigned long)rows);
-    }
-    else if (strcmp(token, "prefetch") == 0) {
-        if (strncmp(str, "on", 2) == 0)  hybrid_prefetch_enable(1);
-        if (strncmp(str, "off", 3) == 0) hybrid_prefetch_enable(0);
-        printf("PREFETCH %s (run-ahead weight reads: recorded on the next forward with logits)\n",
-               hybrid_prefetch_enabled() ? "on" : "off");
     }
     else if (strcmp(token, "hwargmax") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
@@ -930,8 +781,6 @@ static void console_service(void)
     }
     else if (strcmp(token, "hdrload") == 0)
         hdrload();
-    else if (strcmp(token, "vbench") == 0)
-        infer_vbench();
     else if (strlen(token))
         puts("unknown command");
     printf("bonsai> ");
