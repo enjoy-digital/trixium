@@ -314,7 +314,8 @@ class FloatModel:
             # The DeltaNet output is tiled [hd, nk, rep] (v head h = k head h % nk); the
             # fold used the grouped order [hd, rep, nk] (the rep value heads of one key head
             # adjacent), so permute before the rotation. The 16-channel firmware writes
-            # head outputs in grouped order directly (docs/units.md, DeltaNet recurrence arithmetic).
+            # head outputs in grouped order directly (docs/units.md, DeltaNet recurrence
+            # arithmetic).
             hd, nk = cfg.dn_v_head_dim, cfg.dn_num_k_heads
             rep = cfg.dn_num_v_heads//nk
             x = x.reshape(*x.shape[:-1], rep, nk, hd).swapaxes(-3, -2).reshape(x.shape)
