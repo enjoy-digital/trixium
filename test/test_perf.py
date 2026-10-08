@@ -104,7 +104,7 @@ static inline void timer0_reload_write(uint32_t v) { (void)v; }
     if mode != "absent":
         header += "#define CSR_TRIXIUM_ENGINE_CSR_CYC_TOTAL_ADDR 1\n#define CSR_TRIXIUM_ENGINE_CSR_CYC_ENG_ADDR 1\n"
         for i, name in enumerate(NAMES):
-            header += (f"static inline uint32_t engine_csr_cyc_{name}_read(void) "
+            header += (f"static inline uint32_t trixium_engine_csr_cyc_{name}_read(void) "
                        f"{{ return (uint32_t)test_live[{i}]; }}\n")
     else:
         flags.append("-DTEST_NO_COUNTERS")
@@ -117,7 +117,7 @@ static inline void trixium_engine_csr_perf_snapshot_write(uint32_t v) {
 }
 """
         for i, name in enumerate(NAMES):
-            header += (f"static inline uint64_t engine_csr_snap_{name}_read(void) "
+            header += (f"static inline uint64_t trixium_engine_csr_snap_{name}_read(void) "
                        f"{{ return test_snap[{i}]; }}\n")
     (generated / "csr.h").write_text(header)
     exe = tmp_path / "perf_test"
