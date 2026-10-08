@@ -6,21 +6,20 @@
 
 """EngineResetDomain: the soft-resettable clock domain the engine cluster runs in.
 
-`eng` is the `sys` clock with a reset the firmware can pulse (the `engreset` CSR): the
+`eng` is the `sys` clock with a reset the firmware can pulse (the engine soft-reset CSR): the
 matvec engine, the loader (whose per-channel writers carry the engine's KV stores), the
 sequencer and the vector unit are instantiated under `ClockDomainsRenamer("eng")`. Their
-HBM ports go through one AXIResetShim each (axi_shim.py), which keeps the AXI protocol whole
-while they reset and reports when a port cannot be drained. The scratchpad, the CSR front
-and the SoC stay in `sys`: the vector programs and the descriptor lists live in memories
-that a reset does not touch, so the firmware needs no re-upload afterwards.
+memory ports go through one AXIResetShim each, which keeps the AXI protocol whole while they
+reset and reports when a port cannot be drained. The scratchpad, the CSR front and the SoC stay
+in `sys`: the vector programs and the descriptor lists live in memories that a reset does not
+touch, so the firmware needs no re-upload afterwards.
 
-Why: a wedged op (a stalled sequencer, a fetch of a row that does not exist) used to cost an
-FPGA reconfigure and a host warm reboot (~2.5 min, and the weights re-uploaded). Now it is
-a CSR write, a few microseconds of drain, and the console is back (2026-09-15).
+A wedged op (a stalled sequencer, a fetch of a row that does not exist) thus costs a CSR write
+and a few microseconds of drain instead of an FPGA reconfigure.
 """
 
-from functools import reduce
 from operator import or_
+from functools import reduce
 
 from migen import *
 
@@ -28,15 +27,13 @@ from litex.gen import *
 
 from trixium.memory.axi import AXIResetShim
 
-# EngineResetDomain --------------------------------------------------------------------------
+# Engine Reset Domain ------------------------------------------------------------------------------
 
 class EngineResetDomain(LiteXModule):
     def __init__(self, axis, hold_cycles=64, stuck_cycles=1 << 20):
         self.cd_eng  = ClockDomain("eng")
-        # This register implements its own reset equation below. Migen's
-        # ordinary sys reset insertion would otherwise append eng_rst <= 0,
-        # overriding eng_rst <= sys_rst | holding exactly while sys_rst is high.
-        # Keep the registered high-fanout reset, but do not reset its flop low.
+        # The reset register implements its own reset equation below: Migen's sys reset
+        # insertion would append eng_rst <= 0 and override eng_rst <= sys_rst | holding.
         self.cd_eng.rst.reset_less = True
         self.trigger = Signal()      # One-cycle pulse: start a soft reset.
         self.holding = Signal()      # The reset is asserted (hold_cycles after trigger).

@@ -6,17 +6,16 @@
 
 """Sequencer: hardware execution of descriptor lists (engine/vector/rotation ops).
 
-Op dispatch from the CPU costs ~1k cycles per op (CSR writes + completion polling) and the
-engine/vector units serialize behind it - at N >= 16 channels dispatch dominates the token
-time. The sequencer executes a scratchpad-resident descriptor list back-to-back: the CPU
-builds the (mostly static) list once, patches the few data-dependent words, writes
-base/count and one start, then polls a single completion.
+Op dispatch from the CPU costs ~1k cycles per op (CSR writes + completion polling), so the
+sequencer executes a scratchpad-resident descriptor list back-to-back instead: the CPU builds
+the (mostly static) list once, patches the few data-dependent words, writes base/count and one
+start, then polls a single completion.
 
 Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   w0:  [3:0] unit: 0 = stop, 1 = engine op, 2 = vector-unit program.
        [9] (engine) NOWAIT: dispatch and move on instead of waiting for done - following
            VEC descriptors execute while the engine op streams (the per-cycle scratchpad
-           arbitration makes that safe, docs/overlap-design.md). The list author asserts
+           arbitration makes that safe). The list author asserts
            independence; the hardware still interlocks the obvious hazards: a later
            ENGINE descriptor waits in DISPATCH (engine ready = idle), a VEC descriptor
            whose args read engine state (KABS source, S7-from-absmax w0[4], any kreg-add)
@@ -31,18 +30,15 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
            NOWAIT engine op has completed. For data dependences the arg-source interlock
            cannot see (e.g. softmax reading the scores buffer the engine is filling).
        [5] (engine) capture k(absmax) into kreg[w0[7:6]] when this op completes.
-       [8] (engine) ALSO accumulate that k into kreg[3] (kreg3 += k) - lets one register
-           collect a SUM of shifts across ops (silu's eg+eu term) while [7:6] keeps each
+       [8] (engine) also accumulate that k into kreg[3] (kreg3 += k) - lets one register
+           collect a sum of shifts across ops (silu's eg+eu term) while [7:6] keeps each
            op's own k addressable. Firmware zeroes kreg3 by capturing with [7:6]=3 first.
        (vec) w1[31:16]: per-arg 2-bit kreg-add select (arg i at [16+2i +: 2]): 0 = none,
-           n = SUBTRACT kreg[n-1] from the arg AFTER its 2-bit source resolves - or ADD it
-           when w0[11] is set (the 2026-08-28 VSHLS convention turned silu's A4 into
-           imm + kg, which the subtract-only form cannot express). Turns
-           "imm - earlier k" - the FFN exponent algebra that forced a CPU round-trip per
-           op - into descriptor-resident arithmetic. kreg3 is reachable via capture only.
-       [4] seed S7 from the ENGINE ABSMAX instead of the previous program's res6. Used by
-           the absmax spill once cmd.xred does the cross-channel sum in hardware and the
-           value stops flowing through a vector program's res6.
+           n = subtract kreg[n-1] from the arg after its 2-bit source resolves - or add it
+           when w0[11] is set. Makes "imm -/+ earlier k" (the FFN exponent algebra)
+           descriptor-resident arithmetic. kreg3 is reachable via capture only.
+       [4] seed S7 from the engine absmax instead of the previous program's res6 (the
+           absmax spill after a cmd.xred cross-channel sum).
        [31:16] vec arg sources, 2 bits each (arg i at [16+2i +: 2]):
                0 = immediate (w2+i), 1 = k(engine absmax) = max(0, bitlen(absmax) - 14),
                2 = rpre(prev vec res6) = bitlen(res6) + 5 (bitexact.axpy_rpre),
@@ -55,7 +51,7 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           w6 = sbeats | cbeats<<8 | qstride<<16 (head-B result offset, words);
           w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
           w8 = xsrc;  w9 = dst;  w10 = chan;
-          w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE, F1-1).
+          w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE).
   vec:    w1 = pc;  w2..w9 = args 0..7.
   had:    Optional unit 3, always serialized; w0 exactly 3, w1 src, w2 signs,
           w3 dst, w4 block count, w5 stats, w6 inverse (0/1), w7..w15 zero.
@@ -79,20 +75,20 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           w4 n | nseg << 16, w5 FP32 eps, w6 op (0 RMS, 1 L2) | rope_hb << 8 (1.2: RoPE over
           the first 16*rope_hb values of each segment, 0 = none) | rope_tab << 16 (its cos
           then sin beats, a beat index), w7 src_stride | dst_stride << 16 (beats between
-          segments, 0 = contiguous), w8..w15 zero. norm_sp.py.
+          segments, 0 = contiguous), w8..w15 zero. trixium/units/norm.py.
   conv:   Optional unit 13, serialized; w0 exactly 13, w1..w3 window slots x0..x2, w4 new
           input x3, w5 taps, w6 dst, w7 channels | op << 16 (op 1: dst = x0 + x3, the
-          residual add), w8..w15 zero. gateware/conv_sp.py.
+          residual add), w8..w15 zero. trixium/units/conv.py.
 
-Legacy engine/vector numerics are unchanged. Unit 3 returns raw integer rotations;
-it does not silently replace a legacy dense rotation or its quantization boundary.
+Unit 3 returns raw integer rotations; it does not replace a dense rotation or its
+quantization boundary.
 
-Scratchpad access rides the engine fill port (never a fifth RAM port): descriptors are
-fetched only while both units are idle, so the integrator grants the port as
-vec.busy > seq.sp_active > engine."""
+Scratchpad access rides the engine fill port: the integrator grants the port per cycle as
+vec load > seq.sp_active > engine.
+"""
 
-from functools import reduce
 from operator import or_
+from functools import reduce
 
 from migen import *
 
@@ -101,131 +97,138 @@ from litex.gen import *
 from litex.soc.interconnect.csr import *
 from litex.soc.interconnect import stream
 
-# Sequencer ----------------------------------------------------------------------------------
+from trixium.units.hadamard import HADAMARD_COMMAND
+from trixium.units.activation import ACTIVATION_COMMAND
+from trixium.units.restore import RESTORE_COMMAND
+from trixium.units.silu import SILU_COMMAND
+from trixium.units.norm import NORM_COMMAND
+from trixium.units.conv import CONV_COMMAND
+
+# Sequencer ----------------------------------------------------------------------------------------
 
 class Sequencer(LiteXModule):
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False,
-                 with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
-                 scratchpad_size=256*1024):
+                 with_projection_restore=False, with_silu=False, with_norm=False,
+                 with_conv=False, scratchpad_size=256*1024):
         extended = (with_hadamard or with_activation_quantize or with_projection_restore or
                     with_silu or with_norm or with_conv)
-        if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32):
-            raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit address space")
+        if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024
+                         or scratchpad_size % 32):
+            raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit "
+                             "address space")
         self.base   = CSRStorage(24, description="Descriptor list byte address (32B aligned).")
         self.count  = CSRStorage(16, description="Descriptor count (stop descriptor also ends).")
         self.start  = CSRStorage(1,  description="Write 1 to run the list.")
         self.sbmode = CSRStorage(1, reset=0, description=
-            "Posted-write ordering. 0 = legacy: the descriptor fetch stalls while any "
-            "posted write is in flight. 1 = drain-at-start only (see sbw_pending). Exists "
-            "so the two can be A/B'd in one boot, which is the only measurement this "
-            "project trusts; the start drain runs in both modes (harmless under legacy, "
-            "which is strictly stronger), so this bit is the whole behavioural difference.")
+            "Posted-write ordering. 0: the descriptor fetch stalls while any posted write is "
+            "in flight. 1: drain-at-start only (see sbw_pending). The start drain runs in "
+            "both modes.")
         self.status = CSRStatus(fields=[
             CSRField("busy",   size=1),
             CSRField("dcount", size=16, offset=8, description="Descriptors completed."),
         ])
         extension_errors = []
         if with_hadamard:
-            from trixium.units.hadamard import HADAMARD_COMMAND
-            self.hadamard_cmd = stream.Endpoint(HADAMARD_COMMAND)
-            self.hadamard_done = Signal()
+            self.hadamard_cmd    = stream.Endpoint(HADAMARD_COMMAND)
+            self.hadamard_done   = Signal()
             self.hadamard_failed = Signal(8)
-            self.hadamard_abi = CSRStatus(32, reset=0x00010000)
-            self.hadamard_error = CSRStatus(32, description=
-                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, "
-                "bit2 output overlaps descriptor list, bits8..15 rotation-unit error.")
+            self.hadamard_abi    = CSRStatus(32, reset=0x00010000)
+            self.hadamard_error  = CSRStatus(32, description=
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
+                "descriptor, bit2 output overlaps descriptor list, bits8..15 rotation-unit "
+                "error.")
             extension_errors.append(self.hadamard_error)
         if with_activation_quantize:
-            from trixium.units.activation import ACTIVATION_COMMAND
-            self.activation_quantize_cmd = stream.Endpoint(ACTIVATION_COMMAND)
-            self.activation_quantize_done = Signal()
+            self.activation_quantize_cmd    = stream.Endpoint(ACTIVATION_COMMAND)
+            self.activation_quantize_done   = Signal()
             self.activation_quantize_failed = Signal(8)
-            self.activation_quantize_abi = CSRStatus(32, reset=0x00010001)
-            self.activation_quantize_error = CSRStatus(32, description=
-                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, "
-                "bits8..15 conversion-unit error (bit14 protects descriptor list; "
+            self.activation_quantize_abi    = CSRStatus(32, reset=0x00010001)
+            self.activation_quantize_error  = CSRStatus(32, description=
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
+                "descriptor, bits8..15 conversion-unit error (bit14 protects descriptor list; "
                 "bit15 rejects invalid rotation metadata/raw values).")
             extension_errors.append(self.activation_quantize_error)
         if with_projection_restore:
-            from trixium.units.restore import RESTORE_COMMAND
-            self.projection_restore_cmd = stream.Endpoint(RESTORE_COMMAND)
-            self.projection_restore_done = Signal()
+            self.projection_restore_cmd    = stream.Endpoint(RESTORE_COMMAND)
+            self.projection_restore_done   = Signal()
             self.projection_restore_failed = Signal(8)
-            self.projection_restore_abi = CSRStatus(32, reset=0x00010000)
-            self.projection_restore_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
-                'bits8..15 restoration-client error (bit14 protects the full descriptor list).')
+            self.projection_restore_abi    = CSRStatus(32, reset=0x00010000)
+            self.projection_restore_error  = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
+                'descriptor, bits8..15 restoration-client error (bit14 protects the full '
+                'descriptor list).')
             extension_errors.append(self.projection_restore_error)
         if with_silu:
-            # Append-only, after every other optional block.
-            from trixium.units.silu import SILU_COMMAND
-            self.silu_cmd = stream.Endpoint(SILU_COMMAND)
-            self.silu_done = Signal()
-            self.silu_failed = Signal(8)
+            self.silu_cmd         = stream.Endpoint(SILU_COMMAND)
+            self.silu_done        = Signal()
+            self.silu_failed      = Signal(8)
             self.silu_unit_fixups = Signal(16)
-            self.silu_abi = CSRStatus(32, reset=0x00010003)
-            self.silu_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
-                'bits8..15 SiLU-client error (bit14 protects the full descriptor list).')
-            self.silu_fixups = CSRStatus(32, description=
-                'Fixup elements flagged by unit 11 since the last list start (all its RUN descriptors).')
+            self.silu_abi         = CSRStatus(32, reset=0x00010003)
+            self.silu_error       = CSRStatus(32, description=
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
+                'descriptor, bits8..15 SiLU-client error (bit14 protects the full descriptor '
+                'list).')
+            self.silu_fixups      = CSRStatus(32, description=
+                'Fixup elements flagged by unit 11 since the last list start (all its RUN '
+                'descriptors).')
             extension_errors.append(self.silu_error)
         if with_norm:
-            from trixium.units.norm import NORM_COMMAND
-            self.norm_cmd = stream.Endpoint(NORM_COMMAND)
+            self.norm_cmd   = stream.Endpoint(NORM_COMMAND)
             self.norm_done, self.norm_failed = Signal(), Signal(8)
-            self.norm_abi = CSRStatus(32, reset=0x00010002)
+            self.norm_abi   = CSRStatus(32, reset=0x00010002)
             self.norm_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
-                'bits8..15 norm-client error (bit14 protects the full descriptor list).')
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
+                'descriptor, bits8..15 norm-client error (bit14 protects the full descriptor '
+                'list).')
             extension_errors.append(self.norm_error)
         if with_conv:
-            from trixium.units.conv import CONV_COMMAND
-            self.conv_cmd = stream.Endpoint(CONV_COMMAND)
+            self.conv_cmd   = stream.Endpoint(CONV_COMMAND)
             self.conv_done, self.conv_failed = Signal(), Signal(8)
-            self.conv_abi = CSRStatus(32, reset=0x00010000)
+            self.conv_abi   = CSRStatus(32, reset=0x00010000)
             self.conv_error = CSRStatus(32, description=
-                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed descriptor, '
-                'bits8..15 conv-client error (bit14 protects the full descriptor list).')
+                'Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed '
+                'descriptor, bits8..15 conv-client error (bit14 protects the full descriptor '
+                'list).')
             extension_errors.append(self.conv_error)
 
         if with_projection_restore:
             # Appended last: every earlier register keeps its address.
-            self.restore_argmax_clear = Signal()
+            self.restore_argmax_clear    = Signal()
             self.restore_argmax_valid_in = Signal()
             self.restore_argmax_idx_in, self.restore_argmax_val_in = Signal(32), Signal(32)
-            self.restore_argmax_idx = CSRStatus(32, description=
+            self.restore_argmax_idx      = CSRStatus(32, description=
                 'Greedy argmax (first max, NaN-first frozen) of every unit-8 output since the '
                 'last list start: the element index, 0xFFFFFFFF before any output.')
-            self.restore_argmax_val = CSRStatus(32, description='Its FP32 value (0 when none yet).')
+            self.restore_argmax_val      = CSRStatus(32, description=
+                'Its FP32 value (0 when none yet).')
 
         # Engine command side (muxed into engine.cmd by EngineCSR while busy).
-        self.eng_valid  = Signal()
-        self.eng_ready  = Signal()
-        self.eng_kind   = Signal(3)
-        self.eng_rows   = Signal(16)
-        self.eng_cols   = Signal(14)
-        self.eng_wbase  = Signal(32)
-        self.eng_wlen   = Signal(24)
-        self.eng_sbeats = Signal(4)
-        self.eng_cbeats = Signal(8)
-        self.eng_bias   = Signal(7)
-        self.eng_rshift = Signal(6)
-        self.eng_xsrc   = Signal(24)
-        self.eng_dst    = Signal(24)
-        self.eng_chan   = Signal(5)
-        self.eng_rem    = Signal(5)
-        self.eng_ilv    = Signal()
-        self.eng_supw   = Signal()
+        self.eng_valid   = Signal()
+        self.eng_ready   = Signal()
+        self.eng_kind    = Signal(3)
+        self.eng_rows    = Signal(16)
+        self.eng_cols    = Signal(14)
+        self.eng_wbase   = Signal(32)
+        self.eng_wlen    = Signal(24)
+        self.eng_sbeats  = Signal(4)
+        self.eng_cbeats  = Signal(8)
+        self.eng_bias    = Signal(7)
+        self.eng_rshift  = Signal(6)
+        self.eng_xsrc    = Signal(24)
+        self.eng_dst     = Signal(24)
+        self.eng_chan    = Signal(5)
+        self.eng_rem     = Signal(5)
+        self.eng_ilv     = Signal()
+        self.eng_supw    = Signal()
         self.eng_qn      = Signal()
-        self.eng_xred   = Signal()  # AXPY cross-channel reduce (engine sums the partials).
+        self.eng_xred    = Signal()   # AXPY cross-channel reduce (engine sums the partials).
         self.eng_qstride = Signal(16)
         self.eng_rshift2 = Signal(6)
-        self.eng_rep     = Signal(5)   # Multi-packet STORE (words 11-13).
+        self.eng_rep     = Signal(5)  # Multi-packet STORE (words 11-13).
         self.eng_dstride = Signal(24)
         self.eng_sstride = Signal(8)
-        self.eng_done   = Signal()   # From the engine (pulse).
-        self.absmax     = Signal(32) # From the engine tracker.
+        self.eng_done    = Signal()   # From the engine (pulse).
+        self.absmax      = Signal(32) # From the engine tracker.
 
         # Vector-unit direct-drive side.
         self.vec_start = Signal()    # Pulse.
@@ -240,29 +243,21 @@ class Sequencer(LiteXModule):
         self.sp_adr    = Signal(13)
         self.sp_dat    = Signal(256)
         self.sp_active = Signal()
-        # Posted sideband writes still sitting in the scratchpad's FIFO. The descriptor
-        # fetch used to be held for as long as ANY write was in flight, which was correct
-        # but made the CPU's patch burst starve a running list: ~7.5k cycles/layer for 80
-        # writes (v8 qtrace), and two attempts to cut the CPU work around those writes
-        # each cost ~5% because they only bunched the writes tighter. The ordering that is
-        # actually required is "every patch for a list has landed before that list starts",
-        # so the FIFO is drained once at START instead (SBDRAIN below).
+        # Posted sideband writes still sitting in the scratchpad's FIFO. The required ordering
+        # is "every patch for a list has landed before that list starts", so the FIFO is
+        # drained once at START (SBDRAIN below) rather than holding every descriptor fetch
+        # (which let a CPU patch burst starve a running list).
         #
-        # TWO INVARIANTS this relies on, both firmware-side:
-        #  1. A list's descriptors are never patched while THAT list is running. Patching
-        #     other lists under a running one is the whole point of the sideband slot and
-        #     stays safe.
-        #  2. A patch store is in the FIFO before the `start` CSR write is issued - i.e.
-        #     the CPU's descriptor stores are ordered ahead of the start. The scratchpad
-        #     window is mapped cached=False (trixium/targets/fk33.py) and the core is in-order, so
-        #     this holds. NOT a new requirement: a store still sitting in a CPU-side buffer
-        #     never raised sbw_pending either, so the old fetch interlock needed it too.
-        #     What is new is only (1).
-        # Unwired (reset 0) this is a no-op, which keeps unit-test DUTs on FETCH-at-start.
+        # Two firmware-side invariants this relies on:
+        #  1. A list's descriptors are never patched while that list is running (patching
+        #     other lists under a running one is safe).
+        #  2. A patch store is in the FIFO before the `start` CSR write is issued (the
+        #     scratchpad window is uncached and the CPU is in-order).
+        # Unwired (reset 0) this is a no-op.
         self.sbw_pending = Signal()
         self.sp_gnt    = Signal(reset=1) # Integrator: port is the seq's this cycle (a vec
-                                         # load outranks descriptor fetches). Reset-1 keeps
-                                         # unwired unit-test DUTs on the old behavior.
+                                         # load outranks descriptor fetches). Reset 1 when
+                                         # unwired.
 
         self.busy = Signal()
 
@@ -279,26 +274,32 @@ class Sequencer(LiteXModule):
 
         list_ok = C(1, 1)
         # OVERLAP (w0[9] on units 3/4/5/8/11/12/13): dispatch even while a NOWAIT engine op
-        # is in flight - the per-cycle scratchpad arbitration (matvec.py) lets the unit and
+        # is in flight - the per-cycle scratchpad arbitration (engine.py) lets the unit and
         # the op share the ports. The list author asserts independence, as for NOWAIT; w0[10]
         # (WAIT-ENGINE) is not needed on these units, which wait for the engine by default.
         ovl = Signal()
         w0u = Signal(32)
         self.overlap = Signal()   # To the integrator's unit guard: this dispatch may overlap.
-        self.comb += [ovl.eq(w(0, 0)[9]), w0u.eq(w(0, 0) & ~(1 << 9)), self.overlap.eq(self.busy & ovl)]
+        self.comb += [
+            ovl.eq(w(0, 0)[9]),
+            w0u.eq(w(0, 0) & ~(1 << 9)),
+            self.overlap.eq(self.busy & ovl),
+        ]
         had_dispatch, quant_dispatch, restore_dispatch, bad_list = [], [], [], []
         silu_dispatch, norm_dispatch, conv_dispatch = [], [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24)
-            list_end = Signal(32)
+            list_end  = Signal(32)
             start_end = Signal(32)
             self.comb += start_end.eq(self.base.storage + (self.count.storage << 6))
             list_ok = (self.base.storage[:5] == 0) & (start_end <= scratchpad_size)
             self.sync += If(self.start.re & self.start.storage & ~self.busy,
                 list_base.eq(self.base.storage), list_end.eq(start_end))
-            unknown_unit = [*[NextValue(error.status, 2) for error in extension_errors], NextState("EXT_FAILED")]
-            bad_list = [*[NextValue(error.status, 1) for error in extension_errors], NextState("EXT_FAILED")]
+            unknown_unit = [*[NextValue(error.status, 2) for error in extension_errors],
+                            NextState("EXT_FAILED")]
+            bad_list     = [*[NextValue(error.status, 1) for error in extension_errors],
+                            NextState("EXT_FAILED")]
         if with_hadamard:
             dst_end, stats_end = Signal(64), Signal(64)
             malformed, list_overlap = Signal(), Signal()
@@ -310,29 +311,37 @@ class Sequencer(LiteXModule):
                     (w(0, 5)[24:] != 0) | (w(0, 6)[1:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
                 list_overlap.eq(((w(0, 3) < list_end) & (list_base < dst_end)) |
                                 ((w(0, 5) < list_end) & (list_base < stats_end))),
-                self.hadamard_cmd.src.eq(w(0, 1)[:24]), self.hadamard_cmd.signs.eq(w(0, 2)[:24]),
-                self.hadamard_cmd.dst.eq(w(0, 3)[:24]), self.hadamard_cmd.blocks.eq(w(0, 4)[:16]),
-                self.hadamard_cmd.stats.eq(w(0, 5)[:24]), self.hadamard_cmd.inverse.eq(w(0, 6)[0]),
+                self.hadamard_cmd.src.eq(w(0, 1)[:24]),
+                self.hadamard_cmd.signs.eq(w(0, 2)[:24]),
+                self.hadamard_cmd.dst.eq(w(0, 3)[:24]),
+                self.hadamard_cmd.blocks.eq(w(0, 4)[:16]),
+                self.hadamard_cmd.stats.eq(w(0, 5)[:24]),
+                self.hadamard_cmd.inverse.eq(w(0, 6)[0]),
             ]
             had_dispatch = [If(malformed | list_overlap,
                 NextValue(self.hadamard_error.status, Cat(C(0, 1), malformed, list_overlap)),
                 NextState("EXT_FAILED"),
             ).Else(NextState("DISPATCH_HAD"))]
         if with_activation_quantize:
-            malformed = Signal()
+            malformed  = Signal()
             requantize = Signal()
-            command = self.activation_quantize_cmd
+            command    = self.activation_quantize_cmd
             self.comb += [
                 requantize.eq(w(0, 0)[0:4] == 5),
-                malformed.eq((w0u != Mux(requantize, 5, 4)) | (w(0, 1)[24:] != 0) | (w(0, 2)[24:] != 0) |
-                    (w(0, 3)[24:] != 0) | (w(0, 7) != 0) | (d1 != 0) |
-                    Mux(requantize, (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) | (w(0, 6)[16:] != 0),
+                malformed.eq((w0u != Mux(requantize, 5, 4)) | (w(0, 1)[24:] != 0) |
+                    (w(0, 2)[24:] != 0) | (w(0, 3)[24:] != 0) | (w(0, 7) != 0) | (d1 != 0) |
+                    Mux(requantize,
+                        (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) | (w(0, 6)[16:] != 0),
                         (w(0, 4)[16:] != 0) | (w(0, 5)[16:] != 0) | (w(0, 6) != 0))),
-                command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
-                command.exponents.eq(w(0, 3)[:24]), command.elements.eq(Mux(requantize, 1024, w(0, 4)[:16])),
+                command.src.eq(w(0, 1)[:24]),
+                command.dst.eq(w(0, 2)[:24]),
+                command.exponents.eq(w(0, 3)[:24]),
+                command.elements.eq(Mux(requantize, 1024, w(0, 4)[:16])),
                 command.blocks.eq(Mux(requantize, w(0, 6)[:16], w(0, 5)[:16])),
-                command.requantize.eq(requantize), command.maxima.eq(Mux(requantize, w(0, 4)[:24], 0)),
-                command.result_exponent.eq(Mux(requantize, w(0, 5)[:24], 0)), command.protect_start.eq(list_base),
+                command.requantize.eq(requantize),
+                command.maxima.eq(Mux(requantize, w(0, 4)[:24], 0)),
+                command.result_exponent.eq(Mux(requantize, w(0, 5)[:24], 0)),
+                command.protect_start.eq(list_base),
                 command.protect_end.eq(list_end),
             ]
             quant_dispatch = [If(malformed,
@@ -389,7 +398,8 @@ class Sequencer(LiteXModule):
                     (w(0, 6)[29:] != 0) | (d1 != 0)),
                 command.src.eq(w(0, 1)[:24]), command.dst.eq(w(0, 2)[:24]),
                 command.weight.eq(w(0, 3)[:24]), command.n.eq(w(0, 4)[:16]),
-                command.nseg.eq(w(0, 4)[16:32]), command.eps.eq(w(0, 5)), command.op.eq(w(0, 6)[0]),
+                command.nseg.eq(w(0, 4)[16:32]), command.eps.eq(w(0, 5)),
+                command.op.eq(w(0, 6)[0]),
                 command.src_stride.eq(w(0, 7)[:16]), command.dst_stride.eq(w(0, 7)[16:32]),
                 command.rope_hb.eq(w(0, 6)[8:13]), command.rope_tab.eq(w(0, 6)[16:29]),
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
@@ -401,19 +411,24 @@ class Sequencer(LiteXModule):
             malformed = Signal()
             command = self.conv_cmd
             self.comb += [
-                malformed.eq((w0u != 13) | reduce(or_, [w(0, i)[24:] != 0 for i in range(1, 7)]) |
+                malformed.eq((w0u != 13) |
+                    reduce(or_, [w(0, i)[24:] != 0 for i in range(1, 7)]) |
                     (w(0, 7)[17:] != 0) | (d1 != 0)),
-                command.x0.eq(w(0, 1)[:24]), command.x1.eq(w(0, 2)[:24]), command.x2.eq(w(0, 3)[:24]),
-                command.x3.eq(w(0, 4)[:24]), command.w.eq(w(0, 5)[:24]), command.dst.eq(w(0, 6)[:24]),
+                command.x0.eq(w(0, 1)[:24]),
+                command.x1.eq(w(0, 2)[:24]),
+                command.x2.eq(w(0, 3)[:24]),
+                command.x3.eq(w(0, 4)[:24]),
+                command.w.eq(w(0, 5)[:24]),
+                command.dst.eq(w(0, 6)[:24]),
                 command.channels.eq(w(0, 7)[:16]), command.op.eq(w(0, 7)[16]),
                 command.protect_start.eq(list_base), command.protect_end.eq(list_end),
             ]
             conv_dispatch = [If(malformed,
                 NextValue(self.conv_error.status, 2), NextState('EXT_FAILED'),
             ).Else(NextState('DISPATCH_CONV'))]
-        unit    = Signal(4)
-        argsrc  = Signal(16)
-        nowait  = Signal()
+        unit   = Signal(4)
+        argsrc = Signal(16)
+        nowait = Signal()
         self.comb += [
             unit.eq(w(0, 0)[0:4]),
             argsrc.eq(w(0, 0)[16:32]),
@@ -426,7 +441,7 @@ class Sequencer(LiteXModule):
         # set/clear priority below is safe.
         eng_disp     = Signal()
         eng_inflight = Signal()
-        # Capture target of the IN-FLIGHT op (for the per-register kadd hazard below).
+        # Capture target of the in-flight op (for the per-register kadd hazard below).
         infl_cap_en  = Signal()
         infl_cap_sel = Signal(2)
         self.sync += [
@@ -439,12 +454,11 @@ class Sequencer(LiteXModule):
             ),
         ]
         # A vec descriptor whose arguments read engine state must not race an in-flight
-        # engine op: KABS source (code 1) and S7-seed-from-absmax (w0[4]) read the LIVE
+        # engine op: KABS source (code 1) and S7-seed-from-absmax (w0[4]) read the live
         # tracker, so any in-flight op poisons them. A kreg-add only hazards against the
-        # SPECIFIC register the in-flight op will capture (or a capture still in its
-        # done+2 pipe) - the first interlock was register-blind and serialized the
-        # FFN list's norm-under-stream, costing 4% (2026-08-29). kadd reaches kreg0-2
-        # only, so the kreg3 accumulator never hazards a kadd.
+        # specific register the in-flight op will capture (or a capture still in its
+        # done+2 pipe), so independent vector work still overlaps the stream. kadd reaches
+        # kreg0-2 only, so the kreg3 accumulator never hazards a kadd.
         vec_needs_eng = Signal()
         kadd_hazard   = Signal() # Driven after the capture block (needs cap_d/cap_sel).
 
@@ -474,30 +488,22 @@ class Sequencer(LiteXModule):
         ]
 
         # S7 seed select (w0[4]). Normally the previous program's res6, which is how a list
-        # chains a hardware result into the next program. With cmd.xred the engine does the
-        # cross-channel sum itself, so the value the CPU needs afterwards - the absmax of the
-        # summed vector - lives in the engine tracker and no longer passes through a vector
-        # program's res6. Seeding S7 from it lets the existing spill program persist it
-        # unchanged, and because spill ends with SMOV s6, s7 the value also lands in res6, so
-        # a following norm_i32 taking k from KRES6 sees exactly what the reduce_acc chain
-        # used to give it. That is what keeps the numerics bit-identical across the switch.
+        # chains a hardware result into the next program. With cmd.xred the absmax of the
+        # summed vector lives in the engine tracker instead; seeding S7 from it lets the spill
+        # program persist it (and, ending with SMOV s6, s7, hand it on through res6).
         self.comb += self.vec_seed7.eq(Mux(w(0, 0)[4], self.absmax, self.vec_res6))
 
-        # Exponent register file. The FFN chain needs "per-layer constant + an EARLIER op's
+        # Exponent register file. The FFN chain needs "per-layer constant + an earlier op's
         # k" as vec args (eg = ex8 - bias + rshift + kg; silu needs both eg and eu); the
-        # KABS/KRES6 sources only expose the LATEST k, so every such arg forced a CPU
-        # round-trip - measured as 43% of the GEN-HW window in 200-5k-cycle gaps.
+        # KABS/KRES6 sources only expose the latest k.
         self.kregs = kregs = Array([Signal(32, name=f"kreg{i}") for i in range(4)])
         # Two subtleties, both load-bearing:
         # - Gated on self.busy, not an FSM state: eng_done also pulses for CPU-dispatched
         #   ops, but those never run while the sequencer owns the command interface, so
         #   busy & eng_done is exactly "our engine descriptor completed".
-        # - The capture is DELAYED two cycles. The engine absmax tracker lags its write
-        #   stage by two cycles (matvec.py: "the tracker lags the write by two cycles;
-        #   every reader trails done by more") - the KABS arg source qualifies because the
-        #   next DISPATCH is >2 cycles away, but a same-edge capture at done would miss a
-        #   max arriving in the final beat. Control bits are latched at done (d0 is
-        #   overwritten by the next descriptor fetch soon after); k is applied at done+2.
+        # - The capture is delayed two cycles: the engine absmax tracker lags its write
+        #   stage by two cycles, so a same-edge capture at done would miss a max arriving in
+        #   the final beat. Control bits are latched at dispatch; k is applied at done+2.
         cap_d   = Signal(2)
         cap_en  = Signal()
         cap_acc = Signal()
@@ -505,7 +511,7 @@ class Sequencer(LiteXModule):
         self.sync += [
             cap_d.eq(Cat(self.busy & self.eng_done, cap_d[0])),
             # Latched at the DISPATCH handshake: with NOWAIT the descriptor buffer holds a
-            # LATER descriptor when done pulses. Serial lists latch identical values (the
+            # later descriptor when done pulses. Serial lists latch identical values (the
             # buffer does not move during WAIT_ENG).
             If(eng_disp,
                 cap_en.eq(w(0, 0)[5]),
@@ -532,26 +538,22 @@ class Sequencer(LiteXModule):
                 | kadd_hazard),
         ]
 
-        # A5 from a scratchpad LUT (w0[12], 2026-09-09): A5 = LUT[imm5 + kreg[sel5]], the
-        # LUT's beat index in w(1,10) (an engine-only word, free on vec descriptors). The
-        # one arg the k/v chain could not derive in-sequencer was rmsnorm's eps, a
-        # power-of-two scaling of rms_eps by the source exponent - which is a per-layer
-        # constant plus the shift the sequencer already holds in a kreg. The firmware
-        # writes 32 entries per norm per layer (under the previous FFN list) and patches
-        # the per-token part of the exponent into imm5, as it patched eps itself before.
-        # The kreg comes from A5's own kadd select, so the capture-pipe interlock
-        # (kadd_hazard) covers the read; the index is clamped to the 32-entry table.
+        # A5 from a scratchpad LUT (w0[12]): A5 = LUT[imm5 + kreg[sel5]], the LUT's beat
+        # index in w(1,10) (an engine-only word, free on vec descriptors). Used for rmsnorm's
+        # eps, a power-of-two scaling of rms_eps by the source exponent (a per-layer constant
+        # plus the shift held in a kreg). The kreg comes from A5's own kadd select, so the
+        # capture-pipe interlock (kadd_hazard) covers the read; the index is clamped to the
+        # 32-entry table.
         lut_mode = Signal()
         lut_base = Signal(13)
         lut_sel  = Signal(2)
         lut_sum  = Signal(32)
         lut_idx  = Signal(5)
         lut_word = Signal(32)
-        # Timing: the two things this must not do on a 98%-full die are add an adder to
-        # the scratchpad address cone or a mux to its 256-bit read bus (the vec unit's
-        # ex1_r family lives there). So the address is registered in FETCHL from a
-        # comb index (lut_adr_r), the fetched beat is captured whole (lut_beat_r, like
-        # d0/d1) and the word select runs off that register a cycle later.
+        # Timing: no adder in the scratchpad address cone and no mux on its 256-bit read
+        # bus. The address is registered in FETCHL from a comb index (lut_adr_r), the
+        # fetched beat is captured whole (lut_beat_r, like d0/d1) and the word select runs
+        # off that register a cycle later.
         lut_adr_r  = Signal(13)
         lut_sel_r  = Signal(3)
         lut_beat_r = Signal(256)
@@ -582,11 +584,9 @@ class Sequencer(LiteXModule):
                     3: base.eq(k_res6),
                 }),
                 kadd.eq(w(0, 1)[16 + 2*i:18 + 2*i]),
-                # SUBTRACT by default: the old exponent args had the shape 'constant - k'
-                # (pre-VSHLS silu A4 = -(eg+6) = C_layer - kg). w0[11] flips this
-                # descriptor's kreg terms to ADD for the direct-shift convention
-                # (A4 = eg + 6 = C_layer + kg). The '+latest k' case without a register
-                # is already covered by SEQ_SRC_KABS.
+                # Subtract by default (args of the shape 'constant - k'); w0[11] flips this
+                # descriptor's kreg terms to add (A4 = eg + 6 = C_layer + kg). The
+                # '+latest k' case without a register is covered by SEQ_SRC_KABS.
                 full.eq(Mux(w(0, 0)[11],
                     base + Mux(kadd == 0, 0, kregs[kadd - 1]),
                     base - Mux(kadd == 0, 0, kregs[kadd - 1]))),
@@ -654,7 +654,7 @@ class Sequencer(LiteXModule):
             )
         )
         fsm.act("FETCH0_L", # dat valid this cycle: it reflects the address sampled at the
-            # end of the GRANTED FETCH0 cycle, whoever owns the port now.
+            # end of the granted FETCH0 cycle, whoever owns the port now.
             self.busy.eq(1),
             self.sp_active.eq(1),
             self.sp_adr.eq(dptr), # Hold.
@@ -763,7 +763,8 @@ class Sequencer(LiteXModule):
                     If(self.activation_quantize_cmd.ready, NextState("WAIT_QUANT"))))
             fsm.act("WAIT_QUANT", self.busy.eq(1),
                 If(self.activation_quantize_failed != 0,
-                    NextValue(self.activation_quantize_error.status, self.activation_quantize_failed << 8),
+                    NextValue(self.activation_quantize_error.status,
+                        self.activation_quantize_failed << 8),
                     NextState("EXT_FAILED"),
                 ).Elif(self.activation_quantize_done, NextState("NEXT")))
         if extended:
@@ -774,7 +775,8 @@ class Sequencer(LiteXModule):
                     If(self.projection_restore_cmd.ready, NextState('WAIT_RESTORE'))))
             fsm.act('WAIT_RESTORE', self.busy.eq(1),
                 If(self.projection_restore_failed != 0,
-                    NextValue(self.projection_restore_error.status, self.projection_restore_failed << 8),
+                    NextValue(self.projection_restore_error.status,
+                        self.projection_restore_failed << 8),
                     NextState('EXT_FAILED'),
                 ).Elif(self.projection_restore_done, NextState('NEXT')))
         if with_silu:
@@ -786,7 +788,8 @@ class Sequencer(LiteXModule):
                     NextValue(self.silu_error.status, self.silu_failed << 8),
                     NextState('EXT_FAILED'),
                 ).Elif(self.silu_done,
-                    NextValue(self.silu_fixups.status, self.silu_fixups.status + self.silu_unit_fixups),
+                    NextValue(self.silu_fixups.status,
+                        self.silu_fixups.status + self.silu_unit_fixups),
                     NextState('NEXT')))
         for name, enabled in (("norm", with_norm), ("conv", with_conv)):
             if not enabled:
@@ -795,7 +798,9 @@ class Sequencer(LiteXModule):
                                  getattr(self, name + "_done"))
             error = getattr(self, name + "_error")
             fsm.act('DISPATCH_' + name.upper(), self.busy.eq(1),
-                If(~eng_inflight | ovl, cmd.valid.eq(1), If(cmd.ready, NextState('WAIT_' + name.upper()))))
+                If(~eng_inflight | ovl,
+                    cmd.valid.eq(1),
+                    If(cmd.ready, NextState('WAIT_' + name.upper()))))
             fsm.act('WAIT_' + name.upper(), self.busy.eq(1),
                 If(failed != 0,
                     NextValue(error.status, failed << 8), NextState('EXT_FAILED'),

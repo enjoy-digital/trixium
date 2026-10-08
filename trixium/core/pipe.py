@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""ChannelPipe: one HBM channel's compute pipeline (unpack + dot + scale-accumulate).
+"""ChannelPipe: one memory channel's compute pipeline (unpack + dot + scale-accumulate).
 
 Consumes the weight-beat stream of one channel (row packets: scale beats then code beats, see
 trixium.layout), computes one dot product per row against the local x-buffer and emits
@@ -20,8 +20,8 @@ op parameter signals set by the engine before `start`. Fully pipelined: accepts 
 cycle; results (1 per row) go through a small FIFO to the gather stage.
 """
 
-from functools import reduce
 from operator import or_
+from functools import reduce
 
 from migen import *
 
@@ -66,11 +66,13 @@ def _adder_tree(module, lanes, reg_every=2):
         level = nxt
     return level[0], n_regs
 
-# ChannelPipe --------------------------------------------------------------------------------
+# Constants ----------------------------------------------------------------------------------------
 
 KIND_OP_TERNARY = 0
 KIND_OP_Q8      = 1
 KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre).
+
+# Channel Pipe -------------------------------------------------------------------------------------
 
 class ChannelPipe(LiteXModule):
     def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1):
@@ -89,8 +91,7 @@ class ChannelPipe(LiteXModule):
         self.sink = stream.Endpoint([("data", 256)])
         # Matvec results present one int32 in data[:32] (wide=0); AXPY drain entries carry
         # 8 accumulators = one full scratchpad beat (wide=1, row = first lane index).
-        # head (gather adds the qstride offset when set) is always 0 since the dual-Q head-B
-        # datapath was removed.
+        # head (gather adds the qstride offset when set) is always 0.
         self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1), ("head", 1)])
 
         # x-buffer broadcast write port (from the engine's fill FSM).
@@ -133,14 +134,12 @@ class ChannelPipe(LiteXModule):
         g_cnt   = Signal(8)
         row_cnt = Signal(16)
 
-        accept = Signal()
+        accept    = Signal()
         is_code   = Signal()
         row_last  = Signal()
         self.comb += [
             # Beat intake throttles on result-FIFO headroom: at N channels the aggregate
-            # result rate (N/row_beats per cycle) can exceed the 1/cycle gather drain
-            # (first bites at N=4 ternary, 3 beats/row) - without this the FIFO drops
-            # results and the op never completes.
+            # result rate (N/row_beats per cycle) can exceed the 1/cycle gather drain.
             self.sink.ready.eq(out_fifo_room),
             accept.eq(self.sink.valid & self.sink.ready),
         ]
@@ -171,8 +170,8 @@ class ChannelPipe(LiteXModule):
         pidx    = Signal(16) # AXPY: probs byte index = row*n_channels + chan_id.
         # Dual-Q x layout: the fill interleaves the two heads' vectors at 32-byte
         # granularity (position 2g = head A group g, 2g+1 = head B group g), so one xbuf
-        # read serves both heads. AXPY bytes get the same treatment: byte t of head A
-        # lives at (t>>5)*64 + (t&31), head B at +32 - always inside the same 1024b word.
+        # read serves both heads. AXPY byte t of head A lives at (t>>5)*64 + (t&31), head B
+        # at +32: always inside the same 1024-bit word.
         pidx_d = Signal(16) # AXPY dual: interleaved byte index of head A.
         self.comb += [
             t0_fire.eq(accept & is_code),
@@ -202,10 +201,8 @@ class ChannelPipe(LiteXModule):
             )
         ]
         v1        = _delay(self, t0_fire, 1)             # T1 valid.
-        # v1 is a HIGH-FANOUT ENABLE: it gates the clock enable of ~160 lane registers
-        # (128 ternary + 32 Q8) plus the scale capture. A single driver forces the placer
-        # to reach every lane from one flop; per-group dont_touch replicas let each copy
-        # sit with its consumers. (Hardware worst path at WNS -0.487: v1 -> lane reg CE.)
+        # v1 is a high-fanout enable (~160 lane registers plus the scale capture): per-group
+        # dont_touch replicas let each copy sit with its consumers (timing).
         _v1_copies = []
         def v1_rep(tag):
             c = Signal(name=f"v1_rep_{tag}")
@@ -223,7 +220,7 @@ class ChannelPipe(LiteXModule):
         # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error).
         xword  = xbuf_r.dat_r  # 1024-bit, valid at T1.
 
-        tern_lanes  = []
+        tern_lanes = []
         code3_seen = Signal()
         code3_any  = []
         for j in range(128):
@@ -262,18 +259,11 @@ class ChannelPipe(LiteXModule):
         is_axpy = Signal()
         self.sync += is_axpy.eq(self.kind == KIND_OP_AXPY)
         q8_lanes  = []
-        # The 32 signed 8x8 products go to DSP48E2s (2026-09-10, from the external review's
-        # out-of-context study, reproduced with tools/pipe_ooc_study.py): -2.6k LUT, -0.9k
-        # FF and -330 CARRY8 per channel, the CE'd product register absorbed as the DSP's
-        # P register (same cycle), and Vivado folds the first Q8 tree levels into the DSP
-        # ALUs. Exact by construction (a 27x18 signed multiplier). The 16 channels' 912
-        # DSPs are 32% of the die's; they were 3% used.
-        # Operands registered at T1 (the DSP's A/B registers), product at T2 -> valid T3,
-        # one cycle later than the ternary lanes. The single-cycle form (x-buffer BRAM read
-        # -> slice mux -> AXPY mux -> multiply -> P) was the top failing family of v13a and
-        # 17k of v14a's 21.7k endpoints at 212.5 MHz (2026-09-10). The T1 path is now the
-        # same class as the ternary lanes' (BRAM read -> mux -> FF) and the multiply sits
-        # entirely inside the DSP. Costs one cycle of Q8/AXPY op latency, not throughput.
+        # The 32 signed 8x8 products go to DSPs (saves ~2.6k LUT per channel; Vivado folds
+        # the first Q8 tree levels into the DSP ALUs). Operands are registered at T1 (the
+        # DSP's A/B registers), product at T2 -> valid T3, one cycle after the ternary lanes:
+        # the multiply sits entirely inside the DSP (the single-cycle form failed timing).
+        # Costs one cycle of Q8/AXPY op latency, not throughput.
         v2_q8  = [_delay(self, c, 1) for c in v1_q8]
         for j in range(32):
             w_j = Signal((8, True))
@@ -294,8 +284,7 @@ class ChannelPipe(LiteXModule):
 
         # Scale fp16: the beat's halfword selected at T1 straight from the scale RAM read
         # (scale_r.dat_r and g_lo_r are both valid then) and registered as 16 bits, valid
-        # at T2+ - the same value and cycle the old 256-bit scale_word_r + T2 mux gave
-        # (2026-09-10: that mux sat in front of the AXPY shift-amount cone; -240 FF).
+        # at T2+ (keeps the 16:1 mux out of the AXPY shift-amount cone).
         scale_f16_t1 = Signal(16)
         self.comb += Case(g_lo_r, {i: scale_f16_t1.eq(scale_r.dat_r[16*i:16*(i+1)])
                                    for i in range(16)})
@@ -309,14 +298,10 @@ class ChannelPipe(LiteXModule):
         # drain FSM streams code_beats*32 accumulators into the out FIFO (row = g*32 + j).
         # Signed-only arithmetic through dedicated intermediates (unsigned operands mixed
         # into signed expressions emit corrupt Verilog - see the fp16 decompose below).
-        # The shift amount used to be one combinational cone in the T2 cycle: the engine's
-        # bias/rshift flop (which Vivado merged across all 16 pipes - fanout 9,756, ~3.4 ns
-        # of route), a 16:1 scale mux, a 3-operand add, two saturations and then 32
-        # bidirectional barrel shifters - the family that owned ~8k of v11's failing
-        # endpoints. Now: the op-stable part (B - Rpre - 15) is a register, the exponent
-        # part is added at T1 from the RAM read data, and the resulting direction/amount
-        # bits are registered (replicated per 8 lanes, dont_touch) so T2 is register ->
-        # shifter -> register. Values and cycles are identical (2026-09-10).
+        # For timing, the op-stable part (B - Rpre - 15) is a register, the exponent part
+        # is added at T1 from the RAM read data, and the resulting direction/amount bits are
+        # registered (replicated per 8 lanes, dont_touch): T2 is register -> shifter ->
+        # register.
         ax_c31n  = Signal((9, True), reset=-31)
         ax_bias  = Signal((8, True))
         ax_rpre  = Signal((8, True))
@@ -406,15 +391,12 @@ class ChannelPipe(LiteXModule):
             )
         )
 
-        # Accumulate: ONE adder per lane, shared by the four groups (2026-09-10). The RTL
-        # used to write all 128 additions out (Case over the group, each arm its own
-        # `acc += x`), which synthesized as 128 32-bit adders per channel (512 CARRY8) of
-        # which one group's 32 ever added on a beat. Now the beat's bank is selected
-        # (4:1 per lane, select replicated per 8 lanes), added once, and written back
-        # under a registered per-bank enable. Exact: the group sequence is cyclic within a
-        # row and rows are separated by at least one scale beat, so the same bank is
-        # never updated on consecutive beats and the single-cycle read-modify-write sees
-        # its own previous write. `start` keeps priority over the enables.
+        # Accumulate: one adder per lane, shared by the four groups. The beat's bank is
+        # selected (4:1 per lane, select replicated per 8 lanes), added once, and written
+        # back under a registered per-bank enable. Exact: the group sequence is cyclic within
+        # a row and rows are separated by at least one scale beat, so the same bank is never
+        # updated on consecutive beats and the single-cycle read-modify-write sees its own
+        # previous write. `start` keeps priority over the enables.
         g_ax1 = _delay(self, g_ax_r, 2)           # Beat group at T3 (decode below -> T4).
         ax_we = [Signal(name=f"ax_we{g}") for g in range(AX_GROUPS)]
         self.sync += [ax_we[g].eq(v2a & is_axpy & (g_ax1[:2] == g)) for g in range(AX_GROUPS)]
@@ -482,7 +464,7 @@ class ChannelPipe(LiteXModule):
         # T+1: product (DSP). ---------------------------------------------------------------------
         prod   = Signal((34, True))
         bias_s = Signal((8, True)) # Signed copy of B: signed-only arithmetic for sh_c.
-        sh_c   = Signal((8, True)) # 12 - (e16 + B) in [0, 44] (comb; was the sh_r register).
+        sh_c   = Signal((8, True)) # 12 - (e16 + B) in [0, 44] (comb).
         shamt  = Signal(6)         # Saturated at T+1 (>>45 of a 46-bit value = sign only),
                                    # so T+2 is register -> 46-bit shifter -> register.
         v3     = Signal()
@@ -501,7 +483,7 @@ class ChannelPipe(LiteXModule):
         ]
 
         # T+2: shift to accumulator scale (contribution = prod << (e16+B), via <<12 then >>). -----
-        contrib  = Signal((46, True))
+        contrib = Signal((46, True))
         v4      = Signal()
         row4    = Signal(16)
         rlast4  = Signal()
@@ -544,7 +526,8 @@ class ChannelPipe(LiteXModule):
             If(self.kind == KIND_OP_AXPY,
                 axw_fifo.sink.valid.eq(drain_val),
                 axw_fifo.sink.row.eq(Cat(C(0, 3), d_cnt)), # First lane index = d_cnt*8.
-                axw_fifo.sink.data.eq(Cat(*[acc_flat[(d_cnt << 3) + i][0:32] for i in range(8)])),
+                axw_fifo.sink.data.eq(Cat(*[acc_flat[(d_cnt << 3) + i][0:32]
+                    for i in range(8)])),
             ).Else(
                 out_fifo.sink.valid.eq(v4 & rlast4),
                 out_fifo.sink.row.eq(row4),
@@ -564,10 +547,9 @@ class ChannelPipe(LiteXModule):
             ).Else(
                 self.source.valid.eq(out_fifo.source.valid),
                 self.source.row.eq(out_fifo.source.row),
-                # The 32-bit result in EVERY lane: the engine's result packer keeps a
+                # The 32-bit result in every lane: the engine's result packer keeps a
                 # per-lane register and enables only the lane this result belongs to, so
-                # replicating here (pure fanout) is what lets the packer carry no data mux.
-                # Lane 0 still holds the result for every existing consumer.
+                # replicating here (pure fanout) lets the packer carry no data mux.
                 self.source.data.eq(Replicate(out_fifo.source.data, 8)),
                 self.source.head.eq(out_fifo.source.head),
                 out_fifo.source.ready.eq(self.source.ready),

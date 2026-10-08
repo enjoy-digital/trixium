@@ -6,7 +6,7 @@
 
 """MatVecEngine: N-channel ternary/Q8 matvec engine.
 
-One AXIReader + ChannelPipe per HBM pseudo-channel. A matvec command:
+One AXIReader + ChannelPipe per memory channel. A matvec command:
 
   1. FILL : broadcast x8 (cols bytes) from the scratchpad into every channel's x-buffer.
   2. ISSUE: give every reader the same {wbase, wlen} (identical relative layout per channel).
@@ -14,10 +14,13 @@ One AXIReader + ChannelPipe per HBM pseudo-channel. A matvec command:
             dst + (channel*rows + row)*4 bytes; done when rows*n_channels results landed.
 
 The command uses per-channel row counts (rows = M/n_channels) and byte addresses inside the
-per-channel HBM address space. Sequenced by the descriptor engine (or a CSR shim/testbench)."""
+per-channel address space. Other kinds: fetch (memory row -> scratchpad), store (scratchpad
+-> memory, through the loader's writers), axpy (weighted-V accumulate), and the optional
+DeltaNet (5) and attention (6) stream units. Driven by the sequencer or the CSR front-end.
+"""
 
 from functools import reduce
-from operator import and_
+from operator import and_, or_
 
 from migen import *
 from migen.genlib.fifo import SyncFIFO
@@ -30,38 +33,35 @@ from litex.soc.interconnect import stream
 from trixium.layout import BEAT_BYTES
 from trixium.memory.axi import AXIReader
 from trixium.core.pipe import ChannelPipe
+from trixium.units.deltanet_stream import DeltaNetStream
+from trixium.units.attention_stream import AttentionStream
 
-# MatVecEngine -------------------------------------------------------------------------------
+# Result Packer ------------------------------------------------------------------------------------
 
 class _ResultPacker(Module):
     """The per-pipe relay register in front of the gather, which in plain-matvec mode also
     coalesces a channel's consecutive results into full 8-lane beats.
 
-    Why (2026-09-07, docs/performance.md "The vector unit runs 2.9x slower under an engine
-    stream"): a plain matvec wrote ONE int32 result per W-port beat, so the up projection's
-    6,144 results were 6,144 port cycles in a ~6.7k-cycle stream. The engine's result FIFO
-    drains only on cycles the vector unit is not storing, so it pinned at its threshold and
-    a vector store was granted about one cycle in twelve - norm_i32 ran at 15.9 cy/beat under
-    the stream against 5.6 idle. Plain-mode rows are channel-major and contiguous per channel
+    One int32 per W-port beat would hold the scratchpad write port for most of a stream and
+    starve the vector unit. Plain-mode rows are channel-major and contiguous per channel
     (slot = dst + chan*rows + row), so a channel's 8 consecutive results are one aligned beat.
 
-    Structure, chosen for timing (the first version, v10, failed the gate at 31k endpoints):
-    - This IS the relay: its registers feed the gather's 16:1 mux and the round-robin, so
-      the grant side sees exactly what the old stream.Buffer relay gave it.
+    Structure, chosen for timing:
+    - This is the relay: its registers feed the gather's N:1 mux and the round-robin.
     - Its input is registered too (the engine puts a stream.Buffer in front), so every cone
-      here starts at flops: the pipe FIFO's asynchronous read and the slot arithmetic - the
-      chain the n16 #3c fix moved off the critical path - never reach the merge compare.
+      here starts at flops: the pipe FIFO's asynchronous read and the slot arithmetic never
+      reach the merge compare.
     - No data mux: the pipe replicates its 32-bit result across all 8 lanes, so lane l's
-      register always loads bits [32l:32l+32] of the input and only its ENABLE depends on
-      the lane. Bypass modes (ilv/AXPY/xred/fetch) load all 8 lanes and behave as the
-      plain register they replaced.
-    - Flush is LOCAL: the pipe's last row is static per op (rows_last), so the packer
-      flushes its own partial beat when it has consumed that row - no cross-die count.
+      register always loads bits [32l:32l+32] of the input and only its enable depends on
+      the lane. Bypass modes (ilv/AXPY/xred/fetch) load all 8 lanes (a plain register).
+    - Flush is local: the pipe's last row is static per op (rows_last), so the packer
+      flushes its own partial beat when it has consumed that row.
 
     In pack mode a result whose beat matches the held one merges into its lane; otherwise
     the held beat is emitted (displace) and the new result loads. A full beat is presented
     as soon as it is full. Byte-exact: the memory sees the same lanes with the same data,
-    only in fewer, wider writes."""
+    only in fewer, wider writes.
+    """
     def __init__(self):
         layout = [("row", 16), ("data", 256), ("wide", 1), ("head", 1), ("slot", 24)]
         self.sink   = stream.Endpoint(layout)
@@ -70,6 +70,8 @@ class _ResultPacker(Module):
         self.clear     = Signal()   # Op start.
         self.rows_last = Signal(16) # This pipe's last row index (static per op).
         self.qn        = Signal()   # Dual-Q: the last result is (rows_last, head 1).
+
+        # # #
 
         p_v     = Signal()
         p_row   = Signal(16)
@@ -80,13 +82,13 @@ class _ResultPacker(Module):
         p_lanes = Signal(8)
         last_seen = Signal()        # The pipe's final result has been consumed.
 
-        in_v    = Signal()
-        lane    = Signal(3)
-        merge   = Signal()          # Same beat as the held one: add a lane.
+        in_v     = Signal()
+        lane     = Signal(3)
+        merge    = Signal()         # Same beat as the held one: add a lane.
         displace = Signal()         # A new entry that cannot merge: emit the held one.
-        full    = Signal()
-        is_last = Signal()
-        accept  = Signal()
+        full     = Signal()
+        is_last  = Signal()
+        accept   = Signal()
         self.comb += [
             in_v.eq(self.sink.valid),
             lane.eq(self.sink.slot[0:3]),
@@ -140,39 +142,30 @@ class _ResultPacker(Module):
             self.sync += If(accept & (~self.enable | (lane == l)),
                             p_dat[32*l:32*l + 32].eq(self.sink.data[32*l:32*l + 32]))
 
+# MatVec Engine ------------------------------------------------------------------------------------
 
 class MatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False):
-        # chan_stride: byte distance between consecutive channels' weight regions. The HBM IP
-        # is configured with the AXI switch enabled (USER_SWITCH_ENABLE_00/01), so the address
-        # - not the port it arrives on - selects the pseudo-channel: with stride 0 every
-        # channel reads the same bytes. Confirmed on hardware, where `peek <c> 4000000`
-        # returned byte-identical data for all eight channels despite each having been
-        # uploaded a different payload. Sim keeps 0 because its per-channel HBM models are
-        # independent memories (each channel already has its own address space there).
-        # When a VectorUnit is passed, the scratchpad fill/gather ports are muxed
-        # between the engine and the vector unit (granted to the vector unit while it is
-        # busy - firmware serializes engine ops and vector ops, so contention is
-        # structurally impossible; never a 5th RAM port).
+        # chan_stride: byte distance between consecutive channels' weight regions. With the
+        # HBM AXI switch enabled the address (not the port) selects the pseudo-channel, so
+        # each channel needs its own window; 0 when every channel has its own address space.
+        # When a VectorUnit is passed, the scratchpad fill/gather ports are arbitrated per
+        # cycle between the engine, the vector unit and the sequencer (see below).
         assert chan_stride == 0 or (chan_stride & (chan_stride - 1)) == 0, \
             "chan_stride must be 0 or a power of two (the STORE path shifts by it)"
         chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
         # chan_mod: channels per memory controller, a power of two (0 = one flat address
-        # space, the FK33's HBM). On a board with several controllers (the XCU1525's four
-        # DDR4 channels) engine channel c sits on controller c // chan_mod and its window
-        # is that controller's local HBM_WEIGHT_BASE + (c % chan_mod)*stride: the FK33's
-        # constants and images, per controller. The mask is applied on the read, fetch and
-        # STORE paths alike (the loader masks the upload path the same way).
+        # space, e.g. HBM). With several controllers (e.g. four DDR4 channels) engine channel
+        # c sits on controller c // chan_mod and its window is that controller's local weight
+        # base + (c % chan_mod)*stride. The mask is applied on the read, fetch and STORE paths
+        # alike (the loader masks the upload path the same way).
         assert chan_mod == 0 or (chan_mod & (chan_mod - 1)) == 0, \
             "chan_mod must be 0 or a power of two (the STORE path masks by it)"
         # chan_skew: an extra per-channel offset of (c % chan_mod)*chan_skew bytes on top of
         # the stride, so that the channels sharing a DDR4 controller start in different
-        # banks. With power-of-two strides the four windows of a controller sit in the same
-        # bank (the stride is a multiple of the bank period) and four sequential streams
-        # thrash that bank's row: 6-7.6 cycles/beat per port in the LiteDRAM sim against
-        # 4.3 with a bank skew (2026-09-19; the XCU1525 uses 32 KB = a bank group step).
-        # 0 keeps the FK33's netlist exactly.
+        # banks: with power-of-two strides they would all stream through the same bank and
+        # thrash its row.
         assert chan_skew == 0 or chan_mod, "chan_skew needs chan_mod"
         def _chan_off(i): # Python int: per-reader constant.
             local = (i % chan_mod) if chan_mod else i
@@ -183,26 +176,16 @@ class MatVecEngine(LiteXModule):
             return Array([k*chan_skew for k in range(chan_mod)])[sel]
 
         # Keep the vector unit's busy signal, not the module: assigning a Module to an
-        # attribute registers it as a submodule, and it is already one of the SoC's. The
-        # double registration renames its CSRs (vecunit_* -> vecunit_vecunit_*, plus an
-        # engine_vecunit_* alias) and moves them, which silently breaks firmware/vec.c.
+        # attribute would register it as a submodule a second time (and rename its CSRs).
         self.vec_busy_in = vecunit.busy if vecunit is not None else Signal()
 
-        # Overlap counters. The MAC array is idle ~92% of a token and the sequencer runs one
-        # descriptor at a time, so the question that decides whether dual-issue is worth
-        # building is: how much of the token has BOTH units busy already? Free-running from
-        # reset. Neither includes CPU arithmetic and memory stalls as well as dispatch;
-        # it is NOT a prediction of the gain from dual issue. The vector busy input can
-        # include the DeltaNet client through the shared scratchpad mux.
-        #
-        # Counted here rather than in the CSR front end because the engine already holds a
-        # vec_busy_in reference; adding one in csr_front would mean a new integration signal
-        # in BOTH SoC definitions, which is exactly the drift the guard test exists to catch.
+        # Overlap counters, free-running from reset: total, engine busy, vector unit busy
+        # and both busy (exposed by the CSR front-end).
         self.cyc_total = Signal(64)
         self.cyc_eng   = Signal(64)
         self.cyc_vec   = Signal(64)
         self.cyc_both  = Signal(64)
-        self.busy      = Signal()      # declared early: the counters below need it
+        self.busy      = Signal()      # Declared early: the counters below need it.
         self.sync += [
             self.cyc_total.eq(self.cyc_total + 1),
             If(self.busy,          self.cyc_eng.eq(self.cyc_eng + 1)),
@@ -212,7 +195,7 @@ class MatVecEngine(LiteXModule):
         self.n_channels = n = len(hbm_axis)
 
         self.cmd = stream.Endpoint([
-            ("kind",   3),   # 0: ternary, 1: q8, 2: fetch (HBM -> SP), 3: store (SP -> HBM),
+            ("kind",   3),   # 0: ternary, 1: q8, 2: fetch (mem -> SP), 3: store (SP -> mem),
                              # 4: axpy (weighted-V: per-lane accumulate, cols results/chan),
                              # 5: DeltaNet stream (dnstream only: rows = heads, xsrc = the
                              # head record table, wbase/wlen = every channel's state span,
@@ -241,17 +224,12 @@ class MatVecEngine(LiteXModule):
                              # (Q8 scores and AXPY kinds only; x holds both vectors).
             ("qstride", 16), # Head-B result offset in words (dst + 4*qstride).
             ("rshift2", 6),  # Head-B AXPY pre-shift (Rpre differs per head).
-            ("xred",   1),   # AXPY only: sum the per-channel partials IN HARDWARE and write
-                             # one cols-long result instead of n_channels of them. Without
-                             # it the firmware pays n_channels-1 reduce_acc calls per head
-                             # (7 at N=8), which measured 3 cycles/element and is 9 of the
-                             # 13 per-head attention descriptors. int32 add wraps and is
-                             # associative, so the tree here is bit-identical to the
-                             # sequential vector-unit reduce it replaces.
+            ("xred",   1),   # AXPY only: sum the per-channel partials in hardware and write
+                             # one cols-long result instead of n_channels of them (int32
+                             # wrap add: bit-identical to a sequential vector-unit reduce).
             ("rep",    5),   # STORE only: number of packets (0/1 = one). Packet r goes to
-                             # wbase + r*dstride beats from xsrc + r*sstride beats - the
-                             # 16 per-layer KV packets in ONE op (F1-1, 2026-08-29).
-            ("dstride", 24), # STORE: HBM beats between consecutive packets.
+                             # wbase + r*dstride beats from xsrc + r*sstride beats.
+            ("dstride", 24), # STORE: memory beats between consecutive packets.
             ("sstride", 8),  # STORE: scratchpad beats between consecutive source slots.
         ])
         self.sp_busy = Signal() # busy + 1 cycle: the registered write stage's last beat
@@ -266,13 +244,11 @@ class MatVecEngine(LiteXModule):
         self.argmax_val = Signal((32, True), reset=-(1 << 31))
         self.argmax_idx = Signal(24, reset=0xFFFFFF)
 
-        # STORE (kind 3): scratchpad beats -> one HBM channel, through the loader's
-        # per-channel AXI writers (wired by the integrator; a kind-3 op hangs if absent -
-        # firmware only issues it when TRIXIUM_HAS_KVSTORE is set). cmd reuse: chan = dest
-        # channel, wbase = HBM byte address, wlen = beats, xsrc = scratchpad byte source.
+        # STORE (kind 3): scratchpad beats -> one memory channel, through the loader's
+        # per-channel AXI writers (wired by the integrator). cmd reuse: chan = dest channel,
+        # wbase = memory byte address, wlen = beats, xsrc = scratchpad byte source.
+        # addr is 33 bits: per-channel windows can extend past 4 GB.
         self.store_cmd  = stream.Endpoint([("chan", 5), ("addr", 33), ("len", 24)])
-        # addr is 33 bits: with port-matched 256 MB windows channel 15 lives at
-        # PC16 = 0x1_0400_0000 (stack 1's first pseudo-channel, N=16 - 2026-08-29).
         self.store_data = stream.Endpoint([("data", 256)])
         self.store_busy = Signal() # From the loader: executing our store (incl. B drain).
 
@@ -281,7 +257,6 @@ class MatVecEngine(LiteXModule):
         # (same wbase/wlen on every channel, the readers' per-channel offsets).
         self.with_dnstream = dnstream
         if dnstream:
-            from trixium.units.deltanet_stream import DeltaNetStream
             # dnstream=True: the 27B geometry on the exact operators; a dict overrides the
             # unit's arguments (tests: a small geometry on integer operators).
             opts = dict(dnstream) if isinstance(dnstream, (dict, tuple)) else {}
@@ -292,9 +267,9 @@ class MatVecEngine(LiteXModule):
 
         self.with_attnstream = attnstream
         if attnstream:
-            from trixium.units.attention_stream import AttentionStream
             opts = dict(attnstream) if isinstance(attnstream, (dict, tuple)) else {}
-            self.submodules.attnstream = at = AttentionStream(adr_bits=len(scratchpad.fill.adr), **opts)
+            self.submodules.attnstream = at = AttentionStream(
+                adr_bits=len(scratchpad.fill.adr), **opts)
 
         # # #
 
@@ -305,7 +280,7 @@ class MatVecEngine(LiteXModule):
         self.readers = []
         self.pipes   = []
         read_cmds = []
-        # Per-cycle port arbitration state (docs/overlap-design.md). rd_free: the engine
+        # Per-cycle port arbitration state. rd_free: the engine
         # may put an address on the scratchpad R port this cycle. fetch_rdy: the gather
         # write FIFO has headroom for a fetch beat. gw_pending: engine writes queued but
         # not yet in RAM (done waits on it). All default to the serial behavior when no
@@ -323,22 +298,20 @@ class MatVecEngine(LiteXModule):
         rsrc_valids, rsrc_datas = [], []
         for i, axi in enumerate(hbm_axis):
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
-            # per round trip - 33.7 cycles/beat measured); round-robin ARIDs let it pipeline.
+            # per round trip); round-robin ARIDs let it pipeline.
             reader = AXIReader(axi, n_ids=4)
             pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
             setattr(self.submodules, f"reader{i}", reader)
             setattr(self.submodules, f"pipe{i}",   pipe)
-            # Relay register between the reader (its FIFO sits at the HBM port, bottom of
-            # the die) and the pipe: n16 timing #3c had the FIFO output reaching codes_r
-            # with zero logic levels and 4.5 ns of route. Latency only.
+            # Relay register between the reader (its FIFO sits at the memory port) and the
+            # pipe, for timing (route). Latency only.
             rbuf = stream.Buffer([("data", 256)])
             setattr(self.submodules, f"rbuf{i}", rbuf)
             self.comb += reader.source.connect(rbuf.sink)
             read_cmds.append(reader.sink)
             rsrc = rbuf.source
-            # Registered per channel (n16 timing #3d: the combinational decode from cmd_r
-            # reached a far pipe's scale-RAM write enables with 5.4 ns of route). Stable
-            # from the cycle after START; the reader is commanded later than that.
+            # Registered per channel for timing (the decode from cmd_r fans out to far
+            # pipes). Stable from the cycle after START; the reader is commanded later.
             is_fetch = Signal(name=f"is_fetch{i}")
             self.sync += is_fetch.eq(fetch_mode & (fetch_chan == i))
             is_dn = C(0, 1)
@@ -359,8 +332,9 @@ class MatVecEngine(LiteXModule):
                 pipe.sink.data.eq(rsrc.data),
                 # Fetch beats honor the gather-FIFO headroom (a vec store can steal the
                 # W port for a cycle); compute beats honor the pipe's result-FIFO
-                # backpressure (drops results past N=2 otherwise - N/row_beats > 1 gather/cycle).
-                rsrc.ready.eq((is_fetch & fetch_rdy) | (~is_fetch & ~is_dn & ~is_at & pipe.sink.ready)
+                # backpressure.
+                rsrc.ready.eq((is_fetch & fetch_rdy)
+                              | (~is_fetch & ~is_dn & ~is_at & pipe.sink.ready)
                               | (is_dn & (dn.sinks[i].ready if dnstream else 0))
                               | (is_at & at_take & (at_chan == i))),
             ]
@@ -391,17 +365,12 @@ class MatVecEngine(LiteXModule):
             at_mode.eq(cmd_r["kind"] == 6 if attnstream else 0),
             fetch_chan.eq(cmd_r["chan"]),
         ]
-        # Broadcast op params to pipes (channels < rem run one extra row). REGISTERED
-        # per pipe (n16 timing #3c: the combinational broadcast reached a far pipe's
-        # x-buffer address with 3.9 ns of route). They load during START from the new
-        # cmd_r and are stable one cycle later, together with the registered start pulse
-        # below - the first beat or fill write reaches a pipe later than that.
+        # Broadcast op params to pipes (channels < rem run one extra row), registered per
+        # pipe for timing. They load during START from the new cmd_r and are stable one
+        # cycle later, together with the registered start pulse below.
         for i, pipe in enumerate(self.pipes):
-            # The copies are logically identical, so opt_design merged them back into ONE
-            # flop (kept under pipe 0's name) with a fanout of 9,756 and ~3.4 ns of route
-            # into every pipe's AXPY shift cone - the largest failing-endpoint family on
-            # v11 (2026-09-10). dont_touch keeps each pipe's copy next to its consumers,
-            # the v1_rep / fill_*2 idiom. (rows differs per pipe and never merged.)
+            # dont_touch: the copies are logically identical and would otherwise be merged
+            # back into one high-fanout flop.
             for s in (pipe.kind, pipe.scale_beats, pipe.code_beats, pipe.bias,
                       pipe.rshift, pipe.qn, pipe.rshift2):
                 s.attr.add(("dont_touch", "true"))
@@ -437,7 +406,7 @@ class MatVecEngine(LiteXModule):
         fill_active_d = Signal()
         fill_beat_d   = Signal(10)
         st_cnt        = Signal(13) # STORE beat counter (address holds until accepted).
-        # Multi-packet STORE state: packet index, running HBM address, running source
+        # Multi-packet STORE state: packet index, running memory address, running source
         # beat offset (all reset on accept; advanced between packets).
         st_rep        = Signal(5)
         st_addr_r     = Signal(32)
@@ -445,21 +414,18 @@ class MatVecEngine(LiteXModule):
         st_last_pkt   = Signal()
         st_next       = Signal()   # Pulse: advance to the next packet.
         self.comb += st_last_pkt.eq((st_rep + 1 >= cmd_r["rep"]))
-        # Scratchpad read address for the fill and the STORE stream, kept as a COUNTER
-        # (n16 timing #3d: xsrc + Mux(store_mode, off + cnt, beat) put two carry chains and
-        # the store_mode decode in front of a 64-BRAM address net). Reset to xsrc at START,
-        # advanced exactly when fill_beat / st_cnt advance, re-based on each STORE packet.
+        # Scratchpad read address for the fill and the STORE stream, kept as a counter (no
+        # adder in front of the BRAM address, timing). Reset to xsrc at START, advanced
+        # exactly when fill_beat / st_cnt advance, re-based on each STORE packet.
         eng_fill_adr = Signal(len(scratchpad.fill.adr))
         xsrc_w = Signal(len(scratchpad.fill.adr))
         self.comb += xsrc_w.eq(cmd_r["xsrc"] >> 5)
         # STORE stream through a 4-deep prefetch FIFO: reads are issued ahead (whenever the
-        # R port is ours and credit remains), so the stream runs at one beat per clock. It
-        # used to hold each address until its beat was accepted and then wait a cycle for the
-        # next read: one beat every two clocks for every STORE (2026-09-24).
+        # R port is ours and credit remains), so the stream runs at one beat per clock.
         self.submodules.st_fifo = st_fifo = ResetInserter()(stream.SyncFIFO([("data", 256)], 4))
-        st_run   = Signal()    # fsm.ongoing("ST_RUN"), assigned once the FSM exists
-        st_iss   = Signal(13)  # beats read in the current packet
-        st_pend  = Signal()    # a read issued last cycle: its data is on fill.dat_r now
+        st_run   = Signal()    # fsm.ongoing("ST_RUN"), assigned once the FSM exists.
+        st_iss   = Signal(13)  # Beats read in the current packet.
+        st_pend  = Signal()    # A read issued last cycle: its data is on fill.dat_r now.
         st_issue = Signal()
         self.comb += [
             st_issue.eq(st_run & rd_free & (st_iss < cmd_r["wlen"]) &
@@ -490,17 +456,10 @@ class MatVecEngine(LiteXModule):
                     Cat(fill_headb, fill_g[:9])),
                 fill_beat_d)),
         ]
-        # Second fill stage: the 256-bit scratchpad read data was broadcast COMB from
-        # the BRAM output to every pipe's x-buffer write port (the v11 worst path).
-        # Data registers once here; position/enable delay a cycle to stay aligned. The
-        # last writes land during ISSUE - x-buffer reads only start once beats arrive.
-        # Per-pipe copies (dont_touch): a single stage-2 register driving every pipe's
-        # x-buffer write port was the v13 route-spread path; each pipe now owns a local
-        # copy the placer can pull next to its x-buffer.
-        # Relay stage first (n16 timing #3c): the BRAM output fanned out to sixteen
-        # per-pipe copies across the die. One register next to the scratchpad, then the
-        # per-pipe copies off a flop the tool may replicate. Adds a cycle to the fill; the
-        # last writes still land during ISSUE.
+        # Fill broadcast, registered for timing: one relay register next to the scratchpad,
+        # then per-pipe copies (dont_touch) the placer can pull next to each x-buffer;
+        # position/enable are delayed to stay aligned. The last writes land during ISSUE
+        # (x-buffer reads only start once beats arrive).
         fill_act1 = Signal()
         fill_pos1 = Signal(10)
         fill_dat1 = Signal(256)
@@ -532,9 +491,8 @@ class MatVecEngine(LiteXModule):
         result_cnt  = Signal(32)
         # Interleaved (position-major) ops merge every pipe whose head falls in the same
         # scratchpad beat as the granted head: slot = row*N + chan, so within one beat all
-        # lanes map to distinct pipes (N power-of-2) and up to 8 results retire per cycle.
-        # This is the gather-widen: at N channels the aggregate score rate N/row_beats
-        # exceeds 1/cycle from N=4 up, and merged retirement keeps the drain above it.
+        # lanes map to distinct pipes (N power-of-2) and up to 8 results retire per cycle,
+        # keeping the drain above the aggregate score rate N/row_beats.
         ilv_mode  = Signal()
         xred_mode = Signal()
         dstw      = Signal(24)
@@ -543,18 +501,15 @@ class MatVecEngine(LiteXModule):
             xred_mode.eq(axpy_mode & cmd_r["xred"]),
             dstw.eq(cmd_r["dst"] >> 2),
         ]
-        # Per-pipe relay register in front of the gather (n16 timing #3c: the result
-        # FIFO's asynchronous read fed the slot arithmetic, the merge compare and the lane
-        # muxes in one cycle - 14 levels, 6.4 ns). The scratchpad slot of each result is
-        # computed HERE, from the pipe's FIFO output and the (op-static) command fields,
-        # and travels registered with the result: the gather then only compares and
-        # selects. Every mode's addressing is folded into one field:
+        # Per-pipe relay register in front of the gather (timing). The scratchpad slot of
+        # each result is computed here, from the pipe's FIFO output and the (op-static)
+        # command fields, and travels registered with the result: the gather then only
+        # compares and selects. Every mode's addressing is folded into one field:
         #   ilv      slot = dst + qoff + row*N + chan       (position-major, merged beats)
         #   xred     slot = dst + qoff + row                (one summed vector)
         #   axpy     slot = dst + qoff + chan*cols + row    (wide drain rows)
         #   default  slot = dst + qoff + chan*rows + row    (channel-major)
-        # The pipe's stream handshake is unchanged (consumed == counted still holds: the
-        # counting stage sits after the relay, on the same signals it always used).
+        # Consumed == counted holds: the counting stage sits after the relay.
         # Plain-matvec results are packed into full beats per channel in the relay stage
         # (_ResultPacker above). pack_en excludes every mode with its own retirement path.
         pack_en = Signal()
@@ -564,7 +519,7 @@ class MatVecEngine(LiteXModule):
         for i, pipe in enumerate(self.pipes):
             # Registered input stage: the slot arithmetic below is computed from the pipe
             # FIFO's asynchronous read and lands in flops here, so the packer's merge
-            # compare starts from registers (n16 #3c, kept).
+            # compare starts from registers.
             ib = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
                                 ("slot", 24)])
             setattr(self.submodules, f"gin{i}", ib)
@@ -582,7 +537,8 @@ class MatVecEngine(LiteXModule):
                 ib.sink.slot.eq(dstw + Mux(pipe.source.head, cmd_r["qstride"], 0)
                     + Mux(ilv_mode, pipe.source.row*n + i,
                       Mux(xred_mode, pipe.source.row,
-                          pipe.source.row + Mux(axpy_mode, i*cmd_r["cols"], i*cmd_r["rows"])))),
+                          pipe.source.row + Mux(axpy_mode, i*cmd_r["cols"],
+                                                                i*cmd_r["rows"])))),
                 ib.source.connect(pk.sink),
                 pk.enable.eq(pack_en),
                 pk.rows_last.eq(rows_last_i),
@@ -603,27 +559,23 @@ class MatVecEngine(LiteXModule):
             for i in range(n)]))
 
         # Cross-channel reduce (AXPY + cmd.xred). Every pipe drains its partial vector as
-        # cols/8 beats in the SAME order - beat k is always lane group k, pushed by the drain
+        # cols/8 beats in the same order - beat k is always lane group k, pushed by the drain
         # FSM's d_cnt - so the channels are in lockstep by construction and no addressing is
         # needed to line them up: wait until all n have a beat, add them lane-wise, write one
         # beat, and consume all n together.
         #
         # Head-of-line blocking is not a hazard here: every channel produces exactly cols/8
-        # beats regardless of `rem` (rem varies the number of POSITIONS a channel accumulates,
+        # beats regardless of `rem` (rem varies the number of positions a channel accumulates,
         # not the length of its output), and the drain runs after the reader has finished, so
         # a stalled axw_fifo cannot deadlock against an in-flight read.
         xred_all  = Signal()
         self.comb += xred_all.eq(xred_mode & reduce(and_, [g.valid for g in gsrc]))
         xred_dat = Signal(256)
         def _addtree(sigs):
-            # Balanced: a left fold is a chain of n-1 adders (15 carry chains deep at
-            # N=16); the tree is log2(n) deep and, being wrap-add, bit-identical. Exactly
-            # ONE level is registered whatever the depth (n16 timing #3d: four carry levels
-            # behind a far-placed relay were the eng_gw_dat worst path) - the second level
-            # when there is one, else the only level, else the lone input - so the summed
-            # beat always lands one cycle later and the xred write below follows it. (An
-            # earlier form registered "level 1" only: at N=2 there is no level 1, nothing
-            # was registered, and the data ran a cycle ahead of its write enable.)
+            # Balanced tree, log2(n) deep (wrap-add: bit-identical to a left fold). Exactly
+            # one level is registered whatever the depth (timing) - the second level when
+            # there is one, else the only level, else the lone input - so the summed beat
+            # always lands one cycle later and the xred write below follows it.
             depth = (len(sigs) - 1).bit_length()
             if depth == 0:
                 r = Signal(32)
@@ -690,7 +642,7 @@ class MatVecEngine(LiteXModule):
             gidx.eq(rr.grant*cmd_r["rows"] + grant_row - grant_slot[0:3]),
         ]
         # Argmax tap rides the plain-matvec grant path only: it is used exclusively by the
-        # chan-major LM-head op (never ilv, never AXPY). A grant is now a PACKED beat of up
+        # chan-major LM-head op (never ilv, never AXPY). A grant is a packed beat of up
         # to 8 results (_ResultPacker), so the tap reduces 8 lanes to one (value, index)
         # with np.argmax's tie-break (smallest index) through a registered tree - three
         # levels, one per cycle - and then the running compare. Invalid lanes enter as
@@ -760,7 +712,7 @@ class MatVecEngine(LiteXModule):
         fetch_data  = Signal(256)
         fetch_cnt   = Signal(24)
         fetch_wcnt  = Signal(24)
-        fetch_take = Signal() # A fetch beat is actually consumed this cycle.
+        fetch_take  = Signal() # A fetch beat is actually consumed this cycle.
         self.comb += [
             fetch_valid.eq(reduce_or(fetch_valids)),
             fetch_data.eq(Array(fetch_datas)[fetch_chan]),
@@ -768,19 +720,18 @@ class MatVecEngine(LiteXModule):
         ]
 
         # Scratchpad write port: fetch beats, one merged ilv beat, one wide AXPY beat, or
-        # a single gathered int32. The write stage is REGISTERED: FIFO-out -> merge muxes
-        # -> RAM write / absmax tree in one cycle was the worst hardware path (38 logic
-        # levels); the RAM write, result counting and the trackers run one cycle later
-        # off these registers (ops are separated by dispatch - the lag is invisible).
+        # a single gathered int32. The write stage is registered (timing): the RAM write,
+        # result counting and the trackers run one cycle later off these registers (ops are
+        # separated by dispatch - the lag is invisible).
         slot = Signal(24)
         # Fetch write addressing counts at the comb stage (beats arrive every cycle;
         # the registered fetch_cnt lags one cycle and is only the terminator).
         eng_gw_adr_c = Signal(len(scratchpad.gather.adr))
         eng_gw_we_c  = Signal(8)
         eng_gw_dat_c = Signal(256)
-        eng_gw_adr = Signal(len(scratchpad.gather.adr))
-        eng_gw_we  = Signal(8)
-        eng_gw_dat = Signal(256)
+        eng_gw_adr   = Signal(len(scratchpad.gather.adr))
+        eng_gw_we    = Signal(8)
+        eng_gw_dat   = Signal(256)
         self.sync += [
             eng_gw_adr.eq(eng_gw_adr_c),
             eng_gw_we.eq(eng_gw_we_c),
@@ -793,9 +744,7 @@ class MatVecEngine(LiteXModule):
             fetch_wcnt.eq(0),
         ).Elif(fetch_mode & fetch_take,
             # Equivalent to (eng_gw_we_c != 0) in fetch mode, but off the reader valids
-            # directly: the OR-reduce of the muxed write enables dragged the pipes' FIFO
-            # state into this CE (v15's worst path; fetch_rdy adds only a small level
-            # compare from the gather FIFO).
+            # directly: keeps the pipes' FIFO state out of this CE (timing).
             fetch_wcnt.eq(fetch_wcnt + 1),
         )
         # The granted result's slot, precomputed per pipe at the relay register (xred:
@@ -836,22 +785,13 @@ class MatVecEngine(LiteXModule):
             ).Elif(ilv_mode,
                 eng_gw_adr_c.eq(grant_slot[3:]),
                 eng_gw_dat_c.eq(lane_dat),
-                # NOT gated on grant_valid. A merged beat is consumed on merge_mask, which
+                # Not gated on grant_valid: a merged beat is consumed on merge_mask, which
                 # only sets lanes for pipes that are themselves valid and whose slot is in
-                # this beat, so lane_we is already zero when nothing merges. The extra gate
-                # only broke the agreement between consuming and counting: with the
-                # round-robin still pointing at a pipe that had just gone invalid, its stale
-                # slot could match a valid pipe's beat, merge_mask took that pipe's result,
-                # and grant_valid held the write enable at zero. The result vanished without
-                # incrementing result_cnt, RUN waited for a count it could never reach, and
-                # the engine sat busy holding the scratchpad grant (status 0x301).
-                #
-                # It needs pipes presenting at staggered times, so it only bites from two
-                # rows per channel on - with one row all eight merge in a single beat, which
-                # is why rows=1 works at every rem. Position 9 at 8 channels on the card.
-                #
-                # The address is safe without the gate: merge_mask requires
-                # gsrc[i].slot[3:] == grant_slot[3:], so every lane written belongs here.
+                # this beat, so lane_we is already zero when nothing merges. Gating it would
+                # break consumed == counted (the round-robin can still point at a pipe that
+                # just went invalid while merge_mask takes another pipe's result) and hang
+                # RUN. The address is safe: merge_mask requires gsrc[i].slot[3:] ==
+                # grant_slot[3:], so every lane written belongs here.
                 eng_gw_we_c.eq(lane_we),
             ).Elif(xred_mode,
                 eng_gw_adr_c.eq(xred_slot_d),
@@ -863,8 +803,7 @@ class MatVecEngine(LiteXModule):
                 eng_gw_we_c.eq(Mux(grant_valid, 0xFF, 0)),
             ).Else(
                 # Plain matvec: a packed beat from the channel's _ResultPacker - up to 8
-                # results, lanes as written. Was one lane per write (Replicate + 1 << lane),
-                # which held the W port ~92% of a stream and starved the vector unit.
+                # results, lanes as written.
                 eng_gw_adr_c.eq(slot[3:]),
                 eng_gw_dat_c.eq(grant_data),
                 eng_gw_we_c.eq(Mux(grant_valid, grant_lanes, 0)),
@@ -873,9 +812,9 @@ class MatVecEngine(LiteXModule):
 
         # Result absmax tracker, write-stage (norm_i32's shift argument; reset on command
         # accept). Runs over every written lane so merged/wide retirement is covered.
-        # Per-lane |value| is registered before the max tree: FF(write data) -> abs ->
-        # tree -> compare -> CE was v6's worst path. The tracker lags the write by two
-        # cycles; every reader (CSR, sequencer k(absmax) at DISPATCH) trails done by more.
+        # Per-lane |value| is registered before the max tree (timing). The tracker lags the
+        # write by two cycles; every reader (CSR, sequencer k(absmax) at DISPATCH) trails
+        # done by more.
         lane_abs = []
         for l in range(8):
             ls = Signal((32, True), name=f"labs_s{l}")
@@ -932,22 +871,20 @@ class MatVecEngine(LiteXModule):
                 scratchpad.gather.we.eq(sp_gw_we),
             ]
         else:
-            # Per-cycle arbitration (docs/overlap-design.md): the units may run
-            # CONCURRENTLY, so the grant is per cycle, not per op.
+            # Per-cycle arbitration: the units may run concurrently, so the grant is per
+            # cycle, not per op.
             #
-            # R port: vec > seq > engine. A vec load claims the port for exactly its
-            # E1 (address) cycle since the V1 pipeline (sp_rd_req; it was a 3-cycle EX1..EX2
-            # window on the FSM unit); the engine's fill/store address generation simply
-            # does not advance on those cycles (rd_free below). Seq descriptor fetches still
-            # only happen while both units are idle.
+            # R port: vec > seq > engine. A vec load claims the port for exactly its address
+            # cycle (sp_rd_req); the engine's fill/store address generation simply does not
+            # advance on those cycles (rd_free below).
             #
             # W port: engine writes are enqueued into a small FIFO instead of driving the
-            # port directly - the merge/counting stage upstream MUST NOT stall (see the
+            # port directly - the merge/counting stage upstream must not stall (see the
             # consumed-vs-counted note above). Vec stores get the port while the FIFO has
             # headroom; at/above the mark the engine drains continuously and the vec unit
-            # holds in EX2 (sp_wr_gnt). Deadlock-free: the engine never waits on the vec
-            # unit mid-op, so the FIFO always drains. Depth 8 suffices: input is <= 1
-            # write/cycle, and above the mark drain matches input.
+            # holds (sp_wr_gnt). Deadlock-free: the engine never waits on the vec unit
+            # mid-op, so the FIFO always drains. Depth 8 suffices: input is <= 1 write/cycle,
+            # and above the mark drain matches input.
             grant_seq = Signal()
             vec_rd    = Signal()
             vec_wr    = Signal()
@@ -970,27 +907,20 @@ class MatVecEngine(LiteXModule):
                 grant_seq.eq(0 if seq is None else seq.sp_active),
                 vec_rd.eq(vecunit.sp_rd_req),
                 # The seq's fetch FSM holds its address cycle when a vec load outranks it.
-                # It no longer also waits on posted sideband writes: that interlock was
-                # correct but made a CPU patch burst starve a running list (~7.5k cycles
-                # per layer for 80 writes, v8 qtrace). The ordering firmware actually
-                # needs is "every patch for a list has landed before that list starts",
-                # so the sequencer drains the FIFO once at START instead (sequencer.py
-                # SBDRAIN). See the invariant recorded there.
-                # sbmode picks which of the two orderings is live, so both can be measured
-                # in one boot. It is used through a LOCAL register (sbmode_r below): a CSR
-                # storage bit routed straight into this cone is a CPU-region signal in a
-                # port cone, the family that cost two unroutable builds.
+                # Posted sideband writes: either the fetch waits on them (sbmode=0) or the
+                # sequencer drains the FIFO once at START (sbmode=1, sequencer.py SBDRAIN).
+                # sbmode is used through a local register (sbmode_r) to keep a CPU-side CSR
+                # bit out of this port cone (congestion).
                 *([] if seq is None else [
                     seq.sp_gnt.eq(~vec_rd & (~scratchpad.sbw_pending | sbmode_r)),
                     seq.sbw_pending.eq(scratchpad.sbw_pending)]),
                 # Posted sideband writes (see scratchpad.py): the drain takes the W
                 # port on any cycle the vector store slot is idle and the gather FIFO
-                # has registered headroom - an engine-local grant with no CPU-region
-                # term in the cone, and the R port arbitration is untouched. The
-                # headroom margin keeps gw_ovf impossible (level(T-1) < 5 bounds
-                # level(T) <= 6 < 8 on a non-draining cycle).
+                # has registered headroom - an engine-local grant. The headroom margin
+                # keeps gw_ovf impossible (level(T-1) < 5 bounds level(T) <= 6 < 8 on a
+                # non-draining cycle).
                 scratchpad.sbw_gnt.eq(scratchpad.sbw_pending & ~vec_wr & sb_headroom_r),
-                # Read slot (C2-2): reads take the R port on any free cycle, below vec
+                # Read slot: sideband reads take the R port on any free cycle, below vec
                 # loads and the seq fetch; the fill/store address just holds (rd_free).
                 scratchpad.sbr_allow.eq(~vec_rd & ~grant_seq),
                 rd_free.eq(~vec_rd & ~grant_seq & ~scratchpad.sbr_gnt_any),
@@ -1036,7 +966,7 @@ class MatVecEngine(LiteXModule):
                 dn.start.eq(start_pulse & dn_mode),
                 dn.heads.eq(cmd_r["rows"]),
                 dn.table.eq(cmd_r["xsrc"] >> 5),
-                dn.zero.eq(cmd_r["bias"][0]),      # op 5: the incoming state is +0.0
+                dn.zero.eq(cmd_r["bias"][0]),      # Op 5: the incoming state is +0.0.
                 dn.sp_rd_ok.eq(dn_mode & rd_free),
                 dn.sp_rd_dat.eq(scratchpad.fill.dat_r),
             ]
@@ -1070,7 +1000,7 @@ class MatVecEngine(LiteXModule):
                 ),
             ]
         for pk in packs:
-            self.comb += pk.clear.eq(start_pulse)   # No partial beat survives an op boundary.
+            self.comb += pk.clear.eq(start_pulse) # No partial beat survives an op boundary.
         fsm.act("IDLE",
             self.cmd.ready.eq(1),
             If(self.cmd.valid,
@@ -1096,7 +1026,8 @@ class MatVecEngine(LiteXModule):
         # STORE targets the one channel in cmd.chan, so it needs the same per-channel
         # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
         # Built term by term so that chan_skew=0 emits exactly the expression it always did.
-        _store_addr = st_addr_r + (_chan_sel(cmd_r["chan"]) << chan_shift if chan_stride else 0)
+        _store_addr = st_addr_r + (
+            _chan_sel(cmd_r["chan"]) << chan_shift if chan_stride else 0)
         if chan_skew:
             _store_addr = _store_addr + _chan_skew_of(_chan_sel(cmd_r["chan"]))
         fsm.act("ST_CMD",
@@ -1162,14 +1093,9 @@ class MatVecEngine(LiteXModule):
             *[c.len.eq(cmd_r["wlen"]
                 + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
               for i, c in enumerate(read_cmds)],
-            # NOTE: this waits on readers[0] alone. A reader only accepts while idle
-            # (sink.ready = ~active), and readers do not always go idle together - with
-            # rem != 0 they get different lengths, and a fetch commands one channel - so in
-            # principle a reader still draining would miss its command. Measured on the card
-            # it does not happen: at the stall every channel had delivered exactly the beats
-            # commanded (ch0=10/10, ch1..7=5/5). Fixing it anyway cost WNS 0.015 -> -0.766 ns
-            # on a design with no margin, and changed nothing, so it is left as written and
-            # recorded here instead.
+            # Waits on readers[0] alone. A reader only accepts while idle, so a reader still
+            # draining could in principle miss its command; this was never observed on
+            # hardware, and a per-reader wait costs timing.
             If(read_cmds[0].ready,
                 NextState("RUN"),
             )
@@ -1180,12 +1106,12 @@ class MatVecEngine(LiteXModule):
         # A stall in RUN is either "results never produced" or "produced but never retired",
         # and result_cnt against the expected total is what separates the two.
         self.dbg_result_cnt = result_cnt
-        self.dbg_gw_we      = sp_gw_we  # W-port write cycles (a testbench counts them).
+        self.dbg_gw_we      = sp_gw_we # W-port write cycles (a testbench counts them).
         self.dbg_mv_total   = mv_total
         self.dbg_ax_total   = ax_total
         self.comb += [
             mv_total.eq(cmd_r["rows"]*self.n_channels + cmd_r["rem"]),
-            # xred writes ONE cols-long vector, so the retire count drops by n_channels.
+            # xred writes one cols-long vector, so the retire count drops by n_channels.
             # result_cnt counts written lanes (popcount of the write enables), so this is
             # all the accounting the merged beats need.
             ax_total.eq(Mux(cmd_r["xred"], cmd_r["cols"],
@@ -1250,7 +1176,7 @@ class MatVecEngine(LiteXModule):
             ),
         ]
 
+# Helpers ------------------------------------------------------------------------------------------
+
 def reduce_or(sigs):
-    from functools import reduce
-    from operator import or_
     return reduce(or_, sigs)
