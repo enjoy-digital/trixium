@@ -1,11 +1,18 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Ready-to-ready timing, kept independent of the clock/console for native tests.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium token benchmark: ready-to-ready timing
+ *
+ * Kept independent of the clock and the console so the host tests can compile it natively.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #ifndef TRIXIUM_BENCH_H
 #define TRIXIUM_BENCH_H
+
 #include <stdint.h>
 
 struct bench_samples {
@@ -15,7 +22,8 @@ struct bench_samples {
 
 static inline void bench_token_ready(struct bench_samples *s, uint64_t now)
 {
-    if (!s->count) s->first = now;
+    if (!s->count)
+        s->first = now;
     s->last = now;
     s->prior_emit_cycles = s->emit_cycles;
     s->count++;
@@ -36,4 +44,5 @@ static inline uint64_t bench_decode_compute(const struct bench_samples *s)
     uint64_t wall = bench_decode_wall(s);
     return wall >= s->prior_emit_cycles ? wall - s->prior_emit_cycles : 0;
 }
+
 #endif

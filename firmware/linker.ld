@@ -100,12 +100,10 @@ SECTIONS
 	} > sram
 }
 
-/* The stack lives at the top of sram and takes whatever .data/.bss leave it. That number
- * MUST stay >= ~4 KB: deep call paths overflow into .bss and corrupt it silently, at a
- * location that moves with every relink. Keep large arrays OUT of .bss (they live in the
- * main_ram static window instead - see static_memory.h), rather than moving the stack to
- * main_ram (on the FK33, main_ram is the HBM channel-0 window).
- * Check after adding statics:  riscv64-unknown-elf-nm trixium.elf | grep -E "_ebss|_fstack" */
+/* The stack lives at the top of sram and takes what .data/.bss leave: keep it >= 4 KiB, a deep
+ * call path otherwise overflows into .bss and corrupts it silently. Large arrays go to the
+ * main_ram static window (static_memory.h), not .bss; the stack stays in sram (on the FK33,
+ * main_ram is the HBM channel-0 window). */
 PROVIDE(_fstack = ORIGIN(sram) + LENGTH(sram));
 ASSERT(_fstack - _ebss >= 4096, "firmware must leave at least 4 KiB of SRAM for stack")
 

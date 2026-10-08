@@ -1,7 +1,12 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium per-op CPU/HW dispatch
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <stdio.h>
 
@@ -10,16 +15,25 @@
 
 #include "ops.h"
 
+/* Variables */
+/*-----------*/
+
 // Every op the gateware implements, on by default: each one is gated bit-exact against the
 // interpreter (VECCRC) and token-gated in simulation, and the CPU paths are debug fallbacks.
-// hwops_init() is called after the model header is known; `hwops all cpu` still gets the
+// hwops_init() is called after the model header is known; `hwops all cpu` still selects the
 // fallback path for A/B work.
 uint32_t hwops_mask;
 
-// Measured on the 1.7B: 1.177 tok/s here against 0.192 all-CPU. Do NOT reach for a partial
-// mask as a compromise - the resident-BFP loop keeps activations in the scratchpad, so a
-// mixed mask pays a float round-trip every layer and lands at 0.121 tok/s, slower than
-// either end.
+static const char *names[OP_COUNT] = {
+    "embed", "rmsnorm", "qknorm", "rope", "kvquant", "scores", "softmax", "wv",
+    "quant8", "norm_i32", "silu_mul", "resid_add", "lmhead", "engine_wait",
+};
+
+/* Mask */
+/*------*/
+
+// All or nothing: the resident loop keeps activations in the scratchpad, so a mixed mask pays a
+// float round-trip every layer and ends up slower than either all-HW or all-CPU.
 uint32_t hwops_default(void)
 {
     return hw_caps();
@@ -29,11 +43,6 @@ void hwops_init(void)
 {
     hwops_mask = hwops_default();
 }
-
-static const char *names[OP_COUNT] = {
-    "embed", "rmsnorm", "qknorm", "rope", "kvquant", "scores", "softmax", "wv",
-    "quant8", "norm_i32", "silu_mul", "resid_add", "lmhead", "engine_wait",
-};
 
 const char *op_name(enum perf_op op)
 {
@@ -72,6 +81,9 @@ void hwops_set_all(int hw)
 {
     hwops_mask = hw ? hw_caps() : 0;
 }
+
+/* Print */
+/*-------*/
 
 void hwops_print(void)
 {

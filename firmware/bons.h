@@ -1,21 +1,29 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// BONS weight image structures - must match trixium/layout.py exactly.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium BONS weight image structures
+ *
+ * Must match trixium/layout.py exactly.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #ifndef BONS_H
 #define BONS_H
 
 #include <stdint.h>
 
-#define BONS_MAGIC   0x534E4F42 // "BONS"
-#define BONS_STAGING_CLEARED 0x44524c43u // "CLRD": trixium_loader.c loader_clear_staging()
-#define BONS_VERSION 3          // layout.BONS_VERSION; infer_init accepts 2 and 3.
-                                // 2: NORM16 .w16 entries carry their exponent in bias.
-                                // 3: the hybrid fields (a v2 image reads as all-zero ones).
-#define BONS_VERSION_MIN 2
+/* Constants */
+/*-----------*/
+
+#define BONS_MAGIC           0x534E4F42  // "BONS"
+#define BONS_STAGING_CLEARED 0x44524c43u // "CLRD": trixium_loader.c loader_clear_staging().
+#define BONS_VERSION         3           // layout.BONS_VERSION; infer_init accepts 2 and 3.
+                                         // 2: NORM16 .w16 entries carry their exponent in bias.
+                                         // 3: the hybrid fields (a v2 image reads as all-zero ones).
+#define BONS_VERSION_MIN     2
 
 // Tensor kinds.
 #define KIND_TERNARY 0
@@ -25,8 +33,8 @@
 #define KIND_NORM16  4 // int16 rows at 2^-13 (layout.NORM16_EXP) for the vector unit.
 
 #define FLAG_REPLICATED 0x01
-#define FLAG_KSEG       0x02   // One K-segment of a wide matvec (layout.FLAG_KSEG): siblings
-                               // share role/layer/kind/bias/rshift; sum their int32 results.
+#define FLAG_KSEG       0x02 // One K-segment of a wide matvec (layout.FLAG_KSEG): siblings
+                             // share role/layer/kind/bias/rshift; sum their int32 results.
 
 // Tensor roles.
 enum {
@@ -43,7 +51,10 @@ enum {
     // Roles 27-30 are reserved (unused).
 };
 
-#define HYB_EMB16_RESTORED 0x01   // hyb_flags: the emb16 rows are in the plain basis.
+#define HYB_EMB16_RESTORED 0x01 // hyb_flags: the emb16 rows are in the plain basis.
+
+/* Header */
+/*--------*/
 
 struct __attribute__((packed)) bons_header {
     uint32_t magic;
@@ -88,9 +99,13 @@ _Static_assert(__builtin_offsetof(struct bons_header, reserved160) == 160, "BONS
 // ROLE_HADAMARD block tensors: entry layer = width index (header list) * 256 + block.
 #define HADAMARD_LAYER(wi, b) ((int)((wi)*256 + (b)))
 
-static inline int bons_layer_is_deltanet(const struct bons_header *h, unsigned l) {
+static inline int bons_layer_is_deltanet(const struct bons_header *h, unsigned l)
+{
     return (int)((h->layer_types[l >> 6] >> (l & 63)) & 1);
 }
+
+/* Table Entry */
+/*-------------*/
 
 struct __attribute__((packed)) bons_entry {
     uint8_t  role;
@@ -110,13 +125,18 @@ struct __attribute__((packed)) bons_entry {
     char     name[24];
 };
 
+/* Row Packets */
+/*-------------*/
+
 // Row-packet beat math (mirrors layout.py).
-static inline uint32_t bons_scale_beats(uint32_t cols, uint32_t group) {
+static inline uint32_t bons_scale_beats(uint32_t cols, uint32_t group)
+{
     uint32_t n_scales = cols/group;
     return (2*n_scales + 31)/32;
 }
 
-static inline uint32_t bons_code_beats(uint32_t cols, uint8_t kind) {
+static inline uint32_t bons_code_beats(uint32_t cols, uint8_t kind)
+{
     if (kind == KIND_TERNARY) return cols/128;
     if (kind == KIND_Q8)      return cols/32;
     if (kind == KIND_F16)     return (2*cols + 31)/32;
@@ -125,7 +145,8 @@ static inline uint32_t bons_code_beats(uint32_t cols, uint8_t kind) {
     return (4*cols + 31)/32; // F32
 }
 
-static inline uint32_t bons_row_beats(uint32_t cols, uint8_t kind, uint32_t group) {
+static inline uint32_t bons_row_beats(uint32_t cols, uint8_t kind, uint32_t group)
+{
     uint32_t sb = (kind == KIND_TERNARY || kind == KIND_Q8) ? bons_scale_beats(cols, group) : 0;
     return sb + bons_code_beats(cols, kind);
 }

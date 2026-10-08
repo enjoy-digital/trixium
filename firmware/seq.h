@@ -1,16 +1,24 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Descriptor sequencer driver: build 64-byte descriptors in the scratchpad, run lists.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium descriptor sequencer driver: build 64-byte descriptors in the scratchpad, run lists
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #ifndef SEQ_H
 #define SEQ_H
 
 #include <stdint.h>
 
+#include <generated/soc.h>
+
 #include "engine.h"
+
+/* Descriptors */
+/*-------------*/
 
 #define SP_DESC 0x3D000 // Descriptor region (up to 192 descriptors to 0x40000).
 
@@ -30,11 +38,14 @@ void     seq_desc_vec_lut(uint32_t idx, uint16_t pc, const int32_t *args, int n,
 void     seq_desc_engine(uint32_t idx, const struct engine_op *op);
 void     seq_desc_stop(uint32_t idx);
 // Patch one descriptor word. Inline: it is one posted store, issued ~150 times a layer.
-#include <generated/soc.h>
 static inline void seq_patch(uint32_t idx, int word, uint32_t value)
 {
     ((volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + idx*64))[word] = value;
 }
+
+/* Lists */
+/*-------*/
+
 void     seq_run(uint32_t idx0, uint32_t count);            // Run + wait (gives up if wedged).
 void     seq_list_start(uint32_t idx0, uint32_t count);     // Start only; overlap CPU work...
 int      seq_run_trace(uint32_t idx0, uint32_t count,

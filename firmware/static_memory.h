@@ -1,16 +1,21 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium main_ram static area
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #ifndef TRIXIUM_STATIC_MEMORY_H
 #define TRIXIUM_STATIC_MEMORY_H
 
-// Legacy CPU main_ram static area, relative to TRIXIUM_HDR_ADDR. Existing owners:
-// [0,0x80000) header/table; +0x80000 entry cache; +0x90000 KV undo;
-// +0xa0000 prompt buffer. The allocator starts at +0x100000.
-// These buffers are accessed only after main_ram initialization. They are NOT
-// BSS-initialized: every producer must initialize the bytes its consumer reads.
+// CPU main_ram static area, relative to TRIXIUM_HDR_ADDR: [0, 0x80000) BONS header/table,
+// +0x80000 entry cache (model.c), +0x90000 KV undo, +0xa0000 prompt buffer, +0xc0000 the
+// buffers below; the heap starts at +0x100000.
+// These buffers are only accessed after main_ram initialization and are NOT zeroed like .bss:
+// every producer must initialize the bytes its consumer reads.
 #define TRIXIUM_CONSOLE_LINE_ADDR   (TRIXIUM_HDR_ADDR + 0xc0000)
 #define TRIXIUM_CONSOLE_LINE_SIZE   1024
 #define TRIXIUM_CONSOLE_PROMPT_ADDR (TRIXIUM_HDR_ADDR + 0xc0400) // 64 int32s

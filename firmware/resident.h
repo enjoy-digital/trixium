@@ -1,25 +1,35 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// Resident FP32 projections for the hybrid (27B) path: the activation quantization, the
-// integer Hadamard rotation, the whole-vector requantization and the int32 -> FP32 result
-// restoration run as sequencer descriptor lists inside the scratchpad (units 4, 3, 5 and 8
-// around the legacy engine matvec, resident FETCH/STORE for the FP32 vectors). The CPU
-// builds descriptors and invalidates its cache; it touches no element. Numerically this is
-// the fused CPU path of infer.c (same exponent rule, ties-away Q8, int32 K-segment sum, RNE
-// int32->FP32 then a power-of-two scale), so the typed-checkpoint gate must stay 87/87.
-//
-// Needs a bitstream with TRIXIUM_HAS_HADAMARD, TRIXIUM_HAS_ACTIVATION_QUANTIZE (ABI 1.1) and
-// TRIXIUM_HAS_PROJECTION_RESTORE. On any other bitstream resident_available() is 0
-// and hybrid.c keeps its existing path; a failed list disables the path for the session
-// after an engine soft reset (the weights stay).
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium resident FP32 projections and descriptor list builder
+ *
+ * Resident FP32 projections for the hybrid (27B) path: the activation quantization, the
+ * integer Hadamard rotation, the whole-vector requantization and the int32 -> FP32 result
+ * restoration run as sequencer descriptor lists inside the scratchpad (units 4, 3, 5 and 8
+ * around the engine matvec, resident FETCH/STORE for the FP32 vectors). The CPU builds
+ * descriptors and invalidates its cache; it touches no element. Numerically this is the
+ * fused CPU path of infer.c (same exponent rule, ties-away Q8, int32 K-segment sum, RNE
+ * int32 -> FP32 then a power-of-two scale), so the typed-checkpoint gate must stay 87/87.
+ *
+ * Needs a bitstream with TRIXIUM_HAS_HADAMARD, TRIXIUM_HAS_ACTIVATION_QUANTIZE (ABI 1.1) and
+ * TRIXIUM_HAS_PROJECTION_RESTORE. On any other bitstream resident_available() is 0 and
+ * hybrid.c keeps its CPU path; a failed list disables the path for the session after an
+ * engine soft reset (the weights stay).
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
+
 #ifndef RESIDENT_H
 #define RESIDENT_H
 
 #include <stdint.h>
+
 #include "bons.h"
+
+/* Projections */
+/*-------------*/
 
 int  resident_available(void);   // The bitstream carries units 3/4/5/8 with the expected ABIs.
 int  resident_init(void);        // Extract the rotation sign bits from the image. 0 = ready.
@@ -27,13 +37,15 @@ void resident_enable(int on);    // Console A/B: default on when available.
 int  resident_active(void);      // available && enabled && not disabled by a failure.
 
 // Quantize src[width] (FP32, main RAM; NULL = the activation resident_ffn_act left in the
-// scratchpad) into the resident Q8 vector, rotating it first when
-// `rotate` (width must be a multiple of the Hadamard block). Leaves the whole-vector
-// exponent resident too. 0 = ok, -1 = unsupported/failed (caller falls back).
+// scratchpad) into the resident Q8 vector, rotating it first when `rotate` (width must be a
+// multiple of the Hadamard block). Leaves the whole-vector exponent resident too. 0 = ok, -1 = unsupported/failed (caller falls back).
 int  resident_prepare(const float *src, uint32_t width, int rotate);
 // Multiply the resident Q8 vector by tensor e (K-segments summed in int32), restore FP32 and
 // DMA the rows into dst (main RAM, 32-byte aligned, rows*4 bytes). 0 = ok, -1 = unsupported.
 int  resident_matvec(const struct bons_entry *e, float *dst);
+
+/* SiLU Unit */
+/*-----------*/
 
 // Unit 11 (TRIXIUM_HAS_SILU): load the firmware's SiLU table into the unit (after
 // resident_init), through `stage` (main RAM, 32-byte aligned, 1,025*32 bytes, free after
@@ -46,11 +58,14 @@ void resident_silu_enable(int on);   // Console A/B.
 // recomputed on the CPU) and leave it in RS_F for resident_prepare(NULL, ...). act also
 // receives a copy in main RAM (the fallback source); gate_out/up_out, when not NULL,
 // receive the projections for traces. All 32-byte aligned. 0 = ok, -1 = declined/failed.
-void resident_mark_act(void);      // RS_F holds the next prepare's FP32 source (a list left it)
 int  resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                       float *act, float *gate_out, float *up_out);
+void resident_mark_act(void);      // RS_F holds the next prepare's FP32 source (a list left it)
 
-// List builder (resident.c): compose one descriptor list from transfers, prepares, matvecs
+/* List Builder */
+/*--------------*/
+
+// List builder: compose one descriptor list from transfers, prepares, matvecs
 // and raw descriptors, then run it. Any invalid step marks the list bad: rl_run returns -1
 // without running anything. Fixed regions shared with the calls above:
 #define RS_Q8B_ADDR 0x00000u
@@ -62,8 +77,8 @@ void rl_fetch(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store(void *dst, uint32_t bytes, uint32_t sp);
 // No cache maintenance, for main-RAM spans the CPU holds no dirty line of (constants cleaned
 // once, device-owned buffers): rl_fetch cleans its source and rl_store flushes and then
-// invalidates its destination, ~5 cycles per line (the DeltaNet conv's 320 KB per layer
-// cost 1.5M cycles per 27B forward that way).
+// invalidates its destination, ~5 cycles per line (significant on the DeltaNet conv's
+// 320 KB per layer).
 void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp);
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
@@ -112,6 +127,9 @@ int  rl_wait_desc(uint32_t k);
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
                              uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b);
 
+/* State */
+/*-------*/
+
 // State and per-forward accounting (cycles include the descriptor build and the CPU-side
 // cache work). Lives in the main_ram static window (static_memory.h), not SRAM .bss: the
 // 8 KiB SRAM is at its 4 KiB stack floor. Initialized by resident_init(); the flags first.
@@ -141,4 +159,4 @@ struct resident_state *resident_state(void);
 void resident_stats_reset(void);
 void resident_listprof_print(uint32_t forwards);   // `listprof` lines (stats)
 
-#endif
+#endif /* RESIDENT_H */

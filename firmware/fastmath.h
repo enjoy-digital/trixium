@@ -1,12 +1,20 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium bounded FP32 exp, SiLU and sigmoid (canonical forms shared with the host oracles)
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #ifndef TRIXIUM_FASTMATH_H
 #define TRIXIUM_FASTMATH_H
 
 #include <stdint.h>
+
+/* Exp */
+/*-----*/
 
 // expf() is about 250 cycles on the XCU1525's RV32F VexiiRiscv.  Hybrid SiLU calls it
 // 1.9 million times per 27B forward, so a general libm implementation dominates the CPU
@@ -15,7 +23,7 @@
 //
 // Reduce x to r in [-ln(2)/2, ln(2)/2], evaluate exp(r) through degree six, and construct
 // 2^n exactly.  The omitted Taylor term is below 1.3e-7 over this interval.  Explicit
-// fmaf() lets RV32F issue one instruction per polynomial stage; the rest of hybrid.c keeps
+// fmaf() lets RV32F issue one instruction per polynomial stage; the firmware is built with
 // -ffp-contract=off so changing this hot approximation cannot silently change other math.
 static inline float trixium_expf_bounded(float x)
 {
@@ -55,6 +63,9 @@ static inline float trixium_softmax_exp(float x)
 // times per 27B forward.
 static inline float trixium_decay_exp(float g) { return trixium_softmax_exp(g); }
 
+/* SiLU */
+/*------*/
+
 static inline float trixium_siluf(float x)
 {
     // These tails avoid overflow and keep the range-reduction exponent normal.  At 16,
@@ -83,6 +94,9 @@ static inline float trixium_silu_lookup(float x, const float *lut)
     float f = u - (float)i;
     return __builtin_fmaf(f, lut[i + 1] - lut[i], lut[i]);
 }
+
+/* Sigmoid */
+/*---------*/
 
 // Canonical sigmoid (docs/canonical-reductions.md, "sigmoid"): the SiLU lookup's form on a
 // sigmoid table, with tails from the same bounded exp - no libm expf anywhere, so the
@@ -113,4 +127,4 @@ static inline float trixium_sigmoid_lookup(float x, const float *lut)
     return __builtin_fmaf(f, lut[i + 1] - lut[i], lut[i]);
 }
 
-#endif
+#endif /* TRIXIUM_FASTMATH_H */

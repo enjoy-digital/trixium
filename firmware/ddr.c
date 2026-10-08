@@ -1,23 +1,28 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
-//
-// The extra DDR4 controllers (the XCU1525's four channels): LiteX's own liblitedram, compiled
-// once more here with the CSR base as a runtime variable.
-//
-// The BIOS initialises controller 0 (main_ram) the standard way. Controllers 1..N-1 have no
-// CPU window and no BIOS support; they have the same PHY, the same module and the same init
-// sequence, and their CSRs sit at controller 0's offsets shifted by k*TRIXIUM_DDR_CSR_STRIDE
-// (the target pins the (sdram, ddrphy) pairs to consecutive CSR pages). csr.h's accessors are
-// all `CSR_BASE + offset`, so redefining CSR_BASE as a variable for this translation unit
-// turns the unmodified sdram_init() - init sequence, write leveling, read leveling - into
-// init(k). Nothing in the calibration touches the CPU's memory bus: it goes through the DFI
-// injector's CSRs, which is why a controller without a CPU window can be calibrated at all.
-// The final memtest of sdram_init() would use main_ram, so it is compiled out and replaced
-// by ddr_test(): an engine STORE / FETCH round trip through every channel's own window, which
-// is the path the weights take and the one that would alias channels onto one memory.
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium extra DDR4 controllers (the XCU1525's four channels)
+ *
+ * LiteX's own liblitedram, compiled once more here with the CSR base as a runtime variable.
+ *
+ * The BIOS initializes controller 0 (main_ram) the standard way. Controllers 1..N-1 have no CPU
+ * window and no BIOS support; they have the same PHY, module and init sequence, and their CSRs
+ * sit at controller 0's offsets shifted by k*TRIXIUM_DDR_CSR_STRIDE (the target pins the
+ * (sdram, ddrphy) pairs to consecutive CSR pages). csr.h's accessors are all
+ * `CSR_BASE + offset`, so redefining CSR_BASE as a variable for this translation unit turns the
+ * unmodified sdram_init() (init sequence, write leveling, read leveling) into init(k). The
+ * calibration never touches the CPU's memory bus (it goes through the DFI injector's CSRs),
+ * which is why a controller without a CPU window can be calibrated at all. sdram_init()'s final
+ * memtest would use main_ram, so it is compiled out and replaced by ddr_test(): an engine
+ * STORE/FETCH round trip through every channel's own window, the path the weights take.
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
+// The include order below is the mechanism: generated/mem.h's literal CSR_BASE is captured
+// first, then CSR_BASE becomes a variable before csr.h and liblitedram are compiled.
 #include <generated/soc.h>
 
 #ifdef TRIXIUM_N_MEMCTRL
@@ -44,6 +49,9 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 #define TRIXIUM_CHAN_MOD 0
 #endif
 
+/* Init */
+/*------*/
+
 int ddr_init(int k)
 {
     if (k < 0 || k >= TRIXIUM_N_MEMCTRL) {
@@ -66,16 +74,16 @@ int ddr_init_all(void)
     return ok;
 }
 
-// Engine STORE / FETCH round trip through every channel's window, distinct pattern per
+/* Test */
+/*------*/
+
+// Engine STORE/FETCH round trip through every channel's window with a distinct pattern per
 // channel: all stores first, then every fetch, so a channel aliased onto another's memory
-// (e.g. a wrong chan_mod) reads back its neighbour's pattern instead of its own. 64 beats
-// in the last 4 KB of the channel's own window - base + (stride - base % stride) - 4 KB,
-// which the converter reserves (a model is capped at the window minus these 4 KB), so it is
-// free on every board and for every model. NOT "below the window": the hardware adds the
-// channel's offset, so an address below channel c's window is inside channel c-1's (with
-// the sim's 2 MB stride, that is the neighbour's embedding table). And not "base + stride":
-// with the XCU1525's 1 GB stride and 320 MB base that is past the channel's 4 GB for the
-// last window.
+// (e.g. a wrong chan_mod) reads back its neighbour's pattern instead of its own.
+// 64 beats in the last 4 KB of the channel's own window, base + (stride - base % stride) - 4 KB,
+// which the converter reserves, so it is free on every board and for every model. Not below the
+// window: the hardware adds the channel's offset, so that would be inside channel c-1's window.
+// Not base + stride either: for the last XCU1525 window that is past the channel's 4 GB.
 #define DDR_TEST_BEATS  64
 #ifndef TRIXIUM_CHAN_SKEW
 #define TRIXIUM_CHAN_SKEW 0
@@ -84,8 +92,8 @@ int ddr_init_all(void)
 #define DDR_TEST_WINDOW (TRIXIUM_CHAN_STRIDE - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) \
                          - (TRIXIUM_CHAN_MOD ? (TRIXIUM_CHAN_MOD - 1)*TRIXIUM_CHAN_SKEW : 0))
 #define DDR_TEST_ADDR   (TRIXIUM_CHAN_WEIGHT_BASE + DDR_TEST_WINDOW - 0x1000u)
-#define DDR_TEST_SRC   0x0000u   // Scratchpad: the pattern (2 KB).
-#define DDR_TEST_DST   0x4000u   // Scratchpad: the readback.
+#define DDR_TEST_SRC    0x0000u // Scratchpad: the pattern (2 KB).
+#define DDR_TEST_DST    0x4000u // Scratchpad: the readback.
 
 static void ddr_pattern(uint32_t chan, uint32_t seed)
 {
@@ -114,7 +122,7 @@ int ddr_test(int chan)
     }
     int failed = 0;
     for (int c = first; c <= last; c++) {
-        ddr_pattern(c, 0x1000u*c + 1);           // The expected words, back in the source.
+        ddr_pattern(c, 0x1000u*c + 1); // The expected words, back in the source.
         engine_fetch(c, DDR_TEST_ADDR, DDR_TEST_BEATS, DDR_TEST_DST);
         volatile uint32_t *exp = (volatile uint32_t *)(SCRATCHPAD_BASE + DDR_TEST_SRC);
         volatile uint32_t *got = (volatile uint32_t *)(SCRATCHPAD_BASE + DDR_TEST_DST);
@@ -127,7 +135,8 @@ int ddr_test(int chan)
                 errors++;
             }
         }
-        if (errors) failed++;
+        if (errors)
+            failed++;
         printf("DDRTEST chan %2d (controller %d) %s (%d errors)\n", c,
                TRIXIUM_CHAN_MOD ? c/TRIXIUM_CHAN_MOD : 0, errors ? "FAIL" : "OK", errors);
     }

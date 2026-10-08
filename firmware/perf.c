@@ -1,7 +1,12 @@
-// This file is part of TriXium.
-//
-// Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
-// SPDX-License-Identifier: BSD-2-Clause
+/* SPDX-License-Identifier: BSD-2-Clause
+ *
+ * TriXium per-op cycle profiling
+ *
+ * This file is part of TriXium.
+ *
+ * Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+ *
+ */
 
 #include <stdio.h>
 
@@ -11,10 +16,16 @@
 #include "perf.h"
 #include "hybrid.h"
 
+/* Variables */
+/*-----------*/
+
 uint64_t perf_cycles[OP_COUNT];
 uint64_t perf_calls[OP_COUNT];
 static uint64_t perf_t0[OP_COUNT];
 static uint64_t perf_start;
+
+/* Overlap Counters */
+/*------------------*/
 
 struct overlap_snapshot {
     uint64_t cycles[4];
@@ -37,7 +48,8 @@ static void overlap_snapshot(struct overlap_snapshot *s)
     s->cycles[2] = trixium_engine_csr_cyc_vec_read();
     s->cycles[3] = trixium_engine_csr_cyc_both_read();
 #else
-    for (int i = 0; i < 4; i++) s->cycles[i] = 0;
+    for (int i = 0; i < 4; i++)
+        s->cycles[i] = 0;
 #endif
 }
 
@@ -46,16 +58,17 @@ static int overlap_delta(const struct overlap_snapshot *start,
 {
 #ifdef CSR_TRIXIUM_ENGINE_CSR_PERF_SNAPSHOT_ADDR
     for (int i = 0; i < 4; i++) {
-        if (end->cycles[i] < start->cycles[i]) return 0; // reset during window
+        if (end->cycles[i] < start->cycles[i])
+            return 0; // Reset during the window.
         out[i] = end->cycles[i] - start->cycles[i];
     }
-    // Invariant for an atomic snapshot interval. Avoid overflowing intermediate sums.
+    // Invariants of an atomic snapshot interval (written without overflowing sums).
     return out[1] <= out[0] && out[2] <= out[0] && out[3] <= out[1]
         && out[3] <= out[2] && out[1] - out[3] <= out[0] - out[2];
 #elif defined(CSR_TRIXIUM_ENGINE_CSR_CYC_TOTAL_ADDR)
-    // Cannot reconstruct wraps from two low-word samples. Include CSR-read time and
-    // reject the whole interval if even one wrap could have occurred. Legacy reads are
-    // not simultaneous, so their percentages are explicitly approximate.
+    // Wraps cannot be reconstructed from two low-word samples: reject the interval if one
+    // could have occurred (CSR-read time included). Legacy reads are not simultaneous, so
+    // their percentages are approximate.
     if (perf_now64() - start->stamp >= UINT32_MAX) return 0;
     for (int i = 0; i < 4; i++)
         out[i] = (uint32_t)(end->cycles[i] - start->cycles[i]);
@@ -65,6 +78,9 @@ static int overlap_delta(const struct overlap_snapshot *start,
     return 0;
 #endif
 }
+
+/* Profiling */
+/*-----------*/
 
 static const char *op_names[OP_COUNT] = {
     "embed", "rmsnorm", "qknorm", "rope", "kvquant", "scores", "softmax", "wv",
@@ -91,10 +107,8 @@ void perf_reset(void)
         vec_poll_spins = vec_poll_waits = 0;
         seq_poll_spins = seq_poll_waits = 0;
     }
-    // Snapshot the free-running overlap counters too. Without this the percentages are
-    // computed over everything since reset - boot, selftest and the weight load - which on
-    // the n8 sim is ~40M cycles against ~1.7M for a generation leg, so the token loop is
-    // diluted to nothing and every share reads 0%.
+    // Snapshot the free-running overlap counters too, otherwise the percentages cover
+    // everything since reset (boot, self-test, weight load) and dilute the token loop.
     overlap_snapshot(&ovl0);
     perf_start = perf_now64();
     for (int i = 0; i < OP_COUNT; i++) {
@@ -112,9 +126,9 @@ uint32_t perf_now(void)
 
 uint64_t perf_now64(void)
 {
-    // A 27B forward is over a billion cycles and even bench 1 can cross the 32-bit timer
-    // wrap.  RV32 exposes the architectural counter as two CSRs; sample high/low/high so
-    // a low-word rollover between reads cannot create a torn timestamp.
+    // A 27B forward is over a billion cycles, beyond the 32-bit timer wrap. RV32 exposes the
+    // architectural counter as two CSRs: sample high/low/high so a low-word rollover between
+    // reads cannot create a torn timestamp.
     uint32_t hi0, lo, hi1;
     do {
         __asm__ volatile("rdcycleh %0" : "=r"(hi0));
@@ -140,7 +154,8 @@ void perf_exit(enum perf_op op)
         tprof_event((2u << 28) | ((uint32_t)op << 8));
 }
 
-// tprof ------------------------------------------------------------------------------------
+/* Token Trace */
+/*-------------*/
 
 int tprof_armed, tprof_active;
 static uint32_t *tprof_buf;
@@ -204,6 +219,9 @@ void tprof_dump(void)
                (unsigned long)tprof_buf[i+2], (unsigned long)tprof_buf[i+3]);
 }
 
+/* Print */
+/*-------*/
+
 void perf_print_u64(uint64_t v)
 {
     char buf[20];
@@ -212,7 +230,8 @@ void perf_print_u64(uint64_t v)
         buf[n++] = '0' + (char)(v % 10);
         v /= 10;
     } while (v);
-    while (n) putchar(buf[--n]);
+    while (n)
+        putchar(buf[--n]);
 }
 
 static void overlap_print(const char *tag, const uint64_t acc[4]);
@@ -245,8 +264,8 @@ void perf_print(void)
     perf_print_u64(wall);
     puts(" cycles");
     {
-        // Completion-poll census: iterations x ~70cy CSR read bounds what IRQ completion
-        // could recover. Deltas since perf_reset.
+        // Completion-poll census since perf_reset: iterations x ~70 cycles per CSR read
+        // bound what IRQ completion could recover.
         extern uint32_t eng_poll_spins, eng_poll_waits, vec_poll_spins, vec_poll_waits,
                         seq_poll_spins, seq_poll_waits;
         printf("poll: eng %lu/%lu  vec %lu/%lu  seq %lu/%lu (spins/waits; x~70cy = bound)\n",
@@ -255,8 +274,10 @@ void perf_print(void)
                (unsigned long)seq_poll_spins, (unsigned long)seq_poll_waits);
     }
     hybrid_stats_print();
-    if (overlap_ok) overlap_print("overlap", overlap);
-    else puts("overlap: unavailable (legacy 32-bit window too long, absent counters or reset)");
+    if (overlap_ok)
+        overlap_print("overlap", overlap);
+    else
+        puts("overlap: unavailable (legacy 32-bit window too long, absent counters or reset)");
 }
 
 void perf_ovl_mark(void)
@@ -268,13 +289,15 @@ void perf_ovl_acc(uint64_t acc[4])
 {
     struct overlap_snapshot end;
     uint64_t delta[4];
-    if (acc[0] == UINT64_MAX) return;
+    if (acc[0] == UINT64_MAX)
+        return;
     overlap_snapshot(&end);
     if (!overlap_delta(&ovlw, &end, delta)) {
         acc[0] = UINT64_MAX;
         return;
     }
-    for (int i = 0; i < 4; i++) acc[i] += delta[i];
+    for (int i = 0; i < 4; i++)
+        acc[i] += delta[i];
 }
 
 static void overlap_print(const char *tag, const uint64_t acc[4])
@@ -296,15 +319,8 @@ static void overlap_print(const char *tag, const uint64_t acc[4])
 void perf_ovl_report(const char *tag, const uint64_t acc[4])
 {
     printf("OVLW %s ", tag);
-    if (acc[0] == UINT64_MAX) puts("unavailable (invalid counter window)");
-    else overlap_print("window", acc);
-}
-
-void perf_print_overlap(void)
-{
-    struct overlap_snapshot end;
-    uint64_t delta[4];
-    overlap_snapshot(&end);
-    if (overlap_delta(&ovl0, &end, delta)) overlap_print("overlap", delta);
-    else puts("overlap: unavailable (legacy 32-bit window too long, absent counters or reset)");
+    if (acc[0] == UINT64_MAX)
+        puts("unavailable (invalid counter window)");
+    else
+        overlap_print("window", acc);
 }
