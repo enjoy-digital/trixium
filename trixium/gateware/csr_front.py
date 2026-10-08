@@ -113,13 +113,6 @@ class BonsaiEngineCSR(LiteXModule):
 
         pending = Signal()
         manual_request = self.submit.re & self.submit.storage
-        if seq is not None and hasattr(seq, 'eng_native'):
-            # A native list drains older queued manual work before fetching,
-            # but must never replay a NEW manual submit after list ownership.
-            self.native_manual_conflict = Signal()
-            self.comb += self.native_manual_conflict.eq(manual_request &
-                (seq.busy | (seq.start.re & seq.start.storage)))
-            manual_request = manual_request & ~self.native_manual_conflict
         # Accept beats submit: when the engine is idle it accepts the command on the submit
         # cycle itself, and latching pending anyway would replay the op once the engine
         # returns to idle (results are rewritten identically, but the replay's command
@@ -142,42 +135,12 @@ class BonsaiEngineCSR(LiteXModule):
                 self.done_count.status.eq(self.done_count.status + 1),
             ),
         ]
-        units = getattr(engine, "prefetch_units", [])
-        if units:
-            # Run-ahead weight prefetch: mode 0 off, 1 record (one forward's weight reads),
-            # 2 replay; a write to pf_start marks a forward's start (resynchronize, rewind).
-            self.pf_mode    = CSRStorage(2, description="Weight prefetch: 0 off, 1 record, 2 replay.")
-            self.pf_start   = CSRStorage(1, description="Write: a forward starts (between ops).")
-            self.pf_hits    = CSRStatus(32, description="Channel 0: weight reads served from the FIFO.")
-            self.pf_served  = CSRStatus(32, description="Channel 0: beats served from the FIFO.")
-            self.pf_misses  = CSRStatus(32, description="Channel 0: desynchronizations.")
-            self.pf_recorded = CSRStatus(16, description="Channel 0: recorded schedule entries.")
-            self.pf_synced  = CSRStatus(32, description="Per channel: still synchronized.")
-            self.comb += [
-                engine.pf_mode.eq(self.pf_mode.storage),
-                engine.pf_start.eq(self.pf_start.re),
-                self.pf_hits.status.eq(units[0].hits),
-                self.pf_served.status.eq(units[0].served),
-                self.pf_misses.status.eq(units[0].misses),
-                self.pf_recorded.status.eq(units[0].recorded),
-                self.pf_synced.status.eq(Cat(*[u.synced for u in units])),
-            ]
         # `submit.re` fires on CSR write; latch as cmd.valid until accepted. While the
         # sequencer runs it owns the command interface (firmware never mixes the two).
         seq_own = Signal()
-        native_cols = self.cols.storage
-        native_blocked = C(0, 1)
-        if hasattr(engine.cmd, 'native'):
-            # Optional extension bank supplies these; no existing CSR moves.
-            self.native_enable = Signal()
-            self.native_config_pending = native_blocked = Signal()
-            self.comb += engine.cmd.native.eq(Mux(seq_own, getattr(seq, 'eng_native', 0), self.native_enable))
-            native_cols = Mux(self.native_enable,
-                              Mux(self.kind.storage == 0, self.cbeats.storage << 7,
-                                  self.cbeats.storage << 5), self.cols.storage)
         if seq is not None:
             self.comb += [
-                seq_own.eq(seq.busy & ~getattr(seq, 'native_manual_drain', 0)),
+                seq_own.eq(seq.busy),
                 seq.eng_ready.eq(engine.cmd.ready & seq_own),
                 seq.eng_done.eq(engine.done),
                 seq.absmax.eq(engine.absmax),
@@ -208,10 +171,10 @@ class BonsaiEngineCSR(LiteXModule):
                 engine.cmd.dstride.eq(0 if seq is None else seq.eng_dstride),
                 engine.cmd.sstride.eq(0 if seq is None else seq.eng_sstride),
             ).Else(
-            engine.cmd.valid.eq((pending | manual_request) & ~native_blocked),
+            engine.cmd.valid.eq(pending | manual_request),
             engine.cmd.kind.eq(self.kind.storage),
             engine.cmd.rows.eq(self.rows.storage),
-            engine.cmd.cols.eq(native_cols),
+            engine.cmd.cols.eq(self.cols.storage),
             engine.cmd.wbase.eq(self.wbase.storage),
             engine.cmd.wlen.eq(self.wlen.storage),
             engine.cmd.sbeats.eq(self.sbeats.storage),

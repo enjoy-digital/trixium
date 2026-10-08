@@ -73,18 +73,7 @@ KIND_OP_Q8      = 1
 KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre).
 
 class BonsaiChannelPipe(LiteXModule):
-    def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1,
-                 dual=True, semantic=False, with_native=False):
-        if semantic and with_native:
-            raise ValueError('choose semantic-only or selectable native ingress, not both')
-        checked = semantic or with_native
-        if checked and (xbuf_groups < 1 or out_fifo_depth < 10 or n_channels < 1
-                         or not 0 <= chan_id < n_channels):
-            raise ValueError('semantic pipe requires x-buffer capacity, FIFO >=10 and a valid channel')
-        # dual: instantiate the S3/S6 head-B datapath (second lane sets, adder trees,
-        # AXPY accumulator bank, x-buffer copy). It roughly DOUBLES the pipe's area, so
-        # hardware builds that do not need dual-Q GQA / speculative pair-verify leave it
-        # out (the firmware falls back to the single-head sequencer lists).
+    def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1):
         # Op parameters (quasi-static while busy).
         self.kind        = Signal(2)
         self.rows        = Signal(16)
@@ -97,25 +86,11 @@ class BonsaiChannelPipe(LiteXModule):
         self.start       = Signal()    # Pulse: reset counters/accumulator/error.
 
         # Weight beats in, results out.
-        # semantic selects the portable group ingress at elaboration time; the
-        # arithmetic below is shared. Legacy boards retain their existing beat
-        # interface by default. A native decoder or a legacy format adapter can
-        # feed semantic groups without changing the MAC's numerical contract.
-        if semantic:
-            from trixium.gateware.native_weights import GROUP_LAYOUT
-            self.sink = stream.Endpoint(GROUP_LAYOUT)
-        else:
-            self.sink = stream.Endpoint([("data", 256)])
-        native_mode = C(int(semantic), 1)
-        if with_native:
-            from trixium.gateware.native_weights import GROUP_LAYOUT
-            self.native_sink = stream.Endpoint(GROUP_LAYOUT)
-            self.native_mode = native_mode = Signal()  # Stable through result drain.
-        if checked:
-            groups_in = self.native_sink if with_native else self.sink
+        self.sink = stream.Endpoint([("data", 256)])
         # Matvec results present one int32 in data[:32] (wide=0); AXPY drain entries carry
         # 8 accumulators = one full scratchpad beat (wide=1, row = first lane index).
-        # head=1 marks dual-Q head-B results (gather adds the qstride offset).
+        # head (gather adds the qstride offset when set) is always 0 since the dual-Q head-B
+        # datapath was removed.
         self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1), ("head", 1)])
 
         # x-buffer broadcast write port (from the engine's fill FSM).
@@ -125,7 +100,7 @@ class BonsaiChannelPipe(LiteXModule):
         self.xw_we    = Signal()
 
         # Status.
-        self.error    = Signal() # Sticky: reserved code 3 or invalid semantic command/group.
+        self.error    = Signal() # Sticky: reserved code 3.
         self.overflow = Signal() # Sticky: result FIFO overflow (rate mismatch, debug).
 
         # # #
@@ -134,28 +109,11 @@ class BonsaiChannelPipe(LiteXModule):
         out_fifo_room   = Signal() # Driven at the FIFO hookup below (beat-intake flow control).
 
         # x-buffer: 1024-bit words, one per ternary group (4 q8 groups). --------------------------
-        # Dual-Q ternary needs a second read port (head B's word). Vivado will NOT infer
-        # a 1W+2R RAM with byte-granular writes from the emitted Verilog ("Unsupported
-        # RAM template" - the memory dissolves into FFs + read muxes and the LUT budget
-        # explodes, 519k/440k at N=16). Standard idiom instead: two 1W+1R copies with
-        # mirrored writes, one per read port.
         xbuf   = Memory(1024, xbuf_groups)
         self.specials += xbuf
         xbuf_w = xbuf.get_port(write_capable=True, we_granularity=256)
         xbuf_r = xbuf.get_port()
         self.specials += xbuf_w, xbuf_r
-        xbuf_r2 = None
-        if dual:
-            xbufb = Memory(1024, xbuf_groups)
-            self.specials += xbufb
-            xbufb_w = xbufb.get_port(write_capable=True, we_granularity=256)
-            xbuf_r2 = xbufb.get_port()
-            self.specials += xbufb_w, xbuf_r2
-            self.comb += [
-                xbufb_w.adr.eq(xbuf_w.adr),
-                xbufb_w.dat_w.eq(xbuf_w.dat_w),
-                xbufb_w.we.eq(xbuf_w.we),
-            ]
         self.comb += [
             xbuf_w.adr.eq(self.xw_group),
             xbuf_w.dat_w.eq(Replicate(self.xw_data, 4)),
@@ -163,146 +121,50 @@ class BonsaiChannelPipe(LiteXModule):
         ]
 
         # Scale RAM: 16 fp16 per beat, double-buffered by row parity. -----------------------------
-        if not semantic:
-            scale_ram = Memory(256, 16) # 8 words per bank, 2 banks.
-            self.specials += scale_ram
-            scale_w = scale_ram.get_port(write_capable=True)
-            scale_r = scale_ram.get_port()
-            self.specials += scale_w, scale_r
+        scale_ram = Memory(256, 16) # 8 words per bank, 2 banks.
+        self.specials += scale_ram
+        scale_w = scale_ram.get_port(write_capable=True)
+        scale_r = scale_ram.get_port()
+        self.specials += scale_w, scale_r
 
         # Beat parser -----------------------------------------------------------------------------
         phase   = Signal() # 0: scale beats, 1: code beats.
         s_cnt   = Signal(4)
         g_cnt   = Signal(8)
         row_cnt = Signal(16)
-        legacy_g, legacy_row = g_cnt, row_cnt
-        native_g, native_row = g_cnt, row_cnt
-        if with_native:
-            legacy_g, native_g = Signal(8), Signal(8)
-            legacy_row, native_row = Signal(16), Signal(16)
-            self.comb += [g_cnt.eq(Mux(native_mode, native_g, legacy_g)),
-                          row_cnt.eq(Mux(native_mode, native_row, legacy_row))]
 
         accept = Signal()
         is_code   = Signal()
         row_last  = Signal()
-        # These constants add no gates in the default legacy path.
-        ingress_error = C(0, 1)
-        config_error = C(0, 1)
-        arithmetic_event = Signal(name='arithmetic_event') if checked else C(0, 1)
-        arithmetic_events = []
-        native_accept, legacy_accept = C(0, 1), C(0, 1)
-        if checked:
-            native_accept = Signal()
-            self.arithmetic_error = Signal()
-            self.sync += If(self.start, self.arithmetic_error.eq(0)
-                            ).Elif(arithmetic_event, self.arithmetic_error.eq(1))
-            config_ok = Signal()
-            group_ok = Signal()
-            gap = Signal()
-            last_group = Signal()
-            last_row = Signal()
-            first_group = Signal()
-            ax_row_scale = Signal(16)
-            ax_scale_ok = Signal()
-            scale_exp = groups_in.scale[10:15]
-            max_dot_bias = Signal(6)
-            ax_exp_bias = Signal(8)
-            ax_bound = Signal(7)
-            ax_bound2 = Signal(7)
-            ingress_error = Signal()
-            config_error = native_mode & ~config_ok
-            # Bound every truncated x-buffer address used by the shared datapath.
-            tern_limit = min(255, xbuf_groups)
-            tern_dual_limit = min(128, xbuf_groups // 2)
-            q8_limit = min(255, xbuf_groups * 4)
-            q8_dual_limit = min(255, xbuf_groups * 2)
-            ax_rows = max(0, (min(65536, xbuf_groups * 128) - 1 - chan_id)//n_channels + 1)
-            ax_dual_rows = max(0, (min(32768, xbuf_groups * 64) - 1 - chan_id)//n_channels + 1)
-            self.comb += [
-                config_ok.eq((self.code_beats != 0) & (C(int(dual)) | ~self.qn)
-                    & Mux(self.kind == KIND_OP_TERNARY,
-                          (self.rows != 0) & (self.code_beats <= Mux(self.qn, tern_dual_limit, tern_limit)),
-                      Mux(self.kind == KIND_OP_Q8,
-                          (self.rows != 0) & (self.code_beats <= Mux(self.qn, q8_dual_limit, q8_limit)),
-                          (self.kind == KIND_OP_AXPY) & (self.code_beats <= 4)
-                          & (self.rows <= Mux(self.qn, ax_dual_rows, ax_rows))))),
-                last_group.eq(g_cnt == self.code_beats - 1),
-                last_row.eq(row_cnt == self.rows - 1),
-                first_group.eq((row_cnt == 0) & (g_cnt == 0)),
-                max_dot_bias.eq(Mux(scale_exp == 0, 36, 37 - scale_exp)),
-                ax_exp_bias.eq(scale_exp + self.bias),
-                ax_bound.eq(self.rshift + 30), ax_bound2.eq(self.rshift2 + 30),
-                # Existing AXPY is the power-of-two, row-constant KV contract,
-                # not general Q8_0 weighted-V arithmetic. Reject other scales;
-                # the V4 general-scale attention kernel remains separate work.
-                ax_scale_ok.eq(~groups_in.scale[15] & (groups_in.scale[:10] == 0)
-                    & (groups_in.scale[10:15] != 0) & (groups_in.scale[10:15] != 31)
-                    & ((g_cnt == 0) | (groups_in.scale == ax_row_scale))
-                    & (ax_exp_bias <= ax_bound) & (~self.qn | (ax_exp_bias <= ax_bound2))),
-                group_ok.eq(config_ok & ~self.error & ~groups_in.error
-                    & (row_cnt < self.rows) & (groups_in.row == row_cnt)
-                    & (groups_in.group == g_cnt) & (groups_in.row_last == last_group)
-                    & (groups_in.first == first_group) & (groups_in.last == (last_row & last_group))
-                    & (groups_in.kind == (self.kind != KIND_OP_TERNARY))
-                    & Mux(self.kind == KIND_OP_AXPY, ax_scale_ok,
-                          (scale_exp != 31) & (self.bias <= max_dot_bias))),
-                # A single-group native row no longer has a scale beat separating
-                # it from the next row. Preserve two-cycle spacing for dual result
-                # emission and the AXPY feedback schedule. Wider rows need no gap.
-                groups_in.ready.eq(native_mode & out_fifo_room & ~gap & ~self.start),
-                native_accept.eq(groups_in.valid & groups_in.ready),
-                ingress_error.eq(native_accept & ~group_ok),
-            ]
-            if semantic:
-                self.comb += [is_code.eq(group_ok), row_last.eq(last_group)]
-            else:
-                self.comb += [is_code.eq(Mux(native_mode, group_ok, phase == 1)),
-                              row_last.eq(is_code & last_group)]
-            self.sync += If(self.start,
-                native_g.eq(0), native_row.eq(0), gap.eq(0),
-            ).Else(
-                gap.eq(native_accept & group_ok & last_group & (self.code_beats == 1)
-                       & (self.qn | (self.kind == KIND_OP_AXPY))),
-                If(native_accept & group_ok,
-                    If(g_cnt == 0, ax_row_scale.eq(groups_in.scale)),
-                    If(last_group, native_g.eq(0), native_row.eq(row_cnt + 1)
-                    ).Else(native_g.eq(g_cnt + 1)),
+        self.comb += [
+            # Beat intake throttles on result-FIFO headroom: at N channels the aggregate
+            # result rate (N/row_beats per cycle) can exceed the 1/cycle gather drain
+            # (first bites at N=4 ternary, 3 beats/row) - without this the FIFO drops
+            # results and the op never completes.
+            self.sink.ready.eq(out_fifo_room),
+            accept.eq(self.sink.valid & self.sink.ready),
+        ]
+        self.comb += [is_code.eq(phase == 1),
+                      row_last.eq(is_code & (g_cnt == self.code_beats - 1))]
+        self.sync += [
+            If(self.start,
+                phase.eq(0), s_cnt.eq(0), g_cnt.eq(0), row_cnt.eq(0),
+            ).Elif(accept,
+                If(~is_code,
+                    s_cnt.eq(s_cnt + 1),
+                    If(s_cnt == self.scale_beats - 1, phase.eq(1), g_cnt.eq(0)),
+                ).Else(
+                    g_cnt.eq(g_cnt + 1),
+                    If(row_last, phase.eq(0), s_cnt.eq(0), row_cnt.eq(row_cnt + 1)),
                 ),
-            )
-        if not semantic:
-            legacy_accept = Signal()
-            self.comb += [
-                # Beat intake throttles on result-FIFO headroom: at N channels the aggregate
-                # result rate (N/row_beats per cycle) can exceed the 1/cycle gather drain
-                # (first bites at N=4 ternary, 3 beats/row) - without this the FIFO drops
-                # results and the op never completes.
-                self.sink.ready.eq(out_fifo_room & ~native_mode),
-                legacy_accept.eq(self.sink.valid & self.sink.ready),
-            ]
-            if not with_native:
-                self.comb += [is_code.eq(phase == 1),
-                              row_last.eq(is_code & (g_cnt == self.code_beats - 1))]
-            self.sync += [
-                If(self.start,
-                    phase.eq(0), s_cnt.eq(0), legacy_g.eq(0), legacy_row.eq(0),
-                ).Elif(legacy_accept,
-                    If(~is_code,
-                        s_cnt.eq(s_cnt + 1),
-                        If(s_cnt == self.scale_beats - 1, phase.eq(1), legacy_g.eq(0)),
-                    ).Else(
-                        legacy_g.eq(g_cnt + 1),
-                        If(row_last, phase.eq(0), s_cnt.eq(0), legacy_row.eq(row_cnt + 1)),
-                    ),
-                ),
-            ]
-            # Scale writes (bank = row parity).
-            self.comb += [
-                scale_w.adr.eq(Cat(s_cnt[:3], row_cnt[0])),
-                scale_w.dat_w.eq(self.sink.data),
-                scale_w.we.eq(legacy_accept & ~is_code),
-            ]
-        self.comb += accept.eq(native_accept | legacy_accept)
+            ),
+        ]
+        # Scale writes (bank = row parity).
+        self.comb += [
+            scale_w.adr.eq(Cat(s_cnt[:3], row_cnt[0])),
+            scale_w.dat_w.eq(self.sink.data),
+            scale_w.we.eq(accept & ~is_code),
+        ]
 
         # T0: code-beat acceptance: launch x-buffer + scale reads, register codes. ----------------
         t0_fire = Signal()
@@ -323,10 +185,7 @@ class BonsaiChannelPipe(LiteXModule):
                               Mux(self.qn, Cat(C(0, 1), g_cnt[:7]), g_cnt)))),
 
         ]
-        if not semantic:
-            self.comb += scale_r.adr.eq(Cat(g_cnt[4:7], row_cnt[0]))
-        if dual: # Dual ternary: head A at even words (2g), head B at odd (2g+1).
-            self.comb += xbuf_r2.adr.eq(Cat(C(1, 1), g_cnt[:7]))
+        self.comb += scale_r.adr.eq(Cat(g_cnt[4:7], row_cnt[0]))
 
         codes_r   = Signal(256)
         g_lo_r    = Signal(4) # Scale index within the 16-scale word.
@@ -335,8 +194,7 @@ class BonsaiChannelPipe(LiteXModule):
         g_ax_r    = Signal(3) # AXPY: accumulator group of this beat.
         self.sync += [
             If(t0_fire,
-                codes_r.eq(groups_in.codes if semantic else
-                           Mux(native_mode, groups_in.codes, self.sink.data) if with_native else self.sink.data),
+                codes_r.eq(self.sink.data),
                 g_lo_r.eq(g_cnt[:4]),
                 q8_sub_r.eq(Mux(self.qn, Cat(C(0, 1), g_cnt[0]), g_cnt[:2])),
                 pidx_r.eq(Mux(self.qn, pidx_d[:7], pidx[:7])),
@@ -358,28 +216,14 @@ class BonsaiChannelPipe(LiteXModule):
         v1_tern  = [v1_rep(f"t{k}") for k in range(8)] # One per 16 ternary lanes.
         v1_q8    = [v1_rep(f"q{k}") for k in range(2)] # One per 16 Q8 lanes.
         v1_scale = v1_rep("scale")
-        # Head-B lanes get the same treatment, with the (op-stable) qn folded INTO the
-        # replica so the lane CE is a single flop output. The dual build's failing-path
-        # family was exactly these captures: 128+32 head-B lane registers CE'd from one
-        # `v1 & qn` term while head A had per-group replicas.
-        def v1b_rep(tag):
-            c = Signal(name=f"v1b_rep_{tag}")
-            c.attr.add(("dont_touch", "true"))
-            self.sync += c.eq(t0_fire & self.qn)
-            _v1_copies.append(c)
-            return c
-        v1b_tern = [v1b_rep(f"t{k}") for k in range(8)] if dual else []
-        v1b_q8   = [v1b_rep(f"q{k}") for k in range(2)] if dual else []
         row1      = _delay(self, row_cnt, 1)
         row_last1 = _delay(self, row_last, 1)
 
         # T1: lane select + scale fp16 mux; register lanes. ---------------------------------------
         # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error).
         xword  = xbuf_r.dat_r  # 1024-bit, valid at T1.
-        xword2 = xbuf_r2.dat_r if dual else None # Head B's word, valid at T1.
 
         tern_lanes  = []
-        tern_lanesb = []
         code3_seen = Signal()
         code3_any  = []
         for j in range(128):
@@ -400,57 +244,24 @@ class BonsaiChannelPipe(LiteXModule):
             r = Signal((9, True))
             self.sync += If(v1_tern[j // 16], r.eq(lane))
             tern_lanes.append(r)
-            if not dual:
-                continue
-            xb_t  = Signal((8, True))
-            laneb = Signal((9, True))
-            self.comb += [
-                xb_t.eq(xword2[8*j:8*j+8]),
-                Case(c_j, {
-                    0 : laneb.eq(-xb_t),
-                    1 : laneb.eq(0),
-                    2 : laneb.eq(xb_t),
-                    3 : laneb.eq(0),
-                }),
-            ]
-            rbt = Signal((9, True))
-            self.sync += If(v1b_tern[j // 16], rbt.eq(laneb))
-            tern_lanesb.append(rbt)
         self.comb += code3_seen.eq(v1 & (self.kind == KIND_OP_TERNARY) & reduce(or_, code3_any))
-        self.sync += If(self.start, self.error.eq(config_error)
-                       ).Elif(code3_seen | ingress_error | arithmetic_event, self.error.eq(1))
+        self.sync += If(self.start, self.error.eq(0)
+                       ).Elif(code3_seen, self.error.eq(1))
 
-        # Q8 lanes: w8 * x8 over the selected 256-bit x slice. Head B (dual-Q) uses the
-        # adjacent slice / adjacent p8 byte (+32) of the same 1024-bit x word.
+        # Q8 lanes: w8 * x8 over the selected 256-bit x slice.
         xslice  = Signal(256)
         self.comb += Case(q8_sub_r, {i: xslice.eq(xword[256*i:256*(i+1)]) for i in range(4)})
-        if dual:
-            xsliceb = Signal(256)
-            q8_subb = Signal(2)
-            self.comb += q8_subb.eq(q8_sub_r | 1)
-            self.comb += Case(q8_subb, {i: xsliceb.eq(xword[256*i:256*(i+1)])
-                                        for i in range(4)})
         # AXPY coefficient byte: two-stage constant-slice mux out of the 1024-bit x word.
         p8_grp  = Signal(64)
         p8_ax   = Signal((8, True))
         self.comb += Case(pidx_r[3:], {i: p8_grp.eq(xword[64*i:64*(i+1)]) for i in range(16)})
         self.comb += Case(pidx_r[:3], {i: p8_ax.eq(p8_grp[8*i:8*(i+1)]) for i in range(8)})
-        if dual: # Head B byte at +32 (bit 5 clear on A).
-            p8_grpb = Signal(64)
-            p8_axb  = Signal((8, True))
-            pidx_rb = Signal(7)
-            self.comb += pidx_rb.eq(pidx_r | 32)
-            self.comb += Case(pidx_rb[3:], {i: p8_grpb.eq(xword[64*i:64*(i+1)])
-                                            for i in range(16)})
-            self.comb += Case(pidx_rb[:3], {i: p8_axb.eq(p8_grpb[8*i:8*(i+1)])
-                                            for i in range(8)})
         # Op-stable decode, registered: kind loads at START+1 and the first T1 use is at
         # START+5 or later, so a flop copy is exact and keeps the kind compare (and the
         # engine-side flop it would otherwise reach) out of the 32-lane operand mux.
         is_axpy = Signal()
         self.sync += is_axpy.eq(self.kind == KIND_OP_AXPY)
         q8_lanes  = []
-        q8_lanesb = []
         # The 32 signed 8x8 products go to DSP48E2s (2026-09-10, from the external review's
         # out-of-context study, reproduced with tools/pipe_ooc_study.py): -2.6k LUT, -0.9k
         # FF and -330 CARRY8 per channel, the CE'd product register absorbed as the DSP's
@@ -464,7 +275,6 @@ class BonsaiChannelPipe(LiteXModule):
         # same class as the ternary lanes' (BRAM read -> mux -> FF) and the multiply sits
         # entirely inside the DSP. Costs one cycle of Q8/AXPY op latency, not throughput.
         v2_q8  = [_delay(self, c, 1) for c in v1_q8]
-        v2b_q8 = [_delay(self, c, 1) for c in v1b_q8] if dual else []
         for j in range(32):
             w_j = Signal((8, True))
             x_j = Signal((8, True))
@@ -481,38 +291,14 @@ class BonsaiChannelPipe(LiteXModule):
             r = Signal((16, True))
             self.sync += If(v2_q8[j // 16], r.eq(p))
             q8_lanes.append(r)
-            if not dual:
-                continue
-            xb_j = Signal((8, True))
-            xb_r = Signal((8, True))
-            pb   = Signal((16, True))
-            pb.attr.add(("use_dsp", "yes"))
-            self.comb += [
-                xb_j.eq(Mux(is_axpy, p8_axb, xsliceb[8*j:8*j+8])),
-                pb.eq(w_r*xb_r),
-            ]
-            self.sync += If(v1b_q8[j // 16], xb_r.eq(xb_j))
-            rb = Signal((16, True))
-            self.sync += If(v2b_q8[j // 16], rb.eq(pb))
-            q8_lanesb.append(rb)
 
         # Scale fp16: the beat's halfword selected at T1 straight from the scale RAM read
         # (scale_r.dat_r and g_lo_r are both valid then) and registered as 16 bits, valid
         # at T2+ - the same value and cycle the old 256-bit scale_word_r + T2 mux gave
         # (2026-09-10: that mux sat in front of the AXPY shift-amount cone; -240 FF).
         scale_f16_t1 = Signal(16)
-        if semantic:
-            # Capture alongside codes/x-buffer read address: the FP16 scale is
-            # available at exactly the old RAM-read/mux stage, with identical bits.
-            self.sync += If(t0_fire, scale_f16_t1.eq(groups_in.scale))
-        else:
-            legacy_scale = Signal(16) if with_native else scale_f16_t1
-            self.comb += Case(g_lo_r, {i: legacy_scale.eq(scale_r.dat_r[16*i:16*(i+1)])
-                                       for i in range(16)})
-            if with_native:
-                native_scale = Signal(16)
-                self.sync += If(t0_fire & native_mode, native_scale.eq(groups_in.scale))
-                self.comb += scale_f16_t1.eq(Mux(native_mode, native_scale, legacy_scale))
+        self.comb += Case(g_lo_r, {i: scale_f16_t1.eq(scale_r.dat_r[16*i:16*(i+1)])
+                                   for i in range(16)})
         scale_f16 = Signal(16)
         self.sync += If(v1_scale, scale_f16.eq(scale_f16_t1))
 
@@ -568,20 +354,8 @@ class BonsaiChannelPipe(LiteXModule):
                 copies.append((neg, shl, shr))
             return copies
         ax_amt = amount_regs(ax_sh, "a")
-        # Head B (dual-Q): its own pre-shift (Rpre differs per head), same exponent path.
-        if dual:
-          ax_rpre2  = Signal((8, True))
-          ax_bmr2   = Signal((9, True))
-          ax_sh2    = Signal((9, True))
-          self.comb += [
-            ax_rpre2.eq(self.rshift2),
-            ax_sh2.eq(ax_exp_s + ax_bmr2),
-          ]
-          self.sync += ax_bmr2.eq(ax_bias - ax_rpre2 - 15)
-          ax_amt2 = amount_regs(ax_sh2, "b")
         v2a    = _delay(self, v1, 2)              # Lane products valid (T3).
         ax_shifted  = []
-        ax_shifted2 = []
         for j in range(32):
             neg, shl, shr = ax_amt[j // 8]
             sh_full = Signal((32, True))
@@ -589,24 +363,11 @@ class BonsaiChannelPipe(LiteXModule):
             self.comb += sh_full.eq(Mux(neg, q8_lanes[j] >> shr, q8_lanes[j] << shl))
             self.sync += If(v2a, r.eq(sh_full))
             ax_shifted.append(r)
-            if not dual:
-                continue
-            neg2, shl2, shr2 = ax_amt2[j // 8]
-            sh_full2 = Signal((32, True))
-            r2       = Signal((32, True))
-            self.comb += sh_full2.eq(Mux(neg2, q8_lanesb[j] >> shr2, q8_lanesb[j] << shl2))
-            self.sync += If(v2a & self.qn, r2.eq(sh_full2))
-            ax_shifted2.append(r2)
 
         AX_GROUPS = 4 # head_dim <= 128 for AXPY ops (kvpack contract).
         acc_ax = [[Signal((32, True), name=f"axacc{g}_{j}") for j in range(32)]
                   for g in range(AX_GROUPS)]
         acc_flat = Array([acc_ax[g][j] for g in range(AX_GROUPS) for j in range(32)])
-        if dual:
-            acc_ax2 = [[Signal((32, True), name=f"axacc2_{g}_{j}") for j in range(32)]
-                       for g in range(AX_GROUPS)]
-            acc2_flat = Array([acc_ax2[g][j] for g in range(AX_GROUPS)
-                               for j in range(32)])
 
         # Final-beat tag: last code beat of the last row, aligned to the accumulate stage.
         fin_t0  = Signal()
@@ -620,11 +381,9 @@ class BonsaiChannelPipe(LiteXModule):
         self.comb += d_total.eq(Cat(C(0, 2), self.code_beats[:3])) # code_beats * 4 = cols/8.
         self.ax_fsm = ax_fsm = FSM(reset_state="AX_IDLE")
         drain_val  = Signal()
-        drain_head = Signal() # Dual-Q: drain bank A fully, then bank B.
         ax_fsm.act("AX_IDLE",
-            If(self.start & (self.kind == KIND_OP_AXPY) & ~config_error,
+            If(self.start & (self.kind == KIND_OP_AXPY),
                 NextValue(d_cnt, 0),
-                NextValue(drain_head, 0),
                 If(self.rows == 0,
                     NextState("AX_DRAIN"), # No rows on this channel: emit zero partials.
                 ).Else(
@@ -642,13 +401,7 @@ class BonsaiChannelPipe(LiteXModule):
             If(out_fifo_rdy_ax,
                 NextValue(d_cnt, d_cnt + 1),
                 If(d_cnt == d_total - 1,
-                    If(C(1 if dual else 0) & self.qn & ~drain_head,
-                        NextValue(drain_head, 1),
-                        NextValue(d_cnt, 0),
-                    ).Else(
-                        NextValue(drain_head, 0),
-                        NextState("AX_IDLE"),
-                    )
+                    NextState("AX_IDLE"),
                 )
             )
         )
@@ -671,10 +424,6 @@ class BonsaiChannelPipe(LiteXModule):
             c.attr.add(("dont_touch", "true"))
             self.sync += c.eq(g_ax1[:2])        # The beat's group at T3, one copy per 8 lanes.
             g_sel.append(c)
-        if dual:
-            ax_we2 = [Signal(name=f"ax_we2_{g}") for g in range(AX_GROUPS)]
-            self.sync += [ax_we2[g].eq(v2a & is_axpy & self.qn & (g_ax1[:2] == g))
-                          for g in range(AX_GROUPS)]
         for j in range(32):
             acc_sel = Signal((32, True))
             acc_sum = Signal((32, True))
@@ -682,26 +431,9 @@ class BonsaiChannelPipe(LiteXModule):
                 Case(g_sel[j // 8], {g: acc_sel.eq(acc_ax[g][j]) for g in range(AX_GROUPS)}),
                 acc_sum.eq(acc_sel + ax_shifted[j]),
             ]
-            if checked:
-                arithmetic_events.append(reduce(or_, ax_we)
-                    & (acc_sel[31] == ax_shifted[j][31]) & (acc_sum[31] != acc_sel[31]))
             for g in range(AX_GROUPS):
                 self.sync += If(self.start, acc_ax[g][j].eq(0)
                                 ).Elif(ax_we[g], acc_ax[g][j].eq(acc_sum))
-            if not dual:
-                continue
-            acc_sel2 = Signal((32, True))
-            acc_sum2 = Signal((32, True))
-            self.comb += [
-                Case(g_sel[j // 8], {g: acc_sel2.eq(acc_ax2[g][j]) for g in range(AX_GROUPS)}),
-                acc_sum2.eq(acc_sel2 + ax_shifted2[j]),
-            ]
-            if checked:
-                arithmetic_events.append(reduce(or_, ax_we2)
-                    & (acc_sel2[31] == ax_shifted2[j][31]) & (acc_sum2[31] != acc_sel2[31]))
-            for g in range(AX_GROUPS):
-                self.sync += If(self.start, acc_ax2[g][j].eq(0)
-                                ).Elif(ax_we2[g], acc_ax2[g][j].eq(acc_sum2))
 
         # T2..: adder trees (both built; result muxed by kind). -----------------------------------
         tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
@@ -713,13 +445,6 @@ class BonsaiChannelPipe(LiteXModule):
         q8_sum    = _delay(self, q8_sum,    n_tree - q8_regs - 1)
         gs  = Signal((22, True))
         self.comb += gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum))
-        if dual:
-            q8_sumb,   q8_regsb   = _adder_tree(self, q8_lanesb)  # Head B (dual-Q).
-            tern_sumb, tern_regsb = _adder_tree(self, tern_lanesb)
-            q8_sumb   = _delay(self, q8_sumb,   n_tree - q8_regsb - 1)
-            tern_sumb = _delay(self, tern_sumb, n_tree - tern_regsb)
-            gsb = Signal((22, True))
-            self.comb += gsb.eq(Mux(self.kind == KIND_OP_Q8, q8_sumb, tern_sumb))
 
         # Align tags and scale with the tree output. Lanes are registered on v1 (valid T2),
         # the tree adds n_tree stages -> gs valid at T{2+n_tree}. v1 is high at T1, so tags
@@ -792,36 +517,7 @@ class BonsaiChannelPipe(LiteXModule):
         acc_new  = Signal((48, True))
         result   = Signal((48, True))
         self.comb += result.eq(acc_new >> self.rshift)
-        if checked:
-            sum_wide = Signal((49, True))
-            self.comb += [sum_wide.eq(acc + contrib), acc_new.eq(sum_wide)]
-            arithmetic_events.append(v4 & (self.kind != KIND_OP_AXPY)
-                & ((sum_wide[48] != sum_wide[47])
-                   # Compare unsigned high-bit slices, not a signed result to an
-                   # unsigned concatenation (Migen zero-extends the latter).
-                   | (rlast4 & (result[32:] != Replicate(result[31], 16)))))
-        else:
-            self.comb += acc_new.eq(acc + contrib)
-        if dual: # Head-B product/shift/accumulate (shares the row scale and shift).
-            prod2    = Signal((34, True))
-            contrib2 = Signal((46, True))
-            acc2     = Signal((48, True))
-            acc2_new = Signal((48, True))
-            result2  = Signal((48, True))
-            self.sync += prod2.eq(gsb*m11)
-            self.sync += contrib2.eq((prod2 << 12) >> shamt)
-            self.comb += result2.eq(acc2_new >> self.rshift) # Scores share R across the pair.
-            if checked:
-                sum_wide2 = Signal((49, True))
-                self.comb += [sum_wide2.eq(acc2 + contrib2), acc2_new.eq(sum_wide2)]
-                arithmetic_events.append(v4 & self.qn & (self.kind != KIND_OP_AXPY)
-                    & ((sum_wide2[48] != sum_wide2[47])
-                       | (rlast4 & (result2[32:] != Replicate(result2[31], 16)))))
-            else:
-                self.comb += acc2_new.eq(acc2 + contrib2)
-
-        if checked:
-            self.comb += arithmetic_event.eq(native_mode & reduce(or_, arithmetic_events))
+        self.comb += acc_new.eq(acc + contrib)
 
         out_fifo = stream.SyncFIFO([("row", 16), ("data", 32), ("head", 1)], out_fifo_depth)
         # AXPY wide-drain FIFO: 8 accumulators per entry (one full beat). Matvec and AXPY
@@ -830,34 +526,12 @@ class BonsaiChannelPipe(LiteXModule):
         axw_fifo = stream.SyncFIFO([("row", 16), ("data", 256), ("head", 1)], 4)
         self.submodules += out_fifo, axw_fifo
 
-        # Dual-Q: head B's result is staged one cycle behind head A's push (rows are >= 2
-        # beats apart, so the slot is always free before the next row-last).
-        pendb_v   = Signal()
-        if dual:
-            pendb_row = Signal(16)
-            pendb_dat = Signal(32)
         self.sync += [
             If(self.start,
                 acc.eq(0),
-                *([acc2.eq(0)] if dual else []),
             ).Elif(v4,
                 acc.eq(Mux(rlast4, 0, acc_new)),
-                *([acc2.eq(Mux(rlast4, 0, acc2_new))] if dual else []),
             ),
-            # Head-B staging: set on row-last (priority), clear only when the push is
-            # accepted. A clear gated behind the v4 branch re-pushes every dense-stream
-            # cycle (v4 high back-to-back) and overshoots result_cnt - the op never
-            # terminates. Migen tests missed it: reader-latency bubbles masked the race.
-            *([If(self.start,
-                pendb_v.eq(0),
-            ).Elif(v4 & rlast4 & self.qn
-                   & ((self.kind == KIND_OP_Q8) | (self.kind == KIND_OP_TERNARY)),
-                pendb_v.eq(1),
-                pendb_row.eq(row4),
-                pendb_dat.eq(result2[:32]),
-            ).Elif(pendb_v & out_fifo.sink.ready,
-                pendb_v.eq(0),
-            )] if dual else []),
             If(self.start,
                 self.overflow.eq(0),
             ).Elif(out_fifo.sink.valid & ~out_fifo.sink.ready & (self.kind != KIND_OP_AXPY),
@@ -870,18 +544,7 @@ class BonsaiChannelPipe(LiteXModule):
             If(self.kind == KIND_OP_AXPY,
                 axw_fifo.sink.valid.eq(drain_val),
                 axw_fifo.sink.row.eq(Cat(C(0, 3), d_cnt)), # First lane index = d_cnt*8.
-                axw_fifo.sink.head.eq(drain_head),
-                axw_fifo.sink.data.eq(
-                    Mux(drain_head,
-                        Cat(*[acc2_flat[(d_cnt << 3) + i][0:32] for i in range(8)]),
-                        Cat(*[acc_flat[(d_cnt << 3) + i][0:32] for i in range(8)]))
-                    if dual else
-                        Cat(*[acc_flat[(d_cnt << 3) + i][0:32] for i in range(8)])),
-            ).Elif(pendb_v,
-                *([out_fifo.sink.valid.eq(1),
-                   out_fifo.sink.row.eq(pendb_row),
-                   out_fifo.sink.data.eq(pendb_dat),
-                   out_fifo.sink.head.eq(1)] if dual else []),
+                axw_fifo.sink.data.eq(Cat(*[acc_flat[(d_cnt << 3) + i][0:32] for i in range(8)])),
             ).Else(
                 out_fifo.sink.valid.eq(v4 & rlast4),
                 out_fifo.sink.row.eq(row4),
@@ -889,7 +552,7 @@ class BonsaiChannelPipe(LiteXModule):
             ),
             out_fifo_rdy_ax.eq(axw_fifo.sink.ready),
             # 9 slots of slack cover in-flight results (<= 4 row-lasts in the T+0..T+4
-            # stages with the Q8 operand register, x2 for the dual-Q staged head-B pushes).
+            # stages with the Q8 operand register, x2 margin).
             out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 9)),
             If(self.kind == KIND_OP_AXPY,
                 self.source.valid.eq(axw_fifo.source.valid),
