@@ -10,11 +10,13 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -60,6 +62,7 @@ struct bons_header {
  * of syscalls for a gigabyte upload. BAR0 is mapped uncached through sysfs instead: each store
  * is its own posted write, exactly what a FIFO register wants. */
 static volatile uint32_t *bar;
+static int bar_devnum;
 #define BAR_W(a, v) do { bar[((a) - CSR_BASE)/4] = (v); } while (0)
 #define BAR_R(a)    (bar[((a) - CSR_BASE)/4])
 
@@ -95,6 +98,7 @@ void loader_bar_map(int devnum)
     if (m == MAP_FAILED) { perror("mmap BAR0"); exit(1); }
     close(fd);
     bar = (volatile uint32_t *)m;
+    bar_devnum = devnum;
 }
 
 /* CPU reset */
@@ -239,6 +243,13 @@ uint64_t loader_upload_image(const char *path, int verbose)
     printf("done: %.1f MB in %.2f s (%.2f GB/s)\n", mb, dt, mb/dt/1000);
     free(buf);
     fclose(f);
+    char real[4096];
+    struct stat st = {0};
+    stat(path, &st);
+    if (!realpath(path, real))
+        snprintf(real, sizeof(real), "%s", path);
+    loader_state_write(bar_devnum, "load", "\"image\": \"%s\", \"bytes\": %llu, \"time\": %ld",
+                       real, (unsigned long long)st.st_size, (long)time(NULL));
     return (uint64_t)hdr.n_channels*chan_bytes;
 }
 
@@ -277,4 +288,30 @@ uint64_t loader_upload_firmware(const char *path)
     loader_transfer(0, FW_HBM_ADDR, img, BEATS(len));
     free(img);
     return (uint64_t)len;
+}
+
+/* Card state for trixium smi */
+/*----------------------------*/
+
+void loader_state_write(int devnum, const char *kind, const char *fmt, ...)
+{
+    char path[256], tmp[300];
+    va_list ap;
+
+    /* Shared by root (sudo) and user runs: the directory and the records are world-writable. */
+    if (mkdir(TRIXIUM_STATE_DIR, 0777) == 0)
+        chmod(TRIXIUM_STATE_DIR, 0777);
+    snprintf(path, sizeof(path), TRIXIUM_STATE_DIR "/trixium%d.%s.json", devnum, kind);
+    snprintf(tmp,  sizeof(tmp),  "%s.%d", path, (int)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return; /* Best effort: the monitor is optional. */
+    fprintf(f, "{\"pid\": %d, ", (int)getpid());
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "}\n");
+    fclose(f);
+    chmod(tmp, 0666);
+    rename(tmp, path); /* Atomic: a reader never sees half a record. */
 }

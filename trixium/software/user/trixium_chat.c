@@ -520,6 +520,16 @@ static int serialboot(const char *fw)
     return 0;
 }
 
+/* Card state for trixium smi */
+/*----------------------------*/
+
+static void chat_state(int devnum, const char *state, long tokens, double tok_s)
+{
+    loader_state_write(devnum, "chat",
+        "\"tool\": \"trixium_chat\", \"state\": \"%s\", \"tokens\": %ld, \"tok_s\": %.3f, \"time\": %ld",
+        state, tokens, tok_s, (long)time(NULL));
+}
+
 /* Weight upload and fast boot, through the shared loader (trixium_loader.c) */
 /*----------------------------------------------------------------------------*/
 
@@ -946,6 +956,9 @@ int main(int argc, char **argv)
            "(%s; each turn continues the conversation on-card; /reset clears it)\n\n",
            g_chat ? "chat template, thinking off" : "raw completion, -r");
 
+    long tokens_total = 0;
+    chat_state(devnum, "idle", 0, 0.0);
+
     char *linebuf = NULL; size_t linecap = 0;
     int   ids[2048], out[2048];         /* PBUF_N in firmware/main.c: the on-card buffer. */
     int   fresh = 1, prev_closed = 1;
@@ -1033,6 +1046,7 @@ int main(int argc, char **argv)
             }
         }
 
+        chat_state(devnum, "generating", tokens_total, 0.0);
         if (g_chat) send_line("genb %d %d", ntok, g_im_end);   /* stop at <|im_end|> */
         else        send_line("genb %d", ntok);
         printf("bot> ");
@@ -1049,6 +1063,8 @@ int main(int argc, char **argv)
          * first token's latency is this turn's prefill (the card keeps the conversation's
          * KV cache across turns), so folding it in would misreport the decode. */
         double rate = (ng > 1 && dt > first_dt) ? (ng - 1)/(dt - first_dt) : 0.0;
+        tokens_total += ng;
+        chat_state(devnum, "idle", tokens_total, rate);
         printf("\n     [%d tokens in %.1f s: first after %.2f s, then %.1f tok/s%s]\n\n",
                ng, dt, first_dt, rate, prev_closed || !g_chat ? "" : ", cut by -n");
         tty_expect("trixium>", 5.0, NULL, 0, 0);

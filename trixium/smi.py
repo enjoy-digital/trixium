@@ -223,6 +223,23 @@ def _delta(a, b):
 def _bits(value, fields):
     return {name: bool((value >> bit) & 1) for name, bit in fields.items()}
 
+def write_state(devnum, kind, **fields):
+    """Record the card's state (the Python twin of trixium_loader.c's loader_state_write)."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        os.chmod(STATE_DIR, 0o777)
+    except OSError:
+        pass
+    path = os.path.join(STATE_DIR, f"trixium{devnum}.{kind}.json")
+    tmp  = f"{path}.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), **fields}, f)
+        os.chmod(tmp, 0o666)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # Best effort: the monitor is optional.
+
 def read_state(device):
     """The host tools' records for this card: last upload and chat process (or None)."""
     name  = os.path.basename(device)

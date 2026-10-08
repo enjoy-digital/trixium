@@ -45,4 +45,11 @@ uint64_t loader_upload_firmware(const char *path);
 /* Zero the staged BONS header (no model at boot). */
 void     loader_clear_staging(void);
 
+/* Record the card's state for `trixium smi` in TRIXIUM_STATE_DIR/trixium<devnum>.<kind>.json:
+ * {"pid": <this process>, <fmt...>}, written atomically. Best effort, never fails the caller.
+ * loader_upload_image() records "load" itself; trixium_chat records "chat". */
+#define TRIXIUM_STATE_DIR "/tmp/trixium"
+void     loader_state_write(int devnum, const char *kind, const char *fmt, ...)
+             __attribute__((format(printf, 3, 4)));
+
 #endif /* TRIXIUM_LOADER_H */

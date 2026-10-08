@@ -170,6 +170,12 @@ def main(argv=None):
     p.add_argument("--quiet",  default=3.0,  type=float, help="Stop early once the console has been silent this long (s).")
     p.set_defaults(fn=cmd_console)
 
+    # SMI.
+    from trixium import smi
+    p = subparsers.add_parser("smi", help="Card status: bitstream, PCIe link, clock, utilization, memory GB/s, model.")
+    smi.add_arguments(p)
+    p.set_defaults(fn=smi.run)
+
     args = parser.parse_args(argv)
     args.fn(args)
 
