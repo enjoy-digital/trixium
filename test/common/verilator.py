@@ -322,6 +322,10 @@ class Simulator:
             built = subprocess.run(cmd, cwd=self.dir, capture_output=True, text=True, timeout=3600)
             (self.dir / "build.log").write_text(built.stdout + built.stderr)
             assert built.returncode == 0, built.stdout[-4000:] + built.stderr[-4000:]
+            # Only the binary is used: drop the precompiled headers and objects (~100 MB a build).
+            for f in (self.dir / "obj").iterdir():
+                if f.suffix in (".gch", ".o", ".a", ".d"):
+                    f.unlink()
             stamp.write_text("ok\n")
 
     def _header(self, names, widths, mems):
