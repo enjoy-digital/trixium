@@ -27,8 +27,10 @@ from model.silu_hw import LUT_N, f32_bits, silu_mul_firmware, silu_mul_fixed, ta
 from model.activation import scratchpad_silu_descriptor, silu_table_image
 
 from common import RTL
-from common.cluster import SoC, write, install_list
+from common.cluster import BACKEND, SoC, write, install_list
+from common.cluster import run as run_cluster
 from common.verilator import Simulator
+from common.verilator import run as run_tb
 
 # SiluMulKernel ------------------------------------------------------------------------------------
 # SiluMulKernel (portable RTL) against the bit-exact model, compiled with Verilator.
@@ -124,8 +126,10 @@ def test_model_reference_spot_checked_against_firmware():
             assert r == silu_mul_firmware(g, m), (hex(g), hex(m))
 
 
-def test_migen_simulation_small():
-    """The same kernel in Migen's simulator: a few hundred elements with stalls."""
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_migen_simulation_small(backend):
+    """The same kernel, Migen testbench (compiled, and on Migen's simulator in the slow tier):
+    a few hundred elements with stalls."""
     k = SiluMulKernel()
     lut, dlut = tables()
     gates, mults = stress_vectors(seed=21, n_random=200)
@@ -156,7 +160,7 @@ def test_migen_simulation_small():
             if len(got) == len(gates):
                 return
 
-    run_simulation(k, drive())
+    run_tb(k, drive(), backend)
     assert len(got) == len(want)
     for idx, ((r, f), (wr, wf)) in enumerate(zip(got, want)):
         assert f == wf, (idx, hex(gates[idx]), hex(mults[idx]))
@@ -311,7 +315,8 @@ def check_run(dut, cmd, gates, mults, stalls=True):
     return fixups
 
 
-def test_migen_runs_with_stalls_tails_and_inplace():
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_migen_runs_with_stalls_tails_and_inplace(backend):
     dut = SiluSP()
     gates, mults = stress_vectors(seed=31, n_random=300)
     # Put fixups next to exact elements in the first bitmap word.
@@ -326,7 +331,7 @@ def test_migen_runs_with_stalls_tails_and_inplace():
             cmd = run_cmd(src_g=0x9000, src_m=0xA000, dst=dst, fixmap=0xC000, elements=n)
             seen += yield from check_run(dut, cmd, gates[:n], mults[:n], stalls)
         assert seen > 0
-    run_simulation(dut, run())
+    run_tb(dut, run(), backend)
 
 
 REJECTS = [
@@ -359,7 +364,7 @@ def test_migen_rejects_before_memory_access(changed, mask):
         yield dut.unit.cancel.eq(0)
         yield
         assert not (yield dut.unit.error) and not (yield dut.unit.busy)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 @pytest.mark.parametrize("delay", [0, 1, 3, 7, 20, 60])
@@ -381,10 +386,9 @@ def test_migen_cancel_mid_run_then_clean_run(delay):
         assert not (yield dut.unit.busy) and not (yield dut.unit.error)
         cmd = run_cmd(src_g=0x9000, src_m=0xA000, dst=0x9000, fixmap=0xC000, elements=45)
         yield from check_run(dut, cmd, gates[:45], mults[:45])
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
-@pytest.mark.slow  # Migen simulator, ~4 min
 def test_migen_load_fills_both_tables():
     # Unloaded kernel memories, a real LOAD, then a run that touches both tables.
     dut = SiluSP(preload=False)
@@ -395,7 +399,7 @@ def test_migen_load_fills_both_tables():
         assert (yield dut.unit.read_beats) == LOAD_BEATS
         cmd = run_cmd(src_g=0x9000, src_m=0xA000, dst=0xB000, fixmap=0xC000, elements=64)
         yield from check_run(dut, cmd, gates[:64], mults[:64], stalls=False)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 def test_invalid_physical_sizes():
@@ -409,7 +413,8 @@ def test_invalid_physical_sizes():
 def test_compiled_full_scratchpad_image(tmp_path):
     from common.rtl_client import build_client, run_client
     size = 256*1024
-    binary = build_client(SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
+    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp",
+                          key=f"SiluScratchpad({size})")
     rng = np.random.default_rng(12)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
     tab = 0x37000
@@ -464,7 +469,8 @@ def test_compiled_table_only_sigmoid(tmp_path):
     from common.rtl_client import build_client, run_client
     from model.rv32_math import sigmoid_rv32
     size = 256*1024
-    binary = build_client(SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
+    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp",
+                          key=f"SiluScratchpad({size})")
     rng = np.random.default_rng(21)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
     # Both tables resident (ABI 1.3): the SiLU's in set 0, the sigmoid's in set 1.
@@ -610,9 +616,18 @@ def test_dispatch_fields_fixup_sum_and_failure_wins(failure):
     run_simulation(dut, run())
 
 
-def cluster():
+def cluster(backend="verilator"):
     return SoC(TriXiumConfig(with_silu=True, with_projection_restore=True,
-                                   scratchpad_size=64*1024), n=1)
+                                   scratchpad_size=64*1024), n=1, backend=backend)
+
+
+def kernel_tables(dut):
+    """The kernels' table memories (preload() writes them): exported by the compiled cluster."""
+    mems = {}
+    for i, kernel in enumerate(dut.silu.kernels):
+        mems[f"silu_lut{i}"]  = kernel.lut_mem
+        mems[f"silu_dlut{i}"] = kernel.dlut_mem
+    return mems
 
 
 def wait_list(dut, limit, error):
@@ -634,9 +649,10 @@ def preload(dut):
             yield kernel.dlut_mem[i].eq(v)
 
 
-def test_cluster_runs_through_the_shared_arbiter():
+@BACKEND
+def test_cluster_runs_through_the_shared_arbiter(backend):
     """An out-of-place RUN and an in-place RUN on its result, one list, on the cluster."""
-    dut = cluster()
+    dut = cluster(backend)
     size = 64*1024
     gates, mults = stress_vectors(seed=61, n_random=100)
     gates = [0x7F800000] + gates      # one guaranteed fixup
@@ -668,10 +684,9 @@ def test_cluster_runs_through_the_shared_arbiter():
                 got = yield dut.scratchpad.mem[base//32 + beat]
                 want = pack(mem[base//4 + 8*beat:base//4 + 8*beat + 8])
                 assert got == want, (hex(base), beat)
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run(), memories=kernel_tables(dut))
 
 
-@pytest.mark.slow  # Migen simulator, ~40 s
 def test_cluster_list_protection_and_reset_recovery():
     dut = cluster()
     def run():
@@ -698,7 +713,7 @@ def test_cluster_list_protection_and_reset_recovery():
         yield from wait_list(dut, 500, dut.seq.silu_error.status)
         assert (yield dut.scratchpad.mem[0x800//32]) == pack(mem[0x800//4:0x800//4 + 8])
         assert (yield dut.scratchpad.mem[0x1800//32]) == pack(mem[0x1800//4:0x1800//4 + 8])
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run(), memories=kernel_tables(dut))
 
 
 def test_no_cluster_memory_is_exported_over_the_csr_bus():

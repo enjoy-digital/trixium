@@ -19,6 +19,9 @@ from litex.soc.interconnect.axi import AXIInterface
 from gateware.memory.axi import AXIReader, AXIWriter, AXIResetShim
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
+from common.verilator import ChannelModel
+from common.verilator import run as run_tb
+
 # AXIReader / AXIWriter ----------------------------------------------------------------------------
 # AXIReader/Writer unit tests against HBMChannelModel (Migen simulation):
 # exact data/last sequences under latency + R-stall jitter + consumer backpressure,
@@ -221,17 +224,24 @@ def test_hbm_model_flags_axlen_overflow():
 # ship silently again.
 
 class _ReaderIDDUT(Module):
-    def __init__(self, latency, stall_rate, init_bytes, n_ids, reorder_ids):
+    """The reader on an HBMChannelModel (backend "migen") or its compiled stand-in (the C++
+    AXI slave's reorder server, common.verilator.ChannelModel)."""
+    def __init__(self, latency, stall_rate, init_bytes, n_ids, reorder_ids, backend="migen"):
         axi = AXIInterface(data_width=256, address_width=33, id_width=6)
         self.submodules.reader = AXIReader(axi, burst_beats=16, fifo_depth=64,
                                                  n_ids=n_ids)
-        self.submodules.model  = HBMChannelModel(axi, size=MEM_SIZE,
-            init=words_from_bytes(init_bytes), latency=latency, stall_rate=stall_rate,
-            reorder_ids=reorder_ids)
+        self.backend = backend
+        model = HBMChannelModel(axi, size=MEM_SIZE, init=words_from_bytes(init_bytes),
+            latency=latency, stall_rate=stall_rate, reorder_ids=reorder_ids) if backend == "migen" else \
+            ChannelModel(axi, size=MEM_SIZE, init=words_from_bytes(init_bytes), latency=latency,
+            stall_rate=stall_rate, reorder_ids=reorder_ids)
+        if backend == "migen":
+            self.submodules.model = model
+        self.model = model
 
-def _run_id_case(latency, stall_rate, n_ids, reorder_ids, seed, backpressure=False):
+def _run_id_case(latency, stall_rate, n_ids, reorder_ids, seed, backpressure=False, backend="verilator"):
     data = _pattern_bytes(seed)
-    dut  = _ReaderIDDUT(latency, stall_rate, data, n_ids, reorder_ids)
+    dut  = _ReaderIDDUT(latency, stall_rate, data, n_ids, reorder_ids, backend)
     rng  = random.Random(seed)
     cmds = []
     for _ in range(6):
@@ -268,7 +278,7 @@ def _run_id_case(latency, stall_rate, n_ids, reorder_ids, seed, backpressure=Fal
                     raise AssertionError("timeout")
             yield dut.reader.source.ready.eq(0)
 
-    run_simulation(dut, [driver()])
+    run_tb(dut, [driver()], backend, channels=[] if backend == "migen" else [dut.model])
     exp = []
     for addr, nbeats in cmds:
         beats = _expected_beats(data, addr, nbeats)
@@ -283,10 +293,11 @@ def test_reader_multi_id_correct_under_reorder():
                                      (40, 4, True, 3), (64, 2, False, 4)]:
         _run_id_case(latency, stall, 4, 4, seed, bp)
 
-def test_reader_multi_id_correct_on_inorder_model():
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_reader_multi_id_correct_on_inorder_model(backend):
     # The same reader against the legacy in-order model (reorder off): drain order and
     # tags must be identical - covers HBM controllers that happen not to interleave.
-    _run_id_case(24, 2, 4, 0, 5)
+    _run_id_case(24, 2, 4, 0, 5, backend=backend)
 
 def test_reader_single_id_slow_multi_id_fast_under_reorder():
     # The performance claim itself. Same command stream, same model: the single-ID reader
@@ -309,9 +320,13 @@ def test_reader_single_id_slow_multi_id_fast_under_reorder():
 # shim busy and raises `stuck`.
 
 class _DUT(Module):
-    def __init__(self, init):
+    def __init__(self, init, backend="migen"):
         port = AXIInterface(data_width=256, address_width=33, id_width=6)
-        self.submodules.model = HBMChannelModel(port, size=16*1024, init=init, latency=4)
+        self.backend = backend
+        if backend == "migen":
+            self.submodules.model = HBMChannelModel(port, size=16*1024, init=init, latency=4)
+        else:
+            self.model = ChannelModel(port, size=16*1024, init=init, latency=4)
         self.submodules.shim  = AXIResetShim(port, stuck_cycles=2000)
         self.rst = Signal()
         self.submodules.reader = ResetInserter()(AXIReader(self.shim.master, fifo_depth=64))
@@ -470,7 +485,7 @@ def test_shim_write_cut_by_reset():
 
 
 def test_shim_stuck_when_port_never_answers():
-    dut = _DUT([0]*128)
+    dut = _DUT([0]*128, "verilator")
     out = {}
 
     def gen():
@@ -488,7 +503,7 @@ def test_shim_stuck_when_port_never_answers():
         out["drained"] = ok
         out["stuck"] = (yield dut.shim.stuck)
 
-    run_simulation(dut, gen())
+    run_tb(dut, gen(), channels=[dut.model])
     assert not out["drained"] and out["stuck"]
 
 

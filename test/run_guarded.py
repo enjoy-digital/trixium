@@ -45,8 +45,8 @@ from pathlib import Path
 # Constants ----------------------------------------------------------------------------------------
 
 ROOT     = Path(__file__).resolve().parents[1]
-SPLIT    = {"test/gateware/memory/test_ddr.py": 9.5} # Run per test; expected GB of a test the
-                                                     # record does not know yet (LiteDRAM, Migen).
+SPLIT    = {"test/gateware/memory/test_ddr.py": 9.5} # Run per test; expected GB of a Migen test
+                                                     # the record does not know yet (LiteDRAM).
 DESELECT = ()
 PASS     = (0, 5)                                   # pytest: passed, or all deselected
 
@@ -230,7 +230,8 @@ def main():
     units = []
     for name in names:
         rec  = record.get(name, {})
-        peak = rec.get("peak_gb") or SPLIT.get(name.split("::")[0]) or args.min_free
+        heavy = SPLIT.get(name.split("::")[0]) if "migen" in name else None
+        peak  = rec.get("peak_gb") or heavy or args.min_free
         units.append(Unit(name, peak, rec.get("seconds", 60.0)))
     units.sort(key=lambda u: -u.expected_s)
 

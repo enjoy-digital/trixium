@@ -27,8 +27,10 @@ from model.activation import scratchpad_restore_descriptor
 from model import asm
 
 from common import COMMON, RTL
+from common.cluster import run as run_cluster
 from common.cluster import SoC, write, install_list
 from common.verilator import Simulator
+from common.verilator import run as run_tb
 
 # I32ToFp32Scaled ----------------------------------------------------------------------------------
 # IEEE binary32 scalar oracle, independent of the RTL normalization/shifts.
@@ -142,7 +144,7 @@ def exercise(dut, inputs, stalls=True, cancels=()):
 
 def test_projection_restore_all_exponents_rounding_boundaries():
     dut = I32ToFp32Scaled()
-    run_simulation(dut, exercise(dut, vectors(), stalls=False))
+    run_tb(dut, exercise(dut, vectors(), stalls=False))
 
 
 @pytest.mark.parametrize('lanes', [1, 2, 8, 16])
@@ -151,7 +153,7 @@ def test_projection_restore_elastic_cancel(lanes):
     inputs = [([rng.getrandbits(32) for _ in range(lanes)], rng.randrange(-160, 140),
                i % 13 == 0, i % 13 == 12) for i in range(400)]
     dut = I32ToFp32Scaled(lanes)
-    run_simulation(dut, exercise(dut, inputs, cancels=(1, 2, 11, 78, 143, 301)))
+    run_tb(dut, exercise(dut, inputs, cancels=(1, 2, 11, 78, 143, 301)))
 
 
 def test_projection_restore_invalid_lanes():
@@ -294,7 +296,8 @@ def valid(dut, words, *, exponent=0, adjustment=0, inplace=False, dst=None):
 
 
 @pytest.mark.parametrize('inplace', [False, True])
-def test_restore_sp_stalls_tail_scales_and_reuse(inplace):
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_restore_sp_stalls_tail_scales_and_reuse(inplace, backend):
     dut = RestoreSP()
     rng = random.Random(927)
     def run():
@@ -302,7 +305,7 @@ def test_restore_sp_stalls_tail_scales_and_reuse(inplace):
                                             (8, 0, 0), (3, -127, -22), (257, -65, 32)):
             words = [rng.getrandbits(32) for _ in range(count)] if exponent != 127 else [0]
             yield from valid(dut, words, exponent=exponent, adjustment=adjustment, inplace=inplace)
-    run_simulation(dut, run())
+    run_tb(dut, run(), backend)
 
 
 def test_restore_sp_exact_end_and_readonly_metadata_alias():
@@ -554,10 +557,12 @@ def test_restoration_waits_nowait_engine_stable_dispatch_and_failure_wins(failur
     run_simulation(dut, run())
 
 
-@pytest.mark.parametrize('companions', [False, True])
-def test_restoration_fetch_nowait_restore_store_shared_cluster(companions):
+# Compiled cluster; without companions also on Migen's simulator.
+@pytest.mark.parametrize('companions,backend', [(False, "verilator"), (True, "verilator"),
+                                                pytest.param(False, "migen", marks=pytest.mark.slow)])
+def test_restoration_fetch_nowait_restore_store_shared_cluster(companions, backend):
     dut = SoC(TriXiumConfig(with_projection_restore=True, with_hadamard=companions,
-                                 with_activation_quantize=companions, scratchpad_size=16*1024), n=1)
+                                 with_activation_quantize=companions, scratchpad_size=16*1024), n=1, backend=backend)
     words = [(i - 8)*(1 << 24) + (i % 5) for i in range(17)]
     restored, error = expected(words, -31)
     assert not error
@@ -590,11 +595,11 @@ def test_restoration_fetch_nowait_restore_store_shared_cluster(companions):
                 i = 8*beat + lane
                 assert (actual >> (32*lane)) & 0xffffffff == (
                     (restored >> (32*i)) & 0xffffffff if i < 17 else 0xdeadbeef)
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())
 
 
 def test_restoration_actual_wrapping_vector_reduce_before_float_conversion():
-    dut = SoC(TriXiumConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1)
+    dut = SoC(TriXiumConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1, backend="verilator")
     a = [(1 << 24)+1, 0x7fffffff, 0x80000000, -7, (1 << 24)+3, 0, 1, -1]
     b = [-(1 << 24), 1, -1, 7, -(1 << 24), 0, -1, 1]
     total = [(x+y) & 0xffffffff for x, y in zip(a, b)]
@@ -619,11 +624,11 @@ def test_restoration_actual_wrapping_vector_reduce_before_float_conversion():
         assert (yield dut.seq.status.fields.dcount) == 2
         assert (yield dut.scratchpad.mem[0x840//32]) == result
         assert (result & 0xffffffff) == 0x3f800000  # 1.0, not separately-rounded 0.0.
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())
 
 
 def test_restoration_shared_reset_and_whole_list_protection():
-    dut = SoC(TriXiumConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1)
+    dut = SoC(TriXiumConfig(with_projection_restore=True, scratchpad_size=16*1024), n=1, backend="verilator")
     def run():
         # Output writes target the second descriptor, not the executing one.
         bad = descriptor(dst=64, elements=1)
@@ -652,4 +657,4 @@ def test_restoration_shared_reset_and_whole_list_protection():
             raise AssertionError('restoration failed after common reset')
         assert (yield dut.seq.status.fields.dcount) == 1
         assert (yield dut.scratchpad.mem[0x1000//32]) & ((1 << 64)-1) == expected([1, -1], -149)[0]
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())

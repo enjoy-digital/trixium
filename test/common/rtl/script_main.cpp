@@ -45,26 +45,7 @@ int main(int argc, char **argv) {
             std::string prefix, kv;
             in >> prefix;
             AxiConfig c;
-            std::string init;
-            while (in >> kv) {
-                size_t k = kv.find('=');
-                if (k == std::string::npos) sim_fail("axi %s: bad option '%s'", prefix.c_str(), kv.c_str());
-                std::string key = kv.substr(0, k), val = kv.substr(k + 1);
-                auto num = [&]() { return (uint32_t)std::strtoul(val.c_str(), nullptr, 0); };
-                if      (key == "size")        c.size        = std::strtoull(val.c_str(), nullptr, 0);
-                else if (key == "latency")     c.latency     = num();
-                else if (key == "r_stall")     c.r_stall     = num();
-                else if (key == "ar_stall")    c.ar_stall    = num();
-                else if (key == "aw_stall")    c.aw_stall    = num();
-                else if (key == "w_stall")     c.w_stall     = num();
-                else if (key == "b_stall")     c.b_stall     = num();
-                else if (key == "reorder")     c.reorder     = num();
-                else if (key == "max_len")     c.max_len     = num();
-                else if (key == "seed")        c.seed        = num();
-                else if (key == "log")         c.log         = num() != 0;
-                else if (key == "write_order") c.write_order = val;
-                else sim_fail("axi %s: unknown option '%s'", prefix.c_str(), key.c_str());
-            }
+            while (in >> kv) c.option(prefix, kv);
             auto *a = new AxiSlave(sim, prefix, c);
             sim.models.push_back(a);
             owned.push_back(a);

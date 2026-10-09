@@ -6,12 +6,12 @@
 
 """The XCU1525's engine port path: the engine's AXI over LiteDRAM's bridge and converter.
 
-Memory note (measured with test/run_guarded.py): each test that builds a real
-LiteDRAMCore peaks about 9.5 GB in Migen's simulator, and pytest keeps that between
-parametrizations, so the whole file in one process reaches 21 GB. Building the core and PHY
-model costs only 30 MB - the cost is the simulator's state over tens of thousands of cycles,
-not the design or the simulated DRAM (4.2M words = 33.5 MB). Run this file one test per
-process when anything else needs the machine.
+Every test is a Migen testbench run compiled (common.verilator.run: the DUT in Verilator,
+the generators - and LiteDRAM's DRAMMemory model where there is no controller - in Python),
+seconds each. The slow tier also runs a DRAMMemory test and a controller test on Migen's
+simulator, where a test that builds a real LiteDRAMCore peaks about 9.5 GB and takes minutes
+(the simulator's state over tens of thousands of cycles, not the design: run it one test per
+process).
 
 On the FK33 the engine's 256-bit AXI ports meet the HBM controller directly. On the XCU1525
 they meet a 512-bit DDR4 controller through LiteDRAMAXI2Native and the crossbar's 256 -> 512
@@ -39,6 +39,8 @@ from litedram.frontend.adapter import LiteDRAMNativePortConverter
 from gateware.memory.axi import AXIReader
 from gateware.memory.axi import AXIWriter
 
+from common.verilator import module_handles, run
+
 # LiteDRAM's native-port memory model, from the LiteDRAM repository's test package.
 import litedram
 sys.path.insert(0, os.path.dirname(os.path.dirname(litedram.__file__)))
@@ -65,7 +67,27 @@ def _beats_to_words(data, width):
     return [int.from_bytes(data[i:i+width//8], "little") for i in range(0, len(data), width//8)]
 
 
-def test_engine_port_path_write_then_read():
+# The compiled DUT in the fast tier, Migen's simulator (one test of each kind) in the slow one.
+MIGEN   = pytest.param("migen", marks=pytest.mark.slow)
+BACKEND = pytest.mark.parametrize("backend", ["verilator", MIGEN])
+
+
+def _run(dut, generators, backend, extra=None):
+    """run() with the handles the testbenches touch: the readers/writers, the native ports
+    (DRAMMemory's handlers), the extra signals (a LiteDRAMCore's DFII control)."""
+    signals = {}
+    for name in ("reader", "writer", "readers", "writers", "ctrl_port", "engrst", "bcount"):
+        if hasattr(dut, name):
+            found, _ = module_handles(getattr(dut, name), depth=1)
+            signals.update({f"{name}_{k}" if k else name: v for k, v in found.items()})
+            if isinstance(getattr(dut, name), Signal):
+                signals[name] = getattr(dut, name)
+    signals.update(extra or {})
+    run(dut, generators, backend, signals=signals, memories={}, name="ddr")
+
+
+@BACKEND
+def test_engine_port_path_write_then_read(backend):
     dut  = _DUT()
     rng  = np.random.default_rng(5)
     n_beats = 64
@@ -112,8 +134,8 @@ def test_engine_port_path_write_then_read():
         assert len(got) == n_beats, f"read path returned {len(got)} of {n_beats} beats"
         assert got == words, "read data differs from what was written"
 
-    run_simulation(dut, [writer(), dut.mem.write_handler(dut.ctrl_port),
-                         dut.mem.read_handler(dut.ctrl_port)])
+    _run(dut, [writer(), dut.mem.write_handler(dut.ctrl_port),
+               dut.mem.read_handler(dut.ctrl_port)], backend)
 
 
 def _engine_port(core, axi, port_width):
@@ -125,9 +147,11 @@ def _engine_port(core, axi, port_width):
     return engine_ddr_port(core, axi, port_width=port_width, merge=False)
 
 
-@pytest.mark.slow  # Migen simulator on LiteDRAM: 4-6 min and ~9.5 GB each
-@pytest.mark.parametrize("port_width, base_skew", [(256, 0), (512, 0), (512, 32), ("512m", 0), ("512m", 32)])
-def test_engine_port_path_through_the_controller(port_width, base_skew):
+# Compiled; Migen's simulator for one case (4-6 min and ~9.5 GB).
+@pytest.mark.parametrize("port_width, base_skew, backend", [(256, 0, "verilator"), (512, 0, "verilator"),
+    (512, 32, "verilator"), ("512m", 0, "verilator"), ("512m", 32, "verilator"),
+    pytest.param(512, 32, "migen", marks=pytest.mark.slow)])
+def test_engine_port_path_through_the_controller(port_width, base_skew, backend):
     """The same chain on the real LiteDRAM core (bank machines, multiplexer, refresher) over
     the PHY model, DFI in hardware mode as after the BIOS's init - the Verilator sim minus
     the CPU. Two engine ports on one controller, so the crossbar arbitrates. The 512-bit
@@ -211,12 +235,14 @@ def test_engine_port_path_through_the_controller(port_width, base_skew):
         yield dut.core.dfii._control.storage.eq(0b1111)
         yield
 
-    run_simulation(dut, [control(), port_driver(0), port_driver(1)])
+    _run(dut, [control(), port_driver(0), port_driver(1)], backend,
+         extra={"dfii_control": dut.core.dfii._control.storage})
 
 
-@pytest.mark.slow  # Migen simulator on LiteDRAM: 6-7 min and ~9.5 GB each
-@pytest.mark.parametrize("port_width", [256, 512, "512m"])
-def test_engine_port_path_streams_at_rate(port_width):
+# Compiled (the controller's Migen cross-check is test_engine_port_path_through_the_controller's).
+@pytest.mark.parametrize("port_width, backend", [(256, "verilator"), (512, "verilator"),
+    ("512m", "verilator")])
+def test_engine_port_path_streams_at_rate(port_width, backend):
     """A sequential read stream through the whole chain on the real LiteDRAM core must run
     near one beat per cycle. LiteDRAM's native up-converter (the 256-bit port on the 512-bit
     controller) used to hold one controller word in flight - a read had to return before the
@@ -288,7 +314,7 @@ def test_engine_port_path_streams_at_rate(port_width):
         assert got == list(range(n_beats)), "stream data differs"
         stats["cyc_per_beat"] = (t - t0)/n_beats
 
-    run_simulation(dut, [driver()])
+    _run(dut, [driver()], backend, extra={"dfii_control": dut.core.dfii._control.storage})
     print(f"stream ({port_width}-bit port): {stats['cyc_per_beat']:.2f} cycles/beat")
     assert stats["cyc_per_beat"] < 3.0, f"the read stream runs at {stats['cyc_per_beat']:.1f} cycles/beat"
 
@@ -364,9 +390,8 @@ def test_engine_port_path_through_the_reset_shim():
             yield
         assert got == words
 
-    run_simulation(dut, [driver(), dut.mem.write_handler(dut.ctrl_port),
-                         dut.mem.read_handler(dut.ctrl_port)],
-                   clocks={"sys": 10, "eng": 10})
+    _run(dut, [driver(), dut.mem.write_handler(dut.ctrl_port),
+               dut.mem.read_handler(dut.ctrl_port)], "verilator")
 
 
 @pytest.mark.parametrize("row_beats", [3, 5])
@@ -446,9 +471,8 @@ def test_engine_port_path_short_unaligned_rows(row_beats):
         got = yield from read(base, rows*row_beats)
         assert got == _beats_to_words(b"".join(data), 256), "the long stream differs"
 
-    run_simulation(dut, [driver(), dut.mem.write_handler(dut.ctrl_port),
-                         dut.mem.read_handler(dut.ctrl_port)],
-                   clocks={"sys": 10, "eng": 10})
+    _run(dut, [driver(), dut.mem.write_handler(dut.ctrl_port),
+               dut.mem.read_handler(dut.ctrl_port)], "verilator")
 
 
 def test_engine_port_path_read_right_after_write():
@@ -528,6 +552,5 @@ def test_engine_port_path_read_right_after_write():
             assert got.get(r) == _beats_to_words(data[r], 256), \
                 f"row {r}: read returned {'stale' if got.get(r) == [0]*row_beats else 'wrong'} data"
 
-    run_simulation(dut, [driver(), collector(), dut.mem.write_handler(dut.ctrl_port),
-                         dut.mem.read_handler(dut.ctrl_port)],
-                   clocks={"sys": 10, "eng": 10})
+    _run(dut, [driver(), collector(), dut.mem.write_handler(dut.ctrl_port),
+               dut.mem.read_handler(dut.ctrl_port)], "verilator")

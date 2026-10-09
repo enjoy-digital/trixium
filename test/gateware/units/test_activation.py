@@ -24,7 +24,9 @@ from model.activation import scratchpad_quantize_descriptor, scratchpad_requanti
 
 from common import RTL
 from common.cluster import SoC, write, install_list
-from common.verilator import Simulator
+from common.cluster import run as run_cluster
+from common.verilator import Simulator, file_key
+from common.verilator import run as run_tb
 
 # Fp32ToQ8 / Fp32AbsmaxWord ------------------------------------------------------------------------
 # Scalar IEEE float/math oracle, independent of the hardware bit/shift path.
@@ -119,7 +121,7 @@ def test_fp32_q8_all_scale_exponents_and_rounding_neighbors():
                      (middle - 1) | (1 << 31), middle | (1 << 31), (middle + 1) | (1 << 31), 0, 1 << 31]
             vectors.append((words, e8, half == 0.5, half == 127.5))
     dut = Fp32ToQ8()
-    run_simulation(dut, exercise(dut, vectors, stalls=False))
+    run_tb(dut, exercise(dut, vectors, stalls=False))
 
 
 @pytest.mark.parametrize('e8', [-512, -128, -127, 0, 121, 122, 511])
@@ -253,7 +255,7 @@ def test_integer_q8_all_exponents_extremes_backpressure_and_cancel(lanes, width)
         values[0] = -(1 << (width-1)) if exponent & 1 else (1 << (width-1)) - 1
         vectors.append((values, exponent))
     dut = IntegerToQ8(lanes, width)
-    run_simulation(dut, integer_exercise(dut, vectors))
+    run_tb(dut, integer_exercise(dut, vectors))
 
 
 def test_integer_q8_half_integer_neighbors():
@@ -357,7 +359,8 @@ def valid_command(dut, arrays, stall=True):
     yield
 
 
-def test_resident_quantization_per_block_and_whole_vector_reuse():
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_resident_quantization_per_block_and_whole_vector_reuse(backend):
     dut = QuantSP()
     rng = random.Random(500)
     arrays = [[bits(math.ldexp(rng.uniform(-127.9, 127.9), exponent)) for _ in range(256)]
@@ -367,7 +370,7 @@ def test_resident_quantization_per_block_and_whole_vector_reuse():
         yield from valid_command(dut, arrays)
         yield from valid_command(dut, [[v for a in arrays for v in a]], stall=False)
         yield from valid_command(dut, [[0, 0x80000000]*32])
-    run_simulation(dut, run())
+    run_tb(dut, run(), backend)
 
 
 def test_resident_exponent_tail_at_exact_physical_end():
@@ -504,7 +507,7 @@ def test_requantization_global_scale_negative_ties_nine_blocks_and_zero_reuse():
         yield from verify(dut, [[0]*1024]*2, [-127, 121])
         yield from verify(dut, [[1, -1, 2, -2, 3, -3, 63, -63]*128], [-121], stalls=False)
         yield from verify(dut, [[4095, -4095]*512], [121], stalls=False)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 def test_requantization_exact_result_capacity_and_readonly_metadata_alias():
@@ -588,7 +591,7 @@ def test_requantization_detects_stale_metadata_without_publication(actual, decla
         yield dut.unit.cancel.eq(0)
         yield
         yield from verify(dut, [[63, -63]*512], [-5], stalls=False)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 # Sequencer Lists on the Shared Cluster ------------------------------------------------------------
@@ -676,10 +679,12 @@ def test_requantization_dispatch_without_hadamard_and_completion_publication(fai
     run_simulation(dut, run())
 
 
-@pytest.mark.parametrize('with_hadamard', [False, pytest.param(True, marks=pytest.mark.slow)]) # Migen: ~40 s
-def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
+# Compiled cluster; without Hadamard also on Migen's simulator (~40 s).
+@pytest.mark.parametrize('with_hadamard,backend', [(False, "verilator"), (True, "verilator"),
+                                                   pytest.param(False, "migen", marks=pytest.mark.slow)])
+def test_sequenced_fetch_nowait_quantize_store(with_hadamard, backend):
     dut = SoC(TriXiumConfig(with_activation_quantize=True, with_hadamard=with_hadamard,
-                                 scratchpad_size=16*1024), n=1)
+                                 scratchpad_size=16*1024), n=1, backend=backend)
     arrays = [[bits(math.ldexp((i - 32)*0.5, e)) for i in range(64)] for e in (-7, 4)]
     raw = [word for a in arrays for word in a]
     expected = b''.join(reference(a)[0] for a in arrays)
@@ -712,26 +717,28 @@ def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
             assert (yield dut.models[0].mem[0x1000//32 + beat]) == word
         exponents = yield dut.scratchpad.mem[0x700//32]
         assert exponents & ((1 << 64) - 1) == pack([reference(a)[1] for a in arrays], 32)
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())
 
 
 def test_compiled_resident_conversion_rotation_full_ffn_and_reset():
-    dut = SoC(TriXiumConfig(with_hadamard=True, with_activation_quantize=True), n=1)
-    bus = dut.bus
-    status = Signal(24)
-    dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
-    signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
-    signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
-        seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re, seq_status=status,
-        seq_error=dut.seq.activation_quantize_error.status, had_error=dut.seq.hadamard_error.status,
-        reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
-        reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
-        quant_blocks=dut.activation_quantize.blocks_done, quant_reads=dut.activation_quantize.read_beats,
-        quant_writes=dut.activation_quantize.output_beats)
-    for name, signal in signals.items():
-        signal.name_override = name
+    def construct():
+        dut = SoC(TriXiumConfig(with_hadamard=True, with_activation_quantize=True), n=1)
+        bus = dut.bus
+        status = Signal(24)
+        dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
+        signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
+        signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
+            seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re, seq_status=status,
+            seq_error=dut.seq.activation_quantize_error.status, had_error=dut.seq.hadamard_error.status,
+            reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
+            reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
+            quant_blocks=dut.activation_quantize.blocks_done, quant_reads=dut.activation_quantize.read_beats,
+            quant_writes=dut.activation_quantize.output_beats)
+        for name, signal in signals.items():
+            signal.name_override = name
+        return dict(dut=dut, ios=signals)
     # Runs in the build directory, next to the memory .init files.
-    sim = Simulator(dut, ios=signals, name='activation_cluster',
+    sim = Simulator(construct, key=file_key(__file__, 'activation_cluster'), name='activation_cluster',
                     driver=(RTL / 'activation_cluster.cpp').read_text())
     result = sim.run(timeout=120)
     assert '$readmem file not found' not in result.stdout

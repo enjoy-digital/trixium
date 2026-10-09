@@ -27,6 +27,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -36,10 +37,17 @@
 
 static std::function<void()> sim_on_fail;  // Diagnostics hook (the script's dump list).
 static std::function<void()> sim_on_exit;  // Closes the waveform (flushed even on a failure).
+static bool sim_throws = false;            // Library builds (cosim.cpp): throw, never exit.
 
 [[noreturn]] static void sim_fail(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
+    if (sim_throws) {
+        char msg[1024];
+        std::vsnprintf(msg, sizeof(msg), fmt, ap);
+        va_end(ap);
+        throw std::runtime_error(msg);
+    }
     std::fprintf(stderr, "error: ");
     std::vfprintf(stderr, fmt, ap);
     std::fprintf(stderr, "\n");
@@ -90,6 +98,7 @@ struct Sig {
     int      width = 0;
     int      bytes = 0;     // Storage: 1/2/4/8 (CData..QData), or 0 for VlWide (32-bit words).
     void    *p     = nullptr;
+    bool     input = false; // A DUT input port (or a model control): the testbench drives it.
 
     int words() const { return (width + 31)/32; }
 
@@ -225,8 +234,9 @@ struct Sim {
         return it->second;
     }
 
-    template <typename T> void add(const std::string &name, int width, T *p) {
+    template <typename T> void add(const std::string &name, int width, T *p, bool input = false) {
         Sig s; s.name = name; s.width = width; s.bytes = sizeof(T) <= 8 ? (int)sizeof(T) : 0; s.p = (void *)p;
+        s.input = input;
         sigs[name] = s;
     }
     void add_memory(const Mem &m) { mems[m.name] = m; }

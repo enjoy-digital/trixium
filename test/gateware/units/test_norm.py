@@ -86,7 +86,8 @@ def command(op, src, dst, n, nseg, weight=0, **extra):
 
 @pytest.fixture(scope="module")
 def binary(tmp_path_factory):
-    return build_client(NormScratchpad(SIZE), NORM_COMMAND, tmp_path_factory.mktemp("norm"), "norm_sp")
+    return build_client(lambda: NormScratchpad(SIZE), NORM_COMMAND, tmp_path_factory.mktemp("norm"), "norm_sp",
+                        key=f"NormScratchpad({SIZE})")
 
 
 def activations(rng, n, kind):

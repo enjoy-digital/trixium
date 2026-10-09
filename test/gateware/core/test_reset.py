@@ -18,7 +18,6 @@ import numpy as np
 import pytest
 
 from migen import *
-from migen.sim import run_simulation
 
 from litex.gen import *
 from litex.soc.interconnect.axi import AXIInterface
@@ -33,7 +32,7 @@ from gateware.core.reset import EngineResetDomain
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 from common import RTL
-from common.verilator import Simulator
+from common.verilator import ChannelModel, Simulator, run
 
 
 def test_compiled_system_reset_reaches_registered_engine_domain():
@@ -53,7 +52,9 @@ def test_compiled_system_reset_reaches_registered_engine_domain():
 
 
 class _DUT(LiteXModule):
-    def __init__(self, n_channels, chan_payloads, sp_init):
+    """Scratchpad + engine + loader in the reset domain, on HBMChannelModels (backend "migen")
+    or C++ AXI slaves (common.verilator.ChannelModel)."""
+    def __init__(self, n_channels, chan_payloads, sp_init, backend="migen"):
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
         self.scratchpad = Scratchpad(size=64*1024, init=sp_init)
@@ -66,12 +67,18 @@ class _DUT(LiteXModule):
             self.engine.store_data.connect(self.loader.store_data),
             self.engine.store_busy.eq(self.loader.store_busy),
         ]
-        self.models = []
+        self.backend = backend
+        self.models  = []
         for i, axi in enumerate(axis):
-            m = HBMChannelModel(axi, size=64*1024, init=words_from_bytes(chan_payloads[i]),
-                                      latency=6)
-            setattr(self, f"model{i}", m)
+            model = HBMChannelModel if backend == "migen" else ChannelModel
+            m = model(axi, size=64*1024, init=words_from_bytes(chan_payloads[i]), latency=6)
+            if backend == "migen":
+                setattr(self, f"model{i}", m)
             self.models.append(m)
+
+
+def _run(dut, generator):
+    run(dut, generator, dut.backend, clocks={"sys": 10, "eng": 10}, channels=dut.models)
 
 
 def _submit(dut, cmd):
@@ -101,8 +108,8 @@ def _results(dut, dst, n):
     return np.array(out, dtype=np.int64)
 
 
-@pytest.mark.slow  # Migen simulator, ~35 s
-def test_engreset_recovers_a_wedged_matvec():
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_engreset_recovers_a_wedged_matvec(backend):
     n_channels, rows_per_chan, cols = 2, 8, 256
     rng    = np.random.default_rng(7)
     M      = n_channels*rows_per_chan
@@ -121,7 +128,7 @@ def test_engreset_recovers_a_wedged_matvec():
         row0, nrows = layout.shard_rows(M, n_channels, c)
         payloads.append(encode_rows(spec, row0, nrows).tobytes())
     dst = 0x4000
-    dut = _DUT(n_channels, payloads, words_from_bytes(x8.tobytes()))
+    dut = _DUT(n_channels, payloads, words_from_bytes(x8.tobytes()), backend)
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
@@ -170,7 +177,7 @@ def test_engreset_recovers_a_wedged_matvec():
         out["second"] = (yield from _results(dut, dst, M))
         out["error"] = (yield dut.engine.error)
 
-    run_simulation(dut, gen(), clocks={"sys": 10, "eng": 10})
+    _run(dut, gen())
     assert np.array_equal(out["first"], expected)
     assert out["wedged_busy"] == 1 and out["wedged_done"] == 0
     assert out["busy_after_reset"] == 0 and out["draining"] == 1
@@ -179,7 +186,6 @@ def test_engreset_recovers_a_wedged_matvec():
     assert np.array_equal(out["second"], expected), "stale beats after the reset"
 
 
-@pytest.mark.slow  # Migen simulator, ~2.5 min
 def test_engreset_reports_a_port_that_never_answers():
     n_channels, rows_per_chan, cols = 2, 8, 256
     rng    = np.random.default_rng(8)
@@ -195,7 +201,7 @@ def test_engreset_reports_a_port_that_never_answers():
                       scales=scales, values=codes)
     payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
                 for c in range(n_channels)]
-    dut = _DUT(n_channels, payloads, words_from_bytes(x8.tobytes()))
+    dut = _DUT(n_channels, payloads, words_from_bytes(x8.tobytes()), "verilator")
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
@@ -216,5 +222,5 @@ def test_engreset_reports_a_port_that_never_answers():
         out["busy"] = (yield dut.engrst.busy)
         out["stuck"] = (yield dut.engrst.stuck)
 
-    run_simulation(dut, gen(), clocks={"sys": 10, "eng": 10})
+    _run(dut, gen())
     assert out["busy"] == 1 and out["stuck"] == 1

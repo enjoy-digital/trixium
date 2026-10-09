@@ -9,27 +9,30 @@ wiring. Its harness (SoC on HBM channel models, CSR write/submit) is common/clus
 
 import pytest
 
-from migen import run_simulation
-
 from litex.soc.interconnect.axi import AXIInterface
 
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from model import asm
 
-from common.cluster import SoC, write, submit
+from common.cluster import SoC, run, write, submit
 
 
 # Tests --------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize('config', [
+CONFIGS = [
     TriXiumConfig(with_vecunit=False, scratchpad_size=16*1024),
     TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024,
                         chan_stride=1 << 32),  # address >4 GiB, not an extra compute pipe
     TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024,
                         chan_stride=0x10000, chan_mod=2, chan_skew=0x1000),
-])
-def test_cluster_fetch_store_and_reset(config):
-    dut = SoC(config)
+]
+
+# Compiled cluster (common.cluster.run); the last configuration also on Migen's simulator.
+@pytest.mark.parametrize('config,backend',
+    [pytest.param(c, "verilator", id=f"config{i}-verilator") for i, c in enumerate(CONFIGS)] +
+    [pytest.param(CONFIGS[2], "migen", marks=pytest.mark.slow, id="config2-migen")])
+def test_cluster_fetch_store_and_reset(config, backend):
+    dut = SoC(config, backend=backend)
     offset = config.chan_stride + config.chan_skew
     payload = [0x12340000 + i for i in range(3)]
     addresses = []
@@ -78,13 +81,13 @@ def test_cluster_fetch_store_and_reset(config):
                 addresses.append((yield dut.ports[1].ar.addr))
             yield
 
-    run_simulation(dut, [gen(), monitor()], clocks={'sys': 10, 'eng': 10})
+    run(dut, [gen(), monitor()])
     assert addresses and set(addresses) == {offset + 64}
     assert ('TRIXIUM_HAS_VECUNIT' in dut.constants) == config.with_vecunit
 
 
 def test_shared_sequencer_seed_mux_and_arguments():
-    dut = SoC(TriXiumConfig(scratchpad_size=16*1024))
+    dut = SoC(TriXiumConfig(scratchpad_size=16*1024), backend="verilator")
     set6 = asm.assemble([('ARG', 's6', 0), ('DONE',)])
     spill = asm.assemble(asm.prog_spill())
     descriptors = []
@@ -116,7 +119,7 @@ def test_shared_sequencer_seed_mux_and_arguments():
         # Chained res6=0x1234 vs engine absmax=0: the w0[4] selection must differ.
         assert (yield dut.scratchpad.mem[0x800//32]) == sum(0x1234 << (32*i) for i in range(8))
         assert (yield dut.scratchpad.mem[0x820//32]) == 0
-    run_simulation(dut, gen(), clocks={'sys': 10, 'eng': 10})
+    run(dut, gen())
 
 
 @pytest.mark.parametrize('kwargs', [

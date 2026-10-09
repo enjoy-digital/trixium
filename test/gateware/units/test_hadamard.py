@@ -22,8 +22,10 @@ from gateware.core.core import TriXiumConfig
 from model.hadamard import scratchpad_rotation_descriptor
 
 from common import RTL
-from common.cluster import SoC, write, install_list
-from common.verilator import Simulator
+from common.cluster import BACKEND, SoC, write, install_list
+from common.cluster import run as run_cluster
+from common.verilator import Simulator, file_key
+from common.verilator import run as run_tb
 
 # IntegerHadamard ----------------------------------------------------------------------------------
 # Independent dense integer oracle; no floating-point butterfly reference.
@@ -119,10 +121,11 @@ def test_integer_hadamard_dense_equivalence(size, lanes, width, inverse):
     values[0] = -(1 << (width-1))
     signs = [rng.choice([-1, 1]) for _ in range(size)]
     dut = IntegerHadamard(size, lanes, width)
-    run_simulation(dut, command(dut, values, signs, inverse))
+    run_tb(dut, command(dut, values, signs, inverse))
 
 
-def test_integer_hadamard_extremes_reuse_and_dense_rate():
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_integer_hadamard_extremes_reuse_and_dense_rate(backend):
     dut = IntegerHadamard()
     size, lanes = dut.block_size, dut.lanes
 
@@ -137,7 +140,7 @@ def test_integer_hadamard_extremes_reuse_and_dense_rate():
             assert all(b == a + 1 for a, b in zip(cycles, cycles[1:]))
             # 128 input cycles + 10*(64 issue + 1 drain) + one output-read cycle.
             assert cycles[0] <= size//lanes + 10*(size//(2*lanes) + 1) + 2
-    run_simulation(dut, run())
+    run_tb(dut, run(), backend)
 
 
 def test_integer_hadamard_matches_dense_engine_rotation_contract():
@@ -166,7 +169,7 @@ def test_integer_hadamard_matches_dense_engine_rotation_contract():
             engine = bx.matvec_ternary(scales, codes, values, bias, shift)
             assert np.array_equal(engine.astype(np.int64), raw << 14)
             yield from command(dut, values.tolist(), signs.tolist(), stalls=False)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 @pytest.mark.parametrize("last_word", [0, None])
@@ -317,7 +320,7 @@ def test_hadamard_shared_scratchpad_words_signs_bounds_and_reuse(inverse):
         yield from run_command(dut, inverse=inverse)
         yield
         yield from run_command(dut, inverse=not inverse, seed=11)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 @pytest.mark.parametrize('changed,mask', [
@@ -348,9 +351,9 @@ def test_hadamard_rejects_full_span_before_any_scratchpad_access(changed, mask):
 
 # Sequencer Lists on the Shared Cluster ------------------------------------------------------------
 
-@pytest.mark.slow  # Migen simulator, ~1.5 min
-def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports():
-    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
+@BACKEND  # Migen simulator: ~1.5 min
+def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports(backend):
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1, backend=backend)
     rng = random.Random(941)
     values = [rng.randrange(-128, 128) for _ in range(1024)]
     signs = [rng.choice([-1, 1]) for _ in values]
@@ -387,13 +390,13 @@ def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports():
             word = yield dut.scratchpad.mem[0x2000//32 + beat]
             assert unpacked(word, 32, 8) == expected[beat*8:(beat+1)*8]
             assert (yield dut.models[0].mem[0x1000//32 + beat]) == word
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())
 
 
 @pytest.mark.parametrize('field,value,error', [(1, 1 << 24, 2), (4, 65536, 2),
     (6, 2, 2), (7, 1, 2), (15, 1, 2), (3, 0, 4), (5, 0, 4), (1, 0x801, 1 << 8)])
 def test_sequenced_rotation_invalid_descriptor_is_not_completed(field, value, error):
-    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1, backend="verilator")
     words = scratchpad_rotation_descriptor(src=0x800, signs=0x600, dst=0x2000, stats=0x700, blocks=1)
     words[field] = value
     def run():
@@ -410,7 +413,7 @@ def test_sequenced_rotation_invalid_descriptor_is_not_completed(field, value, er
         assert not (yield dut.seq.busy)
         assert not (yield dut.seq.hadamard_error.status)
         assert not (yield dut.hadamard.busy)
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())
 
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
@@ -446,23 +449,25 @@ def test_rotation_descriptor_encoding_and_configuration():
 
 
 def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone():
-    dut = SoC(TriXiumConfig(with_hadamard=True), n=1)
-    bus = dut.bus
-    # A bare RTL fixture has no CSRBank finalization to assemble fielded status.
-    # Export the real driven fields, not CSRStatus.status (otherwise an input).
-    status = Signal(24)
-    dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
-    signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
-    signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
-                   seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re,
-                   seq_status=status, seq_error=dut.seq.hadamard_error.status,
-                   reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
-                   reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
-                   blocks_done=dut.hadamard.blocks_done, output_beats=dut.hadamard.output_beats)
-    for name, signal in signals.items():
-        signal.name_override = name
+    def construct():
+        dut = SoC(TriXiumConfig(with_hadamard=True), n=1)
+        bus = dut.bus
+        # A bare RTL fixture has no CSRBank finalization to assemble fielded status.
+        # Export the real driven fields, not CSRStatus.status (otherwise an input).
+        status = Signal(24)
+        dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
+        signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
+        signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
+                       seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re,
+                       seq_status=status, seq_error=dut.seq.hadamard_error.status,
+                       reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
+                       reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
+                       blocks_done=dut.hadamard.blocks_done, output_beats=dut.hadamard.output_beats)
+        for name, signal in signals.items():
+            signal.name_override = name
+        return dict(dut=dut, ios=signals)
     # Runs in the build directory, next to the memory .init files.
-    sim = Simulator(dut, ios=signals, name='hadamard_cluster',
+    sim = Simulator(construct, key=file_key(__file__, 'hadamard_cluster'), name='hadamard_cluster',
                     driver=(RTL / 'hadamard_cluster.cpp').read_text())
     result = sim.run(timeout=120)
     assert '$readmem file not found' not in result.stdout
@@ -470,11 +475,10 @@ def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone():
     print(result.stdout)
 
 
-@pytest.mark.slow  # Migen simulator, ~1.2 min
 def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
     """w0[9] on a unit (OVERLAP): the rotation dispatches while the NOWAIT fetch is still
     streaming into another region; both results exact, the list end drains the fetch."""
-    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1, backend="verilator")
     rng = random.Random(942)
     values = [rng.randrange(-128, 128) for _ in range(1024)]
     signs = [rng.choice([-1, 1]) for _ in values]
@@ -510,12 +514,11 @@ def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
             assert unpacked(word, 32, 8) == expected[beat*8:(beat+1)*8]
         for beat, word in enumerate(stream):
             assert (yield dut.scratchpad.mem[0x4000//32 + beat]) == word, beat
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())
 
 
-@pytest.mark.slow  # Migen simulator, ~1.2 min
 def test_without_overlap_the_rotation_waits_for_the_nowait_fetch():
-    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
+    dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1, backend="verilator")
     fetch = [1 | (1 << 9), 2, 0, 0, 0x100, 160, 0, 0, 0, 0x4000, 0] + [0]*5
     rotation = scratchpad_rotation_descriptor(src=0x800, signs=0x600, dst=0x2000, stats=0x700, blocks=1)
 
@@ -528,4 +531,4 @@ def test_without_overlap_the_rotation_waits_for_the_nowait_fetch():
             yield
         else:
             raise AssertionError('list did not complete')
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())

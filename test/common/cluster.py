@@ -5,30 +5,110 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 """The shared-cluster harness: the real TriXiumCore on HBM channel models, its CSR and list
-helpers, and the small integer operators the stream-unit plumbing tests plug in."""
+helpers, and the small integer operators the stream-unit plumbing tests plug in.
+
+The cluster tests are Migen testbench generators; run() runs them on either backend:
+
+- "verilator": the core compiled as a co-simulation library (common.verilator.Compiled,
+  cached), the channels answered by C++ AXI slaves. The default.
+- "migen": Migen's simulator with HBMChannelModel channels - the slow cross-check.
+
+The generators see the same objects on both: dut.models[i].mem / .freeze are the channel
+memory and its read freeze (C++ AXI slave "axi<i>" when compiled), every CSR, the units' and
+engine's status signals, the scratchpad memory.
+"""
+
+import pytest
 
 from migen import Signal
 
 from litex.gen import LiteXModule
 
 from litex.soc.interconnect.axi import AXIInterface
+from litex.soc.interconnect.csr import CSRStatus, CSRStorage
 
 from gateware.core.core import TriXiumCore
 from gateware.memory.hbm_model import HBMChannelModel
 
+from common.verilator import ChannelModel
+from common.verilator import run as compiled_run
+
+# Constants ----------------------------------------------------------------------------------------
+
+MODEL_SIZE    = 256*1024
+MODEL_LATENCY = 7
+MODEL_STALL   = 3         # Sixteenths of the cycles (HBMChannelModel's stall_rate).
+
+# The compiled core in the fast tier, Migen's simulator in the slow one (one representative
+# test per file: the cross-check of the emitted Verilog against Migen's own semantics).
+MIGEN   = pytest.param("migen", marks=pytest.mark.slow)
+BACKEND = pytest.mark.parametrize("backend", ["verilator", MIGEN])
+
 # SoC ----------------------------------------------------------------------------------------------
 
 class SoC(TriXiumCore):
-    """The core with an HBM channel model on each memory port."""
-    def __init__(self, config, n=2):
+    """The core with an HBM channel model on each memory port (backend "migen") or with its
+    ports open for the C++ AXI slaves (backend "verilator")."""
+    def __init__(self, config, n=2, backend="migen"):
         self.ports = [AXIInterface(data_width=256, address_width=33, id_width=6)
                       for _ in range(n)]
         TriXiumCore.__init__(self, self.ports, config)
-        self.models = []
+        self.config  = config
+        self.backend = backend
+        self.models  = []
         for i, port in enumerate(self.ports):
-            model = HBMChannelModel(port, size=256*1024, latency=7, stall_rate=3)
-            setattr(self, f'model{i}', model)
+            if backend == "migen":
+                model = HBMChannelModel(port, size=MODEL_SIZE, latency=MODEL_LATENCY,
+                                        stall_rate=MODEL_STALL)
+                setattr(self, f'model{i}', model)
+            else:
+                assert backend == "verilator", backend
+                model = ChannelModel(port, size=MODEL_SIZE, latency=MODEL_LATENCY,
+                                     stall_rate=MODEL_STALL)
             self.models.append(model)
+
+# Run ----------------------------------------------------------------------------------------------
+
+def cluster_signals(dut):
+    """{name: Signal} a cluster testbench may touch: every CSR (storage/re, status and its
+    fields) and the Signal attributes (and command handshake) of the core's modules."""
+    signals = {}
+    for csr in dut.get_csrs():
+        if isinstance(csr, CSRStorage):
+            signals[csr.name + "_storage"] = csr.storage
+            signals[csr.name + "_re"]      = csr.re
+        elif isinstance(csr, CSRStatus):
+            signals[csr.name + "_status"]  = csr.status
+            for field in getattr(getattr(csr, "fields", None), "fields", []):
+                signals[f"{csr.name}_{field.name}"] = field
+    for name in ("engine", "engine_csr", "seq", "vecunit", "loader", "engrst", "scratchpad", "hadamard",
+                 "activation_quantize", "projection_restore", "silu", "norm", "conv"):
+        module = getattr(dut, name, None)
+        if module is None:
+            continue
+        for attr, value in vars(module).items():
+            if isinstance(value, Signal) and not attr.startswith("_"):
+                signals[f"{name}_{attr}"] = value
+        cmd = getattr(module, "cmd", None)
+        if cmd is not None and hasattr(cmd, "valid"):
+            signals[f"{name}_cmd_valid"] = cmd.valid
+            signals[f"{name}_cmd_ready"] = cmd.ready
+    return signals
+
+
+def run(dut, generators, signals=None, memories=None):
+    """run_simulation(dut, generators) on the SoC's backend (see the module doc). signals /
+    memories: {name: object} the generators touch beyond cluster_signals() and the
+    scratchpad."""
+    if dut.backend == "migen":
+        compiled_run(dut, generators, "migen", clocks={"sys": 10, "eng": 10})
+        return
+    sigs = cluster_signals(dut)
+    sigs.update(signals or {})
+    mems = {"sp": dut.scratchpad.mem}
+    mems.update(memories or {})
+    compiled_run(dut, generators, signals=sigs, memories=mems, name="cluster",
+                 key=f"cluster{dut.config!r}n{len(dut.ports)}", channels=dut.models)
 
 # Helpers ------------------------------------------------------------------------------------------
 

@@ -7,7 +7,8 @@
 """gateware/core/sequencer.py: descriptor lists through the sequencer, the engine and the vector unit.
 
 The list tests run on the compiled design (scratchpad + vector unit + sequencer + engine +
-CSR front, common.engine.EngineBench) and, in the slow tier, on Migen's simulator."""
+CSR front, common.engine.EngineBench); the mixed list also on Migen's simulator in the slow
+tier."""
 
 import numpy as np
 import pytest
@@ -22,7 +23,10 @@ from common.verilator import Script
 
 # Backends -----------------------------------------------------------------------------------------
 
+# Every test compiled; Migen's simulator (minutes per test) for the representative only.
 BACKEND = pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+COMPILED = pytest.mark.parametrize("backend", ["verilator"])
+
 
 def _run_list(backend, n_channels, payloads, sp, words, count, cap, reads, peeks=(), seed7=True,
               dumps=(), tag="sequencer_timeout"):
@@ -129,7 +133,7 @@ def test_sequencer_start_drains_posted_writes():
 
     run_simulation(dut, tb())
 
-@BACKEND
+@COMPILED
 def test_sequencer_v2_chaining(backend):
     # Sequencer v2 primitives in one list, the way seq_build_attn will use them:
     #   reduce_acc (res6 = absmax) -> spill (S7 seeded with prev res6, persisted to SP,
@@ -281,7 +285,7 @@ def test_sequencer_mixed_list(backend):
     assert np.array_equal(out["res"], res_exp), "matvec via sequencer"
     assert np.array_equal(out["nrm"], nrm_exp.astype(np.int16)), ("norm_i32 auto-k", out["nrm"][:8], nrm_exp[:8], k_exp, amax)
 
-@BACKEND
+@COMPILED
 def test_sequencer_q8_scores_ragged(backend):
     """Scores op through the *sequencer* at the shipping channel count.
 
@@ -353,7 +357,7 @@ def test_sequencer_q8_scores_ragged(backend):
         got = np.frombuffer(r.reads["got"], dtype="<i4")
         assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
 
-@BACKEND
+@COMPILED
 def test_sequencer_xred_absmax_spill(backend):
     # The exact descriptor sequence seq_build_attn runs per head once cmd.xred is on:
     #     axpy(xred) -> spill(seed S7 from the ENGINE absmax) -> norm_i32(k from res6)
@@ -425,7 +429,7 @@ def test_sequencer_xred_absmax_spill(backend):
     assert np.all(spill == am_exp),  ("head 0 spilled absmax", spill[0], am_exp)
     assert np.all(spill2 == am_exp), ("head 1 spilled absmax", spill2[0], am_exp)
 
-@BACKEND
+@COMPILED
 def test_sequencer_kreg_capture_and_add(backend):
     # The exponent register file: an engine op captures k(absmax) into kreg[i] (w0[5],[7:6])
     # and a LATER vec descriptor adds it to an arg (w1[16+2i]). This is what lets the FFN
@@ -501,7 +505,7 @@ def test_sequencer_kreg_capture_and_add(backend):
     assert np.array_equal(nrmA, nrm_exp), ("norm via kreg ADD (w0[11])",
                                            nrmA[:8], nrm_exp[:8], k_exp)
 
-@BACKEND
+@COMPILED
 def test_sequencer_lut_arg(backend):
     # A5 from a scratchpad LUT indexed by imm5 + kreg (w0[12]): the one arg
     # the k/v chain could not derive in-sequencer was rmsnorm's eps, a per-layer table
@@ -594,7 +598,7 @@ def test_sequencer_lut_arg(backend):
     assert np.array_equal(out_clamp, exp_clamp), ("index 40+k clamps to 31",
                                                   out_clamp[:6], exp_clamp[:6])
 
-@BACKEND
+@COMPILED
 def test_sequencer_nowait_overlap(backend):
     # NOWAIT engine descriptor (w0[9]): the following independent vec descriptor runs
     # WHILE the matvec streams; the next descriptor (norm_i32 with A4 = KABS) trips the
@@ -671,7 +675,7 @@ def test_sequencer_nowait_overlap(backend):
     assert out["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
     assert out["both"] > 50, f"no overlap through the sequencer (cyc_both={out['both']})"
 
-@BACKEND
+@COMPILED
 def test_sequencer_kadd_interlock_precise(backend):
     # The kadd hazard interlock is per-REGISTER: matvec A captures k -> kreg0 (serial),
     # matvec B is NOWAIT and captures k -> kreg1. A norm reading kreg0 must dispatch UNDER
