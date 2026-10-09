@@ -413,7 +413,8 @@ def test_invalid_physical_sizes():
 def test_compiled_full_scratchpad_image(tmp_path):
     from common.rtl_client import build_client, run_client
     size = 256*1024
-    binary = build_client(SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
+    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp",
+                          key=f"SiluScratchpad({size})")
     rng = np.random.default_rng(12)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
     tab = 0x37000
@@ -468,7 +469,8 @@ def test_compiled_table_only_sigmoid(tmp_path):
     from common.rtl_client import build_client, run_client
     from model.rv32_math import sigmoid_rv32
     size = 256*1024
-    binary = build_client(SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
+    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp",
+                          key=f"SiluScratchpad({size})")
     rng = np.random.default_rng(21)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
     # Both tables resident (ABI 1.3): the SiLU's in set 0, the sigmoid's in set 1.

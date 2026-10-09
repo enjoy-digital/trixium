@@ -25,7 +25,7 @@ from model.activation import scratchpad_quantize_descriptor, scratchpad_requanti
 from common import RTL
 from common.cluster import SoC, write, install_list
 from common.cluster import run as run_cluster
-from common.verilator import Simulator
+from common.verilator import Simulator, file_key
 
 # Fp32ToQ8 / Fp32AbsmaxWord ------------------------------------------------------------------------
 # Scalar IEEE float/math oracle, independent of the hardware bit/shift path.
@@ -719,22 +719,24 @@ def test_sequenced_fetch_nowait_quantize_store(with_hadamard, backend):
 
 
 def test_compiled_resident_conversion_rotation_full_ffn_and_reset():
-    dut = SoC(TriXiumConfig(with_hadamard=True, with_activation_quantize=True), n=1)
-    bus = dut.bus
-    status = Signal(24)
-    dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
-    signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
-    signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
-        seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re, seq_status=status,
-        seq_error=dut.seq.activation_quantize_error.status, had_error=dut.seq.hadamard_error.status,
-        reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
-        reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
-        quant_blocks=dut.activation_quantize.blocks_done, quant_reads=dut.activation_quantize.read_beats,
-        quant_writes=dut.activation_quantize.output_beats)
-    for name, signal in signals.items():
-        signal.name_override = name
+    def construct():
+        dut = SoC(TriXiumConfig(with_hadamard=True, with_activation_quantize=True), n=1)
+        bus = dut.bus
+        status = Signal(24)
+        dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
+        signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
+        signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
+            seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re, seq_status=status,
+            seq_error=dut.seq.activation_quantize_error.status, had_error=dut.seq.hadamard_error.status,
+            reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
+            reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
+            quant_blocks=dut.activation_quantize.blocks_done, quant_reads=dut.activation_quantize.read_beats,
+            quant_writes=dut.activation_quantize.output_beats)
+        for name, signal in signals.items():
+            signal.name_override = name
+        return dict(dut=dut, ios=signals)
     # Runs in the build directory, next to the memory .init files.
-    sim = Simulator(dut, ios=signals, name='activation_cluster',
+    sim = Simulator(construct, key=file_key(__file__, 'activation_cluster'), name='activation_cluster',
                     driver=(RTL / 'activation_cluster.cpp').read_text())
     result = sim.run(timeout=120)
     assert '$readmem file not found' not in result.stdout

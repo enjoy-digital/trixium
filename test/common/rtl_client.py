@@ -76,9 +76,18 @@ int main(int argc, char **argv) {{
 '''
 
 
-def build_client(dut, layout, tmp_path, top):
+def build_client(dut, layout, tmp_path, top, key=None):
     """The compiled client (a common.verilator.Simulator). tmp_path is unused: the build is
-    cached under build/verilator/."""
+    cached under build/verilator/. With `key`, `dut` is a factory (called on a cache miss
+    only: a hit neither constructs nor converts the client)."""
+    driver = _driver(layout)
+    if key is not None:
+        return Simulator(lambda: _construct(dut(), layout), name=top, driver=driver,
+                         key=f"rtl_client:{key}")
+    return Simulator(**_construct(dut, layout), name=top, driver=driver)
+
+
+def _construct(dut, layout):
     signals = {name: getattr(dut, name) for name in (
         "cancel", "busy", "done", "error", "read_beats", "output_beats",
         "sp_rd_req", "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_dat", "sp_wr_we", "sp_wr_gnt")}
@@ -87,11 +96,14 @@ def build_client(dut, layout, tmp_path, top):
     signals.update(cmd_valid=dut.cmd.valid, cmd_ready=dut.cmd.ready)
     for name, signal in signals.items():
         signal.name_override = name
+    return dict(dut=dut, ios=signals)
+
+
+def _driver(layout):
     assign = "\n".join(f"        d.cmd_{name} = r[{i}];" for i, (name, _) in enumerate(layout))
     scramble = "\n".join(f"        d.cmd_{name} = (~r[{i}]) & 0x{(1 << w) - 1:x}u;"
                          for i, (name, w) in enumerate(layout))
-    driver = _CPP.format(nfields=len(layout), assign=assign, scramble=scramble)
-    return Simulator(dut, ios=signals, name=top, driver=driver)
+    return _CPP.format(nfields=len(layout), assign=assign, scramble=scramble)
 
 
 def run_client(sim, layout, mem, commands, tmp_path, grant_pct=75):

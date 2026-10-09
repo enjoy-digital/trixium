@@ -18,7 +18,7 @@ from gateware.core.core import TriXiumConfig
 
 from common.cluster import SoC, write, IntAdd5, IntMul5
 from common.cluster import run as run_cluster
-from common.verilator import Simulator
+from common.verilator import Simulator, file_key
 
 # AttentionStream ----------------------------------------------------------------------------------
 # AttentionStream against hybrid.c's attention loops, compiled (Verilator).
@@ -93,6 +93,13 @@ int main(int argc, char **argv) {{
 
 
 def build(tmp_path, **geometry):
+    """The compiled unit (cached by key: a hit neither constructs nor converts it)."""
+    top = "attn_" + "_".join(str(v) for v in geometry.values())
+    return Simulator(lambda: _construct(**geometry), name=top, key=file_key(__file__, top, geometry),
+                     driver=lambda built: _driver(top, built["dut"])).binary
+
+
+def _construct(**geometry):
     dut = AttentionStream(**geometry)
     sig = {n: getattr(dut, n) for n in ("start", "rec", "busy", "done", "error", "sp_rd_ok", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
@@ -102,10 +109,12 @@ def build(tmp_path, **geometry):
         sig[f"progress{i}"] = s
     for n, s in sig.items():
         s.name_override = n
-    top = "attn_" + "_".join(str(v) for v in geometry.values())
-    driver = _CPP.format(top=top, progress=" ".join(["%u"]*len(dut.progress)),
+    return dict(dut=dut, ios=sig)
+
+
+def _driver(top, dut):
+    return _CPP.format(top=top, progress=" ".join(["%u"]*len(dut.progress)),
         progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress))))
-    return Simulator(dut, ios=sig, name=top, driver=driver).binary
 
 
 def layout(rng, nq, n_rep, nkv, hd, T, mode, specials=True):

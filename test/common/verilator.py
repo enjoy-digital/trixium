@@ -216,7 +216,9 @@ class Simulator:
     ios      : {name: Signal} - the ports the testbench drives/reads, by these names.
     axi      : {prefix: AXIInterface} - ports for AxiSlave models (axi_ios()).
     memories : {name: Memory} - DUT memories exposed to images/reads (made public).
-    driver   : C++ main (source text); default script_main.cpp.
+    driver   : C++ main (source text); default script_main.cpp. With `key`, also a function of
+               the factory's dict returning it (a driver generated from the DUT's shape): the key
+               then names the driver as well (see file_key()).
     key      : a string naming the DUT's construction. With it, a build whose key, gateware /
                model / Migen / LiteX sources and C++ sources are unchanged is reused without
                constructing or converting the DUT at all (seconds per configuration).
@@ -229,7 +231,8 @@ class Simulator:
         self.binary = None
         if key is not None:
             h = hashlib.sha256()
-            for part in [key, name, self._driver_source(), " ".join(FLAGS + self.flags),
+            driver_text = "" if callable(driver) else self._driver_source()
+            for part in [key, name, driver_text, " ".join(FLAGS + self.flags),
                          _verilator_version(), _source_fingerprint()] + [(RTL / f).read_text() for f in HEADERS]:
                 h.update(part.encode())
                 h.update(b"\0")
@@ -244,6 +247,8 @@ class Simulator:
             built = dut()
             dut, ios, axi, memories = (built["dut"], built.get("ios"), built.get("axi"),
                                        built.get("memories"))
+            if callable(driver):
+                self.driver = driver(built)
         # ios: {name: Signal}, or signals named by the converter (a harness using d.<name>).
         self.ios = dict(ios or {}) if isinstance(ios, dict) or ios is None else {None: list(ios)}
         for prefix, a in (axi or {}).items():
@@ -389,6 +394,13 @@ class Simulator:
             if run.returncode != 0:
                 raise AssertionError(f"{self.top}: " + run.stdout[-2000:] + run.stderr[-4000:])
             return _parse(run.stdout, tmp)
+
+
+def file_key(path, *parts):
+    """A Simulator key naming a construction made in the file `path` (a test file: its text,
+    e.g. a driver template, is hashed in) with arguments `parts`."""
+    text = Path(path).read_bytes()
+    return f"{Path(path).name}:{hashlib.sha256(text).hexdigest()[:16]}:{parts!r}"
 
 
 @functools.lru_cache(maxsize=None)

@@ -18,7 +18,7 @@ from gateware.core.core import TriXiumConfig
 
 from common.cluster import SoC, write, IntAdd5, IntMul5
 from common.cluster import run as run_cluster
-from common.verilator import Simulator
+from common.verilator import Simulator, file_key
 
 # DeltaNetStream -----------------------------------------------------------------------------------
 # DeltaNetStream against the firmware's recurrence loop, compiled (Verilator).
@@ -108,6 +108,13 @@ int main(int argc, char **argv) {{
 
 
 def build(tmp_path, lanes, rows, cols):
+    """The compiled unit (cached by key: a hit neither constructs nor converts it)."""
+    top = f"dns_{lanes}_{rows}_{cols}"
+    return Simulator(lambda: _construct(lanes, rows, cols), name=top, key=file_key(__file__, top),
+                     driver=lambda built: _driver(top, lanes, built["dut"])).binary
+
+
+def _construct(lanes, rows, cols):
     dut = DeltaNetStream(lanes=lanes, rows=rows, cols=cols)
     sig = {n: getattr(dut, n) for n in ("start", "heads", "table", "zero", "busy", "done", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
@@ -119,16 +126,18 @@ def build(tmp_path, lanes, rows, cols):
         sig[f"progress{i}"] = s
     for n, s in sig.items():
         s.name_override = n if n != "table" else "table_adr"
-    top = f"dns_{lanes}_{rows}_{cols}"
     dut.sp_rd_ok.name_override = "sp_rd_ok"
     sig["sp_rd_ok"] = dut.sp_rd_ok
+    return dict(dut=dut, ios=sig)
+
+
+def _driver(top, lanes, dut):
     j = lambda fmt: ", ".join(fmt.format(l) for l in range(lanes))
-    driver = _CPP.format(top=top, lanes=lanes,
+    return _CPP.format(top=top, lanes=lanes,
         sink_valid=j("&d.sink{}_valid"), sink_ready=j("&d.sink{}_ready"), sink_data=j("&d.sink{}_data[0]"),
         src_valid=j("&d.source{}_valid"), src_ready=j("&d.source{}_ready"), src_data=j("&d.source{}_data[0]"),
         progress=" ".join(["%u"]*len(dut.progress)),
         progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress))))
-    return Simulator(dut, ios=sig, name=top, driver=driver).binary
 
 
 def scenario(rng, heads, rows, cols, nk, zero=False):

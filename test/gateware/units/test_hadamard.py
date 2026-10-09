@@ -24,7 +24,7 @@ from model.hadamard import scratchpad_rotation_descriptor
 from common import RTL
 from common.cluster import BACKEND, SoC, write, install_list
 from common.cluster import run as run_cluster
-from common.verilator import Simulator
+from common.verilator import Simulator, file_key
 
 # IntegerHadamard ----------------------------------------------------------------------------------
 # Independent dense integer oracle; no floating-point butterfly reference.
@@ -447,23 +447,25 @@ def test_rotation_descriptor_encoding_and_configuration():
 
 
 def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone():
-    dut = SoC(TriXiumConfig(with_hadamard=True), n=1)
-    bus = dut.bus
-    # A bare RTL fixture has no CSRBank finalization to assemble fielded status.
-    # Export the real driven fields, not CSRStatus.status (otherwise an input).
-    status = Signal(24)
-    dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
-    signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
-    signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
-                   seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re,
-                   seq_status=status, seq_error=dut.seq.hadamard_error.status,
-                   reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
-                   reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
-                   blocks_done=dut.hadamard.blocks_done, output_beats=dut.hadamard.output_beats)
-    for name, signal in signals.items():
-        signal.name_override = name
+    def construct():
+        dut = SoC(TriXiumConfig(with_hadamard=True), n=1)
+        bus = dut.bus
+        # A bare RTL fixture has no CSRBank finalization to assemble fielded status.
+        # Export the real driven fields, not CSRStatus.status (otherwise an input).
+        status = Signal(24)
+        dut.comb += status.eq(Cat(dut.seq.busy, C(0, 7), dut.seq.status.fields.dcount))
+        signals = {f'host_{name}': getattr(bus, name) for name in ('cyc', 'stb', 'we', 'adr', 'dat_w', 'dat_r', 'sel', 'ack')}
+        signals.update(seq_base=dut.seq.base.storage, seq_count=dut.seq.count.storage,
+                       seq_start=dut.seq.start.storage, seq_start_re=dut.seq.start.re,
+                       seq_status=status, seq_error=dut.seq.hadamard_error.status,
+                       reset_value=dut.engine_csr.soft_reset.storage, reset_re=dut.engine_csr.soft_reset.re,
+                       reset_busy=dut.engine_csr.rst_busy, reset_stuck=dut.engine_csr.rst_stuck,
+                       blocks_done=dut.hadamard.blocks_done, output_beats=dut.hadamard.output_beats)
+        for name, signal in signals.items():
+            signal.name_override = name
+        return dict(dut=dut, ios=signals)
     # Runs in the build directory, next to the memory .init files.
-    sim = Simulator(dut, ios=signals, name='hadamard_cluster',
+    sim = Simulator(construct, key=file_key(__file__, 'hadamard_cluster'), name='hadamard_cluster',
                     driver=(RTL / 'hadamard_cluster.cpp').read_text())
     result = sim.run(timeout=120)
     assert '$readmem file not found' not in result.stdout
