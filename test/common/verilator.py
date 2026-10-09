@@ -688,7 +688,8 @@ def module_handles(module, depth=3):
         elif isinstance(obj, (list, tuple)):
             for i, value in enumerate(obj[:64]):
                 visit(value, f"{name}{i}", level)
-        elif isinstance(obj, Module) and level <= depth:
+        elif (isinstance(obj, Module) and level <= depth) or (level == 0 and hasattr(obj, "__dict__")):
+            # A module tree; at the top, any object holding them (e.g. a LiteDRAM native port).
             for attr, value in vars(obj).items():
                 if not attr.startswith("_"):
                     visit(value, f"{name}_{attr}" if name else attr, level + 1)
@@ -698,12 +699,13 @@ def module_handles(module, depth=3):
 
 
 def run(dut, generators, backend="verilator", signals=None, memories=None, depth=3, name="tb",
-        key=None, **kwargs):
+        key=None, clocks=None, **kwargs):
     """run_simulation(dut, generators) on either backend: "migen" (Migen's simulator) or
     "verilator" (Compiled). signals / memories: what the generators touch (default: every
-    handle module_handles() finds); kwargs go to Compiled.run (axi, aliases, cycles)."""
+    handle module_handles() finds); clocks: Migen's (the compiled DUT derives its domains from
+    sys_clk); kwargs go to Compiled.run (axi, aliases, cycles)."""
     if backend == "migen":
-        run_simulation(dut, generators)
+        run_simulation(dut, generators, **({} if clocks is None else dict(clocks=clocks)))
         return
     assert backend == "verilator", backend
     if signals is None or memories is None:
