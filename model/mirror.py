@@ -29,6 +29,28 @@ from model import bitexact as bx
 
 f32 = np.float32
 
+# Helpers ------------------------------------------------------------------------------------------
+
+def _lroundf(x):
+    return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
+
+
+def _fsum32(v):
+    acc = f32(0.0)
+    for e in np.asarray(v, dtype=f32):
+        acc = f32(acc + e)
+    return acc
+
+
+def _quantize_f_pow2(x):
+    """int8 with a power-of-two exponent (mantissas in [64, 128))."""
+    amax = np.abs(x).max()
+    if amax == 0:
+        return np.zeros(len(x), dtype=np.int8), 0
+    e8 = int(np.frexp(f32(amax))[1]) - 7
+    return np.clip(_lroundf(x*f32(np.exp2(-e8))), -127, 127).astype(np.int8), e8
+
+
 # Dense Mirror -------------------------------------------------------------------------------------
 
 def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
@@ -38,20 +60,10 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
     microcode interpreter). modes: dict op->"cpu"|"hw" (default all-cpu)."""
     from model import asm as vasm
     h    = img.header
-    f32  = np.float32
     E_NORM = -11
 
     if modes is None:
         modes = {}
-
-    def lroundf(x):
-        return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
-
-    def fsum32(v):
-        acc = f32(0.0)
-        for e in np.asarray(v, dtype=f32):
-            acc = f32(acc + e)
-        return acc
 
     def entry(name):
         return img.by_name[name]
@@ -68,11 +80,11 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         if amax == 0:
             return np.zeros(len(x), dtype=np.int64), 0
         e = int(np.frexp(f32(amax))[1]) - 15
-        return np.clip(lroundf(x*f32(np.exp2(-e))), -32767, 32767), e
+        return np.clip(_lroundf(x*f32(np.exp2(-e))), -32767, 32767), e
 
     def w16_exp(w16_name):
-        # The .w16 entry's bias byte is the tensor's exponent (int8; BONS v2) - it was a
-        # fixed -13 that clipped the 1.7B's gammas above 4 (layout.norm16_exp).
+        # The .w16 entry's bias byte is the tensor's exponent (int8; BONS v2,
+        # layout.norm16_exp).
         b = img.by_name[w16_name]["bias"]
         return b - 256 if b >= 128 else b
 
@@ -93,10 +105,10 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
             return np.frombuffer(bytes(sp[2*slot:2*slot+2*n]), dtype="<i2").astype(np.int64)
         w  = norm_w(name)
         v  = m.astype(f32)*f32(np.exp2(e))
-        ss = fsum32(v*v)
+        ss = _fsum32(v*v)
         r  = f32(1.0)/np.sqrt(f32(f32(ss/f32(len(v))) + f32(h["rms_eps"])))
         o  = v*r*w*f32(np.exp2(-E_NORM))
-        return np.clip(lroundf(o), -32767, 32767)
+        return np.clip(_lroundf(o), -32767, 32767)
 
     def quant8_fixed(m):
         # Per-head attention quantization keeps the fixed >>8: the sequencer patches the
@@ -130,10 +142,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
     def silu_sp(gm, eg, um, eu):
         if modes.get("silu_mul", "cpu") == "hw":
             n  = len(gm)
-            # Regions sized to the vector: the 8 KB slots were fine for the tiny model
-            # (ffn 512) and silently overlapped on the 1.7B (ffn 6144: the up vector
-            # overwrote the last third of the gate vector, so the mirror's silu was wrong
-            # for elements 4096.. of every layer).
+            # Regions sized to the vector (fixed slots overlap once 2n exceeds a slot).
             slot = ((2*n + 2047)//2048)*2048
             sp = bytearray(3*slot)
             sp[0:2*n]         = gm.astype("<i2").tobytes()
@@ -144,14 +153,13 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         g = gm.astype(f32)*f32(np.exp2(eg))
         u = um.astype(f32)*f32(np.exp2(eu))
         o = (g/(f32(1.0) + np.exp(-g, dtype=f32))*u).astype(f32)*f32(np.exp2(-(eg + eu + 15)))
-        return np.clip(lroundf(o), -32767, 32767)
+        return np.clip(_lroundf(o), -32767, 32767)
 
     def resid_sp(am, ea, bm, eb):
         # Pick the output exponent from the operands' real magnitudes, not from the worst case
         # both-mantissas-full bound. `max(ea, eb) + 1` spends a mantissa bit on every call, and
-        # there are two calls per layer against a 15-bit mantissa: by layer 11 the residual was
-        # down to a single bit (every element 0 or +-2**ex) and its own quantization error then
-        # grew 4x per layer, which is what turned the output into garbage tokens.
+        # there are two calls per layer against a 15-bit mantissa: the residual would lose its
+        # precision within a few layers.
         emin  = min(ea, eb)
         bound = ((int(np.abs(am).max()) << (ea - emin)) +
                  (int(np.abs(bm).max()) << (eb - emin)))
@@ -169,13 +177,6 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         res = bx.matvec_ternary(scales, codes, x8, e["bias"], e["rshift"])
         return res, e8 - e["bias"] + e["rshift"]
 
-    def quantize_f_pow2(x):
-        amax = np.abs(x).max()
-        if amax == 0:
-            return np.zeros(len(x), dtype=np.int8), 0
-        e8 = int(np.frexp(f32(amax))[1]) - 7
-        return np.clip(lroundf(x*f32(np.exp2(-e8))), -127, 127).astype(np.int8), e8
-
     n_layer         = h["n_layer"]
     n_head, n_kv    = h["n_head"], h["n_kv_head"]
     hd              = h["head_dim"]
@@ -190,13 +191,13 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
     def kv_hbm_append(l, kvh, kind, vec):
         amax = np.abs(vec).max()
         ek = (int(np.frexp(f32(amax))[1]) - 7) if amax > 0 else 0
-        codes = np.clip(lroundf(vec*f32(np.exp2(-ek))), -127, 127).astype(np.int8)
+        codes = np.clip(_lroundf(vec*f32(np.exp2(-ek))), -127, 127).astype(np.int8)
         hbm_kv.setdefault((l, kvh, kind), []).append((ek, codes))
 
     def kv_hbm_wv(l, kvh, pr):
         pmax = pr.max()
         ep = (int(np.frexp(f32(pmax))[1]) - 7) if pmax > 0 else 0
-        p8 = np.clip(lroundf(pr*f32(np.exp2(-ep))), 0, 127).astype(np.int64)
+        p8 = np.clip(_lroundf(pr*f32(np.exp2(-ep))), 0, 127).astype(np.int64)
         rowsd = hbm_kv[(l, kvh, 1)]
         ekmax = max(e for e, _ in rowsd)
         B     = 22 - ekmax
@@ -286,7 +287,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
             amax = np.abs(qh).max()
             if amax > 0:
                 eq = int(np.frexp(f32(amax))[1]) - 7
-            q8 = np.clip(lroundf(qh*f32(np.exp2(-eq))), -127, 127).astype(np.int8)
+            q8 = np.clip(_lroundf(qh*f32(np.exp2(-eq))), -127, 127).astype(np.int8)
         rowsk = hbm_kv[(l, kvh, 0)]
         ekm   = max(e for e, _ in rowsk)
         Bk    = 22 - ekm
@@ -329,7 +330,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         return red.astype(f32)*fs
 
     def rmsnorm_f(x, w):
-        ss = fsum32(x*x)
+        ss = _fsum32(x*x)
         r  = f32(1.0)/np.sqrt(f32(f32(ss/f32(len(x))) + f32(eps)))
         return (x*r*w).astype(f32)
 
@@ -428,7 +429,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                 ea8 = (int(np.frexp(hmax)[1]) - 7) if hmax > 0 else 0
                 a8 = np.zeros(n_head*hd, dtype=np.int8)
                 for i2 in range(n_head):
-                    Mh = int(np.clip(lroundf(np.ldexp(cs[i2], 15 - ea8)), 0, 32767))
+                    Mh = int(np.clip(_lroundf(np.ldexp(cs[i2], 15 - ea8)), 0, 32767))
                     a8[i2*hd:(i2+1)*hd] = np.clip(
                         bx.rne_shift(rms[i2]*Mh, 15), -127, 127).astype(np.int8)
                 # Raw (mantissa, exponent) trace points: the firmware's `dbg` checksums the
@@ -470,11 +471,10 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
             qn, kn = norm_w(p + "attn_q_norm.weight"), norm_w(p + "attn_k_norm.weight")
             q = np.concatenate([rmsnorm_f(q[i*hd:(i+1)*hd], qn) for i in range(n_head)])
             k = np.concatenate([rmsnorm_f(k[i*hd:(i+1)*hd], kn) for i in range(n_kv)])
-            # Rope from the table baked into the image, not recomputed here. Computing
-            # theta = pos*theta_base**(-2p/hd) inline is plain RoPE: it silently drops YaRN,
-            # which the 1.7B uses (factor 4, plus an mscale of ~1.1387) and the tiny sim model
-            # does not (factor 1), so the tiny gate passed while every real model was wrong.
-            # The firmware derives the same thing; the table is the shared source of truth.
+            # Rope from the table baked into the image, not recomputed here: an inline
+            # theta = pos*theta_base**(-2p/hd) is plain RoPE and drops YaRN, which the 1.7B uses
+            # (factor 4, mscale ~1.1387) and the tiny model does not. The table is the firmware's
+            # and the mirror's shared source of truth.
             _, rope_tab = img.tensor("rope_tab")
             rt = np.asarray(rope_tab, dtype=np.int64).reshape(-1, hd)[pos]
             rc = (rt[:hd//2].astype(f32))*f32(2.0**-14)
@@ -498,9 +498,9 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
             va = np.abs(vr).max(axis=1)
             kscale = np.where(ka > 0, ka/f32(127.0), f32(1.0)).astype(f32)
             vscale = np.where(va > 0, va/f32(127.0), f32(1.0)).astype(f32)
-            kc[l].append(lroundf(kr*(f32(1.0)/kscale)[:, None]).astype(np.int8).reshape(-1))
+            kc[l].append(_lroundf(kr*(f32(1.0)/kscale)[:, None]).astype(np.int8).reshape(-1))
             ks[l].append(kscale)
-            vc[l].append(lroundf(vr*(f32(1.0)/vscale)[:, None]).astype(np.int8).reshape(-1))
+            vc[l].append(_lroundf(vr*(f32(1.0)/vscale)[:, None]).astype(np.int8).reshape(-1))
             vs[l].append(vscale)
             if modes.get("kv_hbm", "cpu") == "hw":
                 for i2 in range(n_kv):
@@ -514,11 +514,11 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                 if modes.get("kv_hbm", "cpu") == "hw":
                     attn[i*hd:(i+1)*hd] = kv_hbm_fused(l, kvh, qh)
                     continue
-                sc  = np.array([f32(f32(fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst[kvh])
+                sc  = np.array([f32(f32(_fsum32(qh*kt[kvh*hd:(kvh+1)*hd]))*kst[kvh])
                                 for kt, kst in zip(kc[l], ks[l])], dtype=f32)
                 sc  = sc*f32(1.0/np.sqrt(hd))
                 e   = np.exp(sc - sc.max(), dtype=f32)
-                pr  = e*f32(f32(1.0)/fsum32(e))
+                pr  = e*f32(f32(1.0)/_fsum32(e))
                 if modes.get("kv_hbm", "cpu") == "hw":
                     attn[i*hd:(i+1)*hd] = kv_hbm_wv(l, kvh, pr)
                 else:
@@ -528,7 +528,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                     attn[i*hd:(i+1)*hd] = ah
             if trace is not None:
                 trace(pos, (l, "attn_out"), attn.astype(np.float64))
-            a8, ea8 = quantize_f_pow2(attn)
+            a8, ea8 = _quantize_f_pow2(attn)
             res, er = matvec_i8(p + "attn_output.weight", a8, ea8)
             dm, kk  = norm_i32_sp(res)
             xm, ex  = resid_sp(xm, ex, dm, er + kk)
@@ -573,13 +573,6 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
 
 # Hybrid Mirror ------------------------------------------------------------------------------------
 
-def _fsum32(v):
-    acc = f32(0.0)
-    for e in np.asarray(v, dtype=f32):
-        acc = f32(acc + e)
-    return acc
-
-
 def _sumsq64(v):
     """The canonical sum of squares (doc/units.md (Canonical reductions), hybrid.c sumsq64)."""
     v = np.asarray(v, dtype=f32)
@@ -596,10 +589,6 @@ def _sumsq64(v):
         P[:w] = (P[:w] + P[w:2*w]).astype(f32)
         w //= 2
     return P[0]
-
-
-def _lroundf(x):
-    return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5)).astype(np.int64)
 
 
 def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None, fast_cfg=None,
@@ -643,13 +632,6 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         _, v = img.tensor(e["name"])
         return np.asarray(v, dtype=f32)
 
-    def quantize_f_pow2(x):
-        amax = np.abs(x).max()
-        if amax == 0:
-            return np.zeros(len(x), dtype=np.int8), 0
-        e8 = int(np.frexp(f32(amax))[1]) - 7
-        return np.clip(_lroundf(x*f32(np.exp2(-e8))), -127, 127).astype(np.int8), e8
-
     wcache = {}
 
     def ksegs(e):
@@ -675,7 +657,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
             return (wcache[e["name"]] @ np.asarray(x, dtype=f32)).astype(f32)
         # As infer_matvec_f: one exponent for the whole input; per segment the engine's
         # int32 result (each segment carries the tensor's bias/rshift); the sum, scaled once.
-        x8, e8 = quantize_f_pow2(np.asarray(x, dtype=f32))
+        x8, e8 = _quantize_f_pow2(np.asarray(x, dtype=f32))
         res, c0 = None, 0
         for t in segs:
             scales, codes = img.tensor(t["name"])
