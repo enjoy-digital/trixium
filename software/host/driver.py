@@ -9,7 +9,7 @@
   trixium driver load                         # build/xcu1525/driver/kernel (the build's driver)
   trixium driver load --dir build/fk33/driver/kernel
   trixium driver unload
-  sudo python3 -m software.driver load --dir gen/driver/kernel   # on a board host
+  sudo python3 -m software.host.driver load --dir gen/driver/kernel   # on a board host
 
 The driver is the build's generated LitePCIe driver (name "trixium"). Runs itself through sudo
 when not root.
@@ -23,7 +23,7 @@ import subprocess
 
 # Paths --------------------------------------------------------------------------------------------
 
-KERNEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+KERNEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "build", "xcu1525", "driver", "kernel")
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -102,8 +102,8 @@ def main(argv=None):
     parser.add_argument("--dir",  default=KERNEL_DIR,         help="Directory of trixium.ko/liteuart.ko (and their Makefile).")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
-        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cmd  = ["sudo", sys.executable, "-m", "software.driver", args.action, "--dir", os.path.abspath(args.dir)]
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        cmd  = ["sudo", sys.executable, "-m", "software.host.driver", args.action, "--dir", os.path.abspath(args.dir)]
         sys.exit(subprocess.call(cmd, cwd=repo))
     sys.exit(load(args.dir) if args.action == "load" else unload())
 

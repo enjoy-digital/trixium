@@ -11,10 +11,10 @@
 Two halves, because the GGUF lives on the workstation and the card on the board host:
 
   # workstation: fp32 greedy per prompt, top-5 logits at every position (~3 min a prompt)
-  python3 -m software.fp32_check golden models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf -o build/fp32_ref.json
+  python3 -m software.lab.fp32_check golden models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf -o build/fp32_ref.json
   # board host: at every position of fp32's path, what does the card pick, and how far below
   # fp32's best is that pick (teacher-forced, so one wrong token does not poison the rest)
-  python3 -m software.fp32_check card build/fp32_ref.json --tty /dev/ttyLXU0
+  python3 -m software.lab.fp32_check card build/fp32_ref.json --tty /dev/ttyLXU0
 
 Int8 activations cost a logit or so of noise, so a healthy card diverges where fp32 itself
 was undecided: gaps under ~1 logit, or picks outside the top-10 only where the top-10 spans
@@ -28,7 +28,7 @@ import sys
 import json
 import argparse
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Constants ----------------------------------------------------------------------------------------
 

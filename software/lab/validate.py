@@ -16,7 +16,7 @@ not stop the independent ones.
 Long: run it detached, e.g.
   systemd-run --user -E PATH="$PATH" -E HOME="$HOME" --working-directory=$PWD trixium validate
 
-Board steps: the hosts of ~/.config/trixium/boards.ini (key-based ssh, software/deploy.py).
+Board steps: the hosts of ~/.config/trixium/boards.ini (key-based ssh, software/lab/deploy.py).
 DDR4-1500 is an approved out-of-spec overclock (the XCU1525 build and deploy gate it under the
 ddr1600-overclock approval); the reference is v30b: 27B 32.2 M cycles/token, tokens
 "11751 13 198 760 6511 314 9564 369". FK33 reference v16b: 1.7B 2,101k cycles/token,
@@ -35,7 +35,7 @@ import subprocess
 
 # Paths --------------------------------------------------------------------------------------------
 
-REPO  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 STEPS = ["build-xcu1525", "build-fk33", "tests", "sim", "board", "board-fk33"]
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -121,7 +121,7 @@ def deploy(v, name, *args):
 
 
 def smi(v, board, name):
-    from software.deploy import board_config
+    from software.lab.deploy import board_config
     conf = board_config(board)
     cmd  = ["ssh", "-o", "BatchMode=yes", conf["target"], f"{shlex.quote(conf['dir'])}/user/trixium_smi -i 1"]
     v.run(name, cmd)

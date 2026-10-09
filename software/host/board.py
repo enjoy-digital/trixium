@@ -5,16 +5,16 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 """The board-side session, run ON THE BOARD HOST as root from the deploy directory (the deploy
-copies software/ there: `trixium deploy`, software/deploy.py).
+copies software/ there: `trixium deploy`, software/lab/deploy.py).
 
-  sudo python3 -m software.board reconfigure --board xcu1525 prog/csr.bit
-  sudo python3 -m software.board boot 27b [--firmware trixium.bin]
-  sudo python3 -m software.board boot 1.7b --board fk33
-  sudo python3 -m software.board load bonsai-1p7b-n16.img
-  sudo python3 -m software.board gen 16 785 6722 315 9625 374 [--want "12095 11 ..."]
-  sudo python3 -m software.board model bonsai-27b-n16-xcu1525.img 16 760 6511 314 9338 369
-  sudo python3 -m software.board bench 4
-  sudo python3 -m software.board abtoggle silu [-n 4] [--rounds 2] [--want "..."]
+  sudo python3 -m software.host.board reconfigure --board xcu1525 prog/csr.bit
+  sudo python3 -m software.host.board boot 27b [--firmware trixium.bin]
+  sudo python3 -m software.host.board boot 1.7b --board fk33
+  sudo python3 -m software.host.board load bonsai-1p7b-n16.img
+  sudo python3 -m software.host.board gen 16 785 6722 315 9625 374 [--want "12095 11 ..."]
+  sudo python3 -m software.host.board model bonsai-27b-n16-xcu1525.img 16 760 6511 314 9338 369
+  sudo python3 -m software.host.board bench 4
+  sudo python3 -m software.host.board abtoggle silu [-n 4] [--rounds 2] [--want "..."]
 
 `reconfigure`: drivers out, PCI device removed, the bitstream programmed (XCU1525:
 openFPGALoader, then the JTAG IR capture must read 0x35d75 = DONE in the three SLRs; FK33:
@@ -24,7 +24,7 @@ when the FPGA is not configured: never go on against a removed device.
 `boot` on the XCU1525 is the DDR4 boot order: CPU reset -> BIOS prompt -> host-side training of
 controller 0 -> memtest -> firmware boot without a CPU reset (-R) -> the firmware calibrates
 controllers 1..3 -> host-side training of 1..3 -> engreset -> ddrtest. The host-side training
-(software/rdlevel.py) must never touch controller 0 while the firmware runs from it: `boot`
+(software/host/rdlevel.py) must never touch controller 0 while the firmware runs from it: `boot`
 trains it between the BIOS's calibration and the jump. On the FK33: trixium_chat -k (CPU reset,
 serial boot), retried once.
 """
@@ -37,10 +37,10 @@ import argparse
 import subprocess
 import contextlib
 
-from software import console
-from software import rdlevel
-from software.cpumon import cpumon
-from software.cpurst import cpu_reset, find_xilinx_device
+from software.host import console
+from software.host import rdlevel
+from software.host.cpumon import cpumon
+from software.host.cpurst import cpu_reset, find_xilinx_device
 
 # Constants ----------------------------------------------------------------------------------------
 

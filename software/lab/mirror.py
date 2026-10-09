@@ -12,11 +12,11 @@ output x8, the residual after attention and after the FFN, the FFN x8s, the argm
 same points, and the first line that differs names the block to open.
 
   # workstation (the mirror takes ~2 min for a 13-token prompt on the 1.7B)
-  python3 -m software.mirror mirror models/bons/bonsai-1p7b-n16.img --prompt "Hello" -o build/mir.txt
-  # board host: the firmware's `dbg` checksums (software/fp32_check.py's paced client)
-  python3 -m software.mirror card --prompt "Hello" -o card.txt
+  python3 -m software.lab.mirror mirror models/bons/bonsai-1p7b-n16.img --prompt "Hello" -o build/mir.txt
+  # board host: the firmware's `dbg` checksums (software/lab/fp32_check.py's paced client)
+  python3 -m software.lab.mirror card --prompt "Hello" -o card.txt
   # anywhere
-  python3 -m software.mirror compare build/mir.txt card.txt
+  python3 -m software.lab.mirror compare build/mir.txt card.txt
 
 The simulation gate (./trixium_sim.py --gate) runs mirror and compare against the simulated card.
 
@@ -30,7 +30,7 @@ import sys
 import argparse
 from dataclasses import dataclass
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Constants ----------------------------------------------------------------------------------------
 

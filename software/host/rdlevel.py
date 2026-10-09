@@ -14,13 +14,13 @@ of one module, so this replays the same DFI-injector test pattern as liblitedram
 (sdram_write_read_check_test_pattern, the same LFSR and seeds) from the host, with every CSR
 write visible, and can pin a module to a chosen (bitslip, delay).
 
-  sudo python3 -m software.rdlevel scan 7                  # the scan for module 7, all bitslips
-  sudo python3 -m software.rdlevel scan 7 --bitslips 4 5 6
-  sudo python3 -m software.rdlevel set 7 6 350             # module 7: bitslip 6, delay 350
-  sudo python3 -m software.rdlevel phases                  # rdphase/wrphase
-  sudo python3 -m software.rdlevel train                   # all modules: write DQ-DQS centring + read leveling
-  sudo python3 -m software.rdlevel train --bitslips 7      # one module
-  sudo python3 -m software.rdlevel check                   # error bits per module on the injector pattern
+  sudo python3 -m software.host.rdlevel scan 7                  # the scan for module 7, all bitslips
+  sudo python3 -m software.host.rdlevel scan 7 --bitslips 4 5 6
+  sudo python3 -m software.host.rdlevel set 7 6 350             # module 7: bitslip 6, delay 350
+  sudo python3 -m software.host.rdlevel phases                  # rdphase/wrphase
+  sudo python3 -m software.host.rdlevel train                   # all modules: write DQ-DQS centring + read leveling
+  sudo python3 -m software.host.rdlevel train --bitslips 7      # one module
+  sudo python3 -m software.host.rdlevel check                   # error bits per module on the injector pattern
 
 The CSR offsets are controller 0's (csr.h); --ctrl k adds k*0x1000 for the
 others (DDR_CSR_STRIDE). The controller is put under software control for the scan and
@@ -34,7 +34,7 @@ import mmap
 import ctypes
 import argparse
 
-from software.cpurst import find_xilinx_device
+from software.host.cpurst import find_xilinx_device
 
 # CSRs ---------------------------------------------------------------------------------------------
 

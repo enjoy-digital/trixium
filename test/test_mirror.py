@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from software.mirror import cmd_compare, parse, fnv, format_typed_trace
+from software.lab.mirror import cmd_compare, parse, fnv, format_typed_trace
 
 
 EMBED = "DBG pos=0 l=-1 embed e=-12 1234abcd amax=42 v0..3=1,2,3,4\n"
@@ -87,7 +87,7 @@ def test_typed_argmax_hash():
 
 
 def test_ids_do_not_require_tokenizer():
-    from software.mirror import prompt_ids
+    from software.lab.mirror import prompt_ids
     assert prompt_ids(SimpleNamespace(ids="1 2 3", tokenizer="missing")) == [1, 2, 3]
 
 

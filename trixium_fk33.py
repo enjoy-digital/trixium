@@ -17,14 +17,14 @@
 # From the repository root:
 #   ./trixium_fk33.py --build                          # -> build/fk33/ + build/fk33.verdict
 #   ./trixium_fk33.py --load                           # OpenOCD (JTAG, onboard FT2232)
-#   trixium deploy fk33 --board fk33 --model 1p7b      # the lab board: software/deploy.py
+#   trixium deploy fk33 --board fk33 --model 1p7b      # the lab board: software/lab/deploy.py
 #
 # What the recipe's directives and caches are worth:
 # - fetch-l1 128 sets x 4 ways = 32 KB instruction cache: the per-layer firmware code path
 #   (~24 KB) does not fit 16 KB (-15% on the token); lsu-l1 the same (-5.5%).
 # - AreaOptimized_medium: on this ~98%-full die the synthesis area directive closes timing;
 #   AltSpreadLogic_low is the placer directive that does. Judge a build by TNS and failing
-#   endpoints against the last shipped one, never by WNS alone (software/timing.py).
+#   endpoints against the last shipped one, never by WNS alone (software/lab/timing.py).
 # - update_repo "no": never let LiteX update ext/VexiiRiscv from here (needs network, and a
 #   half-done update leaves a CPU that does not compile against the local SpinalHDL).
 # - If post-route phys_opt crashes, re-route from the placed checkpoint and skip it (worth
@@ -190,7 +190,7 @@ def main():
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     from litex.build.parser import LiteXArgumentParser
-    from software.timing import gate
+    from software.lab.timing import gate
     parser = LiteXArgumentParser(platform=Platform, description="TriXium on the SQRL FK33.")
     parser.add_target_argument("--sys-clk-freq",    default=212.5e6, type=float,                             help="System clock frequency (= HBM AXI clock).")
     parser.add_target_argument("--engine-channels", default=16,      type=int,                               help="Engine channels (HBM pseudo-channels 1..N, max 31).")

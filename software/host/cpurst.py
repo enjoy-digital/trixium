@@ -14,7 +14,7 @@ CPU reset (bit 1), never SoC reset (bit 0): bit 0 takes the PCIe endpoint down w
 the host loses the device until a warm reboot. HBM keeps its contents across a CPU reset,
 so the uploaded weights survive.
 
-  sudo python3 -m software.cpurst
+  sudo python3 -m software.host.cpurst
 """
 
 import os

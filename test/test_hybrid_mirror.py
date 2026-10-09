@@ -546,7 +546,7 @@ def test_rv32_profile_closes_archived_fpu_trace(tmp_path):
     from pathlib import Path
     from model.configs import BONSAI_TINY_HYBRID_1K
     from model.tinygen import generate
-    from software.mirror import format_typed_trace, parse
+    from software.lab.mirror import format_typed_trace, parse
     image, _, _ = generate(str(tmp_path), 8, 1234, cfg=BONSAI_TINY_HYBRID_1K)
     expected, order = parse(Path(__file__).parent / 'data/tiny-hybrid-1k-fpu-trace.txt')
     for mode, full in [('rv32f', True), ('mathematical', False)]:

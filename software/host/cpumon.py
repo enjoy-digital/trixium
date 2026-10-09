@@ -6,7 +6,7 @@
 
 """Print the CPU bus monitor (gateware/common.py) twice, 0.5 s apart, over BAR0.
 
-  sudo python3 -m software.cpumon [--csr-h gen/software/include/generated/csr.h]
+  sudo python3 -m software.host.cpumon [--csr-h gen/software/include/generated/csr.h]
 """
 
 import os
@@ -16,7 +16,7 @@ import time
 import struct
 import argparse
 
-from software.cpurst import find_xilinx_device
+from software.host.cpurst import find_xilinx_device
 
 # CPU Monitor --------------------------------------------------------------------------------------
 

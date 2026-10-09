@@ -18,7 +18,7 @@
     trixium chat      --remote --board fk33                      # on a lab board host, over ssh
     trixium console   "stats" "bench 64"                         # raw firmware commands
 
-`deploy` drives a lab board from the workstation (software/deploy.py, board hosts in
+`deploy` drives a lab board from the workstation (software/lab/deploy.py, board hosts in
 ~/.config/trixium/boards.ini); `chat` and `console` run where the card's /dev/ttyLXU0 is.
 """
 
@@ -107,17 +107,17 @@ def cmd_models(args):
 
 
 def cmd_deploy(args):
-    from software.deploy import run
+    from software.lab.deploy import run
     sys.exit(run(args))
 
 
 def cmd_validate(args):
-    from software.validate import run
+    from software.lab.validate import run
     sys.exit(run(args))
 
 
 def cmd_driver(args):
-    from software.driver import main as driver_main
+    from software.host.driver import main as driver_main
     driver_main([args.action, "--dir", args.dir])
 
 
@@ -136,7 +136,7 @@ def cmd_chat(args):
     if args.remote:
         # From the workstation: the chat runs on the board host over ssh (boards.ini), in the
         # tree the deploy maintains there.
-        from software.deploy import board_config
+        from software.lab.deploy import board_config
         conf   = board_config(args.board)
         remote = (f"cd {shlex.quote(conf['dir'])} && ./user/trixium_chat -t {shlex.quote(args.tty)} "
                   + " ".join(shlex.quote(f) for f in flags))
@@ -148,7 +148,7 @@ def cmd_chat(args):
 
 
 def cmd_console(args):
-    from software.console import main as console_main
+    from software.host.console import main as console_main
     argv = ["-t", args.tty, "-w", str(args.wait), "--quiet-after", str(args.quiet)]
     for c in args.commands:
         argv += ["-c", c]
@@ -202,7 +202,7 @@ def main(argv=None):
     p.set_defaults(fn=cmd_models)
 
     # Deploy.
-    from software import deploy, validate
+    from software.lab import deploy, validate
     p = subparsers.add_parser("deploy", help="Deploy a build on a lab board: timing gate, configure, boot, tokens, bench.")
     deploy.add_arguments(p)
     p.set_defaults(fn=cmd_deploy)

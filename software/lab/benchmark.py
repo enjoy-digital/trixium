@@ -8,7 +8,7 @@
 
 """Parse BENCH_PHASE v1 logs without mistaking mixed bench throughput for decode.
 
-  python3 -m software.benchmark build/bench-*.log
+  python3 -m software.lab.benchmark build/bench-*.log
 
 Each row is one request, not a claim about a filled 16k/64k context. Startup/model
 loading and per-token p95 are not measured by this firmware record.

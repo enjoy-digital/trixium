@@ -806,7 +806,7 @@ static void usage(void)
            "-k firmware    Boot this firmware first (CPU reset, loader into main_ram, boot).\n"
            "-K firmware    Boot it over serial-boot frames on the console instead (30-45 s).\n"
            "-R             With -k: no CPU reset, the BIOS is already at its prompt (a host-side\n"
-           "               DDR training ran after its calibration; software/rdlevel.py).\n"
+           "               DDR training ran after its calibration; software/host/rdlevel.py).\n"
            "-W seconds     Firmware prompt timeout (default = 120; the XCU1525 firmware\n"
            "               calibrates three DDR4 controllers first).\n"
            "-C             Clear the staged BONS header and exit (before a boot on a new\n"

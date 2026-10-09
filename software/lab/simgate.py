@@ -8,7 +8,7 @@
 
 gate : the Python mirror on the image, then one traced generation on the simulated card with the
        resident path on (`dbg N; gen 1 <ids>`), then a checkpoint-by-checkpoint comparison
-       (software/mirror.py): every checkpoint must be bit-identical, the resident path on (and
+       (software/lab/mirror.py): every checkpoint must be bit-identical, the resident path on (and
        the unit 11 FFN activation lists when the SoC has them). The firmware's `stats` profile
        (hybprof: cycles per forward) is printed after the run.
 bench: the firmware's own cycles/forward with a console toggle (resident, silu, dnstream) off
@@ -25,7 +25,7 @@ import time
 
 import pexpect
 
-from software.mirror import mirror, compare
+from software.lab.mirror import mirror, compare
 
 # Constants ----------------------------------------------------------------------------------------
 

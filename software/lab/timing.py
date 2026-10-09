@@ -15,14 +15,14 @@ The thresholds are measured, not guessed: builds with a few thousand failing end
 to the known-good side. This is a heuristic about *this* board and design, not a general rule:
 a passing verdict means "no worse than builds that have run", not "meets timing".
 
-  python3 -m software.timing build/fk33/gateware/sqrl_fk33_timing.rpt
-  python3 -m software.timing --strict ...  # new releases: setup, hold and pulse/skew closure
-  python3 -m software.timing --strict --serializer-baseline v8 ...  # see below
-  python3 -m software.timing --experiment --serializer-baseline v8 ...  # concept tests, see below
-  python3 -m software.timing --force ...   # deploy anyway, and say so in the log
+  python3 -m software.lab.timing build/fk33/gateware/sqrl_fk33_timing.rpt
+  python3 -m software.lab.timing --strict ...  # new releases: setup, hold and pulse/skew closure
+  python3 -m software.lab.timing --strict --serializer-baseline v8 ...  # see below
+  python3 -m software.lab.timing --experiment --serializer-baseline v8 ...  # concept tests, see below
+  python3 -m software.lab.timing --force ...   # deploy anyway, and say so in the log
 
 The target scripts run the gate after a build (`./trixium_xcu1525.py --build`) and the deploy
-runs it again before configuring the card (software/deploy.py); gate() is their entry point.
+runs it again before configuring the card (software/lab/deploy.py); gate() is their entry point.
 
 The experiment gate. To iterate fast, concept work goes on the card even when timing does not
 close: a design that works on a near-miss bitstream has shown the concept, and one that fails

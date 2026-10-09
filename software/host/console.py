@@ -8,8 +8,8 @@
 
 litex_term wants an interactive terminal; this just sends commands and prints what comes back.
 
-  python3 -m software.console                      # drain whatever the SoC has printed
-  python3 -m software.console -c selftest -w 240   # run a command, print the reply
+  python3 -m software.host.console                      # drain whatever the SoC has printed
+  python3 -m software.host.console -c selftest -w 240   # run a command, print the reply
   trixium console "stats" "bench 64"               # the same from the CLI
 """
 
@@ -39,7 +39,7 @@ class Console:
         except OSError:
             os.close(self.fd)
             raise ConsoleBusy(f"{tty} is in use by another console session (trixium_chat, "
-                "software.console, the Python client, litex_term?) - close it first")
+                "software.host.console, the Python client, litex_term?) - close it first")
         a = termios.tcgetattr(self.fd)
         a[0] = a[1] = a[3] = 0                                   # raw: no in/out/local processing
         a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL

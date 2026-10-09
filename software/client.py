@@ -54,13 +54,13 @@ class TriXium:
         import serial
         from tokenizers import Tokenizer
         self.ser = serial.Serial(tty, 115200, timeout=0.05)
-        # One console session at a time (see software/console.py): advisory lock on the tty.
+        # One console session at a time (see software/host/console.py): advisory lock on the tty.
         try:
             fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.ser.close()
             raise TriXiumError(f"{tty} is in use by another console session (trixium_chat, "
-                               "software.console, litex_term?) - close it first")
+                               "software.host.console, litex_term?) - close it first")
         self.tok           = Tokenizer.from_file(tokenizer)
         self.chat_template = chat_template
         self.system        = system  # A system turn ahead of the first user turn.

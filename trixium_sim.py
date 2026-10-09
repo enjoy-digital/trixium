@@ -457,7 +457,7 @@ def main():
         sys.exit(subprocess.call(["obj_dir/Vsim"], cwd=gateware_dir))
 
     # Gate / Bench.
-    from software import simgate
+    from software.lab import simgate
     if args.gate:
         rc = simgate.gate(gateware_dir, args.image, os.path.join(out_dir, "gate"),
             expect_silu=board.get("with_silu", False))

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from software.benchmark import parse_record, read_records, summarize
+from software.lab.benchmark import parse_record, read_records, summarize
 
 
 RECORD = ("BENCH_PHASE v=1 valid=1 clock_hz=150000000 requested_tokens=3 generated_tokens=3 "

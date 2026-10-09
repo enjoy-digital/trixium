@@ -28,10 +28,10 @@ The sequence and its order:
   4. the bitstream archived in build/archive/ (the board-side csr.bit is overwritten by every
      deploy, and build/ gets cleaned for disk space)
   5. driver + host tools built ON THE HOST against its kernel with this build's headers
-  6. reconfigure + warm reboot (software/board.py reconfigure): XCU1525 openFPGALoader + the IR
+  6. reconfigure + warm reboot (software/host/board.py reconfigure): XCU1525 openFPGALoader + the IR
      capture 0x35d75 (DONE in the three SLRs); FK33 OpenOCD pld load. Never go on against a
      removed device
-  7. boot + weights: XCU1525 = the DDR4 boot order of software/board.py (the BIOS calibrates
+  7. boot + weights: XCU1525 = the DDR4 boot order of software/host/board.py (the BIOS calibrates
      controller 0, the host-side training fixes what it could not, the firmware boots without a
      CPU reset and calibrates 1..3, the host trains them too, engreset, the round trip), THEN the
      weights (the loader writes to controllers the firmware initialises). FK33 = weights, then
@@ -61,7 +61,7 @@ import configparser
 
 # Paths --------------------------------------------------------------------------------------------
 
-REPO       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO       = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BOARDS_INI = os.environ.get("TRIXIUM_BOARDS_INI", os.path.expanduser("~/.config/trixium/boards.ini"))
 
 # Models -------------------------------------------------------------------------------------------
@@ -281,7 +281,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     soc_h    = os.path.join(out, "software", "include", "generated", "soc.h")
     drv      = os.path.join(out, "driver", "kernel")
     sudo     = remote.sudo()
-    board_py = f"{sudo} python3 -m software.board"
+    board_py = f"{sudo} python3 -m software.host.board"
     if board == "xcu1525":
         image = f"bonsai-{model}-n16.img" if model == "1p7b" else f"bonsai-{model}-n16-xcu1525.img"
     else:
@@ -293,7 +293,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     # Timing gate.
     if reconfigure:
         say("timing gate")
-        timing = [sys.executable, "-m", "software.timing"]
+        timing = [sys.executable, "-m", "software.lab.timing"]
         if board == "xcu1525":
             # Deploy on the experiment gate (concepts are validated on hardware even when timing
             # does not close), which still refuses anything outside the measured host-safety
@@ -327,15 +327,21 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 
     # Copy.
     remote.ssh(f"mkdir -p {shlex.quote(conf['dir'])} && cd {shlex.quote(conf['dir'])} && mkdir -p prog "
-        "gen/software/include/generated gen/driver/kernel gen/driver/user/liblitepcie user software "
-        "models/1.7b models/8b models/27b", cd=False, check=True)
-    tools = ["__init__.py", "board.py", "console.py", "cpurst.py", "cpumon.py", "rdlevel.py",
-        "driver.py", "client.py", "mirror.py", "fp32_check.py"]
-    tools = [os.path.join("software", t) for t in tools]
-    present = [t for t in tools if os.path.exists(os.path.join(REPO, t))]
-    for t in sorted(set(tools) - set(present)):
-        print(f"warning: {t} not found, not copied")
-    remote.scp(present, "software/")
+        "gen/software/include/generated gen/driver/kernel gen/driver/user/liblitepcie user "
+        "software/host software/lab models/1.7b models/8b models/27b", cd=False, check=True)
+    # The remote tree keeps the repository's layout, so `python3 -m software.host.X` (and the
+    # card-side clients software.lab.mirror / software.lab.fp32_check) import the same way there.
+    tools = {
+        "software"      : ["__init__.py", "client.py"],
+        "software/host" : ["__init__.py", "board.py", "console.py", "cpurst.py", "cpumon.py", "rdlevel.py", "driver.py"],
+        "software/lab"  : ["__init__.py", "mirror.py", "fp32_check.py"],
+    }
+    for directory, files in tools.items():
+        files   = [os.path.join(directory, f) for f in files]
+        present = [f for f in files if os.path.exists(os.path.join(REPO, f))]
+        for f in sorted(set(files) - set(present)):
+            print(f"warning: {f} not found, not copied")
+        remote.scp(present, f"{directory}/")
     if reconfigure:
         say("archive + copy")
         archive = os.path.join(REPO, "build", "archive")
@@ -347,7 +353,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
             shutil.copy(bit,    os.path.join(archive, f"{name}.bit"))
             shutil.copy(report, os.path.join(archive, f"{name}_timing.rpt"))
         if board == "fk33":
-            # The FK33's OpenOCD configuration (litex-boards) for software/board.py reconfigure.
+            # The FK33's OpenOCD configuration (litex-boards) for software/host/board.py reconfigure.
             import litex_boards
             cfg = os.path.join(os.path.dirname(litex_boards.__file__), "prog", "openocd_xcvu33p_ft2232.cfg")
             remote.scp([cfg], "openocd_fk33.cfg")
@@ -387,7 +393,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 
         # Drivers + host tools.
         say("drivers + host tools")
-        remote.ssh(f"{sudo} python3 -m software.driver load --dir gen/driver/kernel", check=True)
+        remote.ssh(f"{sudo} python3 -m software.host.driver load --dir gen/driver/kernel", check=True)
         remote.ssh(f"{sudo} dmesg | grep -m1 'Version TriXium'; lspci -nn | grep -E '10ee:'")
         remote.ssh("cd user && rm -f *.o *.d trixium_load trixium_chat trixium_smi && "
             "(make BUILD_DIR=../gen 2>&1 | grep -i error | head -3); ls trixium_load trixium_chat trixium_smi", check=True)
@@ -427,7 +433,7 @@ def add_arguments(parser):
     parser.add_argument("--model",               default="1p7b", choices=list(MODELS),         help="Model.")
     parser.add_argument("--no-reconfigure",      action="store_true",                          help="Board already deployed: firmware, weights, tokens and bench only.")
     parser.add_argument("--boot",                action="store_true",                          help="With --no-reconfigure: boot the (rebuilt) firmware first (XCU1525).")
-    parser.add_argument("--approval",            default="ddr1600-overclock",                  help="XCU1525 timing gate approval (software/timing.py; '' for none).")
+    parser.add_argument("--approval",            default="ddr1600-overclock",                  help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
     parser.add_argument("--serializer-baseline", default="v8",                                 help="XCU1525 timing gate serializer baseline.")
     parser.add_argument("--bench",               type=int,                                     help="bench n (default: per model).")
     parser.add_argument("--dry-run",             action="store_true",                          help="Print every command, run nothing.")
