@@ -760,10 +760,7 @@ def test_engine_multi_store(chan_stride, backend):
     for r in range(rep):
         assert res.reads[f"packet{r}"] == pk[r], f"multi-store packet {r} mismatch"
 
-@pytest.mark.parametrize("backend", [
-    "verilator",
-    pytest.param("migen", marks=pytest.mark.slow), # sixteen Migen channel models: hours
-])
+@COMPILED
 def test_engine_n16_ternary_and_store_window(backend):
     # N=16 enablement (2026-08-29): the shipping sharding at sixteen channels - a ternary
     # matvec across 16 readers with the 16-input xred-free gather - and the 33-bit STORE
