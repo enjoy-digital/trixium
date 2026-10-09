@@ -178,7 +178,7 @@ def decode_rows(spec_entry, payload):
 def embed_bfp_rows(spec):
     """Every embedding row in the firmware's int16 BFP form: (mantissas int16 (rows, cols),
     exponents int32 (rows,)). Vectorized transcription of embed_row_bfp (firmware/infer.c)
-    and the sim reference embed_bfp_int (test_sim_smoke.py): per group g the fp16 scale
+    and the sim reference embed_bfp_int (test/system/test_sim_smoke.py): per group g the fp16 scale
     splits into (m11, e16); every group's (q-1)*m11 is aligned to the row's smallest e16
     (shift capped at 20); the row's absmax over groups with any nonzero code sets
     k2 = bitlen(absmax) - 15 so mantissas land in [2^14, 2^15); net = sh - k2 shifts left

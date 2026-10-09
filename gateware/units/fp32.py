@@ -20,7 +20,7 @@ the same Verilog is simulated by Verilator and implemented on the FPGA.
   FP32ArgmaxTracker the CPU's greedy argmax over a stream of FP32 beats
 
 Shifts are explicit Case multiplexers, never Migen variable shifts (the Verilog width
-pitfall). Tests: test/test_fp32_exact.py, compiled, against numpy's IEEE float32.
+pitfall). Tests: test/gateware/units/test_fp32.py, compiled, against numpy's IEEE float32.
 """
 
 from migen import *

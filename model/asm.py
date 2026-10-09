@@ -959,7 +959,7 @@ def prog_silu_q8():
 # in [0, 32766] for every clamped input (checked exhaustively), so |mulh15(x, p)| <= |x|
 # fits int16 and the round trip through the scratchpad loses nothing; the VMUL then sees
 # the identical int32 product, and the tail is the fused program's tail verbatim.
-# test_asm.py proves fused == gate-half then mul-half over the whole scratchpad + res6.
+# test/model/test_asm.py proves fused == gate-half then mul-half over the whole scratchpad + res6.
 
 def prog_silu_gate():
     """x*sigmoid(x) of the normalized gate, int16 in place: the gate-only half of

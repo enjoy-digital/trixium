@@ -30,7 +30,7 @@ and g < -80 (s = -0.0) are exact without the polynomial and are NOT fixups.
 Everything here is exact integer arithmetic on IEEE-754 binary32 bit patterns; there is
 no host floating point on the checked path. `silu_mul_fast` is what the RTL implements
 stage for stage; `silu_mul_firmware` is what the CPU computes; the contract, tested in
-test/test_silu_hw.py, is that they agree on every element the fast path does not flag.
+test/model/test_silu_hw.py, is that they agree on every element the fast path does not flag.
 """
 
 from functools import lru_cache
@@ -193,7 +193,7 @@ def silu_mul_fast(g, m, lut=None, dlut=None):
 # i = a20 >> 13 and fraction f = (a20 & 0x1FFF) * 2**-13: a 13-bit fixed-point fraction.
 # The "add 16" is a shift-and-round of g's significand, and the FMA's first operand is a
 # 13-bit integer rather than a general float. silu_mul_fixed() below is structured stage
-# for stage like the RTL; test_silu_hw.py proves it equal to silu_mul_fast().
+# for stage like the RTL; test/model/test_silu_hw.py proves it equal to silu_mul_fast().
 
 def rne_scale(n, k):
     """RNE(n * 2**k) as an integer, for n >= 0 (k <= 0 rounds; k > 0 is exact)."""

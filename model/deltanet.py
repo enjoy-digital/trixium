@@ -32,7 +32,7 @@ algebra between them:
 
 The functions below are the specification: `head_step` is what the two passes plus the
 CPU compute for one head (the mirror runs it on the 27B), `pass_a_args` / `ratchet` /
-`pass_b_args` are the CPU's algebra, and test_asm.py proves the interpreter's execution
+`pass_b_args` are the CPU's algebra, and test/model/test_asm.py proves the interpreter's execution
 of the two programs equals head_step to the bit. Every shift is a floor (the unit's
 SSHLV/VSHLS/VMULH15) except the update's VRNE; the two multiplies by Q15 constants are
 floors on scalars, i.e. rounding-level noise per row, not a drift per element (the
