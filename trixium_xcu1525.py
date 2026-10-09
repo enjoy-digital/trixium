@@ -19,7 +19,7 @@ From the repository root:
   ./trixium_xcu1525.py --build                         # -> build/xcu1525/ + build/xcu1525.verdict
   ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
   ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
-  trixium deploy xcu1525 --board xcu1525 --model 27b   # the lab board: software/lab/deploy.py
+  trixium deploy --board xcu1525 --model 27b           # the lab board: software/lab/deploy.py
 
 Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
 """

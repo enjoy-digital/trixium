@@ -6,10 +6,10 @@
 
 """One-command deployment + measurement on a lab board, driven from the workstation over ssh.
 
-  trixium deploy xcu1525 --board xcu1525 --model 27b     # build/xcu1525 on the XCU1525 host
-  trixium deploy fk33    --board fk33    --model 1p7b    # build/fk33 on the FK33 host
-  trixium deploy xcu1525 --model 8b --no-reconfigure     # next model, board already deployed
-  trixium deploy xcu1525 --model 27b --dry-run           # print every command, run nothing
+  trixium deploy --board xcu1525 --model 27b                  # build/xcu1525 on the XCU1525 host
+  trixium deploy --board fk33    --model 1p7b                 # build/fk33 on the FK33 host
+  trixium deploy --board xcu1525 --model 8b --no-reconfigure  # next model, board already deployed
+  trixium deploy --board xcu1525 --model 27b --dry-run        # print every command, run nothing
 
 The board hosts come from ~/.config/trixium/boards.ini (doc/boards.ini.example), one section per
 board, overridable with TRIXIUM_<BOARD>_<KEY> environment variables (TRIXIUM_XCU1525_HOST=...).

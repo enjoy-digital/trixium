@@ -18,7 +18,7 @@ models.
   ./trixium_sim.py --build      # headers + libraries, firmware, Verilog (~1 min), Verilator (~2.5 min)
   ./trixium_sim.py --run        # run it (console on stdin/stdout)
   ./trixium_sim.py --firmware   # rebuild the firmware and re-bake it into the built sim (seconds)
-  ./trixium_sim.py --gate       # traced generation compared with the Python mirror (~17 min)
+  ./trixium_sim.py --gate       # traced generation compared with the Python mirror (~10 min)
   ./trixium_sim.py --bench      # resident path off/on, cycles per forward
 
 --board (xcu1525, fk33) and --image select the build (build/sim_<board>); the gate and the bench

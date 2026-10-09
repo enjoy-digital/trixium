@@ -17,7 +17,7 @@ doc/boards.md.
 From the repository root:
   ./trixium_fk33.py --build                          # -> build/fk33/ + build/fk33.verdict
   ./trixium_fk33.py --load                           # OpenOCD (JTAG, onboard FT2232)
-  trixium deploy fk33 --board fk33 --model 1p7b      # the lab board: software/lab/deploy.py
+  trixium deploy --board fk33 --model 1p7b           # the lab board: software/lab/deploy.py
 
 What the recipe's directives and caches are worth:
 - fetch-l1 128 sets x 4 ways = 32 KB instruction cache: the per-layer firmware code path
