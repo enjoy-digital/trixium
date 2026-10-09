@@ -1,88 +1,49 @@
 # Python
 __pycache__/
 *.pyc
-.venv/
+/.venv
 *.egg-info/
 
-# Build outputs
+# Build outputs (gateware, simulations, Verilator test cache)
 build/
-firmware/build/
 
 # Models / weight images (regenerable, large)
-models/
+/models
 
-# Vivado-generated HBM IP outputs (only the .xci is tracked).
-# Each TCK variant keeps its own directory - the 31 identically named support files would
-# otherwise clobber each other - and ip/hbm is a local symlink at the one the build wants,
-# because USPHBM2 resolves the XCI as <cwd>/ip/hbm/<name>.xci. See trixium.py.
-/ip/hbm
-ip/hbm900/*
-!ip/hbm900/hbm_0.xci
-ip/hbm800/*
-!ip/hbm800/hbm_800.xci
-
-# Vivado FP32 IP products (regenerated from the reviewed XCI files).
-
-# Build/convert logs at the repo root
-/*.log
+# Vivado output products of the HBM IP (generated next to the tracked .xci)
+gateware/hbm/*
+!gateware/hbm/hbm_800.xci
 
 # Vivado cruft
 .Xil/
 vivado*.jou
 vivado*.log
-*.backup.jou
-*.backup.log
+vivado_pid*.str
 
-# Software build artifacts
-*.o
-*.ko
-*.so
-*.mod
-*.mod.c
-*.cmd
-.tmp_versions/
-Module.symvers
-modules.order
+# VexiiRiscv (sbt) generation leftovers
+/target/
+/project/
 
-# Simulation artifacts
-*.vcd
-*.fst
-*.fst.hier
-csr.csv
-analyzer.csv
-
-# Firmware build artifacts (regenerate with: make -C firmware BUILD_DIR=../build/<tree>).
-# The binary is tree-specific - CSR maps differ - so a checked-in copy is a footgun.
+# Firmware build (make -C firmware BUILD_DIR=<build tree>): tree-specific, never tracked
+firmware/*.o
 firmware/*.d
 firmware/*.elf
 firmware/*.elf.map
 firmware/trixium.bin
-
-# Host tool binaries (build with: make -C software/user BUILD_DIR=<build tree>).
-software/user/trixium_util
-software/user/trixium_load
-software/user/trixium_chat
-software/user/*.d
-software/user/*.o
-
-# Exported Word copies of local docs (not tracked).
-docs/*.docx
-docs/*.doc
-
-rom*.init
+firmware/progs.h
 firmware/.build_dir_stamp
 firmware/.build.lock
-/trace.json
-firmware/progs.h
 
-# Vivado scratch files it drops in the CWD
-vivado_pid*.str
-vivado*.jou
-vivado*.log
+# Host tools build (make -C software/user BUILD_DIR=<build tree>)
+software/user/trixium_smi
+software/user/trixium_load
+software/user/trixium_chat
+software/user/*.o
+software/user/*.a
+software/user/*.d
 software/user/.build_config
 
-# sbt/VexiiRiscv generation leftovers
-/target/
-/project/
-
-# Per-build generated headers (copied from build/<name>/driver/kernel/ by the bring-up scripts).
+# Simulation traces
+*.vcd
+*.fst
+*.fst.hier
