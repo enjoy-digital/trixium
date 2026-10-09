@@ -17,6 +17,7 @@ from gateware.units.deltanet_stream import DeltaNetStream, lanes_to_state, refer
 from gateware.core.core import TriXiumConfig
 
 from common.cluster import SoC, write, IntAdd5, IntMul5
+from common.cluster import run as run_cluster
 from common.verilator import Simulator
 
 # DeltaNetStream -----------------------------------------------------------------------------------
@@ -269,16 +270,18 @@ def int_reference(m, q, k, v, decay, beta, scale):
     return m, out
 
 
-@pytest.mark.slow  # Migen simulator, ~2 min each
-@pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
-def test_dnstream_op_through_the_cluster(placement):
+# Compiled cluster; the plain placement also on Migen's simulator (~2 min).
+@pytest.mark.parametrize('placement,backend', [(dict(), "verilator"),
+    (dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator"),
+    pytest.param(dict(), "migen", marks=pytest.mark.slow)])
+def test_dnstream_op_through_the_cluster(placement, backend):
     L, rows, cols, heads = 2, 16, 16, 5
     R, G = rows//L, cols//8
     config = TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024, with_dnstream=True,
         dnstream_options=(("rows", rows), ("cols", cols), ("add_factory", IntAdd5),
                           ("mul_factory", IntMul5), ("negate", lambda x: -x)),
         **placement)
-    dut = SoC(config, n=L)
+    dut = SoC(config, n=L, backend=backend)
     rng = np.random.default_rng(1)
     rnd = lambda *shape: rng.integers(0, 1 << 12, shape).tolist()
     states = [[rnd(cols) for _ in range(rows)] for _ in range(heads)]
@@ -334,5 +337,5 @@ def test_dnstream_op_through_the_cluster(placement):
             assert got == want[h][1], h
         assert not (yield dut.engine.busy)
 
-    run_simulation(dut, [gen()], clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, [gen()])
     assert 'TRIXIUM_HAS_DNSTREAM' in dut.constants

@@ -17,7 +17,8 @@ from model.activation import (scratchpad_conv_descriptor, scratchpad_norm_descri
                                            scratchpad_silu_descriptor)
 
 from common import import_test
-from common.cluster import SoC, install_list, pack, write
+from common.cluster import BACKEND, SoC, install_list, pack, write
+from common.cluster import run as run_cluster
 
 norm_reference = import_test("gateware/units/test_norm.py").reference
 conv_reference = import_test("gateware/units/test_conv.py").reference
@@ -97,11 +98,11 @@ def test_norm_and_conv_decode_and_reserved_words():
         run_simulation(dut, run())
 
 
-@pytest.mark.slow  # Migen simulator, ~3 min
-def test_cluster_conv_then_norm_list():
+@BACKEND  # Migen simulator: ~3 min
+def test_cluster_conv_then_norm_list(backend):
     """conv (16 channels) then an in-place L2 over two 8-element segments, one list."""
     size = 64*1024
-    dut = SoC(TriXiumConfig(with_norm=True, with_conv=True, scratchpad_size=size), n=1)
+    dut = SoC(TriXiumConfig(with_norm=True, with_conv=True, scratchpad_size=size), n=1, backend=backend)
     rng = np.random.default_rng(3)
     mem = np.zeros(size//4, dtype=np.uint32)
     for a in (0x1000, 0x1100, 0x1200, 0x1300):
@@ -127,4 +128,4 @@ def test_cluster_conv_then_norm_list():
             raise AssertionError("list timed out")
         for beat in (0x2000//32, 0x2000//32 + 1):
             assert (yield dut.scratchpad.mem[beat]) == pack(want[8*beat:8*beat + 8]), beat
-    run_simulation(dut, run(), clocks={"sys": 10, "eng": 10})
+    run_cluster(dut, run())

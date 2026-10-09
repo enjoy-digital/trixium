@@ -12,13 +12,12 @@ import subprocess
 import numpy as np
 import pytest
 
-from migen import run_simulation
-
 from gateware.units.attention_stream import (
     AttentionStream, MODE_SCORES, MODE_VALUES, scores_reference, values_reference)
 from gateware.core.core import TriXiumConfig
 
 from common.cluster import SoC, write, IntAdd5, IntMul5
+from common.cluster import run as run_cluster
 from common.verilator import Simulator
 
 # AttentionStream ----------------------------------------------------------------------------------
@@ -233,21 +232,18 @@ def test_tiny_geometry_on_the_27b_build(tmp_path, big):
 MASK = 0xFFFFFFFF
 
 
-@pytest.mark.parametrize('mode,T', [ # Migen simulator: ~40-90 s each, but (1, 3)
-    pytest.param(0, 11, marks=pytest.mark.slow),
-    pytest.param(1, 11, marks=pytest.mark.slow),
-    pytest.param(0, 1,  marks=pytest.mark.slow),
-    (1, 3),
-])
+# Compiled cluster; one case also on Migen's simulator (~1 min).
+@pytest.mark.parametrize('mode,T,backend', [(0, 11, "verilator"), (1, 11, "verilator"),
+    (0, 1, "verilator"), (1, 3, "verilator"), pytest.param(1, 3, "migen", marks=pytest.mark.slow)])
 @pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
-def test_attn_op_through_the_cluster(placement, mode, T):
+def test_attn_op_through_the_cluster(placement, mode, T, backend):
     n, nq, n_rep, nkv, hd = 2, 4, 2, 2, 32
     hb, rowbeats = hd//8, nkv*hd//8
     config = TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024, with_attnstream=True,
         attnstream_options=(("lanes", 4), ("groups", 2), ("hb_max", 4), ("t_max", 64),
                             ("add_factory", IntAdd5), ("mul_factory", IntMul5)),
         **placement)
-    dut = SoC(config, n=n)
+    dut = SoC(config, n=n, backend=backend)
     rng = np.random.default_rng(T + 10*mode)
     rows = rng.integers(0, 1 << 10, (T, nkv, hd)).tolist()
     SRC, DST, REC = 0x0000, 0x1000, 0x3000
@@ -304,5 +300,5 @@ def test_attn_op_through_the_cluster(placement, mode, T):
         assert not (yield dut.engine.busy)
         assert not (yield dut.engine.error)
 
-    run_simulation(dut, [gen()], clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, [gen()])
     assert 'TRIXIUM_HAS_ATTNSTREAM' in dut.constants

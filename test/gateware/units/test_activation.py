@@ -24,6 +24,7 @@ from model.activation import scratchpad_quantize_descriptor, scratchpad_requanti
 
 from common import RTL
 from common.cluster import SoC, write, install_list
+from common.cluster import run as run_cluster
 from common.verilator import Simulator
 
 # Fp32ToQ8 / Fp32AbsmaxWord ------------------------------------------------------------------------
@@ -676,10 +677,12 @@ def test_requantization_dispatch_without_hadamard_and_completion_publication(fai
     run_simulation(dut, run())
 
 
-@pytest.mark.parametrize('with_hadamard', [False, pytest.param(True, marks=pytest.mark.slow)]) # Migen: ~40 s
-def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
+# Compiled cluster; without Hadamard also on Migen's simulator (~40 s).
+@pytest.mark.parametrize('with_hadamard,backend', [(False, "verilator"), (True, "verilator"),
+                                                   pytest.param(False, "migen", marks=pytest.mark.slow)])
+def test_sequenced_fetch_nowait_quantize_store(with_hadamard, backend):
     dut = SoC(TriXiumConfig(with_activation_quantize=True, with_hadamard=with_hadamard,
-                                 scratchpad_size=16*1024), n=1)
+                                 scratchpad_size=16*1024), n=1, backend=backend)
     arrays = [[bits(math.ldexp((i - 32)*0.5, e)) for i in range(64)] for e in (-7, 4)]
     raw = [word for a in arrays for word in a]
     expected = b''.join(reference(a)[0] for a in arrays)
@@ -712,7 +715,7 @@ def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
             assert (yield dut.models[0].mem[0x1000//32 + beat]) == word
         exponents = yield dut.scratchpad.mem[0x700//32]
         assert exponents & ((1 << 64) - 1) == pack([reference(a)[1] for a in arrays], 32)
-    run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
+    run_cluster(dut, run())
 
 
 def test_compiled_resident_conversion_rotation_full_ffn_and_reset():
