@@ -11,7 +11,7 @@
 Two halves, because the GGUF lives on the workstation and the card on the board host:
 
   # workstation: fp32 greedy per prompt, top-5 logits at every position (~3 min a prompt)
-  python3 -m software.lab.fp32_check golden models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf -o build/fp32_ref.json
+  python3 -m software.lab.fp32_check golden models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf -o build/fp32_ref.json
   # board host: at every position of fp32's path, what does the card pick, and how far below
   # fp32's best is that pick (teacher-forced, so one wrong token does not poison the rest)
   python3 -m software.lab.fp32_check card build/fp32_ref.json --tty /dev/ttyLXU0

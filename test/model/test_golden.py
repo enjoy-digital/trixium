@@ -4,7 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""The 27B's geometry through the GGUF reader: what the converter learns before it refuses.
+"""The 27B's geometry through the GGUF reader: what the converter learns from the file.
 
 Bonsai 2 (Qwen3.5-27B; the GGUF architecture is `qwen35`) is a hybrid: 48 Gated DeltaNet
 layers and 16 gated-attention layers (every fourth), hidden 5120, FFN 17408, a 248,320
@@ -14,11 +14,9 @@ kernel 4. Its ternary matrices are stored in PrismML's rotated basis (Hadamard b
 one sign vector per input width). The metadata here is what the real file declares
 (models/27b); the sign vectors are shortened. What is pinned: the layer pattern,
 the dimensions the engine shards (multiples of 128 and of 16 channels), the gate detection
-from the q projection's shape, the Hadamard bookkeeping, and that the converter refuses the
-model with the reason instead of building a wrong image.
+from the q projection's shape, the Hadamard bookkeeping, and that the engine-support check
+accepts the 27B and the 8B.
 """
-
-import pytest
 
 from model.configs import BONSAI_8B
 from model.golden import config_from_gguf, check_engine_support

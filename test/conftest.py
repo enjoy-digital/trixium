@@ -4,7 +4,8 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""The test tree's conftest: --runslow (pytest.ini puts the repository and test/ on sys.path)."""
+"""The test tree's conftest: --runslow and --waves (pytest.ini puts the repository and test/ on
+sys.path)."""
 
 import os
 

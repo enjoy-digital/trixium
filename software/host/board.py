@@ -134,7 +134,7 @@ def tokens(text):
 # Reconfigure --------------------------------------------------------------------------------------
 
 def reconfigure(board, bitstream):
-    for module in ["liteuart", "bonsai", "trixium"]: # bonsai: the pre-rename driver.
+    for module in ["liteuart", "trixium"]:
         subprocess.run(["rmmod", module], stderr=subprocess.DEVNULL)
     dev = find_xilinx_device()
     if dev is not None:
@@ -173,7 +173,7 @@ def reconfigure(board, bitstream):
 # Boot ---------------------------------------------------------------------------------------------
 
 def kill_consoles():
-    for pattern in ["pcie_consol[e]", "trixium_cha[t]"]:
+    for pattern in ["software.host.consol[e]", "trixium_cha[t]"]:
         subprocess.run(["pkill", "-f", pattern], stderr=subprocess.DEVNULL)
 
 

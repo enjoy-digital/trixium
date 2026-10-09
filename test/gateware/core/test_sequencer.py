@@ -135,7 +135,7 @@ def test_sequencer_start_drains_posted_writes():
 
 @COMPILED
 def test_sequencer_v2_chaining(backend):
-    # Sequencer v2 primitives in one list, the way seq_build_attn will use them:
+    # Sequencer v2 primitives in one list, the way seq_build_attn uses them:
     #   reduce_acc (res6 = absmax) -> spill (S7 seeded with prev res6, persisted to SP,
     #   res6 preserved) -> norm_i32 with k from src=3 (k(res6)) -> reduce_acc over a
     #   crafted buffer (res6 = sum p8, standing in for softmax8's S6) -> engine AXPY with

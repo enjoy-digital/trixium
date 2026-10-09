@@ -13,7 +13,7 @@ same points, and the first line that differs names the block to open.
 
   # workstation (the mirror takes ~2 min for a 13-token prompt on the 1.7B)
   python3 -m software.lab.mirror mirror models/bons/bonsai-1p7b-n16.img --prompt "Hello" -o build/mir.txt
-  # board host: the firmware's `dbg` checksums (software/lab/fp32_check.py's paced client)
+  # board host: the firmware's `dbg` checksums (software/client.py's paced writes)
   python3 -m software.lab.mirror card --prompt "Hello" -o card.txt
   # anywhere
   python3 -m software.lab.mirror compare build/mir.txt card.txt
@@ -220,7 +220,7 @@ def main():
         p = subparsers.add_parser(name)
         if name == "mirror":
             p.add_argument("image",                                                      help="BONS image.")
-            p.add_argument("--hybrid-silu", choices=("rv32f", "mathematical"), default="rv32f", help="Hybrid SiLU profile; rv32f is the qualified VCU baseline libm.")
+            p.add_argument("--hybrid-silu", choices=("rv32f", "mathematical"), default="rv32f", help="Hybrid SiLU profile (rv32f: the firmware's RV32F libm).")
         else:
             p.add_argument("--tty",  default="/dev/ttyLXU0",           help="LiteUART tty.")
             p.add_argument("--pre",  action="append", default=[],      help="Console command to send first (repeatable).")

@@ -185,8 +185,7 @@ uint64_t loader_upload_image(const char *path, int verbose)
         return 0;
     }
     if (hdr.version != 2 && hdr.version != 3) {
-        fprintf(stderr, "%s: legacy loader accepts BONS v2/v3, not v%u; "
-                "v4 needs the region-aware runtime\n", path, hdr.version);
+        fprintf(stderr, "%s: BONS v2/v3 only, not v%u\n", path, hdr.version);
         fclose(f);
         return 0;
     }

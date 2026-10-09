@@ -11,7 +11,7 @@
  * flow-controlled and silently drops data on underflow.
  *
  * Every function exits the process with a message on a hardware error: the loader only runs
- * interactively or from the deploy scripts.
+ * interactively or from the deploy (software/host/board.py).
  */
 
 #ifndef TRIXIUM_LOADER_H
@@ -34,7 +34,7 @@ void     loader_transfer(int chan, uint32_t base, const uint8_t *data, uint64_t 
 /* Upload a BONS image: header+table to the channel-0 staging area (the firmware's `hdrload`
  * copies it into CPU memory), then every channel's payload to its own window. Returns the
  * number of payload bytes written, 0 on a refused image (channel-count mismatch, not a BONS
- * file). verbose=1 prints the per-channel base lines the deploy scripts grep for. */
+ * file). verbose=1 prints the per-channel base lines the deploy greps for. */
 uint64_t loader_upload_image(const char *path, int verbose);
 
 /* Copy a firmware binary (linked at MAIN_RAM_BASE) into main_ram through the loader's port:

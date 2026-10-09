@@ -99,7 +99,7 @@ class Bar0:
         if dev is None:
             raise OSError("no Xilinx device found")
         self.fd = os.open(f"/sys/bus/pci/devices/{dev}/resource0", os.O_RDWR | os.O_SYNC)
-        size = os.fstat(self.fd).st_size or 0x20000     # the whole BAR (0x40000 with --ddr-clk-freq)
+        size = os.fstat(self.fd).st_size or 0x20000     # the whole BAR (0x40000 on the XCU1525)
         self.m    = mmap.mmap(self.fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
         self.base = base
 
@@ -289,7 +289,7 @@ def write_center(ctrl, module, step=8):
     if not runs:
         return 0
     if line[0] and line[-1] and len(runs) > 1:
-        (s0, l0), (s1, l1) = runs[0], runs[-1]
+        (_, l0), (s1, l1) = runs[0], runs[-1]
         runs = [(s1, l1 + l0)] + runs[1:-1]
     start, length = max(runs, key=lambda r: r[1])
     center = (start*step + (length*step)//2) % DELAYS
@@ -453,9 +453,9 @@ def train(ctrl, modules, step):
 
 def csr_shift(path):
     """The controllers' CSR pages relative to the offsets above (controller 0 at 0x4000 of
-    the CSR region): 0 for the builds with the controllers in sys; a build with
-    --ddr-clk-freq puts them on their own bus at DDR_CSR_WINDOW. Read from the build's
-    generated csr.h (the bring-up copies it to gen/software/include/generated/)."""
+    the CSR region), or their own bus at DDR_CSR_WINDOW (the XCU1525 target: the controllers
+    in their ddr domain). Read from the build's generated csr.h (the deploy copies it to
+    gen/software/include/generated/)."""
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()

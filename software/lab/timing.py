@@ -21,7 +21,7 @@ a passing verdict means "no worse than builds that have run", not "meets timing"
   python3 -m software.lab.timing --experiment --serializer-baseline v8 ...  # concept tests, see below
   python3 -m software.lab.timing --force ...   # deploy anyway, and say so in the log
 
-The target scripts run the gate after a build (`./trixium_xcu1525.py --build`) and the deploy
+The targets run the gate after a build (`./trixium_xcu1525.py --build`) and the deploy
 runs it again before configuring the card (software/lab/deploy.py); gate() is their entry point.
 
 The experiment gate. To iterate fast, concept work goes on the card even when timing does not
@@ -53,24 +53,19 @@ WNS_FLOOR   = -0.75   # ns
 FAILING_CAP = 20000   # endpoints
 
 # Pulse-width/serializer-skew baselines: (worst slack ns, total ns, failing). The names are the
-# builds they were measured on (the deploy scripts pass them).
+# builds they were measured on (the XCU1525 target and the deploy pass them).
 SERIALIZER_BASELINES = {
     # The 16 OSERDESE3 CLK/CLKDIV endpoints; the family moves by a few picoseconds with
     # placement, so "v8" allows -0.010 ns per endpoint and "v8-exact" keeps the measured numbers.
     "v8"           : (-0.010, -0.160, 16),
     "v8-exact"     : (-0.003, -0.036, 16),
-    # The same family on 66 endpoints, approved for board tests; explicit use only.
-    "v18-approved" : (-0.022, -0.691, 66),
 }
 
 # Per-build approvals of a report outside the envelope: (setup WNS floor, serializer baseline).
 # Each names one build and its exact numbers, so it cannot drift onto another report.
 APPROVALS = {
-    # DDR4-1600 on the component-mode PHY overclocks the ISERDESE3 (Min Period 1.600 ns, run at
-    # 1.250: -0.350 ns on 941 endpoints) and setup misses the floor by 51 ps (the worst are the
-    # ddr CSR bus into IDELAY/ODELAY CE, static outside calibration). Out-of-spec, accepted.
-    "v27-approved"      : (-0.801, (-0.350, -329.158, 941)),
-    # Any DDR4-1600 build: the ISERDESE3 Min Period overclock (-0.350 ns on the ~940 serializer
+    # DDR4 past DDR4-1250 on the component-mode PHY (the shipping DDR4-1500, up to DDR4-1600):
+    # the ISERDESE3 Min Period overclock (1.600 ns, at most -0.350 ns on the ~940 serializer
     # clock pins) plus the OSERDES skew family; setup keeps the floor.
     "ddr1600-overclock" : (WNS_FLOOR, (-0.351, -360.0, 1000)),
 }
