@@ -10,6 +10,7 @@
 # Run with: .venv/bin/python -m pytest test/system/test_sim_smoke.py --runslow
 
 import os
+import sys
 import subprocess
 
 import numpy as np
@@ -20,10 +21,12 @@ from model import bitexact as bx
 from model.bons import BONSReader
 from model.mirror import hybrid_generate
 
-SIM_DIR = "build/sim/gateware"
-# Override to gate against a different channel count (rebuild the sim with the same
-# image first: TRIXIUM_SIM_IMAGE=... ./trixium_sim.py --image ... --build).
+# The Qwen3 path (1.7B/8B) in the FK33's simulation (the gate, ./trixium_sim.py --gate, covers
+# the hybrid 27B path on the XCU1525's). Built here when missing (~3 min); another image:
+# TRIXIUM_SIM_IMAGE=... (rebuilt when the image changes: the image is baked in).
 IMAGE   = os.environ.get("TRIXIUM_SIM_IMAGE", "models/tiny/bonsai-tiny-n2.img")
+OUT_DIR = os.path.join("build", "sim_fk33_" + os.path.splitext(os.path.basename(IMAGE))[0])
+SIM_DIR = os.path.join(OUT_DIR, "gateware")
 
 def fnv1a(data):
     h = 2166136261
@@ -37,8 +40,10 @@ def x_pattern(n):
 
 @pytest.mark.slow
 def test_sim_selftest_checksums():
-    assert os.path.exists(os.path.join(SIM_DIR, "obj_dir/Vsim")), "build the sim first"
     assert os.path.exists(IMAGE)
+    if not os.path.exists(os.path.join(SIM_DIR, "obj_dir/Vsim")):
+        subprocess.run([sys.executable, "trixium_sim.py", "--board", "fk33", "--image", IMAGE,
+            "--out-dir", OUT_DIR, "--build"], check=True)
 
     # Run the sim until the boot generation demo completes (the token gate needs the GEN
     # line, which lands ~50 sim-seconds / ~5 min wall after SELFTEST).
