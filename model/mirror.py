@@ -176,7 +176,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         e8 = int(np.frexp(f32(amax))[1]) - 7
         return np.clip(lroundf(x*f32(np.exp2(-e8))), -127, 127).astype(np.int8), e8
 
-    n_layer, n_embd = h["n_layer"], h["n_embd"]
+    n_layer         = h["n_layer"]
     n_head, n_kv    = h["n_head"], h["n_kv_head"]
     hd              = h["head_dim"]
     eps             = h["rms_eps"]
@@ -620,7 +620,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         raise ValueError("unknown SiLU numerical profile: " + silu_mode)
     h = img.header
     assert h["version"] >= 3 and (any(t == "deltanet" for t in h["layer_types"]) or h["hadamard_block"])
-    n_layer, n_embd, ffn_dim = h["n_layer"], h["n_embd"], h["ffn_dim"]
+    n_layer, n_embd = h["n_layer"], h["n_embd"]
     n_head, n_kv, hd = h["n_head"], h["n_kv_head"], h["head_dim"]
     nk, hk, nv, hv = h["dn_num_k_heads"], h["dn_k_head_dim"], h["dn_num_v_heads"], h["dn_v_head_dim"]
     nq, nvh, K = nk*hk, nv*hv, h["dn_conv_kernel"]
@@ -629,7 +629,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     B = h["hadamard_block"]
     widths = list(h["hadamard_widths"])
     gated = bool(h["attn_gated"])
-    q_dim, kv_dim, n_rep = n_head*hd, n_kv*hd, n_head//n_kv
+    n_rep = n_head//n_kv
 
     def entry(role, l, kind=None):
         for e in img.entries:

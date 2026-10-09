@@ -47,7 +47,6 @@ from pathlib import Path
 ROOT     = Path(__file__).resolve().parents[1]
 SPLIT    = {"test/gateware/memory/test_ddr.py": 9.5} # Run per test; expected GB of a Migen test
                                                      # the record does not know yet (LiteDRAM).
-DESELECT = ()
 PASS     = (0, 5)                                   # pytest: passed, or all deselected
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -106,7 +105,7 @@ class Unit:
         self.expected_s  = expected_s
         self.attempt     = 0
 
-    def start(self, out, pytest_args, deselect):
+    def start(self, out, pytest_args):
         self.attempt += 1
         stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.name)[:180]
         self.log_path = out / "logs" / f"{stem}.log"
@@ -115,9 +114,6 @@ class Unit:
         # over every child so far and would hide any unit lighter than an earlier one.
         cmd = ["/usr/bin/time", "-o", str(self.rss_path), "-f", "%M",
                sys.executable, "-m", "pytest", self.name, "-p", "no:cacheprovider"] + pytest_args
-        for d in deselect:
-            if d.split("::")[0] == self.name.split("::")[0]:
-                cmd += ["--deselect", d]
         self.log    = open(self.log_path, "w", encoding="utf-8")
         self.proc   = subprocess.Popen(cmd, cwd=ROOT, stdout=self.log, stderr=subprocess.STDOUT,
                                        start_new_session=True)
@@ -146,7 +142,7 @@ class Unit:
 
 # Scheduler ----------------------------------------------------------------------------------------
 
-def run_units(queue, jobs, args, out, pytest_args, deselect, results):
+def run_units(queue, jobs, args, out, pytest_args, results):
     """Run `queue` (longest first) with up to `jobs` units at once; return the killed units."""
     running, killed = [], []
     log = open(out / "pytest.log", "a", encoding="utf-8")
@@ -183,7 +179,7 @@ def run_units(queue, jobs, args, out, pytest_args, deselect, results):
                 fits_cap  = budget + unit.expected_gb <= args.max_gb
                 if (fits_free and fits_cap) or (not running and available_gb() >= args.kill_free + args.margin):
                     queue.remove(unit)
-                    unit.start(out, pytest_args, deselect)
+                    unit.start(out, pytest_args)
                     running.append(unit)
                     started = True
                     break
@@ -208,7 +204,6 @@ def main():
     parser.add_argument("--max-gb",      type=float, default=40.0,      help="Cap on the sum of the running units' expected peaks.")
     parser.add_argument("--kill-free",   type=float, default=6.0,       help="GB available below which the most recent unit is stopped.")
     parser.add_argument("--split-above", type=float, default=240.0,     help="Run a file per test when the record says it took longer (s).")
-    parser.add_argument("--with-27b",    action="store_true",           help="Include the local-27B GGUF test.")
     args = parser.parse_args(argv)
     if args.runslow:
         pytest_args = ["--runslow"] + pytest_args
@@ -217,7 +212,6 @@ def main():
     (out / "pytest.log").write_text("", encoding="utf-8")
     record_path = out / "record.json"
     record      = load_record(record_path)
-    deselect    = () if args.with_27b else DESELECT
 
     # Units: files, or their tests for the long/heavy ones.
     names = []
@@ -237,10 +231,10 @@ def main():
 
     start   = time.time()
     results = []
-    killed  = run_units(units, args.jobs, args, out, pytest_args, deselect, results)
+    killed  = run_units(units, args.jobs, args, out, pytest_args, results)
     if killed:
         print(f"\nRetrying {len(killed)} stopped unit(s) one at a time.", flush=True)
-        run_units(killed, 1, args, out, pytest_args, deselect, results)
+        run_units(killed, 1, args, out, pytest_args, results)
     wall = time.time() - start
 
     # Record: keep the last completed measurement of every unit (a file that was split keeps a

@@ -11,8 +11,6 @@ import subprocess
 import numpy as np
 import pytest
 
-from migen import run_simulation
-
 from gateware.units.deltanet_stream import DeltaNetStream, lanes_to_state, reference, state_to_lanes
 from gateware.core.core import TriXiumConfig
 

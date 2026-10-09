@@ -25,7 +25,7 @@ PROGS=trixium_smi trixium_load trixium_chat
 all: $(PROGS)
 
 liblitepcie.a: litepcie_dma.o litepcie_flash.o litepcie_helpers.o
-	ar rcs $@ $+
+	$(AR) rcs $@ $+
 	ranlib $@
 
 trixium_smi: liblitepcie.a trixium_smi.o

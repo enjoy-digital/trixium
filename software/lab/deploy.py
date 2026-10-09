@@ -68,7 +68,7 @@ BOARDS_INI = os.environ.get("TRIXIUM_BOARDS_INI", os.path.expanduser("~/.config/
 
 # The prompt "The capital of France is" in each model's own vocabulary (the 27B's tokenizer is
 # Qwen3.5's, not Qwen3's) and the reference continuation: the fp32 golden of each model (software/
-# fp32_check.py / model.golden --raw), checked on the cards.
+# lab/fp32_check.py / model.golden --raw), checked on the cards.
 MODELS = {
     #        tokenizer  prompt                     want                                       bench  timeout
     "1p7b": ("1.7b", "785 6722 315 9625 374", "12095 11 323 279 6722 315 17689 374 24081",    64,  1200), # " Paris, and the capital of Spain is Madrid"
@@ -244,7 +244,6 @@ def build_firmware(remote, out):
     binary = os.path.join(out, "trixium.bin")
     if remote.dry_run:
         print(f"# under flock {os.path.relpath(fw_dir, REPO)}/.build.lock: rm firmware/*.o firmware/trixium.bin")
-        remote.local([sys.executable, "-m", "model.asm", "firmware/progs.h"])
         remote.local(["make", "-C", "firmware", f"BUILD_DIR={out}"])
         remote.show(["cp", "firmware/trixium.bin", os.path.relpath(binary, REPO)])
         return binary
@@ -253,7 +252,6 @@ def build_firmware(remote, out):
         for f in glob.glob(os.path.join(fw_dir, "*.o")) + [os.path.join(fw_dir, "trixium.bin"), binary]:
             if os.path.exists(f):
                 os.remove(f)
-        remote.local([sys.executable, "-m", "model.asm", "firmware/progs.h"])
         remote.local(["make", "-C", "firmware", f"BUILD_DIR={out}"], pattern=r"(?i) error|OBJCOPY", check=False)
         if os.path.exists(os.path.join(fw_dir, "trixium.bin")):
             shutil.copy(os.path.join(fw_dir, "trixium.bin"), binary)

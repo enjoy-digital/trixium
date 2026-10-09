@@ -184,7 +184,7 @@ def test_rtl_scalar_ops_m4(backend):
         ("SNORME", "s7", "s0"),
         ("DONE",),
     ]
-    words = asm.PROGRAMS["_m4_scalar"] = lambda: prog
+    asm.PROGRAMS["_m4_scalar"] = lambda: prog
     try:
         for a in ([100, 23, 3], [1 << 20, 5, 12], [7, 0, 30], [-50, 20, 2],
                   [123456, -456, -3], [-17, 0, 0]):

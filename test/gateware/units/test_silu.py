@@ -291,7 +291,6 @@ def load_tables(dut):
 def check_run(dut, cmd, gates, mults, stalls=True):
     n = cmd["elements"]
     beats, words = (n + 7)//8, (n + 31)//32
-    inplace = cmd["dst"] == cmd["src_g"]
     mem = np.full(SIZE//4, SENTINEL, dtype=np.uint32)
     mem[cmd["src_g"]//4:cmd["src_g"]//4 + n] = gates
     mem[cmd["src_m"]//4:cmd["src_m"]//4 + n] = mults
