@@ -8,7 +8,7 @@
 firmware's integer decode.
 
 bons.embed_bfp_rows is a vectorized transcription of embed_row_bfp (firmware/infer.c) - the
-scalar reference below is the sim's embed_bfp_int (test/system/test_sim_smoke.py) lifted
+scalar reference below is the sim's embed_bfp_int (model/mirror.py) lifted
 verbatim. The table lets the card fetch a token's residual row with two engine fetches instead of ~47k
 cycles of CPU decode (-2.6%/token); a mismatch here would be a silent numerics
 change that the tiny-model token gate could only see for the tokens it happens to use.
@@ -27,7 +27,7 @@ from model.bons import embed_bfp_rows
 # Helpers ------------------------------------------------------------------------------------------
 
 def embed_bfp_int_ref(codes, scales):
-    """Scalar reference (test_sim_smoke.embed_bfp_int) for one row."""
+    """Scalar reference (model/mirror.py embed_bfp_int) for one row."""
     m11, e16 = bx.fp16_decompose(scales)
     e16min = int(e16.min())
     sh  = np.minimum(e16 - e16min, 20).astype(np.int64)

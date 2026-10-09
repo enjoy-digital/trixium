@@ -707,7 +707,7 @@ E_NORM = -11
 # Reference implementations ------------------------------------------------------------------------
 #
 # The same rules firmware applies (infer.c: op_quant8_sp, op_resid_add_sp) and the mirror
-# applies (test_sim_smoke.hybrid_generate).
+# applies (model/mirror.py hybrid_generate).
 
 def quant8_shift(amax):
     return 8 if amax == 0 else int(amax).bit_length() - 7

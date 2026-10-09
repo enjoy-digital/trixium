@@ -30,7 +30,7 @@ VECTORS = COMMON / "vectors"
 # Helpers ------------------------------------------------------------------------------------------
 
 def import_test(path):
-    """The test module at `path` (relative to test/), for its oracle or mirror.
+    """The test module at `path` (relative to test/), for its oracle.
 
     pytest imports test files by basename (no __init__.py in the tree: the basenames are
     unique), so the module already collected in this session is reused, never imported twice.
