@@ -6,7 +6,7 @@
 
 """The XCU1525's engine port path: the engine's AXI over LiteDRAM's bridge and converter.
 
-Memory note (measured with tools/run_tests_guarded.py): each test that builds a real
+Memory note (measured with test/run_guarded.py): each test that builds a real
 LiteDRAMCore peaks about 9.5 GB in Migen's simulator, and pytest keeps that between
 parametrizations, so the whole file in one process reaches 21 GB. Building the core and PHY
 model costs only 30 MB - the cost is the simulator's state over tens of thousands of cycles,

@@ -5,9 +5,10 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 # TriXium firmware (VexiiRiscv, bare metal), built against a LiteX build tree:
-#   make BUILD_DIR=../build/sim_xcu1525
+#   make BUILD_DIR=../build/sim_xcu1525   (or ./trixium_sim.py --firmware for the simulation)
 
 BUILD_DIR ?= ../build/sim_xcu1525
+PYTHON    ?= python3
 
 include $(BUILD_DIR)/software/include/generated/variables.mak
 include $(SOC_DIRECTORY)/software/common.mak
@@ -67,7 +68,7 @@ all: trixium.bin
 VREGS := $(shell grep -oE 'define TRIXIUM_VEC_VREGS [0-9]+' $(BUILD_DIR)/software/include/generated/soc.h 2>/dev/null | grep -oE '[0-9]+$$')
 VREGS := $(if $(VREGS),$(VREGS),8)
 progs.h: FORCE
-	cd .. && python3 -m model.asm firmware/progs.h --vregs $(VREGS)
+	cd .. && $(PYTHON) -m model.asm firmware/progs.h --vregs $(VREGS)
 FORCE:
 infer.o main.o vec.o resident.o: progs.h
 

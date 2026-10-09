@@ -21,7 +21,7 @@ from model.bons import BONSReader
 
 SIM_DIR = "build/sim/gateware"
 # Override to gate against a different channel count (rebuild the sim with the same
-# image first: TRIXIUM_SIM_IMAGE=... python3 trixium_sim.py).
+# image first: TRIXIUM_SIM_IMAGE=... ./trixium_sim.py --image ... --build).
 IMAGE   = os.environ.get("TRIXIUM_SIM_IMAGE", "models/tiny/bonsai-tiny-n2.img")
 
 def fnv1a(data):
@@ -551,7 +551,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
                     a8[i2*hd:(i2+1)*hd] = np.clip(
                         bx.rne_shift(rms[i2]*Mh, 15), -127, 127).astype(np.int8)
                 # Raw (mantissa, exponent) trace points: the firmware's `dbg` checksums the
-                # same scratchpad regions at the same points (tools/card_vs_mirror.py).
+                # same scratchpad regions at the same points (software/mirror.py).
                 if trace is not None:
                     trace(pos, (l, "attn_x8"), (a8.copy(), ea8))
                 res, er = matvec_i8(p + "attn_output.weight", a8, ea8)
