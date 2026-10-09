@@ -667,6 +667,52 @@ class Compiled:
 _COSIM = (RTL / "cosim.cpp").read_text()
 
 
+def module_handles(module, depth=3):
+    """({name: Signal}, {name: Memory}) of a module tree, for Compiled: the public Signal,
+    Record (stream endpoint) and Memory attributes, of submodules down to `depth` levels."""
+    signals, memories, seen = {}, {}, set()
+
+    def visit(obj, name, level):
+        if id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, Signal):
+            signals[name] = obj
+        elif isinstance(obj, Memory):
+            if obj.width % 8 == 0:
+                memories[name] = obj
+        elif isinstance(obj, Record):
+            for attr, value in vars(obj).items():
+                if not attr.startswith("_"):
+                    visit(value, f"{name}_{attr}", level)
+        elif isinstance(obj, (list, tuple)):
+            for i, value in enumerate(obj[:64]):
+                visit(value, f"{name}{i}", level)
+        elif isinstance(obj, Module) and level <= depth:
+            for attr, value in vars(obj).items():
+                if not attr.startswith("_"):
+                    visit(value, f"{name}_{attr}" if name else attr, level + 1)
+
+    visit(module, "", 0)
+    return signals, memories
+
+
+def run(dut, generators, backend="verilator", signals=None, memories=None, depth=3, name="tb",
+        key=None, **kwargs):
+    """run_simulation(dut, generators) on either backend: "migen" (Migen's simulator) or
+    "verilator" (Compiled). signals / memories: what the generators touch (default: every
+    handle module_handles() finds); kwargs go to Compiled.run (axi, aliases, cycles)."""
+    if backend == "migen":
+        run_simulation(dut, generators)
+        return
+    assert backend == "verilator", backend
+    if signals is None or memories is None:
+        found_signals, found_memories = module_handles(dut, depth)
+        signals  = found_signals  if signals  is None else signals
+        memories = found_memories if memories is None else memories
+    return Compiled(dut, signals, memories, name=name, key=key).run(generators, **kwargs)
+
+
 class _CosimRun:
     """One run of a Compiled DUT: the handles, Migen's value semantics, the scheduler."""
     def __init__(self, lib, h, compiled, aliases):

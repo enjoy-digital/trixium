@@ -30,6 +30,7 @@ from common import RTL
 from common.cluster import BACKEND, SoC, write, install_list
 from common.cluster import run as run_cluster
 from common.verilator import Simulator
+from common.verilator import run as run_tb
 
 # SiluMulKernel ------------------------------------------------------------------------------------
 # SiluMulKernel (portable RTL) against the bit-exact model, compiled with Verilator.
@@ -125,8 +126,10 @@ def test_model_reference_spot_checked_against_firmware():
             assert r == silu_mul_firmware(g, m), (hex(g), hex(m))
 
 
-def test_migen_simulation_small():
-    """The same kernel in Migen's simulator: a few hundred elements with stalls."""
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_migen_simulation_small(backend):
+    """The same kernel, Migen testbench (compiled, and on Migen's simulator in the slow tier):
+    a few hundred elements with stalls."""
     k = SiluMulKernel()
     lut, dlut = tables()
     gates, mults = stress_vectors(seed=21, n_random=200)
@@ -157,7 +160,7 @@ def test_migen_simulation_small():
             if len(got) == len(gates):
                 return
 
-    run_simulation(k, drive())
+    run_tb(k, drive(), backend)
     assert len(got) == len(want)
     for idx, ((r, f), (wr, wf)) in enumerate(zip(got, want)):
         assert f == wf, (idx, hex(gates[idx]), hex(mults[idx]))
@@ -312,7 +315,8 @@ def check_run(dut, cmd, gates, mults, stalls=True):
     return fixups
 
 
-def test_migen_runs_with_stalls_tails_and_inplace():
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_migen_runs_with_stalls_tails_and_inplace(backend):
     dut = SiluSP()
     gates, mults = stress_vectors(seed=31, n_random=300)
     # Put fixups next to exact elements in the first bitmap word.
@@ -327,7 +331,7 @@ def test_migen_runs_with_stalls_tails_and_inplace():
             cmd = run_cmd(src_g=0x9000, src_m=0xA000, dst=dst, fixmap=0xC000, elements=n)
             seen += yield from check_run(dut, cmd, gates[:n], mults[:n], stalls)
         assert seen > 0
-    run_simulation(dut, run())
+    run_tb(dut, run(), backend)
 
 
 REJECTS = [
@@ -360,7 +364,7 @@ def test_migen_rejects_before_memory_access(changed, mask):
         yield dut.unit.cancel.eq(0)
         yield
         assert not (yield dut.unit.error) and not (yield dut.unit.busy)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 @pytest.mark.parametrize("delay", [0, 1, 3, 7, 20, 60])
@@ -382,10 +386,9 @@ def test_migen_cancel_mid_run_then_clean_run(delay):
         assert not (yield dut.unit.busy) and not (yield dut.unit.error)
         cmd = run_cmd(src_g=0x9000, src_m=0xA000, dst=0x9000, fixmap=0xC000, elements=45)
         yield from check_run(dut, cmd, gates[:45], mults[:45])
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
-@pytest.mark.slow  # Migen simulator, ~4 min
 def test_migen_load_fills_both_tables():
     # Unloaded kernel memories, a real LOAD, then a run that touches both tables.
     dut = SiluSP(preload=False)
@@ -396,7 +399,7 @@ def test_migen_load_fills_both_tables():
         assert (yield dut.unit.read_beats) == LOAD_BEATS
         cmd = run_cmd(src_g=0x9000, src_m=0xA000, dst=0xB000, fixmap=0xC000, elements=64)
         yield from check_run(dut, cmd, gates[:64], mults[:64], stalls=False)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 def test_invalid_physical_sizes():

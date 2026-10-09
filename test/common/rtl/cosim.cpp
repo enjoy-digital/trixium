@@ -50,6 +50,7 @@ Cosim *cosim_new(const char *config) {
     c->sim.ctx = &c->ctx;
     c->sim.max_cycles = ~0ull;
     sim_bind(c->sim, *c->top);
+    c->top->eval();  // Initial blocks ($readmemh of the .init files): the caller's cwd is the build.
     guarded(c, [&]() {
         std::istringstream cfg(config);
         std::string line;
