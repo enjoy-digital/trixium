@@ -111,9 +111,21 @@ def cmd_console(args):
         cmd += ["-c", c]
     sys.exit(_run(cmd))
 
+
+def cmd_smi(args):
+    exe = os.path.join(REPO, "trixium", "software", "user", "trixium_smi")
+    if not os.path.exists(exe):
+        sys.exit(f"{exe} not built: make -C trixium/software/user BUILD_DIR=../../../build/<build>")
+    os.execv(exe, [exe] + args)
+
 # Main ---------------------------------------------------------------------------------------------
 
 def main(argv=None):
+    # smi passes everything through to trixium_smi (its own options and commands).
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["smi"]:
+        cmd_smi(argv[1:])
+
     parser = argparse.ArgumentParser(prog="trixium", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="cmd", required=True)
@@ -171,10 +183,7 @@ def main(argv=None):
     p.set_defaults(fn=cmd_console)
 
     # SMI.
-    from trixium import smi
-    p = subparsers.add_parser("smi", help="Card status: bitstream, PCIe link, clock, utilization, memory GB/s, model.")
-    smi.add_arguments(p)
-    p.set_defaults(fn=smi.run)
+    subparsers.add_parser("smi", help="Card status and diagnostics (runs trixium_smi; -h for its options).")
 
     args = parser.parse_args(argv)
     args.fn(args)

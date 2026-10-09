@@ -12,7 +12,7 @@ LDFLAGS=-g
 CC=$(CROSS_COMPILE)gcc
 AR=ar
 
-PROGS=trixium_util trixium_load trixium_chat
+PROGS=trixium_smi trixium_load trixium_chat
 
 all: $(PROGS)
 
@@ -20,7 +20,7 @@ liblitepcie/liblitepcie.a: liblitepcie/litepcie_dma.o liblitepcie/litepcie_flash
 	ar rcs $@ $+
 	ranlib $@
 
-trixium_util: liblitepcie/liblitepcie.a trixium_util.o
+trixium_smi: liblitepcie/liblitepcie.a trixium_smi.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -llitepcie
 
 trixium_load: trixium_loader.o trixium_load.o

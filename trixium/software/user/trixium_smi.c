@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  *
- * TriXium util (LitePCIe util on the /dev/trixiumN device)
+ * TriXium smi: card status (like nvidia-smi) and LitePCIe diagnostics on /dev/trixiumN
  *
- * This file is part of TriXium, derived from LitePCIe.
+ * This file is part of TriXium, derived from LitePCIe's litepcie_util.
  *
  * Copyright (C) 2018-2023 / EnjoyDigital  / florent@enjoy-digital.fr
  *
@@ -16,6 +16,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <dirent.h>
 #include "liblitepcie.h"
 
 /* Parameters */
@@ -75,6 +78,339 @@ static void info(void)
            (double)litepcie_readl(fd, CSR_XADC_VCCBRAM_ADDR) / 4096 * 3);
 #endif
     close(fd);
+}
+
+/* Status */
+/*--------*/
+
+/* The card's state, like nvidia-smi: identity and link, then the core's counters sampled twice
+ * over an interval (engine/vector busy cycles, done ops, beats and request-wait cycles per memory
+ * channel), then what the host tools recorded in TRIXIUM_STATE_DIR (weights, chat process). A
+ * monitor: it only reads registers, plus perf_chan (the per-channel counter mux, which the
+ * firmware only uses in its stall diagnostics). */
+
+#define TRIXIUM_STATE_DIR "/tmp/trixium"
+#define STATUS_WIDTH      88
+#define BEAT_BYTES        32 /* 256-bit AXI memory ports. */
+
+struct status_sample {
+    double   time;
+    uint32_t cyc_total, cyc_eng, cyc_vec, cyc_both, done;
+    uint32_t beats[TRIXIUM_N_CHANNELS];
+    uint32_t ar_wait[TRIXIUM_N_CHANNELS];
+};
+
+static double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec*1e-9;
+}
+
+static void status_sample(int fd, struct status_sample *s)
+{
+    s->time      = now_s();
+    s->cyc_total = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_CYC_TOTAL_ADDR);
+    s->cyc_eng   = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_CYC_ENG_ADDR);
+    s->cyc_vec   = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_CYC_VEC_ADDR);
+    s->cyc_both  = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_CYC_BOTH_ADDR);
+    s->done      = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_DONE_COUNT_ADDR);
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        litepcie_writel(fd, CSR_TRIXIUM_ENGINE_CSR_PERF_CHAN_ADDR, c);
+        s->beats[c]   = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_PERF_BEATS_ADDR);
+        s->ar_wait[c] = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_PERF_AR_ADDR);
+    }
+}
+
+/* PCIe link of the N-th Xilinx device (the driver creates its nodes without a PCI parent). */
+static int pcie_link(int devnum, char *addr, char *link, size_t n)
+{
+    struct dirent **names;
+    char path[512], speed[32] = "", width[16] = "", max_speed[32] = "", max_width[16] = "";
+    int count = scandir("/sys/bus/pci/devices", &names, NULL, alphasort);
+    int index = 0, found = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (!found && names[i]->d_name[0] != '.') {
+            char vendor[16] = "";
+            snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/vendor", names[i]->d_name);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(vendor, sizeof(vendor), f) && strtoul(vendor, NULL, 0) == 0x10ee &&
+                    index++ == devnum) {
+                    snprintf(addr, 32, "%.31s", names[i]->d_name);
+                    found = 1;
+                }
+                fclose(f);
+            }
+        }
+        free(names[i]);
+    }
+    if (count >= 0)
+        free(names);
+    if (!found)
+        return 0;
+
+    const char *attrs[4] = {"current_link_speed", "current_link_width",
+                            "max_link_speed", "max_link_width"};
+    char *values[4] = {speed, width, max_speed, max_width};
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/%s", addr, attrs[i]);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fgets(values[i], i % 2 ? 16 : 32, f))
+                values[i][strcspn(values[i], "\n")] = 0;
+            fclose(f);
+        }
+    }
+    /* "8.0 GT/s PCIe" -> Gen3. */
+    int gen = (int)(atof(speed)/2.5 + 0.5), max_gen = (int)(atof(max_speed)/2.5 + 0.5);
+    gen     = gen     >= 6 ? 4 : gen     >= 3 ? 3 : gen;
+    max_gen = max_gen >= 6 ? 4 : max_gen >= 3 ? 3 : max_gen;
+    if (gen == max_gen && !strcmp(width, max_width))
+        snprintf(link, n, "PCIe Gen%d x%s", gen, width);
+    else
+        snprintf(link, n, "PCIe Gen%d x%s (slot Gen%d x%s)", gen, width, max_gen, max_width);
+    return 1;
+}
+
+/* The host tools' records: {"key": value, ...} as written by loader_state_write. */
+static int state_read(int devnum, const char *kind, char *buf, size_t n)
+{
+    char path[256];
+    snprintf(path, sizeof(path), TRIXIUM_STATE_DIR "/trixium%d.%s.json", devnum, kind);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    size_t len = fread(buf, 1, n - 1, f);
+    buf[len] = 0;
+    fclose(f);
+    return len > 0;
+}
+
+static double state_num(const char *buf, const char *key)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\": ", key);
+    const char *p = strstr(buf, pattern);
+    return p ? atof(p + strlen(pattern)) : 0.0;
+}
+
+static void state_str(const char *buf, const char *key, char *out, size_t n)
+{
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\": \"", key);
+    const char *p = strstr(buf, pattern);
+    out[0] = 0;
+    if (p) {
+        p += strlen(pattern);
+        size_t len = strcspn(p, "\"");
+        snprintf(out, n, "%.*s", (int)(len < n ? len : n - 1), p);
+    }
+}
+
+/* Table output (UTF-8 box drawing, padded by visible characters). */
+static int utf8_width(const char *s)
+{
+    int n = 0;
+    for (; *s; s++)
+        n += ((*s & 0xc0) != 0x80);
+    return n;
+}
+
+static void status_line(const char *fmt, ...)
+{
+    char text[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    int pad = STATUS_WIDTH - 4 - utf8_width(text);
+    printf("│ %s%*s │\n", text, pad > 0 ? pad : 0, "");
+}
+
+static void status_head(const char *title, int first)
+{
+    int n = STATUS_WIDTH - 2;
+    printf("%s", first ? "╭" : "├");
+    if (title[0]) {
+        printf("─ %s ", title);
+        n -= utf8_width(title) + 3;
+    }
+    for (int i = 0; i < n; i++)
+        printf("─");
+    printf("%s\n", first ? "╮" : "┤");
+}
+
+static void status_bar(char *out, double x, int n)
+{
+    int k = (int)(x*n + 0.5);
+    k = k < 0 ? 0 : k > n ? n : k;
+    out[0] = 0;
+    for (int i = 0; i < n; i++)
+        strcat(out, i < k ? "█" : "░");
+}
+
+static void status(int devnum, double interval, int json)
+{
+    struct status_sample s0, s1;
+    char ident[256], addr[32] = "", link[96] = "PCIe n/a";
+    int fd;
+
+    fd = open(litepcie_device, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "Could not open %s (is the driver loaded?)\n", litepcie_device);
+        exit(1);
+    }
+
+    /* Identity and state. */
+    for (int i = 0; i < 255; i++)
+        ident[i] = litepcie_readl(fd, CSR_IDENTIFIER_MEM_BASE + 4*i);
+    ident[255] = 0;
+    pcie_link(devnum, addr, link, sizeof(link));
+    uint32_t eng_status = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_STATUS_ADDR);
+    uint32_t vec_status = litepcie_readl(fd, CSR_TRIXIUM_VECUNIT_STATUS_ADDR);
+    uint32_t bus_errors = litepcie_readl(fd, CSR_CTRL_BUS_ERRORS_ADDR);
+    int eng_error = (eng_status >> CSR_TRIXIUM_ENGINE_CSR_STATUS_ERROR_OFFSET) & 1;
+    int eng_run   = (eng_status >> CSR_TRIXIUM_ENGINE_CSR_STATUS_RUN_OFFSET) & 1;
+    int eng_busy  = (eng_status >> CSR_TRIXIUM_ENGINE_CSR_STATUS_BUSY_OFFSET) & 1;
+    int vec_bad   = (vec_status >> CSR_TRIXIUM_VECUNIT_STATUS_BAD_OP_OFFSET) & 1;
+#ifdef CSR_CPUMON_CPU_RESET_ADDR
+    const char *cpu = (litepcie_readl(fd, CSR_CPUMON_CPU_RESET_ADDR) & 1) ? "in reset" : "running";
+#else
+    const char *cpu = "n/a";
+#endif
+
+    /* Counters over the interval (32-bit, wrap-safe over a short interval). */
+    status_sample(fd, &s0);
+    usleep((useconds_t)(interval*1e6));
+    status_sample(fd, &s1);
+    close(fd);
+    double   dt     = s1.time - s0.time;
+    uint32_t cycles = s1.cyc_total - s0.cyc_total;
+    double   clk    = dt > 0 ? cycles/dt : 0;
+    double   u_eng  = cycles ? (double)(uint32_t)(s1.cyc_eng  - s0.cyc_eng)/cycles  : 0;
+    double   u_vec  = cycles ? (double)(uint32_t)(s1.cyc_vec  - s0.cyc_vec)/cycles  : 0;
+    double   u_both = cycles ? (double)(uint32_t)(s1.cyc_both - s0.cyc_both)/cycles : 0;
+    double   ops_s  = dt > 0 ? (uint32_t)(s1.done - s0.done)/dt : 0;
+    double   ch_util[TRIXIUM_N_CHANNELS], gbs = 0, ar_wait = 0;
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        uint32_t beats = s1.beats[c] - s0.beats[c];
+        ch_util[c] = cycles ? (double)beats/cycles : 0;
+        gbs       += dt > 0 ? beats*(double)BEAT_BYTES/dt/1e9 : 0;
+        ar_wait   += cycles ? (double)(uint32_t)(s1.ar_wait[c] - s0.ar_wait[c])/cycles : 0;
+    }
+    ar_wait /= TRIXIUM_N_CHANNELS;
+    double peak_gbs = TRIXIUM_N_CHANNELS*BEAT_BYTES*clk/1e9;
+#ifdef HBM_CHANNELS
+    const char *memory = "HBM2";
+#else
+    const char *memory = "DDR4";
+#endif
+
+    /* Host records. */
+    char load[2048], chat[2048], image[1024] = "", tool[64] = "", state[32] = "";
+    int has_load = state_read(devnum, "load", load, sizeof(load));
+    int has_chat = state_read(devnum, "chat", chat, sizeof(chat));
+    int chat_alive = 0;
+    if (has_load)
+        state_str(load, "image", image, sizeof(image));
+    if (has_chat) {
+        state_str(chat, "tool",  tool,  sizeof(tool));
+        state_str(chat, "state", state, sizeof(state));
+        chat_alive = kill((pid_t)state_num(chat, "pid"), 0) == 0 || errno == EPERM;
+    }
+
+    if (json) {
+        printf("{\"device\": \"%s\", \"pci\": \"%s\", \"link\": \"%s\", \"identifier\": \"%s\",\n",
+               litepcie_device, addr, link, ident);
+        printf(" \"clock_mhz\": %.3f, \"cpu\": \"%s\", \"bus_errors\": %u, \"engine_error\": %d, "
+               "\"vector_bad_op\": %d,\n", clk/1e6, cpu, bus_errors, eng_error, vec_bad);
+        printf(" \"seconds\": %.3f, \"engine\": %.4f, \"vector\": %.4f, \"overlap\": %.4f, "
+               "\"ops_s\": %.1f,\n", dt, u_eng, u_vec, u_both, ops_s);
+        printf(" \"memory\": \"%s\", \"channels\": %d, \"gbs\": %.3f, \"peak_gbs\": %.3f, "
+               "\"request_wait\": %.4f, \"channel_util\": [", memory, TRIXIUM_N_CHANNELS, gbs,
+               peak_gbs, ar_wait);
+        for (int c = 0; c < TRIXIUM_N_CHANNELS; c++)
+            printf("%s%.4f", c ? ", " : "", ch_util[c]);
+        printf("],\n \"load\": %s,\n \"chat\": %s}\n",
+               has_load ? load : "null", has_chat && chat_alive ? chat : "null");
+        return;
+    }
+
+    char bar[64], title[160], date[64];
+    time_t t = time(NULL);
+    strftime(date, sizeof(date), "%a %b %d %H:%M:%S %Y", localtime(&t));
+    printf("%-*s%s\n", STATUS_WIDTH - (int)strlen(date), "trixium_smi", date);
+    snprintf(title, sizeof(title), "Card %d · %.64s%s%s", devnum, litepcie_device,
+             addr[0] ? " · " : "", addr);
+    status_head(title, 1);
+    status_line("%-12s%s", "Bitstream", ident);
+    status_line("%-12s%-26ssys %.1f MHz (measured)", "Link", link, clk/1e6);
+    /* Sticky flags: the engine's error bit (reserved ternary code, result FIFO overflow or an
+     * attention record outside its geometry), the vector unit's unknown opcode, bus errors. */
+    char errors[96] = "";
+    if (eng_error)
+        strcat(errors, "engine-err ");
+    if (vec_bad)
+        strcat(errors, "vec-badop ");
+    if (bus_errors)
+        snprintf(errors + strlen(errors), sizeof(errors) - strlen(errors), "bus-err %u", bus_errors);
+    if (!errors[0])
+        strcpy(errors, "no errors");
+    status_line("%-12sCPU %-22sengine %-19s%s", "State", cpu,
+                eng_run ? "streaming" : eng_busy ? "busy" : "idle", errors);
+
+    snprintf(title, sizeof(title), "Utilization over %.0f ms", dt*1e3);
+    status_head(title, 0);
+    char bar2[64];
+    status_bar(bar, u_eng, 10);
+    status_bar(bar2, u_vec, 10);
+    status_line("Engine  %s %3.0f%%     Vector  %s %3.0f%%     Overlap %3.0f%%",
+                bar, 100*u_eng, bar2, 100*u_vec, 100*u_both);
+    status_line("%.0f engine ops/s", ops_s);
+
+    snprintf(title, sizeof(title), "Memory · %s · %d channels", memory, TRIXIUM_N_CHANNELS);
+    status_head(title, 0);
+    status_bar(bar, peak_gbs > 0 ? gbs/peak_gbs : 0, 10);
+    status_line("Read    %s %6.2f GB/s of %.1f GB/s port peak   request wait %3.0f%%",
+                bar, gbs, peak_gbs, 100*ar_wait);
+    for (int c0 = 0; c0 < TRIXIUM_N_CHANNELS; c0 += 6) {
+        char row[512] = "", cell[64];
+        for (int c = c0; c < c0 + 6 && c < TRIXIUM_N_CHANNELS; c++) {
+            status_bar(bar, ch_util[c], 4);
+            snprintf(cell, sizeof(cell), "%s%2d %s%3.0f%%", c > c0 ? "  " : "", c, bar,
+                     100*ch_util[c]);
+            strcat(row, cell);
+        }
+        status_line("%s", row);
+    }
+
+    status_head("Model", 0);
+    if (has_load) {
+        const char *name = strrchr(image, '/');
+        double age = difftime(time(NULL), (time_t)state_num(load, "time"));
+        char ago[32];
+        if (age < 120)
+            snprintf(ago, sizeof(ago), "%.0f s ago", age);
+        else if (age < 7200)
+            snprintf(ago, sizeof(ago), "%.0f min ago", age/60);
+        else
+            snprintf(ago, sizeof(ago), "%.1f h ago", age/3600);
+        status_line("%-12s%s  %.2f GiB, uploaded %s", "Weights", name ? name + 1 : image,
+                    state_num(load, "bytes")/(1 << 30), ago);
+    } else
+        status_line("%-12sunknown (no upload recorded)", "Weights");
+    if (has_chat && chat_alive)
+        status_line("%-12spid %.0f %s  %s, %.0f tokens, %.2f tok/s", "Process",
+                    state_num(chat, "pid"), tool, state, state_num(chat, "tokens"),
+                    state_num(chat, "tok_s"));
+    else
+        status_line("%-12snone", "Process");
+    printf("╰");
+    for (int i = 0; i < STATUS_WIDTH - 2; i++)
+        printf("─");
+    printf("╯\n");
 }
 
 /* Scratch */
@@ -479,24 +815,27 @@ end:
 
 static void help(void)
 {
-    printf("TriXium utilities\n"
-           "usage: trixium_util [options] cmd [args...]\n"
+    printf("TriXium smi: card status and diagnostics\n"
+           "usage: trixium_smi [options] [cmd [args...]]\n"
            "\n"
            "options:\n"
            "-h                                Help.\n"
            "-c device_num                     Select the device (default = 0).\n"
-           "-z                                Enable zero-copy DMA mode.\n"
-           "-e                                Use external loopback (default = internal).\n"
-           "-w data_width                     Width of data bus (default = 16).\n"
-           "-a                                Automatic DMA RX-Delay calibration.\n"
-           "-t duration                       Duration of the test in seconds (default = 0, infinite).\n"
+           "-l seconds                        Status: refresh every N seconds.\n"
+           "-i seconds                        Status: counter sampling interval (default = 0.25).\n"
+           "-j                                Status: JSON output.\n"
+           "-z                                DMA test: zero-copy mode.\n"
+           "-e                                DMA test: external loopback (default = internal).\n"
+           "-w data_width                     DMA test: data bus width (default = 16).\n"
+           "-a                                DMA test: automatic RX-delay calibration.\n"
+           "-t duration                       DMA test: duration in seconds (default = 0, infinite).\n"
            "\n"
            "available commands:\n"
-           "info                              Get Board information.\n"
-           "\n"
-           "dma_test                          Test DMA.\n"
-           "scratch_test                      Test Scratch register.\n"
-           "\n"
+           "(none)                            Card status: bitstream, link, clock, utilization,\n"
+           "                                  memory GB/s per channel, model and process.\n"
+           "info                              FPGA identifier, DNA, temperature.\n"
+           "scratch_test                      Test the scratch register.\n"
+           "dma_test                          Test the PCIe DMA.\n"
 #ifdef CSR_FLASH_BASE
            "flash_write filename [offset]     Write file contents to SPI Flash.\n"
            "flash_read filename size [offset] Read from SPI Flash and write contents to file.\n"
@@ -518,6 +857,9 @@ int main(int argc, char **argv)
     static int litepcie_data_width;
     static int litepcie_auto_rx_delay;
     static int test_duration = 0; /* Default to 0 for infinite duration.*/
+    double status_loop     = 0;
+    double status_interval = 0.25;
+    int    status_json     = 0;
 
     litepcie_device_num = 0;
     litepcie_data_width = 16;
@@ -527,7 +869,7 @@ int main(int argc, char **argv)
 
     /* Parameters. */
     for (;;) {
-        c = getopt(argc, argv, "hc:w:zeat:");
+        c = getopt(argc, argv, "hc:w:zeat:l:i:j");
         if (c == -1)
             break;
         switch(c) {
@@ -552,17 +894,35 @@ int main(int argc, char **argv)
         case 't':
             test_duration = atoi(optarg);
             break;
+        case 'l':
+            status_loop = atof(optarg);
+            break;
+        case 'i':
+            status_interval = atof(optarg);
+            break;
+        case 'j':
+            status_json = 1;
+            break;
         default:
             exit(1);
         }
     }
 
-    /* Show help when too much args. */
-    if (optind >= argc)
-        help();
-
     /* Select device. */
     snprintf(litepcie_device, sizeof(litepcie_device), "/dev/trixium%d", litepcie_device_num);
+
+    /* Status (default command). */
+    if (optind >= argc) {
+        do {
+            if (status_loop > 0 && !status_json)
+                printf("\033[H\033[J");
+            status(litepcie_device_num, status_interval, status_json);
+            fflush(stdout);
+            if (status_loop > 0)
+                usleep((useconds_t)(status_loop*1e6));
+        } while (status_loop > 0);
+        return 0;
+    }
 
     cmd = argv[optind++];
 

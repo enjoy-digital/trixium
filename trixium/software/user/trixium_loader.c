@@ -290,7 +290,7 @@ uint64_t loader_upload_firmware(const char *path)
     return (uint64_t)len;
 }
 
-/* Card state for trixium smi */
+/* Card state for trixium_smi */
 /*----------------------------*/
 
 void loader_state_write(int devnum, const char *kind, const char *fmt, ...)

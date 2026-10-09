@@ -520,7 +520,7 @@ static int serialboot(const char *fw)
     return 0;
 }
 
-/* Card state for trixium smi */
+/* Card state for trixium_smi */
 /*----------------------------*/
 
 static void chat_state(int devnum, const char *state, long tokens, double tok_s)
