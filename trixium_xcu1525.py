@@ -379,8 +379,6 @@ def main():
         os.environ["PYTHONHASHSEED"] = "0"
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    from gateware.migen_fast import install as install_migen_fast
-    install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
     from software.timing import gate
     parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform, description="TriXium on the SQRL XCU1525.")
@@ -432,7 +430,7 @@ def main():
             if builder.compile_gateware:
                 write_verdict(verdict, 1)
             raise
-        generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
+        generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"), name="trixium")
 
         # A successful Vivado run is not a qualified bitstream: the timing gate decides. The strict
         # release verdict is printed for information; DDR4-1500 runs the USPDDRPHY's ISERDES past

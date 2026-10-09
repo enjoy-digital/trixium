@@ -327,7 +327,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 
     # Copy.
     remote.ssh(f"mkdir -p {shlex.quote(conf['dir'])} && cd {shlex.quote(conf['dir'])} && mkdir -p prog "
-        "gen/software/include/generated gen/driver/kernel kernel user/liblitepcie software "
+        "gen/software/include/generated gen/driver/kernel gen/driver/user/liblitepcie user software "
         "models/1.7b models/8b models/27b", cd=False, check=True)
     tools = ["__init__.py", "board.py", "console.py", "cpurst.py", "cpumon.py", "rdlevel.py",
         "driver.py", "client.py", "mirror.py", "fp32_check.py"]
@@ -347,32 +347,26 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
             shutil.copy(bit,    os.path.join(archive, f"{name}.bit"))
             shutil.copy(report, os.path.join(archive, f"{name}_timing.rpt"))
         if board == "fk33":
-            # The FK33's OpenOCD configuration (trixium_fk33.py) for software/board.py reconfigure.
-            sys.path.insert(0, REPO)
-            from trixium_fk33 import OPENOCD_FK33_CFG
-            cfg = os.path.join(out, "openocd_fk33.cfg")
-            if not dry_run:
-                with open(cfg, "w", encoding="utf-8") as f:
-                    f.write(OPENOCD_FK33_CFG)
+            # The FK33's OpenOCD configuration (litex-boards) for software/board.py reconfigure.
+            import litex_boards
+            cfg = os.path.join(os.path.dirname(litex_boards.__file__), "prog", "openocd_xcvu33p_ft2232.cfg")
             remote.scp([cfg], "openocd_fk33.cfg")
         remote.scp([bit], "prog/csr.bit")
         generated = [os.path.join(out, "software", "include", "generated", h) for h in ["csr.h", "soc.h", "mem.h"]]
         remote.scp(generated, "gen/software/include/generated/")
-        remote.scp([os.path.join(drv, h) for h in ["csr.h", "soc.h", "mem.h"]], "gen/driver/kernel/")
-        # The driver: the project's own module (software/kernel: trixium.ko, /dev/trixium0) built
-        # ON THE HOST against its kernel with this build's flavour headers - the generated driver
-        # dir is stock LitePCIe and the CSR map differs per build.
-        remote.scp([os.path.join("software", "kernel", f) for f in ["Makefile", "main.c", "liteuart.c", "litepcie.h", "litex.h"]], "kernel/")
-        remote.scp([os.path.join(drv, h) for h in ["csr.h", "soc.h", "mem.h", "config.h", "flags.h"]], "kernel/")
+        # The driver: the build's generated LitePCIe driver (name "trixium": trixium.ko,
+        # /dev/trixium0) and liblitepcie, built ON THE HOST against its kernel.
+        remote.scp(sorted(glob.glob(os.path.join(drv, "*"))), "gen/driver/kernel/")
+        remote.scp(sorted(glob.glob(os.path.join(out, "driver", "user", "liblitepcie", "*.[ch]"))),
+            "gen/driver/user/liblitepcie/")
         # Every host-tool source: the loader module, the tools and their Makefile change together.
         remote.scp([os.path.join("software", "user", f) for f in ["trixium_loader.c", "trixium_loader.h",
             "trixium_load.c", "trixium_chat.c", "trixium_smi.c", "Makefile"]], "user/")
-        remote.scp(sorted(glob.glob(os.path.join(REPO, "software", "user", "liblitepcie", "*.[ch]"))), "user/liblitepcie/")
         # The tokenizers (the C chat tool wants the .bin, the Python client the .json).
         for m in ["1.7b", "8b", "27b"]:
             if os.path.exists(os.path.join(REPO, "models", m, "tokenizer.bin")):
                 remote.scp([os.path.join("models", m, f) for f in ["tokenizer.bin", "tokenizer.json"]], f"models/{m}/")
-        rc, _ = remote.ssh("cd kernel && rm -f *.ko *.o *.mod* .*.cmd && (make 2>&1 | grep -iE ' error' | head -3); "
+        rc, _ = remote.ssh("cd gen/driver/kernel && rm -f *.ko *.o *.mod* .*.cmd && (make 2>&1 | grep -iE ' error' | head -3); "
             "ls trixium.ko liteuart.ko")
         if rc:
             raise DeployError("driver build failed on the host")
@@ -393,7 +387,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 
         # Drivers + host tools.
         say("drivers + host tools")
-        remote.ssh(f"{sudo} python3 -m software.driver load --dir kernel", check=True)
+        remote.ssh(f"{sudo} python3 -m software.driver load --dir gen/driver/kernel", check=True)
         remote.ssh(f"{sudo} dmesg | grep -m1 'Version TriXium'; lspci -nn | grep -E '10ee:'")
         remote.ssh("cd user && rm -f *.o *.d trixium_load trixium_chat trixium_smi && "
             "(make BUILD_DIR=../gen 2>&1 | grep -i error | head -3); ls trixium_load trixium_chat trixium_smi", check=True)

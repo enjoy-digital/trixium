@@ -6,12 +6,13 @@
 
 """Load/unload trixium.ko + liteuart.ko and open up the device nodes.
 
-  trixium driver load                         # software/kernel (built with `make` there)
+  trixium driver load                         # build/xcu1525/driver/kernel (the build's driver)
+  trixium driver load --dir build/fk33/driver/kernel
   trixium driver unload
-  sudo python3 -m software.driver load --dir kernel   # on a board host, without the CLI
+  sudo python3 -m software.driver load --dir gen/driver/kernel   # on a board host
 
-`make install` in software/kernel sets up udev and modules-load.d for the persistent version
-of this. Runs itself through sudo when not root.
+The driver is the build's generated LitePCIe driver (name "trixium"). Runs itself through sudo
+when not root.
 """
 
 import os
@@ -22,7 +23,8 @@ import subprocess
 
 # Paths --------------------------------------------------------------------------------------------
 
-KERNEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel")
+KERNEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "build", "xcu1525", "driver", "kernel")
 
 # Helpers ------------------------------------------------------------------------------------------
 

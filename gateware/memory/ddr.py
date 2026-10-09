@@ -11,7 +11,7 @@ ways, measured on the real LiteDRAM core in simulation:
 
 - a 256-bit crossbar port: LiteDRAM's native up-converter groups two 256-bit commands into
   one 512-bit controller word through a five-state FSM - ~5 cycles per word even with reads
-  pipelined (docs/patches/litedram-native-port-upconverter-pipelined-reads.patch). 2.55
+  pipelined (LiteDRAMNativePortUpConverter read_depth). 2.55
   cycles/beat for a lone stream, 4.3 with four ports on one controller;
 - a 512-bit crossbar port behind LiteX's AXIUpConverter: every 256-bit beat becomes a
   single 512-bit transaction on the lane its address selects. Twice the DRAM traffic, but

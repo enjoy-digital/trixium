@@ -215,7 +215,7 @@ def main(argv=None):
     # Driver.
     p = subparsers.add_parser("driver", help="Load/unload trixium.ko + liteuart.ko (through sudo).")
     p.add_argument("action", choices=["load", "unload"],                                    help="Load or unload.")
-    p.add_argument("--dir",  default=os.path.join(REPO, "software", "kernel"),              help="Directory of the built modules.")
+    p.add_argument("--dir",  default=os.path.join(REPO, "build", "xcu1525", "driver", "kernel"), help="Directory of the built modules.")
     p.set_defaults(fn=cmd_driver)
 
     # Chat.

@@ -53,30 +53,14 @@ from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable
 from litex_boards.platforms.sqrl_fk33 import Platform
 
-from litex.build.openocd import OpenOCD
 
 # Constants ----------------------------------------------------------------------------------------
 
 # The HBM IP: stack clock 800 MHz (PLL divider 8), AXI clock window 200..400 MHz (PG276).
 HBM_XCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateware", "hbm", "hbm_800.xci")
 
-# The FK33 over its onboard FT2232 (micro-USB): the part is monolithic (single SLR), irlen 6,
-# IDCODE 0x04b69093 (the non-CIV variant; the _CIV part reads 0x04b6d093). openFPGALoader reports
-# "done 1" on this board without configuring it: its JPROGRAM restarts the master-SPI boot and the
-# factory flash image wins the race. openocd's virtex2 pld driver (the CFG_IN/JSTART opcodes are
-# the same on UltraScale+) loads it correctly, ~34 s. openocd 0.11 syntax. The IR capture reads
-# 0x35 = DONE+INIT+ISC_DONE when configured (append '-ircapture 0x00 -irmask 0x3f' to the tap).
-OPENOCD_FK33_CFG = """\
-interface ftdi
-ftdi_vid_pid 0x0403 0x6010
-ftdi_channel 0
-ftdi_layout_init 0x00e8 0x60eb
-reset_config none
-adapter_khz 5000
-set _CHIPNAME xcvu33p
-jtag newtap $_CHIPNAME tap -irlen 6 -expected-id 0x04b69093
-pld device virtex2 xcvu33p.tap 1
-"""
+# Programming: litex-boards' OpenOCD programmer (onboard FT2232, pld load): openFPGALoader
+# reports "done" on this board while the factory flash image wins the race.
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -122,9 +106,7 @@ class TriXiumFK33SoC(SoCCore):
         # HBM --------------------------------------------------------------------------------------
         # 32 pseudo-channels: channel 0 is the CPU's main_ram, channels 1..N the TriXium memory
         # ports (their own AXI ports: the SoC bus bridges do not burst).
-        hbm = USPHBM2(platform, hbm_ip_name="hbm_800")
-        # USPHBM2 adds <cwd>/ip/hbm/<name>.xci: use the repository's IP instead.
-        hbm.add_sources = lambda platform: platform.add_ip(HBM_XCI)
+        hbm = USPHBM2(platform, hbm_ip_name="hbm_800", xci_path=HBM_XCI)
         self.hbm = hbm = ClockDomainsRenamer({"axi": "sys"})(hbm)
         add_usphbm2_pseudochannels(soc=self, hbm=hbm, channels=(0,), main_channel=0)
         set_main_ram_executable(self)
@@ -188,15 +170,6 @@ VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1"
 VEXII_ARGS = ("--fetch-l1-ways=4 --fetch-l1-sets=128 --lsu-l1-ways=4 --lsu-l1-sets=128 "
     "--with-btb --with-ras --with-gshare --with-rvZcbm --with-rvZbb")
 
-class OpenOCDFK33(OpenOCD):
-    """OpenOCD pld load with OPENOCD_FK33_CFG (goes away once litex-boards' sqrl_fk33 has it)."""
-    def __init__(self, config_dir):
-        config = os.path.abspath(os.path.join(config_dir, "openocd_fk33.cfg"))
-        with open(config, "w", encoding="utf-8") as f:
-            f.write(OPENOCD_FK33_CFG)
-        OpenOCD.__init__(self, config)
-
-
 def set_vivado_env(path):
     """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
     if path and os.path.exists(os.path.join(path, "settings64.sh")):
@@ -216,8 +189,6 @@ def main():
         os.environ["PYTHONHASHSEED"] = "0"
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    from gateware.migen_fast import install as install_migen_fast
-    install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
     from software.timing import gate
     parser = LiteXArgumentParser(platform=Platform, description="TriXium on the SQRL FK33.")
@@ -263,7 +234,7 @@ def main():
             if builder.compile_gateware:
                 write_verdict(verdict, 1)
             raise
-        generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
+        generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"), name="trixium")
 
         # The FK33 ships on the empirical gate (no worse than the builds that have run on the
         # card): no FK33 build has ever closed the strict gate (v16b: WNS -0.315 ns).
@@ -276,7 +247,7 @@ def main():
                 sys.exit(rc)
 
     if args.load:
-        prog = OpenOCDFK33(builder.gateware_dir)
+        prog = soc.platform.create_programmer()
         prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":

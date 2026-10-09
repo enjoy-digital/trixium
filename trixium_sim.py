@@ -441,8 +441,6 @@ def main():
 
     # Build.
     if args.build:
-        from gateware.migen_fast import install as install_migen_fast
-        install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
         build_sim(args, board, out_dir)
 
     # Firmware.
