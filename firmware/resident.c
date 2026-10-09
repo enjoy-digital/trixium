@@ -864,8 +864,15 @@ int resident_silu_init(const float *lut, uint32_t *stage)
     // What the unit read must be the image: compare the scratchpad copy word for word.
     const volatile uint32_t *w = (const volatile uint32_t *)(SCRATCHPAD_BASE + RS_F);
     uint32_t bad = 0, first = 0;
+#ifndef TRIXIUM_SIM
     for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++)
         if (w[i] != stage[i] && !bad++) first = i;
+#else
+    // Simulation: 8,200 uncached reads (~0.27M cycles, ~13 s of Verilator) skipped. This
+    // only names a bad DMA as such: the self-test below still fails on a bad table, and the
+    // gate's FFN activations run through it.
+    (void)w;
+#endif
     if (bad) {
         printf("resident: silu table image in the scratchpad differs in %lu words (first %lu) - off\n",
                (unsigned long)bad, (unsigned long)first);

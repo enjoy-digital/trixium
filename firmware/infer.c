@@ -3680,6 +3680,7 @@ int infer_init(void)
         n_pos = 0;
         heap_hi = 0;
         int rc = hybrid_init();
+        SIM_MARK("hybrid_init");
         // The hybrid allocator may halve the requested context to fit main_ram. The
         // request/generation bounds must use that allocation too, otherwise forward()
         // hits its smaller cap and its -1 sentinel can be emitted as a token.
