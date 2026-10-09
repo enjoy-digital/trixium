@@ -21,12 +21,11 @@ from pathlib import Path
 
 # Paths --------------------------------------------------------------------------------------------
 
-COMMON  = Path(__file__).resolve().parent   # test/common: the C oracles.
-TEST    = COMMON.parent                     # test/
-ROOT    = TEST.parent                       # The repository.
-DATA    = COMMON / "data"                   # Archived traces and benchmark logs.
-RTL     = COMMON / "rtl"                    # Verilator C++ harnesses.
-VECTORS = COMMON / "vectors"
+COMMON = Path(__file__).resolve().parent # test/common: the C oracles.
+TEST   = COMMON.parent                   # test/
+ROOT   = TEST.parent                     # The repository.
+DATA   = COMMON / "data"                 # Archived traces and benchmark logs.
+RTL    = COMMON / "rtl"                  # Verilator C++ harnesses.
 
 # Helpers ------------------------------------------------------------------------------------------
 

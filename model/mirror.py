@@ -328,25 +328,6 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
         fs = f32(np.ldexp(f32(1.0)/f32(P8), Rpre - Bv))
         return red.astype(f32)*fs
 
-    def kv_hbm_scores(l, kvh, qh):
-        eq = 0
-        amax = np.abs(qh).max()
-        if amax > 0:
-            eq = int(np.frexp(f32(amax))[1]) - 7
-        q8 = np.clip(lroundf(qh*f32(np.exp2(-eq))), -127, 127).astype(np.int8)
-        rowsd  = hbm_kv[(l, kvh, 0)]
-        ekmax  = max(e for e, _ in rowsd)
-        B      = 22 - ekmax
-        bound  = (hd//32)*32*127*127*1024 << 12
-        R      = 0
-        while (bound >> R) >= (1 << 31):
-            R += 1
-        scales = np.array([[2.0**e]*(hd//32) for e, _ in rowsd], dtype=np.float16)
-        codes  = np.stack([c for _, c in rowsd])
-        res    = bx.matvec_q8(scales, codes, q8, B, R)
-        fs     = f32(np.ldexp(f32(1.0/np.sqrt(hd)), eq - B + R))
-        return res.astype(f32)*fs
-
     def rmsnorm_f(x, w):
         ss = fsum32(x*x)
         r  = f32(1.0)/np.sqrt(f32(f32(ss/f32(len(x))) + f32(eps)))

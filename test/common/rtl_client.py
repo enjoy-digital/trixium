@@ -76,15 +76,12 @@ int main(int argc, char **argv) {{
 '''
 
 
-def build_client(dut, layout, tmp_path, top, key=None):
-    """The compiled client (a common.verilator.Simulator). tmp_path is unused: the build is
-    cached under build/verilator/. With `key`, `dut` is a factory (called on a cache miss
-    only: a hit neither constructs nor converts the client)."""
-    driver = _driver(layout)
-    if key is not None:
-        return Simulator(lambda: _construct(dut(), layout), name=top, driver=driver,
-                         key=f"rtl_client:{key}")
-    return Simulator(**_construct(dut, layout), name=top, driver=driver)
+def build_client(factory, layout, top, key):
+    """The compiled client (a common.verilator.Simulator), cached under build/verilator/ by
+    `key`: `factory` builds the client on a cache miss only (a hit neither constructs nor
+    converts it)."""
+    return Simulator(lambda: _construct(factory(), layout), name=top, driver=_driver(layout),
+                     key=f"rtl_client:{key}")
 
 
 def _construct(dut, layout):

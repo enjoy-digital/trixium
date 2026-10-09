@@ -77,7 +77,6 @@ DDR4_SIM_CHAN_STRIDE = 0x0040_0000 # 4 MB.
 DDR4_SIM_CHAN_SKEW   = 0xA000      # 40 KB.
 DDR4_SIM_CSR_WINDOW  = 0xF0020000  # The target's DDR_CSR_WINDOW.
 DDR_SPLIT_CLK_RATIO  = 2           # ddr clock / sys clock in the simulation.
-DDR4_SIM_CSR_PAGE0   = 8           # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
 
 # The ROM holds no BIOS, only a jump to the firmware in main_ram (`lui t0, MAIN_RAM_BASE;
