@@ -25,6 +25,7 @@ from common import RTL
 from common.cluster import BACKEND, SoC, write, install_list
 from common.cluster import run as run_cluster
 from common.verilator import Simulator, file_key
+from common.verilator import run as run_tb
 
 # IntegerHadamard ----------------------------------------------------------------------------------
 # Independent dense integer oracle; no floating-point butterfly reference.
@@ -120,10 +121,11 @@ def test_integer_hadamard_dense_equivalence(size, lanes, width, inverse):
     values[0] = -(1 << (width-1))
     signs = [rng.choice([-1, 1]) for _ in range(size)]
     dut = IntegerHadamard(size, lanes, width)
-    run_simulation(dut, command(dut, values, signs, inverse))
+    run_tb(dut, command(dut, values, signs, inverse))
 
 
-def test_integer_hadamard_extremes_reuse_and_dense_rate():
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_integer_hadamard_extremes_reuse_and_dense_rate(backend):
     dut = IntegerHadamard()
     size, lanes = dut.block_size, dut.lanes
 
@@ -138,7 +140,7 @@ def test_integer_hadamard_extremes_reuse_and_dense_rate():
             assert all(b == a + 1 for a, b in zip(cycles, cycles[1:]))
             # 128 input cycles + 10*(64 issue + 1 drain) + one output-read cycle.
             assert cycles[0] <= size//lanes + 10*(size//(2*lanes) + 1) + 2
-    run_simulation(dut, run())
+    run_tb(dut, run(), backend)
 
 
 def test_integer_hadamard_matches_dense_engine_rotation_contract():
@@ -167,7 +169,7 @@ def test_integer_hadamard_matches_dense_engine_rotation_contract():
             engine = bx.matvec_ternary(scales, codes, values, bias, shift)
             assert np.array_equal(engine.astype(np.int64), raw << 14)
             yield from command(dut, values.tolist(), signs.tolist(), stalls=False)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 @pytest.mark.parametrize("last_word", [0, None])
@@ -318,7 +320,7 @@ def test_hadamard_shared_scratchpad_words_signs_bounds_and_reuse(inverse):
         yield from run_command(dut, inverse=inverse)
         yield
         yield from run_command(dut, inverse=not inverse, seed=11)
-    run_simulation(dut, run())
+    run_tb(dut, run())
 
 
 @pytest.mark.parametrize('changed,mask', [

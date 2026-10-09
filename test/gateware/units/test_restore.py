@@ -30,6 +30,7 @@ from common import COMMON, RTL
 from common.cluster import run as run_cluster
 from common.cluster import SoC, write, install_list
 from common.verilator import Simulator
+from common.verilator import run as run_tb
 
 # I32ToFp32Scaled ----------------------------------------------------------------------------------
 # IEEE binary32 scalar oracle, independent of the RTL normalization/shifts.
@@ -143,7 +144,7 @@ def exercise(dut, inputs, stalls=True, cancels=()):
 
 def test_projection_restore_all_exponents_rounding_boundaries():
     dut = I32ToFp32Scaled()
-    run_simulation(dut, exercise(dut, vectors(), stalls=False))
+    run_tb(dut, exercise(dut, vectors(), stalls=False))
 
 
 @pytest.mark.parametrize('lanes', [1, 2, 8, 16])
@@ -152,7 +153,7 @@ def test_projection_restore_elastic_cancel(lanes):
     inputs = [([rng.getrandbits(32) for _ in range(lanes)], rng.randrange(-160, 140),
                i % 13 == 0, i % 13 == 12) for i in range(400)]
     dut = I32ToFp32Scaled(lanes)
-    run_simulation(dut, exercise(dut, inputs, cancels=(1, 2, 11, 78, 143, 301)))
+    run_tb(dut, exercise(dut, inputs, cancels=(1, 2, 11, 78, 143, 301)))
 
 
 def test_projection_restore_invalid_lanes():
@@ -295,7 +296,8 @@ def valid(dut, words, *, exponent=0, adjustment=0, inplace=False, dst=None):
 
 
 @pytest.mark.parametrize('inplace', [False, True])
-def test_restore_sp_stalls_tail_scales_and_reuse(inplace):
+@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+def test_restore_sp_stalls_tail_scales_and_reuse(inplace, backend):
     dut = RestoreSP()
     rng = random.Random(927)
     def run():
@@ -303,7 +305,7 @@ def test_restore_sp_stalls_tail_scales_and_reuse(inplace):
                                             (8, 0, 0), (3, -127, -22), (257, -65, 32)):
             words = [rng.getrandbits(32) for _ in range(count)] if exponent != 127 else [0]
             yield from valid(dut, words, exponent=exponent, adjustment=adjustment, inplace=inplace)
-    run_simulation(dut, run())
+    run_tb(dut, run(), backend)
 
 
 def test_restore_sp_exact_end_and_readonly_metadata_alias():
