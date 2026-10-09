@@ -21,7 +21,7 @@ ways, measured on the real LiteDRAM core in simulation:
 
 DDR domain. add_ddr_domain_controllers places the controllers in their own `ddr` clock
 domain (the SoC's add_sdram, by hand). It is shared by the XCU1525 target (--ddr-clk-freq,
-USPDDRPHYs) and the simulation (--ddr-split, LiteDRAM's PHY model on a second sim clock), so
+USPDDRPHYs) and the simulation (trixium_sim.py --board xcu1525, LiteDRAM's PHY model on a second sim clock), so
 the split SoC boots in simulation before it goes on the board.
 
 Each core is renamed {sys: ddr, sys_port: sys}: its crossbar ports, requested with

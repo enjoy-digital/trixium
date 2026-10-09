@@ -16,7 +16,7 @@ Two references live here:
   validated against FloatModel.
 
 CLI smoke test:
-  .venv/bin/python -m model.golden --gguf models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf \
+  .venv/bin/python -m model.golden --gguf models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf \
       --tokenizer models/1.7b/tokenizer.json --prompt "The capital of France is" -n 8
 """
 
@@ -440,7 +440,7 @@ class FloatModel:
         h = rmsnorm(x[-1], self.t["output_norm.weight"], cfg.rms_eps)
         return self._rot(h) @ self.head_out.T  # (V,)
 
-    def generate(self, tokens, n, greedy=True):
+    def generate(self, tokens, n):
         """Greedy continuation; returns the generated ids."""
         out    = []
         logits = self.forward(list(tokens))

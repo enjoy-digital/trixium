@@ -12,7 +12,7 @@ Subcommands:
   verify   --image IMG               - re-CRC all tensor payloads.
 
 Vocab-sharded tensors (embeddings/LM head) are row-padded to divide the channel count with
-zero-weight rows (code 1 -> w = 0, scale 0); the top-k unit masks rows >= vocab."""
+zero-weight rows (code 1 -> w = 0, scale 0); the firmware never picks a row >= vocab."""
 
 import sys
 import time

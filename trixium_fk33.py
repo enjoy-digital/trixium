@@ -39,6 +39,8 @@ from migen import *
 
 from litex.gen import *
 
+from litex_boards.platforms.sqrl_fk33 import Platform
+
 from litex.soc.cores.clock import *
 from litex.soc.cores.led import LedChaser
 from litex.soc.cores.ram.xilinx_usp_hbm2 import USPHBM2, add_usphbm2_pseudochannels
@@ -53,16 +55,11 @@ from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
-from litex_boards.platforms.sqrl_fk33 import Platform
-
 
 # Constants ----------------------------------------------------------------------------------------
 
 # The HBM IP: stack clock 800 MHz (PLL divider 8), AXI clock window 200..400 MHz (PG276).
 HBM_XCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateware", "hbm", "hbm_800.xci")
-
-# Programming: litex-boards' OpenOCD programmer (onboard FT2232, pld load): openFPGALoader
-# reports "done" on this board while the factory flash image wins the race.
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -225,7 +222,7 @@ def main():
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"), name="trixium")
 
         # The FK33 ships on the empirical gate (no worse than the builds that have run on the
-        # card): no FK33 build has ever closed the strict gate (v16b: WNS -0.315 ns).
+        # card): no FK33 build has closed the strict gate.
         if builder.compile_gateware:
             report = os.path.join(builder.gateware_dir, f"{soc.platform.name}_timing.rpt")
             print("\nTiming gate:")
@@ -234,6 +231,8 @@ def main():
             if rc:
                 sys.exit(rc)
 
+    # Load: litex-boards' OpenOCD programmer (onboard FT2232, pld load); openFPGALoader reports
+    # "done" on this board while the factory flash image wins the race.
     if args.load:
         prog = soc.platform.create_programmer()
         prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))

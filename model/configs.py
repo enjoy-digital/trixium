@@ -28,7 +28,7 @@ class ModelConfig:
     # host/firmware fold it into the precomputed sin/cos tables, no hardware impact.
     yarn_factor    : float = 1.0
     yarn_orig_ctx  : int   = 0
-    # Bonsai 2 / Qwen3.8 (the 27B): a hybrid of Gated DeltaNet layers with full attention
+    # Bonsai 2 / Qwen3.5 (the 27B): a hybrid of Gated DeltaNet layers with full attention
     # every full_attention_interval-th layer. () = every layer is attention (the Qwen3
     # models). The DeltaNet geometry sizes the recurrent state for the converter and the
     # firmware (doc/boards.md).
@@ -68,7 +68,7 @@ class ModelConfig:
 
     def vocab_padded(self, n_channels):
         """Vocab-sharded tensors (embeddings/LM head) are row-padded to divide the channel
-        count; the top-k unit masks rows >= vocab so pad rows can never win."""
+        count; the firmware never picks a row >= vocab, so pad rows can never win."""
         return (self.vocab + n_channels - 1)//n_channels*n_channels
 
 # Configs ------------------------------------------------------------------------------------------

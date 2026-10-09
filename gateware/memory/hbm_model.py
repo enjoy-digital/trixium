@@ -9,9 +9,9 @@
 Matches the USPHBM2 port geometry exactly (AXI4, 256-bit data, 33-bit byte address, 6-bit id)
 so the engine RTL is identical in simulation and on hardware. Supports INCR bursts, a
 programmable AR-to-R latency and an LFSR-driven R-stall pattern (backpressure jitter) to
-stress the streamer's credit logic. One command is processed at a time per direction
-(in-order, single-ID traffic, matching the engine's usage); multiple outstanding bursts
-simply queue in the AR/AW FIFOs.
+stress the streamer's credit logic. Reads are in order, one command at a time (outstanding
+bursts queue in the AR FIFO), or out of order across IDs with reorder_ids; writes are one
+command at a time.
 """
 
 from migen import *
@@ -106,11 +106,11 @@ class HBMChannelModel(LiteXModule):
         if reorder_ids:
             self._reorder_read_path(axi, rd_port, latency, stall, reorder_ids)
         else:
-            self._legacy_read_path(axi, rd_port, latency, stall)
+            self._inorder_read_path(axi, rd_port, latency, stall)
         self._write_path(axi, wr_port)
         self.mem = mem # Exposed for direct inspection in tests (excluded from AutoCSR above).
 
-    def _legacy_read_path(self, axi, rd_port, latency, stall):
+    def _inorder_read_path(self, axi, rd_port, latency, stall):
         # Read path --------------------------------------------------------------------------------
         ar_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
         self += ar_fifo
