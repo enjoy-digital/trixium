@@ -263,7 +263,7 @@ static void *halloc_hi(uint32_t n)
 static const struct bons_header *H;
 static int n_ch, head_dim, n_head, n_kv_head, n_embd, ffn_dim, n_layer;
 static int max_ctx;
-static int cpu_kv_ctx; // CPU-side KV cache depth (== max_ctx unless HW attention exists).
+static int cpu_kv_ctx; // CPU-side KV cache depth (capped at CPU_KV_CTX, halved to fit the heap).
 
 static float **attn_norm, **ffn_norm, **q_norm, **k_norm; // Per layer.
 static float *out_norm;
@@ -1877,7 +1877,7 @@ static void seq_build_attn(void)
     // 5 descriptors per head: scores, softmax8 (self-spills its p8 sum), axpy(xred),
     // spill(absmax from the engine tracker), norm_i32 (the q quant8 is batched in the qkr
     // list, the p8 spill is softmax8's tail and the engine reduces across channels).
-    // 16*5 + 66 = 146 of 192, so the FFN and scale8 lists fit behind it.
+    // cap: what the 192-descriptor list leaves behind the qkr list.
     int dph = 5;
     int cap = (192 - seq_qkr_count - (attn_pipe ? 3 : 0))/dph;
     if (attn_chunk_cap > 0 && cap > attn_chunk_cap)
@@ -2244,8 +2244,8 @@ static void qkv_prep_layer(int l)
         seq_patch(b + 6, 0, 1u | (1u << 9) | (1u << 5));             // NOWAIT, k -> kreg0.
         // The layer's eps tables: LUT[s] = eps(E_NORM + s - bias + rshift), s = sx8 + k
         // with sx8 the per-token part (patched into A5's immediate before the list) and k
-        // the norm shift the sequencer adds from the kreg. 32 entries cover sx8 <= 8 and
-        // k <= 18 (int32 sources); seq_eps_int is the same function the qkr list's A5
+        // the norm shift the sequencer adds from the kreg. 32 entries cover sx8 in [0, 13]
+        // with k <= 18 (int32 sources); seq_eps_int is the same function the qkr list's A5
         // patch uses, so the values are identical by construction.
         volatile uint32_t *lq = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_LUTQ);
         volatile uint32_t *lk = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_LUTK);
@@ -2682,7 +2682,7 @@ static void dbg_sum(const char *tag, int l, uint32_t off, uint32_t bytes, int e)
 // Forward one token; returns the next token id (only meaningful when want_logits).
 static int forward(int token, int want_logits)
 {
-    if (hybrid_present()) {          // The 27B's layers: hybrid.c, the CPU path.
+    if (hybrid_present()) {          // The 27B's layers: the hybrid forward (hybrid.c).
         infer_forwards++;
         int t = hybrid_forward(token, want_logits);
         if (dbg_armed) {
@@ -2928,8 +2928,7 @@ embed_done: ;
                 if (likely(seq_use && seq_attn_heads >= n_head
                     && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
                     // Overlap (sideband slot): the attention list's per-layer patches
-                    // run while the sequencer executes the qkr list. Without the slot
-                    // the first patch would simply stall until the list finished.
+                    // run while the sequencer executes the qkr list.
                     seq_list_start(0, seq_qkr_count);
                     attn_patch_slots(l, 0, n_head, 0);
                     attn_prepatched = 1;
@@ -3043,7 +3042,7 @@ attn_scores: ;
         // aligned to a common ea8 and scale8-ed into SP_X after the head loop.
         aw_hvalid = 0; // The fold starts empty for every path below (the list paths reset
                        // it again where they fold; the op-by-head path relies on this).
-        // Attention (CPU, GQA).
+        // Attention (lists, then the op-by-op and CPU fallbacks; GQA).
         int n_rep = n_head/n_kv_head;
         if (likely(seq_use && attn_hw && seq_attn_heads > 0
             && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
@@ -3701,7 +3700,7 @@ int infer_init(void)
     int q_dim  = n_head*head_dim;
 
     if (hybrid_present()) {
-        // The hybrid models run on their own CPU path (hybrid.c) - none of the Qwen3
+        // The hybrid models run their own forward (hybrid.c) - none of the Qwen3
         // lists, caches or resident regions below apply. The embedding comes from the
         // restored emb16 rows (embed_row_fetch).
         emb16_ent  = model_entry(ROLE_TOK_EMB16, 0);
@@ -3762,8 +3761,8 @@ int infer_init(void)
     max_ctx = H->max_ctx;
     // The CPU-side KV cache is the debug fallback when HW attention exists (the fast path
     // keeps its own KV in HBM at full context); cap it so it fits the high heap window
-    // above engine channel 3's weight tail. Without HW attention it is the primary cache
-    // and keeps the full context.
+    // above engine channel 3's weight tail (capped at CPU_KV_CTX, halved below until it
+    // fits).
     cpu_kv_ctx = (max_ctx < CPU_KV_CTX) ? max_ctx : CPU_KV_CTX;
     // KV region: above the per-channel weight payload, 4 KB aligned.
     kv_base   = (uint32_t)((TRIXIUM_CHAN_WEIGHT_BASE + H->payload_beats*32 + 0xFFF) & ~0xFFFull);

@@ -172,7 +172,7 @@ static float *sigmoid_lut;
 
 // DeltaNet stream (engine op 5, TRIXIUM_HAS_DNSTREAM): every head of a layer in one op, the
 // state striped over the channels - channel c holds rows c, c+n_ch, ... of every head, in
-// the unit's column-group-major order (gateware/deltanet_stream.py), heads in processing
+// the unit's column-group-major order (gateware/units/deltanet_stream.py), heads in processing
 // order, n_dn*nv head matrices per layer set; the layout is chosen at hybrid_reset
 // (HP->dnstream_active) and only the resident layer runs it.
 #define DN_STREAM_BEATS (DN_HEAD_BEATS/(uint32_t)n_ch)   // per channel per head
@@ -358,8 +358,8 @@ static float *fetch_f32(const struct bons_entry *e)
     return dst;
 }
 
-// Portable fallback for targets without scratchpad STORE + cache invalidation.  The XCU1525
-// uses the fused path below; keeping this implementation preserves every other hybrid target.
+// Portable fallback for targets without scratchpad STORE + cache invalidation. The XCU1525
+// uses the fused path (infer_rotate_quantize_f) and the resident lists.
 static void rotate_f_legacy(const float *src, float *dst, int width)
 {
     int B = H->hadamard_block, wi = -1;
@@ -645,8 +645,8 @@ int hybrid_init(void)
         }
     }
     SIM_MARK("hybrid: norms");
-    // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; v3 images carry the
-    // scaling fields for models that need them).
+    // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; the header has no scaling
+    // fields).
     rope_c = infer_halloc((rope_n/2)*4, 0); rope_s = infer_halloc((rope_n/2)*4, 0);
     rope_freq = infer_halloc((rope_n/2)*4, 0);
     for (int i = 0; i < rope_n/2; i++)
@@ -1439,7 +1439,7 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 /*------------------*/
 
 #ifdef TRIXIUM_HAS_ATTNSTREAM
-// Attention stream (engine op 6, gateware/attn_stream.py). Scratchpad while the attention
+// Attention stream (engine op 6, gateware/units/attention_stream.py). Scratchpad while the attention
 // core runs (the q/k/v list has stored its outputs; RS_Y and RS_F are free until the out
 // projection's prepare):
 #define AT_Q    RS_Y_ADDR              // q heads (in [q | gate] when gated): <= 48 KB

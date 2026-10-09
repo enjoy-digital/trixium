@@ -17,8 +17,8 @@
 /*------------*/
 
 int  infer_init(void);   // Load norms etc; returns 0 on success.
-// Feed prompt ids then generate up to max_new tokens (greedy); calls emit() per new token.
-// Returns the number of generated tokens.
+// Feed prompt ids then generate up to max_new tokens (greedy unless sampling is set); calls
+// emit() per new token. Returns the number of generated tokens, or -1 on error.
 int  infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok));
 // Same, continuing a conversation: buf[0..resident) are in the KV cache from the previous
 // call (check infer_gen_serial() has not moved), the rest is new. resident 0 = fresh.

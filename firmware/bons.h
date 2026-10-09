@@ -30,7 +30,7 @@
 #define KIND_Q8      1
 #define KIND_F16     2
 #define KIND_F32     3
-#define KIND_NORM16  4 // int16 rows at 2^-13 (layout.NORM16_EXP) for the vector unit.
+#define KIND_NORM16  4 // int16 rows, the tensor's exponent in bias (layout.norm16_exp), for the vector unit.
 
 #define FLAG_REPLICATED 0x01
 #define FLAG_KSEG       0x02 // One K-segment of a wide matvec (layout.FLAG_KSEG): siblings

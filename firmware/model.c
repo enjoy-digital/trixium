@@ -42,7 +42,7 @@ static const struct bons_entry *model_table(void)
 // Every role must be covered, or its lookups fall back to the full scan.
 #define ECACHE_ROLES  32
 #define ECACHE_LAYERS 64
-_Static_assert(ROLE_TOK_EMB16_EXP < ECACHE_ROLES, "entry cache must cover every role");
+_Static_assert(ROLE_HADAMARD < ECACHE_ROLES, "entry cache must cover every role");
 #define ECACHE_BASE   (TRIXIUM_HDR_ADDR + 0x80000)
 #define ecache_any ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE))
 #define ecache_n16 ((int16_t (*)[ECACHE_LAYERS])(ECACHE_BASE + \
