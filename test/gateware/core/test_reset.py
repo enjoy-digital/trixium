@@ -13,11 +13,8 @@ port answers again later, the shims drain the late beats, and the same matvec th
 again with bit-exact results. The scratchpad and the loader's ports are untouched.
 """
 
-import shutil
-import subprocess
 
 import numpy as np
-import pytest
 
 from migen import *
 from migen.sim import run_simulation
@@ -35,13 +32,10 @@ from gateware.core.reset import EngineResetDomain
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 from common import RTL
+from common.verilator import Simulator
 
 
-def test_compiled_system_reset_reaches_registered_engine_domain(tmp_path):
-    from migen.fhdl import verilog
-    verilator = shutil.which('verilator')
-    if not verilator:
-        pytest.skip('Verilator required to check generated reset priority')
+def test_compiled_system_reset_reaches_registered_engine_domain():
     dut = Module()
     axi = AXIInterface(data_width=256, address_width=33, id_width=4)
     dut.submodules.domain = domain = EngineResetDomain([axi], hold_cycles=8)
@@ -52,15 +46,8 @@ def test_compiled_system_reset_reaches_registered_engine_domain(tmp_path):
                  holding=domain.holding, busy=domain.busy)
     for name, signal in ports.items():
         signal.name_override = name
-    rtl = tmp_path / 'engreset.v'
-    verilog.convert(dut, ios=set(ports.values()), name='engreset').write(str(rtl))
-    obj = tmp_path / 'obj'
-    built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
-        '--Mdir', str(obj), '--top-module', 'engreset', str(rtl),
-        str((RTL / 'engreset.cpp').resolve())], capture_output=True, text=True, timeout=120)
-    assert built.returncode == 0, built.stdout[-6000:]+built.stderr[-6000:]
-    run = subprocess.run([str(obj / 'Vengreset')], capture_output=True, text=True, timeout=20)
-    assert run.returncode == 0, run.stdout+run.stderr
+    sim = Simulator(dut, ios=ports, name='engreset', driver=(RTL / 'engreset.cpp').read_text())
+    run = sim.run(timeout=20)
     assert 'ENGRESET_SYSTEM_PASS' in run.stdout
 
 

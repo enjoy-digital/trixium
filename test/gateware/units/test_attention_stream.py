@@ -7,13 +7,11 @@
 """gateware/units/attention_stream.py: AttentionStream, compiled, and engine op 6 on the shared
 cluster."""
 
-import shutil
 import subprocess
 
 import numpy as np
 import pytest
 
-from migen.fhdl import verilog
 from migen import run_simulation
 
 from gateware.units.attention_stream import (
@@ -21,6 +19,7 @@ from gateware.units.attention_stream import (
 from gateware.core.core import TriXiumConfig
 
 from common.cluster import SoC, write, IntAdd5, IntMul5
+from common.verilator import Simulator
 
 # AttentionStream ----------------------------------------------------------------------------------
 # AttentionStream against hybrid.c's attention loops, compiled (Verilator).
@@ -95,9 +94,6 @@ int main(int argc, char **argv) {{
 
 
 def build(tmp_path, **geometry):
-    verilator = shutil.which("verilator")
-    if not verilator:
-        pytest.skip("Verilator required")
     dut = AttentionStream(**geometry)
     sig = {n: getattr(dut, n) for n in ("start", "rec", "busy", "done", "error", "sp_rd_ok", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
@@ -108,17 +104,9 @@ def build(tmp_path, **geometry):
     for n, s in sig.items():
         s.name_override = n
     top = "attn_" + "_".join(str(v) for v in geometry.values())
-    rtl = tmp_path / f"{top}.v"
-    verilog.convert(dut, ios=set(sig.values()), name=top).write(str(rtl))
-    cpp = tmp_path / f"{top}.cpp"
-    cpp.write_text(_CPP.format(top=top, progress=" ".join(["%u"]*len(dut.progress)),
-        progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress)))))
-    built = subprocess.run([verilator, "--cc", "--exe", "--build", "-j", "8", "-Wno-fatal", "-O3",
-                            "--x-assign", "fast", "--x-initial", "fast",
-                            "--Mdir", str(tmp_path / "obj"), "--top-module", top, str(rtl), str(cpp)],
-                           capture_output=True, text=True, timeout=1800)
-    assert built.returncode == 0, built.stdout[-4000:] + built.stderr[-4000:]
-    return tmp_path / f"obj/V{top}"
+    driver = _CPP.format(top=top, progress=" ".join(["%u"]*len(dut.progress)),
+        progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress))))
+    return Simulator(dut, ios=sig, name=top, driver=driver).binary
 
 
 def layout(rng, nq, n_rep, nkv, hd, T, mode, specials=True):
