@@ -47,6 +47,7 @@ from pathlib import Path
 ROOT     = Path(__file__).resolve().parents[1]
 SPLIT    = ("test/gateware/memory/test_ddr.py",)   # ~9.5 GB per test in Migen's simulator
 DESELECT = ()
+PASS     = (0, 5)                                   # pytest: passed, or all deselected
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -158,7 +159,7 @@ def run_units(queue, jobs, args, out, pytest_args, deselect, results):
             log.write(f"\n===== {unit.name} (attempt {unit.attempt})\n")
             log.write(unit.log_path.read_text(encoding="utf-8", errors="replace"))
             log.flush()
-            status = "KILLED" if r["killed"] else ("ok" if r["rc"] == 0 else f"FAIL rc={r['rc']}")
+            status = "KILLED" if r["killed"] else ("ok" if r["rc"] in PASS else f"FAIL rc={r['rc']}")
             print(f"{status:10s} {r['seconds']:7.1f}s  peak {r['peak_gb'] or '-':>5} GB  {unit.name}", flush=True)
             if r["killed"]:
                 killed.append(unit)
@@ -249,7 +250,7 @@ def main():
     record_path.write_text(json.dumps(record, indent=1, sort_keys=True), encoding="utf-8")
 
     final  = {r["unit"]: r for r in results}         # A retried unit's last attempt wins.
-    failed = [r for r in final.values() if r["rc"] != 0 or r["killed"]]
+    failed = [r for r in final.values() if r["rc"] not in PASS or r["killed"]]
     (out / "summary.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
     busy = sum(r["seconds"] for r in results)
     print(f"\n{len(final) - len(failed)}/{len(final)} units passed in {wall:.0f} s wall "
