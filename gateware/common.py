@@ -65,7 +65,7 @@ class CPUBusMonitor(LiteXModule):
     """Where is the CPU? Bus handshake counters and last addresses, readable over PCIe.
 
     When the CPU prints nothing while PCIe CSR access works (and JTAGBone is not available),
-    these CSRs tell from the host (software/cpumon.py) whether it is fetching, stalled on a bus
+    these CSRs tell from the host (software/host/cpumon.py) whether it is fetching, stalled on a bus
     access, or held in reset: AXI address/response handshake counts and the last addresses on
     the CPU's peripheral bus (ROM, SRAM, CSRs) and, when present, its direct memory bus
     (main_ram). A request count ahead of its response count, frozen across reads, is a stalled

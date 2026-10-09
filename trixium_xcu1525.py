@@ -19,7 +19,7 @@
 #   ./trixium_xcu1525.py --build                         # -> build/xcu1525/ + build/xcu1525.verdict
 #   ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
 #   ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
-#   trixium deploy xcu1525 --board xcu1525 --model 27b   # the lab board: software/deploy.py
+#   trixium deploy xcu1525 --board xcu1525 --model 27b   # the lab board: software/lab/deploy.py
 #
 # Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
 
@@ -136,7 +136,7 @@ class _IDELAYCTRL(LiteXModule):
     The counter's domain must NOT be `sys`: sys is held in reset until the IDELAYCTRL is ready,
     and the IDELAYCTRL is not ready until this counter releases RST, so a counter in sys never
     counts and the SoC never leaves reset. It counts in a reset-less domain on the sys clock
-    (test_xcu1525_crg.py).
+    (test/gateware/test_targets.py).
 
     The count starts at MMCM lock: UG571 wants the IDELAYCTRL reset applied after REFCLK is
     stable. `locked` is synchronized into the counter's domain and holds RST asserted (counter
@@ -260,9 +260,9 @@ class TriXiumXCU1525SoC(SoCCore):
             bar0_size  = 0x40000) # Covers DDR_CSR_WINDOW (CSR region + 0x20000): host DDR trainer.
         self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
 
-        # CPU Bus Monitor (read over PCIe by software/cpumon.py) -----------------------------------
+        # CPU Bus Monitor (read over PCIe by software/host/cpumon.py) ------------------------------
         self.cpumon = CPUBusMonitor(self.cpu)
-        self.csr.add("cpumon", 31) # Pinned: ctrl must stay at 0 (software/cpurst.py, console).
+        self.csr.add("cpumon", 31) # Pinned: ctrl must stay at 0 (software/host/cpurst.py, console).
         if cpu_slr is not None:
             # The CPU in one SLR: spread over two, its memory-bus return crosses the boundary
             # at 8 logic levels and misses timing.
@@ -380,7 +380,7 @@ def main():
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     from litex.build.parser import LiteXArgumentParser
-    from software.timing import gate
+    from software.lab.timing import gate
     parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform, description="TriXium on the SQRL XCU1525.")
     parser.add_target_argument("--sys-clk-freq",    default=125e6,   type=float,                             help="System clock frequency (CPU, TriXium core).")
     parser.add_target_argument("--ddr-clk-freq",    default=187.5e6, type=float,                             help="DDR4 controller clock frequency (DDR4 rate = 8x: 187.5e6 = DDR4-1500).")
@@ -388,7 +388,7 @@ def main():
     parser.add_target_argument("--cpu-slr",         default=1,       type=int,                               help="CPU pblock SLR.")
     parser.add_target_argument("--driver",          action="store_true",                                     help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings", default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
-    parser.add_target_argument("--timing-approval", default="ddr1600-overclock",                             help="Timing gate approval (software/timing.py APPROVALS); DDR4-1500 overclocks the ISERDES.")
+    parser.add_target_argument("--timing-approval", default="ddr1600-overclock",                             help="Timing gate approval (software/lab/timing.py APPROVALS); DDR4-1500 overclocks the ISERDES.")
     # The shipping recipe (overridable from the command line).
     parser.set_defaults(
         cpu_type                             = "vexiiriscv",

@@ -2586,7 +2586,7 @@ static int smp_pick(const int32_t *val, const int *tok, int n, float lscale)
 
 // `dbg N`: checksum the resident intermediates of the next N forwards, the same regions at
 // the same points as the Python mirror's raw trace (test_sim_smoke.hybrid_generate, tag
-// names shared) - software/mirror.py lines the two up and names the first divergence.
+// names shared) - software/lab/mirror.py lines the two up and names the first divergence.
 // The only bit-exact reference the 1.7B has: the tiny sim model answers token 0 to
 // everything, so its token gate cannot see a numerics deviation.
 static int dbg_armed;

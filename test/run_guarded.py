@@ -15,12 +15,13 @@ that has to be stopped loses only itself. Before each unit the runner waits unti
 falls below --kill-free GB (protecting a concurrent route), and stopped units are retried
 at the end. Every unit's outcome, duration and peak RSS go to the summary.
 
-  python3 test/run_guarded.py                                 # whole suite (build/tests)
-  python3 test/run_guarded.py --out build/t test/test_foo.py  # selected files
+  python3 test/run_guarded.py                                       # whole suite (build/tests)
+  python3 test/run_guarded.py --out build/t test/model/test_asm.py  # selected files
+  python3 test/run_guarded.py test/gateware/units                   # every test file below
 
 Exit 0 only when every unit passed (skips inside a unit are pytest's own business).
 Whole-suite runs in one process get killed by the memory guard during a route:
-test_ddr_port_path.py alone peaks at 21 GB in one process.
+test/gateware/memory/test_ddr.py alone peaks at 21 GB in one process.
 """
 
 import os
@@ -37,10 +38,21 @@ from pathlib import Path
 # Constants ----------------------------------------------------------------------------------------
 
 ROOT     = Path(__file__).resolve().parents[1]
-SPLIT    = ("test/test_ddr_port_path.py",)   # ~9.5 GB per test in Migen's simulator
+SPLIT    = ("test/gateware/memory/test_ddr.py",)   # ~9.5 GB per test in Migen's simulator
 DESELECT = ()
 
 # Helpers ------------------------------------------------------------------------------------------
+
+def find_test_files(paths):
+    """The test files of `paths` (files, or directories searched recursively), relative to ROOT."""
+    files = []
+    for path in paths or ["test"]:
+        if (ROOT / path).is_dir():
+            files += sorted(glob.glob(os.path.join(path, "**", "test_*.py"), root_dir=ROOT, recursive=True))
+        else:
+            files.append(path)
+    return files
+
 
 def available_gb():
     with open("/proc/meminfo", encoding="utf-8") as f:
@@ -90,7 +102,7 @@ def run_unit(unit, log, kill_free, deselect, rss_file):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("files",       nargs="*",                 help="Test files (default: test/test_*.py).")
+    parser.add_argument("files",       nargs="*",                 help="Test files or directories (default: every test/**/test_*.py).")
     parser.add_argument("--out",       default="build/tests",     help="Output directory (log, summary).")
     parser.add_argument("--min-free",  type=float, default=20.0,  help="GB available before a unit starts.")
     parser.add_argument("--kill-free", type=float, default=8.0,   help="GB available below which a unit is stopped.")
@@ -98,7 +110,7 @@ def main():
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    files = args.files or sorted(glob.glob("test/test_*.py", root_dir=ROOT))
+    files = find_test_files(args.files)
     deselect = () if args.with_27b else DESELECT
     units = []
     for f in files:
