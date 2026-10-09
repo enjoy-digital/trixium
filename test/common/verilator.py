@@ -638,15 +638,20 @@ class Compiled:
         for prefix, a in self.axi.items():
             self.handles.update(axi_ios(prefix, a))
 
-    def run(self, generators, axi=None, aliases=None, cycles=None):
-        """axi: {prefix: AxiConfig options (size, latency, r_stall, ...)}; aliases: {Signal or
-        Memory: name} for testbench objects that are C++ models here (an HBMChannelModel's
-        memory -> "axi0", its freeze -> "axi0_freeze"). Returns the cycle count."""
+    def run(self, generators, slaves=None, aliases=None, cycles=None):
+        """slaves: {prefix: AxiConfig options (size, latency, r_stall, ...; init: bytes)} for the
+        AXI ports; aliases: {Signal or Memory: name} for testbench objects that are C++ models
+        here (an HBMChannelModel's memory -> "axi0", its freeze -> "axi0_freeze"). Returns the
+        cycle count."""
         if not isinstance(generators, (list, tuple)):
             generators = [generators]
         lib = _library(self.sim.binary)
-        cfg = [f"cycles {cycles}"] if cycles else []
-        for prefix, opts in (axi or {}).items():
+        cfg, images = [f"cycles {cycles}"] if cycles else [], {}
+        for prefix, opts in (slaves or {}).items():
+            opts = dict(opts)
+            if opts.get("init"):
+                images[prefix] = bytes(opts["init"])
+            opts.pop("init", None)
             cfg.append(f"axi {prefix} " + " ".join(f"{k}={int(v) if isinstance(v, bool) else v}"
                                                   for k, v in opts.items()))
         # Memory .init files are read at construction, relative to the build directory.
@@ -659,6 +664,9 @@ class Compiled:
         try:
             run = _CosimRun(lib, h, self, aliases or {})
             run.check(-1 if lib.cosim_error(h) else 0)
+            for prefix, data in images.items():
+                handle = lib.cosim_memory(h, prefix.encode())
+                run.check(lib.cosim_memory_access(h, handle, 0, data, len(data), 1))
             return run.run(generators)
         finally:
             lib.cosim_free(h)
@@ -698,12 +706,28 @@ def module_handles(module, depth=3):
     return signals, memories
 
 
+class ChannelModel:
+    """An HBMChannelModel's stand-in for compiled runs (same arguments): the channel is a C++ AXI
+    slave on the DUT's port, `mem` and `freeze` are the testbench's handles to it (run() maps
+    them). A DUT builds HBMChannelModel(axi, ...) for Migen, ChannelModel(axi, ...) otherwise."""
+    def __init__(self, axi, size=64*1024, init=None, latency=16, stall_rate=0, reorder_ids=0,
+                 write_order="aw_first"):
+        self.axi    = axi
+        self.mem    = Memory(256, size//32)
+        self.freeze = Signal()
+        self.options = dict(size=size, latency=latency, r_stall=(stall_rate*100 + 8)//16,
+                            reorder=reorder_ids, max_len=16, write_order=write_order)
+        if init:
+            self.options["init"] = b"".join(int(w).to_bytes(32, "little") for w in init)
+
+
 def run(dut, generators, backend="verilator", signals=None, memories=None, depth=3, name="tb",
-        key=None, clocks=None, **kwargs):
+        key=None, clocks=None, axi=None, channels=(), **kwargs):
     """run_simulation(dut, generators) on either backend: "migen" (Migen's simulator) or
     "verilator" (Compiled). signals / memories: what the generators touch (default: every
     handle module_handles() finds); clocks: Migen's (the compiled DUT derives its domains from
-    sys_clk); kwargs go to Compiled.run (axi, aliases, cycles)."""
+    sys_clk); axi: {prefix: AXIInterface} for C++ slaves; channels: ChannelModels (each one
+    "axi<i>"); kwargs go to Compiled.run (slaves, aliases, cycles)."""
     if backend == "migen":
         run_simulation(dut, generators, **({} if clocks is None else dict(clocks=clocks)))
         return
@@ -712,7 +736,16 @@ def run(dut, generators, backend="verilator", signals=None, memories=None, depth
         found_signals, found_memories = module_handles(dut, depth)
         signals  = found_signals  if signals  is None else signals
         memories = found_memories if memories is None else memories
-    return Compiled(dut, signals, memories, name=name, key=key).run(generators, **kwargs)
+    axi = dict(axi or {})
+    if channels:
+        slaves  = kwargs.setdefault("slaves", {})
+        aliases = kwargs.setdefault("aliases", {})
+        for i, channel in enumerate(channels):
+            axi[f"axi{i}"]    = channel.axi
+            slaves[f"axi{i}"] = dict(channel.options, seed=i + 1)
+            aliases[channel.mem]    = f"axi{i}"
+            aliases[channel.freeze] = f"axi{i}_freeze"
+    return Compiled(dut, signals, memories, axi=axi, name=name, key=key).run(generators, **kwargs)
 
 
 class _CosimRun:

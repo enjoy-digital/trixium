@@ -20,7 +20,7 @@ engine's status signals, the scratchpad memory.
 
 import pytest
 
-from migen import Memory, Signal, run_simulation
+from migen import Signal, run_simulation
 
 from litex.gen import LiteXModule
 
@@ -30,7 +30,8 @@ from litex.soc.interconnect.csr import CSRStatus, CSRStorage
 from gateware.core.core import TriXiumCore
 from gateware.memory.hbm_model import HBMChannelModel
 
-from common.verilator import Compiled
+from common.verilator import ChannelModel
+from common.verilator import run as compiled_run
 
 # Constants ----------------------------------------------------------------------------------------
 
@@ -44,14 +45,6 @@ MIGEN   = pytest.param("migen", marks=pytest.mark.slow)
 BACKEND = pytest.mark.parametrize("backend", ["verilator", MIGEN])
 
 # SoC ----------------------------------------------------------------------------------------------
-
-class ChannelHandle:
-    """An HBMChannelModel's testbench face (mem, freeze) for compiled runs, where the channel is
-    a C++ AXI slave: run() maps both onto it."""
-    def __init__(self, size):
-        self.mem    = Memory(256, size//32)
-        self.freeze = Signal()
-
 
 class SoC(TriXiumCore):
     """The core with an HBM channel model on each memory port (backend "migen") or with its
@@ -70,7 +63,8 @@ class SoC(TriXiumCore):
                 setattr(self, f'model{i}', model)
             else:
                 assert backend == "verilator", backend
-                model = ChannelHandle(MODEL_SIZE)
+                model = ChannelModel(port, size=MODEL_SIZE, latency=MODEL_LATENCY,
+                                     stall_rate=MODEL_STALL)
             self.models.append(model)
 
 # Run ----------------------------------------------------------------------------------------------
@@ -102,8 +96,6 @@ def cluster_signals(dut):
     return signals
 
 
-_compiled = {}
-
 def run(dut, generators, signals=None, memories=None):
     """run_simulation(dut, generators) on the SoC's backend (see the module doc). signals /
     memories: {name: object} the generators touch beyond cluster_signals() and the
@@ -115,16 +107,8 @@ def run(dut, generators, signals=None, memories=None):
     sigs.update(signals or {})
     mems = {"sp": dut.scratchpad.mem}
     mems.update(memories or {})
-    axi  = {f"axi{i}": port for i, port in enumerate(dut.ports)}
-    key  = f"cluster{dut.config!r}n{len(dut.ports)}"
-    compiled = Compiled(dut, sigs, memories=mems, axi=axi, name="cluster", key=key)
-    aliases, config = {}, {}
-    for i, model in enumerate(dut.models):
-        aliases[model.mem]    = f"axi{i}"
-        aliases[model.freeze] = f"axi{i}_freeze"
-        config[f"axi{i}"] = dict(size=MODEL_SIZE, latency=MODEL_LATENCY,
-                                 r_stall=(MODEL_STALL*100 + 8)//16, max_len=16, seed=i + 1)
-    compiled.run(generators, axi=config, aliases=aliases)
+    compiled_run(dut, generators, signals=sigs, memories=mems, name="cluster",
+                 key=f"cluster{dut.config!r}n{len(dut.ports)}", channels=dut.models)
 
 # Helpers ------------------------------------------------------------------------------------------
 
