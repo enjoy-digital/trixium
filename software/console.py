@@ -6,14 +6,11 @@
 
 """Scripted console over the PCIe liteuart tty, for automated hardware checks.
 
-litex_term wants an interactive terminal; this just sends commands and prints what comes back,
-so a self-test run can be piped into tools/check_hw_selftest.py.
+litex_term wants an interactive terminal; this just sends commands and prints what comes back.
 
   python3 -m software.console                      # drain whatever the SoC has printed
   python3 -m software.console -c selftest -w 240   # run a command, print the reply
   trixium console "stats" "bench 64"               # the same from the CLI
-
-Over JTAGBone use tools/jtag_console.py instead - same idea, ~30 B/s.
 """
 
 import os

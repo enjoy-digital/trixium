@@ -13,8 +13,8 @@
  *   4.      REPL: text -> BPE ids -> `tok`/`genb` -> ids back -> text.
  *
  * The model runs entirely on the card; this tool only tokenizes, drives the console and
- * detokenizes. The tokenizer data comes from tools/export_tokenizer.py (raw-byte vocab + merge
- * ranks), so no JSON or Unicode tables are needed here.
+ * detokenizes. The tokenizer data comes from `trixium tokenizer` (model/tokenizer.py: raw-byte
+ * vocab + merge ranks), so no JSON or Unicode tables are needed here.
  *
  *   trixium_chat -T                                   # Tokenizer self-test, no hardware.
  *   trixium_chat -m models/bons/bonsai-1p7b-n8.img \
@@ -127,7 +127,7 @@ static int tok_load(const char *path)
     if (fread(magic, 4, 1, f) != 1 || memcmp(magic, "BTOK", 4) ||
         fread(&ver, 4, 1, f) != 1 || fread(&nvocab, 4, 1, f) != 1 ||
         fread(&nmerges, 4, 1, f) != 1) {
-        fprintf(stderr, "%s: not a BTOK tokenizer (run tools/export_tokenizer.py)\n", path);
+        fprintf(stderr, "%s: not a BTOK tokenizer (run trixium tokenizer)\n", path);
         fclose(f); return -1;
     }
 
@@ -385,7 +385,7 @@ static int tty_open(const char *path)
     /* One console session at a time: the firmware reads one byte stream, and two readers
      * split its replies between them. Advisory lock, shared by every console tool. */
     if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
-        fprintf(stderr, "%s is in use by another console session (trixium_chat, pcie_console.py, "
+        fprintf(stderr, "%s is in use by another console session (trixium_chat, trixium console, "
                         "the Python client, litex_term?) - close it first\n", path);
         close(fd);
         return -1;
@@ -806,7 +806,7 @@ static void usage(void)
            "-k firmware    Boot this firmware first (CPU reset, loader into main_ram, boot).\n"
            "-K firmware    Boot it over serial-boot frames on the console instead (30-45 s).\n"
            "-R             With -k: no CPU reset, the BIOS is already at its prompt (a host-side\n"
-           "               DDR training ran after its calibration; tools/xcu1525_rdlevel.py).\n"
+           "               DDR training ran after its calibration; software/rdlevel.py).\n"
            "-W seconds     Firmware prompt timeout (default = 120; the XCU1525 firmware\n"
            "               calibrates three DDR4 controllers first).\n"
            "-C             Clear the staged BONS header and exit (before a boot on a new\n"
