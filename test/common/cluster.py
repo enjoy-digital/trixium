@@ -20,7 +20,7 @@ engine's status signals, the scratchpad memory.
 
 import pytest
 
-from migen import Signal, run_simulation
+from migen import Signal
 
 from litex.gen import LiteXModule
 
@@ -101,7 +101,7 @@ def run(dut, generators, signals=None, memories=None):
     memories: {name: object} the generators touch beyond cluster_signals() and the
     scratchpad."""
     if dut.backend == "migen":
-        run_simulation(dut, generators, clocks={"sys": 10, "eng": 10})
+        compiled_run(dut, generators, "migen", clocks={"sys": 10, "eng": 10})
         return
     sigs = cluster_signals(dut)
     sigs.update(signals or {})

@@ -666,13 +666,19 @@ class Compiled:
             opts.pop("init", None)
             cfg.append(f"axi {prefix} " + " ".join(f"{k}={int(v) if isinstance(v, bool) else v}"
                                                   for k, v in opts.items()))
-        # Memory .init files are read at construction, relative to the build directory.
-        cwd = os.getcwd()
+        # Memory .init files are read at construction, relative to the build directory; a
+        # tracing build dumps to $TRIXIUM_TRACE_FILE (read at construction too).
+        cwd, trace = os.getcwd(), os.environ.pop("TRIXIUM_TRACE_FILE", None)
+        if tracing():
+            os.environ["TRIXIUM_TRACE_FILE"] = str(trace_path(self.sim.top, "fst"))
         os.chdir(self.sim.dir)
         try:
             h = lib.cosim_new("\n".join(cfg).encode())
         finally:
             os.chdir(cwd)
+            os.environ.pop("TRIXIUM_TRACE_FILE", None)
+            if trace is not None:
+                os.environ["TRIXIUM_TRACE_FILE"] = trace
         try:
             run = _CosimRun(lib, h, self, aliases or {})
             run.check(-1 if lib.cosim_error(h) else 0)
@@ -741,7 +747,8 @@ def run(dut, generators, backend="verilator", signals=None, memories=None, depth
     sys_clk); axi: {prefix: AXIInterface} for C++ slaves; channels: ChannelModels (each one
     "axi<i>"); kwargs go to Compiled.run (slaves, aliases, cycles)."""
     if backend == "migen":
-        run_simulation(dut, generators, **({} if clocks is None else dict(clocks=clocks)))
+        run_simulation(dut, generators, **({} if clocks is None else dict(clocks=clocks)),
+                       vcd_name=str(trace_path("migen", "vcd")) if tracing() else None)
         return
     assert backend == "verilator", backend
     if signals is None or memories is None:
