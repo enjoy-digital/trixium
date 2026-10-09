@@ -10,12 +10,15 @@
     trixium convert   models/8b/Ternary-Bonsai-8B-PQ2_0.gguf      # -> models/bons/bonsai-8b-n16.img
     trixium verify    models/bons/bonsai-1p7b-n16.img
     trixium tokenizer models/1.7b/tokenizer.json                 # -> models/1.7b/tokenizer.bin
-    trixium deploy    xcu1525 [--board xcu1525|fk33]              # bitstream + boot
+    trixium deploy    xcu1525 --board xcu1525 --model 27b       # bitstream + boot + tokens + bench
+    trixium validate  [--steps sim,tests]                        # release validation (hours)
+    trixium driver    load|unload                                # trixium.ko + liteuart.ko
     trixium chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
+    trixium chat      --remote --board fk33                      # on a lab board host, over ssh
     trixium console   "stats" "bench 64"                         # raw firmware commands
 
-`deploy` drives the lab board from the workstation (tools/<board>_bringup.sh with
-tools/board.env); `chat` and `console` run where the card's /dev/ttyLXU0 is.
+`deploy` drives a lab board from the workstation (software/deploy.py, board hosts in
+~/.config/trixium/boards.ini); `chat` and `console` run where the card's /dev/ttyLXU0 is.
 """
 
 import os
@@ -33,17 +36,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _run(cmd, cwd=REPO):
     return subprocess.call(cmd, cwd=cwd)
 
-
-def _board_env():
-    """Read tools/board.env (KEY=value lines) without sourcing it."""
-    env = {}
-    with open(os.path.join(REPO, "tools", "board.env"), encoding="utf-8") as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if "=" in line and not line.startswith(("H=", "REPO=")):
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"')
-    return env
 
 # Commands -----------------------------------------------------------------------------------------
 
@@ -76,7 +68,18 @@ def cmd_tokenizer(args):
 
 
 def cmd_deploy(args):
-    sys.exit(_run([os.path.join(REPO, "tools", f"{args.board}_bringup.sh"), args.build]))
+    from software.deploy import run
+    sys.exit(run(args))
+
+
+def cmd_validate(args):
+    from software.validate import run
+    sys.exit(run(args))
+
+
+def cmd_driver(args):
+    from software.driver import main as driver_main
+    driver_main([args.action, "--dir", args.dir])
 
 
 def cmd_chat(args):
@@ -92,30 +95,31 @@ def cmd_chat(args):
     if args.image:
         flags += ["-m", args.image]
     if args.remote:
-        # From the workstation: the chat runs on the board host over ssh (tools/board.env), in
-        # the tree the deploy script maintains there.
-        env    = _board_env()
-        remote = (f"cd {shlex.quote(env['BOARD_DIR'])} && ./user/trixium_chat -t {shlex.quote(args.tty)} "
+        # From the workstation: the chat runs on the board host over ssh (boards.ini), in the
+        # tree the deploy maintains there.
+        from software.deploy import board_config
+        conf   = board_config(args.board)
+        remote = (f"cd {shlex.quote(conf['dir'])} && ./user/trixium_chat -t {shlex.quote(args.tty)} "
                   + " ".join(shlex.quote(f) for f in flags))
-        os.execvp("ssh", ["ssh", "-t", f"{env['BOARD_USER']}@{env['BOARD_HOST']}", remote])
-    exe = os.path.join(REPO, "trixium", "software", "user", "trixium_chat")
+        os.execvp("ssh", ["ssh", "-t", conf["target"], remote])
+    exe = os.path.join(REPO, "software", "user", "trixium_chat")
     if not os.path.exists(exe):
-        sys.exit(f"{exe} not built: make -C software/user BUILD_DIR=../../../build/<build>")
+        sys.exit(f"{exe} not built: make -C software/user BUILD_DIR=../../build/<build>")
     os.execv(exe, [exe, "-t", args.tty, "-z", args.tokenizer] + flags)
 
 
 def cmd_console(args):
-    cmd = [sys.executable, os.path.join(REPO, "tools", "pcie_console.py"), "-t", args.tty,
-           "-w", str(args.wait), "--quiet-after", str(args.quiet)]
+    from software.console import main as console_main
+    argv = ["-t", args.tty, "-w", str(args.wait), "--quiet-after", str(args.quiet)]
     for c in args.commands:
-        cmd += ["-c", c]
-    sys.exit(_run(cmd))
+        argv += ["-c", c]
+    console_main(argv)
 
 
 def cmd_smi(args):
-    exe = os.path.join(REPO, "trixium", "software", "user", "trixium_smi")
+    exe = os.path.join(REPO, "software", "user", "trixium_smi")
     if not os.path.exists(exe):
-        sys.exit(f"{exe} not built: make -C software/user BUILD_DIR=../../../build/<build>")
+        sys.exit(f"{exe} not built: make -C software/user BUILD_DIR=../../build/<build>")
     os.execv(exe, [exe] + args)
 
 # Main ---------------------------------------------------------------------------------------------
@@ -153,10 +157,21 @@ def main(argv=None):
     p.set_defaults(fn=cmd_tokenizer)
 
     # Deploy.
-    p = subparsers.add_parser("deploy", help="Configure the lab board with a build and boot it (tools/board.env).")
-    p.add_argument("build",   default="xcu1525", nargs="?",                  help="Build name in build/ (default: xcu1525).")
-    p.add_argument("--board", default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
+    from software import deploy, validate
+    p = subparsers.add_parser("deploy", help="Deploy a build on a lab board: timing gate, configure, boot, tokens, bench.")
+    deploy.add_arguments(p)
     p.set_defaults(fn=cmd_deploy)
+
+    # Validate.
+    p = subparsers.add_parser("validate", help="Release validation: bitstreams, tests, simulation, boards (hours).")
+    validate.add_arguments(p)
+    p.set_defaults(fn=cmd_validate)
+
+    # Driver.
+    p = subparsers.add_parser("driver", help="Load/unload trixium.ko + liteuart.ko (through sudo).")
+    p.add_argument("action", choices=["load", "unload"],                                    help="Load or unload.")
+    p.add_argument("--dir",  default=os.path.join(REPO, "software", "kernel"),              help="Directory of the built modules.")
+    p.set_defaults(fn=cmd_driver)
 
     # Chat.
     tokenizer = os.path.join(REPO, "models", "1.7b", "tokenizer.bin")
@@ -169,7 +184,8 @@ def main(argv=None):
     p.add_argument("--repeat",         default=1.0, type=float, help="Repetition penalty (1.1 breaks greedy loops).")
     p.add_argument("--seed",           default=0,   type=int,   help="Sampling PRNG seed.")
     p.add_argument("--system",                                  help="System prompt (a system turn ahead of the conversation).")
-    p.add_argument("--remote",         action="store_true",     help="Run the chat on the board host over ssh (tools/board.env).")
+    p.add_argument("--remote",         action="store_true",     help="Run the chat on a lab board host over ssh (boards.ini).")
+    p.add_argument("--board",          default="xcu1525",       help="Lab board of --remote (a boards.ini section).")
     p.add_argument("-k", "--firmware",                          help="Boot this firmware first (trixium.bin).")
     p.add_argument("-m", "--image",                             help="Upload this weight image first.")
     p.set_defaults(fn=cmd_chat)

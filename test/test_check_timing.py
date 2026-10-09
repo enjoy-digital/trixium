@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.check_timing import parse_full, strict_failures
+from software.timing import parse_full, strict_failures
 
 
 PASS = "0.083 0.000 0 1154468 0.009 0.000 0 1154465 0.003 0.000 0 314334"
@@ -65,14 +65,14 @@ def test_incomplete_and_invalid_reports_fail_closed(tmp_path, row):
 
 def test_cli_strict_not_overridable(tmp_path):
     path = report(tmp_path, V8)
-    result = subprocess.run([sys.executable, str(ROOT / "tools/check_timing.py"),
+    result = subprocess.run([sys.executable, str(ROOT / "software/timing.py"),
                              "--strict", "--force", str(path)], capture_output=True, text=True)
     assert result.returncode == 1
     assert "cannot override" in result.stdout
 
 
 def test_real_v8_report_if_available():
-    path = ROOT / "prog/bitstreams/xcu1525_n16_150_v8_timing.rpt"
+    path = ROOT / "build/archive/xcu1525_n16_150_v8_timing.rpt"
     if not path.exists():
         pytest.skip("local rollback report not present")
     row, failed = parse_full(path)
@@ -86,7 +86,7 @@ V8_PLUS = "0.033 0.000 0 1339665 0.010 0.000 0 1339662 -0.003 -0.036 16 383698"
 
 def test_serializer_baseline_waiver_scope(tmp_path):
     # The exact v8 numbers ("v8-exact"); the tolerant "v8" baseline is tested below.
-    from tools.check_timing import SERIALIZER_BASELINES
+    from software.timing import SERIALIZER_BASELINES
     v8 = SERIALIZER_BASELINES["v8-exact"]
     # Exactly the v8 family on a new build: waived, and reported as such.
     parsed = parse_full(report(tmp_path, V8_PLUS, "Timing constraints are not met.\n"))
@@ -111,7 +111,7 @@ def test_serializer_baseline_waiver_scope(tmp_path):
 
 def test_cli_waiver_verdict_and_v10(tmp_path):
     path = report(tmp_path, V8_PLUS, "Timing constraints are not met.\n")
-    tool = ROOT / "tools/check_timing.py"
+    tool = ROOT / "software/timing.py"
     result = subprocess.run([sys.executable, str(tool), "--strict", "--serializer-baseline", "v8",
                              str(path)], capture_output=True, text=True)
     assert result.returncode == 0 and "PASS WITH WAIVER" in result.stdout and "-0.003" in result.stdout
@@ -123,7 +123,7 @@ def test_cli_waiver_verdict_and_v10(tmp_path):
 
 
 def test_serializer_tolerance_accepts_placement_drift():
-    from tools.check_timing import SERIALIZER_BASELINES
+    from software.timing import SERIALIZER_BASELINES
     v11_family = "0.033 0.000 0 1339665 0.010 0.000 0 1339662 -0.005 -0.068 16 381185"
     parsed = parse_full(report_row(v11_family))
     assert strict_failures(*parsed, serializer_baseline=SERIALIZER_BASELINES["v8"]) == []
@@ -143,13 +143,13 @@ def test_serializer_tolerance_accepts_placement_drift():
     ("-0.100 -10.0 50 1154468 0.009 0.000 0 1154465 -0.146 -38.8 428 383698", False),    # v10 serializers
 ])
 def test_experiment_gate_is_the_host_safety_envelope(row, ok):
-    from tools.check_timing import experiment_failures, SERIALIZER_BASELINES
+    from software.timing import experiment_failures, SERIALIZER_BASELINES
     parsed = parse_full(report_row(row))
     assert (experiment_failures(parsed[0], SERIALIZER_BASELINES["v8"]) == []) == ok
 
 
 def test_cli_experiment_verdicts(tmp_path):
-    tool = ROOT / "tools/check_timing.py"
+    tool = ROOT / "software/timing.py"
     near = report(tmp_path, "-0.300 -500.0 3000 1154468 0.009 0.000 0 1154465 -0.004 -0.050 16 314334",
                   "Timing constraints are not met.\n")
     r = subprocess.run([sys.executable, str(tool), "--experiment", "--serializer-baseline", "v8", str(near)],

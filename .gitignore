@@ -7,8 +7,6 @@ __pycache__/
 # Build outputs
 build/
 firmware/build/
-prog/bitstreams/*
-!prog/bitstreams/.gitkeep
 
 # Models / weight images (regenerable, large)
 models/

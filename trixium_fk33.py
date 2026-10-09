@@ -10,14 +10,29 @@
 #
 # The TriXium core streams its weights from HBM: engine channel c is pseudo-channel c + 1
 # (channel 0 carries the CPU's main_ram). The defaults are the configuration that runs the
-# Bonsai 1.7B and 8B (16 channels, HBM at 800 MHz, sys = HBM AXI clock = 212.5 MHz). Board
-# bring-up and operation: docs/boards.md.
+# Bonsai 1.7B and 8B (16 channels, HBM at 800 MHz, sys = HBM AXI clock = 212.5 MHz), built with
+# the CPU, Vivado directives and timing gate it shipped with. Board bring-up and operation:
+# doc/boards.md.
 #
-# Build:
-#   tools/build_fk33.sh <name>                      # Vivado directives + timing gate.
-#   python3 -m trixium_fk33 --build         # or by hand.
+# From the repository root:
+#   ./trixium_fk33.py --build                          # -> build/fk33/ + build/fk33.verdict
+#   ./trixium_fk33.py --load                           # OpenOCD (JTAG, onboard FT2232)
+#   trixium deploy fk33 --board fk33 --model 1p7b      # the lab board: software/deploy.py
+#
+# What the recipe's directives and caches are worth:
+# - fetch-l1 128 sets x 4 ways = 32 KB instruction cache: the per-layer firmware code path
+#   (~24 KB) does not fit 16 KB (-15% on the token); lsu-l1 the same (-5.5%).
+# - AreaOptimized_medium: on this ~98%-full die the synthesis area directive closes timing;
+#   AltSpreadLogic_low is the placer directive that does. Judge a build by TNS and failing
+#   endpoints against the last shipped one, never by WNS alone (software/timing.py).
+# - update_repo "no": never let LiteX update ext/VexiiRiscv from here (needs network, and a
+#   half-done update leaves a CPU that does not compile against the local SpinalHDL).
+# - If post-route phys_opt crashes, re-route from the placed checkpoint and skip it (worth
+#   ~0.15 ns of WNS, not correctness).
+# Vivado 2024.1 (the 2025.2 install lacks the VU33P; --vivado-settings). A route peaks at ~11-15 GB.
 
 import os
+import sys
 
 from migen import *
 
@@ -38,10 +53,30 @@ from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable
 from litex_boards.platforms.sqrl_fk33 import Platform
 
+from litex.build.openocd import OpenOCD
+
 # Constants ----------------------------------------------------------------------------------------
 
 # The HBM IP: stack clock 800 MHz (PLL divider 8), AXI clock window 200..400 MHz (PG276).
 HBM_XCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateware", "hbm", "hbm_800.xci")
+
+# The FK33 over its onboard FT2232 (micro-USB): the part is monolithic (single SLR), irlen 6,
+# IDCODE 0x04b69093 (the non-CIV variant; the _CIV part reads 0x04b6d093). openFPGALoader reports
+# "done 1" on this board without configuring it: its JPROGRAM restarts the master-SPI boot and the
+# factory flash image wins the race. openocd's virtex2 pld driver (the CFG_IN/JSTART opcodes are
+# the same on UltraScale+) loads it correctly, ~34 s. openocd 0.11 syntax. The IR capture reads
+# 0x35 = DONE+INIT+ISC_DONE when configured (append '-ircapture 0x00 -irmask 0x3f' to the tap).
+OPENOCD_FK33_CFG = """\
+interface ftdi
+ftdi_vid_pid 0x0403 0x6010
+ftdi_channel 0
+ftdi_layout_init 0x00e8 0x60eb
+reset_config none
+adapter_khz 5000
+set _CHIPNAME xcvu33p
+jtag newtap $_CHIPNAME tap -irlen 6 -expected-id 0x04b69093
+pld device virtex2 xcvu33p.tap 1
+"""
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -146,14 +181,62 @@ class TriXiumFK33SoC(SoCCore):
 
 # Build --------------------------------------------------------------------------------------------
 
+VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1"
+
+# CPU: 32 KB I$ + 32 KB D$, branch prediction, Zcbm (cache maintenance for the resident lists)
+# and Zbb (clz).
+VEXII_ARGS = ("--fetch-l1-ways=4 --fetch-l1-sets=128 --lsu-l1-ways=4 --lsu-l1-sets=128 "
+    "--with-btb --with-ras --with-gshare --with-rvZcbm --with-rvZbb")
+
+class OpenOCDFK33(OpenOCD):
+    """OpenOCD pld load with OPENOCD_FK33_CFG (goes away once litex-boards' sqrl_fk33 has it)."""
+    def __init__(self, config_dir):
+        config = os.path.abspath(os.path.join(config_dir, "openocd_fk33.cfg"))
+        with open(config, "w", encoding="utf-8") as f:
+            f.write(OPENOCD_FK33_CFG)
+        OpenOCD.__init__(self, config)
+
+
+def set_vivado_env(path):
+    """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
+    if path and os.path.exists(os.path.join(path, "settings64.sh")):
+        os.environ["LITEX_ENV_VIVADO"] = path
+
+
+def write_verdict(path, rc):
+    """build/<name>.verdict: the build's exit code (0 = timing gate passed)."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{rc}\n")
+
+
 def main():
+    # VexiiRiscv's netlist cache key must not depend on set ordering: hash randomization is
+    # fixed at interpreter start, so run again with PYTHONHASHSEED=0.
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        os.environ["PYTHONHASHSEED"] = "0"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     from gateware.migen_fast import install as install_migen_fast
     install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
+    from software.timing import gate
     parser = LiteXArgumentParser(platform=Platform, description="TriXium on the SQRL FK33.")
-    parser.add_target_argument("--sys-clk-freq",    default=212.5e6, type=float,                     help="System clock frequency (= HBM AXI clock).")
-    parser.add_target_argument("--engine-channels", default=16,      type=int,                       help="Engine channels (HBM pseudo-channels 1..N, max 31).")
-    parser.add_target_argument("--driver",          action="store_true",                             help="Generate PCIe driver.")
+    parser.add_target_argument("--sys-clk-freq",    default=212.5e6, type=float,                             help="System clock frequency (= HBM AXI clock).")
+    parser.add_target_argument("--engine-channels", default=16,      type=int,                               help="Engine channels (HBM pseudo-channels 1..N, max 31).")
+    parser.add_target_argument("--driver",          action="store_true",                                     help="Generate PCIe driver (always with --build).")
+    parser.add_target_argument("--vivado-settings", default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
+    # The shipping recipe (overridable from the command line).
+    parser.set_defaults(
+        cpu_type                             = "vexiiriscv",
+        update_repo                          = "no",
+        vexii_args                           = VEXII_ARGS,
+        vivado_synth_directive               = "AreaOptimized_medium",
+        vivado_opt_directive                 = "ExploreWithRemap",
+        vivado_place_directive               = "AltSpreadLogic_low",
+        vivado_post_place_phys_opt_directive = "AggressiveExplore",
+        vivado_route_directive               = "AggressiveExplore",
+        vivado_post_route_phys_opt_directive = "AggressiveExplore",
+    )
     args = parser.parse_args()
 
     soc = TriXiumFK33SoC(
@@ -164,7 +247,7 @@ def main():
 
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
-        builder_argd["output_dir"] = os.path.join("build", f"fk33_n{args.engine_channels}")
+        builder_argd["output_dir"] = os.path.join("build", "fk33")
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = os.path.join(builder_argd["output_dir"], "csr.csv")
     builder = Builder(soc, **builder_argd)
@@ -172,13 +255,28 @@ def main():
         if not args.build:
             builder.compile_software = False
             builder.compile_gateware = False
-        builder.build(**parser.toolchain_argdict)
-
-    if args.driver:
+        set_vivado_env(args.vivado_settings)
+        verdict = builder.output_dir.rstrip("/") + ".verdict"
+        try:
+            builder.build(**parser.toolchain_argdict)
+        except OSError:
+            if builder.compile_gateware:
+                write_verdict(verdict, 1)
+            raise
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
 
+        # The FK33 ships on the empirical gate (no worse than the builds that have run on the
+        # card): no FK33 build has ever closed the strict gate (v16b: WNS -0.315 ns).
+        if builder.compile_gateware:
+            report = os.path.join(builder.gateware_dir, f"{soc.platform.name}_timing.rpt")
+            print("\nTiming gate:")
+            rc = gate(report)
+            write_verdict(verdict, rc)
+            if rc:
+                sys.exit(rc)
+
     if args.load:
-        prog = soc.platform.create_programmer()
+        prog = OpenOCDFK33(builder.gateware_dir)
         prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))
 
 if __name__ == "__main__":
