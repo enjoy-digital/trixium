@@ -52,6 +52,7 @@ from model.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable
+from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 from litex_boards.platforms.sqrl_fk33 import Platform
 
 
@@ -164,24 +165,10 @@ class TriXiumFK33SoC(SoCCore):
 
 # Build --------------------------------------------------------------------------------------------
 
-VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1"
-
 # CPU: 32 KB I$ + 32 KB D$, branch prediction, Zcbm (cache maintenance for the resident lists)
 # and Zbb (clz).
 VEXII_ARGS = ("--fetch-l1-ways=4 --fetch-l1-sets=128 --lsu-l1-ways=4 --lsu-l1-sets=128 "
     "--with-btb --with-ras --with-gshare --with-rvZcbm --with-rvZbb")
-
-def set_vivado_env(path):
-    """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
-    if path and os.path.exists(os.path.join(path, "settings64.sh")):
-        os.environ["LITEX_ENV_VIVADO"] = path
-
-
-def write_verdict(path, rc):
-    """build/<name>.verdict: the build's exit code (0 = timing gate passed)."""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{rc}\n")
-
 
 def main():
     # VexiiRiscv's netlist cache key must not depend on set ordering: hash randomization is

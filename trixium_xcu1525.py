@@ -52,6 +52,7 @@ from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
+from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -349,21 +350,6 @@ class TriXiumXCU1525SoC(SoCCore):
             modules.append(MT40A512M8(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
             DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
-
-# Helpers ------------------------------------------------------------------------------------------
-
-VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1"
-
-def set_vivado_env(path):
-    """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
-    if path and os.path.exists(os.path.join(path, "settings64.sh")):
-        os.environ["LITEX_ENV_VIVADO"] = path
-
-
-def write_verdict(path, rc):
-    """build/<name>.verdict: the build's exit code (0 = timing gate passed)."""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{rc}\n")
 
 # Build --------------------------------------------------------------------------------------------
 
