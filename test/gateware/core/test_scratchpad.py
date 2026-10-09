@@ -162,9 +162,12 @@ def test_priority_is_last_attached():
 # concurrently - the per-cycle port arbitration is what keeps both results bit-exact. The
 # bench mirrors the SoC's sideband idle wiring (no sequencer in this DUT): the posted-write
 # drain works without it, but read grants are units_idle-gated. Each test runs on the
-# compiled design and, in the slow tier, on Migen's simulator (common.engine.EngineBench).
+# compiled design (common.engine.EngineBench); the concurrent engine/vector test also on
+# Migen's simulator in the slow tier.
 
+# Every test compiled; Migen's simulator (minutes per test) for the representative only.
 BACKEND = pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+COMPILED = pytest.mark.parametrize("backend", ["verilator"])
 
 def _overlap_bench(n_channels):
     return EngineBench(n_channels, vecunit=True, overlap=True)
@@ -226,7 +229,7 @@ def _overlap_case(seed):
     return dict(n_channels=n_channels, M=M, nv=nv, vec_args=vec_args, sp=sp, mirror=mirror,
                 sb_src=sb_src, payloads=payloads, res_exp=res_exp, cmd=cmd)
 
-@BACKEND
+@COMPILED
 def test_overlap_sideband_slot(backend):
     # Posted sideband writes stream in DURING a concurrent engine matvec + vec resid_add
     # (2026-08-31 second form): each push must be accepted within a bounded wait, the
@@ -273,7 +276,7 @@ def test_overlap_sideband_slot(backend):
         v = _lane(r.peeks[f"known{i}"], i)
         assert v == int(c["sb_src"][i*8 + i]), f"known block read {i} returned {v:#x}"
 
-@BACKEND
+@COMPILED
 def test_overlap_sideband_read_slot(backend):
     # C2-2: sideband READS grant during a concurrent engine matvec + vec resid_add (the
     # R-port-only slot), return correct data, and never outrun the posted-write FIFO -
@@ -376,7 +379,7 @@ def test_overlap_engine_vec_concurrent(backend):
     assert r.reads["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
     assert r.peeks["cyc_both"] > 50, f"no real overlap measured (cyc_both={r.peeks['cyc_both']})"
 
-@BACKEND
+@COMPILED
 def test_overlap_fetch_under_vec(backend):
     # Engine FETCH (HBM -> scratchpad, 1 write/cycle - the worst-case W-port load, which
     # must backpressure the reader when a vec store steals the port) under the same
@@ -412,7 +415,7 @@ def test_overlap_fetch_under_vec(backend):
     assert r.reads["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
     assert r.peeks["cyc_both"] > 20, f"no real overlap measured (cyc_both={r.peeks['cyc_both']})"
 
-@BACKEND
+@COMPILED
 def test_overlap_vec_throughput_under_stream(backend):
     # The mechanism behind the result packer (docs/history.md 2026-09-07): with one
     # result per W-port write, a saturating plain-matvec stream held the port ~92% of the

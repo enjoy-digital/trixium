@@ -7,9 +7,9 @@
 """gateware/core/engine.py: MatVecEngine end to end (matvec, fetch, store, AXPY, argmax, channel
 offsets) against model.bitexact, on memory channel models.
 
-Every test runs as a common.verilator.Script on the compiled engine (C++ AXI slaves, the
-default) and, in the slow tier, on Migen's simulator with HBMChannelModel channels: the same
-golden checks on the emitted Verilog and on Migen's own semantics."""
+Every test runs as a common.verilator.Script on the compiled engine (C++ AXI slaves); the
+slim-engine test also runs, in the slow tier, on Migen's simulator with HBMChannelModel
+channels: the same golden checks on Migen's own semantics."""
 
 import os
 
@@ -24,9 +24,11 @@ from common.engine import CMD_FIELDS, EngineBench, csr_write, submit
 from common.verilator import Script
 
 # Backends -----------------------------------------------------------------------------------------
-# The compiled engine in the fast tier, Migen's simulator (minutes per test) in the slow one.
+# The compiled engine in the fast tier; Migen's simulator (minutes per test) in the slow one
+# for the representative test only.
 
 BACKEND = pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+COMPILED = pytest.mark.parametrize("backend", ["verilator"])
 
 # MatVec / Store / AXPY / Argmax -------------------------------------------------------------------
 # MatVecEngine end-to-end unit test: BONS-encoded weight shards in memory channel models,
@@ -84,19 +86,19 @@ def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate,
     got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, dst, latency, stall_rate)
     assert np.array_equal(got, expected), f"N={n_channels} rows={rows_per_chan} cols={cols}"
 
-@BACKEND
+@COMPILED
 def test_matvec_ternary_n1(backend):
     _case_ternary(backend, n_channels=1, rows_per_chan=8, cols=256, latency=8, stall_rate=0, seed=1)
 
-@BACKEND
+@COMPILED
 def test_matvec_ternary_n2(backend):
     _case_ternary(backend, n_channels=2, rows_per_chan=8, cols=256, latency=8, stall_rate=0, seed=2)
 
-@BACKEND
+@COMPILED
 def test_matvec_ternary_n4(backend):
     _case_ternary(backend, n_channels=4, rows_per_chan=4, cols=256, latency=8, stall_rate=3, seed=7)
 
-@BACKEND
+@COMPILED
 def test_matvec_ternary_n4_gather_pressure(backend):
     # 4 channels x 2-beat rows demand 2 results/cycle against the 1/cycle gather drain:
     # pipes must throttle beat intake on result-FIFO headroom instead of dropping results
@@ -163,12 +165,12 @@ def test_matvec_slim_no_dual(backend):
                       n_channels*cols, 0x4000)
     assert np.array_equal(got, expected), "slim axpy"
 
-@BACKEND
+@COMPILED
 def test_matvec_ternary_multi_scaleword(backend):
     # cols=4096: 32 groups -> 2 scale beats/row, exercises scale-word switching + row parity.
     _case_ternary(backend, n_channels=2, rows_per_chan=2, cols=4096, latency=16, stall_rate=5, seed=3)
 
-@BACKEND
+@COMPILED
 def test_matvec_q8(backend):
     n_channels, rows_per_chan, cols, seed = 2, 4, 128, 4
     rng    = np.random.default_rng(seed)
@@ -199,10 +201,8 @@ def test_matvec_q8(backend):
     got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, dst)
     assert np.array_equal(got, expected)
 
-@pytest.mark.parametrize("backend", [
-    pytest.param("verilator", marks=pytest.mark.slow),
-    pytest.param("migen",     marks=pytest.mark.slow),
-])
+@pytest.mark.slow  # Needs a converted 1.7B image.
+@COMPILED
 def test_matvec_real_1p7b_slice(backend):
     # Real Ternary-Bonsai-1.7B layer-0 attn_q data (real fp16 scale distribution, real code
     # statistics) through the engine, bit-exact vs the golden model. Uses a 64-rows-per-
@@ -245,7 +245,7 @@ def test_matvec_real_1p7b_slice(backend):
                       latency=16, stall_rate=4)
     assert np.array_equal(got, expected)
 
-@BACKEND
+@COMPILED
 def test_engine_absmax_tracker(backend):
     # The absmax CSR input signal must equal max(|results|) after a matvec.
     rng    = np.random.default_rng(31)
@@ -275,7 +275,7 @@ def test_engine_absmax_tracker(backend):
     r = EngineBench(2).run(backend, s, sp=x8.tobytes(), payloads=payloads)
     assert r.peeks["absmax"] == int(np.abs(expected).max())
 
-@BACKEND
+@COMPILED
 def test_engine_csr_single_run_per_submit(backend):
     # Regression: submitting while the engine is idle used to latch `pending` even though
     # the command was accepted on the submit cycle itself, replaying every op once the
@@ -329,7 +329,7 @@ def _store_fetch_wait(s, tag, cap=50000):
     s.wait("done", cap=cap, tag=tag)
     s.step()
 
-@BACKEND
+@COMPILED
 @pytest.mark.parametrize("chan_stride", [0, 0x1000])
 def test_engine_store_roundtrip(chan_stride, backend):
     # kind-3 STORE (scratchpad -> HBM via the loader's writers), then FETCH back: the KV
@@ -356,7 +356,7 @@ def test_engine_store_roundtrip(chan_stride, backend):
     r = bench.run(backend, s, sp=src.tobytes())
     assert r.reads["got"] == src.tobytes(), "store/fetch roundtrip mismatch"
 
-@BACKEND
+@COMPILED
 def test_matvec_q8_striped_interleave(backend):
     # Scores-op shape: position-striped rows (uneven per channel via rem) + interleaved
     # (position-major) gather, Q8 kind - each row carries its own scale, per-position KV.
@@ -400,7 +400,7 @@ def test_matvec_q8_striped_interleave(backend):
         got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, T, 0x4000)
         assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
 
-@BACKEND
+@COMPILED
 def test_engine_axpy(backend):
     # Weighted-V: kind-4 op accumulates p8-weighted V rows per lane; each channel emits
     # cols partial sums (chan-major), bit-exact vs bx.axpy_rows on its position stripe.
@@ -444,7 +444,7 @@ def test_engine_axpy(backend):
         got = _run_engine(backend, n_channels, payloads, x_init, cmd, n_channels*cols, 0x4000)
         assert np.array_equal(got, expected), f"T={T}"
 
-@BACKEND
+@COMPILED
 def test_engine_axpy_xred(backend):
     # cmd.xred: the engine sums the per-channel AXPY partials itself and writes ONE
     # cols-long vector, replacing the n_channels-1 reduce_acc calls the firmware runs per
@@ -505,7 +505,7 @@ def test_engine_axpy_xred(backend):
         assert got[1] == int(np.abs(expected.astype(np.int64)).max()), \
             f"xred absmax N={n_channels} T={T}"
 
-@BACKEND
+@COMPILED
 def test_engine_argmax_tap_and_suppress(backend):
     # Argmax tap: value + global index (ties to smallest index) over a suppressed-write
     # ternary op - the scratchpad result region must stay untouched.
@@ -553,7 +553,7 @@ def test_engine_argmax_tap_and_suppress(backend):
     assert r.peeks["argmax_idx"] == exp_idx, (r.peeks["argmax_idx"], exp_idx)
     assert r.reads["region"] == bytes(8*32)
 
-@BACKEND
+@COMPILED
 def test_engine_back_to_back_scores_axpy_ragged(backend):
     """The real per-head chain: scores -> AXPY -> scores, back to back, 8 channels, ragged.
 
@@ -648,7 +648,7 @@ def test_engine_back_to_back_scores_axpy_ragged(backend):
         assert np.array_equal(_i32(r.reads["axpy"]),    exp_axpy),   f"T={T} axpy"
         assert np.array_equal(_i32(r.reads["scores2"]), exp_scores), f"T={T} scores again"
 
-@BACKEND
+@COMPILED
 def test_matvec_q8_ilv_multirow_gaps(backend):
     """Q8 interleaved scores with more than one row per channel, and gaps in the read data.
 
@@ -694,7 +694,7 @@ def test_matvec_q8_ilv_multirow_gaps(backend):
                           xbuf_groups=96)
         assert np.array_equal(got, expected), f"T={T} stall={stall}: {got} != {expected}"
 
-@BACKEND
+@COMPILED
 def test_matvec_ternary_under_id_reorder(backend):
     """Full matvec path against the same-ID-serializing memory model: the multi-ID readers see
     cross-ID response shuffling at high latency and the results must stay bit-exact. This is
@@ -725,7 +725,7 @@ def test_matvec_ternary_under_id_reorder(backend):
         # Position order per channel-stripe layout (kind=0 plain: rows land per channel).
         assert np.array_equal(got, expected), f"latency {latency}"
 
-@BACKEND
+@COMPILED
 @pytest.mark.parametrize("chan_stride", [0, 0x1000])
 def test_engine_multi_store(chan_stride, backend):
     # F1-1: one STORE op scatters `rep` packets - packet r from scratchpad
@@ -813,7 +813,7 @@ def test_engine_n16_ternary_and_store_window(backend):
     aw = r.axi_addresses("axi15", "aw")
     assert aw and aw[0] == want, ([hex(a) for a in aw[:2]], hex(want))
 
-@BACKEND
+@COMPILED
 def test_matvec_packed_writes(backend):
     # The result packer (2026-09-07): a plain matvec must reach the W port as full 8-lane
     # beats, not one lane per result. Counts the cycles the engine drives a write during
@@ -861,7 +861,7 @@ def test_matvec_packed_writes(backend):
 # Fetch --------------------------------------------------------------------------------------------
 # HBM -> scratchpad.
 
-@BACKEND
+@COMPILED
 def test_engine_fetch(backend):
     rng  = np.random.default_rng(21)
     data = rng.integers(0, 256, 8*1024, dtype=np.uint8).tobytes()
@@ -889,7 +889,7 @@ def test_engine_fetch(backend):
 # a data round trip would pass with any offset at all. chan_mod = 0 must leave the FK33's
 # addresses untouched.
 
-@BACKEND
+@COMPILED
 @pytest.mark.parametrize("chan_mod, chan_skew", [(0, 0), (4, 0), (4, 0x2000)])
 def test_chan_mod_addresses_every_path(chan_mod, chan_skew, backend):
     """Read (FETCH), STORE and host upload each add (c % chan_mod)*stride + (c % chan_mod)*skew

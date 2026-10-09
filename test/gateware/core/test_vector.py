@@ -52,10 +52,11 @@ class _DUT(Module):
                             vu_done_count=vu.done_count.status)
 
 # Backends -----------------------------------------------------------------------------------------
-# Every RTL test runs on the compiled vector unit (fast tier) and on Migen's simulator (slow
-# tier): one Script, the same scratchpad image in, the whole scratchpad and S5..S7 out.
+# Every RTL test runs on the compiled vector unit: one Script, the same scratchpad image in, the
+# whole scratchpad and S5..S7 out. The same Script runs on Migen's simulator (minutes per test)
+# for one random program in the slow tier: the cross-check of the emitted Verilog.
 
-BACKEND = pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+COMPILED = pytest.mark.parametrize("backend", ["verilator"])
 
 def _csr_write(s, name, value):
     s.set(name, value)
@@ -117,7 +118,7 @@ def _compare(backend, prog_name, sp_bytes, args):
                              f"ref {[hex(rb[i]) for i in diffs]}")
     return S, got
 
-@BACKEND
+@COMPILED
 def test_rtl_resid_add(backend):
     rng = np.random.default_rng(21)
     n   = 128
@@ -126,7 +127,7 @@ def test_rtl_resid_add(backend):
     sp[1024:1024+2*n] = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
     _compare(backend, "resid_add", sp, [0, 1024, 2048, n//16, -1, -3])
 
-@BACKEND
+@COMPILED
 def test_rtl_quant8(backend):
     rng = np.random.default_rng(22)
     n   = 256
@@ -134,7 +135,7 @@ def test_rtl_quant8(backend):
     sp[0:2*n] = rng.integers(-32767, 32768, n).astype(np.int16).tobytes()
     _compare(backend, "quant8", sp, [0, 0, 2048, n//16])
 
-@BACKEND
+@COMPILED
 def test_rtl_norm_i32(backend):
     rng = np.random.default_rng(23)
     n   = 64
@@ -145,7 +146,7 @@ def test_rtl_norm_i32(backend):
     S, got = _compare(backend, "norm_i32", sp, [0, 0, 2048, n//16, k])
     assert got["s6"] == S[6] # Output absmax matches the interpreter.
 
-@BACKEND
+@COMPILED
 def test_rtl_silu_mul(backend):
     rng = np.random.default_rng(24)
     n   = 128
@@ -154,7 +155,7 @@ def test_rtl_silu_mul(backend):
     sp[2048:2048+2*n] = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
     _compare(backend, "silu_mul", sp, [0, 2048, 4096, n//16, -6, 0, -15]) # eg = -12 -> A4 = eg+6 = -6.
 
-@BACKEND
+@COMPILED
 def test_rtl_rmsnorm(backend):
     rng = np.random.default_rng(31)
     n   = 128
@@ -169,7 +170,7 @@ def test_rtl_rmsnorm(backend):
     args = [0, 4096, 8192, n//16, -int(np.log2(n)), eps_int, (-13) - (-11) - 15]
     _compare(backend, "rmsnorm", bytes(sp), args)
 
-@BACKEND
+@COMPILED
 def test_rtl_scalar_ops_m4(backend):
     # SADD/SSHLV/SNORME + sign-extending ARG, RTL vs interpreter (scalar results via res5-7).
     prog = [
@@ -194,7 +195,7 @@ def test_rtl_scalar_ops_m4(backend):
     finally:
         del asm.PROGRAMS["_m4_scalar"]
 
-@BACKEND
+@COMPILED
 def test_rtl_softmax8(backend):
     rng = np.random.default_rng(61)
     T   = 30
@@ -208,7 +209,7 @@ def test_rtl_softmax8(backend):
     _compare(backend, "softmax8", bytes(sp), [0, 739, 8192, pad//16, -s1, -(-(sigma + 6) - s1),
                                      12288])
 
-@BACKEND
+@COMPILED
 def test_rtl_reduce_acc(backend):
     rng = np.random.default_rng(62)
     n   = 64
@@ -217,7 +218,7 @@ def test_rtl_reduce_acc(backend):
     sp[1024:1024+4*n] = rng.integers(-2**28, 2**28, n).astype("<i4").tobytes()
     _compare(backend, "reduce_acc", bytes(sp), [0, 1024, 0, n//8])
 
-@BACKEND
+@COMPILED
 def test_rtl_rope(backend):
     rng = np.random.default_rng(63)
     hd  = 64
@@ -228,7 +229,7 @@ def test_rtl_rope(backend):
     sp[768:768+hd] = rng.integers(-32767, 32768, hd//2).astype("<i2").tobytes()
     _compare(backend, "rope", bytes(sp), [0, 256, 512, 768, hd//2//16, 1024, 1280])
 
-@BACKEND
+@COMPILED
 def test_rtl_scale8(backend):
     rng = np.random.default_rng(64)
     n   = 64
@@ -245,7 +246,7 @@ def _compare_words(backend, prog, sp_bytes, args):
     assert out["sp"] == bytes(ref), "RTL differs from the interpreter"
 
 
-@BACKEND
+@COMPILED
 def test_rtl_rmsnorm_h(backend):
     rng = np.random.default_rng(41)
     hd, H = 128, 3
@@ -255,7 +256,7 @@ def test_rtl_rmsnorm_h(backend):
     _compare_words(backend, asm.prog_rmsnorm_h(), sp, [0, 0x2000, 0, hd//16, -7, 17, -17, H])
 
 
-@BACKEND
+@COMPILED
 def test_rtl_rope_h(backend):
     rng = np.random.default_rng(42)
     hd, H = 128, 3
@@ -266,7 +267,7 @@ def test_rtl_rope_h(backend):
     _compare_words(backend, asm.prog_rope_h(), sp, [0, hd, 0x2000, 0x2000 + hd, (hd//2)//16, 0, hd, H])
 
 
-@BACKEND
+@COMPILED
 def test_rtl_kvpack_h(backend):
     rng = np.random.default_rng(43)
     hd, H, stride = 128, 4, 0x400
@@ -276,7 +277,7 @@ def test_rtl_kvpack_h(backend):
                    [0, 0, 0x2020, hd//16, 0, 0, stride - 16*(hd//16), H])
 
 
-@BACKEND
+@COMPILED
 def test_rtl_rmsnorm_q8(backend):
     rng = np.random.default_rng(44)
     n = 256
@@ -286,7 +287,7 @@ def test_rtl_rmsnorm_q8(backend):
     _compare_words(backend, asm.prog_rmsnorm_q8(), sp, [0, 0x2000, 0x1000, n//16, -8, 17, -17, 0x3000])
 
 
-@BACKEND
+@COMPILED
 def test_rtl_silu_q8(backend):
     rng = np.random.default_rng(45)
     n = 256
@@ -296,7 +297,7 @@ def test_rtl_silu_q8(backend):
     _compare_words(backend, asm.prog_silu_q8(), sp, [0, 0x1000, 0, n//16, -12, 0, -15, 0x3000])
 
 
-@BACKEND
+@COMPILED
 def test_rtl_silu_gate_and_mul_q8(backend):
     # The FFN SiLU split: both halves, x1 and x2, RTL vs interpreter over the
     # whole scratchpad, run in place the way the FFN list runs them (A2 == A0).
@@ -331,14 +332,14 @@ def _dn_case(seed, hv, hk):
     return sp, K, KQ, NV, DL, tr, hv | ((hk//16) << 16)
 
 
-@BACKEND
+@COMPILED
 def test_rtl_dn_a(backend):
     sp, K, KQ, NV, DL, tr, geom = _dn_case(45, 32, 64)
     shift_a, d15, nbq = tr["a_args"]
     _compare_words(backend, asm.prog_dn_a(), sp, [0, K, NV, DL, shift_a, d15, nbq, geom])
 
 
-@BACKEND
+@COMPILED
 def test_rtl_dn_b(backend):
     sp, K, KQ, NV, DL, tr, geom = _dn_case(46, 32, 64)
     # Pass A's delta beats as pass B finds them.
@@ -510,13 +511,13 @@ def _check(backend, seed, withhold):
     assert got["bad"] == 0 and got["dc"] == 1, (seed, prog, got["bad"], got["dc"])
 
 
-@BACKEND
-@pytest.mark.parametrize("seed", list(range(24)))
+@pytest.mark.parametrize("seed,backend", [(seed, "verilator") for seed in range(24)] +
+                         [pytest.param(0, "migen", marks=pytest.mark.slow)])
 def test_random_program_matches_interpreter(seed, backend):
     _check(backend, seed, withhold=False)
 
 
-@BACKEND
+@COMPILED
 @pytest.mark.parametrize("seed", list(range(100, 112)))
 def test_random_program_under_withheld_store_grants(seed, backend):
     _check(backend, seed, withhold=True)
@@ -530,7 +531,7 @@ def test_random_program_under_withheld_store_grants(seed, backend):
 E_NORM = -11
 
 
-@BACKEND
+@COMPILED
 @pytest.mark.parametrize("e16", [-15, -14, -13, -10, -8, -7])
 def test_rtl_rmsnorm_shift_range(e16, backend):
     rng = np.random.default_rng(100 + e16)
@@ -547,7 +548,7 @@ def test_rtl_rmsnorm_shift_range(e16, backend):
     args = [0, 4096, 8192, n//16, -int(np.log2(n)), eps_int, e16 - E_NORM - 15]
     _compare(backend, "rmsnorm", bytes(sp), args)
 
-@BACKEND
+@COMPILED
 @pytest.mark.parametrize("e16", [-15, -13, -8])
 def test_rtl_rmsnorm_h_shift_range(e16, backend):
     rng = np.random.default_rng(200 + e16)
