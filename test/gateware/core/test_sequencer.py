@@ -4,21 +4,43 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""gateware/core/sequencer.py: descriptor lists through the sequencer, the engine and the vector unit."""
+"""gateware/core/sequencer.py: descriptor lists through the sequencer, the engine and the vector unit.
+
+The list tests run on the compiled design (scratchpad + vector unit + sequencer + engine +
+CSR front, common.engine.EngineBench) and, in the slow tier, on Migen's simulator."""
 
 import numpy as np
+import pytest
 
 from migen import *
 
-from litex.soc.interconnect.axi import AXIInterface
-
-from gateware.core.scratchpad import Scratchpad
-from gateware.core.engine import MatVecEngine
-from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 from model import layout, bitexact as bx
 from model.bons import TensorSpec, encode_rows
 
-from common.engine import read_sp, vec_csr_upload
+from common.engine import EngineBench, seq_start, vec_upload
+from common.verilator import Script
+
+# Backends -----------------------------------------------------------------------------------------
+
+BACKEND = pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
+
+def _run_list(backend, n_channels, payloads, sp, words, count, cap, reads, peeks=(), seed7=True,
+              dumps=(), tag="sequencer_timeout"):
+    """Upload the vector programs, run the descriptor list at 0x6000 until the sequencer
+    drops busy, then read the scratchpad regions {tag: (addr, length)} and the peeks.
+    seed7: wire the sequencer's S7 seed into the vector unit (as the SoC does)."""
+    s = Script()
+    vec_upload(s, words)
+    seq_start(s, 0x6000, count)
+    s.dump(*dumps)
+    s.wait({"seq_busy": 0}, cap=cap, tag=tag)
+    s.step()
+    for name in peeks:
+        s.peek(name)
+    for name, (addr, length) in reads.items():
+        s.read("sp", addr, length, name)
+    bench = EngineBench(n_channels, vecunit=True, seq=True, front=True, seed7=seed7)
+    return bench.run(backend, s, sp=sp, payloads=payloads)
 
 # Descriptor Lists ---------------------------------------------------------------------------------
 
@@ -107,15 +129,13 @@ def test_sequencer_start_drains_posted_writes():
 
     run_simulation(dut, tb())
 
-def test_sequencer_v2_chaining():
+@BACKEND
+def test_sequencer_v2_chaining(backend):
     # Sequencer v2 primitives in one list, the way seq_build_attn will use them:
     #   reduce_acc (res6 = absmax) -> spill (S7 seeded with prev res6, persisted to SP,
     #   res6 preserved) -> norm_i32 with k from src=3 (k(res6)) -> reduce_acc over a
     #   crafted buffer (res6 = sum p8, standing in for softmax8's S6) -> engine AXPY with
     #   rshift_rpre=1 (rshift = bitlen(res6)+5 from the sequencer, w7 rshift left 0).
-    from gateware.core.vector import VectorUnit
-    from gateware.core.csr import EngineCSR
-    from gateware.core.sequencer import Sequencer
     from model import asm as vasm
 
     n_channels, cols, T, seed = 2, 64, 5, 83
@@ -185,81 +205,22 @@ def test_sequencer_v2_chaining():
     sp[0x200:0x200+T]   = p8.tobytes()
     sp[0x6000:0x6000+len(descs)] = descs
 
-    class _SeqDUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                          init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = VectorUnit()
-            self.submodules.seq = Sequencer()
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=32,
-                                                        vecunit=self.vu, seq=self.seq)
-            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-            self.comb += [
-                self.vu.seq_en.eq(self.seq.busy),
-                self.vu.seq_start.eq(self.seq.vec_start),
-                self.vu.seq_pc.eq(self.seq.vec_pc),
-                self.seq.vec_done.eq(self.vu.done),
-                self.seq.vec_res6.eq(self.vu.res6.status),
-                self.vu.seq_seed7.eq(self.seq.vec_seed7), # res6 chaining, or engine absmax (w0[4]).
-            ]
-            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-            for i, axi in enumerate(axis):
-                model = HBMChannelModel(axi, size=64*1024,
-                    init=words_from_bytes(payloads[i]), latency=8)
-                setattr(self.submodules, f"model{i}", model)
+    r = _run_list(backend, n_channels, payloads, sp, words, count=6, cap=100000,
+                  reads={"data": (0, 0x5000)}, peeks=["seq_dcount"])
+    assert r.peeks["seq_dcount"] == 5
+    data  = r.reads["data"]
+    spill = np.frombuffer(bytes(data[0x3800:0x3800+32]), dtype="<u4")
+    nrm   = np.frombuffer(bytes(data[0x3000:0x3000+32]), dtype="<i2")[:16]
+    axp   = np.frombuffer(bytes(data[0x4000:0x4000+4*n_channels*cols]), dtype="<i4")
+    assert np.all(spill == K1 & 0xFFFFFFFF), ("spill S7 seed", spill, K1)
+    assert np.array_equal(nrm, nrm_exp), ("norm_i32 k via src=3", nrm[:8], nrm_exp[:8], k_exp)
+    assert np.array_equal(axp, axpy_exp), ("axpy rshift_rpre", axp[:8], axpy_exp[:8], Rpre)
 
-    dut = _SeqDUT()
-
-    def driver():
-        yield dut.vu.prog_adr.storage.eq(0)
-        yield dut.vu.prog_adr.re.eq(1)
-        yield
-        yield dut.vu.prog_adr.re.eq(0)
-        for wd in words:
-            yield dut.vu.prog.storage.eq(wd)
-            yield dut.vu.prog.re.eq(1)
-            yield
-        yield dut.vu.prog.re.eq(0)
-        yield
-        yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(6)
-        yield
-        yield dut.seq.start.storage.eq(1)
-        yield dut.seq.start.re.eq(1)
-        yield
-        yield dut.seq.start.re.eq(0)
-        yield
-        for _ in range(100000):
-            if not (yield dut.seq.busy):
-                break
-            yield
-        else:
-            raise AssertionError("sequencer timeout")
-        yield
-        assert (yield dut.seq.status.fields.dcount) == 5
-        data = bytearray()
-        for wd in range(0x5000//32):
-            v = (yield dut.scratchpad.mem[wd])
-            data += int(v).to_bytes(32, "little")
-        spill = np.frombuffer(bytes(data[0x3800:0x3800+32]), dtype="<u4")
-        nrm   = np.frombuffer(bytes(data[0x3000:0x3000+32]), dtype="<i2")[:16]
-        axp   = np.frombuffer(bytes(data[0x4000:0x4000+4*n_channels*cols]), dtype="<i4")
-        assert np.all(spill == K1 & 0xFFFFFFFF), ("spill S7 seed", spill, K1)
-        assert np.array_equal(nrm, nrm_exp), ("norm_i32 k via src=3", nrm[:8], nrm_exp[:8], k_exp)
-        assert np.array_equal(axp, axpy_exp), ("axpy rshift_rpre", axp[:8], axpy_exp[:8], Rpre)
-
-    run_simulation(dut, [driver()])
-
-def test_sequencer_mixed_list():
+@BACKEND
+def test_sequencer_mixed_list(backend):
     # Descriptor list: vec quant8 -> engine ternary matvec -> vec norm_i32 with the k
     # auto-arg from the engine absmax tracker -> stop. Results must match the individually
     # computed goldens; numerics are the same as CPU-dispatched ops by construction.
-    from gateware.core.vector import VectorUnit
-    from gateware.core.csr import EngineCSR
-    from gateware.core.sequencer import Sequencer
     from model import asm as vasm
 
     n_channels, rows_per_chan, cols, seed = 2, 4, 128, 71
@@ -307,78 +268,21 @@ def test_sequencer_mixed_list():
     sp[0:2*cols]              = x16.tobytes()
     sp[0x6000:0x6000+len(descs)] = descs
 
-    class _SeqDUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                          init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = VectorUnit()
-            self.submodules.seq = Sequencer()
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=32,
-                                                        vecunit=self.vu, seq=self.seq)
-            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-            self.comb += [
-                self.vu.seq_en.eq(self.seq.busy),
-                self.vu.seq_start.eq(self.seq.vec_start),
-                self.vu.seq_pc.eq(self.seq.vec_pc),
-                self.seq.vec_done.eq(self.vu.done),
-                self.seq.vec_res6.eq(self.vu.res6.status),
-            ]
-            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-            for i, axi in enumerate(axis):
-                model = HBMChannelModel(axi, size=64*1024,
-                    init=words_from_bytes(payloads[i]), latency=8)
-                setattr(self.submodules, f"model{i}", model)
+    r = _run_list(backend, n_channels, payloads, sp, words, count=7, cap=100000,
+                  reads={"data": (0, 0x4000)}, peeks=["seq_dcount"], seed7=False)
+    assert r.peeks["seq_dcount"] == 3
+    data = r.reads["data"]
+    out = {}
+    out["x8"]  = np.frombuffer(bytes(data[0x1000:0x1000+cols]), dtype=np.int8)
+    out["res"] = np.frombuffer(bytes(data[0x2000:0x2000+4*M]), dtype="<i4")
+    out["nrm"] = np.frombuffer(bytes(data[0x3000:0x3000+2*16*max(1, M//16 if M >= 16 else 1)]),
+                               dtype="<i2")[:M]
+    assert np.array_equal(out["x8"], x8_exp.astype(np.int8)), "quant8 via sequencer"
+    assert np.array_equal(out["res"], res_exp), "matvec via sequencer"
+    assert np.array_equal(out["nrm"], nrm_exp.astype(np.int16)), ("norm_i32 auto-k", out["nrm"][:8], nrm_exp[:8], k_exp, amax)
 
-    dut = _SeqDUT()
-
-    def driver():
-        # Upload the vec programs.
-        yield dut.vu.prog_adr.storage.eq(0)
-        yield dut.vu.prog_adr.re.eq(1)
-        yield
-        yield dut.vu.prog_adr.re.eq(0)
-        for wd in words:
-            yield dut.vu.prog.storage.eq(wd)
-            yield dut.vu.prog.re.eq(1)
-            yield
-        yield dut.vu.prog.re.eq(0)
-        yield
-        # Kick the sequencer.
-        yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(7)
-        yield
-        yield dut.seq.start.storage.eq(1)
-        yield dut.seq.start.re.eq(1)
-        yield
-        yield dut.seq.start.re.eq(0)
-        yield
-        for _ in range(100000):
-            if not (yield dut.seq.busy):
-                break
-            yield
-        else:
-            raise AssertionError("sequencer timeout")
-        yield
-        assert (yield dut.seq.status.fields.dcount) == 3
-        data = bytearray()
-        for wd in range(0x4000//32):
-            v = (yield dut.scratchpad.mem[wd])
-            data += int(v).to_bytes(32, "little")
-        out = {}
-        out["x8"]  = np.frombuffer(bytes(data[0x1000:0x1000+cols]), dtype=np.int8)
-        out["res"] = np.frombuffer(bytes(data[0x2000:0x2000+4*M]), dtype="<i4")
-        out["nrm"] = np.frombuffer(bytes(data[0x3000:0x3000+2*16*max(1, M//16 if M >= 16 else 1)]),
-                                   dtype="<i2")[:M]
-        assert np.array_equal(out["x8"], x8_exp.astype(np.int8)), "quant8 via sequencer"
-        assert np.array_equal(out["res"], res_exp), "matvec via sequencer"
-        assert np.array_equal(out["nrm"], nrm_exp.astype(np.int16)), ("norm_i32 auto-k", out["nrm"][:8], nrm_exp[:8], k_exp, amax)
-
-    run_simulation(dut, [driver()])
-
-def test_sequencer_q8_scores_ragged():
+@BACKEND
+def test_sequencer_q8_scores_ragged(backend):
     """Scores op through the *sequencer* at the shipping channel count.
 
     The engine's own tests cover this op shape (test_matvec_q8_striped_interleave /
@@ -396,9 +300,6 @@ def test_sequencer_q8_scores_ragged():
       .venv/bin/python -m model.tinygen --channels 8
       .venv/bin/python trixium_sim.py --image models/tiny/bonsai-tiny-n8.img --build --run
     """
-    from gateware.core.vector import VectorUnit
-    from gateware.core.csr import EngineCSR
-    from gateware.core.sequencer import Sequencer
     from model import asm as vasm
 
     vec_words = vasm.assemble(vasm.PROGRAMS["quant8"]())
@@ -445,71 +346,15 @@ def test_sequencer_q8_scores_ragged():
         sp[0x2000:0x2000 + 2*cols]     = (x8.astype("<i2")*256).tobytes()
         sp[0x6000:0x6000 + len(descs)] = descs
 
-        class _SeqQ8DUT(Module):
-            def __init__(self):
-                axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                        for _ in range(n_channels)]
-                self.submodules.scratchpad = Scratchpad(
-                    size=64*1024, init=words_from_bytes(bytes(sp)))
-                self.submodules.vu  = VectorUnit()
-                self.submodules.seq = Sequencer()
-                self.submodules.engine = MatVecEngine(
-                    self.scratchpad, axis, xbuf_groups=32, vecunit=self.vu, seq=self.seq)
-                self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-                self.comb += [
-                    self.vu.seq_en.eq(self.seq.busy),
-                    self.vu.seq_start.eq(self.seq.vec_start),
-                    self.vu.seq_pc.eq(self.seq.vec_pc),
-                    self.seq.vec_done.eq(self.vu.done),
-                    self.seq.vec_res6.eq(self.vu.res6.status),
-                ]
-                self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-                for i, axi in enumerate(axis):
-                    model = HBMChannelModel(axi, size=64*1024,
-                        init=words_from_bytes(payloads[i]), latency=8)
-                    setattr(self.submodules, f"model{i}", model)
+        # A list that never finishes reports the engine status: this is the SEQSTALL wedge.
+        r = _run_list(backend, n_channels, payloads, sp, vec_words, count=5, cap=200000,
+                      reads={"got": (0x4000, 4*T)}, seed7=False, dumps=["front_status"],
+                      tag=f"T={T}_rows={rows}_rem={rem}:_sequencer_never_finished")
+        got = np.frombuffer(r.reads["got"], dtype="<i4")
+        assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
 
-        dut = _SeqQ8DUT()
-
-        def driver():
-            yield dut.vu.prog_adr.storage.eq(0)
-            yield dut.vu.prog_adr.re.eq(1)
-            yield
-            yield dut.vu.prog_adr.re.eq(0)
-            for wd in vec_words:
-                yield dut.vu.prog.storage.eq(wd)
-                yield dut.vu.prog.re.eq(1)
-                yield
-            yield dut.vu.prog.re.eq(0)
-            yield
-            yield dut.seq.base.storage.eq(0x6000)
-            yield dut.seq.count.storage.eq(5)
-            yield
-            yield dut.seq.start.storage.eq(1)
-            yield dut.seq.start.re.eq(1)
-            yield
-            yield dut.seq.start.re.eq(0)
-            yield
-            for _ in range(200000):
-                if not (yield dut.seq.busy):
-                    break
-                yield
-            else:
-                st = yield dut.front.status.status
-                raise AssertionError(
-                    f"T={T} rows={rows} rem={rem}: sequencer never finished "
-                    f"(engine status {st:03x}) - this is the SEQSTALL wedge")
-            yield
-            data = bytearray()
-            for wd in range(0x5000//32):
-                v = (yield dut.scratchpad.mem[wd])
-                data += int(v).to_bytes(32, "little")
-            got = np.frombuffer(bytes(data[0x4000:0x4000 + 4*T]), dtype="<i4")
-            assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
-
-        run_simulation(dut, [driver()])
-
-def test_sequencer_xred_absmax_spill():
+@BACKEND
+def test_sequencer_xred_absmax_spill(backend):
     # The exact descriptor sequence seq_build_attn runs per head once cmd.xred is on:
     #     axpy(xred) -> spill(seed S7 from the ENGINE absmax) -> norm_i32(k from res6)
     # This is the mechanism that replaces the n_ch-1 reduce_acc chain, and it has three
@@ -521,9 +366,6 @@ def test_sequencer_xred_absmax_spill():
     # engine-level test passed, and a 12-minute Verilator run is the wrong place to debug
     # a three-descriptor question.
     import model.asm as vasm
-    from gateware.core.vector import VectorUnit
-    from gateware.core.sequencer import Sequencer
-    from gateware.core.csr import EngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(97)
 
@@ -573,73 +415,18 @@ def test_sequencer_xred_absmax_spill():
     sp[0x200:0x200+T]            = p8.tobytes()
     sp[0x6000:0x6000+len(descs)] = descs
 
-    class _DUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                          init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = VectorUnit()
-            self.submodules.seq = Sequencer()
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=32,
-                                                        vecunit=self.vu, seq=self.seq)
-            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-            self.comb += [
-                self.vu.seq_en.eq(self.seq.busy),
-                self.vu.seq_start.eq(self.seq.vec_start),
-                self.vu.seq_pc.eq(self.seq.vec_pc),
-                self.seq.vec_done.eq(self.vu.done),
-                self.seq.vec_res6.eq(self.vu.res6.status),
-                self.vu.seq_seed7.eq(self.seq.vec_seed7),
-            ]
-            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-            for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", HBMChannelModel(
-                    axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
+    r = _run_list(backend, n_channels, payloads, sp, words, count=7, cap=200000,
+                  reads={"data": (0, 0x5000)})
+    data   = r.reads["data"]
+    axp    = np.frombuffer(bytes(data[0x4000:0x4000+4*cols]), dtype="<i4")
+    spill  = np.frombuffer(bytes(data[0x3800:0x3800+32]), dtype="<u4")
+    spill2 = np.frombuffer(bytes(data[0x3820:0x3820+32]), dtype="<u4")
+    assert np.array_equal(axp, summed), ("xred sum", axp[:8], summed[:8])
+    assert np.all(spill == am_exp),  ("head 0 spilled absmax", spill[0], am_exp)
+    assert np.all(spill2 == am_exp), ("head 1 spilled absmax", spill2[0], am_exp)
 
-    dut = _DUT()
-
-    def driver():
-        yield dut.vu.prog_adr.storage.eq(0)
-        yield dut.vu.prog_adr.re.eq(1)
-        yield
-        yield dut.vu.prog_adr.re.eq(0)
-        for wd in words:
-            yield dut.vu.prog.storage.eq(wd)
-            yield dut.vu.prog.re.eq(1)
-            yield
-        yield dut.vu.prog.re.eq(0)
-        yield
-        yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(7)
-        yield
-        yield dut.seq.start.storage.eq(1)
-        yield dut.seq.start.re.eq(1)
-        yield
-        yield dut.seq.start.re.eq(0)
-        yield
-        for _ in range(200000):
-            if not (yield dut.seq.busy):
-                break
-            yield
-        else:
-            raise AssertionError("sequencer timeout")
-        yield
-        data = bytearray()
-        for wd in range(0x5000//32):
-            v = (yield dut.scratchpad.mem[wd])
-            data += int(v).to_bytes(32, "little")
-        axp   = np.frombuffer(bytes(data[0x4000:0x4000+4*cols]), dtype="<i4")
-        spill = np.frombuffer(bytes(data[0x3800:0x3800+32]), dtype="<u4")
-        spill2 = np.frombuffer(bytes(data[0x3820:0x3820+32]), dtype="<u4")
-        assert np.array_equal(axp, summed), ("xred sum", axp[:8], summed[:8])
-        assert np.all(spill == am_exp),  ("head 0 spilled absmax", spill[0], am_exp)
-        assert np.all(spill2 == am_exp), ("head 1 spilled absmax", spill2[0], am_exp)
-
-    run_simulation(dut, [driver()])
-
-def test_sequencer_kreg_capture_and_add():
+@BACKEND
+def test_sequencer_kreg_capture_and_add(backend):
     # The exponent register file: an engine op captures k(absmax) into kreg[i] (w0[5],[7:6])
     # and a LATER vec descriptor adds it to an arg (w1[16+2i]). This is what lets the FFN
     # chain's "per-layer constant + an EARLIER op's k" args live in descriptors instead of
@@ -649,9 +436,6 @@ def test_sequencer_kreg_capture_and_add():
     # is bitlen(summed absmax) - 14, i.e. exactly what SEQ_SRC_KABS would give the very next
     # op - but here it survives an arbitrary distance and combines with an immediate.
     import model.asm as vasm
-    from gateware.core.vector import VectorUnit
-    from gateware.core.sequencer import Sequencer
-    from gateware.core.csr import EngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(131)
     ev     = rng.integers(-9, -4, T)
@@ -706,74 +490,19 @@ def test_sequencer_kreg_capture_and_add():
     sp[0x200:0x200+T]            = p8.tobytes()
     sp[0x6000:0x6000+len(descs)] = descs
 
-    class _DUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                          init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = VectorUnit()
-            self.submodules.seq = Sequencer()
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=32,
-                                                        vecunit=self.vu, seq=self.seq)
-            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-            self.comb += [
-                self.vu.seq_en.eq(self.seq.busy),
-                self.vu.seq_start.eq(self.seq.vec_start),
-                self.vu.seq_pc.eq(self.seq.vec_pc),
-                self.seq.vec_done.eq(self.vu.done),
-                self.seq.vec_res6.eq(self.vu.res6.status),
-                self.vu.seq_seed7.eq(self.seq.vec_seed7),
-            ]
-            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-            for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", HBMChannelModel(
-                    axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
+    r = _run_list(backend, n_channels, payloads, sp, words, count=4, cap=200000,
+                  reads={"data": (0, 0x5000)}, peeks=["seq_kreg0"])
+    data = r.reads["data"]
+    nrm  = np.frombuffer(bytes(data[0x3000:0x3000+2*cols]), dtype="<i2")
+    nrmA = np.frombuffer(bytes(data[0x3400:0x3400+2*cols]), dtype="<i2")
+    kr0  = r.peeks["seq_kreg0"]
+    assert kr0 == k_exp, ("kreg0 capture", kr0, k_exp)
+    assert np.array_equal(nrm, nrm_exp), ("norm via kreg", nrm[:8], nrm_exp[:8], k_exp)
+    assert np.array_equal(nrmA, nrm_exp), ("norm via kreg ADD (w0[11])",
+                                           nrmA[:8], nrm_exp[:8], k_exp)
 
-    dut = _DUT()
-
-    def driver():
-        yield dut.vu.prog_adr.storage.eq(0)
-        yield dut.vu.prog_adr.re.eq(1)
-        yield
-        yield dut.vu.prog_adr.re.eq(0)
-        for wd in words:
-            yield dut.vu.prog.storage.eq(wd)
-            yield dut.vu.prog.re.eq(1)
-            yield
-        yield dut.vu.prog.re.eq(0)
-        yield
-        yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(4)
-        yield
-        yield dut.seq.start.storage.eq(1)
-        yield dut.seq.start.re.eq(1)
-        yield
-        yield dut.seq.start.re.eq(0)
-        yield
-        for _ in range(200000):
-            if not (yield dut.seq.busy):
-                break
-            yield
-        else:
-            raise AssertionError("sequencer timeout")
-        yield
-        data = bytearray()
-        for wd in range(0x5000//32):
-            v = (yield dut.scratchpad.mem[wd])
-            data += int(v).to_bytes(32, "little")
-        nrm  = np.frombuffer(bytes(data[0x3000:0x3000+2*cols]), dtype="<i2")
-        nrmA = np.frombuffer(bytes(data[0x3400:0x3400+2*cols]), dtype="<i2")
-        kr0 = (yield dut.seq.kregs[0])
-        assert kr0 == k_exp, ("kreg0 capture", kr0, k_exp)
-        assert np.array_equal(nrm, nrm_exp), ("norm via kreg", nrm[:8], nrm_exp[:8], k_exp)
-        assert np.array_equal(nrmA, nrm_exp), ("norm via kreg ADD (w0[11])",
-                                               nrmA[:8], nrm_exp[:8], k_exp)
-
-    run_simulation(dut, [driver()])
-
-def test_sequencer_lut_arg():
+@BACKEND
+def test_sequencer_lut_arg(backend):
     # A5 from a scratchpad LUT indexed by imm5 + kreg (w0[12]): the one arg
     # the k/v chain could not derive in-sequencer was rmsnorm's eps, a per-layer table
     # indexed by the exponent shift the sequencer already holds in a kreg. Shape: the
@@ -781,9 +510,6 @@ def test_sequencer_lut_arg():
     # same rmsnorm with the immediate the LUT holds must match bit for bit, and an index
     # past the table clamps to entry 31 rather than reading past it.
     import model.asm as vasm
-    from gateware.core.vector import VectorUnit
-    from gateware.core.sequencer import Sequencer
-    from gateware.core.csr import EngineCSR
     n_channels, cols, T = 2, 64, 5
     rng = np.random.default_rng(137)
     ev     = rng.integers(-9, -4, T)
@@ -855,83 +581,25 @@ def test_sequencer_lut_arg():
     sp[LUT_ADDR:LUT_ADDR+4*32]     = b"".join(int(v).to_bytes(4, "little") for v in lut)
     sp[0x6000:0x6000+len(descs)]   = descs
 
-    class _DUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                          init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = VectorUnit()
-            self.submodules.seq = Sequencer()
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=32,
-                                                        vecunit=self.vu, seq=self.seq)
-            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-            self.comb += [
-                self.vu.seq_en.eq(self.seq.busy),
-                self.vu.seq_start.eq(self.seq.vec_start),
-                self.vu.seq_pc.eq(self.seq.vec_pc),
-                self.seq.vec_done.eq(self.vu.done),
-                self.seq.vec_res6.eq(self.vu.res6.status),
-                self.vu.seq_seed7.eq(self.seq.vec_seed7),
-            ]
-            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-            for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", HBMChannelModel(
-                    axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
+    r = _run_list(backend, n_channels, payloads, sp, words, count=5, cap=200000,
+                  reads={"data": (0, 0x3000)}, peeks=["seq_kreg0"])
+    data = r.reads["data"]
+    kr0  = r.peeks["seq_kreg0"]
+    assert kr0 == k_exp, ("kreg0 capture", kr0, k_exp)
+    out_lut   = np.frombuffer(bytes(data[0x2000:0x2000+2*n]), dtype="<i2")
+    out_imm   = np.frombuffer(bytes(data[0x2400:0x2400+2*n]), dtype="<i2")
+    out_clamp = np.frombuffer(bytes(data[0x2800:0x2800+2*n]), dtype="<i2")
+    assert np.array_equal(out_lut, exp_lut), ("A5 via LUT[3+kreg0]", out_lut[:6], exp_lut[:6])
+    assert np.array_equal(out_imm, exp_lut), ("same eps as immediate", out_imm[:6])
+    assert np.array_equal(out_clamp, exp_clamp), ("index 40+k clamps to 31",
+                                                  out_clamp[:6], exp_clamp[:6])
 
-    dut = _DUT()
-
-    def driver():
-        yield dut.vu.prog_adr.storage.eq(0)
-        yield dut.vu.prog_adr.re.eq(1)
-        yield
-        yield dut.vu.prog_adr.re.eq(0)
-        for wd in words:
-            yield dut.vu.prog.storage.eq(wd)
-            yield dut.vu.prog.re.eq(1)
-            yield
-        yield dut.vu.prog.re.eq(0)
-        yield
-        yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(5)
-        yield
-        yield dut.seq.start.storage.eq(1)
-        yield dut.seq.start.re.eq(1)
-        yield
-        yield dut.seq.start.re.eq(0)
-        yield
-        for _ in range(200000):
-            if not (yield dut.seq.busy):
-                break
-            yield
-        else:
-            raise AssertionError("sequencer timeout")
-        yield
-        data = bytearray()
-        for wd in range(0x3000//32):
-            v = (yield dut.scratchpad.mem[wd])
-            data += int(v).to_bytes(32, "little")
-        kr0 = (yield dut.seq.kregs[0])
-        assert kr0 == k_exp, ("kreg0 capture", kr0, k_exp)
-        out_lut   = np.frombuffer(bytes(data[0x2000:0x2000+2*n]), dtype="<i2")
-        out_imm   = np.frombuffer(bytes(data[0x2400:0x2400+2*n]), dtype="<i2")
-        out_clamp = np.frombuffer(bytes(data[0x2800:0x2800+2*n]), dtype="<i2")
-        assert np.array_equal(out_lut, exp_lut), ("A5 via LUT[3+kreg0]", out_lut[:6], exp_lut[:6])
-        assert np.array_equal(out_imm, exp_lut), ("same eps as immediate", out_imm[:6])
-        assert np.array_equal(out_clamp, exp_clamp), ("index 40+k clamps to 31",
-                                                      out_clamp[:6], exp_clamp[:6])
-
-    run_simulation(dut, [driver()])
-
-def test_sequencer_nowait_overlap():
+@BACKEND
+def test_sequencer_nowait_overlap(backend):
     # NOWAIT engine descriptor (w0[9]): the following independent vec descriptor runs
     # WHILE the matvec streams; the next descriptor (norm_i32 with A4 = KABS) trips the
     # hazard interlock and waits for the in-flight op. All three results bit-exact,
     # real overlap measured, and the interlock's k matches the serial golden.
-    from gateware.core.vector import VectorUnit
-    from gateware.core.csr import EngineCSR
-    from gateware.core.sequencer import Sequencer
     from model import asm as vasm
 
     n_channels, rows_per_chan, cols, seed = 2, 32, 128, 57
@@ -983,61 +651,18 @@ def test_sequencer_nowait_overlap():
     vasm.VecInterp(mirror).run(vasm.assemble(vasm.PROGRAMS["resid_add"]()),
                                list(vec_args))
 
-    class _NwDUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                          init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = VectorUnit()
-            self.submodules.seq = Sequencer()
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=32,
-                                                        vecunit=self.vu, seq=self.seq)
-            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-            self.comb += [
-                self.vu.seq_en.eq(self.seq.busy),
-                self.vu.seq_start.eq(self.seq.vec_start),
-                self.vu.seq_pc.eq(self.seq.vec_pc),
-                self.seq.vec_done.eq(self.vu.done),
-                self.seq.vec_res6.eq(self.vu.res6.status),
-                self.vu.seq_seed7.eq(self.seq.vec_seed7),
-            ]
-            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-            for i, axi in enumerate(axis):
-                model = HBMChannelModel(axi, size=64*1024,
-                    init=words_from_bytes(payloads[i]), latency=8)
-                setattr(self.submodules, f"model{i}", model)
-
-    dut = _NwDUT()
+    r = _run_list(backend, n_channels, payloads, sp, words, count=5, cap=100000,
+                  reads={"res": (0x2000, 4*M), "nrm": (0x3000, 2*M), "nrmb": (0x3800, 2*M),
+                         "vec": (0x5000, 2*nv)},
+                  peeks=["seq_dcount", "cyc_both", "gw_ovf"])
     out = {}
-
-    def driver():
-        yield from vec_csr_upload(dut, words)
-        yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(5)
-        yield
-        yield dut.seq.start.storage.eq(1)
-        yield dut.seq.start.re.eq(1)
-        yield
-        yield dut.seq.start.re.eq(0)
-        yield
-        for _ in range(100000):
-            if not (yield dut.seq.busy):
-                break
-            yield
-        else:
-            raise AssertionError("sequencer timeout")
-        yield
-        out["dcount"] = (yield dut.seq.status.fields.dcount)
-        out["both"]   = (yield dut.engine.cyc_both)
-        out["ovf"]    = (yield dut.engine.gw_ovf)
-        out["res"]  = np.frombuffer((yield from read_sp(dut, 0x2000, 4*M)), dtype="<i4")
-        out["nrm"]  = np.frombuffer((yield from read_sp(dut, 0x3000, 2*M)), dtype="<i2")
-        out["nrmb"] = np.frombuffer((yield from read_sp(dut, 0x3800, 2*M)), dtype="<i2")
-        out["vec"]  = (yield from read_sp(dut, 0x5000, 2*nv))
-
-    run_simulation(dut, [driver()])
+    out["dcount"] = r.peeks["seq_dcount"]
+    out["both"]   = r.peeks["cyc_both"]
+    out["ovf"]    = r.peeks["gw_ovf"]
+    out["res"]    = np.frombuffer(r.reads["res"], dtype="<i4")
+    out["nrm"]    = np.frombuffer(r.reads["nrm"], dtype="<i2")
+    out["nrmb"]   = np.frombuffer(r.reads["nrmb"], dtype="<i2")
+    out["vec"]    = r.reads["vec"]
     assert out["ovf"] == 0, "gather FIFO overflow"
     assert out["dcount"] == 4, out["dcount"]
     assert np.array_equal(out["res"], res_exp), (out["res"][:8], res_exp[:8])
@@ -1046,15 +671,13 @@ def test_sequencer_nowait_overlap():
     assert out["vec"] == bytes(mirror[0x5000:0x5000 + 2*nv]), "vec result corrupted"
     assert out["both"] > 50, f"no overlap through the sequencer (cyc_both={out['both']})"
 
-def test_sequencer_kadd_interlock_precise():
+@BACKEND
+def test_sequencer_kadd_interlock_precise(backend):
     # The kadd hazard interlock is per-REGISTER: matvec A captures k -> kreg0 (serial),
     # matvec B is NOWAIT and captures k -> kreg1. A norm reading kreg0 must dispatch UNDER
     # B's stream (real overlap), while a norm reading kreg1 must wait for B's capture
     # (done+2) and see the right k. The register-blind interlock serialized the FFN
     # list's norm-under-stream on the card (13.60M vs 13.45M cycles/token, 2026-08-29).
-    from gateware.core.vector import VectorUnit
-    from gateware.core.csr import EngineCSR
-    from gateware.core.sequencer import Sequencer
     from model import asm as vasm
 
     n_channels, rows_per_chan, cols = 2, 32, 128
@@ -1104,58 +727,15 @@ def test_sequencer_kadd_interlock_precise():
     sp[0x1000:0x1000 + cols] = x8.tobytes()
     sp[0x6000:0x6000 + len(descs)] = descs
 
-    class _DUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                          init=words_from_bytes(bytes(sp)))
-            self.submodules.vu  = VectorUnit()
-            self.submodules.seq = Sequencer()
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=32,
-                                                        vecunit=self.vu, seq=self.seq)
-            self.submodules.front = EngineCSR(self.engine, seq=self.seq)
-            self.comb += [
-                self.vu.seq_en.eq(self.seq.busy),
-                self.vu.seq_start.eq(self.seq.vec_start),
-                self.vu.seq_pc.eq(self.seq.vec_pc),
-                self.seq.vec_done.eq(self.vu.done),
-                self.seq.vec_res6.eq(self.vu.res6.status),
-                self.vu.seq_seed7.eq(self.seq.vec_seed7),
-            ]
-            self.comb += [self.vu.seq_args[i].eq(self.seq.vec_args[i]) for i in range(8)]
-            for i, axi in enumerate(axis):
-                setattr(self.submodules, f"model{i}", HBMChannelModel(
-                    axi, size=64*1024, init=words_from_bytes(payloads[i]), latency=8))
-
-    dut = _DUT()
+    r = _run_list(backend, n_channels, payloads, sp, words, count=5, cap=200000,
+                  reads={"na": (0x3000, 2*M), "nb": (0x3800, 2*M)},
+                  peeks=["cyc_both", "seq_kreg0", "seq_kreg1"])
     out = {}
-
-    def driver():
-        yield from vec_csr_upload(dut, words)
-        yield dut.seq.base.storage.eq(0x6000)
-        yield dut.seq.count.storage.eq(5)
-        yield
-        yield dut.seq.start.storage.eq(1)
-        yield dut.seq.start.re.eq(1)
-        yield
-        yield dut.seq.start.re.eq(0)
-        yield
-        for _ in range(200000):
-            if not (yield dut.seq.busy):
-                break
-            yield
-        else:
-            raise AssertionError("sequencer timeout")
-        yield
-        out["both"] = (yield dut.engine.cyc_both)
-        out["k0"]   = (yield dut.seq.kregs[0])
-        out["k1"]   = (yield dut.seq.kregs[1])
-        out["na"]   = np.frombuffer((yield from read_sp(dut, 0x3000, 2*M)), dtype="<i2")
-        out["nb"]   = np.frombuffer((yield from read_sp(dut, 0x3800, 2*M)), dtype="<i2")
-
-    run_simulation(dut, [driver()])
+    out["both"] = r.peeks["cyc_both"]
+    out["k0"]   = r.peeks["seq_kreg0"]
+    out["k1"]   = r.peeks["seq_kreg1"]
+    out["na"]   = np.frombuffer(r.reads["na"], dtype="<i2")
+    out["nb"]   = np.frombuffer(r.reads["nb"], dtype="<i2")
     assert (out["k0"], out["k1"]) == (ka, kb), (out["k0"], out["k1"], ka, kb)
     assert np.array_equal(out["na"], nrm_a), "norm via kreg0 (under the stream)"
     assert np.array_equal(out["nb"], nrm_b), "norm via kreg1 (after the capture)"

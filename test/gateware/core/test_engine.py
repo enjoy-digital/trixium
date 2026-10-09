@@ -5,84 +5,57 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 """gateware/core/engine.py: MatVecEngine end to end (matvec, fetch, store, AXPY, argmax, channel
-offsets) against model.bitexact, on HBM channel models."""
+offsets) against model.bitexact, on memory channel models.
+
+Every test runs as a common.verilator.Script on the compiled engine (C++ AXI slaves, the
+default) and, in the slow tier, on Migen's simulator with HBMChannelModel channels: the same
+golden checks on the emitted Verilog and on Migen's own semantics."""
 
 import os
 
 import numpy as np
 import pytest
 
-from migen import *
-
-from litex.soc.interconnect.axi import AXIInterface
-
-from gateware.core.scratchpad import Scratchpad
-from gateware.core.engine import MatVecEngine
-from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
-from gateware.memory.loader import Loader
 from model import layout, bitexact as bx
 from model.bons import TensorSpec, encode_rows
 from model.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
-from common.engine import read_sp
+from common.engine import CMD_FIELDS, EngineBench, csr_write, submit
+from common.verilator import Script
+
+# Backends -----------------------------------------------------------------------------------------
+# The compiled engine in the fast tier, Migen's simulator (minutes per test) in the slow one.
+
+BACKEND = pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
 
 # MatVec / Store / AXPY / Argmax -------------------------------------------------------------------
-# MatVecEngine end-to-end unit test: BONS-encoded weight shards in HBM channel models,
+# MatVecEngine end-to-end unit test: BONS-encoded weight shards in memory channel models,
 # x8 in the scratchpad, engine command -> results in scratchpad, compared BIT-EXACTLY against
 # model.bitexact.matvec_ternary()/matvec_q8().
+#
+# latency/stall_rate may be a per-channel list: real HBM channels do not respond in lockstep,
+# and several engine bugs only appear once the readers desynchronize.
 
-class _EngineDUT(Module):
-    def __init__(self, n_channels, chan_payloads, sp_init, latency=8, stall_rate=0,
-                 xbuf_groups=32, reorder_ids=0):
-        # latency/stall_rate may be a per-channel list: real HBM channels do not respond in
-        # lockstep, and several engine bugs only appear once the readers desynchronize.
-        lat = latency if isinstance(latency, (list, tuple)) else [latency]*n_channels
-        stl = stall_rate if isinstance(stall_rate, (list, tuple)) else [stall_rate]*n_channels
-        axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                for _ in range(n_channels)]
-        self.submodules.scratchpad = Scratchpad(size=64*1024, init=sp_init)
-        self.submodules.engine     = MatVecEngine(self.scratchpad, axis,
-                                                        xbuf_groups=xbuf_groups)
-        for i, axi in enumerate(axis):
-            model = HBMChannelModel(axi, size=64*1024,
-                init=words_from_bytes(chan_payloads[i]), latency=lat[i], stall_rate=stl[i],
-                reorder_ids=reorder_ids)
-            setattr(self.submodules, f"model{i}", model)
+def _i32(data):
+    return np.frombuffer(data, dtype="<i4").astype(np.int64)
 
-def _run_engine(dut, cmd, n_results, dst, absmax=False):
+def _run_engine(backend, n_channels, payloads, sp, cmd, n_results, dst, latency=8, stall_rate=0,
+                xbuf_groups=32, reorder_ids=0, absmax=False):
     """Results array, or (results, engine.absmax) when absmax=True."""
-    results = []
-    extra   = {}
+    s = Script()
+    submit(s, cmd)
+    s.wait("done", cap=50000, tag="engine")
+    s.step(2)
+    s.peek("error")
+    s.peek("absmax")
+    s.read("sp", dst, 4*n_results, "res")
+    r = EngineBench(n_channels, xbuf_groups=xbuf_groups).run(backend, s, sp=sp, payloads=payloads,
+        latency=latency, stall_rate=stall_rate, reorder_ids=reorder_ids)
+    assert r.peeks["error"] == 0
+    arr = _i32(r.reads["res"])
+    return (arr, r.peeks["absmax"]) if absmax else arr
 
-    def driver():
-        for k, v in cmd.items():
-            yield getattr(dut.engine.cmd, k).eq(v)
-        yield dut.engine.cmd.valid.eq(1)
-        yield
-        while not (yield dut.engine.cmd.ready):
-            yield
-        yield dut.engine.cmd.valid.eq(0)
-        for _ in range(50000):
-            if (yield dut.engine.done):
-                break
-            yield
-        else:
-            raise AssertionError("engine timeout")
-        yield
-        yield
-        assert (yield dut.engine.error) == 0
-        # Read back int32 results from the scratchpad.
-        for i in range(n_results):
-            word = (yield dut.scratchpad.mem[(dst + 4*i)//32])
-            v    = (word >> (32*(((dst + 4*i)//4) % 8))) & 0xFFFFFFFF
-            results.append(v - (1 << 32) if v & (1 << 31) else v)
-        extra["absmax"] = (yield dut.engine.absmax)
-
-    run_simulation(dut, [driver()])
-    arr = np.array(results, dtype=np.int64)
-    return (arr, extra["absmax"]) if absmax else arr
-
-def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed):
+def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate, seed):
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
     G      = cols//layout.GROUP_TERNARY
@@ -103,35 +76,37 @@ def _case_ternary(n_channels, rows_per_chan, cols, latency, stall_rate, seed):
         payloads.append(encode_rows(spec, row0, nrows).tobytes())
 
     xsrc, dst = 0, 0x4000
-    sp_init   = words_from_bytes(x8.tobytes())
-
-    dut = _EngineDUT(n_channels, payloads, sp_init, latency, stall_rate)
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
                cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
                bias=B, rshift=R, xsrc=xsrc, dst=dst)
-    got = _run_engine(dut, cmd, M, dst)
+    got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, dst, latency, stall_rate)
     assert np.array_equal(got, expected), f"N={n_channels} rows={rows_per_chan} cols={cols}"
 
-def test_matvec_ternary_n1():
-    _case_ternary(n_channels=1, rows_per_chan=8, cols=256, latency=8, stall_rate=0, seed=1)
+@BACKEND
+def test_matvec_ternary_n1(backend):
+    _case_ternary(backend, n_channels=1, rows_per_chan=8, cols=256, latency=8, stall_rate=0, seed=1)
 
-def test_matvec_ternary_n2():
-    _case_ternary(n_channels=2, rows_per_chan=8, cols=256, latency=8, stall_rate=0, seed=2)
+@BACKEND
+def test_matvec_ternary_n2(backend):
+    _case_ternary(backend, n_channels=2, rows_per_chan=8, cols=256, latency=8, stall_rate=0, seed=2)
 
-def test_matvec_ternary_n4():
-    _case_ternary(n_channels=4, rows_per_chan=4, cols=256, latency=8, stall_rate=3, seed=7)
+@BACKEND
+def test_matvec_ternary_n4(backend):
+    _case_ternary(backend, n_channels=4, rows_per_chan=4, cols=256, latency=8, stall_rate=3, seed=7)
 
-def test_matvec_ternary_n4_gather_pressure():
+@BACKEND
+def test_matvec_ternary_n4_gather_pressure(backend):
     # 4 channels x 2-beat rows demand 2 results/cycle against the 1/cycle gather drain:
     # pipes must throttle beat intake on result-FIFO headroom instead of dropping results
     # (without backpressure out_fifo overflows and the op never completes).
-    _case_ternary(n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=9)
+    _case_ternary(backend, n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=9)
 
-def test_matvec_slim_no_dual():
+@BACKEND
+def test_matvec_slim_no_dual(backend):
     # Ternary + Q8 + striped/ilv scores + AXPY on one engine configuration.
-    _case_ternary(n_channels=4, rows_per_chan=8, cols=256, latency=8, stall_rate=2,
+    _case_ternary(backend, n_channels=4, rows_per_chan=8, cols=256, latency=8, stall_rate=2,
                   seed=31)
 
     cols, T, n_channels, seed = 128, 6, 2, 33
@@ -152,13 +127,12 @@ def test_matvec_slim_no_dual():
         payloads.append(encode_rows(spec_c, 0, len(pos)).tobytes())
     maxlen = max(len(p) for p in payloads)
     payloads = [p.ljust(maxlen, b"\0") for p in payloads]
-    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0)
     rb  = layout.row_beats(cols, layout.KIND_Q8)
     cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                sbeats=layout.scale_beats(cols, layout.KIND_Q8),
                cbeats=layout.code_beats(cols, layout.KIND_Q8),
                bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
-    got = _run_engine(dut, cmd, T, 0x4000)
+    got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, T, 0x4000)
     assert np.array_equal(got, expected), "slim ilv scores"
 
     # AXPY (single head) on the slim engine.
@@ -180,21 +154,22 @@ def test_matvec_slim_no_dual():
     maxlen = max(len(p) for p in payloads)
     payloads = [p.ljust(maxlen, b"\0") for p in payloads]
     expected = np.concatenate(expected)
-    dut = _EngineDUT(n_channels, payloads, words_from_bytes(p8.tobytes().ljust(32, b"\0")),
-                     8, 0)
     rb  = layout.row_beats(cols, layout.KIND_Q8)
     cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                sbeats=layout.scale_beats(cols, layout.KIND_Q8),
                cbeats=layout.code_beats(cols, layout.KIND_Q8),
                bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem)
-    got = _run_engine(dut, cmd, n_channels*cols, 0x4000)
+    got = _run_engine(backend, n_channels, payloads, p8.tobytes().ljust(32, b"\0"), cmd,
+                      n_channels*cols, 0x4000)
     assert np.array_equal(got, expected), "slim axpy"
 
-def test_matvec_ternary_multi_scaleword():
+@BACKEND
+def test_matvec_ternary_multi_scaleword(backend):
     # cols=4096: 32 groups -> 2 scale beats/row, exercises scale-word switching + row parity.
-    _case_ternary(n_channels=2, rows_per_chan=2, cols=4096, latency=16, stall_rate=5, seed=3)
+    _case_ternary(backend, n_channels=2, rows_per_chan=2, cols=4096, latency=16, stall_rate=5, seed=3)
 
-def test_matvec_q8():
+@BACKEND
+def test_matvec_q8(backend):
     n_channels, rows_per_chan, cols, seed = 2, 4, 128, 4
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
@@ -216,20 +191,22 @@ def test_matvec_q8():
         payloads.append(encode_rows(spec, row0, nrows).tobytes())
 
     xsrc, dst = 0, 0x4000
-    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0)
     cmd = dict(kind=1, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_Q8),
                sbeats=layout.scale_beats(cols, layout.KIND_Q8),
                cbeats=layout.code_beats(cols, layout.KIND_Q8),
                bias=B, rshift=R, xsrc=xsrc, dst=dst)
-    got = _run_engine(dut, cmd, M, dst)
+    got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, dst)
     assert np.array_equal(got, expected)
 
-@pytest.mark.slow
-def test_matvec_real_1p7b_slice():
+@pytest.mark.parametrize("backend", [
+    pytest.param("verilator", marks=pytest.mark.slow),
+    pytest.param("migen",     marks=pytest.mark.slow),
+])
+def test_matvec_real_1p7b_slice(backend):
     # Real Ternary-Bonsai-1.7B layer-0 attn_q data (real fp16 scale distribution, real code
-    # statistics) through the Migen engine, bit-exact vs the golden model. Uses a 64-rows-per-
-    # channel slice of the N=2 layer-0 image so the HBM model init stays small.
+    # statistics) through the engine, bit-exact vs the golden model. Uses a 64-rows-per-
+    # channel slice of the N=2 layer-0 image so the memory model init stays small.
     from model.bons import BONSReader
     img_path = "models/bons/bonsai-1p7b-l1-n2.img"
     if not os.path.exists(img_path):
@@ -259,16 +236,17 @@ def test_matvec_real_1p7b_slice():
     expected = bx.matvec_ternary(scl, cds, x8, e["bias"], e["rshift"])
 
     dst = 0x8000
-    dut = _EngineDUT(2, payloads, words_from_bytes(x8.tobytes()), latency=16, stall_rate=4)
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*rb,
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
                cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
                bias=e["bias"], rshift=e["rshift"], xsrc=0, dst=dst)
-    got = _run_engine(dut, cmd, 2*rows_per_chan, dst)
+    got = _run_engine(backend, 2, payloads, x8.tobytes(), cmd, 2*rows_per_chan, dst,
+                      latency=16, stall_rate=4)
     assert np.array_equal(got, expected)
 
-def test_engine_absmax_tracker():
+@BACKEND
+def test_engine_absmax_tracker(backend):
     # The absmax CSR input signal must equal max(|results|) after a matvec.
     rng    = np.random.default_rng(31)
     M, K   = 16, 256
@@ -284,42 +262,25 @@ def test_engine_absmax_tracker():
     spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, K,
                       scales=scales, values=codes)
     payloads = [encode_rows(spec, *layout.shard_rows(M, 2, c)).tobytes() for c in range(2)]
-    dut = _EngineDUT(2, payloads, words_from_bytes(x8.tobytes()))
     cmd = dict(kind=0, rows=M//2, cols=K, wbase=0,
                wlen=(M//2)*layout.row_beats(K, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(K, layout.KIND_TERNARY),
                cbeats=layout.code_beats(K, layout.KIND_TERNARY),
                bias=B, rshift=R, xsrc=0, dst=0x4000)
-    absmax = {}
+    s = Script()
+    submit(s, cmd)
+    s.wait("done", cap=20000, tag="done", fatal=False)
+    s.step()
+    s.peek("absmax")
+    r = EngineBench(2).run(backend, s, sp=x8.tobytes(), payloads=payloads)
+    assert r.peeks["absmax"] == int(np.abs(expected).max())
 
-    def check():
-        yield
-        for _ in range(20000):
-            if (yield dut.engine.done):
-                break
-            yield
-        yield
-        absmax["v"] = (yield dut.engine.absmax)
-
-    def driver():
-        for k, v in cmd.items():
-            yield getattr(dut.engine.cmd, k).eq(v)
-        yield dut.engine.cmd.valid.eq(1)
-        yield
-        while not (yield dut.engine.cmd.ready):
-            yield
-        yield dut.engine.cmd.valid.eq(0)
-
-    run_simulation(dut, [driver(), check()])
-    assert absmax["v"] == int(np.abs(expected).max())
-
-def test_engine_csr_single_run_per_submit():
+@BACKEND
+def test_engine_csr_single_run_per_submit(backend):
     # Regression: submitting while the engine is idle used to latch `pending` even though
     # the command was accepted on the submit cycle itself, replaying every op once the
     # engine returned to idle (identical results, but the replay's command accept reset
     # the absmax tracker mid-read and doubled the stream time).
-    from gateware.core.csr import EngineCSR
-
     n_channels, rows_per_chan, cols, seed = 2, 8, 256, 11
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
@@ -340,40 +301,37 @@ def test_engine_csr_single_run_per_submit():
         row0, nrows = layout.shard_rows(M, n_channels, c)
         payloads.append(encode_rows(spec, row0, nrows).tobytes())
 
-    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()))
-    dut.submodules.front = EngineCSR(dut.engine)
-
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
                cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
                bias=B, rshift=R, xsrc=0, dst=0x4000)
 
-    def driver():
-        for k, v in cmd.items():
-            yield getattr(dut.front, k).storage.eq(v)
-        yield
-        yield dut.front.submit.storage.eq(1)
-        yield dut.front.submit.re.eq(1)
-        yield
-        yield dut.front.submit.re.eq(0)
-        yield
-        dones = 0
-        absmax_at_done = None
-        for cyc in range(20000):
-            if (yield dut.engine.done):
-                dones += 1
-                if absmax_at_done is None:
-                    absmax_at_done = (yield dut.engine.absmax)
-            yield
-        assert dones == 1, f"engine ran {dones} times for one submit"
-        assert absmax_at_done == int(np.abs(expected).max())
-        assert (yield dut.front.status.fields.pending) == 0
+    s = Script()
+    for k, v in cmd.items():
+        s.set(f"front_{k}", v)
+    s.step()
+    csr_write(s, "front_submit", 1)
+    s.step()
+    # Every done over the next 20000 cycles; absmax as it stands at the first one.
+    s.count("done", "dones")
+    s.wait("done", cap=20000, tag="first", fatal=False)
+    s.peek("absmax")
+    s.step(20000)
+    s.count_end("dones")
+    s.peek("front_pending")
+    r = EngineBench(n_channels, front=True).run(backend, s, sp=x8.tobytes(), payloads=payloads)
+    assert r.counts["dones"] == 1, f"engine ran {r.counts['dones']} times for one submit"
+    assert r.peeks["absmax"] == int(np.abs(expected).max())
+    assert r.peeks["front_pending"] == 0
 
-    run_simulation(dut, [driver()])
+def _store_fetch_wait(s, tag, cap=50000):
+    s.wait("done", cap=cap, tag=tag)
+    s.step()
 
+@BACKEND
 @pytest.mark.parametrize("chan_stride", [0, 0x1000])
-def test_engine_store_roundtrip(chan_stride):
+def test_engine_store_roundtrip(chan_stride, backend):
     # kind-3 STORE (scratchpad -> HBM via the loader's writers), then FETCH back: the KV
     # append datapath. Also checks the done handshake orders after the B drain.
     #
@@ -381,68 +339,25 @@ def test_engine_store_roundtrip(chan_stride):
     # its own HBM window - the AXI switch makes the address, not the port, select the
     # pseudo-channel) while this test only ever ran at 0. On hardware the KV STORE wedges the
     # engine mid-token, and an untested address path is the first suspect.
-    from gateware.memory.loader import Loader
-
     n_channels = 2
     rng   = np.random.default_rng(17)
     src   = rng.integers(0, 256, 512, dtype=np.uint8)  # 16 beats.
     beats = len(src)//32
 
-    class _StoreDUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(
-                size=64*1024, init=words_from_bytes(src.tobytes()))
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
-                                                        chan_stride=chan_stride)
-            self.submodules.loader = Loader(axis)
-            self.comb += [
-                self.engine.store_cmd.connect(self.loader.store_cmd),
-                self.engine.store_data.connect(self.loader.store_data),
-                self.engine.store_busy.eq(self.loader.store_busy),
-            ]
-            for i, axi in enumerate(axis):
-                model = HBMChannelModel(axi, size=64*1024, latency=8)
-                setattr(self.submodules, f"model{i}", model)
+    s = Script()
+    # Store 16 beats from SP 0x0 to channel 1 @ 0x2000.
+    submit(s, dict(kind=3, chan=1, wbase=0x2000, wlen=beats, xsrc=0), fields=CMD_FIELDS)
+    _store_fetch_wait(s, "store")
+    # Fetch them back to SP 0x4000.
+    submit(s, dict(kind=2, chan=1, wbase=0x2000, wlen=beats, dst=0x4000), fields=CMD_FIELDS)
+    _store_fetch_wait(s, "fetch")
+    s.read("sp", 0x4000, len(src), "got")
+    bench = EngineBench(n_channels, chan_stride=chan_stride, loader=True)
+    r = bench.run(backend, s, sp=src.tobytes())
+    assert r.reads["got"] == src.tobytes(), "store/fetch roundtrip mismatch"
 
-    dut = _StoreDUT()
-
-    def submit(c):
-        for k in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-                  "bias", "rshift", "xsrc", "dst", "chan"):
-            yield getattr(dut.engine.cmd, k).eq(c.get(k, 0))
-        yield dut.engine.cmd.valid.eq(1)
-        yield
-        while not (yield dut.engine.cmd.ready):
-            yield
-        yield dut.engine.cmd.valid.eq(0)
-
-    def wait_done():
-        for _ in range(50000):
-            if (yield dut.engine.done):
-                return
-            yield
-        raise AssertionError("timeout")
-
-    def driver():
-        # Store 16 beats from SP 0x0 to channel 1 @ 0x2000.
-        yield from submit(dict(kind=3, chan=1, wbase=0x2000, wlen=beats, xsrc=0))
-        yield from wait_done()
-        yield
-        # Fetch them back to SP 0x4000.
-        yield from submit(dict(kind=2, chan=1, wbase=0x2000, wlen=beats, dst=0x4000))
-        yield from wait_done()
-        yield
-        got = bytearray()
-        for w in range(len(src)//32):
-            v = (yield dut.scratchpad.mem[(0x4000 + 32*w)//32])
-            got += int(v).to_bytes(32, "little")
-        assert bytes(got) == src.tobytes(), "store/fetch roundtrip mismatch"
-
-    run_simulation(dut, [driver()])
-
-def test_matvec_q8_striped_interleave():
+@BACKEND
+def test_matvec_q8_striped_interleave(backend):
     # Scores-op shape: position-striped rows (uneven per channel via rem) + interleaved
     # (position-major) gather, Q8 kind - each row carries its own scale, per-position KV.
     cols, seed = 128, 23
@@ -477,16 +392,16 @@ def test_matvec_q8_striped_interleave():
         maxlen = max(len(p) for p in payloads)
         payloads = [p.ljust(maxlen, b"\0") for p in payloads]
 
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0)
         rb  = layout.row_beats(cols, layout.KIND_Q8)
         cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                    sbeats=layout.scale_beats(cols, layout.KIND_Q8),
                    cbeats=layout.code_beats(cols, layout.KIND_Q8),
                    bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
-        got = _run_engine(dut, cmd, T, 0x4000)
+        got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, T, 0x4000)
         assert np.array_equal(got, expected), f"T={T}: {got} != {expected}"
 
-def test_engine_axpy():
+@BACKEND
+def test_engine_axpy(backend):
     # Weighted-V: kind-4 op accumulates p8-weighted V rows per lane; each channel emits
     # cols partial sums (chan-major), bit-exact vs bx.axpy_rows on its position stripe.
     cols, seed = 64, 41
@@ -521,16 +436,16 @@ def test_engine_axpy():
         expected = np.concatenate(expected)
 
         x_init = p8.tobytes().ljust(64, b"\0")  # Probs vector, position-major.
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
         rb  = layout.row_beats(cols, layout.KIND_Q8)
         cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                    sbeats=layout.scale_beats(cols, layout.KIND_Q8),
                    cbeats=layout.code_beats(cols, layout.KIND_Q8),
                    bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem)
-        got = _run_engine(dut, cmd, n_channels*cols, 0x4000)
+        got = _run_engine(backend, n_channels, payloads, x_init, cmd, n_channels*cols, 0x4000)
         assert np.array_equal(got, expected), f"T={T}"
 
-def test_engine_axpy_xred():
+@BACKEND
+def test_engine_axpy_xred(backend):
     # cmd.xred: the engine sums the per-channel AXPY partials itself and writes ONE
     # cols-long vector, replacing the n_channels-1 reduce_acc calls the firmware runs per
     # head. The reference is the exact int32-wrapping sum of the partials that the
@@ -575,13 +490,12 @@ def test_engine_axpy_xred():
         expected = np.sum(np.stack(parts).astype(np.int64), axis=0).astype(np.int32)
 
         x_init = p8.tobytes().ljust(64, b"\0")
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), 8, 0)
         rb  = layout.row_beats(cols, layout.KIND_Q8)
         cmd = dict(kind=4, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                    sbeats=layout.scale_beats(cols, layout.KIND_Q8),
                    cbeats=layout.code_beats(cols, layout.KIND_Q8),
                    bias=B, rshift=Rpre, xsrc=0, dst=0x4000, rem=rem, xred=1)
-        got = _run_engine(dut, cmd, cols, 0x4000, absmax=True)
+        got = _run_engine(backend, n_channels, payloads, x_init, cmd, cols, 0x4000, absmax=True)
         assert np.array_equal(got[0].astype(np.int32), expected), \
             f"xred N={n_channels} T={T}"
         # The engine absmax tracker must hold the absmax of the SUMMED vector, because that
@@ -591,7 +505,8 @@ def test_engine_axpy_xred():
         assert got[1] == int(np.abs(expected.astype(np.int64)).max()), \
             f"xred absmax N={n_channels} T={T}"
 
-def test_engine_argmax_tap_and_suppress():
+@BACKEND
+def test_engine_argmax_tap_and_suppress(backend):
     # Argmax tap: value + global index (ties to smallest index) over a suppressed-write
     # ternary op - the scratchpad result region must stay untouched.
     n_channels, rows_per_chan, cols, seed = 2, 16, 256, 51
@@ -619,45 +534,27 @@ def test_engine_argmax_tap_and_suppress():
         row0, nrows = layout.shard_rows(M, n_channels, c)
         payloads.append(encode_rows(spec, row0, nrows).tobytes())
 
-    dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()))
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
                cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
                bias=B, rshift=R, xsrc=0, dst=0x4000, supw=1)
-    out = {}
-
-    def driver():
-        for k, v in cmd.items():
-            yield getattr(dut.engine.cmd, k).eq(v)
-        yield dut.engine.cmd.valid.eq(1)
-        yield
-        while not (yield dut.engine.cmd.ready):
-            yield
-        yield dut.engine.cmd.valid.eq(0)
-        for _ in range(50000):
-            if (yield dut.engine.done):
-                break
-            yield
-        else:
-            raise AssertionError("timeout")
-        yield
-        yield
-        out["val"] = (yield dut.engine.argmax_val)
-        out["idx"] = (yield dut.engine.argmax_idx)
-        # Result region untouched (suppressed): scratchpad still zero there.
-        untouched = 0
-        for w in range(8):
-            untouched |= (yield dut.scratchpad.mem[(0x4000 + 32*w)//32])
-        out["untouched"] = untouched
-
-    run_simulation(dut, [driver()])
-    val = out["val"] - (1 << 32) if out["val"] & (1 << 31) else out["val"]
+    s = Script()
+    submit(s, cmd)
+    s.wait("done", cap=50000, tag="timeout")
+    s.step(2)
+    s.peek("argmax_val")
+    s.peek("argmax_idx")
+    # Result region untouched (suppressed): scratchpad still zero there.
+    s.read("sp", 0x4000, 8*32, "region")
+    r = EngineBench(n_channels).run(backend, s, sp=x8.tobytes(), payloads=payloads)
+    val = r.peek("argmax_val", signed_width=32)
     assert val == exp_val, (val, exp_val)
-    assert out["idx"] == exp_idx, (out["idx"], exp_idx)
-    assert out["untouched"] == 0
+    assert r.peeks["argmax_idx"] == exp_idx, (r.peeks["argmax_idx"], exp_idx)
+    assert r.reads["region"] == bytes(8*32)
 
-def test_engine_back_to_back_scores_axpy_ragged():
+@BACKEND
+def test_engine_back_to_back_scores_axpy_ragged(backend):
     """The real per-head chain: scores -> AXPY -> scores, back to back, 8 channels, ragged.
 
     Each of those ops passes on its own. This runs them consecutively the way one head's
@@ -710,7 +607,6 @@ def test_engine_back_to_back_scores_axpy_ragged():
         # so one still draining when the next op issues is the failure mode under test.
         lat = [4, 20, 6, 28, 8, 32, 10, 36][:n_channels]
         stl = [0, 2, 0, 3, 0, 4, 0, 5][:n_channels]
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x_init), lat, stl)
 
         sc_cmd = dict(kind=1, rows=rows, rem=rem, ilv=1, cols=cols, wbase=0, wlen=rows*rb,
                       sbeats=sb, cbeats=cb, bias=Bs, rshift=Rs, xsrc=0, dst=0x4000)
@@ -720,73 +616,40 @@ def test_engine_back_to_back_scores_axpy_ragged():
                          sbeats=sb, cbeats=cb, bias=0, rshift=0, xsrc=0, dst=0x7000,
                          chan=n_channels - 1)  # last channel, so reader 0 sits out
 
-        def read_i32(dst, n):
-            out = []
-            for i in range(n):
-                word = (yield dut.scratchpad.mem[(dst + 4*i)//32])
-                v    = (word >> (32*(((dst + 4*i)//4) % 8))) & 0xFFFFFFFF
-                out.append(v - (1 << 32) if v & (1 << 31) else v)
-            return np.array(out, dtype=np.int64)
+        s = Script()
+        # If an op never completes, say which readers are still holding it and which pipes
+        # hold a result the gather will not take: the card showed every channel delivering
+        # exactly what it was commanded, so a match here means the same failure. `wide` is in
+        # the merge condition (merge_mask requires ~wide), so a stale wide flag from a
+        # previous AXPY would strand exactly this.
+        s.dump("dbg_result_cnt", "dbg_mv_total", "dbg_ax_total",
+               *[f"reader{i}_idle" for i in range(n_channels)],
+               *[f"pipe{i}_{f}" for i in range(n_channels) for f in ("valid", "row", "wide", "head")])
+        # A fetch commands ONE channel and leaves the rest idle, so it is the most likely
+        # thing to leave a reader busy while the next op issues - and firmware fetches
+        # constantly (rope rows, norm weights, embeddings).
+        for tag, cmd, dst in (("fetch",   fetch_cmd, 0x7000),
+                              ("scores",  sc_cmd,    0x4000),
+                              ("fetch2",  fetch_cmd, 0x7000),
+                              ("axpy",    ax_cmd,    0x5000),
+                              ("scores2", sc_cmd,    0x6000)):
+            submit(s, dict(cmd, dst=dst))
+            s.wait("done", cap=30000, tag=f"T={T}_rows={rows}_rem={rem}:_{tag}_never_completed")
+            s.step(2)
+            s.peek("error", tag)
+        s.read("sp", 0x4000, 4*T, "scores")
+        s.read("sp", 0x5000, 4*n_channels*cols, "axpy")
+        s.read("sp", 0x6000, 4*T, "scores2")
+        r = EngineBench(n_channels).run(backend, s, sp=x_init, payloads=payloads,
+                                        latency=lat, stall_rate=stl)
+        for tag in ("fetch", "scores", "fetch2", "axpy", "scores2"):
+            assert r.peeks[tag] == 0, tag
+        assert np.array_equal(_i32(r.reads["scores"]),  exp_scores), f"T={T} scores"
+        assert np.array_equal(_i32(r.reads["axpy"]),    exp_axpy),   f"T={T} axpy"
+        assert np.array_equal(_i32(r.reads["scores2"]), exp_scores), f"T={T} scores again"
 
-        def driver():
-            # A fetch commands ONE channel and leaves the rest idle, so it is the most
-            # likely thing to leave a reader busy while the next op issues - and firmware
-            # fetches constantly (rope rows, norm weights, embeddings).
-            for tag, cmd, dst in (("fetch",   fetch_cmd, 0x7000),
-                                  ("scores",  sc_cmd,    0x4000),
-                                  ("fetch2",  fetch_cmd, 0x7000),
-                                  ("axpy",    ax_cmd,    0x5000),
-                                  ("scores2", sc_cmd,    0x6000)):
-                for k, v in dict(cmd, dst=dst).items():
-                    yield getattr(dut.engine.cmd, k).eq(v)
-                yield dut.engine.cmd.valid.eq(1)
-                yield
-                while not (yield dut.engine.cmd.ready):
-                    yield
-                yield dut.engine.cmd.valid.eq(0)
-                for _ in range(30000):
-                    if (yield dut.engine.done):
-                        break
-                    yield
-                else:
-                    # Say which readers are still holding the op, and which ones never
-                    # delivered: the card showed every channel delivering exactly what it
-                    # was commanded, so a match here means the same failure, not a
-                    # test-only artefact.
-                    idle = []
-                    for r in dut.engine.readers:
-                        idle.append((yield r.idle))
-                    rc = (yield dut.engine.dbg_result_cnt)
-                    mv = (yield dut.engine.dbg_mv_total)
-                    ax = (yield dut.engine.dbg_ax_total)
-                    # Every reader idle means the data is all in and consumed, so the
-                    # question is which pipe is still holding a result the gather will not
-                    # take. `wide` is in the merge condition (merge_mask requires ~wide), so
-                    # a stale wide flag from a previous AXPY would strand exactly this.
-                    pipes = []
-                    for pi, p in enumerate(dut.engine.pipes):
-                        v = (yield p.source.valid)
-                        if v:
-                            pipes.append((pi, "row%d" % (yield p.source.row),
-                                          "wide%d" % (yield p.source.wide),
-                                          "head%d" % (yield p.source.head)))
-                    raise AssertionError(
-                        f"T={T} rows={rows} rem={rem}: '{tag}' never completed. "
-                        f"result_cnt={rc} mv_total={mv} ax_total={ax} reader idle={idle} "
-                        f"pipes waiting={pipes}")
-                yield
-                yield
-                assert (yield dut.engine.error) == 0, tag
-            got_s = yield from read_i32(0x4000, T)
-            got_a = yield from read_i32(0x5000, n_channels*cols)
-            got_2 = yield from read_i32(0x6000, T)
-            assert np.array_equal(got_s, exp_scores), f"T={T} scores"
-            assert np.array_equal(got_a, exp_axpy),   f"T={T} axpy"
-            assert np.array_equal(got_2, exp_scores), f"T={T} scores again"
-
-        run_simulation(dut, [driver()])
-
-def test_matvec_q8_ilv_multirow_gaps():
+@BACKEND
+def test_matvec_q8_ilv_multirow_gaps(backend):
     """Q8 interleaved scores with more than one row per channel, and gaps in the read data.
 
     On the card the scores op stalls the moment a pipe has to process two rows: rows=1 works
@@ -822,18 +685,18 @@ def test_matvec_q8_ilv_multirow_gaps():
 
         # xbuf_groups=96 is what the SoC builds (the default). The tests had been running
         # 32, and the Verilator sim - which uses 96 - is the only place the wedge reproduced.
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, stall,
-                         xbuf_groups=96)
         rb  = layout.row_beats(cols, layout.KIND_Q8)
         cmd = dict(kind=1, rows=rows, cols=cols, wbase=0, wlen=rows*rb,
                    sbeats=layout.scale_beats(cols, layout.KIND_Q8),
                    cbeats=layout.code_beats(cols, layout.KIND_Q8),
                    bias=B, rshift=R, xsrc=0, dst=0x4000, rem=rem, ilv=1)
-        got = _run_engine(dut, cmd, T, 0x4000)
+        got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, T, 0x4000, 8, stall,
+                          xbuf_groups=96)
         assert np.array_equal(got, expected), f"T={T} stall={stall}: {got} != {expected}"
 
-def test_matvec_ternary_under_id_reorder():
-    """Full matvec path against the same-ID-serializing HBM model: the multi-ID readers see
+@BACKEND
+def test_matvec_ternary_under_id_reorder(backend):
+    """Full matvec path against the same-ID-serializing memory model: the multi-ID readers see
     cross-ID response shuffling at high latency and the results must stay bit-exact. This is
     the engine-level guard for the multi-ARID reorder drain."""
     n_channels, rows_per_chan, cols, seed = 8, 12, 2048, 41
@@ -851,28 +714,24 @@ def test_matvec_ternary_under_id_reorder():
                       scales=scales, values=codes)
     payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
                 for c in range(n_channels)]
-    sp = bytearray(64*1024)
-    sp[0:cols] = x8.tobytes()
     for latency in (8, 48):
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(bytes(sp)),
-                         latency, 0, reorder_ids=4)
         rb  = layout.row_beats(cols, layout.KIND_TERNARY)
         cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0, wlen=rows_per_chan*rb,
                    sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
                    cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
                    bias=B, rshift=R, xsrc=0, dst=0x4000)
-        got = _run_engine(dut, cmd, M, 0x4000)
+        got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, 0x4000, latency, 0,
+                          reorder_ids=4)
         # Position order per channel-stripe layout (kind=0 plain: rows land per channel).
         assert np.array_equal(got, expected), f"latency {latency}"
 
+@BACKEND
 @pytest.mark.parametrize("chan_stride", [0, 0x1000])
-def test_engine_multi_store(chan_stride):
+def test_engine_multi_store(chan_stride, backend):
     # F1-1: one STORE op scatters `rep` packets - packet r from scratchpad
     # xsrc + r*sstride beats to HBM wbase + r*dstride beats - the per-layer KV append as
     # a single dispatch. Fetch every region back and compare; a wrong stride or a packet
     # count off by one shows as a mismatch in exactly one region.
-    from gateware.memory.loader import Loader
-
     n_channels = 2
     rng   = np.random.default_rng(29)
     rep   = 5
@@ -886,71 +745,31 @@ def test_engine_multi_store(chan_stride):
         pk.append(p)
         sp[r*32*sstride:r*32*sstride + len(p)] = p
 
-    class _MStoreDUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.submodules.scratchpad = Scratchpad(
-                size=64*1024, init=words_from_bytes(bytes(sp)))
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
-                                                        chan_stride=chan_stride)
-            self.submodules.loader = Loader(axis)
-            self.comb += [
-                self.engine.store_cmd.connect(self.loader.store_cmd),
-                self.engine.store_data.connect(self.loader.store_data),
-                self.engine.store_busy.eq(self.loader.store_busy),
-            ]
-            for i, axi in enumerate(axis):
-                model = HBMChannelModel(axi, size=64*1024, latency=8)
-                setattr(self.submodules, f"model{i}", model)
+    fields = CMD_FIELDS + ("rep", "dstride", "sstride")
+    s = Script()
+    submit(s, dict(kind=3, chan=1, wbase=0x2000, wlen=beats, xsrc=0,
+                   rep=rep, dstride=dstride, sstride=sstride), fields=fields)
+    _store_fetch_wait(s, "store")
+    for r in range(rep):
+        submit(s, dict(kind=2, chan=1, wbase=0x2000 + r*32*dstride, wlen=beats,
+                       dst=0x8000 + r*0x100), fields=fields)
+        _store_fetch_wait(s, f"fetch{r}")
+        s.read("sp", 0x8000 + r*0x100, 32*beats, f"packet{r}")
+    bench = EngineBench(n_channels, chan_stride=chan_stride, loader=True)
+    res = bench.run(backend, s, sp=bytes(sp))
+    for r in range(rep):
+        assert res.reads[f"packet{r}"] == pk[r], f"multi-store packet {r} mismatch"
 
-    dut = _MStoreDUT()
-
-    def submit(c):
-        for k in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-                  "bias", "rshift", "xsrc", "dst", "chan", "rep", "dstride", "sstride"):
-            yield getattr(dut.engine.cmd, k).eq(c.get(k, 0))
-        yield dut.engine.cmd.valid.eq(1)
-        yield
-        while not (yield dut.engine.cmd.ready):
-            yield
-        yield dut.engine.cmd.valid.eq(0)
-
-    def wait_done():
-        for _ in range(50000):
-            if (yield dut.engine.done):
-                return
-            yield
-        raise AssertionError("timeout")
-
-    def driver():
-        yield from submit(dict(kind=3, chan=1, wbase=0x2000, wlen=beats, xsrc=0,
-                               rep=rep, dstride=dstride, sstride=sstride))
-        yield from wait_done()
-        yield
-        for r in range(rep):
-            yield from submit(dict(kind=2, chan=1, wbase=0x2000 + r*32*dstride, wlen=beats,
-                                   dst=0x8000 + r*0x100))
-            yield from wait_done()
-            yield
-            got = bytearray()
-            for w in range(beats):
-                v = (yield dut.scratchpad.mem[(0x8000 + r*0x100 + 32*w)//32])
-                got += int(v).to_bytes(32, "little")
-            assert bytes(got) == pk[r], f"multi-store packet {r} mismatch"
-
-    run_simulation(dut, [driver()])
-
-@pytest.mark.slow  # sixteen Migen channel models: hours; run explicitly (-m slow or -k n16)
-def test_engine_n16_ternary_and_store_window():
+@pytest.mark.parametrize("backend", [
+    "verilator",
+    pytest.param("migen", marks=pytest.mark.slow), # sixteen Migen channel models: hours
+])
+def test_engine_n16_ternary_and_store_window(backend):
     # N=16 enablement (2026-08-29): the shipping sharding at sixteen channels - a ternary
     # matvec across 16 readers with the 16-input xred-free gather - and the 33-bit STORE
     # address: channel 15's port-matched window is 0x1_0400_0000 (PC16, stack 1), which
     # a 32-bit write path silently wraps into PC0. The AW address on channel 15's AXI is
     # captured and checked against the full 33-bit value.
-    from gateware.memory.loader import Loader
-    from model.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
-
     n_channels, rows_per_chan, cols, seed = 16, 4, 256, 173
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
@@ -969,80 +788,33 @@ def test_engine_n16_ternary_and_store_window():
     maxlen   = max(len(p) for p in payloads)
     payloads = [p.ljust(maxlen, b"\0") for p in payloads]
 
-    class _N16DUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                    for _ in range(n_channels)]
-            self.axis = axis
-            self.submodules.scratchpad = Scratchpad(
-                size=64*1024, init=words_from_bytes(x8.tobytes()))
-            self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
-                                                        chan_stride=HBM_CHAN_STRIDE)
-            self.submodules.loader = Loader(axis)
-            self.comb += [
-                self.engine.store_cmd.connect(self.loader.store_cmd),
-                self.engine.store_data.connect(self.loader.store_data),
-                self.engine.store_busy.eq(self.loader.store_busy),
-            ]
-            for i, axi in enumerate(axis):
-                # The models are 64 KB windows; reads/writes are addressed modulo the
-                # window, so the 33-bit AW address is checked on the bus, not the model.
-                model = HBMChannelModel(axi, size=64*1024,
-                                              init=words_from_bytes(payloads[i]), latency=4)
-                setattr(self.submodules, f"model{i}", model)
+    # The models are 64 KB windows; reads/writes are addressed modulo the window, so the
+    # 33-bit AW address is checked on the bus, not the model.
+    rb = layout.row_beats(cols, layout.KIND_TERNARY)
+    s  = Script()
+    submit(s, dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0, wlen=rows_per_chan*rb,
+                   sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+                   cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+                   bias=B, rshift=R, xsrc=0, dst=0x4000), fields=CMD_FIELDS)
+    s.wait("done", cap=60000, tag="matvec")
+    s.step()
+    s.read("sp", 0x4000, 4*M, "res")
+    # STORE 2 beats to channel 15 at the port-matched weight base: the bus must see the
+    # 33-bit address.
+    submit(s, dict(kind=3, chan=15, wbase=HBM_WEIGHT_BASE, wlen=2, xsrc=0), fields=CMD_FIELDS)
+    s.wait("done", cap=60000, tag="store")
+    s.step()
+    bench = EngineBench(n_channels, chan_stride=HBM_CHAN_STRIDE, loader=True)
+    r = bench.run(backend, s, sp=x8.tobytes(), payloads=payloads, latency=4, axi_log=[15])
+    got = np.frombuffer(r.reads["res"], dtype="<i4")
+    assert np.array_equal(got, expected), (got[:8], expected[:8])
+    want = HBM_WEIGHT_BASE + 15*HBM_CHAN_STRIDE
+    assert want >= (1 << 32), "test premise: channel 15 is above 4 GB"
+    aw = r.axi_addresses("axi15", "aw")
+    assert aw and aw[0] == want, ([hex(a) for a in aw[:2]], hex(want))
 
-    dut = _N16DUT()
-    out = {"aw": []}
-
-    def submit(c):
-        for k in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-                  "bias", "rshift", "xsrc", "dst", "chan"):
-            yield getattr(dut.engine.cmd, k).eq(c.get(k, 0))
-        yield dut.engine.cmd.valid.eq(1)
-        yield
-        while not (yield dut.engine.cmd.ready):
-            yield
-        yield dut.engine.cmd.valid.eq(0)
-
-    def wait_done():
-        for _ in range(60000):
-            if (yield dut.engine.done):
-                return
-            yield
-        raise AssertionError("timeout")
-
-    def aw_probe():
-        # Record every AW handshake on channel 15.
-        axi = dut.axis[15]
-        for _ in range(60000):
-            if (yield axi.aw.valid) and (yield axi.aw.ready):
-                out["aw"].append((yield axi.aw.addr))
-            yield
-
-    def driver():
-        rb = layout.row_beats(cols, layout.KIND_TERNARY)
-        yield from submit(dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
-                               wlen=rows_per_chan*rb,
-                               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
-                               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
-                               bias=B, rshift=R, xsrc=0, dst=0x4000))
-        yield from wait_done()
-        yield
-        got = np.frombuffer((yield from read_sp(dut, 0x4000, 4*M)), dtype="<i4")
-        assert np.array_equal(got, expected), (got[:8], expected[:8])
-        # STORE 2 beats to channel 15 at the port-matched weight base: the bus must see
-        # the 33-bit address.
-        yield from submit(dict(kind=3, chan=15, wbase=HBM_WEIGHT_BASE, wlen=2, xsrc=0))
-        yield from wait_done()
-        yield
-        want = HBM_WEIGHT_BASE + 15*HBM_CHAN_STRIDE
-        assert want >= (1 << 32), "test premise: channel 15 is above 4 GB"
-        assert out["aw"] and out["aw"][0] == want, (
-            [hex(a) for a in out["aw"][:2]], hex(want))
-
-    run_simulation(dut, [driver(), aw_probe()])
-
-def test_matvec_packed_writes():
+@BACKEND
+def test_matvec_packed_writes(backend):
     # The result packer (2026-09-07): a plain matvec must reach the W port as full 8-lane
     # beats, not one lane per result. Counts the cycles the engine drives a write during
     # the op and checks the results are still byte-exact. Two shapes: rows a multiple of 8
@@ -1064,91 +836,48 @@ def test_matvec_packed_writes():
         payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
                     for c in range(n_channels)]
         dst = 0x4000
-        dut = _EngineDUT(n_channels, payloads, words_from_bytes(x8.tobytes()), 8, 0)
         cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                    wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                    sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
                    cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
                    bias=B, rshift=R, xsrc=0, dst=dst)
-        writes = []
-        results = []
-
-        def driver():
-            for k, v in cmd.items():
-                yield getattr(dut.engine.cmd, k).eq(v)
-            yield dut.engine.cmd.valid.eq(1)
-            yield
-            while not (yield dut.engine.cmd.ready):
-                yield
-            yield dut.engine.cmd.valid.eq(0)
-            w = 0
-            for _ in range(50000):
-                if (yield dut.engine.dbg_gw_we):
-                    w += 1
-                if (yield dut.engine.done):
-                    break
-                yield
-            else:
-                raise AssertionError("engine timeout")
-            writes.append(w)
-            yield; yield
-            assert (yield dut.engine.error) == 0
-            for i in range(M):
-                word = (yield dut.scratchpad.mem[(dst + 4*i)//32])
-                v = (word >> (32*(((dst + 4*i)//4) % 8))) & 0xFFFFFFFF
-                results.append(v - (1 << 32) if v & (1 << 31) else v)
-
-        run_simulation(dut, [driver()])
-        assert np.array_equal(np.array(results, dtype=np.int64), expected), rows_per_chan
-        assert writes[0] <= max_writes, (n_channels, rows_per_chan, writes[0], max_writes)
-        assert writes[0] >= M//8, (n_channels, rows_per_chan, writes[0])
+        s = Script()
+        submit(s, cmd)
+        s.count("dbg_gw_we", "writes")
+        s.wait("done", cap=50000, tag="engine_timeout")
+        s.step()                       # The done cycle's write counts too.
+        s.count_end("writes")
+        s.step()
+        s.peek("error")
+        s.read("sp", dst, 4*M, "res")
+        r = EngineBench(n_channels).run(backend, s, sp=x8.tobytes(), payloads=payloads)
+        assert r.peeks["error"] == 0
+        assert np.array_equal(_i32(r.reads["res"]), expected), rows_per_chan
+        writes = r.counts["writes"]
+        assert writes <= max_writes, (n_channels, rows_per_chan, writes, max_writes)
+        assert writes >= M//8, (n_channels, rows_per_chan, writes)
 
 
 # Fetch --------------------------------------------------------------------------------------------
 # HBM -> scratchpad.
 
-def test_engine_fetch():
+@BACKEND
+def test_engine_fetch(backend):
     rng  = np.random.default_rng(21)
     data = rng.integers(0, 256, 8*1024, dtype=np.uint8).tobytes()
-
-    class DUT(Module):
-        def __init__(self):
-            axis = [AXIInterface(data_width=256, address_width=33, id_width=6) for _ in range(2)]
-            self.submodules.scratchpad = Scratchpad(size=16*1024)
-            self.submodules.engine     = MatVecEngine(self.scratchpad, axis, xbuf_groups=8)
-            self.submodules.model0 = HBMChannelModel(axis[0], size=8*1024, latency=4)
-            self.submodules.model1 = HBMChannelModel(axis[1], size=8*1024,
-                init=words_from_bytes(data), latency=12)
-
-    dut  = DUT()
     src  = 32*7   # Beat-aligned source in channel 1.
     dst  = 0x1000
     nbeats = 10
 
-    def gen():
-        yield dut.engine.cmd.kind.eq(2)
-        yield dut.engine.cmd.chan.eq(1)
-        yield dut.engine.cmd.wbase.eq(src)
-        yield dut.engine.cmd.wlen.eq(nbeats)
-        yield dut.engine.cmd.dst.eq(dst)
-        yield dut.engine.cmd.valid.eq(1)
-        yield
-        while not (yield dut.engine.cmd.ready):
-            yield
-        yield dut.engine.cmd.valid.eq(0)
-        for _ in range(2000):
-            if (yield dut.engine.done):
-                break
-            yield
-        else:
-            raise AssertionError("fetch timeout")
-        yield
-        for i in range(nbeats):
-            got    = (yield dut.scratchpad.mem[dst//32 + i])
-            expect = int.from_bytes(data[src + 32*i:src + 32*(i+1)], "little")
-            assert got == expect, f"beat {i}"
-
-    run_simulation(dut, [gen()])
+    s = Script()
+    submit(s, dict(kind=2, chan=1, wbase=src, wlen=nbeats, dst=dst))
+    s.wait("done", cap=2000, tag="fetch_timeout")
+    s.step()
+    s.read("sp", dst, 32*nbeats, "got")
+    bench = EngineBench(2, sp_size=16*1024, xbuf_groups=8)
+    r = bench.run(backend, s, payloads=[b"", data], latency=[4, 12], model_size=8*1024)
+    for i in range(nbeats):
+        assert r.reads["got"][32*i:32*(i + 1)] == data[src + 32*i:src + 32*(i + 1)], f"beat {i}"
 
 
 # Channel Offsets (chan_mod) -----------------------------------------------------------------------
@@ -1160,68 +889,12 @@ def test_engine_fetch():
 # a data round trip would pass with any offset at all. chan_mod = 0 must leave the FK33's
 # addresses untouched.
 
-class _DUT(Module):
-    def __init__(self, n_channels, chan_mod, chan_skew=0):
-        axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
-                for _ in range(n_channels)]
-        self.axis = axis
-        src = np.arange(1024, dtype=np.uint8)
-        self.submodules.scratchpad = Scratchpad(size=64*1024,
-                                                      init=words_from_bytes(src.tobytes()))
-        self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=32,
-                                                    chan_stride=HBM_CHAN_STRIDE,
-                                                    chan_mod=chan_mod, chan_skew=chan_skew)
-        self.submodules.loader = Loader(axis, data_width=256,
-                                                 chan_stride=HBM_CHAN_STRIDE,
-                                                 chan_mod=chan_mod, chan_skew=chan_skew)
-        self.comb += [
-            self.engine.store_cmd.connect(self.loader.store_cmd),
-            self.engine.store_data.connect(self.loader.store_data),
-            self.engine.store_busy.eq(self.loader.store_busy),
-        ]
-        for i, axi in enumerate(axis):
-            # 64 KB windows addressed modulo their size: the address is checked on the bus.
-            model = HBMChannelModel(axi, size=64*1024, latency=4)
-            setattr(self.submodules, f"model{i}", model)
-
-
-def _submit(dut, c):
-    for k in ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
-              "bias", "rshift", "xsrc", "dst", "chan"):
-        yield getattr(dut.engine.cmd, k).eq(c.get(k, 0))
-    yield dut.engine.cmd.valid.eq(1)
-    yield
-    while not (yield dut.engine.cmd.ready):
-        yield
-    yield dut.engine.cmd.valid.eq(0)
-
-
-def _wait_done(dut):
-    for _ in range(8000):
-        if (yield dut.engine.done):
-            return
-        yield
-    raise AssertionError("timeout")
-
-
-def _probe(axi, chan, out, key):
-    # Runs until the driver is done (out["done"]): an 8-channel engine is slow to simulate,
-    # so the probes must not pin the run to a fixed cycle count.
-    while not out.get("done"):
-        if (yield axi.aw.valid) and (yield axi.aw.ready):
-            out.setdefault(("aw", key), []).append((yield axi.aw.addr))
-        if (yield axi.ar.valid) and (yield axi.ar.ready):
-            out.setdefault(("ar", key), []).append((yield axi.ar.addr))
-        yield
-
-
+@BACKEND
 @pytest.mark.parametrize("chan_mod, chan_skew", [(0, 0), (4, 0), (4, 0x2000)])
-def test_chan_mod_addresses_every_path(chan_mod, chan_skew):
+def test_chan_mod_addresses_every_path(chan_mod, chan_skew, backend):
     """Read (FETCH), STORE and host upload each add (c % chan_mod)*stride + (c % chan_mod)*skew
     in hardware - the bank skew (XCU1525: 8 KB) on top of the window stride."""
     n_channels = 8
-    dut = _DUT(n_channels, chan_mod, chan_skew)
-    out = {}
     wbase = HBM_WEIGHT_BASE + 0x8000
 
     def local(c):
@@ -1230,48 +903,33 @@ def test_chan_mod_addresses_every_path(chan_mod, chan_skew):
     def off(c):
         return local(c)*HBM_CHAN_STRIDE + local(c)*chan_skew
 
-    def driver():
-        # FETCH from channel 6: one reader's AR carries wbase + local(6)*stride.
-        yield from _submit(dut, dict(kind=2, chan=6, wbase=wbase, wlen=2, dst=0x4000))
-        yield from _wait_done(dut)
-        yield
-        # STORE to channel 5: the loader's writer on channel 5 sees the masked offset.
-        yield from _submit(dut, dict(kind=3, chan=5, wbase=wbase, wlen=2, xsrc=0))
-        yield from _wait_done(dut)
-        yield
-        # Host upload to channel 7 through the loader's CSR path (base + offset in hardware).
-        yield dut.loader.chan.storage.eq(7)
-        yield dut.loader.base.storage.eq(wbase)
-        yield dut.loader.length.storage.eq(2)
-        yield dut.loader.start.storage.eq(1)
-        yield dut.loader.start.re.eq(1)
-        yield
-        yield dut.loader.start.re.eq(0)
-        for beat in range(2):
-            yield dut.loader.sink.data.eq(beat + 1)
-            yield dut.loader.sink.valid.eq(1)
-            yield
-            while not (yield dut.loader.sink.ready):
-                yield
-        yield dut.loader.sink.valid.eq(0)
-        for _ in range(2000):
-            if (yield dut.loader.status.fields.done):
-                break
-            yield
-        for _ in range(20):
-            yield
-        out["done"] = True
+    s = Script()
+    # FETCH from channel 6: one reader's AR carries wbase + local(6)*stride.
+    submit(s, dict(kind=2, chan=6, wbase=wbase, wlen=2, dst=0x4000), fields=CMD_FIELDS)
+    s.wait("done", cap=8000, tag="fetch")
+    s.step()
+    # STORE to channel 5: the loader's writer on channel 5 sees the masked offset.
+    submit(s, dict(kind=3, chan=5, wbase=wbase, wlen=2, xsrc=0), fields=CMD_FIELDS)
+    s.wait("done", cap=8000, tag="store")
+    s.step()
+    # Host upload to channel 7 through the loader's CSR path (base + offset in hardware).
+    s.set("loader_chan", 7)
+    s.set("loader_base", wbase)
+    s.set("loader_length", 2)
+    csr_write(s, "loader_start", 1)
+    for beat in range(2):
+        s.set("loader_sink_data", beat + 1)
+        s.handshake("loader_sink_valid", "loader_sink_ready", tag="upload")
+    s.wait("loader_done", cap=2000, tag="upload_done", fatal=False)
+    s.step(20)
 
-        assert out[("ar", 6)][0] == wbase + off(6), \
-            [hex(a) for a in out[("ar", 6)][:2]]
-        assert out[("aw", 5)][0] == wbase + off(5), \
-            [hex(a) for a in out[("aw", 5)][:2]]
-        assert out[("aw", 7)][0] == wbase + off(7), \
-            [hex(a) for a in out[("aw", 7)][:2]]
-        # Nothing else was addressed on the probed channels' write side.
-        assert ("aw", 6) not in out
-
-    run_simulation(dut, [driver(),
-                         _probe(dut.axis[5], 5, out, 5),
-                         _probe(dut.axis[6], 6, out, 6),
-                         _probe(dut.axis[7], 7, out, 7)])
+    bench = EngineBench(n_channels, chan_stride=HBM_CHAN_STRIDE, chan_mod=chan_mod,
+                        chan_skew=chan_skew, loader=True, loader_width=256)
+    r = bench.run(backend, s, sp=np.arange(1024, dtype=np.uint8).tobytes(), latency=4,
+                  axi_log=[5, 6, 7])
+    ar6, aw5, aw7 = r.axi_addresses("axi6", "ar"), r.axi_addresses("axi5", "aw"), r.axi_addresses("axi7", "aw")
+    assert ar6 and ar6[0] == wbase + off(6), [hex(a) for a in ar6[:2]]
+    assert aw5 and aw5[0] == wbase + off(5), [hex(a) for a in aw5[:2]]
+    assert aw7 and aw7[0] == wbase + off(7), [hex(a) for a in aw7[:2]]
+    # Nothing else was addressed on the probed channels' write side.
+    assert not r.axi_addresses("axi6", "aw")
