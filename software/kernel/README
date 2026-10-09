@@ -13,7 +13,7 @@ build/<name>/driver/kernel/ and the bring-up scripts copy them here.
 
 - Load both modules and make the device nodes world-writable:
 
-  sudo ./init.sh
+  trixium driver load      (or: sudo python3 -m software.driver load --dir software/kernel)
 
 - Install them persistently (/lib/modules/.../extra, modules-load.d and a udev rule):
 

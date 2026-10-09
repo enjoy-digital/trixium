@@ -11,14 +11,20 @@
 # The TriXium core streams its weights from the four DDR4 controllers: engine channel c reads
 # from controller c // 4 through its own crossbar port, at per-channel windows inside that
 # controller. The defaults are the configuration that runs the 27B (every scratchpad unit, the
-# DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz). Design
-# decisions and board notes: docs/boards.md.
+# DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz), built with the
+# CPU, Vivado directives and timing gate it shipped with. Design decisions and board notes:
+# doc/boards.md.
 #
-# Build (from the repository root):
-#   tools/build_xcu1525.sh <name>                       # Vivado directives + timing gate.
-#   python3 -m trixium_xcu1525 --build          # or by hand.
+# From the repository root:
+#   ./trixium_xcu1525.py --build                         # -> build/xcu1525/ + build/xcu1525.verdict
+#   ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
+#   ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
+#   trixium deploy xcu1525 --board xcu1525 --model 27b   # the lab board: software/deploy.py
+#
+# Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
 
 import os
+import sys
 
 from migen import *
 from migen.genlib.cdc import MultiReg
@@ -254,9 +260,9 @@ class TriXiumXCU1525SoC(SoCCore):
             bar0_size  = 0x40000) # Covers DDR_CSR_WINDOW (CSR region + 0x20000): host DDR trainer.
         self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
 
-        # CPU Bus Monitor (read over PCIe by tools/cpumon.py) --------------------------------------
+        # CPU Bus Monitor (read over PCIe by software/cpumon.py) -----------------------------------
         self.cpumon = CPUBusMonitor(self.cpu)
-        self.csr.add("cpumon", 31) # Pinned: ctrl must stay at 0 (fk33_cpurst.py, pcie_console).
+        self.csr.add("cpumon", 31) # Pinned: ctrl must stay at 0 (software/cpurst.py, console).
         if cpu_slr is not None:
             # The CPU in one SLR: spread over two, its memory-bus return crosses the boundary
             # at 8 logic levels and misses timing.
@@ -343,18 +349,61 @@ class TriXiumXCU1525SoC(SoCCore):
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
             DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
 
+# Helpers ------------------------------------------------------------------------------------------
+
+VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1"
+
+def set_vivado_env(path):
+    """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
+    if path and os.path.exists(os.path.join(path, "settings64.sh")):
+        os.environ["LITEX_ENV_VIVADO"] = path
+
+
+def write_verdict(path, rc):
+    """build/<name>.verdict: the build's exit code (0 = timing gate passed)."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{rc}\n")
+
 # Build --------------------------------------------------------------------------------------------
 
+# CPU: 32 KB I$ + 32 KB D$ (the per-layer firmware code path does not fit 16 KB), branch
+# prediction, the FPU (the 27B's CPU path is ~150 M float ops per token), Zcbm (cache
+# maintenance for the resident lists) and Zbb (clz).
+VEXII_ARGS = ("--fetch-l1-ways=4 --fetch-l1-sets=128 --lsu-l1-ways=4 --lsu-l1-sets=128 "
+    "--with-btb --with-ras --with-gshare --with-rvZcbm --with-rvZbb --with-rvf")
+
 def main():
+    # VexiiRiscv's netlist cache key must not depend on set ordering: hash randomization is
+    # fixed at interpreter start, so run again with PYTHONHASHSEED=0.
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        os.environ["PYTHONHASHSEED"] = "0"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     from gateware.migen_fast import install as install_migen_fast
     install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
     from litex.build.parser import LiteXArgumentParser
+    from software.timing import gate
     parser = LiteXArgumentParser(platform=sqrl_xcu1525.Platform, description="TriXium on the SQRL XCU1525.")
-    parser.add_target_argument("--sys-clk-freq",    default=125e6,   type=float, help="System clock frequency (CPU, TriXium core).")
-    parser.add_target_argument("--ddr-clk-freq",    default=187.5e6, type=float, help="DDR4 controller clock frequency (DDR4 rate = 8x: 187.5e6 = DDR4-1500).")
-    parser.add_target_argument("--engine-channels", default=16,      type=int,   help="Engine channels (multiple of 4).")
-    parser.add_target_argument("--cpu-slr",         default=1,       type=int,   help="CPU pblock SLR.")
-    parser.add_target_argument("--driver",          action="store_true",         help="Generate PCIe driver.")
+    parser.add_target_argument("--sys-clk-freq",    default=125e6,   type=float,                             help="System clock frequency (CPU, TriXium core).")
+    parser.add_target_argument("--ddr-clk-freq",    default=187.5e6, type=float,                             help="DDR4 controller clock frequency (DDR4 rate = 8x: 187.5e6 = DDR4-1500).")
+    parser.add_target_argument("--engine-channels", default=16,      type=int,                               help="Engine channels (multiple of 4).")
+    parser.add_target_argument("--cpu-slr",         default=1,       type=int,                               help="CPU pblock SLR.")
+    parser.add_target_argument("--driver",          action="store_true",                                     help="Generate PCIe driver (always with --build).")
+    parser.add_target_argument("--vivado-settings", default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
+    parser.add_target_argument("--timing-approval", default="ddr1600-overclock",                             help="Timing gate approval (software/timing.py APPROVALS); DDR4-1500 overclocks the ISERDES.")
+    # The shipping recipe (overridable from the command line).
+    parser.set_defaults(
+        cpu_type                             = "vexiiriscv",
+        update_repo                          = "no", # Never update ext/VexiiRiscv from here.
+        vexii_args                           = VEXII_ARGS,
+        vivado_synth_directive               = "AreaOptimized_medium",
+        vivado_opt_directive                 = "ExploreWithRemap",
+        vivado_place_directive               = "SSI_SpreadLogic_high",
+        vivado_post_place_phys_opt_directive = "AggressiveExplore",
+        vivado_route_directive               = "AggressiveExplore",
+        vivado_post_route_phys_opt_directive = "AggressiveExplore",
+        vivado_max_threads                   = 4,
+    )
     args = parser.parse_args()
 
     soc = TriXiumXCU1525SoC(
@@ -367,7 +416,7 @@ def main():
 
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
-        builder_argd["output_dir"] = os.path.join("build", f"xcu1525_n{args.engine_channels}")
+        builder_argd["output_dir"] = os.path.join("build", "xcu1525")
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = os.path.join(builder_argd["output_dir"], "csr.csv")
     builder = Builder(soc, **builder_argd)
@@ -375,10 +424,28 @@ def main():
         if not args.build:
             builder.compile_software = False
             builder.compile_gateware = False
-        builder.build(**parser.toolchain_argdict)
-
-    if args.driver:
+        set_vivado_env(args.vivado_settings)
+        verdict = builder.output_dir.rstrip("/") + ".verdict"
+        try:
+            builder.build(**parser.toolchain_argdict)
+        except OSError:
+            if builder.compile_gateware:
+                write_verdict(verdict, 1)
+            raise
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))
+
+        # A successful Vivado run is not a qualified bitstream: the timing gate decides. The strict
+        # release verdict is printed for information; DDR4-1500 runs the USPDDRPHY's ISERDES past
+        # its minimum period, an out-of-spec overclock passed under its per-build approval.
+        if builder.compile_gateware:
+            report = os.path.join(builder.gateware_dir, f"{soc.platform.name}_timing.rpt")
+            print("\nTiming gate (strict, for information):")
+            gate(report, strict=True, serializer_baseline="v8")
+            print(f"\nTiming gate (approval {args.timing_approval}):")
+            rc = gate(report, experiment=True, serializer_baseline="v8", approval=args.timing_approval)
+            write_verdict(verdict, rc)
+            if rc:
+                sys.exit(rc)
 
     if args.load:
         prog = soc.platform.create_programmer()
