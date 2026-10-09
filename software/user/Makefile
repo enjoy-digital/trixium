@@ -4,7 +4,7 @@
 # (TRIXIUM_N_CHANNELS, CSR map) differ per build and a mismatch silently misconfigures the
 # card. Host code compiles against the driver-flavour headers (csr.h/soc.h/mem.h without the
 # <generated/...> includes) the build scripts generate next to the build.
-BUILD_DIR ?= ../../../build/xcu1525
+BUILD_DIR ?= ../../build/xcu1525
 GEN_INC   := $(BUILD_DIR)/driver/kernel
 
 CFLAGS=-O2 -Wall -g -I$(GEN_INC) -I$(BUILD_DIR)/software/include -I../kernel -Iliblitepcie -MMD -fPIC
