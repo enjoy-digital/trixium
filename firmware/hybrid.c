@@ -103,6 +103,9 @@ static uint32_t dn_hbm_base;
 // layer's op 5 takes it as +0.0 (TRIXIUM_DNSTREAM_ZERO) instead of hybrid_reset clearing the
 // 144 MiB in engine DDR at every generation's first token.
 static uint64_t dn_state_zero;
+#ifdef TRIXIUM_SIM
+static int hybrid_inits, power_on_reset; // Simulation: hybrid_init's first reset (below).
+#endif
 
 static inline float *dn_conv_slot(int s, int p, int C)
 {
@@ -582,6 +585,7 @@ int hybrid_init(void)
     for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++)
         sigmoid_lut[i] = trixium_sigmoid_point(-TRIXIUM_SILU_LUT_LIMIT + (float)i*(1.0f/TRIXIUM_SILU_LUT_SCALE));
 
+    SIM_MARK("hybrid: silu/sigmoid tables");
     int wmax = n_embd;
     if (ffn_dim > wmax) wmax = ffn_dim;
     if (q_dim > wmax) wmax = q_dim;
@@ -640,6 +644,7 @@ int hybrid_init(void)
             if (!norm_q[l] || !norm_k[l]) { printf("hybrid: layer %d q/k norms missing\n", l); return -2; }
         }
     }
+    SIM_MARK("hybrid: norms");
     // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; v3 images carry the
     // scaling fields for models that need them).
     rope_c = infer_halloc((rope_n/2)*4, 0); rope_s = infer_halloc((rope_n/2)*4, 0);
@@ -662,7 +667,17 @@ int hybrid_init(void)
 #else
     HP->dnstream_enabled = 0;
 #endif
+#ifdef TRIXIUM_SIM
+    // The first reset after power-on: the DeltaNet state (engine DDR) and the conv window
+    // (fresh heap) still hold the memory models' initial zeros - nothing stores there before
+    // the first generation, and the CPU has no line of either.
+    power_on_reset = !hybrid_inits++;
+#endif
     hybrid_reset();
+#ifdef TRIXIUM_SIM
+    power_on_reset = 0;
+#endif
+    SIM_MARK("hybrid: reset");
     HP->dnres_enabled = 0;
     HP->xres_enabled = 0;
     if (H->hadamard_block && resident_available()) {
@@ -777,6 +792,13 @@ void hybrid_reset(void)
         }
 #endif
 #endif
+#ifdef TRIXIUM_SIM
+        // Simulation only: the boot-time clear (~0.8M cycles, ~40 s of Verilator: a CPU
+        // zero-fill of 64 KB of scratchpad, then engine STOREs) would write zeros over the
+        // memory model's power-on zeros. Every later reset clears as on the board.
+        if (power_on_reset)
+            cleared = 1;
+#endif
 #ifdef DN_STATE_HW
         if (!cleared)
             dn_hw_reset();
@@ -785,7 +807,13 @@ void hybrid_reset(void)
     } else if (dn_state) {
         memset(dn_state, 0, (size_t)n_dn*nv*hv*hk*4);
     }
+#ifdef TRIXIUM_SIM
+    // Simulation only, likewise: the boot-time memset + flush of the conv window
+    // (~0.4M cycles: every line a main_ram miss, then a write-back).
+    if (dn_conv && !power_on_reset && dn_conv_zero()) {
+#else
     if (dn_conv && dn_conv_zero()) {
+#endif
         memset(dn_conv, 0, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);
         flush_cpu_dcache_range(dn_conv, (size_t)n_dn*(conv_k - 1)*(2*nq + nvh)*4);   // device-owned
     }

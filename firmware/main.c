@@ -777,17 +777,28 @@ int main(void)
     irq_setie(1);
 #endif
     uart_init();
+    SIM_MARK("main");                    // Reset to here: crt0 (no BIOS in the simulation).
     perf_init();
     infer_static_init();
     vec_init();
 
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
 #ifdef TRIXIUM_N_MEMCTRL
+#ifndef TRIXIUM_SIM
     // The BIOS brought up controller 0 (main_ram); the other DDR4 controllers carry
     // the engine channels' weights and have no BIOS support: init them here, then prove
     // every channel's window with the path the weights take (ddr.c).
     ddr_init_all();
     ddr_test(-1);
+#else
+    // Simulation: LiteDRAM's PHY model has no reset/MRS/ZQ/leveling state and the DFII
+    // starts in hardware control, so the init sequence (~1.6M cycles, ~80 s of Verilator)
+    // has nothing to set up. The round trip (~0.5M cycles) is covered by the gate itself:
+    // every channel's weights are fetched and its K/V and DeltaNet state stored through
+    // the same windows, so an aliased or broken channel changes the checkpoints. Both
+    // stay on the console (`ddrinit`, `ddrtest`).
+    puts("ddr: simulation (PHY model) - controller init and DDRTEST skipped");
+#endif
 #endif
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
     model_info();
@@ -860,6 +871,7 @@ int main(void)
         }
     }
     selftest();
+    SIM_MARK("selftests");
     hwops_init();
     if (infer_init() == 0) {
         // Boot generation demo (deterministic; checked by the sim harness).
@@ -911,6 +923,7 @@ int main(void)
     }
 boot_demo_done:
     hwops_init(); // Leave the shell on the fast path, not on the debug fallbacks.
+    SIM_MARK("ready");
     puts("TRIXIUM-READY");
     printf("trixium> ");
 

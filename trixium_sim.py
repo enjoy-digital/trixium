@@ -15,7 +15,7 @@ one HBM channel model per engine channel and no scratchpad units. The firmware b
 BONS header+table are baked into main_ram at elaboration, the channel payloads into the memory
 models.
 
-  ./trixium_sim.py --build      # headers + BIOS, firmware, Verilog (~1 min), Verilator (~2.5 min)
+  ./trixium_sim.py --build      # headers + libraries, firmware, Verilog (~1 min), Verilator (~2.5 min)
   ./trixium_sim.py --run        # run it (console on stdin/stdout)
   ./trixium_sim.py --firmware   # rebuild the firmware and re-bake it into the built sim (seconds)
   ./trixium_sim.py --gate       # traced generation compared with the Python mirror (~17 min)
@@ -64,9 +64,9 @@ MAIN_RAM_SIZE = 0x0080_0000    # 8 MB.
 HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared with hardware).
 
 # The DDR4 flavor of the sim: the XCU1525's memory plumbing on LiteDRAM's PHY model - main_ram on
-# controller 0 through the BIOS's own sdram_init(), the engine channels on crossbar ports behind
-# AXI bridges, chan_mod channels per controller at these window constants, and the firmware's
-# ddr_init_all()/ddr_test() for controllers 1..N-1 (firmware/ddr.c). Sizes: main_ram is 8 MB
+# controller 0, the engine channels on crossbar ports behind AXI bridges, chan_mod channels per
+# controller at these window constants (the PHY model needs no init sequence: the firmware skips
+# ddr_init_all()/ddr_test() under TRIXIUM_SIM, its console still runs them). Sizes: main_ram is 8 MB
 # (0..8 MB of controller 0), the windows start at 12 MB so the header staging area (window - 1 MB)
 # and the round-trip test (window - 2 MB) stay above main_ram; 4 MB per window holds the tiny
 # payload and its KV. The channel skew is a bank skew IN THE SIM'S GEOMETRY (ncols 128 puts the
@@ -79,6 +79,17 @@ DDR4_SIM_CSR_WINDOW  = 0xF0020000  # The target's DDR_CSR_WINDOW.
 DDR_SPLIT_CLK_RATIO  = 2           # ddr clock / sys clock in the simulation.
 DDR4_SIM_CSR_PAGE0   = 8           # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
+
+# The ROM holds no BIOS, only a jump to the firmware in main_ram (`lui t0, MAIN_RAM_BASE;
+# jr t0`), which the elaboration preloads: the BIOS's banner, ROM CRC, controller-0 init,
+# serial-boot timeout and pre-boot flush of the whole 8 MB main_ram (one CBO per line) took
+# ~2.4M cycles, ~150 s of Verilator, before the firmware's first instruction. The firmware's
+# crt0 needs nothing from it (stack, trap vector, .data/.bss are its own), the PHY model needs
+# no init sequence and the DFII starts in hardware control.
+ROM_BOOT_STUB = [
+    0x0000_0037 | (5 << 7) | (MAIN_RAM_BASE & 0xFFFF_F000), # lui  t0, %hi(MAIN_RAM_BASE)
+    0x0000_0067 | (5 << 15),                                # jalr x0, 0(t0)
+]
 
 # Memory Contents ----------------------------------------------------------------------------------
 
@@ -190,6 +201,7 @@ class TriXiumSimSoC(SoCCore):
             ident                    = "TriXium Sim" + (" DDR4" if mem == "ddr4" else ""),
             cpu_type                 = cpu_type,
             integrated_rom_size      = 0x20000,
+            integrated_rom_init      = ROM_BOOT_STUB,
             integrated_main_ram_size = MAIN_RAM_SIZE if mem == "hbm" else 0,
             integrated_main_ram_init = words(ram) if mem == "hbm" else [],
             uart_name                = "sim")
@@ -269,10 +281,11 @@ class TriXiumSimSoC(SoCCore):
             self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
             self.add_constant("TRIXIUM_N_MEMCTRL",        n_memctrl)
             self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   DDR4_SIM_CSR_STRIDE)
-            self.add_constant("SDRAM_TEST_DISABLE") # The BIOS's memtest would erase the init.
+            self.add_constant("SDRAM_TEST_DISABLE") # sdram_init()'s memtest would erase the preload.
         self.add_constant("TRIXIUM_N_CHANNELS",       n_channels)
-        if firmware is not None:
-            self.add_constant("ROM_BOOT_ADDRESS", MAIN_RAM_BASE)
+        # Simulation-only firmware paths (boot shortcuts, boot-phase cycle marks): the board
+        # targets never define it.
+        self.add_constant("TRIXIUM_SIM")
 
     def add_ddr4(self, n_channels, n_memctrl, ram, img, memory_ports):
         """The XCU1525's memory system on LiteDRAM's PHY model; returns chan_mod."""
@@ -387,7 +400,7 @@ def build_sim(args, board, out_dir):
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     csr_csv = os.path.join(out_dir, "csr.csv")
 
-    # Headers + BIOS (to build the firmware against).
+    # Headers + LiteX libraries (to build the firmware against; the ROM is the boot stub, no BIOS).
     soc     = TriXiumSimSoC(image=args.image, firmware=None, **soc_kwargs)
     builder = Builder(soc, output_dir=out_dir, csr_csv=csr_csv)
     builder.build(sim_config=sim_config, build=False, run=False)
@@ -409,7 +422,7 @@ def main():
     parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS),              help="Hardware to mirror.")
     parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img",     help="BONS image to bake in.")
     parser.add_argument("--out-dir",        default=None,                                           help="Build directory (default: build/sim_<board>).")
-    parser.add_argument("--build",          action="store_true",                                    help="Build the simulation (headers + BIOS, firmware, Verilog, Verilator).")
+    parser.add_argument("--build",          action="store_true",                                    help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
     parser.add_argument("--run",            action="store_true",                                    help="Run the built simulation (console on stdin/stdout).")
     parser.add_argument("--firmware",       action="store_true",                                    help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525).")
     parser.add_argument("--gate",           action="store_true",                                    help="Traced generation compared with the Python mirror.")

@@ -54,6 +54,15 @@ void     perf_ovl_mark(void);           // Overlap-window start.
 void     perf_ovl_acc(uint64_t acc[4]); // Zero-init; acc[0] == UINT64_MAX means invalid.
 void     perf_ovl_report(const char *tag, const uint64_t acc[4]);
 
+// Boot-phase marks for the simulation (TRIXIUM_SIM, defined by trixium_sim.py's SoC only):
+// the architectural cycle count since reset, so a slow simulated boot can be broken down.
+// Compiled out of the board firmware.
+#ifdef TRIXIUM_SIM
+#define SIM_MARK(label) printf("SIMT %s %lu\n", (label), (unsigned long)perf_now64())
+#else
+#define SIM_MARK(label) ((void)0)
+#endif
+
 // Accumulators, exposed for bench.
 extern uint64_t perf_cycles[OP_COUNT];
 extern uint64_t perf_calls[OP_COUNT];
