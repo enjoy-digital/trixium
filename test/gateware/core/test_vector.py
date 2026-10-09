@@ -20,6 +20,7 @@ from gateware.memory.hbm_model import words_from_bytes
 from model import asm
 
 from common import import_test
+from common.verilator import Script, Simulator, run_migen
 
 # Stock Programs -----------------------------------------------------------------------------------
 # VectorUnit RTL vs the asm.py interpreter: every stock program runs on both with the
@@ -28,65 +29,86 @@ from common import import_test
 
 SP_SIZE = 16*1024
 
-class _VecDUT(Module):
-    def __init__(self, sp_init):
+class _DUT(Module):
+    def __init__(self, sp_init=None):
         self.submodules.sp = Scratchpad(size=SP_SIZE, init=sp_init)
         self.submodules.vu = VectorUnit()
         self.comb += [
             self.sp.fill.adr.eq(self.vu.sp_rd_adr),
             self.vu.sp_rd_dat.eq(self.sp.fill.dat_r),
             self.sp.gather.adr.eq(self.vu.sp_wr_adr),
-            self.sp.gather.we.eq(self.vu.sp_wr_we),
+            # The integrator's rule: a withheld grant means the write does not happen (the
+            # grant is held at 1 unless a test withholds it).
+            self.sp.gather.we.eq(Mux(self.vu.sp_wr_gnt, self.vu.sp_wr_we, 0)),
             self.sp.gather.dat_w.eq(self.vu.sp_wr_dat),
         ]
+        vu = self.vu
+        self.signals = dict(vu_busy=vu.sp_wr_gnt, vu_sp_wr_gnt=vu.sp_wr_gnt)
+        for name in ("prog", "prog_adr", "pc", "submit") + tuple(f"arg{i}" for i in range(8)):
+            self.signals[f"vu_{name}"]    = getattr(vu, name).storage
+            self.signals[f"vu_{name}_re"] = getattr(vu, name).re
+        self.signals.update(vu_busy=vu.busy, vu_res5=vu.res5.status, vu_res6=vu.res6.status,
+                            vu_res7=vu.res7.status, vu_bad_op=vu.status.fields.bad_op,
+                            vu_done_count=vu.done_count.status)
 
-def _csr_write(csr, value):
-    yield csr.storage.eq(value)
-    yield csr.re.eq(1)
-    yield
-    yield csr.re.eq(0)
-    yield
+# Backends -----------------------------------------------------------------------------------------
+# Every RTL test runs on the compiled vector unit (fast tier) and on Migen's simulator (slow
+# tier): one Script, the same scratchpad image in, the whole scratchpad and S5..S7 out.
 
-def _run_rtl(prog_name, sp_bytes, args, max_cycles=200000):
-    words = asm.assemble(asm.PROGRAMS[prog_name]())
-    dut   = _VecDUT(words_from_bytes(bytes(sp_bytes)))
-    out   = {}
+BACKEND = pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
 
-    def gen():
-        # Upload program.
-        yield from _csr_write(dut.vu.prog_adr, 0)
-        for w in words:
-            yield from _csr_write(dut.vu.prog, w)
-        # Args.
-        arg_csrs = [dut.vu.arg0, dut.vu.arg1, dut.vu.arg2, dut.vu.arg3,
-                    dut.vu.arg4, dut.vu.arg5, dut.vu.arg6, dut.vu.arg7]
-        for i, a in enumerate(args):
-            yield from _csr_write(arg_csrs[i], a & 0xFFFFFFFF)
-        yield from _csr_write(dut.vu.pc, 0)
-        # Run.
-        yield from _csr_write(dut.vu.submit, 1)
-        for _ in range(max_cycles):
-            if not (yield dut.vu.busy):
-                break
-            yield
-        else:
-            raise AssertionError("vector unit timeout")
-        yield
-        # Read back the whole scratchpad.
-        data = bytearray()
-        for w in range(SP_SIZE//32):
-            v = (yield dut.sp.mem[w])
-            data += int(v).to_bytes(32, "little")
-        out["sp"] = bytes(data)
-        out["s6"] = (yield dut.vu.res6.status)
+def _csr_write(s, name, value):
+    s.set(name, value)
+    s.set(name + "_re", 1)
+    s.step()
+    s.set(name + "_re", 0)
+    s.step()
 
-    run_simulation(dut, [gen()])
-    return out
+def _simulator():
+    def build():
+        dut = _DUT()
+        return dict(dut=dut, ios=dut.signals, memories={"sp": dut.sp.mem})
+    return Simulator(build, name="vecunit", key="test_vector._DUT")
 
-def _compare(prog_name, sp_bytes, args):
+def _vec_run(backend, words, sp_bytes, args, withhold_seed=None, max_cycles=200000):
+    """Upload `words`, run them on `args` over the scratchpad image; withhold_seed: withhold
+    the store grant ~40% of the cycles while the program runs."""
+    s = Script()
+    s.reset(2)
+    s.set("vu_sp_wr_gnt", 1)
+    _csr_write(s, "vu_prog_adr", 0)
+    for w in words:
+        _csr_write(s, "vu_prog", w)
+    for i, a in enumerate(args):
+        _csr_write(s, f"vu_arg{i}", a & 0xFFFFFFFF)
+    _csr_write(s, "vu_pc", 0)
+    if withhold_seed is not None:
+        s.random("vu_sp_wr_gnt", 60, withhold_seed)
+    _csr_write(s, "vu_submit", 1)
+    s.wait({"vu_busy": 0}, cap=max_cycles, tag="vector_unit_timeout")
+    s.random("vu_sp_wr_gnt", -1)
+    s.set("vu_sp_wr_gnt", 1)
+    s.step()
+    s.read("sp", 0, SP_SIZE, "sp")
+    for name in ("res5", "res6", "res7", "bad_op", "done_count"):
+        s.peek(f"vu_{name}", name)
+    if backend == "migen":
+        dut = _DUT(words_from_bytes(bytes(sp_bytes)))
+        r = run_migen(dut, dut.signals, s, memories={"sp": dut.sp.mem})
+    else:
+        r = _simulator().run(s, images={"sp": bytes(sp_bytes)})
+    p = r.peeks
+    return dict(sp=r.reads["sp"], s5=p["res5"], s6=p["res6"], s7=p["res7"], bad=p["bad_op"],
+                dc=p["done_count"])
+
+def _run_rtl(backend, prog_name, sp_bytes, args, max_cycles=200000):
+    return _vec_run(backend, asm.assemble(asm.PROGRAMS[prog_name]()), sp_bytes, args,
+                    max_cycles=max_cycles)
+
+def _compare(backend, prog_name, sp_bytes, args):
     ref_sp = bytearray(sp_bytes)
     S, _   = asm.VecInterp(ref_sp).run(asm.assemble(asm.PROGRAMS[prog_name]()), list(args))
-    got    = _run_rtl(prog_name, sp_bytes, args)
+    got    = _run_rtl(backend, prog_name, sp_bytes, args)
     if got["sp"] != bytes(ref_sp):
         gb, rb = got["sp"], bytes(ref_sp)
         diffs = [i for i in range(len(gb)) if gb[i] != rb[i]][:8]
@@ -95,40 +117,45 @@ def _compare(prog_name, sp_bytes, args):
                              f"ref {[hex(rb[i]) for i in diffs]}")
     return S, got
 
-def test_rtl_resid_add():
+@BACKEND
+def test_rtl_resid_add(backend):
     rng = np.random.default_rng(21)
     n   = 128
     sp  = bytearray(SP_SIZE)
     sp[0:2*n]        = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
     sp[1024:1024+2*n] = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
-    _compare("resid_add", sp, [0, 1024, 2048, n//16, -1, -3])
+    _compare(backend, "resid_add", sp, [0, 1024, 2048, n//16, -1, -3])
 
-def test_rtl_quant8():
+@BACKEND
+def test_rtl_quant8(backend):
     rng = np.random.default_rng(22)
     n   = 256
     sp  = bytearray(SP_SIZE)
     sp[0:2*n] = rng.integers(-32767, 32768, n).astype(np.int16).tobytes()
-    _compare("quant8", sp, [0, 0, 2048, n//16])
+    _compare(backend, "quant8", sp, [0, 0, 2048, n//16])
 
-def test_rtl_norm_i32():
+@BACKEND
+def test_rtl_norm_i32(backend):
     rng = np.random.default_rng(23)
     n   = 64
     v   = rng.integers(-2**28, 2**28, n).astype(np.int32)
     sp  = bytearray(SP_SIZE)
     sp[0:4*n] = v.tobytes()
     k = max(0, int(np.abs(v).max()).bit_length() - 14)
-    S, got = _compare("norm_i32", sp, [0, 0, 2048, n//16, k])
+    S, got = _compare(backend, "norm_i32", sp, [0, 0, 2048, n//16, k])
     assert got["s6"] == S[6] # Output absmax matches the interpreter.
 
-def test_rtl_silu_mul():
+@BACKEND
+def test_rtl_silu_mul(backend):
     rng = np.random.default_rng(24)
     n   = 128
     sp  = bytearray(SP_SIZE)
     sp[0:2*n]         = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
     sp[2048:2048+2*n] = rng.integers(-30000, 30000, n).astype(np.int16).tobytes()
-    _compare("silu_mul", sp, [0, 2048, 4096, n//16, -6, 0, -15]) # eg = -12 -> A4 = eg+6 = -6.
+    _compare(backend, "silu_mul", sp, [0, 2048, 4096, n//16, -6, 0, -15]) # eg = -12 -> A4 = eg+6 = -6.
 
-def test_rtl_rmsnorm():
+@BACKEND
+def test_rtl_rmsnorm(backend):
     rng = np.random.default_rng(31)
     n   = 128
     es  = -12
@@ -140,9 +167,10 @@ def test_rtl_rmsnorm():
     sp[4096:4096+2*n] = w16.tobytes()
     eps_int = max(1, int(round(1e-6*2.0**(-2*es))))
     args = [0, 4096, 8192, n//16, -int(np.log2(n)), eps_int, (-13) - (-11) - 15]
-    _compare("rmsnorm", bytes(sp), args)
+    _compare(backend, "rmsnorm", bytes(sp), args)
 
-def test_rtl_scalar_ops_m4():
+@BACKEND
+def test_rtl_scalar_ops_m4(backend):
     # SADD/SSHLV/SNORME + sign-extending ARG, RTL vs interpreter (scalar results via res5-7).
     prog = [
         ("ARG",   "s0", 0),
@@ -160,13 +188,14 @@ def test_rtl_scalar_ops_m4():
         for a in ([100, 23, 3], [1 << 20, 5, 12], [7, 0, 30], [-50, 20, 2],
                   [123456, -456, -3], [-17, 0, 0]):
             ref_S, _ = asm.VecInterp(bytearray(64)).run(asm.assemble(prog), list(a))
-            got = _run_rtl("_m4_scalar", bytes(SP_SIZE), a)
+            got = _run_rtl(backend, "_m4_scalar", bytes(SP_SIZE), a)
             m48 = (1 << 48) - 1
             assert got["s6"] == ref_S[6] & m48, (a, got["s6"], ref_S[6])
     finally:
         del asm.PROGRAMS["_m4_scalar"]
 
-def test_rtl_softmax8():
+@BACKEND
+def test_rtl_softmax8(backend):
     rng = np.random.default_rng(61)
     T   = 30
     pad = 32
@@ -176,18 +205,20 @@ def test_rtl_softmax8():
     sp  = bytearray(SP_SIZE)
     sp[0:4*pad] = buf.astype("<i4").tobytes()
     sigma, s1 = -18, 11
-    _compare("softmax8", bytes(sp), [0, 739, 8192, pad//16, -s1, -(-(sigma + 6) - s1),
+    _compare(backend, "softmax8", bytes(sp), [0, 739, 8192, pad//16, -s1, -(-(sigma + 6) - s1),
                                      12288])
 
-def test_rtl_reduce_acc():
+@BACKEND
+def test_rtl_reduce_acc(backend):
     rng = np.random.default_rng(62)
     n   = 64
     sp  = bytearray(SP_SIZE)
     sp[0:4*n]         = rng.integers(-2**28, 2**28, n).astype("<i4").tobytes()
     sp[1024:1024+4*n] = rng.integers(-2**28, 2**28, n).astype("<i4").tobytes()
-    _compare("reduce_acc", bytes(sp), [0, 1024, 0, n//8])
+    _compare(backend, "reduce_acc", bytes(sp), [0, 1024, 0, n//8])
 
-def test_rtl_rope():
+@BACKEND
+def test_rtl_rope(backend):
     rng = np.random.default_rng(63)
     hd  = 64
     sp  = bytearray(SP_SIZE)
@@ -195,98 +226,78 @@ def test_rtl_rope():
     sp[256:256+hd] = rng.integers(-30000, 30000, hd//2).astype("<i2").tobytes()
     sp[512:512+hd] = rng.integers(-32767, 32768, hd//2).astype("<i2").tobytes()
     sp[768:768+hd] = rng.integers(-32767, 32768, hd//2).astype("<i2").tobytes()
-    _compare("rope", bytes(sp), [0, 256, 512, 768, hd//2//16, 1024, 1280])
+    _compare(backend, "rope", bytes(sp), [0, 256, 512, 768, hd//2//16, 1024, 1280])
 
-def test_rtl_scale8():
+@BACKEND
+def test_rtl_scale8(backend):
     rng = np.random.default_rng(64)
     n   = 64
     sp  = bytearray(SP_SIZE)
     sp[0:2*n] = rng.integers(-16000, 16000, n).astype("<i2").tobytes()
-    _compare("scale8", bytes(sp), [0, 1024, 2048, n//16, 19571])
+    _compare(backend, "scale8", bytes(sp), [0, 1024, 2048, n//16, 19571])
 
 
-def _compare_words(prog, sp_bytes, args):
+def _compare_words(backend, prog, sp_bytes, args):
     # Like _compare but for programs not (yet) in the per-op RTL list: whole scratchpad.
     ref = bytearray(sp_bytes)
     asm.VecInterp(ref).run(asm.assemble(prog), list(args))
-    words = asm.assemble(prog)
-    dut   = _VecDUT(words_from_bytes(bytes(sp_bytes)))
-    out   = {}
-
-    def gen():
-        yield from _csr_write(dut.vu.prog_adr, 0)
-        for w in words:
-            yield from _csr_write(dut.vu.prog, w)
-        arg_csrs = [dut.vu.arg0, dut.vu.arg1, dut.vu.arg2, dut.vu.arg3,
-                    dut.vu.arg4, dut.vu.arg5, dut.vu.arg6, dut.vu.arg7]
-        for i, a in enumerate(args):
-            yield from _csr_write(arg_csrs[i], a & 0xFFFFFFFF)
-        yield from _csr_write(dut.vu.pc, 0)
-        yield from _csr_write(dut.vu.submit, 1)
-        for _ in range(200000):
-            if not (yield dut.vu.busy):
-                break
-            yield
-        else:
-            raise AssertionError("vector unit timeout")
-        yield
-        data = bytearray()
-        for w in range(SP_SIZE//32):
-            v = (yield dut.sp.mem[w])
-            data += int(v).to_bytes(32, "little")
-        out["sp"] = bytes(data)
-
-    run_simulation(dut, [gen()])
+    out = _vec_run(backend, asm.assemble(prog), sp_bytes, args)
     assert out["sp"] == bytes(ref), "RTL differs from the interpreter"
 
 
-def test_rtl_rmsnorm_h():
+@BACKEND
+def test_rtl_rmsnorm_h(backend):
     rng = np.random.default_rng(41)
     hd, H = 128, 3
     sp = bytearray(SP_SIZE)
     sp[0:2*hd*H] = rng.integers(-20000, 20000, hd*H).astype("<i2").tobytes()
     sp[0x2000:0x2000 + 2*hd] = rng.integers(-8000, 8000, hd).astype("<i2").tobytes()
-    _compare_words(asm.prog_rmsnorm_h(), sp, [0, 0x2000, 0, hd//16, -7, 17, -17, H])
+    _compare_words(backend, asm.prog_rmsnorm_h(), sp, [0, 0x2000, 0, hd//16, -7, 17, -17, H])
 
 
-def test_rtl_rope_h():
+@BACKEND
+def test_rtl_rope_h(backend):
     rng = np.random.default_rng(42)
     hd, H = 128, 3
     sp = bytearray(SP_SIZE)
     sp[0:2*hd*H] = rng.integers(-20000, 20000, hd*H).astype("<i2").tobytes()
     sp[0x2000:0x2000 + hd] = rng.integers(-16384, 16384, hd//2).astype("<i2").tobytes()
     sp[0x2000 + hd:0x2000 + 2*hd] = rng.integers(-16384, 16384, hd//2).astype("<i2").tobytes()
-    _compare_words(asm.prog_rope_h(), sp, [0, hd, 0x2000, 0x2000 + hd, (hd//2)//16, 0, hd, H])
+    _compare_words(backend, asm.prog_rope_h(), sp, [0, hd, 0x2000, 0x2000 + hd, (hd//2)//16, 0, hd, H])
 
 
-def test_rtl_kvpack_h():
+@BACKEND
+def test_rtl_kvpack_h(backend):
     rng = np.random.default_rng(43)
     hd, H, stride = 128, 4, 0x400
     sp = bytearray(SP_SIZE)
     sp[0:2*hd*H] = rng.integers(-30000, 30000, hd*H).astype("<i2").tobytes()
-    _compare_words(asm.prog_kvpack_h(), sp,
+    _compare_words(backend, asm.prog_kvpack_h(), sp,
                    [0, 0, 0x2020, hd//16, 0, 0, stride - 16*(hd//16), H])
 
 
-def test_rtl_rmsnorm_q8():
+@BACKEND
+def test_rtl_rmsnorm_q8(backend):
     rng = np.random.default_rng(44)
     n = 256
     sp = bytearray(SP_SIZE)
     sp[0:2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
     sp[0x2000:0x2000 + 2*n] = rng.integers(-8000, 8000, n).astype("<i2").tobytes()
-    _compare_words(asm.prog_rmsnorm_q8(), sp, [0, 0x2000, 0x1000, n//16, -8, 17, -17, 0x3000])
+    _compare_words(backend, asm.prog_rmsnorm_q8(), sp, [0, 0x2000, 0x1000, n//16, -8, 17, -17, 0x3000])
 
 
-def test_rtl_silu_q8():
+@BACKEND
+def test_rtl_silu_q8(backend):
     rng = np.random.default_rng(45)
     n = 256
     sp = bytearray(SP_SIZE)
     sp[0:2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
     sp[0x1000:0x1000 + 2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
-    _compare_words(asm.prog_silu_q8(), sp, [0, 0x1000, 0, n//16, -12, 0, -15, 0x3000])
+    _compare_words(backend, asm.prog_silu_q8(), sp, [0, 0x1000, 0, n//16, -12, 0, -15, 0x3000])
 
 
-def test_rtl_silu_gate_and_mul_q8():
+@BACKEND
+def test_rtl_silu_gate_and_mul_q8(backend):
     # The FFN SiLU split: both halves, x1 and x2, RTL vs interpreter over the
     # whole scratchpad, run in place the way the FFN list runs them (A2 == A0).
     rng = np.random.default_rng(46)
@@ -296,11 +307,11 @@ def test_rtl_silu_gate_and_mul_q8():
         sp = bytearray(SP_SIZE)
         sp[0:2*n] = rng.integers(-32768, 32768, n).astype("<i2").tobytes()
         sp[0x1000:0x1000 + 2*n] = rng.integers(-32768, 32768, n).astype("<i2").tobytes()
-        _compare_words(gate, sp, [0, 0, 0, n//16, -12])
+        _compare_words(backend, gate, sp, [0, 0, 0, n//16, -12])
         # Feed the mul half the gate half's OUTPUT (interpreter-produced, already proven
         # equal to the RTL's by the line above).
         asm.VecInterp(sp).run(asm.assemble(gate), [0, 0, 0, n//16, -12])
-        _compare_words(mul, sp, [0, 0x1000, 0, n//16, 0, 0, -15, 0x3000])
+        _compare_words(backend, mul, sp, [0, 0x1000, 0, n//16, 0, 0, -15, 0x3000])
 
 
 def _dn_case(seed, hv, hk):
@@ -320,19 +331,21 @@ def _dn_case(seed, hv, hk):
     return sp, K, KQ, NV, DL, tr, hv | ((hk//16) << 16)
 
 
-def test_rtl_dn_a():
+@BACKEND
+def test_rtl_dn_a(backend):
     sp, K, KQ, NV, DL, tr, geom = _dn_case(45, 32, 64)
     shift_a, d15, nbq = tr["a_args"]
-    _compare_words(asm.prog_dn_a(), sp, [0, K, NV, DL, shift_a, d15, nbq, geom])
+    _compare_words(backend, asm.prog_dn_a(), sp, [0, K, NV, DL, shift_a, d15, nbq, geom])
 
 
-def test_rtl_dn_b():
+@BACKEND
+def test_rtl_dn_b(backend):
     sp, K, KQ, NV, DL, tr, geom = _dn_case(46, 32, 64)
     # Pass A's delta beats as pass B finds them.
     for j in range(32):
         sp[DL + 32*j:DL + 32*j + 32] = np.full(8, tr["delta"][j], dtype="<i4").tobytes()
     shift_b, d15n, rnd = tr["b_args"]
-    _compare_words(asm.prog_dn_b(), sp, [0, KQ, 0, DL, shift_b, d15n, rnd, geom])
+    _compare_words(backend, asm.prog_dn_b(), sp, [0, KQ, 0, DL, shift_b, d15n, rnd, geom])
 
 
 # Random-Program Hazards ---------------------------------------------------------------------------
@@ -478,67 +491,7 @@ def _seeded_sp(rng):
     return sp
 
 
-class _DUT(Module):
-    def __init__(self, sp_init):
-        self.submodules.sp = Scratchpad(size=SP_SIZE, init=sp_init)
-        self.submodules.vu = VectorUnit()
-        self.comb += [
-            self.sp.fill.adr.eq(self.vu.sp_rd_adr),
-            self.vu.sp_rd_dat.eq(self.sp.fill.dat_r),
-            self.sp.gather.adr.eq(self.vu.sp_wr_adr),
-            # The integrator's rule: a withheld grant means the write does not happen.
-            self.sp.gather.we.eq(Mux(self.vu.sp_wr_gnt, self.vu.sp_wr_we, 0)),
-            self.sp.gather.dat_w.eq(self.vu.sp_wr_dat),
-        ]
-
-
-def _run_random_rtl(words, sp_bytes, args, gnt_rng=None, max_cycles=100000):
-    dut = _DUT(words_from_bytes(bytes(sp_bytes)))
-    out = {}
-
-    def gen():
-        yield from _csr_write(dut.vu.prog_adr, 0)
-        for w in words:
-            yield from _csr_write(dut.vu.prog, w)
-        arg_csrs = [dut.vu.arg0, dut.vu.arg1, dut.vu.arg2, dut.vu.arg3,
-                    dut.vu.arg4, dut.vu.arg5, dut.vu.arg6, dut.vu.arg7]
-        for i, a in enumerate(args):
-            yield from _csr_write(arg_csrs[i], a & 0xFFFFFFFF)
-        yield from _csr_write(dut.vu.pc, 0)
-        yield from _csr_write(dut.vu.submit, 1)
-        for _ in range(max_cycles):
-            if not (yield dut.vu.busy):
-                break
-            yield
-        else:
-            raise AssertionError("vector unit timeout")
-        yield dut.vu.sp_wr_gnt.eq(1)
-        yield
-        data = bytearray()
-        for w in range(SP_SIZE//32):
-            v = (yield dut.sp.mem[w])
-            data += int(v).to_bytes(32, "little")
-        out["sp"] = bytes(data)
-        out["s5"] = (yield dut.vu.res5.status)
-        out["s6"] = (yield dut.vu.res6.status)
-        out["s7"] = (yield dut.vu.res7.status)
-        out["bad"] = (yield dut.vu.status.fields.bad_op)
-        out["dc"]  = (yield dut.vu.done_count.status)
-
-    gens = [gen()]
-    if gnt_rng is not None:
-        # Withhold the store grant ~40% of cycles. Bounded by the main generator's
-        # completion: run_simulation only returns once EVERY generator has finished.
-        def gnt_gen():
-            while "sp" not in out:
-                yield dut.vu.sp_wr_gnt.eq(1 if gnt_rng.random() < 0.6 else 0)
-                yield
-        gens.append(gnt_gen())
-    run_simulation(dut, gens)
-    return out
-
-
-def _check(seed, withhold):
+def _check(backend, seed, withhold):
     rng  = random.Random(seed)
     prog = gen_program(rng)
     words = asm.assemble(prog)
@@ -546,7 +499,8 @@ def _check(seed, withhold):
     args = [SRC0, SRC1, DST, rng.randint(2, 4)]
     ref  = bytearray(sp)
     S, _ = asm.VecInterp(ref).run(words, list(args))
-    got  = _run_random_rtl(words, sp, args, gnt_rng=random.Random(seed + 7) if withhold else None)
+    got  = _vec_run(backend, words, sp, args, withhold_seed=seed + 7 if withhold else None,
+                    max_cycles=100000)
     m48  = (1 << 48) - 1
     diffs = [i for i in range(SP_SIZE) if got["sp"][i] != ref[i]]
     assert not diffs, (seed, prog, f"first diffs at {diffs[:8]}")
@@ -556,14 +510,16 @@ def _check(seed, withhold):
     assert got["bad"] == 0 and got["dc"] == 1, (seed, prog, got["bad"], got["dc"])
 
 
+@BACKEND
 @pytest.mark.parametrize("seed", list(range(24)))
-def test_random_program_matches_interpreter(seed):
-    _check(seed, withhold=False)
+def test_random_program_matches_interpreter(seed, backend):
+    _check(backend, seed, withhold=False)
 
 
+@BACKEND
 @pytest.mark.parametrize("seed", list(range(100, 112)))
-def test_random_program_under_withheld_store_grants(seed):
-    _check(seed, withhold=True)
+def test_random_program_under_withheld_store_grants(seed, backend):
+    _check(backend, seed, withhold=True)
 
 
 # RMSNorm Shift Range ------------------------------------------------------------------------------
@@ -574,8 +530,9 @@ def test_random_program_under_withheld_store_grants(seed):
 E_NORM = -11
 
 
+@BACKEND
 @pytest.mark.parametrize("e16", [-15, -14, -13, -10, -8, -7])
-def test_rtl_rmsnorm_shift_range(e16):
+def test_rtl_rmsnorm_shift_range(e16, backend):
     rng = np.random.default_rng(100 + e16)
     n   = 128
     es  = -12
@@ -588,13 +545,14 @@ def test_rtl_rmsnorm_shift_range(e16):
     sp[4096:4096+2*n] = w16.tobytes()
     eps_int = max(1, int(round(1e-6*2.0**(-2*es))))
     args = [0, 4096, 8192, n//16, -int(np.log2(n)), eps_int, e16 - E_NORM - 15]
-    _compare("rmsnorm", bytes(sp), args)
+    _compare(backend, "rmsnorm", bytes(sp), args)
 
+@BACKEND
 @pytest.mark.parametrize("e16", [-15, -13, -8])
-def test_rtl_rmsnorm_h_shift_range(e16):
+def test_rtl_rmsnorm_h_shift_range(e16, backend):
     rng = np.random.default_rng(200 + e16)
     hd, H = 128, 3
     sp = bytearray(SP_SIZE)
     sp[0:2*hd*H] = rng.integers(-20000, 20000, hd*H).astype("<i2").tobytes()
     sp[0x2000:0x2000 + 2*hd] = rng.integers(-32000, 32000, hd).astype("<i2").tobytes()
-    _compare_words(asm.prog_rmsnorm_h(), sp, [0, 0x2000, 0, hd//16, -7, 17, e16 - E_NORM - 15, H])
+    _compare_words(backend, asm.prog_rmsnorm_h(), sp, [0, 0x2000, 0, hd//16, -7, 17, e16 - E_NORM - 15, H])

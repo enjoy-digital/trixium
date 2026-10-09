@@ -16,6 +16,7 @@
 //   count NAME TAG / count_end TAG    count the cycles NAME != 0 in between
 //   read MEM ADDR LEN TAG             save LEN bytes of a memory to <out>/TAG.bin
 //   dump NAME...                      signals printed if the run fails
+//   random NAME PCT SEED              drive NAME 1 on PCT percent of the cycles (PCT < 0: stop)
 //
 // Results go to stdout as "@<kind> <tag> ..." lines (verilator.py parses them).
 
@@ -51,6 +52,21 @@ struct ScriptCond {
     }
 };
 
+// Random input: a 0/1 drawn every cycle (a withheld grant, a stalling handshake).
+struct RandomInput : Model {
+    Sig      *sig;
+    int       pct;
+    SimRandom rnd;
+    uint64_t  rolled = ~0ull;
+    RandomInput(Sig *sig, int pct, uint32_t seed) : sig(sig), pct(pct), rnd(seed) {}
+    void drive(Sim &sim) override {
+        if (pct < 0 || rolled == sim.cycle) return;
+        rolled = sim.cycle;
+        sig->set(rnd.percent((uint32_t)pct));
+    }
+    void sample(Sim &) override {}
+};
+
 // Interpreter --------------------------------------------------------------------------------------
 
 static void run_script(Sim &sim, const std::string &path, const std::string &outdir) {
@@ -58,6 +74,7 @@ static void run_script(Sim &sim, const std::string &path, const std::string &out
     if (!f) sim_fail("cannot open script %s", path.c_str());
     std::vector<Sig *> dumps;
     std::map<std::string, std::pair<Sig *, uint64_t>> counters;
+    std::map<std::string, RandomInput *> randoms;
     std::string cur_line;
 
     sim_on_fail = [&]() {
@@ -155,6 +172,18 @@ static void run_script(Sim &sim, const std::string &path, const std::string &out
             m.read(addr, buf.data(), len);
             sim_save(outdir + "/" + tag + ".bin", buf.data(), len);
             std::printf("@read %s %zu\n", tag.c_str(), len);
+        } else if (op == "random") {
+            std::string name; int pct; uint32_t seed;
+            in >> name >> pct >> seed;
+            auto it = randoms.find(name);
+            if (it == randoms.end()) {
+                auto *r = new RandomInput(&sim.sig(name), pct, seed);
+                randoms[name] = r;
+                sim.models.push_back(r);
+            } else {
+                it->second->pct = pct;
+            }
+            sim.settled = false;
         } else if (op == "dump") {
             std::string name;
             while (in >> name) dumps.push_back(&sim.sig(name));

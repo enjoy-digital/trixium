@@ -32,6 +32,7 @@ Data goes through files (images in, memory reads out); results come back as "@" 
 
 import os
 import re
+import random
 import fcntl
 import shutil
 import hashlib
@@ -144,6 +145,10 @@ class Script:
 
     def read(self, mem, addr, length, tag):
         self.ops.append(("read", mem, int(addr), int(length), tag))
+
+    def random(self, name, pct, seed=1):
+        """Drive `name` 1 on `pct` percent of the cycles from now on (pct < 0: stop)."""
+        self.ops.append(("random", name, int(pct), int(seed)))
 
     def dump(self, *names):
         self.ops.append(("dump",) + tuple(names))
@@ -444,7 +449,8 @@ def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None):
     memories = memories or {}
     state = dict(dirty=False, cycle=0, done=False)
     counters = {}
-    dumps = []
+    randoms  = {}
+    dumps    = []
 
     def sig(name):
         try:
@@ -456,6 +462,8 @@ def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None):
         return v & ((1 << len(sig(name))) - 1)
 
     def tick():
+        for name, (pct, rng) in randoms.items():
+            yield sig(name).eq(int(rng.random()*100 < pct))
         for tag, (name, n) in counters.items():
             if (yield sig(name)):
                 counters[tag] = (name, n + 1)
@@ -532,6 +540,12 @@ def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None):
                     data += int((yield m[w])).to_bytes(wb, "little")
                 off = addr % wb
                 r._add(r.reads, tag, bytes(data[off:off + length]))
+            elif kind == "random":
+                _, name, pct, seed = op
+                if pct < 0:
+                    randoms.pop(name, None)
+                else:
+                    randoms[name] = (pct, random.Random(seed))
             elif kind == "dump":
                 dumps.extend(op[1:])
             else:
