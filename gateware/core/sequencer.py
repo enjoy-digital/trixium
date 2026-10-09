@@ -55,15 +55,15 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   vec:    w1 = pc;  w2..w9 = args 0..7.
   had:    Optional unit 3, always serialized; w0 exactly 3, w1 src, w2 signs,
           w3 dst, w4 block count, w5 stats, w6 inverse (0/1), w7..w15 zero.
-          See docs/units.md for bounds, ownership and raw numerics.
+          See doc/units.md for bounds, ownership and raw numerics.
   quant:  Optional unit 4, always serialized; w0 exactly 4, w1 FP32 src,
           w2 Q8 dst, w3 exponent array, w4 elements/block, w5 blocks, w6..w15 zero.
   requant: Unit 5 (quant ABI >=1.1), serialized; w0 exactly 5, w1 raw int32 src,
            w2 Q8 dst, w3 input exponent array, w4 raw absmax array, w5 result
-           exponent, w6 blocks of 1024, w7..w15 zero. See docs/units.md.
+           exponent, w6 blocks of 1024, w7..w15 zero. See doc/units.md.
   restore: Optional unit 8, serialized; w0 exactly 8, w1 int32 src, w2 FP32 dst,
            w3 resident exponent beat, w4 elements, w5 signed adjustment (R-B),
-           w6..w15 zero. See docs/units.md.
+           w6..w15 zero. See doc/units.md.
   silu:   Optional unit 11 (ABI 1.1), serialized; w0 exactly 11, w1 FP32 gate src, w2
           FP32 multiplier src, w3 dst (== w1 or disjoint), w4 fixup bitmap, w5 elements,
           w6 op (bit0: 0 RUN, 1 LOAD tables from w1) | unit_m << 1 (m = 1.0, w2 unused)

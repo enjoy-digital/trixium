@@ -13,7 +13,7 @@ same points, and the first line that differs names the block to open.
 
   # workstation (the mirror takes ~2 min for a 13-token prompt on the 1.7B)
   python3 -m software.lab.mirror mirror models/bons/bonsai-1p7b-n16.img --prompt "Hello" -o build/mir.txt
-  # board host: the firmware's `dbg` checksums (software/lab/fp32_check.py's paced client)
+  # board host: the firmware's `dbg` checksums (software/client.py's paced writes)
   python3 -m software.lab.mirror card --prompt "Hello" -o card.txt
   # anywhere
   python3 -m software.lab.mirror compare build/mir.txt card.txt
@@ -219,23 +219,23 @@ def main():
     for name, fn in (("mirror", cmd_mirror), ("card", cmd_card)):
         p = subparsers.add_parser(name)
         if name == "mirror":
-            p.add_argument("image",                                                      help="BONS image.")
-            p.add_argument("--hybrid-silu", choices=("rv32f", "mathematical"), default="rv32f", help="Hybrid SiLU profile; rv32f is the qualified VCU baseline libm.")
+            p.add_argument("image",                                                             help="BONS image.")
+            p.add_argument("--hybrid-silu", choices=("rv32f", "mathematical"), default="rv32f", help="Hybrid SiLU profile (rv32f: the firmware's RV32F libm).")
         else:
-            p.add_argument("--tty",  default="/dev/ttyLXU0",           help="LiteUART tty.")
-            p.add_argument("--pre",  action="append", default=[],      help="Console command to send first (repeatable).")
-            p.add_argument("--post", action="append", default=[],      help="Console command to send after (repeatable).")
-        p.add_argument("--prompt",    default="Hello",                                               help="Prompt text.")
-        p.add_argument("--ids",                                                                      help="Token ids instead of --prompt.")
-        p.add_argument("--raw",       action="store_true",                                           help="No chat template.")
+            p.add_argument("--tty",  default="/dev/ttyLXU0",                                          help="LiteUART tty.")
+            p.add_argument("--pre",  action="append", default=[],                                     help="Console command to send first (repeatable).")
+            p.add_argument("--post", action="append", default=[],                                     help="Console command to send after (repeatable).")
+        p.add_argument("--prompt",    default="Hello",                                                help="Prompt text.")
+        p.add_argument("--ids",                                                                       help="Token ids instead of --prompt.")
+        p.add_argument("--raw",       action="store_true",                                            help="No chat template.")
         p.add_argument("--tokenizer", default=os.path.join(REPO, "models", "1.7b", "tokenizer.json"), help="tokenizer.json.")
-        p.add_argument("-o", "--out", required=True,                                                 help="Output trace.")
+        p.add_argument("-o", "--out", required=True,                                                  help="Output trace.")
         p.set_defaults(fn=fn)
 
     # Compare.
     p = subparsers.add_parser("compare")
-    p.add_argument("mirror",          help="Mirror trace.")
-    p.add_argument("card",            help="Card trace.")
+    p.add_argument("mirror",                               help="Mirror trace.")
+    p.add_argument("card",                                 help="Card trace.")
     p.add_argument("-v", "--verbose", action="store_true", help="List every divergence.")
     p.set_defaults(fn=cmd_compare)
 

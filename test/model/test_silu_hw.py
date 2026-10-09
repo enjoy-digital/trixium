@@ -15,7 +15,6 @@ the compiled FPU SoC); and the fixup set against its documented definition.
 import random
 
 import numpy as np
-import pytest
 
 from model import rv32_math
 from model.silu_hw import (

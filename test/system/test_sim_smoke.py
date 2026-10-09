@@ -4,10 +4,12 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Slow end-to-end check (needs a built Verilator sim): runs the firmware in simulation and
-# verifies the self-test checksums against the golden model + image bytes, and the generated
-# token ids against a hybrid reference (model/mirror.py: engine-exact matvecs + float vector ops).
-# Run with: .venv/bin/python -m pytest test/system/test_sim_smoke.py --runslow
+"""Slow end-to-end check of the Qwen3 path in the FK33 simulation: the firmware's self-test
+checksums against the golden model + image bytes, and the generated token ids against a hybrid
+reference (model/mirror.py: engine-exact matvecs + float vector ops).
+
+  python3 -m pytest test/system/test_sim_smoke.py --runslow
+"""
 
 import os
 import sys
@@ -16,7 +18,6 @@ import subprocess
 import numpy as np
 import pytest
 
-from model import layout
 from model import bitexact as bx
 from model.bons import BONSReader
 from model.mirror import hybrid_generate
@@ -97,7 +98,7 @@ def test_sim_selftest_checksums():
             crc = ((crc ^ w)*16777619) & 0xFFFFFFFF
         exp_crc[name] = (crc, S[6] & 0xFFFFFFFF)
     for m2 in _re.finditer(r"VECCRC (\w+) ([0-9a-f]{8}) ([0-9a-f]{8})", out):
-        name, crc, r6 = m2.group(1), int(m2.group(2), 16), int(m2.group(3), 16)
+        name, crc = m2.group(1), int(m2.group(2), 16)
         assert name in exp_crc, name
         assert crc == exp_crc[name][0], (
             f"vec program '{name}' diverged from the interpreter "
@@ -106,7 +107,6 @@ def test_sim_selftest_checksums():
 
     img  = BONSReader(IMAGE)
     e    = img.by_name["blk.0.attn_q.weight"]
-    n_ch = img.header["n_channels"]
 
     # Expected MATVEC checksum.
     scales, codes = img.tensor("blk.0.attn_q.weight")

@@ -6,10 +6,10 @@
 
 """One-command deployment + measurement on a lab board, driven from the workstation over ssh.
 
-  trixium deploy xcu1525 --board xcu1525 --model 27b     # build/xcu1525 on the XCU1525 host
-  trixium deploy fk33    --board fk33    --model 1p7b    # build/fk33 on the FK33 host
-  trixium deploy xcu1525 --model 8b --no-reconfigure     # next model, board already deployed
-  trixium deploy xcu1525 --model 27b --dry-run           # print every command, run nothing
+  trixium deploy --board xcu1525 --model 27b                  # build/xcu1525 on the XCU1525 host
+  trixium deploy --board fk33    --model 1p7b                 # build/fk33 on the FK33 host
+  trixium deploy --board xcu1525 --model 8b --no-reconfigure  # next model, board already deployed
+  trixium deploy --board xcu1525 --model 27b --dry-run        # print every command, run nothing
 
 The board hosts come from ~/.config/trixium/boards.ini (doc/boards.ini.example), one section per
 board, overridable with TRIXIUM_<BOARD>_<KEY> environment variables (TRIXIUM_XCU1525_HOST=...).
@@ -68,7 +68,7 @@ BOARDS_INI = os.environ.get("TRIXIUM_BOARDS_INI", os.path.expanduser("~/.config/
 
 # The prompt "The capital of France is" in each model's own vocabulary (the 27B's tokenizer is
 # Qwen3.5's, not Qwen3's) and the reference continuation: the fp32 golden of each model (software/
-# fp32_check.py / model.golden --raw), checked on the cards.
+# lab/fp32_check.py / model.golden --raw), checked on the cards.
 MODELS = {
     #        tokenizer  prompt                     want                                       bench  timeout
     "1p7b": ("1.7b", "785 6722 315 9625 374", "12095 11 323 279 6722 315 17689 374 24081",    64,  1200), # " Paris, and the capital of Spain is Madrid"
@@ -244,7 +244,6 @@ def build_firmware(remote, out):
     binary = os.path.join(out, "trixium.bin")
     if remote.dry_run:
         print(f"# under flock {os.path.relpath(fw_dir, REPO)}/.build.lock: rm firmware/*.o firmware/trixium.bin")
-        remote.local([sys.executable, "-m", "model.asm", "firmware/progs.h"])
         remote.local(["make", "-C", "firmware", f"BUILD_DIR={out}"])
         remote.show(["cp", "firmware/trixium.bin", os.path.relpath(binary, REPO)])
         return binary
@@ -253,7 +252,6 @@ def build_firmware(remote, out):
         for f in glob.glob(os.path.join(fw_dir, "*.o")) + [os.path.join(fw_dir, "trixium.bin"), binary]:
             if os.path.exists(f):
                 os.remove(f)
-        remote.local([sys.executable, "-m", "model.asm", "firmware/progs.h"])
         remote.local(["make", "-C", "firmware", f"BUILD_DIR={out}"], pattern=r"(?i) error|OBJCOPY", check=False)
         if os.path.exists(os.path.join(fw_dir, "trixium.bin")):
             shutil.copy(os.path.join(fw_dir, "trixium.bin"), binary)
@@ -428,15 +426,15 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 # Run ----------------------------------------------------------------------------------------------
 
 def add_arguments(parser):
-    parser.add_argument("build",                 nargs="?",                                 help="Build name in build/ (default: the board's).")
+    parser.add_argument("build",                 nargs="?",                                      help="Build name in build/ (default: the board's).")
     parser.add_argument("--board",               default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
-    parser.add_argument("--model",               default="1p7b", choices=list(MODELS),         help="Model.")
-    parser.add_argument("--no-reconfigure",      action="store_true",                          help="Board already deployed: firmware, weights, tokens and bench only.")
-    parser.add_argument("--boot",                action="store_true",                          help="With --no-reconfigure: boot the (rebuilt) firmware first (XCU1525).")
-    parser.add_argument("--approval",            default="ddr1600-overclock",                  help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
-    parser.add_argument("--serializer-baseline", default="v8",                                 help="XCU1525 timing gate serializer baseline.")
-    parser.add_argument("--bench",               type=int,                                     help="bench n (default: per model).")
-    parser.add_argument("--dry-run",             action="store_true",                          help="Print every command, run nothing.")
+    parser.add_argument("--model",               default="1p7b", choices=list(MODELS),           help="Model.")
+    parser.add_argument("--no-reconfigure",      action="store_true",                            help="Board already deployed: firmware, weights, tokens and bench only.")
+    parser.add_argument("--boot",                action="store_true",                            help="With --no-reconfigure: boot the (rebuilt) firmware first (XCU1525).")
+    parser.add_argument("--approval",            default="ddr1600-overclock",                    help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
+    parser.add_argument("--serializer-baseline", default="v8",                                   help="XCU1525 timing gate serializer baseline.")
+    parser.add_argument("--bench",               type=int,                                       help="bench n (default: per model).")
+    parser.add_argument("--dry-run",             action="store_true",                            help="Print every command, run nothing.")
 
 
 def run(args):

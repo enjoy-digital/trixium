@@ -26,16 +26,10 @@ import os
 import sys
 import shlex
 import argparse
-import subprocess
 
 # Paths --------------------------------------------------------------------------------------------
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Helpers ------------------------------------------------------------------------------------------
-
-def _run(cmd, cwd=REPO):
-    return subprocess.call(cmd, cwd=cwd)
 
 
 # Commands -----------------------------------------------------------------------------------------
@@ -175,13 +169,13 @@ def main(argv=None):
 
     # Convert.
     p = subparsers.add_parser("convert", help="GGUF -> BONS image (streams; ~13 s, ~2 GB for the 1.7B).")
-    p.add_argument("gguf",                                    help="Source GGUF.")
-    p.add_argument("--channels",  default=16, type=int,       help="Engine channels of the bitstream (default: 16).")
-    p.add_argument("--out",                                   help="Image (default: models/bons/bonsai-<model>-n<channels>.img).")
-    p.add_argument("--tokenizer",                             help="tokenizer.json hashed into the image (default: next to the GGUF).")
-    p.add_argument("--layers",    type=int,                   help="Truncate to the first K layers.")
-    p.add_argument("--check",     action="store_true",        help="Re-read and CRC every tensor.")
-    p.add_argument("--no-emb16",  action="store_true",        help="Leave out the int16 embedding table (-622 MB, ~2.6%% slower per token).")
+    p.add_argument("gguf",                              help="Source GGUF.")
+    p.add_argument("--channels",  default=16, type=int, help="Engine channels of the bitstream (default: 16).")
+    p.add_argument("--out",                             help="Image (default: models/bons/bonsai-<model>-n<channels>.img).")
+    p.add_argument("--tokenizer",                       help="tokenizer.json hashed into the image (default: next to the GGUF).")
+    p.add_argument("--layers",    type=int,             help="Truncate to the first K layers.")
+    p.add_argument("--check",     action="store_true",  help="Read two tensors back and compare.")
+    p.add_argument("--no-emb16",  action="store_true",  help="Leave out the int16 embedding table (-622 MB, ~2.6%% slower per token).")
     p.set_defaults(fn=cmd_convert)
 
     # Verify.
@@ -214,7 +208,7 @@ def main(argv=None):
 
     # Driver.
     p = subparsers.add_parser("driver", help="Load/unload trixium.ko + liteuart.ko (through sudo).")
-    p.add_argument("action", choices=["load", "unload"],                                    help="Load or unload.")
+    p.add_argument("action", choices=["load", "unload"],                                         help="Load or unload.")
     p.add_argument("--dir",  default=os.path.join(REPO, "build", "xcu1525", "driver", "kernel"), help="Directory of the built modules.")
     p.set_defaults(fn=cmd_driver)
 

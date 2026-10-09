@@ -172,7 +172,7 @@ static float *sigmoid_lut;
 
 // DeltaNet stream (engine op 5, TRIXIUM_HAS_DNSTREAM): every head of a layer in one op, the
 // state striped over the channels - channel c holds rows c, c+n_ch, ... of every head, in
-// the unit's column-group-major order (gateware/deltanet_stream.py), heads in processing
+// the unit's column-group-major order (gateware/units/deltanet_stream.py), heads in processing
 // order, n_dn*nv head matrices per layer set; the layout is chosen at hybrid_reset
 // (HP->dnstream_active) and only the resident layer runs it.
 #define DN_STREAM_BEATS (DN_HEAD_BEATS/(uint32_t)n_ch)   // per channel per head
@@ -270,7 +270,7 @@ static inline float siluf(float x)
     return trixium_silu_lookup(x, silu_lut);
 }
 
-// The canonical FP32 sum of squares (docs/units.md (Canonical reductions)): 64 partial sums, element
+// The canonical FP32 sum of squares (doc/units.md (Canonical reductions)): 64 partial sums, element
 // i into partial i % 64 in index order (each term x*x rounded, then added, starting from
 // +0), then a halving tree P[j] += P[j + w] for w = 32, 16, ..., 1. A scratchpad unit that
 // takes one 8-float beat per clock revisits each partial every 8 clocks, so it can use a
@@ -309,7 +309,7 @@ static void l2norm_fv(float *v, int n)   // ggml_l2_norm: v / max(|v|, eps)
     int i;
     float nrm = sqrtf(ss);
     if (nrm < rms_eps) nrm = rms_eps;
-    // Canonical (docs/units.md (Canonical reductions)): one correctly rounded reciprocal, then a
+    // Canonical (doc/units.md (Canonical reductions)): one correctly rounded reciprocal, then a
     // multiply per element - what the norm unit does - not a divide per element.
     float inv = 1.0f/nrm;
     i = 0;
@@ -358,8 +358,8 @@ static float *fetch_f32(const struct bons_entry *e)
     return dst;
 }
 
-// Portable fallback for targets without scratchpad STORE + cache invalidation.  The XCU1525
-// uses the fused path below; keeping this implementation preserves every other hybrid target.
+// Portable fallback for targets without scratchpad STORE + cache invalidation. The XCU1525
+// uses the fused path (infer_rotate_quantize_f) and the resident lists.
 static void rotate_f_legacy(const float *src, float *dst, int width)
 {
     int B = H->hadamard_block, wi = -1;
@@ -645,8 +645,8 @@ int hybrid_init(void)
         }
     }
     SIM_MARK("hybrid: norms");
-    // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; v3 images carry the
-    // scaling fields for models that need them).
+    // Plain RoPE over rope_n dims (the 27B: theta 1e7, no YaRN; the header has no scaling
+    // fields).
     rope_c = infer_halloc((rope_n/2)*4, 0); rope_s = infer_halloc((rope_n/2)*4, 0);
     rope_freq = infer_halloc((rope_n/2)*4, 0);
     for (int i = 0; i < rope_n/2; i++)
@@ -1439,7 +1439,7 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 /*------------------*/
 
 #ifdef TRIXIUM_HAS_ATTNSTREAM
-// Attention stream (engine op 6, gateware/attn_stream.py). Scratchpad while the attention
+// Attention stream (engine op 6, gateware/units/attention_stream.py). Scratchpad while the attention
 // core runs (the q/k/v list has stored its outputs; RS_Y and RS_F are free until the out
 // projection's prepare):
 #define AT_Q    RS_Y_ADDR              // q heads (in [q | gate] when gated): <= 48 KB

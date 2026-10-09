@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  *
- * Compiled check of gateware/fp32_exact.py against numpy float32 (IEEE, canonical NaN).
+ * Compiled check of gateware/units/fp32.py against numpy float32 (IEEE, canonical NaN).
  * usage: Vfp32x <op> vectors.bin    op: mul | add | div | sqrt
  * vectors.bin: count x {u32 a, u32 b, u32 expected}. Pipelined ops run with random clock-
  * enable gaps; div/sqrt run start -> done one at a time.

@@ -4,6 +4,8 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
+"""software/lab/benchmark.py: bench record parsing, decode-rate arithmetic and the recorded baselines."""
+
 import pytest
 
 from software.lab.benchmark import parse_record, read_records, summarize

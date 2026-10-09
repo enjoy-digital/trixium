@@ -156,7 +156,7 @@ def axpy_rows(scales_f16, v8w, p8, B, Rpre):
         assert np.all(np.abs(acc) < 2**31), "axpy accumulator overflow"
     return acc.astype(np.int32)
 
-def axpy_rpre(p8_sum_bound, B_top=22):
+def axpy_rpre(p8_sum_bound):
     """Rpre keeping worst-case |acc| < 2^31: per unit of p8 the contribution is bounded by
     127*1024*127*2^12 < 2^36, so r = max(0, bitlen(sum|p8|) + 36 - 31). Pure bit-length
     form (a priority encoder in hardware - the sequencer computes it from the softmax's

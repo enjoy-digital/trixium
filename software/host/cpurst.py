@@ -11,7 +11,7 @@ the firmware is running, `trixium_chat -k` just reports "no magic from the BIOS"
 firmware needs this first.
 
 CPU reset (bit 1), never SoC reset (bit 0): bit 0 takes the PCIe endpoint down with it and
-the host loses the device until a warm reboot. HBM keeps its contents across a CPU reset,
+the host loses the device until a warm reboot. the weight memory (HBM/DDR4) keeps its contents across a CPU reset,
 so the uploaded weights survive.
 
   sudo python3 -m software.host.cpurst

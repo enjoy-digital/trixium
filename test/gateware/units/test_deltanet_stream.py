@@ -11,8 +11,6 @@ import subprocess
 import numpy as np
 import pytest
 
-from migen import run_simulation
-
 from gateware.units.deltanet_stream import DeltaNetStream, lanes_to_state, reference, state_to_lanes
 from gateware.core.core import TriXiumConfig
 
@@ -107,7 +105,7 @@ int main(int argc, char **argv) {{
 '''
 
 
-def build(tmp_path, lanes, rows, cols):
+def build(lanes, rows, cols):
     """The compiled unit (cached by key: a hit neither constructs nor converts it)."""
     top = f"dns_{lanes}_{rows}_{cols}"
     return Simulator(lambda: _construct(lanes, rows, cols), name=top, key=file_key(__file__, top),
@@ -198,15 +196,15 @@ def check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols):
 def test_small_geometry(tmp_path_factory, pcts):
     tmp = tmp_path_factory.mktemp("dns_small")
     lanes, rows, cols, heads = 2, 16, 16, 9
-    binary = build(tmp, lanes, rows, cols)
+    binary = build(lanes, rows, cols)
     mem, states, table, want_mem, want_states = scenario(np.random.default_rng(3), heads, rows, cols, 3)
     got_mem, got_lanes, cycles = run(binary, tmp, mem, states, lanes, heads, table, pcts)
     check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
 
 
 @pytest.fixture(scope="module")
-def binary27(tmp_path_factory):
-    return build(tmp_path_factory.mktemp("dns27"), 16, 128, 128)
+def binary27():
+    return build(16, 128, 128)
 
 
 def test_27b_geometry_streams_a_head_per_1024_clocks(tmp_path, binary27):
@@ -238,7 +236,7 @@ def test_zero_flag_ignores_the_incoming_state(tmp_path_factory, pcts):
     the streams are still consumed; with the flag low the same netlist reads the state."""
     tmp = tmp_path_factory.mktemp("dns_zero")
     lanes, rows, cols, heads = 2, 16, 16, 9
-    binary = build(tmp, lanes, rows, cols)
+    binary = build(lanes, rows, cols)
     rng = np.random.default_rng(5)
     mem, states, table, want_mem, want_states = scenario(rng, heads, rows, cols, 3, zero=True)
     garbage = rng.integers(0, 1 << 32, states.size, dtype=np.uint64).astype(np.uint32).reshape(states.shape)

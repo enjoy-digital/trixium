@@ -7,7 +7,6 @@
 """Sequencer units 11 (options), 12 (norm) and 13 (conv): decode, and lists on the cluster."""
 
 import numpy as np
-import pytest
 
 from migen import Memory, Module, run_simulation
 

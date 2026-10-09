@@ -6,22 +6,23 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# TriXium on the SQRL XCU1525 (XCVU9P, four DDR4 x64 channels, PCIe Gen3 x4).
-#
-# The TriXium core streams its weights from the four DDR4 controllers: engine channel c reads
-# from controller c // 4 through its own crossbar port, at per-channel windows inside that
-# controller. The defaults are the configuration that runs the 27B (every scratchpad unit, the
-# DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz), built with the
-# CPU, Vivado directives and timing gate it shipped with. Design decisions and board notes:
-# doc/boards.md.
-#
-# From the repository root:
-#   ./trixium_xcu1525.py --build                         # -> build/xcu1525/ + build/xcu1525.verdict
-#   ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
-#   ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
-#   trixium deploy xcu1525 --board xcu1525 --model 27b   # the lab board: software/lab/deploy.py
-#
-# Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
+"""TriXium on the SQRL XCU1525 (XCVU9P, four DDR4 x64 channels, PCIe Gen3 x4).
+
+The TriXium core streams its weights from the four DDR4 controllers: engine channel c reads
+from controller c // 4 through its own crossbar port, at per-channel windows inside that
+controller. The defaults are the configuration that runs the 27B (every scratchpad unit, the
+DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz), built with the
+CPU, Vivado directives and timing gate it shipped with. Design decisions and board notes:
+doc/boards.md.
+
+From the repository root:
+  ./trixium_xcu1525.py --build                         # -> build/xcu1525/ + build/xcu1525.verdict
+  ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
+  ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
+  trixium deploy --board xcu1525 --model 27b           # the lab board: software/lab/deploy.py
+
+Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
+"""
 
 import os
 import sys
@@ -51,6 +52,7 @@ from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
+from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -348,21 +350,6 @@ class TriXiumXCU1525SoC(SoCCore):
             modules.append(MT40A512M8(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
             DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
-
-# Helpers ------------------------------------------------------------------------------------------
-
-VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1"
-
-def set_vivado_env(path):
-    """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
-    if path and os.path.exists(os.path.join(path, "settings64.sh")):
-        os.environ["LITEX_ENV_VIVADO"] = path
-
-
-def write_verdict(path, rc):
-    """build/<name>.verdict: the build's exit code (0 = timing gate passed)."""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{rc}\n")
 
 # Build --------------------------------------------------------------------------------------------
 

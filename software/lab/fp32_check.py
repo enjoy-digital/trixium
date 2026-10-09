@@ -11,7 +11,7 @@
 Two halves, because the GGUF lives on the workstation and the card on the board host:
 
   # workstation: fp32 greedy per prompt, top-5 logits at every position (~3 min a prompt)
-  python3 -m software.lab.fp32_check golden models/1.7b/Ternary-Bonsai-1.7B-Q2_0.gguf -o build/fp32_ref.json
+  python3 -m software.lab.fp32_check golden models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf -o build/fp32_ref.json
   # board host: at every position of fp32's path, what does the card pick, and how far below
   # fp32's best is that pick (teacher-forced, so one wrong token does not poison the rest)
   python3 -m software.lab.fp32_check card build/fp32_ref.json --tty /dev/ttyLXU0
@@ -111,17 +111,17 @@ def main():
 
     # Golden.
     p = subparsers.add_parser("golden", help="fp32 greedy reference (workstation).")
-    p.add_argument("gguf",                                         help="Ternary-Bonsai GGUF.")
-    p.add_argument("-o", "--out",  default="build/fp32_ref.json",  help="Reference JSON.")
-    p.add_argument("--tokenizer",                                  help="tokenizer.json (default: next to the GGUF).")
-    p.add_argument("-n",           type=int, default=20,           help="Tokens per prompt.")
-    p.add_argument("--prompt",     action="append",                help="Prompt instead of the built-in ones (repeatable).")
+    p.add_argument("gguf",                                        help="Ternary-Bonsai GGUF.")
+    p.add_argument("-o", "--out",  default="build/fp32_ref.json", help="Reference JSON.")
+    p.add_argument("--tokenizer",                                 help="tokenizer.json (default: next to the GGUF).")
+    p.add_argument("-n",           type=int, default=20,          help="Tokens per prompt.")
+    p.add_argument("--prompt",     action="append",               help="Prompt instead of the built-in ones (repeatable).")
     p.set_defaults(fn=cmd_golden)
 
     # Card.
     p = subparsers.add_parser("card", help="Teacher-forced card picks vs the reference (board host).")
-    p.add_argument("ref",                                                                     help="Reference JSON.")
-    p.add_argument("--tty",       default="/dev/ttyLXU0",                                     help="LiteUART tty.")
+    p.add_argument("ref",                                                                         help="Reference JSON.")
+    p.add_argument("--tty",       default="/dev/ttyLXU0",                                         help="LiteUART tty.")
     p.add_argument("--tokenizer", default=os.path.join(REPO, "models", "1.7b", "tokenizer.json"), help="tokenizer.json.")
     p.set_defaults(fn=cmd_card)
 

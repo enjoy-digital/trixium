@@ -12,7 +12,7 @@ Subcommands:
   verify   --image IMG               - re-CRC all tensor payloads.
 
 Vocab-sharded tensors (embeddings/LM head) are row-padded to divide the channel count with
-zero-weight rows (code 1 -> w = 0, scale 0); the top-k unit masks rows >= vocab."""
+zero-weight rows (code 1 -> w = 0, scale 0); the firmware never picks a row >= vocab."""
 
 import sys
 import time
@@ -337,17 +337,17 @@ def main():
 
     # Convert.
     p = sub.add_parser("convert", help="Convert a GGUF file to a BONS image.")
-    p.add_argument("--gguf",           required=True,           help="GGUF file.")
-    p.add_argument("--channels",       required=True, type=int, help="Engine channel count.")
-    p.add_argument("--out",            required=True,           help="Output BONS image.")
-    p.add_argument("--manifest",       default=None,            help="Output JSON manifest (default: <out>.json).")
-    p.add_argument("--tokenizer",      default=None,            help="tokenizer.json (sha256 stored in the header).")
-    p.add_argument("--layers",         default=None, type=int,  help="Truncate to the first K layers.")
-    p.add_argument("--check",          action="store_true",     help="Read two tensors back and compare.")
-    p.add_argument("--no-emb16",       action="store_true",     help="Leave out the int16 embedding table (~2.6%% slower).")
-    p.add_argument("--chan-stride",    default=None, type=_int, help="Per-channel stride (TRIXIUM_CHAN_STRIDE, default: FK33's).")
-    p.add_argument("--weight-base",    default=None, type=_int, help="Weight base (TRIXIUM_CHAN_WEIGHT_BASE, default: FK33's).")
-    p.add_argument("--window-reserve", default=0,    type=_int, help="Bytes lost to the bank skew ((chan_mod-1)*TRIXIUM_CHAN_SKEW).")
+    p.add_argument("--gguf",           required=True,                     help="GGUF file.")
+    p.add_argument("--channels",       required=True, type=int,           help="Engine channel count.")
+    p.add_argument("--out",            required=True,                     help="Output BONS image.")
+    p.add_argument("--manifest",       default=None,                      help="Output JSON manifest (default: <out>.json).")
+    p.add_argument("--tokenizer",      default=None,                      help="tokenizer.json (sha256 stored in the header).")
+    p.add_argument("--layers",         default=None, type=int,            help="Truncate to the first K layers.")
+    p.add_argument("--check",          action="store_true",               help="Read two tensors back and compare.")
+    p.add_argument("--no-emb16",       action="store_true",               help="Leave out the int16 embedding table (~2.6%% slower).")
+    p.add_argument("--chan-stride",    default=None, type=_int,           help="Per-channel stride (TRIXIUM_CHAN_STRIDE, default: FK33's).")
+    p.add_argument("--weight-base",    default=None, type=_int,           help="Weight base (TRIXIUM_CHAN_WEIGHT_BASE, default: FK33's).")
+    p.add_argument("--window-reserve", default=0,    type=_int,           help="Bytes lost to the bank skew ((chan_mod-1)*TRIXIUM_CHAN_SKEW).")
     p.add_argument("--kseg-max",       default=layout.KSEG_MAX, type=int, help="Split matvecs wider than this (K-segments).")
 
     # Verify.

@@ -290,8 +290,8 @@ static void bench_cmd(char *args)
 
 static int gen_emit_to_pbuf;
 // Chunked prompt buffer (tok/genb), in the main_ram static window (static_memory.h), not
-// .bss: TRIXIUM_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000) and the KV undo
-// (+0x90000). Sized to the KV budget (the image's max_ctx, 2048 for the 1.7B): a
+// .bss: TRIXIUM_HDR_ADDR + 0xA0000, clear of the entry cache (+0x80000).
+// Sized to the KV budget (the image's max_ctx, 2048 for the 1.7B): a
 // conversation can use the whole context.
 #define PBUF_N 2048
 static int *const pbuf = (int *)(TRIXIUM_HDR_ADDR + 0xA0000); // [PBUF_N]

@@ -92,7 +92,7 @@ int main(int argc, char **argv) {{
 '''
 
 
-def build(tmp_path, **geometry):
+def build(**geometry):
     """The compiled unit (cached by key: a hit neither constructs nor converts it)."""
     top = "attn_" + "_".join(str(v) for v in geometry.values())
     return Simulator(lambda: _construct(**geometry), name=top, key=file_key(__file__, top, geometry),
@@ -183,8 +183,8 @@ SMALL = dict(lanes=4, groups=2, hb_max=4, t_max=64)
 
 
 @pytest.fixture(scope="module")
-def small(tmp_path_factory):
-    return build(tmp_path_factory.mktemp("attn_small"), **SMALL)
+def small():
+    return build(**SMALL)
 
 
 @pytest.mark.parametrize("mode", [MODE_SCORES, MODE_VALUES])
@@ -207,8 +207,8 @@ def test_bad_geometry_is_an_error(tmp_path, small):
 
 
 @pytest.fixture(scope="module")
-def big(tmp_path_factory):
-    return build(tmp_path_factory.mktemp("attn_27b"), lanes=24, groups=4, hb_max=32, t_max=2048)
+def big():
+    return build(lanes=24, groups=4, hb_max=32, t_max=2048)
 
 
 @pytest.mark.parametrize("mode", [MODE_SCORES, MODE_VALUES])

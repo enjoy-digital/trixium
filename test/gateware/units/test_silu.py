@@ -291,7 +291,6 @@ def load_tables(dut):
 def check_run(dut, cmd, gates, mults, stalls=True):
     n = cmd["elements"]
     beats, words = (n + 7)//8, (n + 31)//32
-    inplace = cmd["dst"] == cmd["src_g"]
     mem = np.full(SIZE//4, SENTINEL, dtype=np.uint32)
     mem[cmd["src_g"]//4:cmd["src_g"]//4 + n] = gates
     mem[cmd["src_m"]//4:cmd["src_m"]//4 + n] = mults
@@ -413,7 +412,7 @@ def test_invalid_physical_sizes():
 def test_compiled_full_scratchpad_image(tmp_path):
     from common.rtl_client import build_client, run_client
     size = 256*1024
-    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp",
+    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, "silu_sp",
                           key=f"SiluScratchpad({size})")
     rng = np.random.default_rng(12)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)
@@ -469,7 +468,7 @@ def test_compiled_table_only_sigmoid(tmp_path):
     from common.rtl_client import build_client, run_client
     from model.rv32_math import sigmoid_rv32
     size = 256*1024
-    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp",
+    binary = build_client(lambda: SiluScratchpad(size), SILU_COMMAND, "silu_sp",
                           key=f"SiluScratchpad({size})")
     rng = np.random.default_rng(21)
     mem = rng.integers(0, 1 << 32, size//4, dtype=np.uint64).astype(np.uint32)

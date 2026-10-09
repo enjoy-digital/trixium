@@ -15,8 +15,7 @@ by hand. It runs a common.verilator.Script on either backend:
 - "migen": Migen's simulator with HBMChannelModel channels - the slow cross-check.
 
 Both see the same signal names (cmd_<field>, done, vu_prog, seq_busy, ...), the scratchpad as
-memory "sp" and channel i's memory as "axi<i>". Also here: the Migen-only helpers
-(read_sp, vec_csr_upload/submit) for tests that drive the DUT directly.
+memory "sp" and channel i's memory as "axi<i>".
 """
 
 import hashlib
@@ -33,7 +32,6 @@ from common.verilator import Script, Simulator, run_migen
 
 # Constants ----------------------------------------------------------------------------------------
 
-BACKENDS   = ["verilator", "migen"]
 CMD_FIELDS = ("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats", "bias", "rshift",
               "xsrc", "dst", "chan")
 
@@ -169,7 +167,7 @@ class EngineBench:
         return _simulators[key]
 
     def run(self, backend, script, sp=b"", payloads=None, latency=8, stall_rate=0, reorder_ids=0,
-            model_size=64*1024, axi_log=(), r_stall=None):
+            model_size=64*1024, axi_log=()):
         """Run `script` after a reset. payloads: per-channel memory images; latency/stall_rate:
         a value or a per-channel list (stall_rate in sixteenths, as HBMChannelModel)."""
         n   = self.n_channels
@@ -219,7 +217,7 @@ def csr_write(s, name, value):
 
 
 def vec_upload(s, words):
-    """Vector-unit program upload through its CSRs (vec_csr_upload's Script twin)."""
+    """Vector-unit program upload through its CSRs."""
     s.set("vu_prog_adr", 0)
     s.set("vu_prog_adr_re", 1)
     s.step()
@@ -233,7 +231,7 @@ def vec_upload(s, words):
 
 
 def vec_submit(s, args):
-    """Vector-unit program start through its CSRs (vec_csr_submit's Script twin)."""
+    """Vector-unit program start through its CSRs."""
     for i, a in enumerate(args):
         s.set(f"vu_arg{i}", a & 0xFFFFFFFF)
     s.set("vu_pc", 0)
@@ -254,38 +252,3 @@ def seq_start(s, base, count):
     s.step()
     s.set("seq_start_re", 0)
     s.step()
-
-# Migen Helpers ------------------------------------------------------------------------------------
-
-def vec_csr_upload(dut, words):
-    yield dut.vu.prog_adr.storage.eq(0)
-    yield dut.vu.prog_adr.re.eq(1)
-    yield
-    yield dut.vu.prog_adr.re.eq(0)
-    for wd in words:
-        yield dut.vu.prog.storage.eq(wd)
-        yield dut.vu.prog.re.eq(1)
-        yield
-    yield dut.vu.prog.re.eq(0)
-    yield
-
-
-def vec_csr_submit(dut, args):
-    arg_csrs = [dut.vu.arg0, dut.vu.arg1, dut.vu.arg2, dut.vu.arg3,
-                dut.vu.arg4, dut.vu.arg5, dut.vu.arg6, dut.vu.arg7]
-    for i, a in enumerate(args):
-        yield arg_csrs[i].storage.eq(a & 0xFFFFFFFF)
-    yield dut.vu.pc.storage.eq(0)
-    yield dut.vu.submit.storage.eq(1)
-    yield dut.vu.submit.re.eq(1)
-    yield
-    yield dut.vu.submit.re.eq(0)
-    yield
-
-
-def read_sp(dut, start, length):
-    data = bytearray()
-    for wd in range(start//32, (start + length + 31)//32):
-        v = (yield dut.scratchpad.mem[wd])
-        data += int(v).to_bytes(32, "little")
-    return bytes(data[:length])

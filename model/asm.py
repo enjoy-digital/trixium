@@ -12,7 +12,7 @@ The vector unit is a microcoded 16-lane SIMD engine working on the scratchpad:
 - 8 scalar registers S0..S7, 48-bit signed (reduction accumulators need > 32 bits).
 - 8 argument registers A0..A7 written via CSR before VECRUN (addresses, lengths, shifts).
 - Two hardware loop levels (LOOPS/LOOPE, and LOOPS2/LOOPE2 around them).
-- Q15 LUT ops (EXP2F/RSQRT/RECIP) with linear interpolation, tables from
+- Q15 LUT ops (LUTE2/LUTRSQRT/LUTRECIP) with linear interpolation, tables from
   model.bitexact (identical ROM contents in RTL, interpreter and firmware).
 
 The INTERPRETER IS THE GOLDEN MODEL: the RTL must execute the same binary with identical
@@ -1633,7 +1633,7 @@ def emit_c(out):
 
 def main():
     parser = argparse.ArgumentParser(description="Assemble the vector unit programs into a C header.")
-    parser.add_argument("out",     nargs="?", default="firmware/progs.h", help="Output header.")
+    parser.add_argument("out",     nargs="?", default="firmware/progs.h",    help="Output header.")
     parser.add_argument("--vregs", type=int,  default=None, choices=(8, 16), help="Vector register count (encoding).")
     args = parser.parse_args()
 

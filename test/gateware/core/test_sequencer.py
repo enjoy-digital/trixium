@@ -135,7 +135,7 @@ def test_sequencer_start_drains_posted_writes():
 
 @COMPILED
 def test_sequencer_v2_chaining(backend):
-    # Sequencer v2 primitives in one list, the way seq_build_attn will use them:
+    # Sequencer v2 primitives in one list, the way seq_build_attn uses them:
     #   reduce_acc (res6 = absmax) -> spill (S7 seeded with prev res6, persisted to SP,
     #   res6 preserved) -> norm_i32 with k from src=3 (k(res6)) -> reduce_acc over a
     #   crafted buffer (res6 = sum p8, standing in for softmax8's S6) -> engine AXPY with
@@ -681,7 +681,7 @@ def test_sequencer_kadd_interlock_precise(backend):
     # matvec B is NOWAIT and captures k -> kreg1. A norm reading kreg0 must dispatch UNDER
     # B's stream (real overlap), while a norm reading kreg1 must wait for B's capture
     # (done+2) and see the right k. The register-blind interlock serialized the FFN
-    # list's norm-under-stream on the card (13.60M vs 13.45M cycles/token, 2026-08-29).
+    # list's norm-under-stream on the card.
     from model import asm as vasm
 
     n_channels, rows_per_chan, cols = 2, 32, 128

@@ -29,7 +29,6 @@ import pytest
 
 from migen import *
 
-from litex.soc.interconnect import stream
 from litex.soc.interconnect.axi import AXIInterface
 
 from litedram.common import LiteDRAMNativePort

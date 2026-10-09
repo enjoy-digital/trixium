@@ -81,7 +81,7 @@ static int eng_shadow_valid;
 
 // engine_submit programs and launches the op and returns the done_count to hand to
 // engine_join; the caller may run independent vector-unit work in between (the scratchpad
-// ports arbitrate per cycle, docs/units.md (Overlap and scratchpad arbitration)). Between submit and join:
+// ports arbitrate per cycle, doc/units.md (Overlap and scratchpad arbitration)). Between submit and join:
 //  - do not read the engine absmax/argmax (they belong to the streaming op),
 //  - do not submit another engine op,
 //  - only touch scratchpad regions disjoint from the op's xsrc/dst,

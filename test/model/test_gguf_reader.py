@@ -4,8 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# GGUFReader unit test: writes a small synthetic GGUF v3 file (with an unknown quant type to
-# exercise the offset-delta size derivation) and checks metadata + tensor parsing.
+"""model/gguf_reader.py: a tiny synthetic GGUF file read back (metadata, tensor infos, data)."""
 
 import struct
 

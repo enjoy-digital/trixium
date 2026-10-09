@@ -12,7 +12,7 @@ firmware header generation and the host tools. Three contracts live here:
 1. HW weight layout ("row packets"): how a quantized tensor is arranged in HBM so that one
    linear AXI burst region per channel feeds the engine.
 2. BONS image format: the on-disk/in-memory weight image (header + tensor table + payloads).
-3. Engine CSR/descriptor contract constants (opcodes, kinds).
+3. Tensor kinds, flags and roles, and the memory placement constants.
 
 Geometry: one HBM pseudo-channel AXI beat is 256 bits = 32 bytes. For ternary tensors
 (group=128), one beat carries exactly one group's 2-bit codes (128 codes x 2b = 32B), so one
@@ -200,9 +200,9 @@ def shard_rows(rows, n_channels, channel):
 #
 # Single file: [header 4 KiB][tensor table, 64 B/entry, padded to 4 KiB][channel 0 payload]
 # [channel 1 payload]...[channel N-1 payload]. All channel payloads have the same length
-# (payload_beats). In HBM, each channel's payload is uploaded at the same base offset of its
-# pseudo-channel; the header+table are uploaded at HBM_WEIGHT_BASE in channel 0 so the firmware
-# can walk the model without host-side sideband.
+# (payload_beats). Each channel's payload is uploaded at the same base offset of its window;
+# the header+table go to channel 0's staging area (the MB below its window) and the firmware's
+# `hdrload` copies them to main_ram, so it walks the model without host-side sideband.
 
 BONS_MAGIC       = 0x534E4F42 # "BONS" little-endian.
 BONS_VERSION     = 3  # 2: NORM16 .w16 entries carry their exponent in bias.

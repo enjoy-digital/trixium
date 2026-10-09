@@ -141,7 +141,7 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
         if (dc != last) {
             last = dc;
             if (n < max)
-        ts[n++] = perf_now();
+                ts[n++] = perf_now();
         }
         if (!(st & 1))
             break;

@@ -49,8 +49,8 @@ def command(x0, x1, x2, x3, w, dst, channels, **extra):
 
 
 @pytest.fixture(scope="module")
-def binary(tmp_path_factory):
-    return build_client(lambda: ConvScratchpad(SIZE), CONV_COMMAND, tmp_path_factory.mktemp("conv"), "conv_sp",
+def binary():
+    return build_client(lambda: ConvScratchpad(SIZE), CONV_COMMAND, "conv_sp",
                         key=f"ConvScratchpad({SIZE})")
 
 

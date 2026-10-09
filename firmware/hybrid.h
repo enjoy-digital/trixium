@@ -25,7 +25,7 @@ int  hybrid_forward(int token, int want_logits); // Next token (argmax) or -1.
 /*-----------*/
 
 void hybrid_stats_reset(void);                   // Reset the per-stage cycle counters.
-void hybrid_stats_print(void);                   // Print the per-stage averages (hybprof).
+void hybrid_stats_print(void);                   // Print the per-stage averages (stats' hybprof lines).
 
 /* Console Controls */
 /*------------------*/

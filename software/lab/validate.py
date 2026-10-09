@@ -18,9 +18,7 @@ Long: run it detached, e.g.
 
 Board steps: the hosts of ~/.config/trixium/boards.ini (key-based ssh, software/lab/deploy.py).
 DDR4-1500 is an approved out-of-spec overclock (the XCU1525 build and deploy gate it under the
-ddr1600-overclock approval); the reference is v30b: 27B 32.2 M cycles/token, tokens
-"11751 13 198 760 6511 314 9564 369". FK33 reference v16b: 1.7B 2,101k cycles/token,
-101.2 tok/s at 212.5 MHz; 8B 30.0 tok/s.
+ddr1600-overclock approval). Reference tokens and speeds: doc/boards.md.
 """
 
 import os
@@ -189,7 +187,7 @@ def validate(steps, out):
 # Run ----------------------------------------------------------------------------------------------
 
 def add_arguments(parser):
-    parser.add_argument("--steps", default=",".join(STEPS), help="Comma-separated subset of: " + ", ".join(STEPS) + ".")
+    parser.add_argument("--steps", default=",".join(STEPS),  help="Comma-separated subset of: " + ", ".join(STEPS) + ".")
     parser.add_argument("--out",   default="build/validate", help="Logs and summary directory.")
 
 

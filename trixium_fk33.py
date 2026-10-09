@@ -6,30 +6,31 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# TriXium on the SQRL FK33 (XCVU33P, 8 GB HBM2, PCIe Gen3 x4).
-#
-# The TriXium core streams its weights from HBM: engine channel c is pseudo-channel c + 1
-# (channel 0 carries the CPU's main_ram). The defaults are the configuration that runs the
-# Bonsai 1.7B and 8B (16 channels, HBM at 800 MHz, sys = HBM AXI clock = 212.5 MHz), built with
-# the CPU, Vivado directives and timing gate it shipped with. Board bring-up and operation:
-# doc/boards.md.
-#
-# From the repository root:
-#   ./trixium_fk33.py --build                          # -> build/fk33/ + build/fk33.verdict
-#   ./trixium_fk33.py --load                           # OpenOCD (JTAG, onboard FT2232)
-#   trixium deploy fk33 --board fk33 --model 1p7b      # the lab board: software/lab/deploy.py
-#
-# What the recipe's directives and caches are worth:
-# - fetch-l1 128 sets x 4 ways = 32 KB instruction cache: the per-layer firmware code path
-#   (~24 KB) does not fit 16 KB (-15% on the token); lsu-l1 the same (-5.5%).
-# - AreaOptimized_medium: on this ~98%-full die the synthesis area directive closes timing;
-#   AltSpreadLogic_low is the placer directive that does. Judge a build by TNS and failing
-#   endpoints against the last shipped one, never by WNS alone (software/lab/timing.py).
-# - update_repo "no": never let LiteX update ext/VexiiRiscv from here (needs network, and a
-#   half-done update leaves a CPU that does not compile against the local SpinalHDL).
-# - If post-route phys_opt crashes, re-route from the placed checkpoint and skip it (worth
-#   ~0.15 ns of WNS, not correctness).
-# Vivado 2024.1 (the 2025.2 install lacks the VU33P; --vivado-settings). A route peaks at ~11-15 GB.
+"""TriXium on the SQRL FK33 (XCVU33P, 8 GB HBM2, PCIe Gen3 x4).
+
+The TriXium core streams its weights from HBM: engine channel c is pseudo-channel c + 1
+(channel 0 carries the CPU's main_ram). The defaults are the configuration that runs the
+Bonsai 1.7B and 8B (16 channels, HBM at 800 MHz, sys = HBM AXI clock = 212.5 MHz), built with
+the CPU, Vivado directives and timing gate it shipped with. Board bring-up and operation:
+doc/boards.md.
+
+From the repository root:
+  ./trixium_fk33.py --build                          # -> build/fk33/ + build/fk33.verdict
+  ./trixium_fk33.py --load                           # OpenOCD (JTAG, onboard FT2232)
+  trixium deploy --board fk33 --model 1p7b           # the lab board: software/lab/deploy.py
+
+What the recipe's directives and caches are worth:
+- fetch-l1 128 sets x 4 ways = 32 KB instruction cache: the per-layer firmware code path
+  (~24 KB) does not fit 16 KB (-15% on the token); lsu-l1 the same (-5.5%).
+- AreaOptimized_medium: on this ~98%-full die the synthesis area directive closes timing;
+  AltSpreadLogic_low is the placer directive that does. Judge a build by TNS and failing
+  endpoints against the last shipped one, never by WNS alone (software/lab/timing.py).
+- update_repo "no": never let LiteX update ext/VexiiRiscv from here (needs network, and a
+  half-done update leaves a CPU that does not compile against the local SpinalHDL).
+- If post-route phys_opt crashes, re-route from the placed checkpoint and skip it (worth
+  ~0.15 ns of WNS, not correctness).
+Vivado 2024.1 (the 2025.2 install lacks the VU33P; --vivado-settings). A route peaks at ~11-15 GB.
+"""
 
 import os
 import sys
@@ -37,6 +38,8 @@ import sys
 from migen import *
 
 from litex.gen import *
+
+from litex_boards.platforms.sqrl_fk33 import Platform
 
 from litex.soc.cores.clock import *
 from litex.soc.cores.led import LedChaser
@@ -51,16 +54,12 @@ from model.layout import HBM_WEIGHT_BASE, HBM_CHAN_STRIDE, HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable
-from litex_boards.platforms.sqrl_fk33 import Platform
-
+from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 
 # Constants ----------------------------------------------------------------------------------------
 
 # The HBM IP: stack clock 800 MHz (PLL divider 8), AXI clock window 200..400 MHz (PG276).
 HBM_XCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateware", "hbm", "hbm_800.xci")
-
-# Programming: litex-boards' OpenOCD programmer (onboard FT2232, pld load): openFPGALoader
-# reports "done" on this board while the factory flash image wins the race.
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -163,24 +162,10 @@ class TriXiumFK33SoC(SoCCore):
 
 # Build --------------------------------------------------------------------------------------------
 
-VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1"
-
 # CPU: 32 KB I$ + 32 KB D$, branch prediction, Zcbm (cache maintenance for the resident lists)
 # and Zbb (clz).
 VEXII_ARGS = ("--fetch-l1-ways=4 --fetch-l1-sets=128 --lsu-l1-ways=4 --lsu-l1-sets=128 "
     "--with-btb --with-ras --with-gshare --with-rvZcbm --with-rvZbb")
-
-def set_vivado_env(path):
-    """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
-    if path and os.path.exists(os.path.join(path, "settings64.sh")):
-        os.environ["LITEX_ENV_VIVADO"] = path
-
-
-def write_verdict(path, rc):
-    """build/<name>.verdict: the build's exit code (0 = timing gate passed)."""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{rc}\n")
-
 
 def main():
     # VexiiRiscv's netlist cache key must not depend on set ordering: hash randomization is
@@ -237,7 +222,7 @@ def main():
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"), name="trixium")
 
         # The FK33 ships on the empirical gate (no worse than the builds that have run on the
-        # card): no FK33 build has ever closed the strict gate (v16b: WNS -0.315 ns).
+        # card): no FK33 build has closed the strict gate.
         if builder.compile_gateware:
             report = os.path.join(builder.gateware_dir, f"{soc.platform.name}_timing.rpt")
             print("\nTiming gate:")
@@ -246,6 +231,8 @@ def main():
             if rc:
                 sys.exit(rc)
 
+    # Load: litex-boards' OpenOCD programmer (onboard FT2232, pld load); openFPGALoader reports
+    # "done" on this board while the factory flash image wins the race.
     if args.load:
         prog = soc.platform.create_programmer()
         prog.load_bitstream(builder.get_bitstream_filename(mode="sram"))

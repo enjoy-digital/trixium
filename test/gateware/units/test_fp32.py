@@ -19,7 +19,7 @@ from common import RTL
 from common.verilator import Simulator
 
 # FP32Add / FP32Mul / FP32DivSqrt ------------------------------------------------------------------
-# gateware/fp32_exact.py against IEEE float32 (numpy), NaNs canonical as on RV32F.
+# gateware/units/fp32.py against IEEE float32 (numpy), NaNs canonical as on RV32F.
 
 f32 = np.float32
 

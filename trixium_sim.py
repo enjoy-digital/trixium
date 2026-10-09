@@ -18,7 +18,7 @@ models.
   ./trixium_sim.py --build      # headers + libraries, firmware, Verilog (~1 min), Verilator (~2.5 min)
   ./trixium_sim.py --run        # run it (console on stdin/stdout)
   ./trixium_sim.py --firmware   # rebuild the firmware and re-bake it into the built sim (seconds)
-  ./trixium_sim.py --gate       # traced generation compared with the Python mirror (~17 min)
+  ./trixium_sim.py --gate       # traced generation compared with the Python mirror (~10 min)
   ./trixium_sim.py --bench      # resident path off/on, cycles per forward
 
 --board (xcu1525, fk33) and --image select the build (build/sim_<board>); the gate and the bench
@@ -77,7 +77,6 @@ DDR4_SIM_CHAN_STRIDE = 0x0040_0000 # 4 MB.
 DDR4_SIM_CHAN_SKEW   = 0xA000      # 40 KB.
 DDR4_SIM_CSR_WINDOW  = 0xF0020000  # The target's DDR_CSR_WINDOW.
 DDR_SPLIT_CLK_RATIO  = 2           # ddr clock / sys clock in the simulation.
-DDR4_SIM_CSR_PAGE0   = 8           # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
 
 # The ROM holds no BIOS, only a jump to the firmware in main_ram (`lui t0, MAIN_RAM_BASE;
@@ -419,22 +418,22 @@ def build_sim(args, board, out_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
-    parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS),              help="Hardware to mirror.")
-    parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img",     help="BONS image to bake in.")
-    parser.add_argument("--out-dir",        default=None,                                           help="Build directory (default: build/sim_<board>).")
-    parser.add_argument("--build",          action="store_true",                                    help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
-    parser.add_argument("--run",            action="store_true",                                    help="Run the built simulation (console on stdin/stdout).")
-    parser.add_argument("--firmware",       action="store_true",                                    help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525).")
-    parser.add_argument("--gate",           action="store_true",                                    help="Traced generation compared with the Python mirror.")
-    parser.add_argument("--bench",          action="store_true",                                    help="Cycles per forward with --bench-toggle off, then on.")
-    parser.add_argument("--bench-toggle",   default="resident",                                     help="--bench: console toggle to A/B (resident, silu, dnstream).")
-    parser.add_argument("--bench-tokens",   default=2,  type=int,                                   help="--bench: bench N (N+2 forwards).")
+    parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS),               help="Hardware to mirror.")
+    parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img",    help="BONS image to bake in.")
+    parser.add_argument("--out-dir",        default=None,                                          help="Build directory (default: build/sim_<board>).")
+    parser.add_argument("--build",          action="store_true",                                   help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
+    parser.add_argument("--run",            action="store_true",                                   help="Run the built simulation (console on stdin/stdout).")
+    parser.add_argument("--firmware",       action="store_true",                                   help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525).")
+    parser.add_argument("--gate",           action="store_true",                                   help="Traced generation compared with the Python mirror.")
+    parser.add_argument("--bench",          action="store_true",                                   help="Cycles per forward with --bench-toggle off, then on.")
+    parser.add_argument("--bench-toggle",   default="resident",                                    help="--bench: console toggle to A/B (resident, silu, dnstream).")
+    parser.add_argument("--bench-tokens",   default=2,  type=int,                                  help="--bench: bench N (N+2 forwards).")
     parser.add_argument("--cpu-type",       default=None, choices=["vexriscv", "vexiiriscv"],      help="Override the board's CPU.")
     parser.add_argument("--update-repo",    default="no", choices=["no", "recommended", "latest"], help="VexiiRiscv source update policy.")
-    parser.add_argument("--trace",          action="store_true",                                    help="Enable FST tracing.")
-    parser.add_argument("--hbm-latency",    default=16, type=int,                                   help="--board fk33: HBM model read latency.")
-    parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                   help="--board fk33: HBM model stall rate.")
-    parser.add_argument("--threads",        default=4,  type=int,                                   help="Verilator threads.")
+    parser.add_argument("--trace",          action="store_true",                                   help="Enable FST tracing.")
+    parser.add_argument("--hbm-latency",    default=16, type=int,                                  help="--board fk33: HBM model read latency.")
+    parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
+    parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
     args = parser.parse_args()
     if not (args.build or args.run or args.firmware or args.gate or args.bench):
         parser.error("nothing to do: --build, --run, --firmware, --gate or --bench.")

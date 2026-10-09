@@ -12,7 +12,7 @@ the command interface instead. Also exposes the soft engine reset, the op status
 absmax/argmax and the per-channel/overlap performance counters.
 
 Ops: kind 0 = ternary matvec, 1 = q8 matvec, 2 = fetch (memory row -> scratchpad), 3 = store,
-4 = axpy.
+4 = axpy, 5 = DeltaNet stream, 6 = attention stream (when built).
 """
 
 from migen import *

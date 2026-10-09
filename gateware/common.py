@@ -6,11 +6,13 @@
 
 """Target-side pieces shared by the boards and the simulation.
 
-The physical constraints of the TriXium core, the CPU integration helpers and the CPU bus
-monitor. The constraints are NOT a timing waiver: new integrations need routed timing and
-selector coverage checks. In particular a signal-name refactor is not physically neutral (the
-constraints match cell names).
+The physical constraints of the TriXium core, the CPU integration helpers, the CPU bus monitor
+and the board build helpers. The constraints are NOT a timing waiver: new integrations need
+routed timing and selector coverage checks. In particular a signal-name refactor is not
+physically neutral (the constraints match cell names).
 """
+
+import os
 
 from migen import *
 
@@ -94,3 +96,17 @@ class CPUBusMonitor(LiteXModule):
                 setattr(self, f"{name}{ch}addr", adr)
                 ep = getattr(bus, ch)
                 self.sync += If(ep.valid, adr.status.eq(ep.addr))
+
+# Build Helpers ------------------------------------------------------------------------------------
+
+VIVADO_PATH = "/opt/Xilinx/2024.1/Vivado/2024.1" # The Vivado the boards are built with.
+
+def set_vivado_env(path):
+    """Have the build script source <path>/settings64.sh (LiteX's LITEX_ENV_VIVADO)."""
+    if path and os.path.exists(os.path.join(path, "settings64.sh")):
+        os.environ["LITEX_ENV_VIVADO"] = path
+
+def write_verdict(path, rc):
+    """build/<name>.verdict: the build's exit code (0 = timing gate passed)."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"{rc}\n")
