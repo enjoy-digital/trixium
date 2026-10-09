@@ -16,3 +16,4 @@ csr_register,cpumon_cpu_reset,0xf000f800,1,ro
 constant,config_clock_frequency,125000000,,
 constant,config_identifier,TriXium on XCU1525 2025-10-08 05:06:40,,
 constant,trixium_n_channels,16,,
+csr_register,trixium_engine_csr_perf_ar,0xf000412c,1,ro

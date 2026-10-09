@@ -44,6 +44,8 @@ import datetime
 
 STATE_DIR = "/tmp/trixium"          # Written by trixium_load / trixium_chat / trixium.client.
 BEAT_BYTES = 32                     # 256-bit AXI memory ports.
+CSR_BASE   = 0xf0000000             # LiteX CSR bus base (csr.csv csr_base), the REG ioctl's view.
+CSR_SIZE   = 0x10000                # CSR window.
 WIDTH      = 88                     # Table width.
 
 # _IOWR('S', 0, struct litepcie_ioctl_reg { u32 addr; u32 val; u8 is_write; }) -> 12 bytes.
@@ -69,12 +71,22 @@ class CSRMap:
                 kind, name = row[0], row[1]
                 if kind == "csr_base" and name == "ctrl":
                     self.base = int(row[2], 0)
+                elif kind == "csr_base" and name == "identifier_mem":
+                    self.regs[name] = (int(row[2], 0), 1)
                 elif kind == "csr_register":
                     self.regs[name] = (int(row[2], 0), int(row[3]))
                 elif kind == "constant":
                     self.constants[name] = row[2]
         if "identifier_mem" not in self.regs:
             self.regs["identifier_mem"] = (self.base + 0x800, 1)
+        # Builds from before the TriXium rename (TriXium: separate engine_csr/seq/vecunit
+        # banks, bonsai_* constants) carry the same registers under their old names.
+        for name in list(self.regs):
+            if name.startswith(("engine_csr_", "seq_", "vecunit_")):
+                self.regs.setdefault("trixium_" + name, self.regs[name])
+        for name in list(self.constants):
+            if name.startswith("bonsai_"):
+                self.constants.setdefault("trixium_" + name[len("bonsai_"):], self.constants[name])
 
     @property
     def identifier(self):
@@ -103,25 +115,46 @@ def find_csr_maps(paths=None):
 # Cards --------------------------------------------------------------------------------------------
 
 class DriverCard:
-    """A card behind the TriXium driver: BAR0 register reads/writes through the REG ioctl."""
-    def __init__(self, device):
-        self.device = device
-        self.fd     = os.open(device, os.O_RDWR)
+    """A card behind the TriXium driver: CSR reads/writes through the LitePCIe REG ioctl.
 
-    def read(self, offset):
-        buf = bytearray(struct.pack("<IIB3x", offset, 0, 0))
+    The ioctl takes the CSR bus address (it subtracts CSR_BASE itself) and does no bounds
+    check: an address outside the CSR window faults in the kernel, so it is refused here."""
+    def __init__(self, device, csr_base=CSR_BASE, csr_size=CSR_SIZE):
+        self.device   = device
+        self.csr_base = csr_base
+        self.csr_size = csr_size
+        self.fd       = os.open(device, os.O_RDWR)
+
+    def _reg(self, offset, value, is_write):
+        if not 0 <= offset < self.csr_size or offset % 4:
+            raise ValueError(f"CSR offset 0x{offset:x} outside the CSR window")
+        buf = bytearray(struct.pack("<IIB3x", self.csr_base + offset, value, is_write))
         fcntl.ioctl(self.fd, LITEPCIE_IOCTL_REG, buf)
         return struct.unpack("<IIB3x", buf)[1]
 
+    def read(self, offset):
+        return self._reg(offset, 0, 0)
+
     def write(self, offset, value):
-        buf = bytearray(struct.pack("<IIB3x", offset, value, 1))
-        fcntl.ioctl(self.fd, LITEPCIE_IOCTL_REG, buf)
+        self._reg(offset, value, 1)
 
     def pci_device(self):
-        """The card's sysfs PCI device directory (via the driver's class device)."""
-        name = os.path.basename(self.device)
-        path = os.path.realpath(f"/sys/class/trixium/{name}/device")
-        return path if os.path.isdir(path) else None
+        """The card's sysfs PCI device directory (from the device node's major:minor)."""
+        rdev = os.stat(self.device).st_rdev
+        path = os.path.realpath(f"/sys/dev/char/{os.major(rdev)}:{os.minor(rdev)}/device")
+        if os.path.isdir(path):
+            return path
+        # The LitePCIe driver creates its nodes without a parent: the N-th Xilinx device.
+        xilinx = []
+        for dev in sorted(glob.glob("/sys/bus/pci/devices/*")):
+            try:
+                with open(os.path.join(dev, "vendor"), encoding="utf-8") as f:
+                    if f.read().strip() == "0x10ee":
+                        xilinx.append(dev)
+            except OSError:
+                pass
+        index = int("0" + "".join(c for c in os.path.basename(self.device) if c.isdigit()))
+        return xilinx[index] if index < len(xilinx) else None
 
     def close(self):
         os.close(self.fd)
@@ -154,9 +187,8 @@ class FakeCard:
             "trixium_engine_csr_cyc_both"   : int(c*0.05),
             "trixium_engine_csr_done_count" : c//9000,
             "trixium_engine_csr_status"     : 0x101,
-            "trixium_seq_status"            : 0x1 | ((c//20000) & 0xffff) << 8,
             "trixium_engine_csr_perf_beats" : int(c*0.42*(1 - 0.02*self.chan)),
-            "trixium_engine_csr_perf_r"     : int(c*0.20),
+            "trixium_engine_csr_perf_ar"    : int(c*0.20),
         }.get(name, 0)
         return value & 0xffffffff
 
@@ -209,11 +241,11 @@ def snapshot(card, csr_map, channels):
     s  = {"time": time.monotonic()}
     for name in ("cyc_total", "cyc_eng", "cyc_vec", "cyc_both", "done_count"):
         s[name] = rd(f"trixium_engine_csr_{name}")
-    s["seq_status"] = rd("trixium_seq_status")
-    s["beats"], s["r_stalls"] = [], []
+    s["beats"], s["ar_stalls"], s["r_stalls"] = [], [], []
     for c in range(channels):
         card.write(csr_map.offset("trixium_engine_csr_perf_chan"), c)
         s["beats"].append(rd("trixium_engine_csr_perf_beats"))
+        s["ar_stalls"].append(rd("trixium_engine_csr_perf_ar"))
         s["r_stalls"].append(rd("trixium_engine_csr_perf_r"))
     return s
 
@@ -265,7 +297,7 @@ def query(card, csr_map, interval=0.25):
         "csr_csv"    : csr_map.filename,
         "pcie"       : pcie_link(card),
     }
-    if not d["identifier"].startswith("TriXium"):
+    if not d["identifier"].startswith(("TriXium", "TriXium")):
         d["ok"] = False
         return d
     d["ok"] = True
@@ -287,6 +319,7 @@ def query(card, csr_map, interval=0.25):
     clk     = cycles/seconds if seconds > 0 else 0
     frac    = lambda name: _delta(s0[name], s1[name])/cycles if cycles else 0.0
     beats   = [_delta(a, b) for a, b in zip(s0["beats"],    s1["beats"])]
+    ar      = [_delta(a, b) for a, b in zip(s0["ar_stalls"], s1["ar_stalls"])]
     stalls  = [_delta(a, b) for a, b in zip(s0["r_stalls"], s1["r_stalls"])]
     d["clock_mhz"] = clk/1e6
     d["sample"]    = {"seconds": seconds, "cycles": cycles}
@@ -295,8 +328,6 @@ def query(card, csr_map, interval=0.25):
         "vector"  : frac("cyc_vec"),
         "overlap" : frac("cyc_both"),
         "ops_s"   : _delta(s0["done_count"], s1["done_count"])/seconds if seconds else 0.0,
-        "lists_s" : ((s1["seq_status"] >> 8) - (s0["seq_status"] >> 8)) % (1 << 16)/seconds
-                    if seconds else 0.0,
     }
     gbs = [b*BEAT_BYTES/seconds/1e9 if seconds else 0.0 for b in beats]
     d["memory"] = {
@@ -306,7 +337,8 @@ def query(card, csr_map, interval=0.25):
         "peak_gbs"      : channels*BEAT_BYTES*clk/1e9,
         "channel_gbs"   : gbs,
         "channel_util"  : [b/cycles if cycles else 0.0 for b in beats],
-        "r_stall"       : sum(stalls)/(channels*cycles) if cycles else 0.0,
+        "ar_wait"       : sum(ar)/(channels*cycles) if cycles else 0.0,      # Memory not taking requests.
+        "backpressure"  : sum(stalls)/(channels*cycles) if cycles else 0.0,  # Engine not taking data.
     }
     d.update(read_state(card.device))
     return d
@@ -376,14 +408,14 @@ def table(devices):
         out.append(_line(f"Engine  {_bar(u['engine'])} {_pct(u['engine'])}     "
                          f"Vector  {_bar(u['vector'])} {_pct(u['vector'])}     "
                          f"Overlap {_pct(u['overlap'])}"))
-        out.append(_line(f"{u['ops_s']:,.0f} engine ops/s   {u['lists_s']:,.0f} descriptors/s"))
+        out.append(_line(f"{u['ops_s']:,.0f} engine ops/s"))
 
         # Memory.
         m = d["memory"]
         out.append(_head(f"Memory · {m['kind']} · {m['channels']} channels"))
         out.append(_line(f"Read    {_bar(m['gbs']/m['peak_gbs'] if m['peak_gbs'] else 0)} "
                          f"{m['gbs']:6.2f} GB/s of {m['peak_gbs']:.1f} GB/s port peak   "
-                         f"read-stall {_pct(m['r_stall'])}"))
+                         f"request wait {_pct(m['ar_wait'])}"))
         cells = [f"{c:2d} {_bar(x, 4)}{100*x:3.0f}%" for c, x in enumerate(m["channel_util"])]
         for i in range(0, len(cells), 6):
             out.append(_line("  ".join(cells[i:i + 6])))
@@ -421,7 +453,7 @@ def open_cards(args):
     maps  = find_csr_maps(args.csr)
     cards = []
     for device in devices:
-        card = DriverCard(device)
+        card = DriverCard(device, csr_base=maps[0].base if maps else CSR_BASE)
         # The register map whose identifier is the card's (identifier_mem sits at the same
         # place in every LiteX SoC), else the first one given.
         match = None
