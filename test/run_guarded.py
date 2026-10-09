@@ -195,15 +195,15 @@ def main():
     if "--" in argv:
         argv, pytest_args = argv[:argv.index("--")], argv[argv.index("--") + 1:]
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("files",         nargs="*",                     help="Test files or directories (default: every test/**/test_*.py).")
+    parser.add_argument("files",         nargs="*",                                          help="Test files or directories (default: every test/**/test_*.py).")
     parser.add_argument("-j", "--jobs",  type=int, default=max(1, (os.cpu_count() or 2)//2), help="Units run at once (default: cores/2).")
-    parser.add_argument("--out",         default="build/tests",         help="Output directory (logs, summary, record).")
-    parser.add_argument("--runslow",     action="store_true",           help="Full tier: include the tests marked slow.")
-    parser.add_argument("--min-free",    type=float, default=4.0,       help="Expected peak GB of a unit the record does not know.")
-    parser.add_argument("--margin",      type=float, default=10.0,      help="GB left available after every running unit reaches its peak.")
-    parser.add_argument("--max-gb",      type=float, default=40.0,      help="Cap on the sum of the running units' expected peaks.")
-    parser.add_argument("--kill-free",   type=float, default=6.0,       help="GB available below which the most recent unit is stopped.")
-    parser.add_argument("--split-above", type=float, default=240.0,     help="Run a file per test when the record says it took longer (s).")
+    parser.add_argument("--out",         default="build/tests",                              help="Output directory (logs, summary, record).")
+    parser.add_argument("--runslow",     action="store_true",                                help="Full tier: include the tests marked slow.")
+    parser.add_argument("--min-free",    type=float, default=4.0,                            help="Expected peak GB of a unit the record does not know.")
+    parser.add_argument("--margin",      type=float, default=10.0,                           help="GB left available after every running unit reaches its peak.")
+    parser.add_argument("--max-gb",      type=float, default=40.0,                           help="Cap on the sum of the running units' expected peaks.")
+    parser.add_argument("--kill-free",   type=float, default=6.0,                            help="GB available below which the most recent unit is stopped.")
+    parser.add_argument("--split-above", type=float, default=240.0,                          help="Run a file per test when the record says it took longer (s).")
     args = parser.parse_args(argv)
     if args.runslow:
         pytest_args = ["--runslow"] + pytest_args

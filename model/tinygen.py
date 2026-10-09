@@ -146,11 +146,11 @@ def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate the bonsai-tiny random model.")
-    parser.add_argument("--out",       default="models/tiny", help="Output directory.")
-    parser.add_argument("--channels",  default=2, type=int,   help="Channel shard count.")
+    parser.add_argument("--out",       default="models/tiny",  help="Output directory.")
+    parser.add_argument("--channels",  default=2, type=int,    help="Channel shard count.")
     parser.add_argument("--seed",      default=1234, type=int, help="Random seed.")
-    parser.add_argument("--hybrid",    action="store_true",   help="bonsai-tiny-hybrid (the 27B's shape).")
-    parser.add_argument("--hybrid-1k", action="store_true",   help="bonsai-tiny-hybrid-1k (1024-wide rotation blocks).")
+    parser.add_argument("--hybrid",    action="store_true",    help="bonsai-tiny-hybrid (the 27B's shape).")
+    parser.add_argument("--hybrid-1k", action="store_true",    help="bonsai-tiny-hybrid-1k (1024-wide rotation blocks).")
     parser.add_argument("--kseg-max",  default=None, type=int, help="Split matvecs wider than this (K-segments).")
     args = parser.parse_args()
 

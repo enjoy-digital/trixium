@@ -1633,7 +1633,7 @@ def emit_c(out):
 
 def main():
     parser = argparse.ArgumentParser(description="Assemble the vector unit programs into a C header.")
-    parser.add_argument("out",     nargs="?", default="firmware/progs.h", help="Output header.")
+    parser.add_argument("out",     nargs="?", default="firmware/progs.h",    help="Output header.")
     parser.add_argument("--vregs", type=int,  default=None, choices=(8, 16), help="Vector register count (encoding).")
     args = parser.parse_args()
 

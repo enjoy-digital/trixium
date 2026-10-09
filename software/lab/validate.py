@@ -187,7 +187,7 @@ def validate(steps, out):
 # Run ----------------------------------------------------------------------------------------------
 
 def add_arguments(parser):
-    parser.add_argument("--steps", default=",".join(STEPS), help="Comma-separated subset of: " + ", ".join(STEPS) + ".")
+    parser.add_argument("--steps", default=",".join(STEPS),  help="Comma-separated subset of: " + ", ".join(STEPS) + ".")
     parser.add_argument("--out",   default="build/validate", help="Logs and summary directory.")
 
 

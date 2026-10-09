@@ -254,12 +254,12 @@ def gate(report, strict=False, force=False, experiment=False, serializer_baselin
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Decide whether a build is safe to put on the card, from its timing report.")
-    parser.add_argument("report",                                                    help="Vivado timing report.")
-    parser.add_argument("--strict",              action="store_true",                help="Require full setup, hold and pulse-width/serializer-skew closure.")
-    parser.add_argument("-f", "--force",         action="store_true",                help="Deploy despite a failing verdict (says so on stdout).")
-    parser.add_argument("--experiment",          action="store_true",                help="Concept experiment: timing need not close, but setup must stay inside the host-safety envelope and hold must pass.")
+    parser.add_argument("report",                                                      help="Vivado timing report.")
+    parser.add_argument("--strict",              action="store_true",                  help="Require full setup, hold and pulse-width/serializer-skew closure.")
+    parser.add_argument("-f", "--force",         action="store_true",                  help="Deploy despite a failing verdict (says so on stdout).")
+    parser.add_argument("--experiment",          action="store_true",                  help="Concept experiment: timing need not close, but setup must stay inside the host-safety envelope and hold must pass.")
     parser.add_argument("--serializer-baseline", choices=sorted(SERIALIZER_BASELINES), help="Strict mode: accept serializer-skew violations no worse than this board-validated build's.")
-    parser.add_argument("--approval",            choices=sorted(APPROVALS),          help="Experiment mode: per-build approval (its own WNS floor and serializer baseline).")
+    parser.add_argument("--approval",            choices=sorted(APPROVALS),            help="Experiment mode: per-build approval (its own WNS floor and serializer baseline).")
     args = parser.parse_args(argv)
     return gate(args.report,
         strict              = args.strict,

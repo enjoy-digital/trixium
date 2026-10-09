@@ -111,17 +111,17 @@ def main():
 
     # Golden.
     p = subparsers.add_parser("golden", help="fp32 greedy reference (workstation).")
-    p.add_argument("gguf",                                         help="Ternary-Bonsai GGUF.")
-    p.add_argument("-o", "--out",  default="build/fp32_ref.json",  help="Reference JSON.")
-    p.add_argument("--tokenizer",                                  help="tokenizer.json (default: next to the GGUF).")
-    p.add_argument("-n",           type=int, default=20,           help="Tokens per prompt.")
-    p.add_argument("--prompt",     action="append",                help="Prompt instead of the built-in ones (repeatable).")
+    p.add_argument("gguf",                                        help="Ternary-Bonsai GGUF.")
+    p.add_argument("-o", "--out",  default="build/fp32_ref.json", help="Reference JSON.")
+    p.add_argument("--tokenizer",                                 help="tokenizer.json (default: next to the GGUF).")
+    p.add_argument("-n",           type=int, default=20,          help="Tokens per prompt.")
+    p.add_argument("--prompt",     action="append",               help="Prompt instead of the built-in ones (repeatable).")
     p.set_defaults(fn=cmd_golden)
 
     # Card.
     p = subparsers.add_parser("card", help="Teacher-forced card picks vs the reference (board host).")
-    p.add_argument("ref",                                                                     help="Reference JSON.")
-    p.add_argument("--tty",       default="/dev/ttyLXU0",                                     help="LiteUART tty.")
+    p.add_argument("ref",                                                                         help="Reference JSON.")
+    p.add_argument("--tty",       default="/dev/ttyLXU0",                                         help="LiteUART tty.")
     p.add_argument("--tokenizer", default=os.path.join(REPO, "models", "1.7b", "tokenizer.json"), help="tokenizer.json.")
     p.set_defaults(fn=cmd_card)
 

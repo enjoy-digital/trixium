@@ -426,15 +426,15 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 # Run ----------------------------------------------------------------------------------------------
 
 def add_arguments(parser):
-    parser.add_argument("build",                 nargs="?",                                 help="Build name in build/ (default: the board's).")
+    parser.add_argument("build",                 nargs="?",                                      help="Build name in build/ (default: the board's).")
     parser.add_argument("--board",               default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
-    parser.add_argument("--model",               default="1p7b", choices=list(MODELS),         help="Model.")
-    parser.add_argument("--no-reconfigure",      action="store_true",                          help="Board already deployed: firmware, weights, tokens and bench only.")
-    parser.add_argument("--boot",                action="store_true",                          help="With --no-reconfigure: boot the (rebuilt) firmware first (XCU1525).")
-    parser.add_argument("--approval",            default="ddr1600-overclock",                  help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
-    parser.add_argument("--serializer-baseline", default="v8",                                 help="XCU1525 timing gate serializer baseline.")
-    parser.add_argument("--bench",               type=int,                                     help="bench n (default: per model).")
-    parser.add_argument("--dry-run",             action="store_true",                          help="Print every command, run nothing.")
+    parser.add_argument("--model",               default="1p7b", choices=list(MODELS),           help="Model.")
+    parser.add_argument("--no-reconfigure",      action="store_true",                            help="Board already deployed: firmware, weights, tokens and bench only.")
+    parser.add_argument("--boot",                action="store_true",                            help="With --no-reconfigure: boot the (rebuilt) firmware first (XCU1525).")
+    parser.add_argument("--approval",            default="ddr1600-overclock",                    help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
+    parser.add_argument("--serializer-baseline", default="v8",                                   help="XCU1525 timing gate serializer baseline.")
+    parser.add_argument("--bench",               type=int,                                       help="bench n (default: per model).")
+    parser.add_argument("--dry-run",             action="store_true",                            help="Print every command, run nothing.")
 
 
 def run(args):

@@ -3,3 +3,5 @@
 #
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
+
+"""The TriXium gateware: the core (core/), its units (units/), memory paths (memory/), the HBM IP (hbm/)."""

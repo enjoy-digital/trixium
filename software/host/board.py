@@ -316,36 +316,36 @@ def main(argv=None):
     sub    = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("reconfigure", help="Program the FPGA and warm-reboot the host.")
-    p.add_argument("bitstream",                                                     help="Bitstream.")
-    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33"],  help="Board.")
+    p.add_argument("bitstream",                                                  help="Bitstream.")
+    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
 
     p = sub.add_parser("boot", help="Boot the firmware (XCU1525: with the DDR4 training).")
-    p.add_argument("tok",        default="1.7b", nargs="?",                       help="Tokenizer directory in models/.")
-    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33"],  help="Board.")
-    p.add_argument("--firmware", default="trixium.bin",                           help="Firmware binary.")
+    p.add_argument("tok",        default="1.7b", nargs="?",                      help="Tokenizer directory in models/.")
+    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
+    p.add_argument("--firmware", default="trixium.bin",                          help="Firmware binary.")
 
     p = sub.add_parser("load", help="Upload a weight image (trixium_load).")
     p.add_argument("image",                                                       help="BONS image.")
 
     p = sub.add_parser("gen", help="hdrload + gen <args> on the console.")
-    p.add_argument("args",       nargs="+",                                       help="gen arguments (n, prompt ids).")
-    p.add_argument("--want",                                                      help="Expected token ids (exit 1 otherwise).")
-    p.add_argument("--timeout",  default=1200, type=int,                          help="Generation timeout (s).")
+    p.add_argument("args",       nargs="+",              help="gen arguments (n, prompt ids).")
+    p.add_argument("--want",                             help="Expected token ids (exit 1 otherwise).")
+    p.add_argument("--timeout",  default=1200, type=int, help="Generation timeout (s).")
 
     p = sub.add_parser("model", help="load + gen.")
-    p.add_argument("image",                                                       help="BONS image.")
-    p.add_argument("args",       nargs="+",                                       help="gen arguments (n, prompt ids).")
-    p.add_argument("--want",                                                      help="Expected token ids (exit 1 otherwise).")
-    p.add_argument("--timeout",  default=1200, type=int,                          help="Generation timeout (s).")
+    p.add_argument("image",                              help="BONS image.")
+    p.add_argument("args",       nargs="+",              help="gen arguments (n, prompt ids).")
+    p.add_argument("--want",                             help="Expected token ids (exit 1 otherwise).")
+    p.add_argument("--timeout",  default=1200, type=int, help="Generation timeout (s).")
 
     p = sub.add_parser("bench", help="stats reset / bench n / stats / sptest.")
     p.add_argument("n",          default=64, type=int, nargs="?",                 help="Forwards.")
 
     p = sub.add_parser("abtoggle", help="Interleaved A/B of one console on/off toggle.")
-    p.add_argument("toggle",                                                      help="Console toggle command (e.g. silu).")
-    p.add_argument("-n",         default=4, type=int,                             help="bench n.")
-    p.add_argument("--rounds",   default=2, type=int,                             help="A/B rounds.")
-    p.add_argument("--want",                                                      help="Expected token ids.")
+    p.add_argument("toggle",                          help="Console toggle command (e.g. silu).")
+    p.add_argument("-n",         default=4, type=int, help="bench n.")
+    p.add_argument("--rounds",   default=2, type=int, help="A/B rounds.")
+    p.add_argument("--want",                          help="Expected token ids.")
     args = parser.parse_args(argv)
 
     if args.cmd == "reconfigure":
