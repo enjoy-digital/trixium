@@ -8,9 +8,10 @@
 
 Every test is a Migen testbench run compiled (common.verilator.run: the DUT in Verilator,
 the generators - and LiteDRAM's DRAMMemory model where there is no controller - in Python),
-seconds each. The slow tier also runs one test of each kind on Migen's simulator, where a
-test that builds a real LiteDRAMCore peaks about 9.5 GB and takes minutes (the simulator's
-state over tens of thousands of cycles, not the design: run it one test per process).
+seconds each. The slow tier also runs a DRAMMemory test and a controller test on Migen's
+simulator, where a test that builds a real LiteDRAMCore peaks about 9.5 GB and takes minutes
+(the simulator's state over tens of thousands of cycles, not the design: run it one test per
+process).
 
 On the FK33 the engine's 256-bit AXI ports meet the HBM controller directly. On the XCU1525
 they meet a 512-bit DDR4 controller through LiteDRAMAXI2Native and the crossbar's 256 -> 512
@@ -238,9 +239,9 @@ def test_engine_port_path_through_the_controller(port_width, base_skew, backend)
          extra={"dfii_control": dut.core.dfii._control.storage})
 
 
-# Compiled; Migen's simulator for one case (6-7 min and ~9.5 GB).
+# Compiled (the controller's Migen cross-check is test_engine_port_path_through_the_controller's).
 @pytest.mark.parametrize("port_width, backend", [(256, "verilator"), (512, "verilator"),
-    ("512m", "verilator"), pytest.param("512m", "migen", marks=pytest.mark.slow)])
+    ("512m", "verilator")])
 def test_engine_port_path_streams_at_rate(port_width, backend):
     """A sequential read stream through the whole chain on the real LiteDRAM core must run
     near one beat per cycle. LiteDRAM's native up-converter (the 256-bit port on the 512-bit
