@@ -13,7 +13,7 @@ from setuptools import setup, find_packages
 setup(
     name             = "trixium",
     version          = "2026.10",
-    description      = "TriXium: PrismML Bonsai ternary LLMs on FPGAs, built with LiteX.",
+    description      = "PrismML Bonsai ternary LLMs running entirely on FPGA cards (XCU1525, FK33): open-source, bit-exact, built with LiteX.",
     long_description = open("README.md", encoding="utf-8").read(),
     long_description_content_type = "text/markdown",
     author           = "Enjoy-Digital",
