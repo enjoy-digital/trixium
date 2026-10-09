@@ -16,7 +16,6 @@ import subprocess
 import pytest
 
 from migen import *
-from migen.fhdl import verilog
 
 from litex.gen import LiteXModule
 
@@ -29,6 +28,7 @@ from model import asm
 
 from common import COMMON, RTL
 from common.cluster import SoC, write, install_list
+from common.verilator import Simulator
 
 # I32ToFp32Scaled ----------------------------------------------------------------------------------
 # IEEE binary32 scalar oracle, independent of the RTL normalization/shifts.
@@ -170,10 +170,7 @@ def test_projection_restore_reference_operation_order():
     assert expected([signed(0x7fffffff + 1)], 0) == (bits(-(1 << 31)), 0)
 
 
-def test_projection_restore_compiled_float_oracle(tmp_path):
-    verilator = shutil.which('verilator')
-    if not verilator:
-        pytest.skip('Verilator required for independent compiled restoration check')
+def test_projection_restore_compiled_float_oracle():
     dut = I32ToFp32Scaled()
     signals = {'cancel': dut.cancel}
     for direction, endpoint in (('in', dut.sink), ('out', dut.source)):
@@ -182,17 +179,9 @@ def test_projection_restore_compiled_float_oracle(tmp_path):
     signals['out_error'] = dut.source.error
     for name, signal in signals.items():
         signal.name_override = name
-    rtl = tmp_path / 'projection_restore.v'
-    verilog.convert(dut, ios=set(signals.values()), name='projection_restore').write(str(rtl))
-    obj = tmp_path / 'obj'
-    harness = RTL / 'projection_restore.cpp'
-    built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
-                            '--Mdir', str(obj), '--top-module', 'projection_restore',
-                            str(rtl), str(harness.resolve())], capture_output=True, text=True, timeout=120)
-    assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
-    result = subprocess.run([str(obj / 'Vprojection_restore')], cwd=tmp_path,
-                            capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stdout + result.stderr
+    sim = Simulator(dut, ios=signals, name='projection_restore',
+                    driver=(RTL / 'projection_restore.cpp').read_text())
+    result = sim.run(timeout=60)
     assert 'PROJECTION_RESTORE_PASS' in result.stdout
     print(result.stdout)
 
@@ -422,10 +411,7 @@ def test_restore_sp_invalid_physical_sizes():
             ProjectionRestoreScratchpad(size)
 
 
-def test_restore_sp_compiled_memory_tails_inplace_reset_and_extremes(tmp_path):
-    verilator = shutil.which('verilator')
-    if not verilator:
-        pytest.skip('Verilator required for standalone compiled scratchpad restoration check')
+def test_restore_sp_compiled_memory_tails_inplace_reset_and_extremes():
     dut = ProjectionRestoreScratchpad()
     signals = {name: getattr(dut, name) for name in (
         'cancel', 'busy', 'done', 'error', 'read_beats', 'output_beats', 'exponent',
@@ -435,17 +421,9 @@ def test_restore_sp_compiled_memory_tails_inplace_reset_and_extremes(tmp_path):
     signals.update(cmd_valid=dut.cmd.valid, cmd_ready=dut.cmd.ready)
     for name, signal in signals.items():
         signal.name_override = name
-    rtl = tmp_path / 'projection_restore_sp.v'
-    verilog.convert(dut, ios=set(signals.values()), name='projection_restore_sp').write(str(rtl))
-    obj = tmp_path / 'obj'
-    harness = RTL / 'projection_restore_sp.cpp'
-    built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
-                            '--Mdir', str(obj), '--top-module', 'projection_restore_sp',
-                            str(rtl), str(harness.resolve())], capture_output=True, text=True, timeout=120)
-    assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
-    result = subprocess.run([str(obj / 'Vprojection_restore_sp')], cwd=tmp_path,
-                            capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stdout + result.stderr
+    sim = Simulator(dut, ios=signals, name='projection_restore_sp',
+                    driver=(RTL / 'projection_restore_sp.cpp').read_text())
+    result = sim.run(timeout=60)
     assert 'PROJECTION_RESTORE_SP_PASS' in result.stdout
     print(result.stdout)
 

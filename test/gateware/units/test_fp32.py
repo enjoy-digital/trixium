@@ -6,18 +6,17 @@
 
 """gateware/units/fp32.py: the exact FP32 operators and FP32ArgmaxTracker."""
 
-import shutil
 import subprocess
 
 import numpy as np
 import pytest
 
 from migen import Module, Signal, run_simulation
-from migen.fhdl import verilog
 
 from gateware.units.fp32 import CANONICAL_NAN, FP32Add, FP32DivSqrt, FP32Mul, FP32ArgmaxTracker
 
 from common import RTL
+from common.verilator import Simulator
 
 # FP32Add / FP32Mul / FP32DivSqrt ------------------------------------------------------------------
 # gateware/fp32_exact.py against IEEE float32 (numpy), NaNs canonical as on RV32F.
@@ -63,11 +62,7 @@ def expected(op, a, b):
 
 
 @pytest.fixture(scope="module")
-def compiled(tmp_path_factory):
-    verilator = shutil.which("verilator")
-    if not verilator:
-        pytest.skip("Verilator required")
-    tmp = tmp_path_factory.mktemp("fp32x")
+def compiled():
     top = Module()
     top.submodules.mul = mul = FP32Mul()
     top.submodules.add = add = FP32Add()
@@ -84,14 +79,8 @@ def compiled(tmp_path_factory):
         s = Signal(8, name_override=name)
         top.comb += s.eq(value)
         consts[name] = s
-    rtl = tmp / "fp32x.v"
-    verilog.convert(top, ios=set(ports.values()) | set(consts.values()), name="fp32x").write(str(rtl))
-    harness = RTL / "fp32_exact.cpp"
-    built = subprocess.run([verilator, "--cc", "--exe", "--build", "-j", "4", "-Wno-fatal", "-O3",
-                            "--Mdir", str(tmp / "obj"), "--top-module", "fp32x", str(rtl),
-                            str(harness.resolve())], capture_output=True, text=True, timeout=900)
-    assert built.returncode == 0, built.stdout[-4000:] + built.stderr[-4000:]
-    return tmp / "obj/Vfp32x"
+    return Simulator(top, ios=dict(ports, **consts), name="fp32x",
+                     driver=(RTL / "fp32_exact.cpp").read_text()).binary
 
 
 @pytest.mark.parametrize("op,n", [("mul", 400000), ("add", 400000), ("div", 60000), ("sqrt", 60000)])

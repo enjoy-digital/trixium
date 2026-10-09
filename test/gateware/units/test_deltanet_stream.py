@@ -6,19 +6,18 @@
 
 """gateware/units/deltanet_stream.py: DeltaNetStream, compiled, and engine op 5 on the shared cluster."""
 
-import shutil
 import subprocess
 
 import numpy as np
 import pytest
 
-from migen.fhdl import verilog
 from migen import run_simulation
 
 from gateware.units.deltanet_stream import DeltaNetStream, lanes_to_state, reference, state_to_lanes
 from gateware.core.core import TriXiumConfig
 
 from common.cluster import SoC, write, IntAdd5, IntMul5
+from common.verilator import Simulator
 
 # DeltaNetStream -----------------------------------------------------------------------------------
 # DeltaNetStream against the firmware's recurrence loop, compiled (Verilator).
@@ -108,9 +107,6 @@ int main(int argc, char **argv) {{
 
 
 def build(tmp_path, lanes, rows, cols):
-    verilator = shutil.which("verilator")
-    if not verilator:
-        pytest.skip("Verilator required")
     dut = DeltaNetStream(lanes=lanes, rows=rows, cols=cols)
     sig = {n: getattr(dut, n) for n in ("start", "heads", "table", "zero", "busy", "done", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
@@ -123,22 +119,15 @@ def build(tmp_path, lanes, rows, cols):
     for n, s in sig.items():
         s.name_override = n if n != "table" else "table_adr"
     top = f"dns_{lanes}_{rows}_{cols}"
-    rtl = tmp_path / f"{top}.v"
     dut.sp_rd_ok.name_override = "sp_rd_ok"
-    verilog.convert(dut, ios=set(sig.values()) | {dut.sp_rd_ok}, name=top).write(str(rtl))
+    sig["sp_rd_ok"] = dut.sp_rd_ok
     j = lambda fmt: ", ".join(fmt.format(l) for l in range(lanes))
-    cpp = tmp_path / f"{top}.cpp"
-    cpp.write_text(_CPP.format(top=top, lanes=lanes,
+    driver = _CPP.format(top=top, lanes=lanes,
         sink_valid=j("&d.sink{}_valid"), sink_ready=j("&d.sink{}_ready"), sink_data=j("&d.sink{}_data[0]"),
         src_valid=j("&d.source{}_valid"), src_ready=j("&d.source{}_ready"), src_data=j("&d.source{}_data[0]"),
         progress=" ".join(["%u"]*len(dut.progress)),
-        progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress)))))
-    built = subprocess.run([verilator, "--cc", "--exe", "--build", "-j", "8", "-Wno-fatal", "-O3",
-                            "--x-assign", "fast", "--x-initial", "fast",
-                            "--Mdir", str(tmp_path / "obj"), "--top-module", top, str(rtl), str(cpp)],
-                           capture_output=True, text=True, timeout=1800)
-    assert built.returncode == 0, built.stdout[-4000:] + built.stderr[-4000:]
-    return tmp_path / f"obj/V{top}"
+        progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress))))
+    return Simulator(dut, ios=sig, name=top, driver=driver).binary
 
 
 def scenario(rng, heads, rows, cols, nk, zero=False):
@@ -280,6 +269,7 @@ def int_reference(m, q, k, v, decay, beta, scale):
     return m, out
 
 
+@pytest.mark.slow  # Migen simulator, ~2 min each
 @pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
 def test_dnstream_op_through_the_cluster(placement):
     L, rows, cols, heads = 2, 16, 16, 5

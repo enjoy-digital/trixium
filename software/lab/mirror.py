@@ -81,10 +81,8 @@ def prompt_ids(a):
 def mirror(image, ids, out, hybrid_silu="rv32f"):
     """Run the Python mirror on `ids` and write its checkpoints to `out`."""
     import numpy as np
-    sys.path.insert(0, os.path.join(REPO, "test")) # The mirrors live with their tests.
-    from common import import_test
-    hybrid_generate = import_test("system/test_sim_smoke.py").hybrid_generate
     from model.bons import BONSReader
+    from model.mirror import hybrid_generate, hybrid27_generate
     img = BONSReader(image)
     lines = []
 
@@ -102,7 +100,6 @@ def mirror(image, ids, out, hybrid_silu="rv32f"):
     h = img.header
     is_hybrid = h["version"] >= 3 and ("deltanet" in h["layer_types"] or h["hadamard_block"])
     if is_hybrid:
-        hybrid27_generate = import_test("firmware/test_hybrid.py").hybrid27_generate
         mode = hybrid_silu
         print(f"NOTE: hybrid SiLU profile is {mode}. RV32F means GCC-10.1/newlib LUT/FMA. Other "
               "transcendentals still use NumPy; arbitrary-input bit-exactness and other "

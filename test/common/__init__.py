@@ -7,9 +7,10 @@
 """What the test files share: the tree's paths and a way to reuse another test file's oracle.
 
 test/ mirrors the source tree (test/gateware/units/test_silu.py tests gateware/units/silu.py);
-the testbench pieces several files use live here: rtl_client.py (compiled scratchpad
-clients), cluster.py (the shared integration harness), engine.py (engine/vector-unit CSR
-helpers), the C oracles, rtl/ (Verilator harnesses), data/ (archived traces and logs).
+the testbench pieces several files use live here: verilator.py (compiled simulation, cached
+builds, Scripts for either backend), engine.py (the engine bench), rtl_client.py (compiled
+scratchpad clients), cluster.py (the shared integration harness), the C oracles, rtl/
+(Verilator models and harnesses), data/ (archived traces and logs).
 pytest.ini puts the repository and test/ on sys.path, so `from common import ...` works from
 any directory.
 """
@@ -30,7 +31,7 @@ VECTORS = COMMON / "vectors"
 # Helpers ------------------------------------------------------------------------------------------
 
 def import_test(path):
-    """The test module at `path` (relative to test/), for its oracle or mirror.
+    """The test module at `path` (relative to test/), for its oracle.
 
     pytest imports test files by basename (no __init__.py in the tree: the basenames are
     unique), so the module already collected in this session is reused, never imported twice.

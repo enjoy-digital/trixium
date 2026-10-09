@@ -10,13 +10,10 @@
 import math
 import random
 import struct
-import shutil
-import subprocess
 
 import pytest
 
 from migen import *
-from migen.fhdl import verilog
 
 from litex.gen import LiteXModule
 
@@ -27,6 +24,7 @@ from model.activation import scratchpad_quantize_descriptor, scratchpad_requanti
 
 from common import RTL
 from common.cluster import SoC, write, install_list
+from common.verilator import Simulator
 
 # Fp32ToQ8 / Fp32AbsmaxWord ------------------------------------------------------------------------
 # Scalar IEEE float/math oracle, independent of the hardware bit/shift path.
@@ -182,10 +180,7 @@ def test_fp32_absmax_word_elastic_metadata_and_cancel(lanes):
     run_simulation(dut, run())
 
 
-def test_fp32_q8_compiled_float_oracle_and_reset(tmp_path):
-    verilator = shutil.which('verilator')
-    if not verilator:
-        pytest.skip('Verilator required for independent compiled quantization check')
+def test_fp32_q8_compiled_float_oracle_and_reset():
     dut = Fp32ToQ8()
     signals = {'cancel': dut.cancel}
     for direction, endpoint in (('in', dut.sink), ('out', dut.source)):
@@ -194,17 +189,9 @@ def test_fp32_q8_compiled_float_oracle_and_reset(tmp_path):
     signals['out_error'] = dut.source.error
     for name, signal in signals.items():
         signal.name_override = name
-    rtl = tmp_path / 'activation_quantize.v'
-    verilog.convert(dut, ios=set(signals.values()), name='activation_quantize').write(str(rtl))
-    obj = tmp_path / 'obj'
-    harness = RTL / 'activation_quantize.cpp'
-    built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
-                            '--Mdir', str(obj), '--top-module', 'activation_quantize',
-                            str(rtl), str(harness.resolve())], capture_output=True, text=True, timeout=120)
-    assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
-    result = subprocess.run([str(obj / 'Vactivation_quantize')], cwd=tmp_path,
-                            capture_output=True, text=True, timeout=60)
-    assert result.returncode == 0, result.stdout + result.stderr
+    sim = Simulator(dut, ios=signals, name='activation_quantize',
+                    driver=(RTL / 'activation_quantize.cpp').read_text())
+    result = sim.run(timeout=60)
     assert 'ACTIVATION_QUANTIZE_PASS' in result.stdout
     print(result.stdout)
 
@@ -689,7 +676,7 @@ def test_requantization_dispatch_without_hadamard_and_completion_publication(fai
     run_simulation(dut, run())
 
 
-@pytest.mark.parametrize('with_hadamard', [False, True])
+@pytest.mark.parametrize('with_hadamard', [False, pytest.param(True, marks=pytest.mark.slow)]) # Migen: ~40 s
 def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
     dut = SoC(TriXiumConfig(with_activation_quantize=True, with_hadamard=with_hadamard,
                                  scratchpad_size=16*1024), n=1)
@@ -728,10 +715,7 @@ def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
 
 
-def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path):
-    verilator = shutil.which('verilator')
-    if not verilator:
-        pytest.skip('Verilator required for full resident conversion/rotation check')
+def test_compiled_resident_conversion_rotation_full_ffn_and_reset():
     dut = SoC(TriXiumConfig(with_hadamard=True, with_activation_quantize=True), n=1)
     bus = dut.bus
     status = Signal(24)
@@ -746,21 +730,10 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset(tmp_path):
         quant_writes=dut.activation_quantize.output_beats)
     for name, signal in signals.items():
         signal.name_override = name
-    rtl = tmp_path / 'activation_cluster.v'
-    converted = verilog.convert(dut, ios=set(signals.values()), name='activation_cluster')
-    rtl.write_text(converted.main_source)
-    for name, content in converted.data_files.items():
-        (tmp_path / name).write_text(content)
-    obj = tmp_path / 'obj'
-    harness = RTL / 'activation_cluster.cpp'
-    built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
-                            '--Mdir', str(obj), '--top-module', 'activation_cluster',
-                            str(rtl), str(harness.resolve())],
-                           capture_output=True, text=True, timeout=240)
-    assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
-    result = subprocess.run([str(obj / 'Vactivation_cluster')], cwd=tmp_path,
-                            capture_output=True, text=True, timeout=120)
-    assert result.returncode == 0, result.stdout + result.stderr
+    # Runs in the build directory, next to the memory .init files.
+    sim = Simulator(dut, ios=signals, name='activation_cluster',
+                    driver=(RTL / 'activation_cluster.cpp').read_text())
+    result = sim.run(timeout=120)
     assert '$readmem file not found' not in result.stdout
     assert 'ACTIVATION_CLUSTER_PASS' in result.stdout
     print(result.stdout)

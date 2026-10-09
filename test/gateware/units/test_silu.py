@@ -8,7 +8,6 @@
 cluster."""
 
 import random
-import shutil
 import struct
 import subprocess
 
@@ -16,7 +15,6 @@ import numpy as np
 import pytest
 
 from migen import run_simulation, Signal, Mux, Memory, Module
-from migen.fhdl import verilog
 
 from litex.gen import LiteXModule
 
@@ -30,6 +28,7 @@ from model.activation import scratchpad_silu_descriptor, silu_table_image
 
 from common import RTL
 from common.cluster import SoC, write, install_list
+from common.verilator import Simulator
 
 # SiluMulKernel ------------------------------------------------------------------------------------
 # SiluMulKernel (portable RTL) against the bit-exact model, compiled with Verilator.
@@ -80,11 +79,7 @@ def expected(gates, mults):
 
 
 @pytest.fixture(scope="module")
-def compiled(tmp_path_factory):
-    verilator = shutil.which("verilator")
-    if not verilator:
-        pytest.skip("Verilator required")
-    tmp = tmp_path_factory.mktemp("silu-mul")
+def compiled():
     k = SiluMulKernel()
     ports = {"sink_valid": k.sink.valid, "sink_ready": k.sink.ready, "sink_g": k.sink.g,
              "sink_m": k.sink.m, "source_valid": k.source.valid, "source_ready": k.source.ready,
@@ -93,14 +88,7 @@ def compiled(tmp_path_factory):
              "dlut_we": k.dlut_we, "dlut_adr": k.dlut_adr, "dlut_dat": k.dlut_dat}
     for name, sig in ports.items():
         sig.name_override = name
-    rtl = tmp / "silu_mul.v"
-    verilog.convert(k, ios=set(ports.values()), name="silu_mul").write(str(rtl))
-    harness = RTL / "silu_mul.cpp"
-    built = subprocess.run([verilator, "--cc", "--exe", "--build", "-j", "4", "-Wno-fatal", "-O3",
-                            "--Mdir", str(tmp / "obj"), "--top-module", "silu_mul", str(rtl),
-                            str(harness.resolve())], capture_output=True, text=True, timeout=600)
-    assert built.returncode == 0, built.stdout[-4000:] + built.stderr[-4000:]
-    return tmp / "obj/Vsilu_mul"
+    return Simulator(k, ios=ports, name="silu_mul", driver=(RTL / "silu_mul.cpp").read_text()).binary
 
 
 def write_vectors(path, gates, mults, want):
@@ -396,6 +384,7 @@ def test_migen_cancel_mid_run_then_clean_run(delay):
     run_simulation(dut, run())
 
 
+@pytest.mark.slow  # Migen simulator, ~4 min
 def test_migen_load_fills_both_tables():
     # Unloaded kernel memories, a real LOAD, then a run that touches both tables.
     dut = SiluSP(preload=False)
@@ -682,6 +671,7 @@ def test_cluster_runs_through_the_shared_arbiter():
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
 
 
+@pytest.mark.slow  # Migen simulator, ~40 s
 def test_cluster_list_protection_and_reset_recovery():
     dut = cluster()
     def run():

@@ -8,14 +8,11 @@
 shared cluster."""
 
 import random
-import shutil
-import subprocess
 
 import numpy as np
 import pytest
 
 from migen import *
-from migen.fhdl import verilog
 
 from litex.gen import LiteXModule
 
@@ -26,6 +23,7 @@ from model.hadamard import scratchpad_rotation_descriptor
 
 from common import RTL
 from common.cluster import SoC, write, install_list
+from common.verilator import Simulator
 
 # IntegerHadamard ----------------------------------------------------------------------------------
 # Independent dense integer oracle; no floating-point butterfly reference.
@@ -233,23 +231,13 @@ def test_integer_hadamard_parameter_validation(args):
         IntegerHadamard(*args)
 
 
-def test_compiled_integer_hadamard(tmp_path):
-    verilator = shutil.which("verilator")
-    if not verilator:
-        pytest.skip("Verilator required for compiled arithmetic/memory check")
+def test_compiled_integer_hadamard():
     dut = IntegerHadamard()
     ios = set(dut.cmd.flatten() + dut.sink.flatten() + dut.source.flatten()) | {
         dut.cancel, dut.busy, dut.done, dut.error, dut.cancelled, dut.absmax}
-    rtl = tmp_path / "integer_hadamard.v"
-    verilog.convert(dut, ios=ios, name="integer_hadamard").write(str(rtl))
-    obj = tmp_path / "obj"
-    harness = RTL / "integer_hadamard.cpp"
-    built = subprocess.run([verilator, "--cc", "--exe", "--build", "-j", "2", "-Wno-fatal",
-                            "--Mdir", str(obj), "--top-module", "integer_hadamard",
-                            str(rtl), str(harness.resolve())], capture_output=True, text=True, timeout=120)
-    assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
-    result = subprocess.run([str(obj / "Vinteger_hadamard")], capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stdout + result.stderr
+    sim = Simulator(dut, ios=ios, name="integer_hadamard",
+                    driver=(RTL / "integer_hadamard.cpp").read_text())
+    result = sim.run(timeout=30)
     assert "HADAMARD_COMPILED_PASS" in result.stdout
     print(result.stdout)
 
@@ -360,6 +348,7 @@ def test_hadamard_rejects_full_span_before_any_scratchpad_access(changed, mask):
 
 # Sequencer Lists on the Shared Cluster ------------------------------------------------------------
 
+@pytest.mark.slow  # Migen simulator, ~1.5 min
 def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports():
     dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
     rng = random.Random(941)
@@ -456,10 +445,7 @@ def test_rotation_descriptor_encoding_and_configuration():
             Sequencer(with_hadamard=True, scratchpad_size=size)
 
 
-def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone(tmp_path):
-    verilator = shutil.which('verilator')
-    if not verilator:
-        pytest.skip('Verilator required for compiled full-vector scratchpad check')
+def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone():
     dut = SoC(TriXiumConfig(with_hadamard=True), n=1)
     bus = dut.bus
     # A bare RTL fixture has no CSRBank finalization to assemble fielded status.
@@ -475,25 +461,16 @@ def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone(tmp_p
                    blocks_done=dut.hadamard.blocks_done, output_beats=dut.hadamard.output_beats)
     for name, signal in signals.items():
         signal.name_override = name
-    rtl = tmp_path / 'hadamard_cluster.v'
-    converted = verilog.convert(dut, ios=set(signals.values()), name='hadamard_cluster')
-    rtl.write_text(converted.main_source)
-    for name, content in converted.data_files.items():
-        (tmp_path / name).write_text(content)
-    obj = tmp_path / 'obj'
-    harness = RTL / 'hadamard_cluster.cpp'
-    built = subprocess.run([verilator, '--cc', '--exe', '--build', '-j', '2', '-Wno-fatal',
-                            '--Mdir', str(obj), '--top-module', 'hadamard_cluster',
-                            str(rtl), str(harness.resolve())], capture_output=True, text=True, timeout=180)
-    assert built.returncode == 0, built.stdout[-8000:] + built.stderr[-8000:]
-    result = subprocess.run([str(obj / 'Vhadamard_cluster')], cwd=tmp_path,
-                             capture_output=True, text=True, timeout=120)
-    assert result.returncode == 0, result.stdout + result.stderr
+    # Runs in the build directory, next to the memory .init files.
+    sim = Simulator(dut, ios=signals, name='hadamard_cluster',
+                    driver=(RTL / 'hadamard_cluster.cpp').read_text())
+    result = sim.run(timeout=120)
     assert '$readmem file not found' not in result.stdout
     assert 'HADAMARD_CLUSTER_PASS' in result.stdout
     print(result.stdout)
 
 
+@pytest.mark.slow  # Migen simulator, ~1.2 min
 def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
     """w0[9] on a unit (OVERLAP): the rotation dispatches while the NOWAIT fetch is still
     streaming into another region; both results exact, the list end drains the fetch."""
@@ -536,6 +513,7 @@ def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
 
 
+@pytest.mark.slow  # Migen simulator, ~1.2 min
 def test_without_overlap_the_rotation_waits_for_the_nowait_fetch():
     dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
     fetch = [1 | (1 << 9), 2, 0, 0, 0x100, 160, 0, 0, 0, 0x4000, 0] + [0]*5
