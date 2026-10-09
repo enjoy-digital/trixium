@@ -27,7 +27,14 @@ includes the same headers (`driver=`; rtl_client.py does).
 The same Script runs on the Migen model of the DUT with run_migen() - the slow cross-check
 of the emitted Verilog against Migen's own semantics.
 
-Data goes through files (images in, memory reads out); results come back as "@" lines.
+Migen testbench generators run unchanged on the compiled DUT through Compiled (the model
+as a shared library, rtl/cosim.cpp, driven through ctypes with run_simulation's semantics):
+
+    run(dut, [gen()], backend)                    # "verilator" (default) or "migen"
+    run(dut, gen(), channels=[ChannelModel(axi, size=..., init=..., latency=...)])
+
+Script data goes through files (images in, memory reads out); results come back as "@"
+lines.
 """
 
 import os
