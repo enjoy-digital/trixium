@@ -15,14 +15,21 @@ one HBM channel model per engine channel and no scratchpad units. The firmware b
 BONS header+table are baked into main_ram at elaboration, the channel payloads into the memory
 models.
 
-Flow (from the repository root):
-  python3 -m trixium_sim --build-software       # headers + BIOS (no gateware)
-  make -C firmware BUILD_DIR=../build/sim_xcu1525       # firmware/trixium.bin
-  python3 -m trixium_sim --run                  # elaborate + verilate + run
+  ./trixium_sim.py --build      # headers + BIOS, firmware, Verilog (~1 min), Verilator (~2.5 min)
+  ./trixium_sim.py --run        # run it (console on stdin/stdout)
+  ./trixium_sim.py --firmware   # rebuild the firmware and re-bake it into the built sim (seconds)
+  ./trixium_sim.py --gate       # traced generation compared with the Python mirror (~17 min)
+  ./trixium_sim.py --bench      # resident path off/on, cycles per forward
+
+--board (xcu1525, fk33) and --image select the build (build/sim_<board>); the gate and the bench
+must use the image the simulation was built with.
 """
 
 import os
+import sys
+import glob
 import argparse
+import subprocess
 
 from migen import *
 from migen.genlib.resetsync import AsyncResetSynchronizer
@@ -30,7 +37,7 @@ from migen.genlib.resetsync import AsyncResetSynchronizer
 from litex.gen import *
 
 from litex.build.io import CRG
-from litex.build.generic_platform import Pins, Subsignal
+from litex.build.generic_platform import Pins
 from litex.build.sim.config import SimConfig
 from litex.tools.litex_sim import Platform
 
@@ -73,6 +80,55 @@ DDR_SPLIT_CLK_RATIO  = 2           # ddr clock / sys clock in the simulation.
 DDR4_SIM_CSR_PAGE0   = 8           # (sdram, ddrphy) pairs on pages 8/9, 10/11, ... as the target.
 DDR4_SIM_CSR_STRIDE  = 0x1000
 
+# Memory Contents ----------------------------------------------------------------------------------
+
+class SimDDR4(MT40A512M8):
+    # The board's part with 2048 rows x 128 columns: 32 MB per x64 controller, enough for
+    # main_ram (8 MB) and up to four 4 MB windows from 12 MB, small enough to initialize from
+    # Python and hold in the verilated memory. (The PHY model needs at least 11 address bits for
+    # the A10 precharge-all decode: rows, not columns.)
+    nrows = 2048
+    ncols = 128
+
+
+def main_ram_content(img, firmware=None):
+    """main_ram: the firmware binary at 0, the BONS header+table at HDR_OFFSET."""
+    ram = bytearray(MAIN_RAM_SIZE)
+    if firmware is not None:
+        assert len(firmware) < HDR_OFFSET
+        ram[:len(firmware)] = firmware
+    if img is not None:
+        meta = bytes(img.data[:img.header["payload_offset"]])
+        ram[HDR_OFFSET:HDR_OFFSET + len(meta)] = meta
+    return ram
+
+
+def ddr4_content(k, ram, img, chan_mod):
+    """DDR4 controller k: main_ram at 0 for controller 0 and, for all, its channels' payloads at
+    their windows."""
+    content = bytearray(DDR4_SIM_WEIGHT_BASE + chan_mod*DDR4_SIM_CHAN_STRIDE)
+    if k == 0:
+        content[:len(ram)] = ram
+    if img is not None:
+        for j in range(chan_mod):
+            c = k*chan_mod + j
+            payload = bytes(img.channel_payload(c))
+            base = DDR4_SIM_WEIGHT_BASE + j*DDR4_SIM_CHAN_STRIDE + j*DDR4_SIM_CHAN_SKEW
+            assert len(payload) + 512*1024 + (chan_mod - 1)*DDR4_SIM_CHAN_SKEW <= DDR4_SIM_CHAN_STRIDE, \
+                f"channel {c}: {len(payload)} B does not fit a sim window"
+            content[base:base + len(payload)] = payload
+    return content
+
+
+def words(content):
+    return [int.from_bytes(content[i:i+4], "little") for i in range(0, len(content), 4)]
+
+
+def ddr4_phy(content):
+    module = SimDDR4(int(100e6), "1:4") # 100 MHz timings, as litex_sim does.
+    phy    = SDRAMPHYModel(module=module, data_width=64, clk_freq=int(100e6), init=words(content))
+    return phy, module
+
 # TriXiumSimSoC ------------------------------------------------------------------------------------
 
 class TriXiumSimSoC(SoCCore):
@@ -88,18 +144,12 @@ class TriXiumSimSoC(SoCCore):
         self.comb += platform.trace.eq(1)
 
         # main_ram init: firmware at 0, BONS header+table at HDR_OFFSET.
-        ram = bytearray(MAIN_RAM_SIZE)
+        fw = None
         if firmware is not None and os.path.exists(firmware):
             with open(firmware, "rb") as f:
                 fw = f.read()
-            assert len(fw) < HDR_OFFSET
-            ram[:len(fw)] = fw
-        img = None
-        if image is not None:
-            img  = BONSReader(image)
-            meta = bytes(img.data[:img.header["payload_offset"]])
-            ram[HDR_OFFSET:HDR_OFFSET+len(meta)] = meta
-        ram_words = [int.from_bytes(ram[i:i+4], "little") for i in range(0, len(ram), 4)]
+        img = BONSReader(image) if image is not None else None
+        ram = main_ram_content(img, fw)
 
         # CPU --------------------------------------------------------------------------------------
         # VexiiRiscv is generated at build time, so its I-cache is a parameter (VexRiscv's is a
@@ -141,7 +191,7 @@ class TriXiumSimSoC(SoCCore):
             cpu_type                 = cpu_type,
             integrated_rom_size      = 0x20000,
             integrated_main_ram_size = MAIN_RAM_SIZE if mem == "hbm" else 0,
-            integrated_main_ram_init = ram_words if mem == "hbm" else [],
+            integrated_main_ram_init = words(ram) if mem == "hbm" else [],
             uart_name                = "sim")
 
         # CRG --------------------------------------------------------------------------------------
@@ -153,17 +203,6 @@ class TriXiumSimSoC(SoCCore):
             self.cd_ddr = ClockDomain()
             self.comb += self.cd_ddr.clk.eq(platform.request("ddr_clk"))
             self.specials += AsyncResetSynchronizer(self.cd_ddr, ResetSignal("sys"))
-
-        # Profiler Pads ----------------------------------------------------------------------------
-        # Unit busy bits as top-level sim ports (prof_eng_busy, prof_vec_busy, prof_seq_busy on the
-        # Vsim), traced by the C++ profiler into an event file for the Perfetto timeline. Pads
-        # because requested pads are emitted verbatim, while Verilator's internal names are not
-        # a stable contract.
-        platform.add_extension([("prof", 0,
-            Subsignal("eng_busy", Pins(1)),
-            Subsignal("vec_busy", Pins(1)),
-            Subsignal("seq_busy", Pins(1)))])
-        self._prof_pads = platform.request("prof")
 
         # TriXium Memory Ports ---------------------------------------------------------------------
         memory_ports = []
@@ -208,11 +247,6 @@ class TriXiumSimSoC(SoCCore):
         self.trixium = TriXiumCore(memory_ports, config)
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
-        self.comb += [
-            self._prof_pads.eng_busy.eq(self.trixium.engine.busy),
-            self._prof_pads.vec_busy.eq(self.trixium.vecunit.busy),
-            self._prof_pads.seq_busy.eq(self.trixium.seq.busy),
-        ]
 
         # Scratchpad on the SoC bus (CPU access).
         self.bus.add_slave("scratchpad", self.trixium.bus,
@@ -246,33 +280,10 @@ class TriXiumSimSoC(SoCCore):
         chan_mod = n_channels//n_memctrl
         assert chan_mod & (chan_mod - 1) == 0
 
-        class _SimDDR4(MT40A512M8):
-            # The board's part with 2048 rows x 128 columns: 32 MB per x64 controller, enough
-            # for main_ram (8 MB) and up to four 4 MB windows from 12 MB, small enough to
-            # initialize from Python and hold in the verilated memory. (The PHY model needs
-            # at least 11 address bits for the A10 precharge-all decode: rows, not columns.)
-            nrows = 2048
-            ncols = 128
-
-        # Controllers: controller k's contents are main_ram (firmware + header) at 0 for
-        # controller 0 and, for all, its channels' payloads at their windows.
-        span = DDR4_SIM_WEIGHT_BASE + chan_mod*DDR4_SIM_CHAN_STRIDE
+        # Controllers.
         self.sdrams, split_phys, split_modules = [], [], []
         for k in range(n_memctrl):
-            content = bytearray(span)
-            if k == 0:
-                content[:len(ram)] = ram
-            if img is not None:
-                for j in range(chan_mod):
-                    c = k*chan_mod + j
-                    payload = bytes(img.channel_payload(c))
-                    base = DDR4_SIM_WEIGHT_BASE + j*DDR4_SIM_CHAN_STRIDE + j*DDR4_SIM_CHAN_SKEW
-                    assert len(payload) + 512*1024 + (chan_mod - 1)*DDR4_SIM_CHAN_SKEW <= DDR4_SIM_CHAN_STRIDE, \
-                        f"channel {c}: {len(payload)} B does not fit a sim window"
-                    content[base:base + len(payload)] = payload
-            words = [int.from_bytes(content[i:i+4], "little") for i in range(0, len(content), 4)]
-            module = _SimDDR4(int(100e6), "1:4") # 100 MHz timings, as litex_sim does.
-            phy = SDRAMPHYModel(module=module, data_width=64, clk_freq=int(100e6), init=words)
+            phy, module = ddr4_phy(ddr4_content(k, ram, img, chan_mod))
             split_phys.append(phy)
             split_modules.append(module)
         add_ddr_domain_controllers(self, split_phys, split_modules, int(100e6), MAIN_RAM_SIZE,
@@ -290,6 +301,57 @@ class TriXiumSimSoC(SoCCore):
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 
+# Firmware Re-bake --------------------------------------------------------------------------------
+
+def bank_inits(content):
+    """The init lines of each bank Memory of a DDR4 PHY model holding `content`."""
+    phy, _ = ddr4_phy(content)
+    inits  = []
+    # BankModels are anonymous submodules: collect their Memory specials in creation order.
+    for _, sub in phy._submodules:
+        for m in sub._fragment.specials:
+            if isinstance(m, Memory) and m.init is not None and len(m.init):
+                width = (m.width + 3)//4
+                inits.append([f"{v:0{width}x}" for v in m.init])
+    return inits
+
+
+def rebake_firmware(gateware_dir, image, firmware, n_memctrl):
+    """Rewrite the bank init files holding the firmware in a built DDR4 simulation (seconds).
+
+    The firmware lives in DDR4 controller 0's memory model: one sim_mem_N.init per bank, read at
+    simulation start ($readmemh). Controller 0's contents are rebuilt as the SoC does, each bank's
+    file is found by matching every line outside the firmware area, and rewritten."""
+    img      = BONSReader(image)
+    chan_mod = img.header["n_channels"]//n_memctrl
+    with open(firmware, "rb") as f:
+        fw = f.read()
+    def inits(fw):
+        return bank_inits(ddr4_content(0, main_ram_content(img, fw), img, chan_mod))
+    new   = inits(fw)
+    blank = inits(None)
+    # Every line a firmware could occupy (the whole window below the header), so a smaller
+    # firmware than the one baked in still matches: the old firmware's tail is replaced.
+    full  = inits(b"\xff"*(HDR_OFFSET - 4))
+    assert len(new) == len(blank) and new, "no bank memories found"
+
+    files = {}
+    for filename in glob.glob(os.path.join(gateware_dir, "sim_mem*.init")):
+        with open(filename, encoding="utf-8") as f:
+            files[filename] = f.read().split()
+    done = 0
+    for b, (n, z, f) in enumerate(zip(new, blank, full)):
+        fw_lines = {i for i, (x, y) in enumerate(zip(f, z)) if x != y}
+        match = [name for name, lines in files.items() if len(lines) == len(n)
+                 and all(lines[i] == n[i] for i in range(len(n)) if i not in fw_lines)]
+        if len(match) != 1:
+            raise SystemExit(f"bank {b}: {len(match)} matching init files (rebuild with --build).")
+        if files[match[0]] != n:
+            with open(match[0], "w", encoding="utf-8") as fh:
+                fh.write("\n".join(n) + "\n")
+            done += 1
+    print(f"[trixium] {done} bank files rewritten ({len(fw)} B firmware).")
+
 # Build --------------------------------------------------------------------------------------------
 
 # Board presets: the hardware the simulation mirrors.
@@ -305,66 +367,107 @@ BOARDS = {
         cpu_type="vexiiriscv", icache_kb=32, vexii_extra="--with-rvZcbm"),
 }
 
+FIRMWARE = "firmware/trixium.bin"
+
+
+def build_firmware(out_dir):
+    # BUILD_DIR relative to firmware/, as documented (make -C firmware BUILD_DIR=../build/<name>):
+    # the firmware's build stamp then sees the same tree and keeps its objects.
+    build_dir = os.path.relpath(os.path.abspath(out_dir), "firmware")
+    subprocess.run(["make", "-C", "firmware", f"BUILD_DIR={build_dir}", f"PYTHON={sys.executable}"],
+        check=True)
+
+
+def build_sim(args, board, out_dir):
+    sim_config = SimConfig(default_clk="sys_clk")
+    sim_config.add_module("serial2console", "serial")
+    if board["mem"] == "ddr4":
+        sim_config.add_clocker("ddr_clk", int(1e6)*DDR_SPLIT_CLK_RATIO)
+    soc_kwargs = dict(board, update_repo=args.update_repo,
+        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
+    csr_csv = os.path.join(out_dir, "csr.csv")
+
+    # Headers + BIOS (to build the firmware against).
+    soc     = TriXiumSimSoC(image=args.image, firmware=None, **soc_kwargs)
+    builder = Builder(soc, output_dir=out_dir, csr_csv=csr_csv)
+    builder.build(sim_config=sim_config, build=False, run=False)
+
+    # Firmware.
+    build_firmware(out_dir)
+
+    # SoC with the firmware baked in: Verilog, then Verilator.
+    soc     = TriXiumSimSoC(image=args.image, firmware=FIRMWARE, **soc_kwargs)
+    builder = Builder(soc, output_dir=out_dir, csr_csv=csr_csv)
+    builder.build(sim_config=sim_config, run=False, opt_level="O3",
+        threads=args.threads, trace=args.trace, trace_fst=args.trace)
+    subprocess.run(["bash", "build_sim.sh"], cwd=os.path.join(out_dir, "gateware"), check=True)
+
+# Run ----------------------------------------------------------------------------------------------
+
 def main():
-    from gateware.migen_fast import install as install_migen_fast
-    install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
     parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS),              help="Hardware to mirror.")
     parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img",     help="BONS image to bake in.")
-    parser.add_argument("--firmware",       default="firmware/trixium.bin",                         help="Firmware binary to bake in.")
-    parser.add_argument("--build-software", action="store_true",                                    help="Generate headers + BIOS only (to build the firmware against).")
-    parser.add_argument("--run",            action="store_true",                                    help="Build and run the simulation.")
     parser.add_argument("--out-dir",        default=None,                                           help="Build directory (default: build/sim_<board>).")
-    parser.add_argument("--cpu-type",       default=None, choices=["vexriscv", "vexiiriscv"],      help="Override the board's CPU (vexriscv: the PC profiler).")
+    parser.add_argument("--build",          action="store_true",                                    help="Build the simulation (headers + BIOS, firmware, Verilog, Verilator).")
+    parser.add_argument("--run",            action="store_true",                                    help="Run the built simulation (console on stdin/stdout).")
+    parser.add_argument("--firmware",       action="store_true",                                    help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525).")
+    parser.add_argument("--gate",           action="store_true",                                    help="Traced generation compared with the Python mirror.")
+    parser.add_argument("--bench",          action="store_true",                                    help="Cycles per forward with --bench-toggle off, then on.")
+    parser.add_argument("--bench-toggle",   default="resident",                                     help="--bench: console toggle to A/B (resident, silu, dnstream).")
+    parser.add_argument("--bench-tokens",   default=2,  type=int,                                   help="--bench: bench N (N+2 forwards).")
+    parser.add_argument("--cpu-type",       default=None, choices=["vexriscv", "vexiiriscv"],      help="Override the board's CPU.")
     parser.add_argument("--update-repo",    default="no", choices=["no", "recommended", "latest"], help="VexiiRiscv source update policy.")
-    parser.add_argument("--pc-profile",     action="store_true",                                    help="Compile the VexRiscv PC profiler in (sim_pc_profiler.cpp).")
     parser.add_argument("--trace",          action="store_true",                                    help="Enable FST tracing.")
     parser.add_argument("--hbm-latency",    default=16, type=int,                                   help="--board fk33: HBM model read latency.")
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                   help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                   help="Verilator threads.")
     args = parser.parse_args()
-    out_dir = args.out_dir or f"build/sim_{args.board}"
-    board   = dict(BOARDS[args.board])
+    if not (args.build or args.run or args.firmware or args.gate or args.bench):
+        parser.error("nothing to do: --build, --run, --firmware, --gate or --bench.")
+
+    # Reproducible builds: the generated sources follow set/dict orders, hence the hash seed.
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        os.environ["PYTHONHASHSEED"] = "0"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    # Everything runs from the repository root (firmware/, models/, build/).
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    out_dir      = args.out_dir or f"build/sim_{args.board}"
+    gateware_dir = os.path.join(out_dir, "gateware")
+    board        = dict(BOARDS[args.board])
     if args.cpu_type is not None:
         board.update(cpu_type=args.cpu_type, icache_kb=0, vexii_extra="")
 
-    # Simulation config.
-    sim_config = SimConfig(default_clk="sys_clk")
-    sim_config.add_module("serial2console", "serial")
-    if board["mem"] == "ddr4":
-        sim_config.add_clocker("ddr_clk", int(1e6)*DDR_SPLIT_CLK_RATIO)
+    # Build.
+    if args.build:
+        from gateware.migen_fast import install as install_migen_fast
+        install_migen_fast() # Linear-time Verilog conversion (minutes -> seconds).
+        build_sim(args, board, out_dir)
 
-    soc_kwargs = dict(board, update_repo=args.update_repo,
-        hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
+    # Firmware.
+    if args.firmware:
+        if board["mem"] != "ddr4":
+            raise SystemExit("--firmware re-bakes the DDR4 model memories (--board xcu1525): use --build.")
+        build_firmware(out_dir)
+        rebake_firmware(gateware_dir, args.image, FIRMWARE, board["n_memctrl"])
 
-    # Headers + BIOS only.
-    if args.build_software:
-        soc     = TriXiumSimSoC(image=args.image, firmware=None, **soc_kwargs)
-        builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
-        builder.compile_gateware = False
-        builder.build(sim_config=sim_config, run=False)
-        return
+    # Run.
+    if args.run:
+        if not os.path.exists(os.path.join(gateware_dir, "obj_dir", "Vsim")):
+            raise SystemExit(f"no simulator in {gateware_dir}: build it first (--build).")
+        sys.exit(subprocess.call(["obj_dir/Vsim"], cwd=gateware_dir))
 
-    # Full build (+ run).
-    soc     = TriXiumSimSoC(image=args.image, firmware=args.firmware, **soc_kwargs)
-    builder = Builder(soc, output_dir=out_dir, csr_csv=os.path.join(out_dir, "csr.csv"))
-    # --pc-profile links sim_pc_profiler.cpp into the verilated binary, where it overrides LiteX's
-    # weak litex_sim_user_init / litex_sim_user_post_eval hooks and samples the VexRiscv retired
-    # PC every cycle (the CPU time no unit busy bit accounts for). LiteX's build_sim.sh removes
-    # obj_dir/, so the first such build re-verilates fully.
-    extra_sources = []
-    if args.pc_profile and board["cpu_type"] != "vexriscv":
-        # The profiler reads VexRiscv's lastStagePc/lastStageIsFiring by name (Vsim_VexRiscv.h);
-        # VexiiRiscv's generated module has neither.
-        raise SystemExit("--pc-profile currently supports --cpu-type vexriscv only "
-                         "(the profiler reads VexRiscv's lastStagePc by name). "
-                         "Compare CPUs on leg cycle counts instead.")
-    if args.pc_profile:
-        extra_sources.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "gateware", "sim_pc_profiler.cpp"))
-    builder.build(sim_config=sim_config, run=args.run, opt_level="O3",
-        threads=args.threads, trace=args.trace, trace_fst=args.trace,
-        verilator_extra_sources=extra_sources)
+    # Gate / Bench.
+    from software import simgate
+    if args.gate:
+        rc = simgate.gate(gateware_dir, args.image, os.path.join(out_dir, "gate"),
+            expect_silu=board.get("with_silu", False))
+        if rc:
+            sys.exit(rc)
+    if args.bench:
+        sys.exit(simgate.bench(gateware_dir, os.path.join(out_dir, "bench"),
+            toggle=args.bench_toggle, tokens=args.bench_tokens))
 
 if __name__ == "__main__":
     main()

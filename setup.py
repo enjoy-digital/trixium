@@ -20,9 +20,9 @@ setup(
     license          = "BSD-2-Clause",
     python_requires  = ">=3.10",
     install_requires = ["numpy", "tokenizers", "pyserial"],
-    extras_require   = {"dev": ["pytest", "pytest-xdist", "huggingface_hub"]},
+    extras_require   = {"dev": ["pytest", "pytest-xdist", "huggingface_hub", "pexpect"]},
     py_modules       = ["trixium_xcu1525", "trixium_fk33", "trixium_sim"],
     packages         = find_packages(exclude=["test*"]),
-    package_data     = {"software": ["lib/*.c", "lib/*.h"], "gateware": ["hbm/*.xci", "*.cpp"]},
+    package_data     = {"software": ["lib/*.c", "lib/*.h"], "gateware": ["hbm/*.xci"]},
     entry_points     = {"console_scripts": ["trixium=software.cli:main"]},
 )

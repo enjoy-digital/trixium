@@ -1022,7 +1022,7 @@ def test_sequencer_q8_scores_ragged():
     with a tiny model sharded 8 ways (the n2 sim does not reach a failing shape):
 
       .venv/bin/python -m model.tinygen --channels 8
-      .venv/bin/python trixium_sim.py --image models/tiny/bonsai-tiny-n8.img --run
+      .venv/bin/python trixium_sim.py --image models/tiny/bonsai-tiny-n8.img --build --run
     """
     from gateware.core.vector import VectorUnit
     from gateware.core.csr import EngineCSR

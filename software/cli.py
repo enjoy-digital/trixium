@@ -6,6 +6,7 @@
 
 """`trixium`: the one entry point for the model path.
 
+    trixium models    [--tiny]                                   # PrismML models (or the tiny ones)
     trixium convert   models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf  # -> models/bons/bonsai-1p7b-n16.img
     trixium convert   models/8b/Ternary-Bonsai-8B-PQ2_0.gguf      # -> models/bons/bonsai-8b-n16.img
     trixium verify    models/bons/bonsai-1p7b-n16.img
@@ -70,9 +71,47 @@ def cmd_verify(args):
 
 
 def cmd_tokenizer(args):
+    from model.tokenizer import export_tokenizer
     out = args.out or os.path.join(os.path.dirname(args.tokenizer_json), "tokenizer.bin")
-    sys.exit(_run([sys.executable, os.path.join(REPO, "tools", "export_tokenizer.py"),
-                   args.tokenizer_json, "-o", out]))
+    export_tokenizer(args.tokenizer_json, out)
+
+
+# PrismML Ternary-Bonsai models: GGUF PQ2_0 (ggml type 142: 2-bit codes + one fp16 scale per 128
+# weights, the block earlier releases shipped as "Q2_0"; the *_Q2_0_g64 files do not convert) +
+# the tokenizer/config of the matching "unpacked" repo.
+MODELS = {
+    "1.7b": ("Ternary-Bonsai-1.7B", ["Ternary-Bonsai-1.7B-PQ2_0.gguf"]),
+    "8b":   ("Ternary-Bonsai-8B",   ["Ternary-Bonsai-8B-PQ2_0.gguf"]),
+}
+MODELS_FREE_GB = 8 # Disk guard.
+
+# The tiny random models the tests and the simulation use (seconds): (channels, config).
+TINY_MODELS = [(2, "tiny"), (4, "tiny"), (8, "tiny"), (16, "tiny"),
+               (2, "hybrid"), (8, "hybrid"), (8, "hybrid-1k")]
+
+
+def cmd_models(args):
+    out = args.out or os.path.join(REPO, "models", "tiny" if args.tiny else "")
+    if args.tiny:
+        from model import tinygen
+        configs = {"tiny": tinygen.BONSAI_TINY, "hybrid": tinygen.BONSAI_TINY_HYBRID,
+                   "hybrid-1k": tinygen.BONSAI_TINY_HYBRID_1K}
+        for channels, name in TINY_MODELS:
+            img, _, _ = tinygen.generate(out, channels, cfg=configs[name])
+            print(img)
+        return
+    import shutil
+    from huggingface_hub import hf_hub_download
+    os.makedirs(out, exist_ok=True)
+    free = shutil.disk_usage(out).free/1e9
+    if free < MODELS_FREE_GB:
+        sys.exit(f"only {free:.0f} GB free in {out}, need >= {MODELS_FREE_GB} GB.")
+    for name, (repo, ggufs) in MODELS.items():
+        local_dir = os.path.join(out, name)
+        for filename in ggufs:
+            print(hf_hub_download(f"prism-ml/{repo}-gguf", filename, local_dir=local_dir))
+        for filename in ["config.json", "tokenizer.json", "tokenizer_config.json"]:
+            print(hf_hub_download(f"prism-ml/{repo}-unpacked", filename, local_dir=local_dir))
 
 
 def cmd_deploy(args):
@@ -151,6 +190,12 @@ def main(argv=None):
     p.add_argument("tokenizer_json", help="Source tokenizer.json.")
     p.add_argument("-o", "--out",    help="Output (default: tokenizer.bin next to the JSON).")
     p.set_defaults(fn=cmd_tokenizer)
+
+    # Models.
+    p = subparsers.add_parser("models", help="Download the PrismML models (~2.6 GB) or generate the tiny test models.")
+    p.add_argument("--tiny", action="store_true", help="Generate the tiny random models (tests, simulation) instead.")
+    p.add_argument("--out",                       help="Output directory (default: models/, models/tiny/ with --tiny).")
+    p.set_defaults(fn=cmd_models)
 
     # Deploy.
     p = subparsers.add_parser("deploy", help="Configure the lab board with a build and boot it (tools/board.env).")

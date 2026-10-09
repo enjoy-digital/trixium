@@ -13,7 +13,7 @@ models the RV32F baseline's target-libm LUT, fused interpolation and polynomial 
 exact=True retains direct mathematical SiLU for comparison with the FP32 golden.
 Other transcendental operations still use NumPy; passing the pinned tiny trace does
 not prove bit-exactness for arbitrary models, inputs or target libm implementations.
-It is what tools/check_sim_tokens.py compares the sim's GEN legs against when the image is
+It is what the simulation's GEN legs are compared against when the image is
 a hybrid, and the test below pins it to the fp32 golden on the tiny hybrid model.
 """
 
@@ -546,7 +546,7 @@ def test_rv32_profile_closes_archived_fpu_trace(tmp_path):
     from pathlib import Path
     from model.configs import BONSAI_TINY_HYBRID_1K
     from model.tinygen import generate
-    from tools.card_vs_mirror import format_typed_trace, parse
+    from software.mirror import format_typed_trace, parse
     image, _, _ = generate(str(tmp_path), 8, 1234, cfg=BONSAI_TINY_HYBRID_1K)
     expected, order = parse(Path(__file__).parent / 'data/tiny-hybrid-1k-fpu-trace.txt')
     for mode, full in [('rv32f', True), ('mathematical', False)]:
