@@ -233,7 +233,12 @@ def test_tiny_geometry_on_the_27b_build(tmp_path, big):
 MASK = 0xFFFFFFFF
 
 
-@pytest.mark.parametrize('mode,T', [(0, 11), (1, 11), (0, 1), (1, 3)])
+@pytest.mark.parametrize('mode,T', [ # Migen simulator: ~40-90 s each, but (1, 3)
+    pytest.param(0, 11, marks=pytest.mark.slow),
+    pytest.param(1, 11, marks=pytest.mark.slow),
+    pytest.param(0, 1,  marks=pytest.mark.slow),
+    (1, 3),
+])
 @pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
 def test_attn_op_through_the_cluster(placement, mode, T):
     n, nq, n_rep, nkv, hd = 2, 4, 2, 2, 32

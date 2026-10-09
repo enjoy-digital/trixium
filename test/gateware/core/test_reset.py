@@ -15,6 +15,7 @@ again with bit-exact results. The scratchpad and the loader's ports are untouche
 
 
 import numpy as np
+import pytest
 
 from migen import *
 from migen.sim import run_simulation
@@ -100,6 +101,7 @@ def _results(dut, dst, n):
     return np.array(out, dtype=np.int64)
 
 
+@pytest.mark.slow  # Migen simulator, ~35 s
 def test_engreset_recovers_a_wedged_matvec():
     n_channels, rows_per_chan, cols = 2, 8, 256
     rng    = np.random.default_rng(7)
@@ -177,6 +179,7 @@ def test_engreset_recovers_a_wedged_matvec():
     assert np.array_equal(out["second"], expected), "stale beats after the reset"
 
 
+@pytest.mark.slow  # Migen simulator, ~2.5 min
 def test_engreset_reports_a_port_that_never_answers():
     n_channels, rows_per_chan, cols = 2, 8, 256
     rng    = np.random.default_rng(8)

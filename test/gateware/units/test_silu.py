@@ -384,6 +384,7 @@ def test_migen_cancel_mid_run_then_clean_run(delay):
     run_simulation(dut, run())
 
 
+@pytest.mark.slow  # Migen simulator, ~4 min
 def test_migen_load_fills_both_tables():
     # Unloaded kernel memories, a real LOAD, then a run that touches both tables.
     dut = SiluSP(preload=False)
@@ -670,6 +671,7 @@ def test_cluster_runs_through_the_shared_arbiter():
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
 
 
+@pytest.mark.slow  # Migen simulator, ~40 s
 def test_cluster_list_protection_and_reset_recovery():
     dut = cluster()
     def run():

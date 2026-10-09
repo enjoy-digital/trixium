@@ -7,6 +7,7 @@
 """Sequencer units 11 (options), 12 (norm) and 13 (conv): decode, and lists on the cluster."""
 
 import numpy as np
+import pytest
 
 from migen import Memory, Module, run_simulation
 
@@ -96,6 +97,7 @@ def test_norm_and_conv_decode_and_reserved_words():
         run_simulation(dut, run())
 
 
+@pytest.mark.slow  # Migen simulator, ~3 min
 def test_cluster_conv_then_norm_list():
     """conv (16 channels) then an in-place L2 over two 8-element segments, one list."""
     size = 64*1024

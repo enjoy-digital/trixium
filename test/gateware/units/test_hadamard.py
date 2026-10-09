@@ -348,6 +348,7 @@ def test_hadamard_rejects_full_span_before_any_scratchpad_access(changed, mask):
 
 # Sequencer Lists on the Shared Cluster ------------------------------------------------------------
 
+@pytest.mark.slow  # Migen simulator, ~1.5 min
 def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports():
     dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1)
     rng = random.Random(941)
@@ -469,6 +470,7 @@ def test_compiled_full_vector_rotation_through_shared_cluster_and_wishbone():
     print(result.stdout)
 
 
+@pytest.mark.slow  # Migen simulator, ~1.2 min
 def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
     """w0[9] on a unit (OVERLAP): the rotation dispatches while the NOWAIT fetch is still
     streaming into another region; both results exact, the list end drains the fetch."""
@@ -511,6 +513,7 @@ def test_overlap_rotation_runs_under_a_nowait_fetch_on_the_shared_ports():
     run_simulation(dut, run(), clocks={'sys': 10, 'eng': 10})
 
 
+@pytest.mark.slow  # Migen simulator, ~1.2 min
 def test_without_overlap_the_rotation_waits_for_the_nowait_fetch():
     dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=32*1024), n=1)
     fetch = [1 | (1 << 9), 2, 0, 0, 0x100, 160, 0, 0, 0, 0x4000, 0] + [0]*5

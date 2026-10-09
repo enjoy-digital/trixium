@@ -269,6 +269,7 @@ def int_reference(m, q, k, v, decay, beta, scale):
     return m, out
 
 
+@pytest.mark.slow  # Migen simulator, ~2 min each
 @pytest.mark.parametrize('placement', [dict(), dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000)])
 def test_dnstream_op_through_the_cluster(placement):
     L, rows, cols, heads = 2, 16, 16, 5

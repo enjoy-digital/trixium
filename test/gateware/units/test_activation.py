@@ -676,7 +676,7 @@ def test_requantization_dispatch_without_hadamard_and_completion_publication(fai
     run_simulation(dut, run())
 
 
-@pytest.mark.parametrize('with_hadamard', [False, True])
+@pytest.mark.parametrize('with_hadamard', [False, pytest.param(True, marks=pytest.mark.slow)]) # Migen: ~40 s
 def test_sequenced_fetch_nowait_quantize_store(with_hadamard):
     dut = SoC(TriXiumConfig(with_activation_quantize=True, with_hadamard=with_hadamard,
                                  scratchpad_size=16*1024), n=1)
