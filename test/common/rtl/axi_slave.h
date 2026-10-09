@@ -20,6 +20,8 @@
 // per cycle (AR/AW/W ready dropped, R/B valid withheld). Checked: master payloads hold
 // while ungranted, WLAST on the burst's last beat, AxLEN within max_len (16 = the HBM IP's
 // AXI3 4-bit AxLEN). Handshakes can be logged ("@axi <prefix> ar|aw <cycle> <addr> <len> <id>").
+// <prefix>_freeze, a testbench-driven control (HBMChannelModel.freeze): while it is 1 the read
+// server delivers nothing, a port that never answers.
 
 #pragma once
 
@@ -40,6 +42,27 @@ struct AxiConfig {
     uint32_t seed        = 1;
     bool     log         = false;
     std::string write_order = "aw_first";
+
+    // One "key=value" option (the config line of script_main.cpp, cosim.cpp).
+    void option(const std::string &prefix, const std::string &kv) {
+        size_t k = kv.find('=');
+        if (k == std::string::npos) sim_fail("axi %s: bad option '%s'", prefix.c_str(), kv.c_str());
+        std::string key = kv.substr(0, k), val = kv.substr(k + 1);
+        auto num = [&]() { return (uint32_t)std::strtoul(val.c_str(), nullptr, 0); };
+        if      (key == "size")        size        = std::strtoull(val.c_str(), nullptr, 0);
+        else if (key == "latency")     latency     = num();
+        else if (key == "r_stall")     r_stall     = num();
+        else if (key == "ar_stall")    ar_stall    = num();
+        else if (key == "aw_stall")    aw_stall    = num();
+        else if (key == "w_stall")     w_stall     = num();
+        else if (key == "b_stall")     b_stall     = num();
+        else if (key == "reorder")     reorder     = num();
+        else if (key == "max_len")     max_len     = num();
+        else if (key == "seed")        seed        = num();
+        else if (key == "log")         log         = num() != 0;
+        else if (key == "write_order") write_order = val;
+        else sim_fail("axi %s: unknown option '%s'", prefix.c_str(), key.c_str());
+    }
 };
 
 struct AxiSlave : Model {
@@ -50,6 +73,7 @@ struct AxiSlave : Model {
     std::vector<uint8_t> mem;
     SimRandom            rnd;
     uint32_t             beat_bytes;
+    uint8_t              freeze = 0;  // <prefix>_freeze: withhold every read beat.
 
     // Ports.
     Sig *ar_valid, *ar_ready, *ar_addr, *ar_len, *ar_id;
@@ -116,6 +140,7 @@ struct AxiSlave : Model {
             cooldown.assign(cfg.reorder, 0);
         }
         sim.add_memory(sim_vector_memory(prefix, &mem));
+        sim.add(prefix + "_freeze", 1, &freeze, true);
     }
 
     uint64_t beat_offset(const Burst &b, uint32_t beat) const {
@@ -155,7 +180,7 @@ struct AxiSlave : Model {
         ar_ready->set(ar_ok && !st_ar);
         // R.
         Burst b; uint32_t beat;
-        if (serving(&b, &beat) && !st_r) {
+        if (serving(&b, &beat) && !st_r && !freeze) {
             r_valid->set(1);
             std::vector<uint32_t> w(r_data->words());
             std::memcpy(w.data(), mem.data() + beat_offset(b, beat), beat_bytes);

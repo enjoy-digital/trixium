@@ -34,6 +34,7 @@ import os
 import re
 import random
 import fcntl
+import ctypes
 import shutil
 import hashlib
 import tempfile
@@ -43,6 +44,8 @@ from pathlib import Path
 
 from migen import *
 from migen.fhdl import verilog
+from migen.fhdl.structure import _Assign, _Slice
+from migen.fhdl.specials import _MemoryLocation
 from migen.sim import passive
 
 from common import ROOT, RTL
@@ -271,6 +274,7 @@ class Simulator:
             assert m.width % 8 == 0, f"memory {n}: width {m.width} is not whole bytes"
             mems[n] = (vname, m.width, m.depth)
 
+        self.inputs = set(re.findall(r"^\s*input\s+(?:wire\s+)?(?:signed\s+)?(?:\[[^\]]*\]\s*)?(\w+)", vsrc, re.M))
         header = self._header(names, {n: len(s) for n, s in self.ios.items()}, mems)
         vlt    = "`verilator_config\n" + "".join(
             f'public_flat_rw -module "{self.top}" -var "{v}"\n' for v, _, _ in mems.values())
@@ -336,7 +340,8 @@ class Simulator:
             "#endif",
         ]
         for n, v in sorted(names.items()):
-            lines.append(f'    sim.add("{n}", {widths[n]}, &d.{v});')
+            flag = ", true" if v in self.inputs else ""
+            lines.append(f'    sim.add("{n}", {widths[n]}, &d.{v}{flag});')
         for n, (v, w, depth) in sorted(mems.items()):
             lines.append(f'    sim.add_memory(sim_dut_memory("{n}", &d.rootp->{self.top}__DOT__{v}, {w}, {depth}));')
         lines.append("}")
@@ -569,3 +574,240 @@ def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None):
         vcd_name = str(trace_path("migen", "vcd"))
     run_simulation(dut, gens, vcd_name=vcd_name)
     return r
+
+# Compiled Co-Simulation ---------------------------------------------------------------------------
+
+LIB_FLAGS = ["-CFLAGS", "-fPIC", "-LDFLAGS", "-shared"]
+
+_libraries = {}
+
+def _library(path):
+    """The co-simulation library at `path`, loaded once per process (ctypes)."""
+    path = str(path)
+    if path not in _libraries:
+        lib = ctypes.CDLL(path)
+        P, I, U, ULL, B = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint32),
+                           ctypes.c_ulonglong, ctypes.c_char_p)
+        for fn, res, args in [
+                ("cosim_new",           P,    [B]),
+                ("cosim_free",          None, [P]),
+                ("cosim_error",         B,    [P]),
+                ("cosim_signal",        I,    [P, B]),
+                ("cosim_width",         I,    [P, I]),
+                ("cosim_is_input",      I,    [P, I]),
+                ("cosim_get",           I,    [P, I, U]),
+                ("cosim_set",           None, [P, I, U]),
+                ("cosim_memory",        I,    [P, B]),
+                ("cosim_memory_size",   ULL,  [P, I]),
+                ("cosim_memory_access", I,    [P, I, ULL, B, ULL, I]),
+                ("cosim_tick",          I,    [P, ULL]),
+                ("cosim_cycle",         ULL,  [P])]:
+            f = getattr(lib, fn)
+            f.restype, f.argtypes = res, args
+        _libraries[path] = lib
+    return _libraries[path]
+
+
+class Compiled:
+    """A DUT compiled as a co-simulation library that runs Migen testbench generators unchanged.
+
+    run() keeps run_simulation's contract on the Verilated model: every generator runs once
+    per sys clock; `(yield sig)` / `(yield mem[i])` read the settled state before the edge;
+    `yield sig.eq(v)` / `yield mem[i].eq(v)` take effect after it (Migen commits them with
+    the edge); "passive" generators do not keep the simulation alive.
+
+    dut      : the module, constructed by the test (its Signals/Memories are the handles).
+    signals  : {name: Signal} the generators read or drive: ports of the compiled DUT (the
+               undriven ones are inputs, at their Migen reset value until driven).
+    memories : {name: Memory} the generators read or write (made public).
+    axi      : {prefix: AXIInterface} answered by C++ AXI slaves (axi_slave.h).
+    key      : the DUT's construction (see Simulator): a hit skips the Verilog conversion.
+    """
+    def __init__(self, dut, signals, memories=None, axi=None, name="cosim", key=None):
+        self.signals  = dict(signals)
+        self.memories = dict(memories or {})
+        self.axi      = dict(axi or {})
+        build = dict(dut=dut, ios=self.signals, axi=self.axi, memories=self.memories)
+        if key is not None:
+            key = f"{key}|{sorted(self.signals)}|{sorted(self.memories)}|{sorted(self.axi)}"
+            self.sim = Simulator(lambda: build, name=name, driver=_COSIM, flags=LIB_FLAGS, key=key)
+        else:
+            self.sim = Simulator(dut, ios=self.signals, axi=self.axi, memories=self.memories,
+                                 name=name, driver=_COSIM, flags=LIB_FLAGS)
+        self.handles = dict(self.signals)
+        for prefix, a in self.axi.items():
+            self.handles.update(axi_ios(prefix, a))
+
+    def run(self, generators, axi=None, aliases=None, cycles=None):
+        """axi: {prefix: AxiConfig options (size, latency, r_stall, ...)}; aliases: {Signal or
+        Memory: name} for testbench objects that are C++ models here (an HBMChannelModel's
+        memory -> "axi0", its freeze -> "axi0_freeze"). Returns the cycle count."""
+        if not isinstance(generators, (list, tuple)):
+            generators = [generators]
+        lib = _library(self.sim.binary)
+        cfg = [f"cycles {cycles}"] if cycles else []
+        for prefix, opts in (axi or {}).items():
+            cfg.append(f"axi {prefix} " + " ".join(f"{k}={int(v) if isinstance(v, bool) else v}"
+                                                  for k, v in opts.items()))
+        # Memory .init files are read at construction, relative to the build directory.
+        cwd = os.getcwd()
+        os.chdir(self.sim.dir)
+        try:
+            h = lib.cosim_new("\n".join(cfg).encode())
+        finally:
+            os.chdir(cwd)
+        try:
+            run = _CosimRun(lib, h, self, aliases or {})
+            run.check(-1 if lib.cosim_error(h) else 0)
+            return run.run(generators)
+        finally:
+            lib.cosim_free(h)
+
+
+_COSIM = (RTL / "cosim.cpp").read_text()
+
+
+class _CosimRun:
+    """One run of a Compiled DUT: the handles, Migen's value semantics, the scheduler."""
+    def __init__(self, lib, h, compiled, aliases):
+        self.lib    = lib
+        self.h      = h
+        self.sigs   = {}  # id(Signal) -> (handle, width, signed, buffer)
+        self.mems   = {}  # id(Memory) -> (handle, bytes per word)
+        self.names  = {}  # id(object) -> name in the compiled model
+        self.writes = []
+        for objects in (compiled.handles, compiled.memories):
+            for name, obj in objects.items():
+                self.names[id(obj)] = name
+        for obj, name in aliases.items():
+            self.names[id(obj)] = name
+        self.keep = list(aliases)  # The aliased objects outlive the run (ids stay unique).
+        # Undriven ports start at their Migen reset value (the compiled model zeroes them).
+        for sig in compiled.signals.values():
+            if sig.reset.value and lib.cosim_is_input(h, self._signal(sig)[0]):
+                self._set(sig, sig.reset.value)
+        # Memories without init start zeroed, as in Migen.
+        for mem in compiled.memories.values():
+            if not mem.init:
+                handle, _ = self._memory(mem)
+                size = lib.cosim_memory_size(h, handle)
+                self.check(lib.cosim_memory_access(h, handle, 0, bytes(size), size, 1))
+
+    def check(self, rc):
+        if rc:
+            raise AssertionError("compiled simulation: " + self.lib.cosim_error(self.h).decode())
+
+    def _signal(self, sig):
+        entry = self.sigs.get(id(sig))
+        if entry is None:
+            name   = self.names.get(id(sig))
+            handle = -1 if name is None else self.lib.cosim_signal(self.h, name.encode())
+            if handle < 0:
+                raise KeyError(f"{sig!r} is not a port of the compiled DUT: add it to the signals")
+            width = self.lib.cosim_width(self.h, handle)
+            entry = self.sigs[id(sig)] = (handle, width, sig.signed,
+                                          (ctypes.c_uint32*((width + 31)//32))())
+        return entry
+
+    def _memory(self, mem):
+        entry = self.mems.get(id(mem))
+        if entry is None:
+            name   = self.names.get(id(mem))
+            handle = -1 if name is None else self.lib.cosim_memory(self.h, name.encode())
+            if handle < 0:
+                raise KeyError(f"memory {mem.name_override} is not exported by the compiled DUT: "
+                               "add it to the memories")
+            entry = self.mems[id(mem)] = (handle, (mem.width + 7)//8)
+        return entry
+
+    # Values ---------------------------------------------------------------------------------------
+
+    def _get(self, sig):
+        handle, width, signed, buf = self._signal(sig)
+        self.check(self.lib.cosim_get(self.h, handle, buf))
+        v = int.from_bytes(bytes(buf), "little") & ((1 << width) - 1)
+        if signed and v >> (width - 1):
+            v -= 1 << width
+        return v
+
+    def _set(self, sig, value):
+        handle, width, _, buf = self._signal(sig)
+        if not self.lib.cosim_is_input(self.h, handle):
+            raise ValueError(f"{sig!r} is driven by the DUT: a testbench write would corrupt it")
+        value &= (1 << width) - 1
+        words = (ctypes.c_uint32*len(buf)).from_buffer_copy(value.to_bytes(4*len(buf), "little"))
+        self.lib.cosim_set(self.h, handle, words)
+
+    def _access(self, mem, index, value=None):
+        handle, wb = self._memory(mem)
+        if value is None:
+            out = ctypes.create_string_buffer(wb)
+            self.check(self.lib.cosim_memory_access(self.h, handle, index*wb, out, wb, 0))
+            return int.from_bytes(out.raw, "little")
+        data = (value & ((1 << (8*wb)) - 1)).to_bytes(wb, "little")
+        self.check(self.lib.cosim_memory_access(self.h, handle, index*wb, data, wb, 1))
+
+    def _eval(self, v):
+        if isinstance(v, (int, bool)):
+            return int(v)
+        if isinstance(v, Constant):
+            return v.value
+        if isinstance(v, Signal):
+            return self._get(v)
+        if isinstance(v, _Slice):
+            return (self._eval(v.value) >> v.start) & ((1 << (v.stop - v.start)) - 1)
+        if isinstance(v, _MemoryLocation):
+            return self._access(v.memory, self._eval(v.index))
+        if isinstance(v, Cat):
+            r, offset = 0, 0
+            for part in v.l:
+                r |= (self._eval(part) & ((1 << len(part)) - 1)) << offset
+                offset += len(part)
+            return r
+        raise TypeError(f"compiled simulation: unsupported value {v!r}")
+
+    def _request(self, request):
+        if isinstance(request, (list, tuple)):
+            return [self._request(r) for r in request]
+        if isinstance(request, _Assign):
+            self.writes.append((request.l, self._eval(request.r)))
+            return None
+        return self._eval(request)
+
+    def _commit(self):
+        for target, value in self.writes:
+            if isinstance(target, _MemoryLocation):
+                self._access(target.memory, self._eval(target.index), value)
+            elif isinstance(target, _Slice):
+                mask = ((1 << (target.stop - target.start)) - 1) << target.start
+                self._set(target.value, (self._get(target.value) & ~mask) | ((value << target.start) & mask))
+            else:
+                self._set(target, value)
+        self.writes = []
+
+    # Scheduler ------------------------------------------------------------------------------------
+
+    def run(self, generators):
+        active  = list(generators)
+        passive = set()
+        while any(id(g) not in passive for g in active):
+            for g in list(active):
+                reply = None
+                while True:
+                    try:
+                        request = g.send(reply)
+                    except StopIteration:
+                        active.remove(g)
+                        break
+                    if request is None:
+                        break
+                    if isinstance(request, str):
+                        if request not in ("passive", "active"):
+                            raise ValueError(f"unknown simulator command '{request}'")
+                        (passive.add if request == "passive" else passive.discard)(id(g))
+                        reply = None
+                    else:
+                        reply = self._request(request)
+            self.check(self.lib.cosim_tick(self.h, 1))
+            self._commit()
+        return self.lib.cosim_cycle(self.h)
