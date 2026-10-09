@@ -70,6 +70,7 @@ int main(int argc, char **argv) {{
         }}
     }}
     sim_save(argv[3], sp.mem.data(), sp.mem.size());
+    sim.finish();
     return 0;
 }}
 '''

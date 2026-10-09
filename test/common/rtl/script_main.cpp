@@ -89,6 +89,7 @@ int main(int argc, char **argv) {
 
     run_script(sim, argv[2], argv[3]);
     for (auto *m : sim.models) m->report(sim);
+    sim.finish();
     d.final();
     for (auto *m : owned) delete m;
     return 0;

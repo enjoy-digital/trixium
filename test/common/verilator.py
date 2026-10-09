@@ -54,6 +54,23 @@ FLAGS   = ["-Wno-fatal", "-O3", "--x-assign", "fast", "--x-initial", "fast"]
 
 # Helpers ------------------------------------------------------------------------------------------
 
+def tracing():
+    """Waveforms on request only (pytest --waves, or TRIXIUM_TRACE=1): a tracing build is a
+    different (slower) model, cached separately."""
+    return os.environ.get("TRIXIUM_TRACE") == "1"
+
+
+_trace_runs = {}
+
+def trace_path(name, ext):
+    """build/traces/<current test id>/<name>-<n>.<ext>: one file per run of the test."""
+    test = os.environ.get("PYTEST_CURRENT_TEST", "no-test").rsplit(" ", 1)[0]
+    d = ROOT / "build" / "traces" / re.sub(r"[^A-Za-z0-9_.-]+", "_", test)
+    d.mkdir(parents=True, exist_ok=True)
+    n = _trace_runs[d] = _trace_runs.get(d, -1) + 1
+    return d / f"{name}-{n}.{ext}"
+
+
 def verilator_path():
     """The verilator binary, or skip the calling test when there is none."""
     path = shutil.which("verilator")
@@ -200,7 +217,7 @@ class Simulator:
                  key=None):
         self.top    = name
         self.driver = driver
-        self.flags  = list(flags)
+        self.flags  = list(flags) + (["--trace-fst"] if tracing() else [])
         self.binary = None
         if key is not None:
             h = hashlib.sha256()
@@ -294,10 +311,24 @@ class Simulator:
             f'#include "{top}.h"',
             f'#include "{top}___024root.h"',
             '#include "sim.h"',
+            "#if VM_TRACE",
+            '#include "verilated_fst_c.h"',
+            "#endif",
             f"#define SIM_TOP {top}",
             f"static void sim_bind(Sim &sim, {top} &d) {{",
             "    sim.clock = [&d](int v) { d.sys_clk = v; };",
             "    sim.eval  = [&d]() { d.eval(); };",
+            "#if VM_TRACE",
+            "    // Tracing builds only (TRIXIUM_TRACE=1 / pytest --waves): dump to $TRIXIUM_TRACE_FILE.",
+            '    if (const char *path = std::getenv("TRIXIUM_TRACE_FILE")) {',
+            "        d.contextp()->traceEverOn(true);",
+            "        auto *t = new VerilatedFstC;",
+            "        d.trace(t, 99);",
+            "        t->open(path);",
+            "        sim.dump = [t](uint64_t time) { t->dump(time); };",
+            "        sim_on_exit = [t]() { t->close(); };",
+            "    }",
+            "#endif",
         ]
         for n, v in sorted(names.items()):
             lines.append(f'    sim.add("{n}", {widths[n]}, &d.{v});')
@@ -339,7 +370,12 @@ class Simulator:
                 (tmp / "config.txt").write_text("\n".join(cfg) + "\n")
                 (tmp / "script.txt").write_text(script.text())
                 cmd = [str(self.binary), str(tmp / "config.txt"), str(tmp / "script.txt"), str(tmp)]
-            run = subprocess.run(cmd, cwd=self.dir, capture_output=True, text=True, timeout=timeout)
+            env = dict(os.environ)
+            env.pop("TRIXIUM_TRACE_FILE", None)
+            if tracing():
+                env["TRIXIUM_TRACE_FILE"] = str(trace_path(self.top, "fst"))
+            run = subprocess.run(cmd, cwd=self.dir, env=env, capture_output=True, text=True,
+                                 timeout=timeout)
             if run.returncode != 0:
                 raise AssertionError(f"{self.top}: " + run.stdout[-2000:] + run.stderr[-4000:])
             return _parse(run.stdout, tmp)
@@ -515,5 +551,7 @@ def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None):
             yield
 
     gens = [gen()] + [probe(p, a) for p, a in (axi_log or {}).items()]
+    if vcd_name is None and tracing():
+        vcd_name = str(trace_path("migen", "vcd"))
     run_simulation(dut, gens, vcd_name=vcd_name)
     return r

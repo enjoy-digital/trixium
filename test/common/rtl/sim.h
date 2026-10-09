@@ -35,6 +35,7 @@
 // Errors -------------------------------------------------------------------------------------------
 
 static std::function<void()> sim_on_fail;  // Diagnostics hook (the script's dump list).
+static std::function<void()> sim_on_exit;  // Closes the waveform (flushed even on a failure).
 
 [[noreturn]] static void sim_fail(const char *fmt, ...) {
     va_list ap;
@@ -48,6 +49,7 @@ static std::function<void()> sim_on_fail;  // Diagnostics hook (the script's dum
         sim_on_fail = nullptr;
         hook();
     }
+    if (sim_on_exit) sim_on_exit();
     std::fflush(stdout);
     std::fflush(stderr);
     std::exit(2);
@@ -199,6 +201,7 @@ struct Sim {
     VerilatedContext           *ctx = nullptr;
     std::function<void(int)>    clock;     // Drives sys_clk.
     std::function<void()>       eval;
+    std::function<void(uint64_t)> dump;  // Waveform sample (tracing builds only, see sim_bind).
     std::map<std::string, Sig>  sigs;
     std::map<std::string, Mem>  mems;
     std::vector<Model *>        models;
@@ -231,6 +234,7 @@ struct Sim {
     void settle() {
         for (auto *m : models) m->drive(*this);
         eval();
+        if (dump) dump(2*cycle);
         settled = true;
     }
     void tick() {
@@ -239,11 +243,15 @@ struct Sim {
         for (auto *m : models) m->sample(*this);
         clock(1);
         eval();
+        if (dump) dump(2*cycle + 1);
         clock(0);
         settled = false;
         cycle++;
         if (cycle > max_cycles)
             sim_fail("cycle cap reached (%llu cycles)", (unsigned long long)max_cycles);
+    }
+    void finish() {
+        if (sim_on_exit) { sim_on_exit(); sim_on_exit = nullptr; }
     }
     void reset(int cycles = 2) {
         Sig *rst = find("sys_rst");
