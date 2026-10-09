@@ -6,22 +6,23 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# TriXium on the SQRL XCU1525 (XCVU9P, four DDR4 x64 channels, PCIe Gen3 x4).
-#
-# The TriXium core streams its weights from the four DDR4 controllers: engine channel c reads
-# from controller c // 4 through its own crossbar port, at per-channel windows inside that
-# controller. The defaults are the configuration that runs the 27B (every scratchpad unit, the
-# DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz), built with the
-# CPU, Vivado directives and timing gate it shipped with. Design decisions and board notes:
-# doc/boards.md.
-#
-# From the repository root:
-#   ./trixium_xcu1525.py --build                         # -> build/xcu1525/ + build/xcu1525.verdict
-#   ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
-#   ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
-#   trixium deploy xcu1525 --board xcu1525 --model 27b   # the lab board: software/lab/deploy.py
-#
-# Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
+"""TriXium on the SQRL XCU1525 (XCVU9P, four DDR4 x64 channels, PCIe Gen3 x4).
+
+The TriXium core streams its weights from the four DDR4 controllers: engine channel c reads
+from controller c // 4 through its own crossbar port, at per-channel windows inside that
+controller. The defaults are the configuration that runs the 27B (every scratchpad unit, the
+DeltaNet and attention streams, DDR4-1500 in a 187.5 MHz ddr domain, sys 125 MHz), built with the
+CPU, Vivado directives and timing gate it shipped with. Design decisions and board notes:
+doc/boards.md.
+
+From the repository root:
+  ./trixium_xcu1525.py --build                         # -> build/xcu1525/ + build/xcu1525.verdict
+  ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
+  ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
+  trixium deploy xcu1525 --board xcu1525 --model 27b   # the lab board: software/lab/deploy.py
+
+Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
+"""
 
 import os
 import sys

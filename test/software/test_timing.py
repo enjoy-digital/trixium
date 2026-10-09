@@ -4,6 +4,8 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
+"""software/lab/timing.py: the timing gate (strict, serializer-skew approvals, experiment envelope) and its CLI."""
+
 import sys
 import subprocess
 

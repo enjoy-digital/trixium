@@ -1,3 +1,9 @@
+#
+# This file is part of TriXium.
+#
+# Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
+# SPDX-License-Identifier: BSD-2-Clause
+#
 # Makefile for the TriXium user tools (derived from LitePCIe's).
 #
 # BUILD_DIR selects the gateware build whose bitstream is loaded: the generated headers

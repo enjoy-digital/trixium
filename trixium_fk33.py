@@ -6,30 +6,31 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# TriXium on the SQRL FK33 (XCVU33P, 8 GB HBM2, PCIe Gen3 x4).
-#
-# The TriXium core streams its weights from HBM: engine channel c is pseudo-channel c + 1
-# (channel 0 carries the CPU's main_ram). The defaults are the configuration that runs the
-# Bonsai 1.7B and 8B (16 channels, HBM at 800 MHz, sys = HBM AXI clock = 212.5 MHz), built with
-# the CPU, Vivado directives and timing gate it shipped with. Board bring-up and operation:
-# doc/boards.md.
-#
-# From the repository root:
-#   ./trixium_fk33.py --build                          # -> build/fk33/ + build/fk33.verdict
-#   ./trixium_fk33.py --load                           # OpenOCD (JTAG, onboard FT2232)
-#   trixium deploy fk33 --board fk33 --model 1p7b      # the lab board: software/lab/deploy.py
-#
-# What the recipe's directives and caches are worth:
-# - fetch-l1 128 sets x 4 ways = 32 KB instruction cache: the per-layer firmware code path
-#   (~24 KB) does not fit 16 KB (-15% on the token); lsu-l1 the same (-5.5%).
-# - AreaOptimized_medium: on this ~98%-full die the synthesis area directive closes timing;
-#   AltSpreadLogic_low is the placer directive that does. Judge a build by TNS and failing
-#   endpoints against the last shipped one, never by WNS alone (software/lab/timing.py).
-# - update_repo "no": never let LiteX update ext/VexiiRiscv from here (needs network, and a
-#   half-done update leaves a CPU that does not compile against the local SpinalHDL).
-# - If post-route phys_opt crashes, re-route from the placed checkpoint and skip it (worth
-#   ~0.15 ns of WNS, not correctness).
-# Vivado 2024.1 (the 2025.2 install lacks the VU33P; --vivado-settings). A route peaks at ~11-15 GB.
+"""TriXium on the SQRL FK33 (XCVU33P, 8 GB HBM2, PCIe Gen3 x4).
+
+The TriXium core streams its weights from HBM: engine channel c is pseudo-channel c + 1
+(channel 0 carries the CPU's main_ram). The defaults are the configuration that runs the
+Bonsai 1.7B and 8B (16 channels, HBM at 800 MHz, sys = HBM AXI clock = 212.5 MHz), built with
+the CPU, Vivado directives and timing gate it shipped with. Board bring-up and operation:
+doc/boards.md.
+
+From the repository root:
+  ./trixium_fk33.py --build                          # -> build/fk33/ + build/fk33.verdict
+  ./trixium_fk33.py --load                           # OpenOCD (JTAG, onboard FT2232)
+  trixium deploy fk33 --board fk33 --model 1p7b      # the lab board: software/lab/deploy.py
+
+What the recipe's directives and caches are worth:
+- fetch-l1 128 sets x 4 ways = 32 KB instruction cache: the per-layer firmware code path
+  (~24 KB) does not fit 16 KB (-15% on the token); lsu-l1 the same (-5.5%).
+- AreaOptimized_medium: on this ~98%-full die the synthesis area directive closes timing;
+  AltSpreadLogic_low is the placer directive that does. Judge a build by TNS and failing
+  endpoints against the last shipped one, never by WNS alone (software/lab/timing.py).
+- update_repo "no": never let LiteX update ext/VexiiRiscv from here (needs network, and a
+  half-done update leaves a CPU that does not compile against the local SpinalHDL).
+- If post-route phys_opt crashes, re-route from the placed checkpoint and skip it (worth
+  ~0.15 ns of WNS, not correctness).
+Vivado 2024.1 (the 2025.2 install lacks the VU33P; --vivado-settings). A route peaks at ~11-15 GB.
+"""
 
 import os
 import sys

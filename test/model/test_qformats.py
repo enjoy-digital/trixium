@@ -4,8 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# qformats unit tests: pack/unpack roundtrips and a scalar transliteration of the PrismML
-# llama.cpp fork's C reference (ggml-quants.c) to pin the exact bit layout.
+"""model/qformats.py: the Q2_0/Q8_0/Q1_0/PTQ1_0 packers and decoders against scalar references."""
 
 import numpy as np
 

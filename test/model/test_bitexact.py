@@ -4,8 +4,7 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Bit-exact numerics spec tests: primitive correctness (RNE, fp16 decomposition), matvec
-# accuracy against the float reference, and overflow-bound guarantees.
+"""model/bitexact.py: rounding, FP16/BFP conversions, the ternary/Q8 matvec arithmetic and its LUTs."""
 
 import numpy as np
 

@@ -4,8 +4,8 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Layout/BONS contract tests: beat math invariants, header/entry roundtrip, and a full
-# tiny-image write/read roundtrip (every tensor recovered bit-exactly from its shards).
+"""model/layout.py and model/bons.py: beat math invariants, header/entry roundtrip and a full
+tiny-image write/read roundtrip (every tensor recovered bit-exactly from its shards)."""
 
 import numpy as np
 

@@ -4,10 +4,12 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-# Slow end-to-end check (needs a built Verilator sim): runs the firmware in simulation and
-# verifies the self-test checksums against the golden model + image bytes, and the generated
-# token ids against a hybrid reference (model/mirror.py: engine-exact matvecs + float vector ops).
-# Run with: .venv/bin/python -m pytest test/system/test_sim_smoke.py --runslow
+"""Slow end-to-end check of the Qwen3 path in the FK33 simulation: the firmware's self-test
+checksums against the golden model + image bytes, and the generated token ids against a hybrid
+reference (model/mirror.py: engine-exact matvecs + float vector ops).
+
+  python3 -m pytest test/system/test_sim_smoke.py --runslow
+"""
 
 import os
 import sys
