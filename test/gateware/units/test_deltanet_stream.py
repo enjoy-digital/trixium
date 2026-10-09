@@ -280,9 +280,10 @@ def int_reference(m, q, k, v, decay, beta, scale):
 
 
 # Compiled cluster; the plain placement also on Migen's simulator (~2 min).
-@pytest.mark.parametrize('placement,backend', [(dict(), "verilator"),
-    (dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator"),
-    pytest.param(dict(), "migen", marks=pytest.mark.slow)])
+@pytest.mark.parametrize('placement,backend', [
+    pytest.param(dict(), "verilator", id="placement0-verilator"),
+    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", id="placement1-verilator"),
+    pytest.param(dict(), "migen", marks=pytest.mark.slow, id="placement0-migen")])
 def test_dnstream_op_through_the_cluster(placement, backend):
     L, rows, cols, heads = 2, 16, 16, 5
     R, G = rows//L, cols//8

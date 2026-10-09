@@ -28,8 +28,9 @@ CONFIGS = [
 ]
 
 # Compiled cluster (common.cluster.run); the last configuration also on Migen's simulator.
-@pytest.mark.parametrize('config,backend', [(c, "verilator") for c in CONFIGS] +
-                         [pytest.param(CONFIGS[2], "migen", marks=pytest.mark.slow)])
+@pytest.mark.parametrize('config,backend',
+    [pytest.param(c, "verilator", id=f"config{i}-verilator") for i, c in enumerate(CONFIGS)] +
+    [pytest.param(CONFIGS[2], "migen", marks=pytest.mark.slow, id="config2-migen")])
 def test_cluster_fetch_store_and_reset(config, backend):
     dut = SoC(config, backend=backend)
     offset = config.chan_stride + config.chan_skew
