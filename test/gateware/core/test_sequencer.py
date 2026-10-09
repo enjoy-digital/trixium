@@ -681,7 +681,7 @@ def test_sequencer_kadd_interlock_precise(backend):
     # matvec B is NOWAIT and captures k -> kreg1. A norm reading kreg0 must dispatch UNDER
     # B's stream (real overlap), while a norm reading kreg1 must wait for B's capture
     # (done+2) and see the right k. The register-blind interlock serialized the FFN
-    # list's norm-under-stream on the card (13.60M vs 13.45M cycles/token, 2026-08-29).
+    # list's norm-under-stream on the card.
     from model import asm as vasm
 
     n_channels, rows_per_chan, cols = 2, 32, 128

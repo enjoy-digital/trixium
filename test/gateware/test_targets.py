@@ -39,8 +39,8 @@ def test_idelayctrl_reset_releases_sys():
 
     def gen():
         # sys.rst starts low (its register's init), goes high once the ic domain runs, and
-        # must come back low after RDY - with RST staying low throughout (v2's failure was
-        # RST re-asserting when sys reset the counter that drives it).
+        # must come back low after RDY - with RST staying low throughout (the deadlock: RST
+        # re-asserting when sys resets the counter that drives it).
         for t in range(80):
             rst = (yield dut.ic.ic_reset)
             srst = (yield dut.cd_sys.rst)
@@ -54,7 +54,7 @@ def test_idelayctrl_reset_releases_sys():
                 seen["sys_released"] = t
             yield
         assert seen["rst_dropped"] is not None, "IDELAYCTRL RST never released"
-        assert seen["rst_back"] is None, f"RST re-asserted at {seen['rst_back']} (the v2 deadlock)"
+        assert seen["rst_back"] is None, f"RST re-asserted at {seen['rst_back']} (the reset deadlock)"
         assert seen["sys_in_reset"] is not None and seen["sys_released"] is not None, seen
         assert seen["sys_released"] > seen["rst_dropped"], seen
 

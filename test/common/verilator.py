@@ -123,10 +123,6 @@ class Script:
     def set(self, name, value):
         self.ops.append(("set", name, int(value)))
 
-    def sets(self, prefix="", **fields):
-        for name, value in fields.items():
-            self.set(prefix + name, value)
-
     def step(self, n=1):
         if n:
             self.ops.append(("step", int(n)))
@@ -365,14 +361,13 @@ class Simulator:
 
     # Run ------------------------------------------------------------------------------------------
 
-    def run(self, script=None, images=None, axi=None, spclient=None, cycles=50_000_000, args=None,
+    def run(self, script=None, images=None, axi=None, cycles=50_000_000, args=None,
             timeout=3600):
         """Run a Script (default driver) or the custom driver with `args` (paths are str()).
 
         images  : {memory: bytes} loaded before the script (DUT memories start zeroed).
         axi     : {prefix: dict(init=bytes, size=, latency=, r_stall=, ar_stall=, aw_stall=,
                   w_stall=, b_stall=, reorder=, max_len=, seed=, log=, write_order=)}.
-        spclient: (name, size, grant_pct) - a SpClient on the sp_* ports.
         """
         with tempfile.TemporaryDirectory(prefix=f"{self.top}-") as tmp:
             tmp = Path(tmp)
@@ -387,8 +382,6 @@ class Simulator:
                                                           for k, v in opts.items()))
                     if init:
                         images = dict(images or {}, **{prefix: init})
-                if spclient:
-                    cfg.append("spclient {} {} {}".format(*spclient))
                 for i, (mem, data) in enumerate((images or {}).items()):
                     path = tmp / f"image{i}.bin"
                     path.write_bytes(bytes(data))

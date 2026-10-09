@@ -9,14 +9,12 @@
 // The config sets up the run before the script starts, one item per line:
 //   cycles N                         cycle cap
 //   axi PREFIX key=value...          an AxiSlave on the PREFIX_* ports (see AxiConfig)
-//   spclient NAME SIZE GRANT_PCT     a SpClient answering the sp_* ports, memory NAME
 //   image MEM FILE [ADDR]            load FILE into memory MEM (DUT memories start zeroed)
 
 #include <sstream>
 
 #include "sim_top.h"
 #include "axi_slave.h"
-#include "sp_client.h"
 #include "script.h"
 
 int main(int argc, char **argv) {
@@ -49,12 +47,6 @@ int main(int argc, char **argv) {
             auto *a = new AxiSlave(sim, prefix, c);
             sim.models.push_back(a);
             owned.push_back(a);
-        } else if (op == "spclient") {
-            std::string name; size_t size; uint32_t grant;
-            in >> name >> size >> grant;
-            auto *s = new SpClient(sim, name, size, grant);
-            sim.models.push_back(s);
-            owned.push_back(s);
         } else if (op == "image") {
             std::string mem, file; size_t addr = 0;
             in >> mem >> file >> addr;

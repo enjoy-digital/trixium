@@ -167,7 +167,7 @@ class EngineBench:
         return _simulators[key]
 
     def run(self, backend, script, sp=b"", payloads=None, latency=8, stall_rate=0, reorder_ids=0,
-            model_size=64*1024, axi_log=(), r_stall=None):
+            model_size=64*1024, axi_log=()):
         """Run `script` after a reset. payloads: per-channel memory images; latency/stall_rate:
         a value or a per-channel list (stall_rate in sixteenths, as HBMChannelModel)."""
         n   = self.n_channels
