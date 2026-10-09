@@ -792,6 +792,18 @@ static int silu_selftest(void)
 
 #define SILU_IMAGE_WORDS (1025u*8u)
 
+// The table image (resident_silu_init): values lut[0..N] from word 0, slopes lut[i+1] - lut[i]
+// from beat 513, zeros in between and after. Each word is written once: a zero pass over the
+// whole 32 KB first would take every line through a main_ram miss twice.
+static void silu_image_build(uint32_t *image, const float *lut)
+{
+    union { float f; uint32_t u; } v;
+    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) { v.f = lut[i]; image[i] = v.u; }
+    for (uint32_t i = TRIXIUM_SILU_LUT_N + 1; i < 513u*8u; i++) image[i] = 0;
+    for (int i = 0; i < TRIXIUM_SILU_LUT_N; i++) { v.f = lut[i + 1] - lut[i]; image[513*8 + i] = v.u; }
+    for (uint32_t i = 513u*8u + TRIXIUM_SILU_LUT_N; i < SILU_IMAGE_WORDS; i++) image[i] = 0;
+}
+
 // Diagnostic, run when the self-test fails: every table node g = -16 + k/128 (F = 0, so
 // the unit must return lut[k] exactly for m = 1) and every midpoint (F = 1/2, the slopes),
 // inputs DMA-staged, results against the CPU. Prints which indices fail and their pattern.
@@ -848,10 +860,7 @@ int resident_silu_init(const float *lut, uint32_t *stage)
     // trixium_silu_lookup computes per element. Built in main RAM and DMA-fetched into RS_F
     // in the same list as the LOAD, like every other bulk transfer (not over the CSR bus),
     // then read back: a bad image is reported as such instead of as self-test mismatches.
-    union { float f; uint32_t u; } v;
-    for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++) stage[i] = 0;
-    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) { v.f = lut[i]; stage[i] = v.u; }
-    for (int i = 0; i < TRIXIUM_SILU_LUT_N; i++) { v.f = lut[i + 1] - lut[i]; stage[513*8 + i] = v.u; }
+    silu_image_build(stage, lut);
     clean_cpu_dcache_range(stage, SILU_IMAGE_WORDS*4);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
@@ -905,10 +914,7 @@ int resident_gate_init(const float *sig_lut, uint32_t *image)
         (trixium_seq_silu_abi_read() >> 16) != 1 || (trixium_seq_silu_abi_read() & 0xffff) < 2)
         return -1;
     // The SiLU image's layout (resident_silu_init) on the canonical sigmoid table.
-    union { float f; uint32_t u; } v;
-    for (uint32_t i = 0; i < SILU_IMAGE_WORDS; i++) image[i] = 0;
-    for (int i = 0; i <= TRIXIUM_SILU_LUT_N; i++) { v.f = sig_lut[i]; image[i] = v.u; }
-    for (int i = 0; i < TRIXIUM_SILU_LUT_N; i++) { v.f = sig_lut[i + 1] - sig_lut[i]; image[513*8 + i] = v.u; }
+    silu_image_build(image, sig_lut);
     clean_cpu_dcache_range(image, SILU_IMAGE_WORDS*4);
     R->sig_image = image;
     R->sig_lut = sig_lut;

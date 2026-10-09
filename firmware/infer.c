@@ -919,6 +919,26 @@ uint64_t infer_heap_room(int big)
 
 void infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n)
 {
+#if defined(HAS_INVD_CPU_DCACHE_RANGE)
+    // Whole beats into a 32-byte aligned destination (every halloc'd table): the engine
+    // stores each staged 8 KB back to main_ram instead of the CPU reading it word by word
+    // over the uncached bus (~30 cycles a float; the hybrid models' norm and conv tables are
+    // 19k floats on the tiny model, millions on the 27B). Same bytes: the lines are written
+    // back before the STOREs and dropped after them.
+    if (((uintptr_t)dst & 31) == 0 && n > 0 && n % 8 == 0 && (uint32_t)n/8 <= beats) {
+        flush_cpu_dcache_range(dst, (size_t)n*4);
+        for (int done = 0; done < n; ) {
+            uint32_t b = (uint32_t)(n - done)/8;
+            if (b > 256) b = 256;
+            engine_fetch(0, addr + (uint32_t)done*4, b, SP_FET);
+            engine_store(0, (uint32_t)((uintptr_t)(dst + done) - MAIN_RAM_BASE
+                                       + TRIXIUM_MEM_CPU_OFFSET), b, SP_FET);
+            done += (int)b*8;
+        }
+        invd_cpu_dcache_range(dst, (size_t)n*4);
+        return;
+    }
+#endif
     // Through the fetch staging region, 8 KB at a time.
     int done = 0;
     while (done < n) {
@@ -2607,9 +2627,19 @@ static void dbg_typed(const char *tag, int layer, const void *values, uint32_t n
     if (!dbg_armed) return;
     // f32/u32 are both four bytes, little-endian on the supported RISC-V targets.
     // Do not convert floats to integers: +/-zero and exact FP32 rounding matter.
-    const uint8_t *p = values;
+    // FNV-1a over the 4*n bytes in memory order, one 32-bit load per element (byte 0 is
+    // the low byte): a quarter of the loads of a byte loop - the ffn_act checkpoint reads
+    // the scratchpad over the uncached bus - for the same hash.
+    typedef uint32_t __attribute__((may_alias)) word_alias;
+    const word_alias *p = values;
     uint32_t hash = 2166136261u;
-    for (uint32_t i = 0; i < 4*n; i++) hash = (hash ^ p[i])*16777619u;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v = p[i];
+        hash = (hash ^ (v & 0xffu))*16777619u;
+        hash = (hash ^ ((v >> 8) & 0xffu))*16777619u;
+        hash = (hash ^ ((v >> 16) & 0xffu))*16777619u;
+        hash = (hash ^ (v >> 24))*16777619u;
+    }
     printf("DBG pos=%d l=%d %s dtype=%s n=%lu e=0 %08lx\n", n_pos, layer, tag, dtype,
            (unsigned long)n, (unsigned long)hash);
 }
