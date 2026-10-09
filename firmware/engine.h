@@ -65,7 +65,7 @@ struct engine_op {
 /*-----------*/
 
 void engine_run(const struct engine_op *op);
-// Overlap split (docs/units.md (Overlap and scratchpad arbitration)): submit returns the pre-op done_count for
+// Overlap split (doc/units.md (Overlap and scratchpad arbitration)): submit returns the pre-op done_count for
 // engine_join; independent vector-unit work may run in between. Not for CPU loops (the
 // scratchpad sideband stalls while the engine is busy).
 uint32_t engine_submit(const struct engine_op *op);

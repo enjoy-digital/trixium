@@ -2283,7 +2283,7 @@ static void qkv_prep_layer(int l)
 // The descriptor lists (attention, FFN, qkv, scale8) are on by default: they collapse the
 // per-head and per-op dispatch round-trips into one submit per list, same tokens either way.
 // `seq off` selects the CPU-dispatched op-by-op path, which still overlaps the engine and
-// the vector unit (docs/units.md (Overlap and scratchpad arbitration)): e.g. the FFN up-projection stream runs UNDER the
+// the vector unit (doc/units.md (Overlap and scratchpad arbitration)): e.g. the FFN up-projection stream runs UNDER the
 // gate-norm vector program (disjoint regions; gate absmax captured before the submit, so
 // numerics are byte-identical by construction).
 int seq_use = 1;

@@ -600,7 +600,7 @@ def _fsum32(v):
 
 
 def _sumsq64(v):
-    """The canonical sum of squares (docs/units.md (Canonical reductions), hybrid.c sumsq64)."""
+    """The canonical sum of squares (doc/units.md (Canonical reductions), hybrid.c sumsq64)."""
     v = np.asarray(v, dtype=f32)
     sq = (v*v).astype(f32)
     P = np.zeros(64, dtype=f32)
@@ -625,7 +625,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
                       trace=None, silu_mode=None):
     """exact=True: fp32 weights and no activation quantization (the golden's arithmetic),
     which tests the mirror's structure against the golden independently of the int8 noise.
-    fast=True: the DeltaNet recurrence in the fast path's arithmetic (docs/units.md (DeltaNet recurrence arithmetic)) -
+    fast=True: the DeltaNet recurrence in the fast path's arithmetic (doc/units.md (DeltaNet recurrence arithmetic)) -
     q and k as int8 per head (unit vectors, exponent -7), v as int8 per head, the state as
     int16 with one exponent per head that ratchets up when a row would overflow, the decay
     as Q15, the dots as exact int32 sums (the engine's Q8 matvec on the two int8 planes),
@@ -812,7 +812,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         return q + ((rem > half) | ((rem == half) & (q & 1 == 1)))
 
     def recurrence_vecunit(l, hh, qh, kk, vh, decay, beta_h):
-        """One head in the two-pass vector-unit arithmetic (docs/units.md (DeltaNet recurrence arithmetic)): the state
+        """One head in the two-pass vector-unit arithmetic (doc/units.md (DeltaNet recurrence arithmetic)): the state
         int16 in the scratchpad at one exponent per head, k and q as int16 with their own
         exponents, the dots exact into the 48-bit scalar registers, the per-row delta in
         units of 2^-19 (a scalar SSHLV, VMULH15 by the Q15 decay and by -beta, both

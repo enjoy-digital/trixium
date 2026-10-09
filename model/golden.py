@@ -39,7 +39,7 @@ from model.gguf_reader import GGUFReader
 # and PrismML's prism.hadamard.* rotation metadata. From the file: 24/4 attention heads x 256
 # with the output gate, 48/16 DeltaNet heads x 128, hidden 5120, FFN 17408, vocab 248320,
 # Hadamard block 1024 with sign vectors for widths 5120/6144/17408. check_engine_support()
-# names what the plain Qwen3 path cannot run (docs/units.md); the image is built anyway.
+# names what the plain Qwen3 path cannot run (doc/units.md); the image is built anyway.
 GGUF_ARCHS = ("qwen3", "qwen35", "qwen3next")
 
 def config_from_gguf(reader):
@@ -314,7 +314,7 @@ class FloatModel:
             # The DeltaNet output is tiled [hd, nk, rep] (v head h = k head h % nk); the
             # fold used the grouped order [hd, rep, nk] (the rep value heads of one key head
             # adjacent), so permute before the rotation. The 16-channel firmware writes
-            # head outputs in grouped order directly (docs/units.md, DeltaNet recurrence
+            # head outputs in grouped order directly (doc/units.md, DeltaNet recurrence
             # arithmetic).
             hd, nk = cfg.dn_v_head_dim, cfg.dn_num_k_heads
             rep = cfg.dn_num_v_heads//nk

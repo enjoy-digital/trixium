@@ -31,7 +31,7 @@ class ModelConfig:
     # Bonsai 2 / Qwen3.8 (the 27B): a hybrid of Gated DeltaNet layers with full attention
     # every full_attention_interval-th layer. () = every layer is attention (the Qwen3
     # models). The DeltaNet geometry sizes the recurrent state for the converter and the
-    # firmware (docs/boards.md).
+    # firmware (doc/boards.md).
     layer_types    : tuple = ()           # "attn" / "deltanet" per layer, or ().
     dn_num_v_heads : int   = 0            # DeltaNet value heads (GGUF ssm.time_step_rank).
     dn_num_k_heads : int   = 0            # DeltaNet key heads (ssm.group_count).

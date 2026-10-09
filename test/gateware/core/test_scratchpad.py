@@ -155,7 +155,7 @@ def test_priority_is_last_attached():
 
 
 # Per-Cycle Arbitration (Engine + Vector Unit Overlap) ---------------------------------------------
-# Per-cycle scratchpad arbitration (docs/units.md (Overlap and scratchpad arbitration)).
+# Per-cycle scratchpad arbitration (doc/units.md (Overlap and scratchpad arbitration)).
 #
 # Engine + vector unit sharing the scratchpad WITHOUT a sequencer or CSR front: engine.cmd is
 # testbench-driven, the vector unit runs from its own CSRs, and the two are launched
@@ -417,7 +417,7 @@ def test_overlap_fetch_under_vec(backend):
 
 @COMPILED
 def test_overlap_vec_throughput_under_stream(backend):
-    # The mechanism behind the result packer (docs/history.md 2026-09-07): with one
+    # The mechanism behind the result packer (doc/history.md, "The result packer"): with one
     # result per W-port write, a saturating plain-matvec stream held the port ~92% of the
     # time and a vector STORE was granted about one cycle in twelve - norm_i32 ran 2.9x
     # slower under the up projection than idle. This pins the property: the same
