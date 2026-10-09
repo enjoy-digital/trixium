@@ -8,7 +8,8 @@
 
 from setuptools import setup, find_packages
 
-# The gateware needs Migen/LiteX from the LiteX installer (litex_setup.py), not from PyPI.
+# The gateware needs Migen/LiteX from the LiteX installer (litex_setup.py), not from PyPI. Install
+# editable (pip install -e .): the tools use the tree (firmware/, software/user/, models/, build/).
 
 setup(
     name             = "trixium",
@@ -19,10 +20,10 @@ setup(
     author           = "Enjoy-Digital",
     license          = "BSD-2-Clause",
     python_requires  = ">=3.10",
-    install_requires = ["numpy", "tokenizers", "pyserial"],
-    extras_require   = {"dev": ["pytest", "pytest-xdist", "huggingface_hub", "pexpect"]},
+    install_requires = ["numpy", "tokenizers", "pyserial", "huggingface_hub"],
+    extras_require   = {"dev": ["pytest", "pytest-xdist", "pexpect"]},
     py_modules       = ["trixium_xcu1525", "trixium_fk33", "trixium_sim"],
     packages         = find_packages(exclude=["test*"]),
-    package_data     = {"software": ["lib/*.c", "lib/*.h"], "gateware": ["hbm/*.xci"]},
+    package_data     = {"gateware": ["hbm/*.xci"]},
     entry_points     = {"console_scripts": ["trixium=software.cli:main"]},
 )
