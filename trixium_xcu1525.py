@@ -136,7 +136,7 @@ class _IDELAYCTRL(LiteXModule):
     The counter's domain must NOT be `sys`: sys is held in reset until the IDELAYCTRL is ready,
     and the IDELAYCTRL is not ready until this counter releases RST, so a counter in sys never
     counts and the SoC never leaves reset. It counts in a reset-less domain on the sys clock
-    (test_xcu1525_crg.py).
+    (test/gateware/test_targets.py).
 
     The count starts at MMCM lock: UG571 wants the IDELAYCTRL reset applied after REFCLK is
     stable. `locked` is synchronized into the counter's domain and holds RST asserted (counter
