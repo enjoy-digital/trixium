@@ -17,7 +17,7 @@ import pytest
 
 from migen import run_simulation
 
-from trixium.core.core import TriXiumConfig
+from gateware.core.core import TriXiumConfig
 from test_integration import SoC, write
 from test_dnstream_integration import _IntAdd5, _IntMul5
 

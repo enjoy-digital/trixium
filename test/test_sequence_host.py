@@ -15,14 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from trixium.model.activation import (
+from model.activation import (
     scratchpad_quantize_descriptor, scratchpad_requantize_descriptor, scratchpad_restore_descriptor,
     scratchpad_silu_descriptor, scratchpad_norm_descriptor, scratchpad_conv_descriptor,
     scratchpad_add_descriptor,
 )
-from trixium.model.hadamard import scratchpad_rotation_descriptor
+from model.hadamard import scratchpad_rotation_descriptor
 
-LIB = Path(__file__).resolve().parents[1] / 'trixium/software/lib'
+LIB = Path(__file__).resolve().parents[1] / 'software/lib'
 
 
 # Helpers ------------------------------------------------------------------------------------------

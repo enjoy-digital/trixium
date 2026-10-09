@@ -13,10 +13,10 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.core.scratchpad import Scratchpad
-from trixium.core.engine import MatVecEngine
-from trixium.memory.loader import Loader
-from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
+from gateware.core.scratchpad import Scratchpad
+from gateware.core.engine import MatVecEngine
+from gateware.memory.loader import Loader
+from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 def test_engine_fetch():
     rng  = np.random.default_rng(21)

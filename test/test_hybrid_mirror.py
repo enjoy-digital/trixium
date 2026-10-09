@@ -24,9 +24,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from trixium import layout
-from trixium.model import bitexact as bx
-from trixium.model.bons import BONSReader
+from model import layout
+from model import bitexact as bx
+from model.bons import BONSReader
 
 f32 = np.float32
 
@@ -178,15 +178,15 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
 
     def sigmoid(x): return (f32(1.0)/(f32(1.0) + np.exp(-x, dtype=f32))).astype(f32)
     if silu_mode == "rv32f":
-        from trixium.model.rv32_math import sigmoid_rv32 as sigmoid   # canonical LUT sigmoid
+        from model.rv32_math import sigmoid_rv32 as sigmoid   # canonical LUT sigmoid
     if silu_mode == "rv32f":
-        from trixium.model.rv32_math import silu_rv32 as silu
+        from model.rv32_math import silu_rv32 as silu
     else:
         def silu(x): return (x/(f32(1.0) + np.exp(-x, dtype=f32))).astype(f32)
     def softplus(x): return np.where(x > 20, x, np.log1p(np.exp(x, dtype=f32), dtype=f32)).astype(f32)
     def softmax_exp(x): return np.exp(x, dtype=f32)
     if silu_mode == "rv32f":
-        from trixium.model.rv32_math import softmax_exp_rv32 as softmax_exp   # canonical
+        from model.rv32_math import softmax_exp_rv32 as softmax_exp   # canonical
 
     # Tables.
     norm_attn = [f32_rows(layout.ROLE_ATTN_NORM, l).reshape(-1) for l in range(n_layer)]
@@ -494,9 +494,9 @@ def test_mirror_agrees_with_the_fp32_golden_on_the_tiny_hybrid():
     the recurrence, the head order, the gates and the rotation independently of the int8
     noise. The sim then compares the firmware to the quantized mirror exactly."""
     import tempfile
-    from trixium.model.configs import BONSAI_TINY_HYBRID
-    from trixium.model.tinygen import generate, make_tiny_hybrid_tensors
-    from trixium.model.golden import FloatModel
+    from model.configs import BONSAI_TINY_HYBRID
+    from model.tinygen import generate, make_tiny_hybrid_tensors
+    from model.golden import FloatModel
     cfg = BONSAI_TINY_HYBRID
     with tempfile.TemporaryDirectory() as d:
         img_path, _, _ = generate(d, 2, 1234, cfg=cfg)
@@ -544,8 +544,8 @@ def test_rv32_profile_closes_archived_fpu_trace(tmp_path):
     from the canonical-numerics sim gate (docs/units.md (Canonical reductions)). The mirror's rv32f
     profile must reproduce every checkpoint; the mathematical profile must not."""
     from pathlib import Path
-    from trixium.model.configs import BONSAI_TINY_HYBRID_1K
-    from trixium.model.tinygen import generate
+    from model.configs import BONSAI_TINY_HYBRID_1K
+    from model.tinygen import generate
     from tools.card_vs_mirror import format_typed_trace, parse
     image, _, _ = generate(str(tmp_path), 8, 1234, cfg=BONSAI_TINY_HYBRID_1K)
     expected, order = parse(Path(__file__).parent / 'data/tiny-hybrid-1k-fpu-trace.txt')

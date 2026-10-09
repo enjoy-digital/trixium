@@ -12,10 +12,10 @@ import numpy as np
 
 from migen import *
 
-from trixium.model import asm
-from trixium.core.scratchpad import Scratchpad
-from trixium.core.vector import VectorUnit
-from trixium.memory.hbm_model import words_from_bytes
+from model import asm
+from gateware.core.scratchpad import Scratchpad
+from gateware.core.vector import VectorUnit
+from gateware.memory.hbm_model import words_from_bytes
 
 SP_SIZE = 16*1024
 
@@ -297,7 +297,7 @@ def test_rtl_silu_gate_and_mul_q8():
 def _dn_case(seed, hv, hk):
     """A DeltaNet head mid-life: a state at its exponent, unit k/q, a value row - the
     scratchpad and both passes' arguments from deltanet.head_step's trace."""
-    from trixium.model import deltanet as dn
+    from model import deltanet as dn
     from test_asm import _dn_scratchpad
     rng = np.random.default_rng(seed)
     M = rng.integers(-30000, 30000, (hv, hk)).astype(np.int64)

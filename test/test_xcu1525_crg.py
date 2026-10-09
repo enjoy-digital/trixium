@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_idelayctrl_reset_releases_sys():
-    from trixium.targets.xcu1525 import _IDELAYCTRL
+    from trixium_xcu1525 import _IDELAYCTRL
 
     class _DUT(Module):
         def __init__(self):
@@ -65,7 +65,7 @@ def test_idelayctrl_reset_releases_sys():
 def test_idelayctrl_reset_waits_for_mmcm_lock():
     """RST stays asserted while the MMCM is unlocked, drops reset_cycles after lock, and
     comes back (counter reloaded) if lock is lost - UG571's "reset after REFCLK is stable"."""
-    from trixium.targets.xcu1525 import _IDELAYCTRL
+    from trixium_xcu1525 import _IDELAYCTRL
 
     class _DUT(Module):
         def __init__(self):
@@ -105,7 +105,7 @@ def test_idelayctrl_reset_waits_for_mmcm_lock():
 
 def test_serializer_clock_group_uses_related_buffer_outputs():
     from litex_boards.platforms.sqrl_xcu1525 import Platform
-    from trixium.targets.xcu1525 import _CRG
+    from trixium_xcu1525 import _CRG
     platform = Platform()
     crg = _CRG(platform, 125e6, ddr_clk_freq=187.5e6)
     groups = [(command, signals) for command, signals in platform.constraint_manager.platform_commands
@@ -122,7 +122,7 @@ def test_serializer_clock_group_uses_related_buffer_outputs():
 def test_serializer_buffers_share_mmcm_output_and_preserve_fabric_clock():
     """Structural test, not a primitive simulation or a routed timing result."""
     from litex_boards.platforms.sqrl_xcu1525 import Platform
-    from trixium.targets.xcu1525 import _CRG
+    from trixium_xcu1525 import _CRG
 
     crg = _CRG(Platform(), 125e6, ddr_clk_freq=187.5e6)
     buffers = [special for special in crg._fragment.specials if isinstance(special, Instance)]

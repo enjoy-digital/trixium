@@ -20,7 +20,7 @@ point: it makes that a visible decision rather than an invisible drift.
 import numpy as np
 import pytest
 
-from trixium.model import asm as vasm
+from model import asm as vasm
 
 # Pre-hoist programs (verbatim, before loop-invariant code motion) ---------------------------------
 

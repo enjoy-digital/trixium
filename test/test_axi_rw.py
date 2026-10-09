@@ -17,9 +17,9 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.memory.axi import AXIReader
-from trixium.memory.axi import AXIWriter
-from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
+from gateware.memory.axi import AXIReader
+from gateware.memory.axi import AXIWriter
+from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 MEM_SIZE = 16*1024 # 512 beats.
 

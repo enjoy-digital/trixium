@@ -26,14 +26,14 @@ from migen.sim import run_simulation
 from litex.gen import *
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium import layout
-from trixium.model import bitexact as bx
-from trixium.model.bons import TensorSpec, encode_rows
-from trixium.core.scratchpad import Scratchpad
-from trixium.core.engine import MatVecEngine
-from trixium.memory.loader import Loader
-from trixium.core.reset import EngineResetDomain
-from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
+from model import layout
+from model import bitexact as bx
+from model.bons import TensorSpec, encode_rows
+from gateware.core.scratchpad import Scratchpad
+from gateware.core.engine import MatVecEngine
+from gateware.memory.loader import Loader
+from gateware.core.reset import EngineResetDomain
+from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 
 def test_compiled_system_reset_reaches_registered_engine_domain(tmp_path):

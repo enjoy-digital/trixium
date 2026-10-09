@@ -12,8 +12,8 @@ from migen import *
 
 from litex.gen import LiteXModule
 
-from trixium.units.hadamard import HadamardScratchpad
-from trixium.core.scratchpad import Scratchpad
+from gateware.units.hadamard import HadamardScratchpad
+from gateware.core.scratchpad import Scratchpad
 from test_hadamard import dense, packed, unpacked
 
 

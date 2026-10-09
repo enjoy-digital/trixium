@@ -11,7 +11,7 @@ import pytest
 
 from migen import run_simulation
 
-from trixium.units.fp32 import FP32ArgmaxTracker
+from gateware.units.fp32 import FP32ArgmaxTracker
 
 f32 = np.float32
 

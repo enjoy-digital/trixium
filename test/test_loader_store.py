@@ -22,8 +22,8 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.memory.hbm_model import HBMChannelModel
-from trixium.memory.loader import Loader
+from gateware.memory.hbm_model import HBMChannelModel
+from gateware.memory.loader import Loader
 
 MEM_SIZE = 64*1024
 

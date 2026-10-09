@@ -19,8 +19,8 @@ microcode agrees with the exponent algebra firmware does in C.
 import numpy as np
 import pytest
 
-from trixium.model import asm as vasm
-from trixium.model import bitexact as bx
+from model import asm as vasm
+from model import bitexact as bx
 
 E_NORM = -11
 

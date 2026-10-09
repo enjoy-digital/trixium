@@ -11,8 +11,8 @@
 import numpy as np
 import pytest
 
-from trixium.model import asm
-from trixium.model import bitexact as bx
+from model import asm
+from model import bitexact as bx
 
 def _run(prog_name, sp, args):
     words = asm.assemble(asm.PROGRAMS[prog_name]())
@@ -461,7 +461,7 @@ def test_dn_passes_match_head_step(hv, hk, seed):
     bit: the delta beats and max |delta| out of pass A, the updated state, max |M'| and
     the o beats out of pass B - over a few tokens so the ratchet fires (the state starts
     at a small exponent and the first updates overflow it) and a token where it does not."""
-    from trixium.model import deltanet as dn
+    from model import deltanet as dn
     rng = np.random.default_rng(seed)
     beats = hk//16
     M = np.zeros((hv, hk), dtype=np.int64)

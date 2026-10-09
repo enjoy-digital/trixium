@@ -16,9 +16,9 @@ from migen import Module, Constant, run_simulation
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.core.csr import EngineCSR
-from trixium.core.engine import MatVecEngine
-from trixium.core.scratchpad import Scratchpad
+from gateware.core.csr import EngineCSR
+from gateware.core.engine import MatVecEngine
+from gateware.core.scratchpad import Scratchpad
 
 
 ROOT = Path(__file__).resolve().parents[1]

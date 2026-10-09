@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from trixium.model import asm
+from model import asm
 from test_vector import _compare, _compare_words, SP_SIZE
 
 E_NORM = -11

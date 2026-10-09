@@ -60,15 +60,15 @@ firmware/*.elf
 firmware/*.elf.map
 firmware/trixium.bin
 
-# Host tool binaries (build with: make -C trixium/software/user BUILD_DIR=<build tree>).
-trixium/software/user/trixium_util
-trixium/software/user/trixium_load
-trixium/software/user/trixium_chat
-trixium/software/user/*.d
-trixium/software/user/*.o
-trixium/software/user/liblitepcie/*.d
-trixium/software/user/liblitepcie/*.o
-trixium/software/user/liblitepcie/*.a
+# Host tool binaries (build with: make -C software/user BUILD_DIR=<build tree>).
+software/user/trixium_util
+software/user/trixium_load
+software/user/trixium_chat
+software/user/*.d
+software/user/*.o
+software/user/liblitepcie/*.d
+software/user/liblitepcie/*.o
+software/user/liblitepcie/*.a
 
 # Exported Word copies of local docs (not tracked).
 docs/*.docx
@@ -87,13 +87,13 @@ firmware/progs.h
 vivado_pid*.str
 vivado*.jou
 vivado*.log
-trixium/software/user/.build_config
+software/user/.build_config
 
 # sbt/VexiiRiscv generation leftovers
 /target/
 /project/
 
 # Per-build generated headers (copied from build/<name>/driver/kernel/ by the bring-up scripts).
-trixium/software/kernel/csr.h
-trixium/software/kernel/soc.h
-trixium/software/kernel/mem.h
+software/kernel/csr.h
+software/kernel/soc.h
+software/kernel/mem.h

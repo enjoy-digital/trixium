@@ -9,10 +9,10 @@
 
 import numpy as np
 
-from trixium import layout
-from trixium.model import bons
-from trixium.model.configs import BONSAI_TINY, BONSAI_1P7B, BONSAI_8B
-from trixium.model.tinygen import make_tiny_tensors, generate
+from model import layout
+from model import bons
+from model.configs import BONSAI_TINY, BONSAI_1P7B, BONSAI_8B
+from model.tinygen import make_tiny_tensors, generate
 
 def test_beat_math():
     # Ternary: one code beat per 128-group.
@@ -116,7 +116,7 @@ def test_targets_use_one_cluster_implementation():
     import ast
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
-    for fname in ("trixium/targets/fk33.py", "trixium/targets/xcu1525.py", "trixium/targets/sim.py"):
+    for fname in ("trixium_fk33.py", "trixium_xcu1525.py", "trixium_sim.py"):
         tree = ast.parse((root / fname).read_text())
         calls = [node.func.id for node in ast.walk(tree)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
@@ -125,7 +125,7 @@ def test_targets_use_one_cluster_implementation():
                             "EngineCSR", "Loader", "EngineResetDomain"):
             assert constructor not in calls, (fname, constructor)
 
-    portable = (root / "trixium/core/core.py").read_text()
+    portable = (root / "gateware/core/core.py").read_text()
     assert "vecunit.seq_seed7.eq(seq.vec_seed7)" in portable
     assert "platform.add_ip" not in portable
     assert "add_platform_command" not in portable

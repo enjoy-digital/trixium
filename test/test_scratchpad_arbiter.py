@@ -22,7 +22,7 @@ from migen import Module, Signal, Mux, run_simulation
 
 from litex.gen import LiteXModule
 
-from trixium.core.scratchpad import ScratchpadArbiter
+from gateware.core.scratchpad import ScratchpadArbiter
 
 # Helpers ------------------------------------------------------------------------------------------
 

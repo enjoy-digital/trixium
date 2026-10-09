@@ -11,9 +11,9 @@ import pytest
 
 from migen import Memory, Module, run_simulation
 
-from trixium.core.core import TriXiumConfig
-from trixium.core.sequencer import Sequencer
-from trixium.model.activation import (scratchpad_conv_descriptor, scratchpad_norm_descriptor,
+from gateware.core.core import TriXiumConfig
+from gateware.core.sequencer import Sequencer
+from model.activation import (scratchpad_conv_descriptor, scratchpad_norm_descriptor,
                                            scratchpad_silu_descriptor)
 from test_hadamard_integration import install_list
 from test_integration import SoC, write

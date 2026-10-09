@@ -18,7 +18,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.units.restore import I32ToFp32Scaled
+from gateware.units.restore import I32ToFp32Scaled
 
 
 # Helpers ------------------------------------------------------------------------------------------

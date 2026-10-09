@@ -24,7 +24,7 @@ CFLAGS := $(subst -Os,$(OPT),$(CFLAGS))
 CFLAGS += -ffp-contract=off
 
 # The portable descriptor encoders shared with the host tools (no MMIO, no board policy).
-PORTABLE_LIB = ../trixium/software/lib
+PORTABLE_LIB = ../software/lib
 CFLAGS += -I$(PORTABLE_LIB)
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o hybrid.o \
@@ -67,7 +67,7 @@ all: trixium.bin
 VREGS := $(shell grep -oE 'define TRIXIUM_VEC_VREGS [0-9]+' $(BUILD_DIR)/software/include/generated/soc.h 2>/dev/null | grep -oE '[0-9]+$$')
 VREGS := $(if $(VREGS),$(VREGS),8)
 progs.h: FORCE
-	cd .. && python3 -m trixium.model.asm firmware/progs.h --vregs $(VREGS)
+	cd .. && python3 -m model.asm firmware/progs.h --vregs $(VREGS)
 FORCE:
 infer.o main.o vec.o resident.o: progs.h
 

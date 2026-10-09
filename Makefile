@@ -34,16 +34,16 @@ models:
 
 # The tiny random models the tests and the simulation use (seconds).
 tiny:
-	for n in 2 4 8 16; do $(PYTHON) -m trixium.model.tinygen --out models/tiny --channels $$n; done
-	for n in 2 8; do $(PYTHON) -m trixium.model.tinygen --out models/tiny --channels $$n --hybrid; done
-	$(PYTHON) -m trixium.model.tinygen --out models/tiny --channels 8 --hybrid-1k
+	for n in 2 4 8 16; do $(PYTHON) -m model.tinygen --out models/tiny --channels $$n; done
+	for n in 2 8; do $(PYTHON) -m model.tinygen --out models/tiny --channels $$n --hybrid; done
+	$(PYTHON) -m model.tinygen --out models/tiny --channels 8 --hybrid-1k
 
 # GGUF -> BONS image + the chat tool's tokenizer. `make convert GGUF=... CHANNELS=16`.
 GGUF     ?= models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf
 CHANNELS ?= 16
 convert:
-	$(PYTHON) -m trixium.cli convert $(GGUF) --channels $(CHANNELS)
-	$(PYTHON) -m trixium.cli tokenizer $(dir $(GGUF))tokenizer.json
+	$(PYTHON) -m software.cli convert $(GGUF) --channels $(CHANNELS)
+	$(PYTHON) -m software.cli tokenizer $(dir $(GGUF))tokenizer.json
 
 # Tests --------------------------------------------------------------------------------------------
 
@@ -68,9 +68,9 @@ SIM_DIR    = build/sim_$(SIM_BOARD)
 
 .PHONY: sim sim-run sim-firmware sim-gate
 sim:
-	$(PYTHON) -m trixium.targets.sim --board $(SIM_BOARD) --image $(SIM_IMAGE) --build-software
+	$(PYTHON) -m trixium_sim --board $(SIM_BOARD) --image $(SIM_IMAGE) --build-software
 	$(MAKE) -C firmware BUILD_DIR=../$(SIM_DIR)
-	$(PYTHON) -m trixium.targets.sim --board $(SIM_BOARD) --image $(SIM_IMAGE) --firmware firmware/trixium.bin
+	$(PYTHON) -m trixium_sim --board $(SIM_BOARD) --image $(SIM_IMAGE) --firmware firmware/trixium.bin
 	cd $(SIM_DIR)/gateware && bash build_sim.sh
 
 sim-run:
@@ -107,10 +107,10 @@ firmware:
 	$(MAKE) -C firmware BUILD_DIR=../build/$(BUILD)
 
 software:
-	$(MAKE) -C trixium/software/user BUILD_DIR=../../../build/$(BUILD)
+	$(MAKE) -C software/user BUILD_DIR=../../../build/$(BUILD)
 
 driver:
-	$(MAKE) -C trixium/software/kernel
+	$(MAKE) -C software/kernel
 
 # Cleanup ------------------------------------------------------------------------------------------
 

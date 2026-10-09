@@ -21,10 +21,10 @@ import pytest
 
 from migen import *
 
-from trixium import layout
-from trixium.model import bitexact as bx
-from trixium.model.bons import TensorSpec, encode_rows
-from trixium.core.pipe import ChannelPipe, KIND_OP_AXPY
+from model import layout
+from model import bitexact as bx
+from model.bons import TensorSpec, encode_rows
+from gateware.core.pipe import ChannelPipe, KIND_OP_AXPY
 
 
 # Helpers ------------------------------------------------------------------------------------------

@@ -36,8 +36,8 @@ from litedram.common import LiteDRAMNativePort
 from litedram.frontend.axi import LiteDRAMAXI2Native
 from litedram.frontend.adapter import LiteDRAMNativePortConverter
 
-from trixium.memory.axi import AXIReader
-from trixium.memory.axi import AXIWriter
+from gateware.memory.axi import AXIReader
+from gateware.memory.axi import AXIWriter
 
 # LiteDRAM's native-port memory model, from the LiteDRAM repository's test package.
 import litedram
@@ -119,7 +119,7 @@ def test_engine_port_path_write_then_read():
 def _engine_port(core, axi, port_width):
     """256: the native up-converter; 512: LiteX's beat-wise AXIUpConverter; "512m": the
     merged read bursts (axi_merge.AXIWide)."""
-    from trixium.memory.ddr import engine_ddr_port
+    from gateware.memory.ddr import engine_ddr_port
     if port_width == "512m":
         return engine_ddr_port(core, axi, port_width=512, merge=True)
     return engine_ddr_port(core, axi, port_width=port_width, merge=False)
@@ -296,7 +296,7 @@ def test_engine_port_path_through_the_reset_shim():
     (engreset.py), the shim's port side into LiteDRAMAXI2Native. The shim derives WLAST from
     its own queue of accepted AW lengths; LiteDRAM's bridge, unlike the HBM IP, accepts W
     beats into a FIFO before their AW has fired, which is where the two can disagree."""
-    from trixium.core.reset import EngineResetDomain
+    from gateware.core.reset import EngineResetDomain
 
     class _ShimDUT(Module):
         def __init__(self):
@@ -373,7 +373,7 @@ def test_engine_port_path_short_unaligned_rows(row_beats):
     rows start at every 32-byte phase of the converter's 64-byte word, and the scores stream
     reads them back row by row. Write 8 rows one STORE each, read them back one FETCH each
     and as one long stream: every byte where it was put."""
-    from trixium.core.reset import EngineResetDomain
+    from gateware.core.reset import EngineResetDomain
 
     class _RowDUT(Module):
         def __init__(self):
@@ -455,7 +455,7 @@ def test_engine_port_path_read_right_after_write():
     write; on LiteDRAM the bridge answers B when the data left its FIFO, so this pins that
     a read issued the cycle the writer goes idle still returns the new data, row by row,
     with the previous row's read in flight."""
-    from trixium.core.reset import EngineResetDomain
+    from gateware.core.reset import EngineResetDomain
 
     class _RAWDUT(Module):
         def __init__(self):

@@ -19,9 +19,9 @@ import types
 import numpy as np
 import pytest
 
-from trixium import layout
-from trixium.model import bitexact as bx
-from trixium.model.bons import embed_bfp_rows
+from model import layout
+from model import bitexact as bx
+from model.bons import embed_bfp_rows
 
 
 # Helpers ------------------------------------------------------------------------------------------

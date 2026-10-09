@@ -8,7 +8,7 @@ from migen import If, Signal
 from migen.fhdl import tools as fhdl_tools
 from migen.fhdl.namer import build_namespace
 
-from trixium.migen_fast import linear_group_by_targets, linear_topological_sort
+from gateware.migen_fast import linear_group_by_targets, linear_topological_sort
 
 
 # Helpers ------------------------------------------------------------------------------------------

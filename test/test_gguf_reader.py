@@ -11,7 +11,7 @@ import struct
 
 import numpy as np
 
-from trixium.model.gguf_reader import GGUFReader
+from model.gguf_reader import GGUFReader
 
 ALIGNMENT = 32
 

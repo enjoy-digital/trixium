@@ -14,8 +14,8 @@ import pytest
 from migen import C, Cat, Signal, run_simulation
 from migen.fhdl import verilog
 
-from trixium.core.core import TriXiumConfig
-from trixium.model.hadamard import scratchpad_rotation_descriptor
+from gateware.core.core import TriXiumConfig
+from model.hadamard import scratchpad_rotation_descriptor
 from test_hadamard import dense, packed, unpacked
 from test_integration import SoC, write
 
@@ -100,7 +100,7 @@ def test_sequenced_rotation_invalid_descriptor_is_not_completed(field, value, er
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
 def test_rotation_profile_checks_whole_descriptor_list_before_fetch(base, count):
-    from trixium.core.sequencer import Sequencer
+    from gateware.core.sequencer import Sequencer
     dut = Sequencer(with_hadamard=True, scratchpad_size=16*1024)
     def run():
         yield from write(dut.base, base)
@@ -114,7 +114,7 @@ def test_rotation_profile_checks_whole_descriptor_list_before_fetch(base, count)
 
 
 def test_rotation_descriptor_encoding_and_configuration():
-    from trixium.core.sequencer import Sequencer
+    from gateware.core.sequencer import Sequencer
     assert scratchpad_rotation_descriptor(src=32, signs=64, dst=96, stats=128, blocks=17, inverse=True) == [3, 32, 64, 96, 17, 128, 1] + [0]*9
     for changed in ({'src': 1}, {'signs': -32}, {'dst': 1 << 24}, {'stats': 7}, {'blocks': 0}, {'blocks': 65536}, {'inverse': 2}):
         args = dict(src=32, signs=64, dst=96, stats=128, blocks=1)

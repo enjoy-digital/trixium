@@ -18,7 +18,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.units.activation import Fp32AbsmaxWord, Fp32ToQ8
+from gateware.units.activation import Fp32AbsmaxWord, Fp32ToQ8
 
 
 # Helpers ------------------------------------------------------------------------------------------

@@ -11,10 +11,10 @@ import pytest
 
 from migen import Memory, Module, run_simulation
 
-from trixium.core.core import TriXiumConfig
-from trixium.core.sequencer import Sequencer
-from trixium.model.activation import scratchpad_silu_descriptor, silu_table_image
-from trixium.model.silu_hw import tables
+from gateware.core.core import TriXiumConfig
+from gateware.core.sequencer import Sequencer
+from model.activation import scratchpad_silu_descriptor, silu_table_image
+from model.silu_hw import tables
 from test_hadamard_integration import install_list
 from test_integration import SoC, write
 from test_silu_mul_rtl import stress_vectors

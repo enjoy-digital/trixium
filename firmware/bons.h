@@ -2,7 +2,7 @@
  *
  * TriXium BONS weight image structures
  *
- * Must match trixium/layout.py exactly.
+ * Must match model/layout.py exactly.
  *
  * This file is part of TriXium.
  *

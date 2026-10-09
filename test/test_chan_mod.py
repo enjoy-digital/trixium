@@ -20,12 +20,12 @@ from migen import *
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium import layout
-from trixium.core.scratchpad import Scratchpad
-from trixium.core.engine import MatVecEngine
-from trixium.memory.loader import Loader
-from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
-from trixium.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
+from model import layout
+from gateware.core.scratchpad import Scratchpad
+from gateware.core.engine import MatVecEngine
+from gateware.memory.loader import Loader
+from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
+from model.layout import HBM_CHAN_STRIDE, HBM_WEIGHT_BASE
 
 
 # Helpers ------------------------------------------------------------------------------------------

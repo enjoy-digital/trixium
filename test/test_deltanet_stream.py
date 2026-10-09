@@ -20,7 +20,7 @@ import pytest
 
 from migen.fhdl import verilog
 
-from trixium.units.deltanet_stream import (
+from gateware.units.deltanet_stream import (
     DeltaNetStream, lanes_to_state, reference, state_to_lanes)
 
 f32 = np.float32

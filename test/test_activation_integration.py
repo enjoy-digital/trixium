@@ -14,8 +14,8 @@ import pytest
 from migen import C, Cat, Memory, Module, Signal, run_simulation
 from migen.fhdl import verilog
 
-from trixium.core.core import TriXiumConfig
-from trixium.model.activation import scratchpad_quantize_descriptor, scratchpad_requantize_descriptor
+from gateware.core.core import TriXiumConfig
+from model.activation import scratchpad_quantize_descriptor, scratchpad_requantize_descriptor
 from test_activation_sp import bits, pack, reference
 from test_hadamard_integration import install_list
 from test_integration import SoC, write
@@ -44,7 +44,7 @@ def test_activation_descriptor_and_configuration():
 
 @pytest.mark.parametrize('base,count', [(1, 1), (0xffffe0, 1), (0, 65535), (0x3fe0, 1)])
 def test_quantization_only_profile_validates_full_list_before_fetch(base, count):
-    from trixium.core.sequencer import Sequencer
+    from gateware.core.sequencer import Sequencer
     dut = Sequencer(with_activation_quantize=True, scratchpad_size=16*1024)
     def run():
         yield from write(dut.base, base)
@@ -59,7 +59,7 @@ def test_quantization_only_profile_validates_full_list_before_fetch(base, count)
 
 @pytest.mark.parametrize('failure', [0, 128])
 def test_requantization_dispatch_without_hadamard_and_completion_publication(failure):
-    from trixium.core.sequencer import Sequencer
+    from gateware.core.sequencer import Sequencer
     dut = Module()
     dut.submodules.seq = seq = Sequencer(with_activation_quantize=True)
     words = scratchpad_requantize_descriptor(src=0x10000, dst=0x8000, exponents=0x800,

@@ -16,8 +16,8 @@ from migen.fhdl import verilog
 
 from litex.gen import LiteXModule
 
-from trixium.units.restore import ProjectionRestoreScratchpad
-from trixium.core.scratchpad import Scratchpad
+from gateware.units.restore import ProjectionRestoreScratchpad
+from gateware.core.scratchpad import Scratchpad
 from test_projection_restore import expected
 
 

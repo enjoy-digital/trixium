@@ -12,9 +12,9 @@ from migen import run_simulation
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.core.core import TriXiumConfig, TriXiumCore
-from trixium.memory.hbm_model import HBMChannelModel
-from trixium.model import asm
+from gateware.core.core import TriXiumConfig, TriXiumCore
+from gateware.memory.hbm_model import HBMChannelModel
+from model import asm
 
 
 # Helpers ------------------------------------------------------------------------------------------

@@ -25,7 +25,7 @@ int engine_wedged; // Sticky: an op never completed, so engine results are not t
 /*----------*/
 
 // Soft reset of the engine cluster (engine, loader, sequencer, vector unit): the `eng` clock
-// domain, trixium/core/reset.py. The HBM ports stay whole behind their AXI shims; the
+// domain, gateware/core/reset.py. The HBM ports stay whole behind their AXI shims; the
 // scratchpad, the vector programs and the descriptor lists survive. Returns 0 when the ports
 // drained, -1 when a port never answers (the shim's `stuck`: the FPGA needs a reconfigure) or
 // the drain timed out.

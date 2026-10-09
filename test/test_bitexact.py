@@ -9,7 +9,7 @@
 
 import numpy as np
 
-from trixium.model import bitexact as bx
+from model import bitexact as bx
 
 def test_rne_shift():
     # Ties to even, floor base, negatives.

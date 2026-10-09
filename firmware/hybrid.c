@@ -12,7 +12,7 @@
  * The hybrid models (Bonsai 2 = Qwen3.5: Gated DeltaNet layers, gated attention with partial
  * RoPE, PrismML's rotated weight basis). The CPU path does float math over main_ram with the
  * engine for every matvec (the projections and the rotation blocks): the golden's semantics
- * (trixium/model/golden.py) transliterated, gated on the tiny hybrid model in the Verilator
+ * (model/golden.py) transliterated, gated on the tiny hybrid model in the Verilator
  * sim, and the reference the hardware paths are checked against. Where the bitstream has the
  * units, the same layers run as scratchpad descriptor lists (resident.c), the DeltaNet stream
  * (engine op 5) and the attention stream (engine op 6) - bit-exact with the CPU path.

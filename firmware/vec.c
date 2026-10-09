@@ -18,7 +18,7 @@
 #include "perf.h"
 #include "progs.h"
 
-// The microcode encoding must be the bitstream's (trixium/model/asm.py). The Makefile
+// The microcode encoding must be the bitstream's (model/asm.py). The Makefile
 // regenerates progs.h per build tree; this catches a stale header at build time.
 #ifndef TRIXIUM_VEC_VREGS
 #define TRIXIUM_VEC_VREGS 8

@@ -22,10 +22,10 @@ import pytest
 
 from migen import *
 
-from trixium.model import asm
-from trixium.core.scratchpad import Scratchpad
-from trixium.core.vector import VectorUnit
-from trixium.memory.hbm_model import words_from_bytes
+from model import asm
+from gateware.core.scratchpad import Scratchpad
+from gateware.core.vector import VectorUnit
+from gateware.memory.hbm_model import words_from_bytes
 
 SP_SIZE = 16*1024
 SRC0, SRC1, DST = 0x0000, 0x0800, 0x1000

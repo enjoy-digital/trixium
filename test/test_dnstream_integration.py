@@ -19,7 +19,7 @@ from migen import run_simulation
 
 from litex.gen import LiteXModule
 
-from trixium.core.core import TriXiumConfig
+from gateware.core.core import TriXiumConfig
 from test_integration import SoC, write
 
 MASK = 0xFFFFFFFF

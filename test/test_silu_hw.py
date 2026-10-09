@@ -17,8 +17,8 @@ import random
 import numpy as np
 import pytest
 
-from trixium.model import rv32_math
-from trixium.model.silu_hw import (
+from model import rv32_math
+from model.silu_hw import (
     F32_16, LUT_N, bits_f32, decode, f32_add, f32_bits, f32_fma, f32_mul, f32_sub,
     silu_mul_fast, silu_mul_firmware, tables,
 )
@@ -140,7 +140,7 @@ def test_fast_path_never_needs_subnormal_fma_operands():
 
 def test_fixed_point_structure_equals_the_float_model():
     """a20 is exact, i/f come out of it by shifts, and the restricted FMA equals f32_fma."""
-    from trixium.model.silu_hw import add16_fixed, silu_mul_fixed
+    from model.silu_hw import add16_fixed, silu_mul_fixed
     lut, dlut = tables()
     grid = [g for g in firmware_grid() if (g & 0x7FFFFFFF) < F32_16]
     for g in grid:

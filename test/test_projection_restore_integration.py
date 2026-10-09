@@ -8,10 +8,10 @@ import pytest
 
 from migen import Memory, Module, run_simulation
 
-from trixium.core.core import TriXiumConfig
-from trixium.core.sequencer import Sequencer
-from trixium.model.activation import scratchpad_restore_descriptor
-from trixium.model import asm
+from gateware.core.core import TriXiumConfig
+from gateware.core.sequencer import Sequencer
+from model.activation import scratchpad_restore_descriptor
+from model import asm
 from test_projection_restore import expected
 from test_projection_restore_sp import pack
 from test_hadamard_integration import install_list

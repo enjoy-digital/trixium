@@ -14,8 +14,8 @@ from migen import *
 
 from litex.gen import LiteXModule
 
-from trixium.units.activation import ActivationScratchpad
-from trixium.core.scratchpad import Scratchpad
+from gateware.units.activation import ActivationScratchpad
+from gateware.core.scratchpad import Scratchpad
 from test_activation_quantize import bits, expected
 
 

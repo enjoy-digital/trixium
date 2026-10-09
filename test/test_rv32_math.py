@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from trixium.model.rv32_math import (
+from model.rv32_math import (
     expf_rv32, expf_bounded, fma32, sigmoid_rv32, sigmoid_table, silu_polynomial, silu_rv32,
     softmax_exp_rv32,
     silu_table,

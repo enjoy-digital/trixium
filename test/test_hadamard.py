@@ -17,7 +17,7 @@ import pytest
 from migen import run_simulation
 from migen.fhdl import verilog
 
-from trixium.units.hadamard import IntegerHadamard
+from gateware.units.hadamard import IntegerHadamard
 
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -137,7 +137,7 @@ def test_integer_hadamard_extremes_reuse_and_dense_rate():
 
 
 def test_integer_hadamard_matches_dense_engine_rotation_contract():
-    from trixium.model import bitexact as bx
+    from model import bitexact as bx
 
     size = 1024
     rng = np.random.default_rng(2714)

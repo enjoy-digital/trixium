@@ -26,9 +26,9 @@ from migen import Signal, Mux
 
 from litex.gen import LiteXModule
 
-from trixium.core.scratchpad import Scratchpad
-from trixium.units.silu import SiluScratchpad, LOAD_BEATS, OP_LOAD, OP_RUN, SILU_COMMAND
-from trixium.model.silu_hw import LUT_N, silu_mul_fixed, tables
+from gateware.core.scratchpad import Scratchpad
+from gateware.units.silu import SiluScratchpad, LOAD_BEATS, OP_LOAD, OP_RUN, SILU_COMMAND
+from model.silu_hw import LUT_N, silu_mul_fixed, tables
 from test_silu_mul_rtl import stress_vectors
 
 SENTINEL = 0xDEADBEEF
@@ -310,7 +310,7 @@ def test_compiled_full_scratchpad_image(tmp_path):
 
 def sigmoid_tables():
     """The canonical sigmoid table (firmware/fastmath.h) in the unit's lut/dlut form."""
-    from trixium.model.rv32_math import sigmoid_table
+    from model.rv32_math import sigmoid_table
     lut = np.asarray(sigmoid_table(), dtype=np.float32)
     dlut = (lut[1:] - lut[:-1]).astype(np.float32)
     return [int(x) for x in lut.view(np.uint32)], [int(x) for x in dlut.view(np.uint32)]
@@ -320,7 +320,7 @@ def test_compiled_table_only_sigmoid(tmp_path):
     """ABI 1.2: a sigmoid table, table only - the attention output gate o *= sigmoid(g).
     Every non-fixup element equals the firmware's m * trixium_sigmoid_lookup(g)."""
     from rtl_client import build_client, run_client
-    from trixium.model.rv32_math import sigmoid_rv32
+    from model.rv32_math import sigmoid_rv32
     size = 256*1024
     binary = build_client(SiluScratchpad(size), SILU_COMMAND, tmp_path, "silu_sp")
     rng = np.random.default_rng(21)

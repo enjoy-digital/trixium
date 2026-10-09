@@ -18,7 +18,7 @@ import pytest
 
 from migen.fhdl import verilog
 
-from trixium.units.attention_stream import (
+from gateware.units.attention_stream import (
     AttentionStream, MODE_SCORES, MODE_VALUES, scores_reference, values_reference)
 
 f32 = np.float32

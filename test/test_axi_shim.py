@@ -20,10 +20,10 @@ from migen.sim import run_simulation
 
 from litex.soc.interconnect.axi import AXIInterface
 
-from trixium.memory.axi import AXIResetShim
-from trixium.memory.axi import AXIReader
-from trixium.memory.axi import AXIWriter
-from trixium.memory.hbm_model import HBMChannelModel, words_from_bytes
+from gateware.memory.axi import AXIResetShim
+from gateware.memory.axi import AXIReader
+from gateware.memory.axi import AXIWriter
+from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 
 # Helpers ------------------------------------------------------------------------------------------

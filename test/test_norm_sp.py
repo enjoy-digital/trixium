@@ -9,7 +9,7 @@
 import numpy as np
 import pytest
 
-from trixium.units.norm import NORM_COMMAND, OP_L2, OP_RMS, NormScratchpad
+from gateware.units.norm import NORM_COMMAND, OP_L2, OP_RMS, NormScratchpad
 from rtl_client import build_client, run_client
 
 f32 = np.float32

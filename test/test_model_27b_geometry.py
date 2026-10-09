@@ -20,8 +20,8 @@ model with the reason instead of building a wrong image.
 
 import pytest
 
-from trixium.model.configs import BONSAI_8B
-from trixium.model.golden import config_from_gguf, check_engine_support
+from model.configs import BONSAI_8B
+from model.golden import config_from_gguf, check_engine_support
 
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -95,7 +95,7 @@ def test_27b_layer_pattern_and_dimensions():
     assert cfg.vocab_padded(16) == 248320
     # 48 DeltaNet layers x 48 value heads = 2304 whole 128x128 FP32 matrices;
     # striped evenly over 16 channels, that is 144 x 64 KiB per channel.
-    from trixium import layout
+    from model import layout
     assert layout.deltanet_state_bytes_per_channel(cfg, 16) == 144*128*128*4
 
 
@@ -114,7 +114,7 @@ def test_hadamard_rotation_algebra():
     as W' = W diag(s) R sees its input as R (s * x) and reproduces W x; the embedding table
     stored as z = R (s * e) is restored by s * (R z)."""
     import numpy as np
-    from trixium.model.golden import hadamard_matrix, hadamard_rotate, hadamard_restore
+    from model.golden import hadamard_matrix, hadamard_rotate, hadamard_restore
     rng   = np.random.default_rng(3)
     block = 16
     width = 3*block
@@ -136,10 +136,10 @@ def test_hadamard_block_tensors_match_the_golden():
     """The converter's ROLE_HADAMARD block tensors, dequantized and applied blockwise, are
     the golden's hadamard_rotate - so an engine matvec per block rotates like the reference."""
     import numpy as np
-    from trixium import layout
-    from trixium.model.configs import BONSAI_TINY_HYBRID
-    from trixium.model.tinygen import make_tiny_hybrid_tensors
-    from trixium.model.golden import hadamard_rotate
+    from model import layout
+    from model.configs import BONSAI_TINY_HYBRID
+    from model.tinygen import make_tiny_hybrid_tensors
+    from model.golden import hadamard_rotate
     cfg   = BONSAI_TINY_HYBRID
     specs = {s.name: s for s in make_tiny_hybrid_tensors(cfg, 7)}
     rng   = np.random.default_rng(9)

@@ -15,13 +15,13 @@ import subprocess
 import numpy as np
 import pytest
 
-from trixium import layout
-from trixium.model import bitexact as bx
-from trixium.model.bons import BONSReader
+from model import layout
+from model import bitexact as bx
+from model.bons import BONSReader
 
 SIM_DIR = "build/sim/gateware"
 # Override to gate against a different channel count (rebuild the sim with the same
-# image first: TRIXIUM_SIM_IMAGE=... python3 trixium/targets/sim.py).
+# image first: TRIXIUM_SIM_IMAGE=... python3 trixium_sim.py).
 IMAGE   = os.environ.get("TRIXIUM_SIM_IMAGE", "models/tiny/bonsai-tiny-n2.img")
 
 def fnv1a(data):
@@ -59,7 +59,7 @@ def test_sim_selftest_checksums():
 
     # Per-program CRC sweep vs the interpreter (named failure per program).
     import re as _re
-    from trixium.model import asm as _vasm
+    from model import asm as _vasm
     sp = bytearray(256*1024)
     seed = 0x12345678
     for i in range(1024):
@@ -136,7 +136,7 @@ def hybrid_generate(img, prompt, n_new, modes=None, trace=None):
     int16 scratchpad-resident activations with integer exponent algebra, float32 CPU op
     math mirroring the soft-float firmware, per-op cpu/hw switches (hw ops run the actual
     microcode interpreter). modes: dict op->"cpu"|"hw" (default all-cpu)."""
-    from trixium.model import asm as vasm
+    from model import asm as vasm
     h    = img.header
     f32  = np.float32
     E_NORM = -11

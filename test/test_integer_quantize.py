@@ -10,7 +10,7 @@ import pytest
 
 from migen import run_simulation
 
-from trixium.units.activation import IntegerToQ8
+from gateware.units.activation import IntegerToQ8
 
 
 # Helpers ------------------------------------------------------------------------------------------

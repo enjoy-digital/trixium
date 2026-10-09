@@ -9,7 +9,7 @@
 
 import numpy as np
 
-from trixium.model.qformats import (
+from model.qformats import (
     QK_Q2_0, BLOCK_Q2_0, q2_0_pack, q2_0_unpack, q2_0_dequant,
     QK_Q8_0, q8_0_pack, q8_0_unpack, q8_0_dequant, q8_0_quant,
 )
@@ -73,7 +73,7 @@ def test_q8_0_quant_dequant_close():
     assert np.abs(w - wq).max() < 0.02 # |err| <= d/2 with d ~= amax/127.
 
 def test_q1_0_roundtrip_and_semantics():
-    from trixium.model.qformats import (
+    from model.qformats import (
         QK_Q1_0, BLOCK_Q1_0, q1_0_pack, q1_0_unpack, q1_0_dequant, q1_0_to_ternary_codes)
     rng    = np.random.default_rng(9)
     nb     = 6
@@ -103,7 +103,7 @@ def test_q1_0_roundtrip_and_semantics():
 
 def _ptq1_0_decode_reference(raw):
     """Straight port of dequantize_row_ptq1_0 (ggml-quants.c, prism branch), scalar."""
-    from trixium.model.qformats import BLOCK_PTQ1_0
+    from model.qformats import BLOCK_PTQ1_0
     raw = np.frombuffer(raw, dtype=np.uint8)
     pow3 = [1, 3, 9, 27, 81, 243]
     out = []
@@ -126,7 +126,7 @@ def _ptq1_0_decode_reference(raw):
 
 
 def test_ptq1_0_pack_unpack_matches_c_reference():
-    from trixium.model.qformats import ptq1_0_pack, ptq1_0_unpack, ptq1_0_dequant, BLOCK_PTQ1_0
+    from model.qformats import ptq1_0_pack, ptq1_0_unpack, ptq1_0_dequant, BLOCK_PTQ1_0
     rng    = np.random.default_rng(7)
     codes  = rng.integers(0, 3, (37, 128), dtype=np.uint8)
     scales = rng.uniform(0.01, 0.1, 37).astype(np.float16)
@@ -142,7 +142,7 @@ def test_ptq1_0_pack_unpack_matches_c_reference():
 
 
 def test_ptq1_0_and_pq2_0_agree_on_the_same_weights():
-    from trixium.model.qformats import (ptq1_0_pack, ptq1_0_dequant, q2_0_pack, q2_0_dequant,
+    from model.qformats import (ptq1_0_pack, ptq1_0_dequant, q2_0_pack, q2_0_dequant,
                                              DEQUANT, GGML_PQ2_0, GGML_PTQ1_0, GGML_Q2_0)
     rng    = np.random.default_rng(8)
     codes  = rng.integers(0, 3, (16, 128), dtype=np.uint8)
@@ -153,7 +153,7 @@ def test_ptq1_0_and_pq2_0_agree_on_the_same_weights():
 
 
 def test_q2_0_group_detection():
-    from trixium.model.qformats import q2_0_group
+    from model.qformats import q2_0_group
     assert q2_0_group(np.zeros(34*10, np.uint8), 1280) == 128
     assert q2_0_group(np.zeros(18*20, np.uint8), 1280) == 64
     import pytest

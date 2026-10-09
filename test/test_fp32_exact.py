@@ -16,7 +16,7 @@ import pytest
 from migen import Module, Signal, run_simulation
 from migen.fhdl import verilog
 
-from trixium.units.fp32 import CANONICAL_NAN, FP32Add, FP32DivSqrt, FP32Mul
+from gateware.units.fp32 import CANONICAL_NAN, FP32Add, FP32DivSqrt, FP32Mul
 
 f32 = np.float32
 
