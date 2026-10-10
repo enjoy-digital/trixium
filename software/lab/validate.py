@@ -10,7 +10,7 @@ build/validate/<step>.log and the summary goes to build/validate/summary.txt; a 
 not stop the independent ones.
 
   trixium validate                                  # everything
-  trixium validate --steps sim,tests                # a subset of: build-xcu1525 build-fk33
+  trixium validate --steps sim,tests                # a subset of: build-xcu1525 build-fk33 build-ypcb
                                                     #   tests sim board board-fk33
 
 Long: run it detached, e.g.
@@ -34,7 +34,7 @@ import subprocess
 # Paths --------------------------------------------------------------------------------------------
 
 REPO  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-STEPS = ["build-xcu1525", "build-fk33", "tests", "sim", "board", "board-fk33"]
+STEPS = ["build-xcu1525", "build-fk33", "build-ypcb", "tests", "sim", "board", "board-fk33"]
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -90,7 +90,7 @@ def utilization(build):
     for path in glob.glob(os.path.join(REPO, "build", build, "gateware", "*utilization_place.rpt")):
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
-                if re.match(r"\| (CLB LUTs|LUT as Logic)", line):
+                if re.match(r"\| (CLB LUTs|Slice LUTs|LUT as Logic)", line):
                     return " ".join(line.split())
     return ""
 
@@ -112,6 +112,8 @@ def sim(v):
     rc = v.run("sim-fk33", [sys.executable, "trixium_sim.py", "--build", "--board", "fk33",
         "--image", "models/tiny/bonsai-tiny-n8.img"])
     v.note("sim-fk33", "BUILT" if rc == 0 else "BUILD FAIL")
+    rc = v.run("sim-ypcb", [sys.executable, "trixium_sim.py", "--build", "--board", "ypcb"])
+    v.note("sim-ypcb", "BUILT" if rc == 0 else "BUILD FAIL")
 
 
 def deploy(v, name, *args):
@@ -156,6 +158,10 @@ def validate(steps, out):
         while free_gb() < 20:
             time.sleep(60)
         builds["fk33"] = v.start("build-fk33", [sys.executable, "trixium_fk33.py", "--build", "--output-dir", "build/fk33"])
+    if "build-ypcb" in steps:
+        while free_gb() < 12:
+            time.sleep(60)
+        builds["ypcb"] = v.start("build-ypcb", [sys.executable, "trixium_ypcb.py", "--build", "--output-dir", "build/ypcb"])
 
     # Tests and simulation, while the bitstreams build.
     if "tests" in steps:

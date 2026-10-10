@@ -318,7 +318,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
             gate = timing + ["--experiment", "--serializer-baseline", serializer_baseline] + \
                 (["--approval", approval] if approval else []) + [report]
         elif board == "ypcb":
-            gate = timing + ["--strict", report]
+            gate = timing + ["--strict", "--board", "ypcb", report]
         else:
             gate = timing + [report]
         if remote.local(gate, check=False):

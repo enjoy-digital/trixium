@@ -153,7 +153,7 @@ def test_targets_use_one_cluster_implementation():
     Internal Migen names are allowed to change, but require fresh physical gates.
     """
     root = ROOT
-    for fname in ("trixium_fk33.py", "trixium_xcu1525.py", "trixium_sim.py"):
+    for fname in ("trixium_fk33.py", "trixium_xcu1525.py", "trixium_ypcb.py", "trixium_sim.py"):
         tree = ast.parse((root / fname).read_text())
         calls = [node.func.id for node in ast.walk(tree)
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
@@ -166,3 +166,47 @@ def test_targets_use_one_cluster_implementation():
     assert "vecunit.seq_seed7.eq(seq.vec_seed7)" in portable
     assert "platform.add_ip" not in portable
     assert "add_platform_command" not in portable
+
+# YPCB ---------------------------------------------------------------------------------------------
+
+def test_ypcb_windows_and_banks():
+    """The YPCB's four channel windows: two per 2 GB controller, inside it, above main_ram and
+    the header staging area, and the two windows of a controller four DDR3 banks apart at every
+    offset under LiteDRAM's ROW_BANK_COL mapping (8 KB rows on a 64-bit channel: bank = byte
+    address bits 13..15), so its two crossbar ports never meet in a bank."""
+    import inspect
+    from trixium_ypcb import TriXiumYPCBSoC, YPCBDDR3
+    from model.layout import HBM_WEIGHT_BASE
+
+    d        = {k: v.default for k, v in inspect.signature(TriXiumYPCBSoC.__init__).parameters.items()}
+    chan_mod = d["engine_channels"]//2
+    module   = YPCBDDR3(400e6/3, "1:4")
+    g        = module.geom_settings
+    ctrl     = (1 << (g.bankbits + g.rowbits + g.colbits))*8
+    assert ctrl == 2 << 30
+    row_bytes = (1 << g.colbits)*8
+    assert row_bytes == 8192
+
+    def bank(addr):
+        return (addr // row_bytes) % (1 << g.bankbits)
+
+    windows = []
+    for j in range(chan_mod):
+        base = HBM_WEIGHT_BASE + j*d["chan_stride"] + j*d["chan_skew"]
+        end  = HBM_WEIGHT_BASE + (j + 1)*d["chan_stride"] - (HBM_WEIGHT_BASE % d["chan_stride"])
+        windows.append((base, end))
+    assert windows[0][0] >= d["main_ram_size"] + 0x100000  # Staging MB above main_ram.
+    assert windows[-1][1] <= ctrl
+    assert all(a[1] <= b[0] for a, b in zip(windows, windows[1:]))
+    for off in range(0, 1 << 20, 4096):
+        assert (bank(windows[1][0] + off) - bank(windows[0][0] + off)) % 8 == 4
+
+
+def test_ypcb_crg_clocks():
+    """One MMCM on the 50 MHz oscillator: sys 150, ddr 133.33 (DDR3-1066), IDELAY 200 MHz."""
+    from litex_boards.platforms.ypcb_00338_1p1 import Platform
+    from trixium_ypcb import _CRG
+    crg = _CRG(Platform(), 150e6, 400e6/3)
+    freqs = sorted(round(v[1]/1e6, 2) for v in crg.pll.clkouts.values())
+    assert freqs == [133.33, 150.0, 200.0]
+    assert crg.pll.clkin_freq == 50e6

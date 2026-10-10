@@ -41,6 +41,9 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 #define SDRAM_TEST_DISABLE              // No main_ram memtest at the end of sdram_init().
 #include <liblitedram/sdram.c>          // The BIOS's init and calibration, at our base.
 #include <liblitedram/accessors.c>      // The PHY delay accessors the leveling uses.
+#ifdef TRIXIUM_DDR_S7HR
+#include "ddr_s7hr.c"                   // sdram_custom_init(): the YPCB's DDR3 calibration.
+#endif
 
 #include "engine.h"
 #include "ddr.h"
@@ -58,6 +61,14 @@ int ddr_init(int k)
         printf("ddr: controller %d does not exist (0..%d)\n", k, TRIXIUM_N_MEMCTRL - 1);
         return 0;
     }
+#ifdef TRIXIUM_DDR_S7HR
+    // The calibration takes the controller out of hardware control for seconds: never the one
+    // the firmware runs from (the BIOS calibrates controller 0).
+    if (k == 0) {
+        printf("ddr: controller 0 holds main_ram (the BIOS calibrates it)\n");
+        return 0;
+    }
+#endif
     ddr_csr_base = ddr_csr_base0 + (unsigned long)k*TRIXIUM_DDR_CSR_STRIDE;
     printf("ddr: controller %d (CSRs at %08lx)\n", k, (unsigned long)CSR_SDRAM_BASE);
     int ok = sdram_init();

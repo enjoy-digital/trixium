@@ -50,6 +50,7 @@ from litex.soc.integration.soc import SoCRegion, SoCCSRRegion
 from litedram.core import LiteDRAMCore
 from litedram.frontend.axi import LiteDRAMAXI2Native
 from litedram.frontend.wishbone import LiteDRAMWishbone2Native
+from litedram.frontend.bist import LiteDRAMBISTGenerator, LiteDRAMBISTChecker
 
 from gateware.memory.axi import AXIWide
 
@@ -178,9 +179,18 @@ class _DDRCSRHolder(Module):
 # DDR Domain Controllers ---------------------------------------------------------------------------
 
 def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_size,
-                               csr_window, phy_renames={"sys": "ddr"}):
+                               csr_window, phy_renames={"sys": "ddr"}, controller_settings=None,
+                               with_bist=False):
     """Add one LiteDRAM controller per phy/module in the `ddr` domain (controller 0 carries
-    main_ram). Fills soc.sdrams; returns the per-controller memory sizes."""
+    main_ram). Fills soc.sdrams; returns the per-controller memory sizes.
+
+    controller_settings: a function returning the ControllerSettings of a controller (one
+                         instance each), None for LiteDRAM's defaults.
+    with_bist:           a LiteDRAM BIST generator/checker per controller on its own crossbar
+                         port (sdram_generator{k}/sdram_checker{k}), for the calibration's
+                         traffic test; their CSR pages follow the controller's two, so
+                         controller k's CSRs sit at controller 0's + k*4 pages.
+    """
     n            = len(phys)
     holder       = _DDRCSRHolder()
     memory_sizes = []
@@ -191,13 +201,26 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
         g   = module.geom_settings
         memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits)) *
                             phy.settings.nranks*phy.settings.databits//8)
+        core_kwargs = {}
+        if controller_settings is not None:
+            core_kwargs["controller_settings"] = controller_settings()
         core = LiteDRAMCore(phy=phy, geom_settings=module.geom_settings,
-                            timing_settings=module.timing_settings, clk_freq=clk_freq)
+                            timing_settings=module.timing_settings, clk_freq=clk_freq,
+                            **core_kwargs)
         setattr(holder, f"ddrphy{sfx}", phy)
         setattr(holder, f"sdram{sfx}", core)
         soc.submodules += ClockDomainsRenamer(phy_renames)(phy)
         soc.submodules += ClockDomainsRenamer({"sys": "ddr", "sys_port": "sys"})(core)
         soc.sdrams.append(core)
+    if with_bist:
+        for i, core in enumerate(soc.sdrams):
+            sfx = "" if i == 0 else str(i)
+            generator = LiteDRAMBISTGenerator(core.crossbar.get_port())
+            checker   = LiteDRAMBISTChecker(core.crossbar.get_port())
+            setattr(holder, f"sdram_generator{sfx}", generator)
+            setattr(holder, f"sdram_checker{sfx}",   checker)
+            soc.submodules += ClockDomainsRenamer("ddr")(generator)
+            soc.submodules += ClockDomainsRenamer("ddr")(checker)
     soc.submodules += holder
     core0 = soc.sdrams[0]
     # The builder writes sdram_phy.h from soc.sdram.controller.settings; the CSR bridge's
@@ -237,11 +260,16 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
         soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=soc.l2_cache.slave, port=port,
                                                       base_address=base)
 
-    # The ddr-domain CSR bus: sdram{k} on page 2k, ddrphy{k} on 2k + 1.
+    # The ddr-domain CSR bus: sdram{k} on page 2k, ddrphy{k} on 2k + 1 (with the BIST: 4k,
+    # 4k + 1, then its generator and checker).
     pages = {}
     for i in range(n):
         sfx = "" if i == 0 else str(i)
-        pages[f"sdram{sfx}"], pages[f"ddrphy{sfx}"] = 2*i, 2*i + 1
+        if with_bist:
+            pages[f"sdram{sfx}"], pages[f"ddrphy{sfx}"] = 4*i, 4*i + 1
+            pages[f"sdram_generator{sfx}"], pages[f"sdram_checker{sfx}"] = 4*i + 2, 4*i + 3
+        else:
+            pages[f"sdram{sfx}"], pages[f"ddrphy{sfx}"] = 2*i, 2*i + 1
     bank = csr_bus.CSRBankArray(holder, lambda name, memory: pages[name],
         data_width=soc.csr.data_width, address_width=soc.csr.address_width,
         alignment=soc.csr.alignment, paging=soc.csr.paging, ordering=soc.csr.ordering)
@@ -249,11 +277,12 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
     assert not bank.srams
     by_page = {mapaddr: b for (_, _, mapaddr, b) in bank.banks}
     # (LiteDRAM's PHY model has no CSRs: its ddrphy page is then empty.)
-    groups = [[by_page[p].bus for p in (2*i, 2*i + 1) if p in by_page] for i in range(n)]
+    per = 4 if with_bist else 2
+    groups = [[by_page[p].bus for p in range(per*i, per*i + per) if p in by_page] for i in range(n)]
     bridge = PipelinedDDRCSR(wb, groups, soc.csr.address_width, soc.csr.data_width)
     soc.submodules += ClockDomainsRenamer("ddr")(bank)
     soc.submodules += ClockDomainsRenamer("ddr")(bridge)
-    window = soc.csr.paging*2*n
+    window = soc.csr.paging*per*n
     soc.bus.add_slave(name="ddrcsr", slave=wb,
         region=SoCRegion(origin=csr_window, size=max(window, 0x10000), cached=False),
         clock_domain="ddr")
