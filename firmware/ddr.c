@@ -42,6 +42,8 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 #include <liblitedram/sdram.c>          // The BIOS's init and calibration, at our base.
 #include <liblitedram/accessors.c>      // The PHY delay accessors the leveling uses.
 #ifdef TRIXIUM_DDR_S7HR
+#include "static_memory.h"
+#define S7HR_STATE_ADDR TRIXIUM_DDR_CAL_ADDR   // The scan state in main_ram (SRAM keeps the stack).
 #include "ddr_s7hr.c"                   // sdram_custom_init(): the YPCB's DDR3 calibration.
 #endif
 

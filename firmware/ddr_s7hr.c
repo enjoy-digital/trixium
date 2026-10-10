@@ -91,7 +91,30 @@ struct s7hr_result {
     uint32_t bist_errors;             // Final BIST.
 };
 
-static struct s7hr_result s7hr;
+// Per-bit summary of one write latency's scan: the widest window over the read bitslips.
+struct s7hr_best {
+    uint8_t len, start, bitslip;
+};
+
+// The calibration's state (~3.5 KB): in the BIOS's .bss (SRAM), in the firmware at
+// S7HR_STATE_ADDR (ddr.c: the main_ram static window; the firmware's .bss is SRAM, kept for the
+// stack). Not zeroed: everything is written before it is read.
+struct s7hr_state {
+    struct s7hr_result result;
+    uint32_t scan[S7HR_BITSLIPS][S7HR_BITS];      // Passing taps per (read bitslip, bit).
+    struct s7hr_best wl_best[S7HR_WLS][S7HR_BITS]; // Per write latency, per bit.
+};
+
+#ifdef S7HR_STATE_ADDR
+#define S7HR_STATE ((struct s7hr_state *)(S7HR_STATE_ADDR))
+_Static_assert(sizeof(struct s7hr_state) <= 0x1000, "the static_memory.h window is 4 KB");
+#else
+static struct s7hr_state s7hr_state;
+#define S7HR_STATE (&s7hr_state)
+#endif
+#define s7hr         (S7HR_STATE->result)
+#define s7hr_scan    (S7HR_STATE->scan)
+#define s7hr_wl_best (S7HR_STATE->wl_best)
 
 /* PHY Helpers */
 /*-------------*/
@@ -319,14 +342,6 @@ static int s7hr_window(uint32_t mask, int *start)
     }
     return best;
 }
-
-// Per-bit summary of one write latency's scan: the widest window over the read bitslips.
-struct s7hr_best {
-    uint8_t len, start, bitslip;
-};
-
-static uint32_t s7hr_scan[S7HR_BITSLIPS][S7HR_BITS]; // Passing taps per (read bitslip, bit).
-static struct s7hr_best s7hr_wl_best[S7HR_WLS][S7HR_BITS];
 
 static void s7hr_read_scan(void)
 {

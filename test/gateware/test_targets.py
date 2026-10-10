@@ -192,7 +192,7 @@ def test_ypcb_windows_and_banks():
 
     windows = []
     for j in range(chan_mod):
-        base = HBM_WEIGHT_BASE + j*d["chan_stride"] + j*d["chan_skew"]
+        base = HBM_WEIGHT_BASE + j*d["chan_stride"] + j*(d["chan_skew"] or 0x10000//chan_mod)
         end  = HBM_WEIGHT_BASE + (j + 1)*d["chan_stride"] - (HBM_WEIGHT_BASE % d["chan_stride"])
         windows.append((base, end))
     assert windows[0][0] >= d["main_ram_size"] + 0x100000  # Staging MB above main_ram.

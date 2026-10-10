@@ -583,3 +583,180 @@ class S7HRDDRPHY(LiteXModule):
         if self.mmcm_loc is not None:
             platform.add_platform_command(
                 f"set_property LOC {self.mmcm_loc} [get_cells -hierarchical -filter {{{{NAME =~ *{self.name}_mmcm}}}}]")
+
+# S7HRChannelModel ---------------------------------------------------------------------------------
+
+class S7HRChannelModel(Module):
+    """A fly-by DDR3 channel as the calibration sees it (S7HRPHYModel, the simulation).
+
+    Inputs: the CK phase `ck` (signed fine steps, |ck| < 128), each lane's write bitslip `wl`,
+    each bit's read bitslip `rb` and IDELAY tap `tap`. Outputs: `lane_bad` (the lane's writes go
+    wrong: wrong latency for its side of the tDQSS crossing, or within +-zone of it) and
+    `bit_bad` (the bit reads outside its eye, v0 + 0.215*ck in bitslip*12 + tap units).
+    Unsigned arithmetic only (a first version with signed arithmetic read every bit bad at a
+    negative CK phase in the SoC simulation; test_s7hrmodel.py checks the compiled model).
+    """
+    def __init__(self, cross, base_wl, v0, zone=3, half_eye=4):
+        lanes, bits = len(cross), len(v0)
+        self.ck       = Signal((16, True))
+        self.wl       = [Signal(3) for _ in range(lanes)]
+        self.rb       = [Signal(3) for _ in range(bits)]
+        self.tap      = [Signal(5) for _ in range(bits)]
+        self.lane_bad = Signal(lanes)
+        self.bit_bad  = Signal(bits)
+
+        # # #
+
+        # The phase offset by 128: u = ck + 128.
+        u = Signal(8)
+        self.comb += u.eq(self.ck[:8] + 128)
+        # The read eye's drift: 16.74 ps per step over 78 ps taps, 55/256 = 0.215; at ck = 0,
+        # (128*55) >> 8 = 27.
+        drift = Signal(16)
+        self.comb += drift.eq((u*55)[8:])
+        for l in range(lanes):
+            need = Signal(3)
+            cu   = cross[l] + 128
+            self.comb += [
+                need.eq(Mux(u >= cu, (base_wl[l] + 2) & 7, base_wl[l])),
+                self.lane_bad[l].eq((self.wl[l] != need) | ((u + zone >= cu) & (u <= cu + zone))),
+            ]
+        for b in range(bits):
+            # Good when |bitslip*12 + tap - (v0 + drift - 27)| <= half_eye.
+            pos    = Signal(12)
+            centre = Signal(16)
+            self.comb += [
+                pos.eq(self.rb[b]*12 + self.tap[b] + 27),
+                centre.eq(drift + v0[b]),
+                self.bit_bad[b].eq((pos + half_eye < centre) | (pos > centre + half_eye)),
+            ]
+
+# S7HRPHYModel -------------------------------------------------------------------------------------
+
+class S7HRPHYModel(LiteXModule):
+    """The S7HRDDRPHY's CSRs and a fly-by channel in front of LiteDRAM's SDRAMPHYModel, for the
+    simulation of the calibration (firmware/ddr_s7hr.c) in the SoC.
+
+    The channel (the host test's fake, test/common/s7hr/s7hr_fake.c, in gateware): each lane has
+    a tDQSS crossing `cross[l]` (CK fine steps) where its write latency steps from base_wl[l] to
+    base_wl[l] + 2 and around which (+-zone) its writes fail; a lane written at the wrong
+    latency or phase stores its bytes XORed with 0xA5. Each DQ bit reads right when
+    bitslip*12 + tap is within +-half_eye of its eye, v0[b] + 0.215*ck (the DRAM drives DQ from
+    the shifted CK, |ck| < 128); a bit read outside it comes back inverted. ideal: no channel effects (a
+    controller the firmware does not calibrate in the simulation, e.g. the one it runs from).
+    """
+    def __init__(self, model, cross=None, base_wl=None, v0=None, zone=3, half_eye=4, ideal=False):
+        self.model = model
+        settings = model.settings
+        # The PHY's capabilities: liblitedram builds its leveling against them (and against the
+        # CSRs below), which a plain SDRAMPHYModel does not have.
+        settings.read_leveling = True
+        settings.delays        = 32
+        settings.bitslips      = 8
+        databits = settings.databits
+        strobes  = databits//8
+        nphases  = settings.nphases
+        assert nphases == 4 and databits % 8 == 0
+        self.settings = settings
+        cross   = cross   or [0]*strobes
+        base_wl = base_wl or [0]*strobes
+        v0      = v0      or [0]*databits
+
+        # Registers --------------------------------------------------------------------------------
+        self._rst             = CSRStorage()
+        self._dly_sel         = CSRStorage(strobes)
+        self._dq_dly_sel      = CSRStorage(8)
+        self._half_sys8x_taps = CSRStorage(5)
+        self._wlevel_en       = CSRStorage()
+        self._wlevel_strobe   = CSR()
+        self._rdly_dq_rst         = CSR()
+        self._rdly_dq_inc         = CSR()
+        self._rdly_dq_bitslip_rst = CSR()
+        self._rdly_dq_bitslip     = CSR()
+        self._wdly_dq_bitslip_rst = CSR()
+        self._wdly_dq_bitslip     = CSR()
+        self._rdphase = CSRStorage(2, reset=settings.rdphase)
+        self._wrphase = CSRStorage(2, reset=settings.wrphase)
+        self.ckphase = ckphase = S7HRCKPhase()
+
+        # DFI Interface ----------------------------------------------------------------------------
+        self.dfi = dfi = Interface(len(model.dfi.p0.address), len(model.dfi.p0.bank),
+            settings.nranks, 2*databits, nphases)
+
+        # # #
+
+        # The MMCM: locked, PSDONE 12 cycles after PSEN.
+        ps_delay = Signal(12)
+        self.sync += ps_delay.eq(Cat(ckphase.psen, ps_delay[:-1]))
+        self.comb += [
+            ckphase.locked.eq(1),
+            ckphase.psdone.eq(ps_delay[-1]),
+        ]
+        ck = Signal((16, True))
+        self.comb += ck.eq(ckphase._status.fields.value)
+
+        # PHY state: write bitslip per lane, read bitslip and IDELAY tap per bit.
+        wl  = [Signal(3) for _ in range(strobes)]
+        rb  = [Signal(3) for _ in range(databits)]
+        tap = [Signal(5) for _ in range(databits)]
+        dq_sel = Signal(8)
+        self.comb += If(self._dq_dly_sel.storage == 0,
+            dq_sel.eq(0xff)
+        ).Else(
+            dq_sel.eq(self._dq_dly_sel.storage)
+        )
+        for l in range(strobes):
+            self.sync += [
+                If(self._rst.storage | (self._dly_sel.storage[l] & self._wdly_dq_bitslip_rst.re),
+                    wl[l].eq(0)
+                ).Elif(self._dly_sel.storage[l] & self._wdly_dq_bitslip.re,
+                    wl[l].eq(wl[l] + 1)
+                )
+            ]
+        for b in range(databits):
+            sel = self._dly_sel.storage[b//8] & dq_sel[b%8]
+            self.sync += [
+                If(self._rst.storage | (sel & self._rdly_dq_bitslip_rst.re),
+                    rb[b].eq(0)
+                ).Elif(sel & self._rdly_dq_bitslip.re,
+                    rb[b].eq(rb[b] + 1)
+                ),
+                If(self._rst.storage | (sel & self._rdly_dq_rst.re),
+                    tap[b].eq(0)
+                ).Elif(sel & self._rdly_dq_inc.re & (tap[b] != 31),
+                    tap[b].eq(tap[b] + 1)
+                ),
+            ]
+
+        # Channel: lanes that write wrong, bits that read wrong.
+        lane_bad = Signal(strobes)
+        bit_bad  = Signal(databits)
+        if not ideal:
+            self.channel = channel = S7HRChannelModel(cross, base_wl, v0, zone, half_eye)
+            self.comb += [
+                channel.ck.eq(ck),
+                lane_bad.eq(channel.lane_bad),
+                bit_bad.eq(channel.bit_bad),
+            ]
+            self.comb += [channel.wl[l].eq(wl[l]) for l in range(strobes)]
+            self.comb += [channel.rb[b].eq(rb[b]) for b in range(databits)]
+            self.comb += [channel.tap[b].eq(tap[b]) for b in range(databits)]
+
+        # DFI pass-through with the channel's effects on the write and read data. The read data
+        # valid on every phase, as the PHY drives it (SDRAMPHYModel drives phase 0's only, and
+        # the DFII's phase injectors each capture on their own phase's valid).
+        wmask = Cat(*[Mux(lane_bad[l], 0xa5, 0) for _ in range(2) for l in range(strobes)])
+        rmask = Cat(bit_bad, bit_bad)
+        rddata_valid = Signal()
+        self.comb += rddata_valid.eq(reduce(or_, [ph.rddata_valid for ph in model.dfi.phases]))
+        for p in range(nphases):
+            ours, theirs = dfi.phases[p], model.dfi.phases[p]
+            for name in ["address", "bank", "cas_n", "cs_n", "ras_n", "we_n", "cke", "odt",
+                         "reset_n", "act_n", "wrdata_en", "wrdata_mask", "rddata_en"]:
+                if hasattr(ours, name) and hasattr(theirs, name):
+                    self.comb += getattr(theirs, name).eq(getattr(ours, name))
+            self.comb += [
+                theirs.wrdata.eq(ours.wrdata ^ wmask),
+                ours.rddata.eq(theirs.rddata ^ rmask),
+                ours.rddata_valid.eq(rddata_valid),
+            ]

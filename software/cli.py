@@ -56,6 +56,11 @@ def cmd_convert(args):
     chan_stride, window_reserve, suffix = BOARD_WINDOWS[args.board]
     if args.channels is None:
         args.channels = BOARD_CHANNELS[args.board]
+    if args.board == "ypcb":
+        # The bank skew spreads a controller's windows over its 8 banks (64 KB / windows):
+        # 32 KB at the default 4 channels, 16 KB x 3 at 8 (trixium_ypcb.py --engine-channels).
+        chan_mod       = args.channels//2
+        window_reserve = (chan_mod - 1)*(0x10000//chan_mod)
     out = args.out
     if out is None:
         name = os.path.basename(args.gguf)

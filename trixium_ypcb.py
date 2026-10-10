@@ -88,11 +88,13 @@ class YPCBDDR3(MT41K256M8):
     speedgrade_timings["default"] = speedgrade_timings["1600"]
 
 
-def ddr_controller_settings(read_time=256, write_time=128, refresh_postponing=2):
-    """The controller settings for weight streaming. LiteDRAM's defaults (32/16, postponing 1)
-    switch direction every few dozen cycles and refresh one row at a time; longer read/write
-    times and postponed refreshes keep the streams on their rows (trixium_sim.py --board ypcb
-    --bench measures them)."""
+def ddr_controller_settings(read_time=256, write_time=128, refresh_postponing=1):
+    """The controller settings (trixium_sim.py --board ypcb --ddr-settings). Measured on the
+    truncated 1.7B (one layer + LM head, decode token): every setting within 0.25 %, the weight
+    streams are reads and a token's KV writes are a few beats. Postponing refreshes costs (2:
+    +0.1 %, 8: +0.25 %: a burst of refreshes stalls both streams at once); the read/write times
+    are neutral here (32/16 to 256/128 within 0.02 %) and 256/128 keeps the writes of longer
+    contexts grouped (-0.6 % on a Qwen3.5 decode in openTPU's co-simulation of this card)."""
     return lambda: ControllerSettings(
         read_time          = read_time,
         write_time         = write_time,
@@ -146,10 +148,10 @@ class TriXiumYPCBSoC(SoCCore):
     def __init__(self, sys_clk_freq=150e6, ddr_clk_freq=400e6/3, engine_channels=4,
         main_ram_size  = 0x1000_0000,
         chan_stride    = 0x4000_0000,
-        chan_skew      = 0x8000,
+        chan_skew      = None,
         read_time      = 256,
         write_time     = 128,
-        refresh_postponing = 2,
+        refresh_postponing = 1,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -223,6 +225,8 @@ class TriXiumYPCBSoC(SoCCore):
         # --window-reserve). main_ram is controller 0's 0..256 MB, below every window; the BONS
         # staging area is the MB below channel 0's window.
         ctrl_size = 2 << 30
+        if chan_skew is None:
+            chan_skew = 0x10000//chan_mod # The 8 banks' 64 KB cycle, spread over the windows.
         assert chan_stride & (chan_stride - 1) == 0 and HBM_WEIGHT_BASE < chan_stride
         assert HBM_WEIGHT_BASE + chan_stride*chan_mod - (HBM_WEIGHT_BASE % chan_stride) <= ctrl_size
         assert chan_skew % 0x1000 == 0 and (chan_mod - 1)*chan_skew < chan_stride // 64
@@ -311,7 +315,7 @@ def main():
     parser.add_target_argument("--engine-channels",    default=4,        type=int,                            help="Engine channels (multiple of 2).")
     parser.add_target_argument("--read-time",          default=256,      type=int,                            help="LiteDRAM read time (cycles before a pending write wins).")
     parser.add_target_argument("--write-time",         default=128,      type=int,                            help="LiteDRAM write time.")
-    parser.add_target_argument("--refresh-postponing", default=2,        type=int,                            help="LiteDRAM refresh postponing (1-8).")
+    parser.add_target_argument("--refresh-postponing", default=1,        type=int,                            help="LiteDRAM refresh postponing (1-8).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).

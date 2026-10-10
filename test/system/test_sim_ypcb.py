@@ -101,3 +101,37 @@ def test_sim_ypcb():
     # Every channel's window, both controllers (a wrong chan_mod/stride/skew aliases them).
     for c in range(4):
         assert re.search(rf"DDRTEST chan +{c} \(controller {c//2}\) OK", out), out[-1500:]
+
+
+@pytest.mark.slow
+def test_sim_ypcb_calibration():
+    """The board's DDR3 calibration (firmware/ddr_s7hr.c) in the SoC: the PHY models behind the
+    S7HRDDRPHY's CSRs (S7HRPHYModel, --s7hr-model), controller 1 a fly-by channel that needs it
+    (trixium_sim.S7HR_CHANNEL), calibrated from the console through the CSR window and the BIST
+    ports as on the card; then every channel's window and a generation must be right."""
+    import trixium_sim as ts
+    out_dir = os.path.join("build", "sim_ypcb_s7hr")
+    sim_dir = os.path.join(out_dir, "gateware")
+    if not os.path.exists(os.path.join(sim_dir, "obj_dir/Vsim")):
+        subprocess.run([sys.executable, "trixium_sim.py", "--board", "ypcb", "--s7hr-model",
+            "--image", IMAGE, "--out-dir", out_dir, "--build"], check=True)
+    global SIM_DIR
+    saved, SIM_DIR = SIM_DIR, sim_dir
+    try:
+        out = run_console(["ddrinit 1", "ddrtest"], timeout=90*60)
+    finally:
+        SIM_DIR = saved
+    assert "S7HR: OK" in out and "ddr: controller 1 OK" in out, out[-3000:]
+
+    # The phase: inside the model's common window (every lane outside its crossing zone) and
+    # each lane at the write latency the model needs there.
+    ch = ts.S7HR_CHANNEL
+    m  = re.search(r"S7HR: CK phase ([+-]\d+) \(run (\d+) steps\), write bitslips((?: \d)+)", out)
+    assert m, out[-3000:]
+    ck  = int(m.group(1))
+    wls = [int(w) for w in m.group(3).split()]
+    for l, (cross, base) in enumerate(zip(ch["cross"], ch["base_wl"])):
+        assert abs(ck - cross) > 3, (ck, l)
+        assert wls[l] == ((base + 2) & 7 if ck >= cross else base), (ck, l, wls)
+    for c in range(4):
+        assert re.search(rf"DDRTEST chan +{c} \(controller {c//2}\) OK", out), out[-1500:]

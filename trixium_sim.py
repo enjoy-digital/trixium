@@ -60,7 +60,7 @@ from model.layout import HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
-from gateware.memory.s7hrddrphy import s7hr_model_settings
+from gateware.memory.s7hrddrphy import s7hr_model_settings, S7HRPHYModel
 from model.bons import BONSReader
 from gateware.common import set_main_ram_executable
 
@@ -164,6 +164,16 @@ def sim_ddr3(size):
     return type("SimDDR3", (YPCBDDR3,), {"nrows": size//(8*1024*8)})
 
 
+# The fly-by channel of the calibration's simulation (--s7hr-model): crossings ordered along the
+# chain, latencies 0 and 6 (-2), one bit of lane 3 framed a CLK late; the common window is
+# +9..-34 across the tCK boundary (the scan's stride-28 samples settle at -56).
+S7HR_CHANNEL = dict(
+    cross   = [-30, -25, -20, -15, -10, -5, 0, 5],
+    base_wl = [0, 0, 6, 6, 0, 0, 6, 0],
+    v0      = [40 + (b % 8) + (24 if b == 27 else 0) for b in range(64)],
+)
+
+
 def ddr3_skew(chan_mod):
     """The board's bank skew: the chan_mod windows of a controller evenly spread over the 8 banks
     (32 KB, four banks apart, for two)."""
@@ -229,7 +239,7 @@ class TriXiumSimSoC(SoCCore):
                  mem="hbm", n_memctrl=4, update_repo="no",
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
-                 with_dnstream=False, attn_geometry=None, ddr_settings=None):
+                 with_dnstream=False, attn_geometry=None, ddr_settings=None, s7hr_model=False):
         assert mem in ("hbm", "ddr4", "ddr3")
         ddr_split = mem in ("ddr4", "ddr3")
         platform = Platform()
@@ -322,7 +332,7 @@ class TriXiumSimSoC(SoCCore):
         else:
             stride   = ddr3_stride(img)
             chan_mod = self.add_ddr3(n_channels, n_memctrl, ram, img, memory_ports, stride,
-                ddr_settings or {})
+                ddr_settings or {}, s7hr_model)
 
         # TriXium ----------------------------------------------------------------------------------
         # Same integration as both hardware targets; only memory/physical policy differs.
@@ -364,8 +374,17 @@ class TriXiumSimSoC(SoCCore):
             self.add_constant("TRIXIUM_CHAN_SKEW",        ddr3_skew(chan_mod))
             self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
             self.add_constant("TRIXIUM_N_MEMCTRL",        n_memctrl)
-            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   DDR4_SIM_CSR_STRIDE)
+            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   2*DDR4_SIM_CSR_STRIDE if s7hr_model else DDR4_SIM_CSR_STRIDE)
             self.add_constant("SDRAM_TEST_DISABLE")
+            if s7hr_model:
+                # The board's calibration (firmware/ddr_s7hr.c) on the PHY model: `ddrinit 1` on
+                # the console. Scan stride and BIST sizes cut to simulation time.
+                self.add_config("SDRAM_CUSTOM_INIT")
+                self.add_constant("TRIXIUM_DDR_S7HR")
+                self.add_constant("TRIXIUM_DDR_CKPHASE_STEPS", 112)
+                self.add_constant("S7HR_SCAN_STRIDE",      28)
+                self.add_constant("S7HR_BIST_STEP_BYTES",  0x10000)
+                self.add_constant("S7HR_BIST_FINAL_BYTES", 0x40000)
         else:
             # The XCU1525's geometry, scaled to the tiny model: the same constants the firmware
             # reads on the board, with 4 MB windows from 12 MB.
@@ -409,8 +428,13 @@ class TriXiumSimSoC(SoCCore):
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 
-    def add_ddr3(self, n_channels, n_memctrl, ram, img, memory_ports, stride, ddr_settings):
-        """The YPCB's memory system on LiteDRAM's PHY model; returns chan_mod."""
+    def add_ddr3(self, n_channels, n_memctrl, ram, img, memory_ports, stride, ddr_settings,
+                 s7hr_model=False):
+        """The YPCB's memory system on LiteDRAM's PHY model; returns chan_mod.
+
+        s7hr_model: the PHY models behind the S7HRDDRPHY's CSRs (S7HRPHYModel), with a LiteDRAM
+        BIST per controller: controller 0 (main_ram, the firmware) without channel effects,
+        controller 1 as a fly-by channel to calibrate (S7HR_CHANNEL)."""
         assert n_channels % n_memctrl == 0, "channels shard evenly over the controllers"
         chan_mod = n_channels//n_memctrl
         assert chan_mod & (chan_mod - 1) == 0
@@ -420,10 +444,13 @@ class TriXiumSimSoC(SoCCore):
         for k in range(n_memctrl):
             size = ddr3_size(chan_mod, stride)
             phy, module = ddr3_phy(ddr3_content(k, ram, img, chan_mod, stride, size), size)
+            if s7hr_model:
+                phy = S7HRPHYModel(phy, ideal=(k == 0), **S7HR_CHANNEL)
             split_phys.append(phy)
             split_modules.append(module)
         add_ddr_domain_controllers(self, split_phys, split_modules, DDR3_SIM_FREQ, MAIN_RAM_SIZE,
-            8192, DDR4_SIM_CSR_WINDOW, controller_settings=ddr_controller_settings(**ddr_settings))
+            8192, DDR4_SIM_CSR_WINDOW, controller_settings=ddr_controller_settings(**ddr_settings),
+            with_bist=s7hr_model)
 
         # Engine ports: channel c -> controller c // chan_mod.
         for k in range(n_memctrl):
@@ -534,6 +561,8 @@ def build_sim(args, board, out_dir):
         sim_config.add_clocker("ddr_clk", DDR3_SIM_CLK_FREQ)
     soc_kwargs = dict(board, update_repo=args.update_repo,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
+    if args.s7hr_model:
+        soc_kwargs["s7hr_model"] = True
     if args.ddr_settings:
         soc_kwargs["ddr_settings"] = {k: int(v) for k, v in
             (kv.split("=") for kv in args.ddr_settings.split(","))}
@@ -574,6 +603,7 @@ def main():
     parser.add_argument("--hbm-latency",    default=16, type=int,                                  help="--board fk33: HBM model read latency.")
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
+    parser.add_argument("--s7hr-model",     action="store_true",                                   help="--board ypcb: the PHY models behind the S7HRDDRPHY's CSRs (calibration test: ddrinit 1).")
     parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")
     args = parser.parse_args()
     if not (args.build or args.run or args.firmware or args.gate or args.bench):
