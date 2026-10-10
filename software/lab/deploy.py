@@ -41,7 +41,7 @@ The sequence and its order:
   9. bench
 
 Images: models/bons/. The XCU1525's windows are 704 MB (1 GB stride): its 8B and 27B images are
-its own (bonsai-<model>-n16-xcu1525.img, converted with --chan-stride 0x40000000); its 1.7B
+its own (bonsai-<model>-n16-xcu1525.img, trixium convert --board xcu1525); its 1.7B
 image is the FK33's, byte-identical. The FK33's image must match the bitstream's channel count
 (bonsai-<model>-n<channels>.img, from the build's soc.h).
 """
@@ -431,7 +431,7 @@ def add_arguments(parser):
     parser.add_argument("--model",               default="1p7b", choices=list(MODELS),           help="Model.")
     parser.add_argument("--no-reconfigure",      action="store_true",                            help="Board already deployed: firmware, weights, tokens and bench only.")
     parser.add_argument("--boot",                action="store_true",                            help="With --no-reconfigure: boot the (rebuilt) firmware first (XCU1525).")
-    parser.add_argument("--approval",            default="ddr1600-overclock",                    help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
+    parser.add_argument("--approval",            default="ddr4-overclock",                    help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
     parser.add_argument("--serializer-baseline", default="v8",                                   help="XCU1525 timing gate serializer baseline.")
     parser.add_argument("--bench",               type=int,                                       help="bench n (default: per model).")
     parser.add_argument("--dry-run",             action="store_true",                            help="Print every command, run nothing.")

@@ -790,9 +790,9 @@ static int self_test(const char *tests_path)
 /* Help */
 /*------*/
 
-static void usage(void)
+static void usage(FILE *f)
 {
-    printf("TriXium chat\n"
+    fprintf(f,"TriXium chat\n"
            "usage: trixium_chat [options]\n"
            "\n"
            "options:\n"
@@ -876,7 +876,8 @@ int main(int argc, char **argv)
         case 'y': g_system = optarg; break;
         case 'E': enc_text = optarg; break;
         case 'T': do_test = 1; if (optarg) testf = optarg; break;
-        default: usage(); return 0;
+        case 'h': usage(stdout); return 0;
+        default:  usage(stderr); return 1;
         }
     }
 

@@ -18,7 +18,7 @@ Long: run it detached, e.g.
 
 Board steps: the hosts of ~/.config/trixium/boards.ini (key-based ssh, software/lab/deploy.py).
 DDR4-1500 is an approved out-of-spec overclock (the XCU1525 build and deploy gate it under the
-ddr1600-overclock approval). Reference tokens and speeds: doc/boards.md.
+ddr4-overclock approval). Reference tokens and speeds: doc/boards.md.
 """
 
 import os
@@ -168,7 +168,7 @@ def validate(steps, out):
         rc = p.wait()
         verdict = "PASS (timing gate)" if rc == 0 else f"verdict {rc} (see {v.log('build-' + b)})"
         if b == "xcu1525" and rc == 0:
-            verdict = "PASS (timing gate, ddr1600-overclock approval)"
+            verdict = "PASS (timing gate, ddr4-overclock approval)"
         v.note(f"build-{b}", f"{verdict}; {utilization(b)}")
 
     # Boards (in parallel: two hosts).

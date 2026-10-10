@@ -375,7 +375,7 @@ def main():
     parser.add_target_argument("--cpu-slr",         default=1,       type=int,                               help="CPU pblock SLR.")
     parser.add_target_argument("--driver",          action="store_true",                                     help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings", default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
-    parser.add_target_argument("--timing-approval", default="ddr1600-overclock",                             help="Timing gate approval (software/lab/timing.py APPROVALS); DDR4-1500 overclocks the ISERDES.")
+    parser.add_target_argument("--timing-approval", default="ddr4-overclock",                             help="Timing gate approval (software/lab/timing.py APPROVALS); DDR4-1500 overclocks the ISERDES.")
     # The shipping recipe (overridable from the command line).
     parser.set_defaults(
         cpu_type                             = "vexiiriscv",

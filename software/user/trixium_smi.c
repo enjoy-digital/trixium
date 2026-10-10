@@ -813,9 +813,9 @@ end:
 /* Help */
 /*------*/
 
-static void help(void)
+static void help(int status)
 {
-    printf("TriXium smi: card status and diagnostics\n"
+    fprintf(status ? stderr : stdout,"TriXium smi: card status and diagnostics\n"
            "usage: trixium_smi [options] [cmd [args...]]\n"
            "\n"
            "options:\n"
@@ -842,7 +842,7 @@ static void help(void)
            "flash_reload                      Reload FPGA Image.\n"
 #endif
            );
-    exit(1);
+    exit(status);
 }
 
 /* Main */
@@ -874,7 +874,7 @@ int main(int argc, char **argv)
             break;
         switch(c) {
         case 'h':
-            help();
+            help(0);
             break;
         case 'c':
             litepcie_device_num = atoi(optarg);
@@ -904,7 +904,7 @@ int main(int argc, char **argv)
             status_json = 1;
             break;
         default:
-            exit(1);
+            help(1);
         }
     }
 
@@ -976,7 +976,7 @@ int main(int argc, char **argv)
     return 0;
 
 show_help:
-        help();
+        help(1);
 
     return 0;
 }

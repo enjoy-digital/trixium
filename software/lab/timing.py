@@ -67,7 +67,7 @@ APPROVALS = {
     # DDR4 past DDR4-1250 on the component-mode PHY (the shipping DDR4-1500, up to DDR4-1600):
     # the ISERDESE3 Min Period overclock (1.600 ns, at most -0.350 ns on the ~940 serializer
     # clock pins) plus the OSERDES skew family; setup keeps the floor.
-    "ddr1600-overclock" : (WNS_FLOOR, (-0.351, -360.0, 1000)),
+    "ddr4-overclock"    : (WNS_FLOOR, (-0.351, -360.0, 1000)),
 }
 
 # Report Parsing -----------------------------------------------------------------------------------

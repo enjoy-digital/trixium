@@ -48,8 +48,10 @@ int main(int argc, char **argv)
         case 'c':
             devnum = atoi(optarg);
             break;
-        default:
+        case 'h':
             help(0);
+        default:
+            help(1);
         }
     }
     if (optind >= argc)
