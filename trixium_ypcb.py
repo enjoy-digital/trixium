@@ -369,7 +369,7 @@ def main():
         if builder.compile_gateware:
             report = os.path.join(builder.gateware_dir, f"{soc.platform.name}_timing.rpt")
             print("\nTiming gate:")
-            rc = gate(report, strict=True, board="ypcb")
+            rc = gate(report, strict=True, board="ypcb", clocks=[round(1e9/args.sys_clk_freq, 3)])
             write_verdict(verdict, rc)
             if rc:
                 sys.exit(rc)

@@ -640,7 +640,7 @@ class S7HRPHYModel(LiteXModule):
     The channel (the host test's fake, test/common/s7hr/s7hr_fake.c, in gateware): each lane has
     a tDQSS crossing `cross[l]` (CK fine steps) where its write latency steps from base_wl[l] to
     base_wl[l] + 2 and around which (+-zone) its writes fail; a lane written at the wrong
-    latency or phase stores its bytes XORed with 0xA5. Each DQ bit reads right when
+    latency or phase stores 0xA5 in its bytes. Each DQ bit reads right when
     bitslip*12 + tap is within +-half_eye of its eye, v0[b] + 0.215*ck (the DRAM drives DQ from
     the shifted CK, |ck| < 128); a bit read outside it comes back inverted. ideal: no channel effects (a
     controller the firmware does not calibrate in the simulation, e.g. the one it runs from).
@@ -745,7 +745,10 @@ class S7HRPHYModel(LiteXModule):
         # DFI pass-through with the channel's effects on the write and read data. The read data
         # valid on every phase, as the PHY drives it (SDRAMPHYModel drives phase 0's only, and
         # the DFII's phase injectors each capture on their own phase's valid).
-        wmask = Cat(*[Mux(lane_bad[l], 0xa5, 0) for _ in range(2) for l in range(strobes)])
+        # A lane written wrong stores 0xa5 (not an XOR of the data: a fixed XOR and a read
+        # inversion would cancel and pass the check).
+        wsel  = Cat(*[Replicate(lane_bad[l], 8) for _ in range(2) for l in range(strobes)])
+        wbad  = Cat(*[Constant(0xa5, 8) for _ in range(2*strobes)])
         rmask = Cat(bit_bad, bit_bad)
         rddata_valid = Signal()
         self.comb += rddata_valid.eq(reduce(or_, [ph.rddata_valid for ph in model.dfi.phases]))
@@ -756,7 +759,7 @@ class S7HRPHYModel(LiteXModule):
                 if hasattr(ours, name) and hasattr(theirs, name):
                     self.comb += getattr(theirs, name).eq(getattr(ours, name))
             self.comb += [
-                theirs.wrdata.eq(ours.wrdata ^ wmask),
+                theirs.wrdata.eq((ours.wrdata & ~wsel) | (wbad & wsel)),
                 ours.rddata.eq(theirs.rddata ^ rmask),
                 ours.rddata_valid.eq(rddata_valid),
             ]

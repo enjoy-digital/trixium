@@ -94,8 +94,8 @@ DDR4_SIM_CSR_STRIDE  = 0x1000
 # the tiny models; a truncated 1.7B for the performance runs needs 32 MB).
 DDR3_SIM_WEIGHT_BASE = 0x00C0_0000 # 12 MB.
 DDR3_SIM_BANK_CYCLE  = 0x10000     # 8 banks x 8 KB rows: the windows' skew is 1/chan_mod of it.
-DDR3_SIM_SYS_FREQ    = 125000000   # Hz: the sim clocks in integer picoseconds, 8 ns for sys and
-DDR3_SIM_CLK_FREQ    = 111111111   # 9 ns for ddr: the board's 150/133.33 MHz ratio.
+DDR3_SIM_DDR_PERIOD  = 9000        # ps: the sim's clocks are integer picoseconds, ddr at 9 ns and
+                                   # sys at the board's ratio (8 ns for 150 MHz, ddr3_sim_clocks()).
 DDR3_SIM_FREQ        = 400e6/3     # The controllers' timings: the board's DDR3-1066.
 DDR3_SIM_SIZE        = 128 << 20   # Per controller, at least (2048 rows; more for big images).
 
@@ -172,6 +172,13 @@ S7HR_CHANNEL = dict(
     base_wl = [0, 0, 6, 6, 0, 0, 6, 0],
     v0      = [40 + (b % 8) + (24 if b == 27 else 0) for b in range(64)],
 )
+
+
+def ddr3_sim_clocks(sys_clk_freq=150e6):
+    """(sys, ddr) clocker frequencies of the YPCB sim: the board's sys/ddr ratio on integer
+    picosecond periods (the clocker's timebase is their half periods' GCD)."""
+    sys_period = 100*round(DDR3_SIM_DDR_PERIOD*DDR3_SIM_FREQ/sys_clk_freq/100) # 0.1 ns steps.
+    return int(1e12//sys_period), int(1e12//DDR3_SIM_DDR_PERIOD)
 
 
 def ddr3_skew(chan_mod):
@@ -552,13 +559,14 @@ def build_firmware(out_dir):
 
 
 def build_sim(args, board, out_dir):
+    sys_freq, ddr_freq = ddr3_sim_clocks(args.sys_clk_freq)
     sim_config = SimConfig(default_clk="sys_clk",
-        default_clk_freq=DDR3_SIM_SYS_FREQ if board["mem"] == "ddr3" else int(1e6))
+        default_clk_freq=sys_freq if board["mem"] == "ddr3" else int(1e6))
     sim_config.add_module("serial2console", "serial")
     if board["mem"] == "ddr4":
         sim_config.add_clocker("ddr_clk", int(1e6)*DDR_SPLIT_CLK_RATIO)
     if board["mem"] == "ddr3":
-        sim_config.add_clocker("ddr_clk", DDR3_SIM_CLK_FREQ)
+        sim_config.add_clocker("ddr_clk", ddr_freq)
     soc_kwargs = dict(board, update_repo=args.update_repo,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     if args.s7hr_model:
@@ -603,6 +611,7 @@ def main():
     parser.add_argument("--hbm-latency",    default=16, type=int,                                  help="--board fk33: HBM model read latency.")
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
+    parser.add_argument("--sys-clk-freq",   default=150e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--s7hr-model",     action="store_true",                                   help="--board ypcb: the PHY models behind the S7HRDDRPHY's CSRs (calibration test: ddrinit 1).")
     parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")
     args = parser.parse_args()

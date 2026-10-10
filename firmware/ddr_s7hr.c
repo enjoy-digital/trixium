@@ -541,7 +541,7 @@ int sdram_custom_init(void)
                 s7hr.bit[8*l + i].window);
         printf("\n");
     }
-    printf("S7HR: %s (BIST %lu MB, %lu errors)\n", s7hr.ok ? "OK" : "FAILED",
-        (unsigned long)(S7HR_BIST_FINAL_BYTES >> 20), (unsigned long)s7hr.bist_errors);
+    printf("S7HR: %s (BIST %lu KB, %lu errors)\n", s7hr.ok ? "OK" : "FAILED",
+        (unsigned long)(S7HR_BIST_FINAL_BYTES >> 10), (unsigned long)s7hr.bist_errors);
     return s7hr.ok;
 }

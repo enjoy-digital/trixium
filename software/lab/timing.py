@@ -75,8 +75,9 @@ APPROVALS = {
 # passes on what it did time (the YPCB's first build: the board's 50 MHz input was unconstrained,
 # and the summary showed the PCIe clocks alone).
 REQUIRED_CLOCKS = {
-    # clk50, sys 150, ddr 133.33 (and each DDR3 PHY's CLKDIV pair), the PHYs' 4x clocks, IDELAY 200.
-    "ypcb" : (20.0, 6.667, 7.5, 1.875, 5.0),
+    # clk50, ddr 133.33 (and each DDR3 PHY's CLKDIV pair), the PHYs' 4x clocks, IDELAY 200; the
+    # target adds its sys clock (gate(clocks=)).
+    "ypcb" : (20.0, 7.5, 1.875, 5.0),
 }
 
 # Report Parsing -----------------------------------------------------------------------------------
@@ -133,10 +134,11 @@ def parse_clocks(path):
     return clocks
 
 
-def missing_clocks(path, board):
-    """The required clock periods of `board` the report does not time."""
+def missing_clocks(path, board, clocks=()):
+    """The required clock periods of `board` (and `clocks`) the report does not time."""
     periods = [p for _, p in parse_clocks(path)]
-    return [r for r in REQUIRED_CLOCKS.get(board, ()) if not any(abs(p - r) < 0.01 for p in periods)]
+    return [r for r in tuple(REQUIRED_CLOCKS.get(board, ())) + tuple(clocks)
+            if not any(abs(p - r) < 0.01 for p in periods)]
 
 # Gates --------------------------------------------------------------------------------------------
 
@@ -198,14 +200,15 @@ def experiment_failures(row, serializer_baseline=None, wns_floor=WNS_FLOOR):
 # Gate ---------------------------------------------------------------------------------------------
 
 def gate(report, strict=False, force=False, experiment=False, serializer_baseline=None, approval=None,
-         board=None):
+         board=None, clocks=()):
     """Print the verdict on a Vivado timing report; return the exit code (0 = deploy).
 
-    board: check the clock coverage of REQUIRED_CLOCKS[board] first (any mode)."""
+    board: check the clock coverage of REQUIRED_CLOCKS[board] (and of the `clocks` periods, ns)
+    first, in any mode."""
     try:
         full = parse_full(report)
         got  = parse(report)
-        missing = missing_clocks(report, board) if board else []
+        missing = missing_clocks(report, board, clocks) if (board or clocks) else []
     except OSError as exc:
         print(f"timing: {exc}")
         return 2
