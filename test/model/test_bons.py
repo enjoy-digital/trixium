@@ -21,7 +21,7 @@ import pytest
 
 from model import layout
 from model import bitexact as bx
-from model.bons import embed_bfp_rows
+from model.bons import TensorSpec, embed_bfp_rows, split_wide
 
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -93,3 +93,33 @@ def test_embed_bfp_rows_mantissa_range():
             continue
         amax = int(np.abs(mant[r].astype(np.int32)).max())
         assert (1 << 14) <= amax < (1 << 15), (r, amax)
+
+
+def _ternary_spec(rng, role, rows, cols):
+    codes  = rng.integers(0, 3, (rows, cols), dtype=np.uint8)
+    scales = (rng.random((rows, cols//128))*0.01 + 0.001).astype(np.float16)
+    return TensorSpec("t.weight", role, 0, layout.KIND_TERNARY, rows, cols, scales=scales, values=codes)
+
+
+def test_split_wide_segments_reassemble():
+    """K-segments: group-aligned column ranges that concatenate back to the tensor, each with
+    the tensor's own bias/rshift (their int32 results add up)."""
+    spec = _ternary_spec(np.random.default_rng(3), layout.ROLE_FFN_DOWN, 8, 1024)
+    segs = split_wide(spec, 256)
+    assert len(segs) == 4
+    assert all(seg.flags & layout.FLAG_KSEG and seg.kseg == k for k, seg in enumerate(segs))
+    assert all((seg.bias, seg.rshift) == (spec.bias, spec.rshift) for seg in segs)
+    assert np.array_equal(np.concatenate([seg.values for seg in segs], axis=1), spec.values)
+    assert np.array_equal(np.concatenate([seg.scales for seg in segs], axis=1), spec.scales)
+
+
+def test_split_wide_keeps_token_embedding():
+    """The embedding is read whole-row (lookup, tied LM head): never split."""
+    spec = _ternary_spec(np.random.default_rng(4), layout.ROLE_TOK_EMB, 8, 1024)
+    assert split_wide(spec, 256) == [spec]
+
+
+def test_split_wide_refuses_narrower_than_group():
+    spec = _ternary_spec(np.random.default_rng(5), layout.ROLE_FFN_DOWN, 8, 1024)
+    with pytest.raises(ValueError):
+        split_wide(spec, 64)

@@ -295,10 +295,10 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
         img = BONSReader(out_path)
         for name in ("blk.0.attn_q.weight", "blk.0.ffn_gate.weight"):
             s_img, v_img = img.tensor(name)
-            s_ref, v_ref = None, None
-            for spec in specs:
-                if spec.name == name:
-                    s_ref, v_ref = spec.scales, spec.values
+            # The streaming writer leaves the codes to the spec's loader.
+            spec  = next(spec for spec in specs if spec.name == name)
+            s_ref = spec.scales
+            v_ref = spec.values if spec.values is not None else spec.loader()
             assert np.array_equal(v_img, v_ref), name
             assert np.array_equal(s_img, s_ref.astype(np.float16)), name
             print(f"  check {name}: OK")
