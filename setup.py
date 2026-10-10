@@ -14,7 +14,7 @@ from setuptools import setup, find_packages
 setup(
     name             = "trixium",
     version          = "2026.10",
-    description      = "Fast, bit-exact LLM inference on FPGA (PrismML Bonsai ternary models), open source end to end: a LiteX ecosystem showcase (LitePCIe/LiteDRAM, no vendor PCIe/DDR IP) with an AI-developed core, improvements sent back upstream.",
+    description      = "PrismML Bonsai ternary LLMs on FPGA, bit-exact and open source end to end with LiteX.",
     long_description = open("README.md", encoding="utf-8").read(),
     long_description_content_type = "text/markdown",
     author           = "Enjoy-Digital",
@@ -24,6 +24,6 @@ setup(
     extras_require   = {"dev": ["pytest", "pytest-xdist", "pexpect"]},
     py_modules       = ["trixium_xcu1525", "trixium_fk33", "trixium_sim"],
     packages         = find_packages(exclude=["test*"]),
-    package_data     = {"gateware": ["hbm/*.xci"]},
+    package_data     = {"gateware": ["memory/*.xci"]},
     entry_points     = {"console_scripts": ["trixium=software.cli:main"]},
 )

@@ -34,6 +34,7 @@ Vivado 2024.1 (the 2025.2 install lacks the VU33P; --vivado-settings). A route p
 
 import os
 import sys
+import shutil
 
 from migen import *
 
@@ -58,8 +59,9 @@ from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 
 # Constants ----------------------------------------------------------------------------------------
 
-# The HBM IP: stack clock 800 MHz (PLL divider 8), AXI clock window 200..400 MHz (PG276).
-HBM_XCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateware", "hbm", "hbm_800.xci")
+# The HBM IP: stack clock 800 MHz (PLL divider 8), AXI clock window 200..400 MHz (PG276). Builds
+# use a copy in their own directory: Vivado generates the IP's outputs next to the xci.
+HBM_XCI = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gateware", "memory", "hbm_800.xci")
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -84,7 +86,7 @@ class _CRG(LiteXModule):
 # TriXiumFK33SoC -----------------------------------------------------------------------------------
 
 class TriXiumFK33SoC(SoCCore):
-    def __init__(self, sys_clk_freq=212.5e6, engine_channels=16, **kwargs):
+    def __init__(self, sys_clk_freq=212.5e6, engine_channels=16, hbm_xci=HBM_XCI, **kwargs):
         # The HBM AXI clock (sys) must sit in [tck/4, tck/2] of the IP's 800 MHz stack clock.
         assert 200e6 <= sys_clk_freq <= 400e6
         assert 1 <= engine_channels <= 31
@@ -105,7 +107,7 @@ class TriXiumFK33SoC(SoCCore):
         # HBM --------------------------------------------------------------------------------------
         # 32 pseudo-channels: channel 0 is the CPU's main_ram, channels 1..N the TriXium memory
         # ports (their own AXI ports: the SoC bus bridges do not burst).
-        hbm = USPHBM2(platform, hbm_ip_name="hbm_800", xci_path=HBM_XCI)
+        hbm = USPHBM2(platform, hbm_ip_name="hbm_800", xci_path=hbm_xci)
         self.hbm = hbm = ClockDomainsRenamer({"axi": "sys"})(hbm)
         add_usphbm2_pseudochannels(soc=self, hbm=hbm, channels=(0,), main_channel=0)
         set_main_ram_executable(self)
@@ -195,15 +197,20 @@ def main():
     )
     args = parser.parse_args()
 
-    soc = TriXiumFK33SoC(
-        sys_clk_freq    = args.sys_clk_freq,
-        engine_channels = args.engine_channels,
-        **parser.soc_argdict)
-    add_zbb_constant(soc, args)
-
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
         builder_argd["output_dir"] = os.path.join("build", "fk33")
+    hbm_xci = os.path.join(builder_argd["output_dir"], "ip", "hbm_800", "hbm_800.xci")
+    os.makedirs(os.path.dirname(hbm_xci), exist_ok=True)
+    shutil.copyfile(HBM_XCI, hbm_xci)
+
+    soc = TriXiumFK33SoC(
+        sys_clk_freq    = args.sys_clk_freq,
+        engine_channels = args.engine_channels,
+        hbm_xci         = hbm_xci,
+        **parser.soc_argdict)
+    add_zbb_constant(soc, args)
+
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = os.path.join(builder_argd["output_dir"], "csr.csv")
     builder = Builder(soc, **builder_argd)

@@ -10,10 +10,6 @@ build/
 # Models / weight images (regenerable, large)
 /models
 
-# Vivado output products of the HBM IP (generated next to the tracked .xci)
-gateware/hbm/*
-!gateware/hbm/hbm_800.xci
-
 # Vivado cruft
 .Xil/
 vivado*.jou

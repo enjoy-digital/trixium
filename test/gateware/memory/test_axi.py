@@ -177,9 +177,9 @@ def test_writer_readback():
 
 # AXI3 burst-length cap ----------------------------------------------------------------------------
 #
-# The HBM controller's ports are AXI3: AXI_nn_AxLEN is 4 bits (see the IP's hbm_800_stub.v, generated next to gateware/hbm/hbm_800.xci), so a
-# burst can never exceed 16 beats. LiteX's AXIInterface carries an 8-bit `len` and the upper
-# bits are dropped where it meets the IP, which is silent and ugly: reads stall forever waiting
+# The HBM controller's ports are AXI3: AXI_nn_AxLEN is 4 bits (see the IP's hbm_800_stub.v in
+# build/fk33/ip/hbm_800/), so a burst can never exceed 16 beats. LiteX's AXIInterface carries an
+# 8-bit `len` and the upper bits are dropped where it meets the IP, which is silent and ugly: reads stall forever waiting
 # for beats the IP will not send, and writes place WLAST late and corrupt memory (on hardware:
 # ENGSTALL, 32 of 128 beats delivered), so the limit is pinned here.
 
