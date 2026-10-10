@@ -11,8 +11,8 @@ counts, a few layers, a truncated vocabulary) on the XCU1525's clocks, DDR4 timi
 This module parses the firmware's own profile of that run (BENCH, hybprof/dnprof, the op table,
 the engine/vector overlap counters), normalizes it per layer and extrapolates the full model:
 
-    forward = sum(per-layer phase x the model's layers) + embed + LM head x vocab ratio
-              + the per-forward remainder outside the profiled phases
+    token = sum(per-layer phase x the model's layers) + embed + LM head (its chunk lists x the
+            vocabulary ratio) + the rest of the measured decode token outside those phases
 
 and compares it with the XCU1525 v30b board measurements (doc/simulation.md).
 
@@ -22,6 +22,7 @@ Stream efficiency: weight bytes over the DDR4 peak (4 controllers x 64 B per ddr
 sys clock at 187.5:125 MHz) for the time they take; per phase where a phase is one weight stream.
 """
 
+import os
 import re
 
 from model.bons import BONSReader
@@ -89,8 +90,9 @@ def parse_bench(text):
             m = re.search(r"(\d+) cycles/call", line)
             out["lmhead_call"] = int(m.group(1))
         elif line.startswith("overlap:"):
+            # The bench's own (the later `stats` window also counts the idle console).
             m = re.search(r"eng (\d+)%\s+vec/dn (\d+)%\s+both (\d+)%\s+neither (\d+)%\s+\(of (\d+)", line)
-            if m:
+            if m and "overlap" not in out:
                 out["overlap"] = dict(zip(("eng", "vec", "both", "neither", "total"),
                                           map(int, m.groups())))
         else:
@@ -203,7 +205,6 @@ def predict(profile, image):
     return res
 
 def _slice_name(image):
-    import os
     base = os.path.basename(image)
     return next((name for name in SLICE_OF if base.startswith(name)), None)
 
@@ -237,6 +238,13 @@ def report(profile, image, out=print):
         return res
     out(f"board v30b: {board['cycles']/1e6:.2f} M cycles/token = {SYS_CLK_FREQ/board['cycles']:.2f} tok/s "
         f"(prediction {_err(res['predicted'], board['cycles'])})")
+    if "layers" in res["phases"]:
+        # Qwen3: the board's per layer, its token less the predicted head and embedding.
+        n     = SLICE_OF[_slice_name(image)]["n_attn"]
+        sim   = res["phases"]["layers"]/n
+        per_b = (board["cycles"] - res["phases"]["embed"] - res["phases"]["logits"])/n
+        out(f"per layer: sim {sim:.0f}, board {per_b:.0f} cycles ({_err(sim, per_b)}; the board's "
+            f"token less the predicted LM head {res['phases']['logits']/1e6:.3f} M)")
     if board.get("phases"):
         out(f"{'phase':12s} {'sim':>10s} {'board':>10s} {'error':>7s}   (full model, per token; "
             "logits per LM head)")
@@ -246,3 +254,17 @@ def report(profile, image, out=print):
         sim = res["dn"].get(k, 0)*SLICE_OF[_slice_name(image)]["n_dn"]
         out(f"{'dn.' + k:12s} {_m(sim)} {_m(v)} {_err(sim, v)}")
     return res
+
+# Run -----------------------------------------------------------------------------------------------
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Board prediction from a board-timing bench log.")
+    parser.add_argument("log",   help="bench log (build/sim_xcu1525_bt_<image>/bench/bench-as-built.log).")
+    parser.add_argument("image", help="The slice image the simulation was built with.")
+    args = parser.parse_args()
+    with open(args.log, encoding="utf-8") as f:
+        report(parse_bench(f.read()), args.image)
+
+if __name__ == "__main__":
+    main()
