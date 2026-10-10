@@ -482,7 +482,7 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
 // can hold DIRTY lines. One evicted while the engine's STORE is in flight would overwrite
 // the result in DDR, and the invalidate after the list would then expose the stale value -
 // rare, data-dependent corruption. Clean AND invalidate before the store, so the CPU holds
-// no copy of this span at all. (infer.c's i32_stage needs only the invalidate: nothing but
+// no copy of this span at all. (infer_float.c's i32_stage needs only the invalidate: nothing but
 // the engine ever writes it.)
 static void store_out(uint32_t *n, float *dst, uint32_t rows, uint32_t sp_src)
 {

@@ -22,7 +22,7 @@
 #define TRIXIUM_FPROF_BUFFER_ADDR   (TRIXIUM_HDR_ADDR + 0xc0800) // 160 bytes, diagnostic only
 #define TRIXIUM_RESIDENT_STATE_ADDR (TRIXIUM_HDR_ADDR + 0xc0900) // struct resident_state (resident.h)
 #define TRIXIUM_HYBPROF_ADDR        (TRIXIUM_HDR_ADDR + 0xc0a00) // struct hyb_prof (hybrid.c), 256 B
-#define TRIXIUM_EPS_MEMO_ADDR       (TRIXIUM_HDR_ADDR + 0xc0b00) // int32[128] seq_eps_int memo (infer.c), 512 B
+#define TRIXIUM_EPS_MEMO_ADDR       (TRIXIUM_HDR_ADDR + 0xc0b00) // int32[128] seq_eps_int memo (infer_lists.c), 512 B
 #define TRIXIUM_LISTPROF_ADDR       (TRIXIUM_HDR_ADDR + 0xc2000) // struct list_prof[16] (resident.c), 8.25 KB
 
 #endif

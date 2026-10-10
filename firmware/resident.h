@@ -7,7 +7,7 @@
  * restoration run as sequencer descriptor lists inside the scratchpad (units 4, 3, 5 and 8
  * around the engine matvec, resident FETCH/STORE for the FP32 vectors). The CPU builds
  * descriptors and invalidates its cache; it touches no element. Numerically this is the
- * fused CPU path of infer.c (same exponent rule, ties-away Q8, int32 K-segment sum, RNE
+ * fused CPU path of infer_float.c (same exponent rule, ties-away Q8, int32 K-segment sum, RNE
  * int32 -> FP32 then a power-of-two scale), so the typed-checkpoint gate must stay 87/87.
  *
  * Needs a bitstream with TRIXIUM_HAS_HADAMARD, TRIXIUM_HAS_ACTIVATION_QUANTIZE (ABI 1.1) and

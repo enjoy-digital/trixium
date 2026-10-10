@@ -706,7 +706,7 @@ E_NORM = -11
 
 # Reference implementations ------------------------------------------------------------------------
 #
-# The same rules firmware applies (infer.c: op_quant8_sp, op_resid_add_sp) and the mirror
+# The same rules firmware applies (infer_bfp.c: op_quant8_sp, op_resid_add_sp) and the mirror
 # applies (model/mirror.py hybrid_generate).
 
 def quant8_shift(amax):

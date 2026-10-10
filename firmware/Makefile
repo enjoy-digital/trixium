@@ -28,8 +28,8 @@ CFLAGS += -ffp-contract=off
 PORTABLE_LIB = ../software/lib
 CFLAGS += -I$(PORTABLE_LIB)
 
-OBJECTS = crt0.o main.o engine.o model.o infer.o perf.o ops.o vec.o seq.o ddr.o hybrid.o \
-          resident.o trixium_sequence.o
+OBJECTS = crt0.o main.o engine.o model.o infer.o infer_float.o infer_bfp.o infer_lists.o perf.o \
+          ops.o vec.o seq.o ddr.o hybrid.o resident.o trixium_sequence.o
 
 # Build tree stamp ---------------------------------------------------------------------------------
 
@@ -70,7 +70,7 @@ VREGS := $(if $(VREGS),$(VREGS),8)
 progs.h: FORCE
 	cd .. && $(PYTHON) -m model.asm firmware/progs.h --vregs $(VREGS)
 FORCE:
-infer.o main.o vec.o resident.o: progs.h
+infer.o infer_bfp.o infer_lists.o main.o vec.o resident.o: progs.h
 
 %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@

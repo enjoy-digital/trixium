@@ -7,7 +7,7 @@
 """The pre-dequantized embedding table (ROLE_TOK_EMB16 / _EXP) is bit-exact with the
 firmware's integer decode.
 
-bons.embed_bfp_rows is a vectorized transcription of embed_row_bfp (firmware/infer.c) - the
+bons.embed_bfp_rows is a vectorized transcription of embed_row_bfp (firmware/infer_bfp.c) - the
 scalar reference below is the sim's embed_bfp_int (model/mirror.py) lifted
 verbatim. The table lets the card fetch a token's residual row with two engine fetches instead of ~47k
 cycles of CPU decode (-2.6%/token); a mismatch here would be a silent numerics
@@ -98,7 +98,8 @@ def test_embed_bfp_rows_mantissa_range():
 def _ternary_spec(rng, role, rows, cols):
     codes  = rng.integers(0, 3, (rows, cols), dtype=np.uint8)
     scales = (rng.random((rows, cols//128))*0.01 + 0.001).astype(np.float16)
-    return TensorSpec("t.weight", role, 0, layout.KIND_TERNARY, rows, cols, scales=scales, values=codes)
+    return TensorSpec("t.weight", role, 0, layout.KIND_TERNARY, rows, cols, scales=scales,
+                      values=codes)
 
 
 def test_split_wide_segments_reassemble():
