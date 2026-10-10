@@ -12,8 +12,10 @@ gate : the Python mirror on the image, then one traced generation on the simulat
        the unit 11 FFN activation lists when the SoC has them). The firmware's `stats` profile
        (hybprof: cycles per forward) is printed after the run.
 bench: the firmware's own cycles/forward with a console toggle (resident, silu, dnstream) off
-       then on. The DDR4 model's latency is not the board's: treat the ratio as a signal about
-       the CPU work removed, never as a board number.
+       then on. The default simulation's DDR4 model is not the board's: treat the ratio as a
+       signal about the CPU work removed, never as a board number. With toggle none on a
+       board-timing simulation of a shape-true slice: one run, the W/P split, the per-layer
+       comparison with the board and the predicted board tok/s (software/lab/simcal.py).
 
 The firmware's boot legs (`BOOT-LEGS (q to skip)`, ~70 min of Verilator time on the 1k model) are
 skipped: these runs only need the console.
@@ -120,19 +122,25 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False):
 
 # Bench --------------------------------------------------------------------------------------------
 
-PROFILE_LINES = r"^(resprof|siluprof|listprof|hybprof|attnprof|floor|dnprof|dnhw|quant8|norm_i32|total \(sum)"
+PROFILE_LINES = r"^(resprof|siluprof|listprof|hybprof|attnprof|floor|dnprof|dnhw|quant8|norm_i32|embed|lmhead|overlap|total \(sum)"
 
-def bench(gateware_dir, out_dir, toggle="resident", tokens=2):
-    """A/B a console toggle on cycles/forward; returns 0 when both runs reported."""
+def bench(gateware_dir, out_dir, toggle="resident", tokens=2, image=None):
+    """A/B a console toggle on cycles/forward; returns 0 when both runs reported.
+
+    toggle "none": one run as built, then the W/P split and, for a shape-true slice image (a
+    board-timing simulation), the per-layer normalization, the full-model board prediction and
+    the comparison with the board (software/lab/simcal.py)."""
     child   = spawn(gateware_dir, out_dir)
     results = {}
+    modes   = ("as-built",) if toggle == "none" else ("off", "on")
     try:
         boot(child)
         child.expect(PROMPT)
-        for mode in ("off", "on"):
-            answer = command(child, f"{toggle} {mode}")
-            if f"{toggle.upper()} {mode}" not in answer:
-                raise SystemExit(f"{toggle} {mode} was not acknowledged: {answer[-200:]!r}")
+        for mode in modes:
+            if toggle != "none":
+                answer = command(child, f"{toggle} {mode}")
+                if f"{toggle.upper()} {mode}" not in answer:
+                    raise SystemExit(f"{toggle} {mode} was not acknowledged: {answer[-200:]!r}")
             command(child, "stats reset")
             text  = command(child, f"bench {tokens}", timeout=2*TIMEOUT)
             text += command(child, "stats", timeout=900)
@@ -147,6 +155,14 @@ def bench(gateware_dir, out_dir, toggle="resident", tokens=2):
     finally:
         child.sendline("")
         child.close(force=True)
+    if toggle == "none":
+        if not results.get("as-built"):
+            return 1
+        if image is not None:
+            from software.lab import simcal
+            with open(os.path.join(out_dir, "bench-as-built.log"), encoding="utf-8") as f:
+                simcal.report(simcal.parse_bench(f.read()), image)
+        return 0
     off, on = results.get("off"), results.get("on")
     if not (off and on):
         return 1

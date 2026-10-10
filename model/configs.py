@@ -175,5 +175,69 @@ BONSAI_TINY_HYBRID_1K = ModelConfig(
     hadamard_signs = None,
 )
 
+# Shape-true slices: random weights at the real models' widths and head counts, a few layers and
+# a truncated vocabulary, for the board-timing simulation (trixium_sim.py --board-timing): the
+# per-layer cycles are the board's, the full model is extrapolated from them (doc/simulation.md).
+# max_ctx only sizes the KV/rope tables (the bench runs a few positions).
+BONSAI_27B_SLICE = ModelConfig(
+    name           = "bonsai-27b-slice",
+    n_layer        = 4,
+    n_embd         = 5120,
+    n_head         = 24,
+    n_kv_head      = 4,
+    head_dim       = 256,
+    ffn_dim        = 17408,
+    vocab          = 29440,  # The 27B: 248320 (both: whole LM-head chunks + one of 7552 rows).
+    max_ctx        = 256,
+    rope_theta     = 10000000.0,
+    layer_types    = ("deltanet", "deltanet", "deltanet", "attn"),
+    dn_num_v_heads = 48,
+    dn_num_k_heads = 16,
+    dn_k_head_dim  = 128,
+    dn_v_head_dim  = 128,
+    dn_conv_kernel = 4,
+    rope_dims      = 64,
+    attn_gated     = True,
+    hadamard_block = 1024,
+    hadamard_signs = None,   # filled by tinygen
+)
+
+BONSAI_8B_SLICE = ModelConfig(
+    name          = "bonsai-8b-slice",
+    n_layer       = 4,
+    n_embd        = 4096,
+    n_head        = 32,
+    n_kv_head     = 8,
+    head_dim      = 128,
+    ffn_dim       = 12288,
+    vocab         = 8192,    # The 8B: 151669.
+    max_ctx       = 256,
+    yarn_factor   = 4.0,
+    yarn_orig_ctx = 16384,
+)
+
+BONSAI_1P7B_SLICE = ModelConfig(
+    name           = "bonsai-1p7b-slice",
+    n_layer        = 4,
+    n_embd         = 2048,
+    n_head         = 16,
+    n_kv_head      = 8,
+    head_dim       = 128,
+    ffn_dim        = 6144,
+    vocab          = 8192,   # The 1.7B: 151669.
+    max_ctx        = 256,
+    tie_embeddings = True,
+    yarn_factor    = 4.0,
+    yarn_orig_ctx  = 8192,
+)
+
+# The full model a slice stands for: per-layer cycles x layers + the LM head scaled by the vocab.
+SLICE_OF = {
+    "bonsai-27b-slice"  : dict(model="27B",  n_dn=48, n_attn=16, vocab=248320),
+    "bonsai-8b-slice"   : dict(model="8B",   n_dn=0,  n_attn=36, vocab=151669),
+    "bonsai-1p7b-slice" : dict(model="1.7B", n_dn=0,  n_attn=28, vocab=151669),
+}
+
 CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B, BONSAI_TINY_HYBRID,
-                               BONSAI_TINY_HYBRID_1K)}
+                               BONSAI_TINY_HYBRID_1K, BONSAI_27B_SLICE, BONSAI_8B_SLICE,
+                               BONSAI_1P7B_SLICE)}

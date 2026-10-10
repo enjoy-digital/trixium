@@ -26,9 +26,11 @@ from model.layout import (
     ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT, ROLE_SSM_BETA,
     ROLE_SSM_ALPHA, ROLE_SSM_CONV, ROLE_SSM_A, ROLE_SSM_DT, ROLE_SSM_NORM,
 )
+from model.layout import KSEG_MAX
 from model.bons import TensorSpec, write_image, split_wide
 from model.convert import _hadamard_specs
 from model.configs import BONSAI_TINY, BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K
+from model.configs import CONFIGS, SLICE_OF
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -54,9 +56,9 @@ def _f32(name, role, layer, values):
 
 # Tensors ------------------------------------------------------------------------------------------
 
-def make_tiny_tensors(cfg, seed=1234):
+def make_tiny_tensors(cfg, seed=1234, lm_head=False):
     """The real Ternary-Bonsai GGUF inventory: ternary everything (embeddings included, tied:
-    no separate output.weight) + F32 norm vectors."""
+    no separate output.weight unless lm_head, the 8B's) + F32 norm vectors."""
     rng = np.random.default_rng(seed)
     t   = []
     t.append(_ternary(rng, "token_embd.weight", ROLE_TOK_EMB, 0, cfg.vocab, cfg.n_embd))
@@ -75,6 +77,8 @@ def make_tiny_tensors(cfg, seed=1234):
         t.append(_ternary(rng, p+"ffn_down.weight",    ROLE_FFN_DOWN,    l, cfg.n_embd,  cfg.ffn_dim))
     t.append(_norm(rng, "output_norm.weight", ROLE_OUT_NORM, 0, cfg.n_embd))
     # Tied embeddings: the LM head matvec streams token_embd.weight.
+    if lm_head:
+        t.append(_ternary(rng, "output.weight", ROLE_LM_HEAD, 0, cfg.vocab, cfg.n_embd))
     return t
 
 def make_tiny_hybrid_tensors(cfg, seed=1234):
@@ -142,6 +146,22 @@ def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
     manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path)
     return img_path, man_path, manifest
 
+def generate_slice(out_dir, name, n_channels=16, seed=1234):
+    """A shape-true slice (model.configs.SLICE_OF): the real model's tensors at its real widths,
+    K-segmented as the converter does (layout.KSEG_MAX), the int16 embedding table included;
+    an untied model (the 8B) gets its own output.weight."""
+    cfg = CONFIGS[name]
+    os.makedirs(out_dir, exist_ok=True)
+    if cfg.layer_types:
+        tensors = make_tiny_hybrid_tensors(cfg, seed)
+    else:
+        tensors = make_tiny_tensors(cfg, seed, lm_head=not cfg.tie_embeddings)
+    tensors  = [seg for t in tensors for seg in split_wide(t, KSEG_MAX)]
+    img_path = os.path.join(out_dir, f"{cfg.name}-n{n_channels}.img")
+    man_path = os.path.join(out_dir, f"{cfg.name}-n{n_channels}.json")
+    manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path)
+    return img_path, man_path, manifest
+
 # Run ----------------------------------------------------------------------------------------------
 
 def main():
@@ -152,10 +172,14 @@ def main():
     parser.add_argument("--hybrid",    action="store_true",    help="bonsai-tiny-hybrid (the 27B's shape).")
     parser.add_argument("--hybrid-1k", action="store_true",    help="bonsai-tiny-hybrid-1k (1024-wide rotation blocks).")
     parser.add_argument("--kseg-max",  default=None, type=int, help="Split matvecs wider than this (K-segments).")
+    parser.add_argument("--slice",     default=None, choices=list(SLICE_OF), help="A shape-true slice (real widths, few layers).")
     args = parser.parse_args()
 
-    cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
-    img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max)
+    if args.slice:
+        img, man, manifest = generate_slice(args.out, args.slice, args.channels, args.seed)
+    else:
+        cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
+        img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")
     print(f"manifest : {man}")
     print(f"payload  : {manifest['payload_beats']} beats/channel "
