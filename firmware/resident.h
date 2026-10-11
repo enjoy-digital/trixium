@@ -93,6 +93,10 @@ void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
 // the call covers the whole tensor; otherwise store it with rl_store_packets.
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage,
                     uint32_t dst_sp);
+// NOWAIT on the last descriptor added (an engine op: the next unit descriptors added with
+// rl_desc_overlap run under it), and rl_desc with OVERLAP. The caller asserts independence.
+void rl_nowait(void);
+void rl_desc_overlap(const struct bns_seq_descriptor *d);
 // One engine STORE of `packets` runs of packet_bytes: run r from sp + r*sp_stride to
 // dst + r*dst_stride (bytes, 32-byte multiples; <= 31 runs, sp_stride <= 8160). inv/inv_bytes:
 // the main-RAM span to clean now and invalidate after the list (NULL: the caller does it).

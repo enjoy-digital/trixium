@@ -709,6 +709,19 @@ void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
     if (dst_sp == RS_F) rl_rsf_lost();   // partials stay below RS_F (build_matvec_rows)
 }
 
+void rl_nowait(void)
+{
+    if (RLS->n)
+        seq_patch(RLS->bbase + RLS->n - 1, 0, 1u | (1u << 9));
+}
+
+void rl_desc_overlap(const struct bns_seq_descriptor *d)
+{
+    struct bns_seq_descriptor o = *d;
+    o.word[0] |= 1u << 9;
+    rl_desc(&o);
+}
+
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage,
                     uint32_t dst_sp)
 {
@@ -1245,6 +1258,8 @@ void rl_begin(void) {}
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp) { (void)src; (void)bytes; (void)sp; }
 void rl_store(void *dst, uint32_t bytes, uint32_t sp) { (void)dst; (void)bytes; (void)sp; }
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp) { (void)e; (void)ystage; (void)dst_sp; }
+void rl_nowait(void) {}
+void rl_desc_overlap(const struct bns_seq_descriptor *d) { (void)d; }
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage, uint32_t dst_sp)
 { (void)e; (void)row0; (void)rows; (void)ystage; (void)dst_sp; }
 void rl_prepare(const float *src, uint32_t width, int rotate) { (void)src; (void)width; (void)rotate; }

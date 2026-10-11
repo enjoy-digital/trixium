@@ -1169,7 +1169,11 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         z_stays = 1;
     }
 #endif
-    const uint32_t CH = 2048, W = RS_F_ADDR, X = RS_F_ADDR + 16*CH;
+    // The conv's chunks: the taps in two buffers (W, W + 16*CH), so chunk c+1's taps stream
+    // in (NOWAIT) while unit 13 convolves chunk c (OVERLAP), then the three window slots - 44*CH
+    // bytes, inside RS_F.
+    const uint32_t CH = 1920, W = RS_F_ADDR, X = RS_F_ADDR + 32*CH;
+    _Static_assert(RS_F_ADDR + 44u*1920u <= 0x32000u, "conv buffers fit RS_F");
     uint32_t eps = f32_bits(rms_eps);
     if (!HP->dnres_enabled || !resident_silu_active() || !H->hadamard_block || conv_k != 4 ||
         Z2 + 4u*(uint32_t)nvh > RS_F_ADDR || C % 8 || hv % 8 || hk % 8 ||
@@ -1205,18 +1209,24 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     float *xn = dn_conv_slot(s, pn, C);
 #define DN_CONV_LIST() do {                                                                      \
         rl_begin();                                                                              \
-        for (uint32_t c0 = 0; c0 < C; c0 += CH) {                                                \
-            uint32_t ch = C - c0 < CH ? C - c0 : CH;                                             \
-            /* Raw transfers: the taps were cleaned once at load, and the window is device-   */ \
-            /* owned (the CPU path flushes it around its own use, hybrid_reset after its      */ \
-            /* memset).                                                                       */ \
-            rl_fetch_raw(conv_w[l] + 4*c0, 16*ch, W);                                            \
+        /* Raw transfers: the taps were cleaned once at load, and the window is device-owned */  \
+        /* (the CPU path flushes it around its own use, hybrid_reset after its memset).      */  \
+        rl_fetch_raw(conv_w[l], 16*(C < CH ? C : CH), W);                                        \
+        for (uint32_t c0 = 0, b = 0; c0 < C; c0 += CH, b ^= 1) {                                 \
+            uint32_t ch = C - c0 < CH ? C - c0 : CH, wb = W + b*16*CH;                           \
             rl_fetch_raw(x0 + c0, 4*ch, X);                                                      \
             rl_fetch_raw(x1 + c0, 4*ch, X + 4*CH);                                               \
             rl_fetch_raw(x2 + c0, 4*ch, X + 8*CH);                                               \
             rl_store_raw(xn + c0, 4*ch, DNR_QKV + 4*c0);                                         \
-            bns_seq_desc_conv(&d, X, X + 4*CH, X + 8*CH, DNR_QKV + 4*c0, W, DNR_QKV + 4*c0, ch); \
-            rl_desc(&d);                                                                         \
+            bns_seq_desc_conv(&d, X, X + 4*CH, X + 8*CH, DNR_QKV + 4*c0, wb, DNR_QKV + 4*c0, ch);\
+            if (c0 + CH < C) {                                                                   \
+                uint32_t cn = C - c0 - CH < CH ? C - c0 - CH : CH;                               \
+                rl_fetch_raw(conv_w[l] + 4*(c0 + CH), 16*cn, W + (b ^ 1)*16*CH);                 \
+                rl_nowait();                                                                     \
+                rl_desc_overlap(&d);                                                             \
+            } else {                                                                             \
+                rl_desc(&d);                                                                     \
+            }                                                                                    \
         }                                                                                        \
         bns_seq_desc_silu_ex(&d, DNR_QKV, DNR_QKV, DNR_QKV, FIX, C, 1, 0, 0, 0);                 \
         rl_desc(&d);                                                                             \
@@ -1670,12 +1680,12 @@ static void attention_layer(int l, const float *h, float *out)
             }
         }
         rl_begin();
+        rl_fetch_raw(norm_q[l], 4*(uint32_t)head_dim, NQ);
+        rl_fetch_raw(norm_k[l], 4*(uint32_t)head_dim, NK);
         rl_prepare(h, (uint32_t)n_embd, 1);
         rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
         rl_matvec(model_entry(ROLE_ATTN_K, l), KS, KS);
         rl_matvec(model_entry(ROLE_ATTN_V, l), VS, VS);
-        rl_fetch_raw(norm_q[l], 4*(uint32_t)head_dim, NQ);
-        rl_fetch_raw(norm_k[l], 4*(uint32_t)head_dim, NK);
         bns_seq_desc_norm_strided(&d, 0, QS, QS, NQ, (uint32_t)head_dim, (uint32_t)n_head, eps,
                                   gated ? 2*hb8 : hb8, gated ? 2*hb8 : hb8);
         if (want_rope && bns_seq_desc_norm_rope(&d, (uint32_t)rope_n, RT)) want_rope = 0;

@@ -623,8 +623,15 @@ int infer_embed_f(int token, float *dst)
     const struct bons_entry *emb = model_entry(ROLE_TOK_EMB, 0);
     if (!emb) return -1;
     int e = embed_row_fetch(emb, token, SP_XR);
-    volatile int16_t *p = sp16(SP_XR);
     float s = ldexpf(1.0f, e);
-    for (int i = 0; i < n_embd; i++) dst[i] = (float)p[i]*s;
+    // Two int16 per scratchpad read: each is an uncached bus transaction (~30 cycles).
+    const volatile uint32_t *p = (const volatile uint32_t *)(SCRATCHPAD_BASE + SP_XR);
+    int i = 0;
+    for (; i + 1 < n_embd; i += 2) {
+        uint32_t w = p[i/2];
+        dst[i]     = (float)(int16_t)(w & 0xffffu)*s;
+        dst[i + 1] = (float)(int16_t)(w >> 16)*s;
+    }
+    if (i < n_embd) dst[i] = (float)sp16(SP_XR)[i]*s;
     return 0;
 }
