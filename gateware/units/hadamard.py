@@ -330,8 +330,16 @@ class HadamardScratchpad(LiteXModule):
 
         # Command capture and validation.
         (IDLE, START, SIGN_REQ, SIGN_CAP, DATA_REQ, DATA_CAP, SEND, OUTPUT, STATS, NEXT, FINISH,
-         FAILED) = range(12)
+         FAILED, SIGNS, STREAM) = range(14)
         state = Signal(4, reset=IDLE)
+        # Streamed input (32 lanes, one core word per scratchpad beat, blocks <= 1,024): the
+        # block's sign beats first (one read per clock into a block-wide register), then one
+        # data read per clock straight into the kernel, which is always ready while loading.
+        # ~block/32 + block/256 + 2 clocks per block instead of three per word (request,
+        # capture, send) plus two per sign beat.
+        streamed = (L == 32) and (block_size <= 1024)
+        nsb      = block_size//256              # sign beats per block
+        words    = block_size//L
         captured = {name: Signal(width, reset_less=True) for name, width in HADAMARD_COMMAND}
         block = Signal(16)
         in_word = Signal(max=block_size//L)
@@ -366,17 +374,8 @@ class HadamardScratchpad(LiteXModule):
             core.cancel.eq(self.cancel | (state == FAILED)),
             core.cmd.valid.eq((state == START) & ~self.cancel),
             core.cmd.inverse.eq(captured["inverse"]),
-            core.sink.valid.eq((state == SEND) & ~self.cancel),
-            core.sink.data.eq(inputs[:8*L]), core.sink.negate.eq(signs[:L]),
-            core.sink.last.eq(in_word == block_size//L - 1),
             core.source.ready.eq((state == OUTPUT) & self.sp_wr_gnt & (out_sub == bpw - 1) &
                                  ~self.cancel),
-            self.sp_rd_req.eq(((state == SIGN_REQ) | (state == DATA_REQ)) & ~self.cancel),
-            self.sp_rd_adr.eq(Mux(state == SIGN_REQ,
-                (captured["signs"] >> 5) + block*(block_size//256) +
-                (in_word >> (wps.bit_length() - 1)),
-                (captured["src"] >> 5) + block*(block_size//32) +
-                (in_word >> (wpb.bit_length() - 1)))),
             self.sp_wr_req.eq(((state == OUTPUT) & core.source.valid | (state == STATS)) &
                               ~self.cancel),
             self.sp_wr_adr.eq(Mux(state == STATS,
@@ -384,6 +383,51 @@ class HadamardScratchpad(LiteXModule):
                 (captured["dst"] >> 5) + block*(block_size//8) + out_word)),
             self.sp_wr_we.eq(Mux(state == STATS, C(1, 8) << block[:3], 0xff)),
         ]
+        if not streamed:
+            self.comb += [
+                core.sink.valid.eq((state == SEND) & ~self.cancel),
+                core.sink.data.eq(inputs[:8*L]), core.sink.negate.eq(signs[:L]),
+                core.sink.last.eq(in_word == block_size//L - 1),
+                self.sp_rd_req.eq(((state == SIGN_REQ) | (state == DATA_REQ)) & ~self.cancel),
+                self.sp_rd_adr.eq(Mux(state == SIGN_REQ,
+                    (captured["signs"] >> 5) + block*(block_size//256) +
+                    (in_word >> (wps.bit_length() - 1)),
+                    (captured["src"] >> 5) + block*(block_size//32) +
+                    (in_word >> (wpb.bit_length() - 1)))),
+            ]
+        else:
+            issue      = Signal(max=max(2, words + 1))  # reads issued in SIGNS/STREAM
+            sign_pend  = Signal()                       # a sign read's data is on sp_rd_dat
+            sign_shift = Signal(block_size, reset_less=True)
+            data_pend  = Signal()                       # a data read's data is on sp_rd_dat
+            data_last  = Signal(reset_less=True)        # (data_pend)
+            self.comb += [
+                core.sink.valid.eq(data_pend & (state == STREAM) & ~self.cancel),
+                core.sink.data.eq(self.sp_rd_dat[:8*L]),
+                core.sink.negate.eq(sign_shift[:L]),
+                core.sink.last.eq(data_last),
+                self.sp_rd_req.eq((((state == SIGNS) & (issue < nsb)) |
+                                   ((state == STREAM) & (issue < words))) & ~self.cancel),
+                self.sp_rd_adr.eq(Mux(state == SIGNS,
+                    (captured["signs"] >> 5) + block*nsb + issue,
+                    (captured["src"] >> 5) + block*words + issue)),
+            ]
+            self.sync += [
+                If(self.cancel | (state == FAILED),
+                    sign_pend.eq(0), data_pend.eq(0),
+                ).Else(
+                    sign_pend.eq(self.sp_rd_req & (state == SIGNS)),
+                    data_pend.eq(self.sp_rd_req & (state == STREAM)),
+                ),
+                If(self.sp_rd_req, data_last.eq(issue == words - 1)),
+                # Sign beats arrive in order: shift each in from the top, so after nsb beats
+                # beat 0 sits at the bottom; each accepted data word then consumes L bits.
+                If(sign_pend,
+                    sign_shift.eq(Cat(sign_shift[256:], self.sp_rd_dat) if nsb > 1 else
+                                  self.sp_rd_dat),
+                ).Elif(core.sink.valid & core.sink.ready,
+                    sign_shift.eq(sign_shift >> L)),
+            ]
         for lane in range(8):
             value = Signal((core.output_width, True))
             wide = Signal((32, True))
@@ -412,7 +456,18 @@ class HadamardScratchpad(LiteXModule):
                         state.eq(FAILED),
                     ).Else(state.eq(START)),
                 ),
-                START: If(core.cmd.ready, state.eq(SIGN_REQ)),
+                START: If(core.cmd.ready, state.eq(SIGNS if streamed else SIGN_REQ),
+                          *([issue.eq(0)] if streamed else [])),
+                **({
+                    SIGNS: If(self.sp_rd_req,
+                        issue.eq(issue + 1),
+                    ).Elif(~sign_pend,         # the last sign beat has landed
+                        issue.eq(0), state.eq(STREAM)),
+                    STREAM: [
+                        If(self.sp_rd_req, issue.eq(issue + 1)),
+                        If(core.sink.valid & core.sink.ready & data_last, state.eq(OUTPUT)),
+                    ],
+                } if streamed else {}),
                 SIGN_REQ: state.eq(SIGN_CAP),
                 SIGN_CAP: [signs.eq(self.sp_rd_dat), state.eq(DATA_REQ)],
                 DATA_REQ: state.eq(DATA_CAP),

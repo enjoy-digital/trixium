@@ -168,8 +168,9 @@ int main() {
     for (unsigned i=0; i<100; i++) tick(d);
     complete(d,1024,17,true); complete(d,1024,17,true,false);
     complete(d,17408,1); complete(d,5120,1); complete(d,32,5);
-    // Reset points across the 17-block list (14,024 cycles with the 32-lane Hadamard).
-    for (unsigned stop : {20u,160u,260u,1300u,6000u,11000u,13500u}) {
+    // Reset points across the 17-block list (12,919 cycles with the 32-lane Hadamard and its
+    // streamed input).
+    for (unsigned stop : {20u,160u,260u,1300u,6000u,11000u,12500u}) {
         start(d,quant(1024,17),true);
         for (unsigned i=0; i<stop; i++) tick(d);
         require(d.seq_status&1,"list completed before reset case");

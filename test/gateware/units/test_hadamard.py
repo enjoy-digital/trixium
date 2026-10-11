@@ -532,3 +532,38 @@ def test_without_overlap_the_rotation_waits_for_the_nowait_fetch():
         else:
             raise AssertionError('list did not complete')
     run_cluster(dut, run())
+
+
+def test_hadamard_streamed_input_rate():
+    # 32 lanes, 1,024-element blocks (the targets' configuration): the input streams one core
+    # word per clock after the block's sign beats, so a block costs its sign beats, 32 input
+    # words, 10 stages of 16 issue clocks + 1 drain, and 128 int32 output beats, plus a few
+    # control clocks - not three clocks per input word (request, capture, send).
+    size, blocks = 1024, 3
+    dut = RotationSP(size=64*1024, block_size=size)
+    cycles = []
+    def run():
+        rng = random.Random(5)
+        src, signs, dst, stats = 0x100, 0x3100, 0x4000, 0x8000
+        values = [rng.randrange(-128, 128) for _ in range(blocks*size)]
+        sg = [rng.choice([-1, 1]) for _ in values]
+        for beat in range(blocks*size//32):
+            yield dut.sp.mem[src//32 + beat].eq(packed(values[beat*32:(beat+1)*32], 8))
+        for beat in range(blocks*size//256):
+            yield dut.sp.mem[signs//32 + beat].eq(sum((s < 0) << i for i, s in enumerate(sg[beat*256:(beat+1)*256])))
+        yield from submit(dut, src=src, signs=signs, dst=dst, stats=stats, blocks=blocks, inverse=0)
+        for cycle in range(20000):
+            yield
+            if (yield dut.unit.done):
+                cycles.append(cycle)
+                break
+        for block in range(blocks):
+            expected = dense(values[block*size:(block+1)*size], sg[block*size:(block+1)*size], False)
+            actual = []
+            for beat in range(size//8):
+                actual += unpacked((yield dut.sp.mem[(dst + block*size*4)//32 + beat]), 32, 8)
+            assert actual == expected
+    run_tb(dut, run())
+    per_block = cycles[0]/blocks
+    print(f"\nhadamard: {per_block:.0f} clocks per 1,024-element block")
+    assert per_block <= size//256 + size//32 + 10*(size//64 + 1) + size//8 + 16, per_block
