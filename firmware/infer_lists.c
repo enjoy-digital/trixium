@@ -456,7 +456,7 @@ int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
 void seq_build_ffn(void)
 {
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
-    int len = 10;
+    int len = 9;
     if (di + len > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
@@ -472,10 +472,11 @@ void seq_build_ffn(void)
     //   3 norm_g SP_Y -> SP_G [k via KRES6]            <- runs under the up stream
     //   4 silu_gate SP_G in place [A4 = imm + kreg0]   <- runs under the up stream
     //   5 spill up-absmax (seed_abs: interlock waits the stream)
-    //   6 norm_u SP_YU -> SP_U [k via KRES6]
-    //   7 mul_q8 -> SP_X [res6 = source absmax, read by the CPU after the list -
-    //     desc 8 is an engine op and leaves it alone]
-    //   8 down mv   9 stop
+    //   6 norm_mul_q8 SP_G x (SP_YU >> ku) -> SP_X [ku via KRES6; res6 = source absmax,
+    //     read by the CPU after the list - desc 7 is an engine op and leaves it alone]
+    //   7 down mv   8 stop
+    // The up norm rides inside the multiply (prog_norm_mul_q8): no int16 up in SP_U, one pass
+    // and one descriptor less on the serial tail between the up and down streams.
     struct engine_op z = {0};
     seq_desc_engine(di + 0, &z);
     int32_t pa = (int32_t)SP_FFSP;
@@ -503,14 +504,12 @@ void seq_build_ffn(void)
     int32_t pb = (int32_t)(SP_FFSP + 32);
     seq_desc_vec_seed(d, PROG_SPILL, &pb, 1, 0, 1);                      // spill up-absmax
     d++;
-    int32_t nb[5] = {(int32_t)SP_YU, 0, (int32_t)SP_U, ffn_dim/16, 0};
-    seq_desc_vec(d, PROG_NORM_I32, nb, 5, (uint16_t)(SEQ_SRC_KRES6 << 8)); // norm_u
-    d++;
     {
-        // mul_q8: (silu * up) << A6, clamp, absmax (res6 for the CPU), quant8 -> SP_X.
-        int32_t ma[8] = {(int32_t)SP_G, (int32_t)SP_U, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
+        // norm_mul_q8: (silu * (up >> ku)) << A6, clamp, absmax (res6 for the CPU), quant8
+        // -> SP_X; A4 = ku from the spill's res6 (KRES6), as norm_u took it.
+        int32_t ma[8] = {(int32_t)SP_G, (int32_t)SP_YU, (int32_t)SP_G, ffn_dim/16, 0, 0, -15,
                          (int32_t)SP_X};
-        seq_desc_vec(d, PROG_MUL_Q8, ma, 8, 0);
+        seq_desc_vec(d, PROG_NORM_MUL_Q8, ma, 8, (uint16_t)(SEQ_SRC_KRES6 << 8));
     }
     d++;
     seq_desc_engine(d, &z);                                               // down mv

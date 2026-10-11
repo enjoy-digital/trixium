@@ -315,6 +315,40 @@ def test_rtl_silu_gate_and_mul_q8(backend):
         _compare_words(backend, mul, sp, [0, 0x1000, 0, n//16, 0, 0, -15, 0x3000])
 
 
+@COMPILED
+def test_rtl_resid_rmsnorm_q8(backend):
+    # The residual tail (x1 and x2), RTL vs interpreter: the packed-shift extraction (48-bit
+    # wrap), both operand shifts signed, the residual updated in place.
+    rng = np.random.default_rng(48)
+    n = 256
+    for prog in (asm.prog_resid_rmsnorm_q8(), asm.prog_resid_rmsnorm_q8_x2()):
+        for k, sa, sb in ((3, 0, 1), (0, 2, -1)):
+            sp = bytearray(SP_SIZE)
+            sp[0:2*n] = rng.integers(-30000, 30000, n).astype("<i2").tobytes()
+            sp[0x2000:0x2000 + 2*n] = rng.integers(-8000, 8000, n).astype("<i2").tobytes()
+            sp[0x3400:0x3400 + 4*n] = rng.integers(-(1 << (13 + k)), 1 << (13 + k), n).astype("<i4").tobytes()
+            a4 = asm.resid_tail_pack(-k, -sa, -sb, -8, -17)
+            args = [0x3400, 0, 0x1000, n//16, a4, 17, 0x2000, 0x3000]
+            ref  = bytearray(sp)
+            S, _ = asm.VecInterp(ref).run(asm.assemble(prog), list(args))
+            out  = _vec_run(backend, asm.assemble(prog), sp, args)
+            assert out["sp"] == bytes(ref), "RTL differs from the interpreter"
+            assert out["s6"] & 0xFFFFFFFF == S[6] & 0xFFFFFFFF
+
+
+@COMPILED
+def test_rtl_norm_mul_q8(backend):
+    # The FFN tail with the up norm folded in (x1 and x2), RTL vs interpreter, in place.
+    rng = np.random.default_rng(49)
+    n = 256
+    for prog in (asm.prog_norm_mul_q8(), asm.prog_norm_mul_q8_x2()):
+        k = 5
+        sp = bytearray(SP_SIZE)
+        sp[0:2*n] = rng.integers(-32768, 32768, n).astype("<i2").tobytes()
+        sp[0x1000:0x1000 + 4*n] = rng.integers(-(1 << (13 + k)), 1 << (13 + k), n).astype("<i4").tobytes()
+        _compare_words(backend, prog, sp, [0, 0x1000, 0, n//16, k, 0, -15, 0x3000])
+
+
 def _dn_case(seed, hv, hk):
     """A DeltaNet head mid-life: a state at its exponent, unit k/q, a value row - the
     scratchpad and both passes' arguments from deltanet.head_step's trace."""

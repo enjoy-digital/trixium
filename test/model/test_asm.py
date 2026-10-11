@@ -443,6 +443,83 @@ def test_silu_split_matches_fused():
     assert cases == 6*6*3*2
 
 
+def test_resid_rmsnorm_q8_matches_the_three_programs():
+    """The residual tail: prog_resid_rmsnorm_q8 (x1 and x2) leaves the residual, the int16
+    normed output and the int8 x8 byte-identical to prog_norm_i32 -> prog_resid_add ->
+    prog_rmsnorm_q8, and its S6 packs both programs' absmaxes - over the shift range the
+    firmware hands it, left shifts of either operand included, and the int16 extremes."""
+    rng = np.random.default_rng(47)
+    n = 512
+    X, D, H, W, Y, X8 = 0x0000, 0x1000, 0x2000, 0x3000, 0x4000, 0x6000
+    fused = (asm.assemble(asm.prog_resid_rmsnorm_q8()), asm.assemble(asm.prog_resid_rmsnorm_q8_x2()))
+    cases = 0
+    for trial in range(5):
+        base = bytearray(32*1024)
+        if trial == 0:
+            x = np.array([-32767, 32767, 0, 1, -1, 16384] * (n//6 + 1))[:n].astype("<i2")
+        else:
+            x = rng.integers(-32767, 32768, n).astype("<i2")
+        base[X:X + 2*n] = x.tobytes()
+        base[W:W + 2*n] = rng.integers(-8000, 8000, n).astype("<i2").tobytes()
+        for k in (0, 3, 9):
+            # Engine results within norm_i32's contract for this k: |y >> k| < 2^14.
+            y = rng.integers(-(1 << (13 + k)), 1 << (13 + k), n).astype("<i4")
+            base[Y:Y + 4*n] = y.tobytes()
+            for sa, sb in ((0, 1), (1, 0), (2, -1), (-1, 3), (0, 0)):
+                for eps, wsh in ((17, -17), (1, -12)):
+                    ref = bytearray(base)
+                    _run_words(asm.assemble(asm.prog_norm_i32()), ref, [Y, 0, D, n//16, k])
+                    Sr1, _ = _run_words(asm.assemble(asm.prog_resid_add()), ref,
+                                        [X, D, X, n//16, -sa, -sb])
+                    Sr2, _ = _run_words(asm.assemble(asm.prog_rmsnorm_q8()), ref,
+                                        [X, W, H, n//16, -9, eps, wsh, X8])
+                    a4 = asm.resid_tail_pack(-k, -sa, -sb, -9, wsh)
+                    for words in fused:
+                        got = bytearray(base)
+                        Sg, _ = _run_words(words, got, [Y, X, H, n//16, a4, eps, W, X8])
+                        # SP_D is the only region the fused program leaves untouched.
+                        got[D:D + 2*n] = ref[D:D + 2*n]
+                        assert bytes(got) == bytes(ref), (trial, k, sa, sb, eps)
+                        assert Sg[6] == (Sr1[6] << 16) | Sr2[6], (Sg[6], Sr1[6], Sr2[6])
+                        cases += 1
+    assert cases == 5*3*5*2*2
+
+
+def test_norm_mul_q8_matches_norm_i32_then_mul_q8():
+    """The FFN tail: prog_norm_mul_q8 (x1 and x2) == prog_norm_i32 (up -> int16) then
+    prog_mul_q8, in place as the FFN list runs it - scratchpad (but the int16 up it no
+    longer writes) and res6."""
+    rng = np.random.default_rng(49)
+    n = 512
+    G, U, YU, X8 = 0x0000, 0x1000, 0x2000, 0x4000
+    fused = (asm.assemble(asm.prog_norm_mul_q8()), asm.assemble(asm.prog_norm_mul_q8_x2()))
+    cases = 0
+    for trial in range(4):
+        base = bytearray(24*1024)
+        base[G:G + 2*n] = rng.integers(-32768, 32768, n).astype("<i2").tobytes()
+        for k in (0, 2, 11):
+            base[YU:YU + 4*n] = rng.integers(-(1 << (13 + k)), 1 << (13 + k), n).astype("<i4").tobytes()
+            for a6 in (-15, -13, -10):
+                ref = bytearray(base)
+                _run_words(asm.assemble(asm.prog_norm_i32()), ref, [YU, 0, U, n//16, k])
+                Sr, _ = _run_words(asm.assemble(asm.prog_mul_q8()), ref,
+                                   [G, U, G, n//16, 0, 0, a6, X8])
+                for words in fused:
+                    got = bytearray(base)
+                    Sg, _ = _run_words(words, got, [G, YU, G, n//16, k, 0, a6, X8])
+                    got[U:U + 2*n] = ref[U:U + 2*n]
+                    assert bytes(got) == bytes(ref), (trial, k, a6)
+                    assert Sg[6] == Sr[6]
+                    cases += 1
+    assert cases == 4*3*3*2
+
+
+def test_resid_tail_pack_fields():
+    assert asm.resid_tail_pack(-32, 31, 0, -12, -17) is not None
+    assert asm.resid_tail_pack(-33, 0, 0, 0, 0) is None
+    assert asm.resid_tail_pack(0, 0, 0, 0, 32) is None
+
+
 def _dn_scratchpad(M, k16, q16, nv, rows, beats, base=0x10000, size=0x14000):
     """The two passes' scratchpad: state at 0, k at K, k/q interleaved at KQ, -v beats at
     NV (word 0 of each, the rest zero), delta/o beats at DL."""

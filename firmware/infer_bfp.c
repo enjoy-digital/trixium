@@ -152,6 +152,17 @@ uint32_t norm_fetch_submit(const struct bons_entry *w16)
 static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
                            uint32_t bmax, uint32_t *amax_io);
 
+// resid_add's output exponent (see op_resid_add_sp): bound the sum at the common exponent,
+// then keep only the headroom it actually needs.
+static int resid_eo(int ea, uint32_t amax, int eb, uint32_t bmax)
+{
+    int emin = (ea < eb) ? ea : eb;
+    uint64_t bound = ((uint64_t)amax << (ea - emin)) + ((uint64_t)bmax << (eb - emin));
+    int k = 0;
+    while ((bound >> k) > 32767) k++;
+    return emin + k;
+}
+
 // resid_add with the NEXT norm's weight row streaming underneath. SP_FET is idle here (its
 // last reader, the previous rmsnorm or the qkr list, has finished) and the engine is idle
 // (the preceding matvec/list joined) - same numerics either way.
@@ -198,6 +209,62 @@ int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w,
     int s = op_quant8_sp(dst16, dst8, n);
     perf_exit(OP_QUANT8);
     return s;
+}
+
+// The residual tail in one program (prog_resid_rmsnorm_q8): the projection's norm_i32, resid_add
+// into the residual and the next rmsnorm_q8 - byte-identical to op_norm_i32_sp_m + resid_add_pf
+// + op_rmsnorm_q8_sp, one dispatch instead of three, and the addend never goes through SP_D.
+// The shifts ride one argument as 6-bit fields (asm.resid_tail_pack).
+static int32_t resid_tail_pack(int nk, int nsa, int nsb, int nln, int wsh)
+{
+    int v[5] = {nk, nsa, nsb, nln, wsh};
+    uint32_t word = 0;
+    for (int i = 0; i < 5; i++) {
+        if (v[i] < -32 || v[i] > 31)
+            return -1; // Never a packing: bits 31:30 are always clear.
+        word |= ((uint32_t)v[i] & 0x3F) << (6*i);
+    }
+    return (int32_t)word;
+}
+
+// src = the engine results (the projection that just ran: its absmax is still in the tracker,
+// read before the norm-row fetch is submitted - the tracker resets on accept), eproj = their
+// exponent before the norm shift (input exponent - bias + rshift), *eres/*xamax = the residual
+// exponent/absmax (updated), w16 = the next norm's row. Returns the next norm's quant8 shift
+// (int16 out in SP_H, x8 in SP_X), or RESID_TAIL_OFF with nothing run - an op off the hardware
+// or a shift that does not fit its field - and the caller runs the three ops.
+int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
+                  const struct bons_entry *w16, int n)
+{
+#ifdef CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR
+    if (!w16 || !op_on_hw(OP_NORM_I32) || !op_on_hw(OP_RESID_ADD) || !op_on_hw(OP_RMSNORM)
+        || !op_on_hw(OP_QUANT8))
+        return RESID_TAIL_OFF;
+    uint32_t amax = trixium_engine_csr_absmax_read();
+    int k = 0;
+    while ((amax >> k) > 16383u) k++;
+    uint32_t dmax = amax >> k;
+    int ed = eproj + k;
+    int eo = resid_eo(*eres, *xamax, ed, dmax);
+    int ln = 0;
+    while ((1 << ln) < n) ln++;
+    int32_t a4 = resid_tail_pack(-k, *eres - eo, ed - eo, -ln, w16_shift(w16));
+    if (a4 < 0)
+        return RESID_TAIL_OFF;
+    uint32_t df = norm_fetch_submit(w16);
+    int32_t args[8] = {(int32_t)src, (int32_t)SP_XR, (int32_t)SP_H, n/16, a4, eps_for(eo),
+                       (int32_t)SP_FET, (int32_t)SP_X};
+    engine_join(df);
+    perf_enter(OP_RESID_ADD);
+    uint32_t r = (uint32_t)vec_run(PROG_RESID_RMSQ8, args, 8);
+    perf_exit(OP_RESID_ADD);
+    *eres  = eo;
+    *xamax = r >> 16;
+    return quant8_shift(r & 0xFFFF);
+#else
+    (void)src; (void)eproj; (void)eres; (void)xamax; (void)w16; (void)n;
+    return RESID_TAIL_OFF;
+#endif
 }
 
 static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n);
@@ -326,12 +393,7 @@ COLD static void op_silu_mul_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, in
 static int op_resid_add_sp(uint32_t a, int ea, uint32_t b, int eb, int n,
                            uint32_t bmax, uint32_t *amax_io)
 {
-    int emin = (ea < eb) ? ea : eb;
-    // Bound the sum at the common exponent, then keep only the headroom it actually needs.
-    uint64_t bound = ((uint64_t)*amax_io << (ea - emin)) + ((uint64_t)bmax << (eb - emin));
-    int k = 0;
-    while ((bound >> k) > 32767) k++;
-    int eo = emin + k;
+    int eo = resid_eo(ea, *amax_io, eb, bmax);
     int sa = eo - ea, sb = eo - eb;
     if (op_on_hw(OP_RESID_ADD)) {
         int32_t args[6] = {(int32_t)a, (int32_t)b, (int32_t)a, n/16, -sa, -sb};

@@ -301,6 +301,9 @@ int resid_add_pf(uint32_t src, int esrc, uint32_t d, int ed, int n, uint32_t dma
 int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w, const struct bons_entry *w16,
                      int n, uint32_t dst16, uint32_t dst8);
 int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, uint32_t dst8);
+#define RESID_TAIL_OFF (-1000) // resid_norm_q8 ran nothing (no quant8 shift is ever this).
+int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
+                  const struct bons_entry *w16, int n);
 int op_norm_i32_sp_a(uint32_t src, uint32_t dst, int n, uint32_t amax, uint32_t *omax);
 int op_norm_i32_sp_m(uint32_t src, uint32_t dst, int n, uint32_t *omax);
 static inline int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)

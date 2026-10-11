@@ -895,6 +895,96 @@ def prog_rmsnorm_q8():
         ("DONE",),
     ]
 
+# The residual tail's shifts ride one argument as 6-bit signed fields (the program has eight
+# argument registers and needs eleven values). A field is extracted with two scalar shifts:
+# left so its top bit lands on bit 47 (the 48-bit wrap drops everything above), then
+# arithmetic right by 42.
+RESID_TAIL_FIELDS = ("nk", "nsa", "nsb", "nln", "wsh") # A4 bits [5:0], [11:6], ... [29:24].
+
+def resid_tail_pack(nk, nsa, nsb, nln, wsh):
+    """A4 of prog_resid_rmsnorm_q8, or None when a value does not fit its 6-bit field."""
+    word = 0
+    for i, v in enumerate((nk, nsa, nsb, nln, wsh)):
+        if not -32 <= v <= 31:
+            return None
+        word |= (v & 0x3F) << (6*i)
+    return word
+
+def _resid_tail_field(dst, i, tmp, m42):
+    """dst = field i of the packed word in s1 (s1 kept); tmp is clobbered, m42 holds -42."""
+    return [("SMOV", dst, "s1"), ("MOVSI", tmp, 42 - 6*i), ("SSHLV", dst, tmp),
+            ("SSHLV", dst, m42)]
+
+def _resid_tail(unroll):
+    """prog_resid_rmsnorm_q8 / _x2: pass 1 is norm_i32 + resid_add + rmsnorm's sum of squares
+    over one stream, passes 2 and 3 are prog_rmsnorm_q8(_x2)'s."""
+    A = dict(a="v0", b="v1"); B = dict(a="v8", b="v9")
+    def p1(c):
+        return [
+            ("LDW",   c["a"], "s0"),
+            ("LDW",   c["b"], "s0"),
+            ("VPACK", c["a"], c["a"], c["b"]),
+            ("VSHLV", c["a"], c["a"], "v5"),     # norm_i32: arith right by k (floor).
+            ("VSHLV", c["a"], c["a"], "v7"),     # resid_add: the addend's shift...
+            ("LDV",   c["b"], "s1"),
+            ("VSHLV", c["b"], c["b"], "v6"),     # ...and the residual's.
+            ("VADD",  c["a"], c["a"], c["b"]),
+            ("VCLAMP16", c["a"], c["a"]),
+            ("REDMAX", "s6", c["a"]),
+            ("REDSSQ", "s7", c["a"]),            # rmsnorm pass 1 on what is stored.
+            ("STV",   c["a"], "s2"),
+        ]
+    rms = prog_rmsnorm_q8_x2() if unroll else prog_rmsnorm_q8()
+    scale = _rmsnorm_scale()
+    tail  = rms[rms.index(scale[-1]) + 1:] # From "ARG s0, 0" (rewind) on: passes 2 and 3.
+    assert tail[0] == ("ARG", "s0", 0) and tail[-1] == ("DONE",)
+    halve = [("MOVSI", "s4", -1), ("SSHLV", "s3", "s4")] if unroll else []
+    # x2: each chain's two LDWs back to back (they are one output beat's consecutive source
+    # beats), then the two chains interleaved.
+    body  = p1(A)[:2] + p1(B)[:2] + _zip2(p1(A)[2:], p1(B)[2:]) if unroll else p1(A)
+    return [
+        ("ARG",   "s1", 4), ("MOVSI", "s3", -42),
+    ] + _resid_tail_field("s0", 0, "s2", "s3") + [("BCAST", "v5", "s0")] \
+      + _resid_tail_field("s0", 1, "s2", "s3") + [("BCAST", "v6", "s0")] \
+      + _resid_tail_field("s0", 2, "s2", "s3") + [("BCAST", "v7", "s0")] + [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 1), ("ARG", "s3", 3),
+    ] + halve + [
+        ("MOVSI", "s6", 0), ("MOVSI", "s7", 0),
+        ("LOOPS", "s3"),
+    ] + body + [
+        ("LOOPE",),
+        ("SMOV",  "s0", "s6"),                   # The residual's absmax, kept to the end.
+        ("ARG",   "s1", 4), ("MOVSI", "s2", -42),
+    ] + _resid_tail_field("s4", 3, "s3", "s2") + _resid_tail_field("s6", 4, "s3", "s2") + [
+        ("ARG",   "s5", 5),
+    ] + scale + [
+        ("SMOV",  "s5", "s0"),
+        ("ARG",   "s1", 6), ("ARG", "s2", 2), ("ARG", "s3", 3),
+    ] + ([("MOVSI", "s7", -1), ("SSHLV", "s3", "s7")] if unroll else []) + [
+        ("ARG",   "s0", 1),                      # Passes 2 and 3 read the new residual.
+    ] + tail[1:-1] + [
+        ("MOVSI", "s4", 16),
+        ("SSHLV", "s5", "s4"),
+        ("SADD",  "s6", "s5"),                   # S6 = residual absmax << 16 | x8 absmax.
+        ("DONE",),
+    ]
+
+def prog_resid_rmsnorm_q8():
+    """The post-projection residual tail in one program: norm_i32 of the engine results,
+    resid_add into the residual, then rmsnorm_q8 of the new residual - byte-identical to
+    prog_norm_i32 -> prog_resid_add -> prog_rmsnorm_q8, one dispatch instead of three, and
+    the addend never makes the int16 round trip through the scratchpad (norm_i32's contract
+    keeps it inside int16, so the round trip was lossless).
+      A0 = int32 engine results, A1 = int16 residual (updated in place), A2 = int16 normed
+      dst, A3 = beats (n/16), A4 = resid_tail_pack(-k, -sa, -sb, -log2(n), w16 shift),
+      A5 = eps_int, A6 = int16 norm weights, A7 = int8 dst.
+    Returns S6 = residual absmax << 16 | absmax of the int16 normed output (both < 2^15:
+    resid_add's and rmsnorm_q8's own S6)."""
+    return _resid_tail(False)
+
+def prog_resid_rmsnorm_q8_x2():
+    return _resid_tail(True)
+
 def prog_nopd():
     """One DONE. A placeholder slot for descriptor lists whose geometry wants a uniform
     group size (the pipelined attention list's last group has no next-head scores op)."""
@@ -1023,6 +1113,53 @@ def prog_mul_q8():
         ("LOOPE",),
         ("DONE",),
     ]
+
+def _norm_mul_q8(unroll):
+    """prog_norm_mul_q8 / _x2: prog_mul_q8(_x2) with the up operand read as the engine's int32
+    results and norm_i32-shifted in the loop (A1 = int32 up, A4 = k)."""
+    A = dict(s="v0", u="v3", t="v4"); B = dict(s="v8", u="v9", t="v10")
+    def p1(c):
+        return [
+            ("LDV",   c["s"], "s0"),
+            ("LDW",   c["u"], "s1"),
+            ("LDW",   c["t"], "s1"),
+            ("VPACK", c["u"], c["u"], c["t"]),
+            ("VSHLV", c["u"], c["u"], "v2"),     # norm_i32: arith right by k (floor).
+            ("VMUL",  c["s"], c["s"], c["u"]),
+            ("VSHLS", c["s"], c["s"], "s6"),
+            ("VCLAMP16", c["s"], c["s"]),
+            ("REDMAX", "s7", c["s"]),
+            ("STV",   c["s"], "s2"),
+        ]
+    mul  = prog_mul_q8_x2() if unroll else prog_mul_q8()
+    tail = mul[mul.index(("LOOPE",)) + 1:]       # From the absmax handoff on: quant8 pass.
+    assert tail[0] == ("SMOV", "s6", "s7") and tail[-1] == ("DONE",)
+    # x2: each chain's up loads back to back (one output beat's two source beats).
+    body = (p1(A)[:3] + p1(B)[:3] + _zip2(p1(A)[3:], p1(B)[3:])) if unroll else p1(A)
+    return [
+        ("ARG",   "s0", 0), ("ARG", "s1", 1), ("ARG", "s2", 2), ("ARG", "s3", 3),
+        ("ARG",   "s4", 4), ("ARG", "s6", 6),
+        ("MOVSI", "s7", 0),
+        ("BCAST", "v1", "s7"),
+        ("BCAST", "v2", "s4"),
+        ("VSUB",  "v2", "v1", "v2"),             # -k
+    ] + ([("MOVSI", "s5", -1), ("SSHLV", "s3", "s5")] if unroll else []) + [
+        ("LOOPS", "s3"),
+    ] + body + [
+        ("LOOPE",),
+    ] + tail
+
+def prog_norm_mul_q8():
+    """The FFN's up norm folded into prog_mul_q8: the up operand is the engine's int32 results,
+    shifted right by A4 = k in the loop - byte-identical to prog_norm_i32 (up -> int16) then
+    prog_mul_q8, without the int16 round trip (norm_i32's contract keeps it inside int16) or
+    its pass. A0 = silu src, A1 = int32 up, A2 = int16 dst (may equal A0), A3 = beats,
+    A4 = k (the list derives it from the spilled up absmax, KRES6), A6 = shift, A7 = int8
+    dst. S6 = the absmax, as prog_mul_q8."""
+    return _norm_mul_q8(False)
+
+def prog_norm_mul_q8_x2():
+    return _norm_mul_q8(True)
 
 def prog_reduce_acc():
     """acc_i32 += src_i32 (8 int32 per iteration); S6 = |max| of the post-add values
@@ -1478,6 +1615,8 @@ UNROLL16 = {
     "kvpack_h"   : prog_kvpack_h_x2,
     "silu_gate"  : prog_silu_gate_x2,
     "mul_q8"     : prog_mul_q8_x2,
+    "resid_rmsq8": prog_resid_rmsnorm_q8_x2,
+    "norm_mul_q8": prog_norm_mul_q8_x2,
 }
 
 # Gated DeltaNet Programs --------------------------------------------------------------------------
@@ -1600,6 +1739,8 @@ PROGRAMS = {
     "nopd"       : prog_nopd,
     "dn_a"       : prog_dn_a,      # Gated DeltaNet recurrence, pass A (deltanet.py).
     "dn_b"       : prog_dn_b,      # Pass B.
+    "resid_rmsq8": prog_resid_rmsnorm_q8, # Residual tail: norm_i32 + resid_add + rmsnorm_q8.
+    "norm_mul_q8": prog_norm_mul_q8,      # FFN tail: norm_u folded into mul_q8.
 }
 
 # Emit ---------------------------------------------------------------------------------------------

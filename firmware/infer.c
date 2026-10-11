@@ -602,6 +602,9 @@ embed_done: ;
     int   pos    = n_pos;
 
     int attn_hw = attn_all_hw();
+    // The quant8 shift of a norm the previous residual tail already ran (resid_norm_q8: the
+    // int16/x8 outputs are in place), or RESID_TAIL_OFF: run the norm.
+    int sx8_next = RESID_TAIL_OFF;
     if (likely(attn_hw)) {
         // Rope table row for this position ([c14 | s14], Q14, from the image).
         const struct bons_entry *rt = model_entry_kind(ROLE_ROPE_TAB, 0, KIND_NORM16);
@@ -619,9 +622,11 @@ embed_done: ;
         if (unlikely(tprof_active))
             tprof_event((3u << 28) | ((uint32_t)l << 8));
         // Attention block.
-        int sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, attn_norm[l],
-                                   nrm_attn16[l],
-                                   n_embd, SP_H, SP_X);
+        int sx8 = sx8_next;
+        if (sx8 == RESID_TAIL_OFF)
+            sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, attn_norm[l], nrm_attn16[l], n_embd,
+                                   SP_H, SP_X);
+        sx8_next = RESID_TAIL_OFF;
         dbg_sum("attn_in_x8", l, SP_X, n_embd, E_NORM + sx8);
         int ev_res = 0;
         if (likely(attn_hw)) {
@@ -1209,13 +1214,18 @@ attn_heads_done: ;
             dbg_sum("awam", l, SP_AWAM, n_head*32, 0);
             dbg_sum("scb",  l, SP_SCB2, 64, 0);
             model_matvec(eo, SP_X, SP_Y);
-            perf_enter(OP_NORM_I32);
-            uint32_t dmax = 0;
-            int kk = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
-            perf_exit(OP_NORM_I32);
-            int ed = ea8 - (int)eo->bias + (int)eo->rshift + kk;
-            ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
-                                    nrm_ffn16[l]);
+            // The residual tail and the FFN norm in one program when it can (resid_norm_q8).
+            sx8_next = resid_norm_q8(SP_Y, ea8 - (int)eo->bias + (int)eo->rshift, &ex_state,
+                                     &x_amax, nrm_ffn16[l], n_embd);
+            if (sx8_next == RESID_TAIL_OFF) {
+                perf_enter(OP_NORM_I32);
+                uint32_t dmax = 0;
+                int kk = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
+                perf_exit(OP_NORM_I32);
+                int ed = ea8 - (int)eo->bias + (int)eo->rshift + kk;
+                ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
+                                        nrm_ffn16[l]);
+            }
             dbg_sum("attn_res", l, SP_XR, 2*n_embd, ex_state);
         }
 
@@ -1224,9 +1234,12 @@ attn_heads_done: ;
             const struct bons_entry *eg_t = model_entry(ROLE_FFN_GATE, l);
             const struct bons_entry *eu_t = model_entry(ROLE_FFN_UP, l);
             const struct bons_entry *ed_t = model_entry(ROLE_FFN_DOWN, l);
-            int ex8 = E_NORM + op_rmsnorm_q8_sp(SP_XR, ex_state, ffn_norm[l],
-                                                nrm_ffn16[l],
-                                                n_embd, SP_H, SP_X);
+            int sx8f = sx8_next;
+            if (sx8f == RESID_TAIL_OFF)
+                sx8f = op_rmsnorm_q8_sp(SP_XR, ex_state, ffn_norm[l], nrm_ffn16[l], n_embd,
+                                        SP_H, SP_X);
+            sx8_next = RESID_TAIL_OFF;
+            int ex8 = E_NORM + sx8f;
             dbg_sum("ffn_x8", l, SP_X, n_embd, ex8);
 
             if (likely(seq_use && seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
@@ -1269,13 +1282,20 @@ attn_heads_done: ;
                         + quant8_shift((uint32_t)trixium_vecunit_res6_read());
                 dbg_sum("ffn_g16", l, SP_G, 2*ffn_dim, eg);      // silu(gate)*up, int16
                 dbg_sum("silu_x8", l, SP_X, ffn_dim, es8);
-                perf_enter(OP_NORM_I32);
-                uint32_t dmax = 0;
-                int kd = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
-                perf_exit(OP_NORM_I32);
-                int ed = es8 - (int)ed_t->bias + (int)ed_t->rshift + kd;
-                ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
-                                        next_norm16(l));
+                // The residual tail and the next norm in one program - the last layer's
+                // final norm only when the logits will read it.
+                if (l + 1 < n_layer || want_logits)
+                    sx8_next = resid_norm_q8(SP_Y, es8 - (int)ed_t->bias + (int)ed_t->rshift,
+                                             &ex_state, &x_amax, next_norm16(l), n_embd);
+                if (sx8_next == RESID_TAIL_OFF) {
+                    perf_enter(OP_NORM_I32);
+                    uint32_t dmax = 0;
+                    int kd = op_norm_i32_sp_m(SP_Y, SP_D, n_embd, &dmax);
+                    perf_exit(OP_NORM_I32);
+                    int ed = es8 - (int)ed_t->bias + (int)ed_t->rshift + kd;
+                    ex_state = resid_add_pf(SP_XR, ex_state, SP_D, ed, n_embd, dmax, &x_amax,
+                                            next_norm16(l));
+                }
                 dbg_sum("ffn_res", l, SP_XR, 2*n_embd, ex_state);
                 goto ffn_done;
             }
@@ -1349,8 +1369,9 @@ attn_heads_done: ;
         return -1;
 
     // Final norm + LM head (tied or separate), chunked over rows to fit the scratchpad.
-    int lm_sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, out_norm,
-                                  nrm_out16, n_embd, SP_H, SP_X);
+    int lm_sx8 = sx8_next;
+    if (lm_sx8 == RESID_TAIL_OFF)
+        lm_sx8 = op_rmsnorm_q8_sp(SP_XR, ex_state, out_norm, nrm_out16, n_embd, SP_H, SP_X);
     perf_enter(OP_LMHEAD);
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head)
