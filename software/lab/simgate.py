@@ -72,6 +72,12 @@ def command(child, cmd, timeout=300):
 
 # Gate ---------------------------------------------------------------------------------------------
 
+def is_hybrid_image(image):
+    """The 27B's hybrid layout (DeltaNet layers or the Hadamard rotation), as the mirror decides."""
+    from model.bons import BONSReader
+    h = BONSReader(image).header
+    return h["version"] >= 3 and ("deltanet" in h["layer_types"] or bool(h["hadamard_block"]))
+
 def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False):
     """Mirror vs traced simulation run; returns 0 when everything matches."""
     os.makedirs(out_dir, exist_ok=True)
@@ -105,9 +111,11 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False):
     ok = "GEN DONE" in trace
     tokens = re.search(r"(-?\d+(?:[ \t]+-?\d+)*)\s*GEN DONE", trace) # The line before GEN DONE.
     print("tokens:", tokens.group(1) if tokens else "(none)")
-    resident = "resident projections" in boot_text and "resident path off" not in trace
-    print("resident path:", "on" if resident else "OFF/absent")
-    ok &= resident
+    # The resident projection lists are the hybrid (27B) path's; a Qwen3 image has none.
+    if is_hybrid_image(image):
+        resident = "resident projections" in boot_text and "resident path off" not in trace
+        print("resident path:", "on" if resident else "OFF/absent")
+        ok &= resident
     if expect_silu:
         silu = re.search(r"siluprof: per fwd (\d+) ffn lists", stats)
         silu = int(silu.group(1)) if silu and "resident FFN activation" in boot_text else 0

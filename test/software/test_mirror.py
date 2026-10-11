@@ -57,6 +57,14 @@ def test_diagnostics_are_not_part_of_checksum(tmp_path):
     assert compare(tmp_path, EMBED, EMBED.replace("1234abcd", "1234ABCD")) == 0
 
 
+def test_card_only_spills_are_not_compared(tmp_path):
+    # The Qwen3 attention list's raw spill sums have no mirror counterpart; another extra
+    # card point still fails.
+    spill = "DBG pos=0 l=0 awp8 e=0 0badf00d amax=1 v0..3=0,0,0,0\n"
+    assert compare(tmp_path, EMBED + ARGMAX, EMBED + spill + ARGMAX) == 0
+    assert compare(tmp_path, EMBED + ARGMAX, EMBED + spill.replace("awp8", "attn_x8") + ARGMAX) == 1
+
+
 def test_parse_reports_line_and_key(tmp_path):
     path = tmp_path / "trace"
     path.write_text(EMBED + EMBED)
