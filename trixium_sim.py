@@ -715,6 +715,12 @@ def build_sim(args, board, out_dir):
     builder = Builder(soc, output_dir=out_dir, csr_csv=csr_csv)
     builder.build(sim_config=sim_config, run=False, opt_level="O3",
         threads=args.threads, trace=args.trace, trace_fst=args.trace)
+    if args.random_init is not None:
+        # The never-reset registers start at random values (this seed), not their init.
+        from software.lab import randinit
+        n, bits = randinit.randomize(os.path.join(out_dir, "gateware", "sim.v"), args.random_init)
+        print(f"[trixium] random init (seed {args.random_init}): {n} never-reset registers, "
+              f"{bits} bits")
     subprocess.run(["bash", "build_sim.sh"], cwd=os.path.join(out_dir, "gateware"), check=True)
 
 # Run ----------------------------------------------------------------------------------------------
@@ -741,6 +747,8 @@ def main():
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--s7hr-model",     action="store_true",                                   help="--board ypcb: the PHY models behind the S7HRDDRPHY's CSRs (calibration test: ddrinit 1).")
     parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")
+    parser.add_argument("--gate-pre",       default="",                                            help="--gate: console commands before the traced generation, ';'-separated (e.g. 'gen 2 5 6 7;engreset').")
+    parser.add_argument("--random-init",    default=None, type=int, metavar="SEED",               help="--build: never-reset registers start at random values from SEED (build/sim_<board>_ri<SEED>; software/lab/randinit.py).")
     args = parser.parse_args()
     if not (args.build or args.run or args.firmware or args.gate or args.bench):
         parser.error("nothing to do: --build, --run, --firmware, --gate or --bench.")
@@ -754,7 +762,8 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     if args.image is None:
         args.image = DEFAULT_IMAGES.get(args.board, DEFAULT_IMAGES["xcu1525"])
-    out_dir      = args.out_dir or f"build/sim_{args.board}"
+    out_dir      = args.out_dir or (f"build/sim_{args.board}" +
+                                    ("" if args.random_init is None else f"_ri{args.random_init}"))
     board        = dict(BOARDS[args.board])
     if args.board_timing:
         if args.board != "xcu1525":
@@ -794,7 +803,8 @@ def main():
     from software.lab import simgate
     if args.gate:
         rc = simgate.gate(gateware_dir, args.image, os.path.join(out_dir, "gate"),
-            expect_silu=board.get("with_silu", False))
+            expect_silu=board.get("with_silu", False),
+            pre=[c.strip() for c in args.gate_pre.split(";") if c.strip()])
         if rc:
             sys.exit(rc)
     if args.bench:

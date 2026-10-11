@@ -78,8 +78,12 @@ def is_hybrid_image(image):
     h = BONSReader(image).header
     return h["version"] >= 3 and ("deltanet" in h["layer_types"] or bool(h["hadamard_block"]))
 
-def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False):
-    """Mirror vs traced simulation run; returns 0 when everything matches."""
+def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, pre=()):
+    """Mirror vs traced simulation run; returns 0 when everything matches.
+
+    pre: console commands run after boot, before the traced generation (e.g. a generation then
+    `wedge`, a soft reset in the middle of an op: it must leave nothing behind that changes the
+    next generation)."""
     os.makedirs(out_dir, exist_ok=True)
     mirror_trace = os.path.join(out_dir, "mirror.txt")
     sim_trace    = os.path.join(out_dir, "trace.txt")
@@ -92,6 +96,13 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False):
     child = spawn(gateware_dir, out_dir)
     try:
         boot_text = boot(child)
+        for cmd in pre:
+            print(f"pre: {cmd}", flush=True)
+            answer = command(child, cmd, timeout=2*TIMEOUT)
+            # engreset soft-resets the engine cluster; wedge does it in the middle of an op.
+            expect = {"engreset": "ENGRESET ok", "wedge": "WEDGE: recovered"}.get(cmd)
+            if expect and expect not in answer:
+                raise SystemExit(f"{cmd} failed: {answer[-300:]!r}")
         child.sendline(f"dbg {dbg}")
         child.expect(r"DBG armed for \d+ forwards", timeout=60)
         # `gen` takes the token COUNT first, then the prompt ids: "gen 1 1 2 3" is one token from
