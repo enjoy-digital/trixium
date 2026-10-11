@@ -36,6 +36,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 TEMPLATE     = "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 INT8_TAGS    = {"attn_in_x8", "attn_x8", "ffn_x8", "silu_x8"}
+# Raw hardware spills the Qwen3 path's firmware checksums for diagnosis (the attention list's
+# per-head p8 sums and absmaxes, scores buffer B): the mirror has no counterpart, the values
+# they feed (attn_x8 and on) are compared.
+CARD_ONLY_TAGS = {"awp8", "awam", "scb"}
 TRACE_DTYPES = {"i8": "<i1", "i16": "<i2", "i32": "<i4", "u32": "<u4", "f32": "<f4"}
 
 # Checkpoints --------------------------------------------------------------------------------------
@@ -110,6 +114,8 @@ def mirror(image, ids, out, hybrid_silu="rv32f"):
         tokens = hybrid27_generate(img, ids, 1, trace=typed_trace, silu_mode=mode)
     else:
         tokens = hybrid_generate(img, ids, 1, modes=modes, trace=trace)
+        # The card's `gen 1 <ids>` runs the prompt's forwards only: drop the generated token's.
+        lines = [ln for ln in lines if int(ln.split()[1][4:]) < len(ids)]
         lines.append(f"DBG pos={len(ids)-1} l=-1 argmax e=0 {tokens[0]:08x}")
     with open(out, "w", encoding="utf-8") as stream:
         stream.write("\n".join(lines) + "\n")
@@ -194,7 +200,7 @@ def compare(mirror_path, card_path, verbose=False):
                       f"  mirror {mir[key]}\n"
                       f"  card   {card[key]}")
     missing = [k for k in order if k not in card]
-    extra   = [k for k in card if k not in mir]
+    extra   = [k for k in card if k not in mir and k[2] not in CARD_ONLY_TAGS]
     print(f"{same} checksums identical, {diff} different, {len(missing)} mirror points the "
           f"card did not report" + (f" (e.g. {missing[0]})" if missing else ""))
     if extra:
