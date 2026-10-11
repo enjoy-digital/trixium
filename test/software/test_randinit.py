@@ -59,6 +59,26 @@ def test_synchronizer_stages_untouched():
     assert "builder_multiregimpl3_regs1" in clocked
     assert randinit.SYNC.search("builder_multiregimpl3_regs1")
 
+def test_reset_generators_untouched():
+    # LiteX's power-on reset (por domain, INIT 1) and a reset synchronizer: never randomized.
+    text = ("reg build_sim_int_rst = 1'd1;\n"
+            "reg builder_rst1 = 1'd0;\n"
+            "reg ddr_rst = 1'd0;\n"
+            "reg data = 1'd0;\n"
+            "always @(posedge por_clk) begin\n"
+            "    build_sim_int_rst <= 1'd0;\n"
+            "end\n"
+            "always @(posedge resync_clk) begin\n"
+            "    builder_rst1 <= sys_rst;\n"
+            "    ddr_rst <= (sys_rst | builder_rst1);\n"
+            "end\n"
+            "always @(posedge sys_clk) begin\n"
+            "    data <= x;\n"
+            "end\n")
+    clocked, reset = randinit.clocked_and_reset(text)
+    assert {"build_sim_int_rst", "builder_rst1", "ddr_rst"} <= reset and "data" in clocked
+    assert randinit.RESET.search("eng_rst") and not randinit.RESET.search("first")
+
 def test_seed_determinism(tmp_path):
     texts = []
     for k in range(2):

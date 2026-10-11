@@ -15,10 +15,14 @@ gate mismatch, a hang, a wrong token.
 
 Only those registers change: memories, memory read registers and the registers a reset
 assigns keep their values (the FPGA configures BRAMs and flops to their INIT values; what a
-reset-less register must survive is a reset that does not touch it). So do the MultiReg
-synchronizer stages: clock-domain crossings start from their INIT value by design (an async
-FIFO's gray pointers, a status bit), and a random value there is a phantom crossing at power
-on, not a missing reset.
+reset-less register must survive is a reset that does not touch it). So do two kinds of
+registers whose INIT value is their function:
+- the reset generators: the power-on reset (the `por` domain's register that starts at 1), the
+  reset synchronizers (`resync`) and the reset nets themselves (`*_rst`) - randomized, the
+  reset they make never comes;
+- the MultiReg synchronizer stages: clock-domain crossings start from INIT by design (an async
+  FIFO's gray pointers, a status bit), and a random value there is a phantom crossing at power
+  on, not a missing reset.
 """
 
 import random
@@ -28,6 +32,8 @@ DECL   = re.compile(r"^(reg\s+(?:signed\s+)?(?:\[(\d+):(\d+)\]\s*)?)(\w+)(\s*=\s
 LHS    = re.compile(r"^\s*(\w+)\s*(?:\[|<=)")
 CONCAT = re.compile(r"^\s*\{([^}]*)\}\s*<=")
 SYNC   = re.compile(r"multiregimpl\d*_regs\d+$") # Migen's MultiReg stages.
+RESET  = re.compile(r"(^|_)rst\d*$")                # Reset nets (sys_rst, ddr_rst, eng_rst...).
+RESET_DOMAINS = ("por", "resync")                   # Reset generation: power-on, synchronizers.
 
 def _lhs(line):
     m = CONCAT.match(line)
@@ -38,12 +44,14 @@ def _lhs(line):
 
 def clocked_and_reset(text):
     """(clocked, reset): the registers assigned in a clocked always block, and those assigned
-    in one of its reset branches (`if (<domain>_rst) begin ... end`)."""
+    in one of its reset branches (`if (<domain>_rst) begin ... end`) or by a reset-generation
+    domain (RESET_DOMAINS: they count as reset, their INIT is their function)."""
     clocked, reset = set(), set()
-    in_clocked, rst_indent = False, None
+    in_clocked, rst_indent, generator = False, None, False
     for line in text.splitlines():
         if line.startswith("always @(posedge"):
             in_clocked = True
+            generator  = any(line.startswith(f"always @(posedge {d}_clk") for d in RESET_DOMAINS)
             continue
         if line.startswith("always"):
             in_clocked = False
@@ -62,7 +70,7 @@ def clocked_and_reset(text):
             rst_indent = None
             continue
         for name in _lhs(line):
-            (reset if rst_indent is not None else clocked).add(name)
+            (reset if rst_indent is not None or generator else clocked).add(name)
     return clocked, reset
 
 def randomize(path, seed):
@@ -75,7 +83,7 @@ def randomize(path, seed):
     count = [0, 0]
     def sub(m):
         name = m.group(4)
-        if name not in clocked or name in reset or SYNC.search(name):
+        if name not in clocked or name in reset or SYNC.search(name) or RESET.search(name):
             return m.group(0)
         width = int(m.group(2)) - int(m.group(3)) + 1 if m.group(2) else 1
         count[0] += 1
