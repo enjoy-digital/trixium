@@ -15,7 +15,7 @@ nine x8 chips): the PHY is gateware/memory/s7hrddrphy.py (write leveling by CK p
 calibration runs on the SoC's CPU (firmware/ddr_s7hr.c: the BIOS calibrates controller 0, the
 firmware controller 1). The defaults are the shipping recipe: the Qwen3 path's units (engine,
 sequencer, vector unit; the Ternary-Bonsai 1.7B and 8B), DDR3-1066 in a 133.33 MHz ddr domain,
-sys 150 MHz, the FK33's CPU configuration. Design notes: doc/boards.md.
+sys 125 MHz (the clock this K480T design closes timing at), the FK33's CPU configuration. Design notes: doc/boards.md.
 
 From the repository root:
   ./trixium_ypcb.py --build                          # -> build/ypcb/ + build/ypcb.verdict
@@ -123,9 +123,11 @@ class _CRG(LiteXModule):
         clk50 = platform.request("clk50")
         platform.add_period_constraint(clk50, 1e9/50e6) # Not the platform's default clock (clk200).
         pll.register_clkin(clk50, 50e6)
-        pll.create_clkout(self.cd_sys,    sys_clk_freq)
-        pll.create_clkout(self.cd_ddr,    ddr_clk_freq)
-        pll.create_clkout(self.cd_idelay, 200e6)
+        # Exact frequencies (the controllers' timings and refresh interval are computed for
+        # them); ddr first: CLKOUT0 is the MMCM's fractional output (1000 MHz / 7.5 at 125 MHz).
+        pll.create_clkout(self.cd_ddr,    ddr_clk_freq, margin=1e-4)
+        pll.create_clkout(self.cd_sys,    sys_clk_freq, margin=1e-4)
+        pll.create_clkout(self.cd_idelay, 200e6,        margin=1e-4)
         platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
         platform.add_false_path_constraints(self.cd_sys.clk, self.cd_ddr.clk)
 
@@ -145,7 +147,7 @@ DDR_CSR_STRIDE = 0x2000
 DDR_MMCM_LOCS = ["MMCME2_ADV_X0Y2", "MMCME2_ADV_X0Y6"]
 
 class TriXiumYPCBSoC(SoCCore):
-    def __init__(self, sys_clk_freq=150e6, ddr_clk_freq=400e6/3, engine_channels=4,
+    def __init__(self, sys_clk_freq=125e6, ddr_clk_freq=400e6/3, engine_channels=4,
         main_ram_size  = 0x1000_0000,
         chan_stride    = 0x4000_0000,
         chan_skew      = None,
@@ -310,7 +312,7 @@ def main():
     from litex.build.parser import LiteXArgumentParser
     from software.lab.timing import gate
     parser = LiteXArgumentParser(platform=ypcb_00338_1p1.Platform, description="TriXium on the Inspur YPCB-00338-1P1.")
-    parser.add_target_argument("--sys-clk-freq",       default=150e6,    type=float,                          help="System clock frequency (CPU, TriXium core).")
+    parser.add_target_argument("--sys-clk-freq",       default=125e6,    type=float,                          help="System clock frequency (CPU, TriXium core).")
     parser.add_target_argument("--ddr-clk-freq",       default=400e6/3,  type=float,                          help="DDR3 controller clock frequency (DDR3 rate = 8x: 133.33e6 = DDR3-1066).")
     parser.add_target_argument("--engine-channels",    default=4,        type=int,                            help="Engine channels (multiple of 2).")
     parser.add_target_argument("--read-time",          default=256,      type=int,                            help="LiteDRAM read time (cycles before a pending write wins).")
@@ -323,9 +325,9 @@ def main():
         cpu_type                             = "vexiiriscv",
         update_repo                          = "no",
         vexii_args                           = VEXII_ARGS,
-        vivado_synth_directive               = "AreaOptimized_medium",
+        vivado_synth_directive               = "PerformanceOptimized",
         vivado_opt_directive                 = "ExploreWithRemap",
-        vivado_place_directive               = "ExtraNetDelay_high",
+        vivado_place_directive               = "ExtraTimingOpt",
         vivado_post_place_phys_opt_directive = "AggressiveExplore",
         vivado_route_directive               = "AggressiveExplore",
         vivado_post_route_phys_opt_directive = "AggressiveExplore",

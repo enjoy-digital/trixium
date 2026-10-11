@@ -76,7 +76,8 @@ APPROVALS = {
 # and the summary showed the PCIe clocks alone).
 REQUIRED_CLOCKS = {
     # clk50, ddr 133.33 (and each DDR3 PHY's CLKDIV pair), the PHYs' 4x clocks, IDELAY 200; the
-    # target adds its sys clock (gate(clocks=)).
+    # target adds its sys clock (gate(clocks=)). Reference build (strict PASS, 2026-10-11, sys
+    # 125 MHz): WNS +0.001 ns, WHS +0.017 ns, 359,171 endpoints; sys 150 MHz: WNS -1.33 ns.
     "ypcb" : (20.0, 7.5, 1.875, 5.0),
 }
 

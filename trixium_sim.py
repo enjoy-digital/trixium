@@ -174,7 +174,7 @@ S7HR_CHANNEL = dict(
 )
 
 
-def ddr3_sim_clocks(sys_clk_freq=150e6):
+def ddr3_sim_clocks(sys_clk_freq=125e6):
     """(sys, ddr) clocker frequencies of the YPCB sim: the board's sys/ddr ratio on integer
     picosecond periods (the clocker's timebase is their half periods' GCD)."""
     sys_period = 100*round(DDR3_SIM_DDR_PERIOD*DDR3_SIM_FREQ/sys_clk_freq/100) # 0.1 ns steps.
@@ -611,7 +611,7 @@ def main():
     parser.add_argument("--hbm-latency",    default=16, type=int,                                  help="--board fk33: HBM model read latency.")
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
-    parser.add_argument("--sys-clk-freq",   default=150e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
+    parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--s7hr-model",     action="store_true",                                   help="--board ypcb: the PHY models behind the S7HRDDRPHY's CSRs (calibration test: ddrinit 1).")
     parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")
     args = parser.parse_args()
