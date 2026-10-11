@@ -70,6 +70,17 @@ APPROVALS = {
     "ddr4-overclock"    : (WNS_FLOOR, (-0.351, -360.0, 1000)),
 }
 
+# Per-board clock coverage of the strict gate: the clock periods (ns) the routed report must time.
+# A clock missing from the report means part of the design was never timed: Vivado's summary then
+# passes on what it did time (the YPCB's first build: the board's 50 MHz input was unconstrained,
+# and the summary showed the PCIe clocks alone).
+REQUIRED_CLOCKS = {
+    # clk50, ddr 133.33 (and each DDR3 PHY's CLKDIV pair), the PHYs' 4x clocks, IDELAY 200; the
+    # target adds its sys clock (gate(clocks=)). Reference build (strict PASS, 2026-10-11, sys
+    # 125 MHz): WNS +0.001 ns, WHS +0.017 ns, 359,171 endpoints; sys 150 MHz: WNS -1.33 ns.
+    "ypcb" : (20.0, 7.5, 1.875, 5.0),
+}
+
 # Report Parsing -----------------------------------------------------------------------------------
 
 def parse(path):
@@ -110,6 +121,25 @@ def parse_full(path):
             continue
         return row, "Timing constraints are not met." in section
     return None
+
+def parse_clocks(path):
+    """The Clock Summary's (name, period ns) rows."""
+    with open(path, encoding="utf-8") as stream:
+        text = stream.read()
+    section = text.partition("Clock Summary")[2].split("Intra Clock Table", 1)[0]
+    clocks = []
+    for line in section.splitlines():
+        m = re.match(r"\s*(\S+)\s+\{[^}]*\}\s+(\d+\.\d+)\s+\d+\.\d+", line)
+        if m:
+            clocks.append((m.group(1), float(m.group(2))))
+    return clocks
+
+
+def missing_clocks(path, board, clocks=()):
+    """The required clock periods of `board` (and `clocks`) the report does not time."""
+    periods = [p for _, p in parse_clocks(path)]
+    return [r for r in tuple(REQUIRED_CLOCKS.get(board, ())) + tuple(clocks)
+            if not any(abs(p - r) < 0.01 for p in periods)]
 
 # Gates --------------------------------------------------------------------------------------------
 
@@ -170,14 +200,23 @@ def experiment_failures(row, serializer_baseline=None, wns_floor=WNS_FLOOR):
 
 # Gate ---------------------------------------------------------------------------------------------
 
-def gate(report, strict=False, force=False, experiment=False, serializer_baseline=None, approval=None):
-    """Print the verdict on a Vivado timing report; return the exit code (0 = deploy)."""
+def gate(report, strict=False, force=False, experiment=False, serializer_baseline=None, approval=None,
+         board=None, clocks=()):
+    """Print the verdict on a Vivado timing report; return the exit code (0 = deploy).
+
+    board: check the clock coverage of REQUIRED_CLOCKS[board] (and of the `clocks` periods, ns)
+    first, in any mode."""
     try:
         full = parse_full(report)
         got  = parse(report)
+        missing = missing_clocks(report, board, clocks) if (board or clocks) else []
     except OSError as exc:
         print(f"timing: {exc}")
         return 2
+    if missing:
+        print("verdict: DO NOT SHIP - no timed clock at " + ", ".join(f"{p} ns" for p in missing) +
+              f" (the {board} design is not fully constrained)")
+        return 1
     if experiment:
         if full is None:
             print(f"timing: no complete Design Timing Summary in {report}")
@@ -260,13 +299,15 @@ def main(argv=None):
     parser.add_argument("--experiment",          action="store_true",                  help="Concept experiment: timing need not close, but setup must stay inside the host-safety envelope and hold must pass.")
     parser.add_argument("--serializer-baseline", choices=sorted(SERIALIZER_BASELINES), help="Strict mode: accept serializer-skew violations no worse than this board-validated build's.")
     parser.add_argument("--approval",            choices=sorted(APPROVALS),            help="Experiment mode: per-build approval (its own WNS floor and serializer baseline).")
+    parser.add_argument("--board",               choices=sorted(REQUIRED_CLOCKS),      help="Check the board's clock coverage (REQUIRED_CLOCKS) first.")
     args = parser.parse_args(argv)
     return gate(args.report,
         strict              = args.strict,
         force               = args.force,
         experiment          = args.experiment,
         serializer_baseline = args.serializer_baseline,
-        approval            = args.approval)
+        approval            = args.approval,
+        board               = args.board)
 
 
 if __name__ == "__main__":

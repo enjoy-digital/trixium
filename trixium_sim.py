@@ -11,7 +11,9 @@
 The same TriXium core and firmware-visible contract as the boards, on simulated memories
 initialized from a BONS image: --board xcu1525 is the XCU1525's memory system (four LiteDRAM
 controllers on LiteDRAM's DDR4 PHY model, in their own ddr domain) with every unit, --board fk33
-one HBM channel model per engine channel and no scratchpad units. The firmware binary and the
+one HBM channel model per engine channel and no scratchpad units, --board ypcb the YPCB's two
+DDR3 controllers (the board's geometry, timings, PHY latencies and clock ratio) with the FK33's
+units. The firmware binary and the
 BONS header+table are baked into main_ram at elaboration, the channel payloads into the memory
 models.
 
@@ -21,7 +23,7 @@ models.
   ./trixium_sim.py --gate       # traced generation compared with the Python mirror (~10 min)
   ./trixium_sim.py --bench      # resident path off/on, cycles per forward
 
---board (xcu1525, fk33) and --image select the build (build/sim_<board>); the gate and the bench
+--board (xcu1525, fk33, ypcb) and --image select the build (build/sim_<board>); the gate and the bench
 must use the image the simulation was built with.
 
 --board-timing (xcu1525) builds the board-faithful flavor for the shape-true slices (models from
@@ -60,10 +62,13 @@ from litex.soc.interconnect.axi import AXIInterface
 from litedram.modules import MT40A512M8
 from litedram.phy.model import SDRAMPHYModel
 
+from trixium_ypcb import YPCBDDR3, DDR3_CL, DDR3_CWL, ddr_controller_settings
+
 from model.layout import HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
+from gateware.memory.s7hrddrphy import s7hr_model_settings, S7HRPHYModel
 from model.bons import BONSReader
 from gateware.common import set_main_ram_executable
 
@@ -75,6 +80,19 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 
 DDR4_SIM_CSR_WINDOW = 0xF0020000 # The target's DDR_CSR_WINDOW.
 DDR4_SIM_CSR_STRIDE = 0x1000
+
+# The YPCB's DDR3 flavor: two LiteDRAM controllers on LiteDRAM's PHY model with the S7HRDDRPHY's
+# latencies, the board's DDR3-1066 timings and controller settings, and the ddr clock at 8/9 of sys
+# (the board's 133.33/150 MHz). The geometry is the board's (8 banks x 1024 columns: 8 KB rows, the
+# bank in byte address bits 13..15) with 2048 rows, 128 MB per controller, so the windows' 32 KB bank
+# skew is the board's own. Windows from 12 MB at a power-of-two stride sized for the image (4 MB for
+# the tiny models; a truncated 1.7B for the performance runs needs 32 MB).
+DDR3_SIM_WEIGHT_BASE = 0x00C0_0000 # 12 MB.
+DDR3_SIM_BANK_CYCLE  = 0x10000     # 8 banks x 8 KB rows: the windows' skew is 1/chan_mod of it.
+DDR3_SIM_DDR_PERIOD  = 9000        # ps: the sim's clocks are integer picoseconds, ddr at 9 ns and
+                                   # sys at the board's ratio (8 ns for 150 MHz, ddr3_sim_clocks()).
+DDR3_SIM_FREQ        = 400e6/3     # The controllers' timings: the board's DDR3-1066.
+DDR3_SIM_SIZE        = 128 << 20   # Per controller, at least (2048 rows; more for big images).
 
 # The ROM holds no BIOS, only a jump to the firmware in main_ram (`lui t0, MAIN_RAM_BASE;
 # jr t0`), which the elaboration preloads: the BIOS's banner, ROM CRC, controller-0 init,
@@ -185,8 +203,87 @@ def ddr4_content(k, ram, img, chan_mod, dmap=SIM_DDR4_MAP):
     return content[:end]
 
 
+def ddr3_size(chan_mod, stride):
+    """The sim's DDR3 per controller: a power of two holding the windows (128 MB at least: the
+    PHY model needs 11 row address bits for the A10 precharge-all decode)."""
+    size = DDR3_SIM_SIZE
+    while size < DDR3_SIM_WEIGHT_BASE + chan_mod*stride:
+        size *= 2
+    return size
+
+
+def sim_ddr3(size):
+    """The board's part (8 banks x 1024 columns, 8 KB rows on 64 bits) with the rows of `size`."""
+    return type("SimDDR3", (YPCBDDR3,), {"nrows": size//(8*1024*8)})
+
+
+# The fly-by channel of the calibration's simulation (--s7hr-model): crossings ordered along the
+# chain, latencies 0 and 6 (-2), one bit of lane 3 framed a CLK late; the common window is
+# +9..-34 across the tCK boundary (the scan's stride-28 samples settle at -56).
+S7HR_CHANNEL = dict(
+    cross   = [-30, -25, -20, -15, -10, -5, 0, 5],
+    base_wl = [0, 0, 6, 6, 0, 0, 6, 0],
+    v0      = [40 + (b % 8) + (24 if b == 27 else 0) for b in range(64)],
+)
+
+
+def ddr3_sim_clocks(sys_clk_freq=125e6):
+    """(sys, ddr) clocker frequencies of the YPCB sim: the board's sys/ddr ratio on integer
+    picosecond periods (the clocker's timebase is their half periods' GCD)."""
+    sys_period = 100*round(DDR3_SIM_DDR_PERIOD*DDR3_SIM_FREQ/sys_clk_freq/100) # 0.1 ns steps.
+    return int(1e12//sys_period), int(1e12//DDR3_SIM_DDR_PERIOD)
+
+
+def ddr3_skew(chan_mod):
+    """The board's bank skew: the chan_mod windows of a controller evenly spread over the 8 banks
+    (32 KB, four banks apart, for two)."""
+    return DDR3_SIM_BANK_CYCLE//chan_mod
+
+
+def ddr3_stride(img):
+    """The YPCB sim's window stride: a power of two holding the largest channel payload, its KV
+    cache (the converter's sizing), the firmware's round-trip test page and the bank skew (4 MB
+    at least)."""
+    stride = 0x40_0000
+    if img is not None:
+        h    = img.header
+        n    = h["n_channels"]
+        kv   = h["n_layer"]*h["n_kv_head"]*2*((h["max_ctx"] + n - 1)//n)*(1 + h["head_dim"]//32)*32
+        need = max(len(img.channel_payload(c)) for c in range(n)) + kv + 512*1024
+        while stride < need + DDR3_SIM_BANK_CYCLE:
+            stride *= 2
+    return stride
+
+
+def ddr3_content(k, ram, img, chan_mod, stride, size):
+    """DDR3 controller k: main_ram at 0 for controller 0 and, for all, its channels' payloads at
+    their windows (the content ends with the last payload: the model's banks start zeroed)."""
+    content = bytearray(ram) if k == 0 else bytearray()
+    if img is not None:
+        for j in range(chan_mod):
+            c = k*chan_mod + j
+            payload = bytes(img.channel_payload(c))
+            base = DDR3_SIM_WEIGHT_BASE + j*stride + j*ddr3_skew(chan_mod)
+            assert base + stride - j*ddr3_skew(chan_mod) <= size, \
+                f"channel {c}: a {stride >> 20} MB window does not fit the sim's DDR3"
+            if len(content) < base + len(payload):
+                content.extend(bytes(base + len(payload) - len(content)))
+            content[base:base + len(payload)] = payload
+    content.extend(bytes(-len(content) % 64))
+    return content
+
+
+def ddr3_phy(content, size):
+    module   = sim_ddr3(size)(DDR3_SIM_FREQ, "1:4")
+    settings = s7hr_model_settings(DDR3_SIM_FREQ, 64, DDR3_CL, DDR3_CWL)
+    phy      = SDRAMPHYModel(module=module, settings=settings, clk_freq=DDR3_SIM_FREQ,
+                             init=words(content))
+    return phy, module
+
+
 def words(content):
-    return [int.from_bytes(content[i:i+4], "little") for i in range(0, len(content), 4)]
+    content = bytes(content) + bytes(-len(content) % 4)
+    return np.frombuffer(content, dtype="<u4").tolist()
 
 
 def bank_words(content, module):
@@ -233,10 +330,11 @@ class TriXiumSimSoC(SoCCore):
                  mem="hbm", n_memctrl=4, update_repo="no",
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
-                 with_dnstream=False, attn_geometry=None, board_timing=False, contents=True):
-        assert mem in ("hbm", "ddr4")
+                 with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
+                 ddr_settings=None, s7hr_model=False):
+        assert mem in ("hbm", "ddr4", "ddr3")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
-        ddr_split = mem == "ddr4"
+        ddr_split = mem in ("ddr4", "ddr3")
         dmap      = BOARD_DDR4_MAP if board_timing else SIM_DDR4_MAP
         platform  = Platform()
         self.comb += platform.trace.eq(1)
@@ -289,7 +387,7 @@ class TriXiumSimSoC(SoCCore):
         # only keep the ddr:sys ratio.
         SoCCore.__init__(self, platform,
             clk_freq                 = int(BOARD_SYS_CLK_FREQ) if board_timing else int(1e6),
-            ident                    = "TriXium Sim" + (" DDR4" if mem == "ddr4" else ""),
+            ident                    = "TriXium Sim" + {"hbm": "", "ddr4": " DDR4", "ddr3": " DDR3"}[mem],
             cpu_type                 = cpu_type,
             integrated_rom_size      = 0x20000,
             integrated_rom_init      = ROM_BOOT_STUB,
@@ -327,16 +425,20 @@ class TriXiumSimSoC(SoCCore):
                     latency=hbm_latency, stall_rate=hbm_stall_rate)
                 self.add_module(f"hbm_model{c}", model)
                 memory_ports.append(axi)
-        else:
+        elif mem == "ddr4":
             chan_mod = self.add_ddr4(n_channels, n_memctrl, ram, img, memory_ports, dmap,
                                      contents)
+        else:
+            stride   = ddr3_stride(img)
+            chan_mod = self.add_ddr3(n_channels, n_memctrl, ram, img, memory_ports, stride,
+                ddr_settings or {}, s7hr_model)
 
         # TriXium ----------------------------------------------------------------------------------
         # Same integration as both hardware targets; only memory/physical policy differs.
         config = TriXiumConfig(with_sp_csr=False,
-            chan_stride              = dmap.chan_stride if mem == "ddr4" else 0,
+            chan_stride              = stride if mem == "ddr3" else dmap.chan_stride if mem == "ddr4" else 0,
             chan_mod                 = chan_mod,
-            chan_skew                = dmap.chan_skew if mem == "ddr4" else 0,
+            chan_skew                = ddr3_skew(chan_mod) if mem == "ddr3" else dmap.chan_skew if mem == "ddr4" else 0,
             with_hadamard            = with_hadamard,
             with_activation_quantize = with_activation_quantize,
             with_projection_restore  = with_projection_restore,
@@ -363,6 +465,25 @@ class TriXiumSimSoC(SoCCore):
             # Stride 0: every channel has its own HBM model, hence a private address space. On
             # hardware the AXI switch makes the address select the pseudo-channel.
             self.add_constant("TRIXIUM_CHAN_STRIDE",      0)
+        elif mem == "ddr3":
+            # The YPCB's constants, with the sim's windows.
+            self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", DDR3_SIM_WEIGHT_BASE)
+            self.add_constant("TRIXIUM_CHAN_STRIDE",      stride)
+            self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
+            self.add_constant("TRIXIUM_CHAN_SKEW",        ddr3_skew(chan_mod))
+            self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
+            self.add_constant("TRIXIUM_N_MEMCTRL",        n_memctrl)
+            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   2*DDR4_SIM_CSR_STRIDE if s7hr_model else DDR4_SIM_CSR_STRIDE)
+            self.add_constant("SDRAM_TEST_DISABLE")
+            if s7hr_model:
+                # The board's calibration (firmware/ddr_s7hr.c) on the PHY model: `ddrinit 1` on
+                # the console. Scan stride and BIST sizes cut to simulation time.
+                self.add_config("SDRAM_CUSTOM_INIT")
+                self.add_constant("TRIXIUM_DDR_S7HR")
+                self.add_constant("TRIXIUM_DDR_CKPHASE_STEPS", 112)
+                self.add_constant("S7HR_SCAN_STRIDE",      28)
+                self.add_constant("S7HR_BIST_STEP_BYTES",  0x10000)
+                self.add_constant("S7HR_BIST_FINAL_BYTES", 0x40000)
         else:
             # The XCU1525's geometry, scaled to the simulated memories: the same constants the
             # firmware reads on the board, at the map's windows (DDR4Map).
@@ -404,6 +525,42 @@ class TriXiumSimSoC(SoCCore):
             for j in range(chan_mod):
                 c = k*chan_mod + j
                 axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+                for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port")):
+                    setattr(self, f"engport{c}_{jj}", m)
+                memory_ports.append(axi)
+        set_main_ram_executable(self, MAIN_RAM_BASE)
+        return chan_mod
+
+    def add_ddr3(self, n_channels, n_memctrl, ram, img, memory_ports, stride, ddr_settings,
+                 s7hr_model=False):
+        """The YPCB's memory system on LiteDRAM's PHY model; returns chan_mod.
+
+        s7hr_model: the PHY models behind the S7HRDDRPHY's CSRs (S7HRPHYModel), with a LiteDRAM
+        BIST per controller: controller 0 (main_ram, the firmware) without channel effects,
+        controller 1 as a fly-by channel to calibrate (S7HR_CHANNEL)."""
+        assert n_channels % n_memctrl == 0, "channels shard evenly over the controllers"
+        chan_mod = n_channels//n_memctrl
+        assert chan_mod & (chan_mod - 1) == 0
+
+        # Controllers (the board's controller settings unless ddr_settings overrides them).
+        self.sdrams, split_phys, split_modules = [], [], []
+        for k in range(n_memctrl):
+            size = ddr3_size(chan_mod, stride)
+            phy, module = ddr3_phy(ddr3_content(k, ram, img, chan_mod, stride, size), size)
+            if s7hr_model:
+                phy = S7HRPHYModel(phy, ideal=(k == 0), **S7HR_CHANNEL)
+            split_phys.append(phy)
+            split_modules.append(module)
+        add_ddr_domain_controllers(self, split_phys, split_modules, DDR3_SIM_FREQ, MAIN_RAM_SIZE,
+            8192, DDR4_SIM_CSR_WINDOW, controller_settings=ddr_controller_settings(**ddr_settings),
+            with_bist=s7hr_model)
+
+        # Engine ports: channel c -> controller c // chan_mod.
+        for k in range(n_memctrl):
+            core = self.sdrams[k]
+            for j in range(chan_mod):
+                c = k*chan_mod + j
+                axi = AXIInterface(data_width=256, address_width=32, id_width=6)
                 for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port")):
                     setattr(self, f"engport{c}_{jj}", m)
                 memory_ports.append(axi)
@@ -476,6 +633,16 @@ BOARDS = {
     # The FK33: HBM channels, the engine/sequencer/vector unit only (the Qwen3 path).
     "fk33": dict(mem="hbm",
         cpu_type="vexiiriscv", icache_kb=32, vexii_extra="--with-rvZcbm"),
+    # The YPCB: two DDR3 controllers, the FK33's units and CPU (the Qwen3 path).
+    "ypcb": dict(mem="ddr3", n_memctrl=2,
+        cpu_type="vexiiriscv", icache_kb=32, vexii_extra="--with-rvZcbm"),
+}
+
+# The image each board's simulation bakes in by default (--image).
+DEFAULT_IMAGES = {
+    "xcu1525": "models/tiny/bonsai-tiny-hybrid-1k-n8.img",
+    "fk33":    "models/tiny/bonsai-tiny-hybrid-1k-n8.img",
+    "ypcb":    "models/tiny/bonsai-tiny-n4.img", # Four engine channels, the Qwen3 path.
 }
 
 BOARD_SYS_CLK_FREQ = 125e6
@@ -518,11 +685,20 @@ def build_sim(args, board, out_dir):
         sys_hz, ddr_hz = dmap.sim_clk_freqs
         sim_config = SimConfig(default_clk="sys_clk", default_clk_freq=sys_hz)
         sim_config.add_clocker("ddr_clk", ddr_hz)
+    elif board["mem"] == "ddr3":
+        sys_hz, ddr_hz = ddr3_sim_clocks(args.sys_clk_freq)
+        sim_config = SimConfig(default_clk="sys_clk", default_clk_freq=sys_hz)
+        sim_config.add_clocker("ddr_clk", ddr_hz)
     else:
         sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
     soc_kwargs = dict(board, update_repo=args.update_repo,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
+    if args.s7hr_model:
+        soc_kwargs["s7hr_model"] = True
+    if args.ddr_settings:
+        soc_kwargs["ddr_settings"] = {k: int(v) for k, v in
+            (kv.split("=") for kv in args.ddr_settings.split(","))}
     csr_csv = os.path.join(out_dir, "csr.csv")
 
     # Headers + LiteX libraries (to build the firmware against; the ROM is the boot stub, no BIOS;
@@ -546,7 +722,7 @@ def build_sim(args, board, out_dir):
 def main():
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
     parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS),               help="Hardware to mirror.")
-    parser.add_argument("--image",          default="models/tiny/bonsai-tiny-hybrid-1k-n8.img",    help="BONS image to bake in.")
+    parser.add_argument("--image",          default=None,                                          help="BONS image to bake in (default: the board's, DEFAULT_IMAGES).")
     parser.add_argument("--out-dir",        default=None,                                          help="Build directory (default: build/sim_<board>, build/sim_<board>_bt_<image> with --board-timing).")
     parser.add_argument("--board-timing",   action="store_true",                                   help="--board xcu1525: the board's clocks, DDR4 timings/map, CPU and stream geometry (shape-true slices, doc/simulation.md).")
     parser.add_argument("--build",          action="store_true",                                   help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
@@ -562,6 +738,9 @@ def main():
     parser.add_argument("--hbm-latency",    default=16, type=int,                                  help="--board fk33: HBM model read latency.")
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
+    parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
+    parser.add_argument("--s7hr-model",     action="store_true",                                   help="--board ypcb: the PHY models behind the S7HRDDRPHY's CSRs (calibration test: ddrinit 1).")
+    parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")
     args = parser.parse_args()
     if not (args.build or args.run or args.firmware or args.gate or args.bench):
         parser.error("nothing to do: --build, --run, --firmware, --gate or --bench.")
@@ -573,6 +752,8 @@ def main():
 
     # Everything runs from the repository root (firmware/, models/, build/).
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    if args.image is None:
+        args.image = DEFAULT_IMAGES.get(args.board, DEFAULT_IMAGES["xcu1525"])
     out_dir      = args.out_dir or f"build/sim_{args.board}"
     board        = dict(BOARDS[args.board])
     if args.board_timing:

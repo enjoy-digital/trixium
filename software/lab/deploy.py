@@ -8,6 +8,7 @@
 
   trixium deploy --board xcu1525 --model 27b                  # build/xcu1525 on the XCU1525 host
   trixium deploy --board fk33    --model 1p7b                 # build/fk33 on the FK33 host
+  trixium deploy --board ypcb    --model 1p7b                 # build/ypcb on the YPCB-00338 host
   trixium deploy --board xcu1525 --model 8b --no-reconfigure  # next model, board already deployed
   trixium deploy --board xcu1525 --model 27b --dry-run        # print every command, run nothing
 
@@ -18,7 +19,8 @@ ssh runs in BatchMode: an ssh key must be installed on the host.
 The sequence and its order:
   1. timing gate      - refuse a bitstream that missed timing badly (it can take the host down).
                         XCU1525: the strict verdict for information, then the experiment gate under
-                        the DDR4-1500 approval; FK33: the empirical gate it has always shipped on
+                        the DDR4-1500 approval; FK33: the empirical gate it has always shipped on;
+                        YPCB-00338: the strict gate (no build has run on a card yet)
   2. firmware         - built for this build tree under firmware/.build.lock (firmware/ is shared
                         with every other build, each against its own CSR map), shipped from a
                         private snapshot (build/<name>/trixium.bin)
@@ -29,13 +31,14 @@ The sequence and its order:
      deploy, and build/ gets cleaned for disk space)
   5. driver + host tools built ON THE HOST against its kernel with this build's headers
   6. reconfigure + warm reboot (software/host/board.py reconfigure): XCU1525 openFPGALoader + the IR
-     capture 0x35d75 (DONE in the three SLRs); FK33 OpenOCD pld load. Never go on against a
-     removed device
+     capture 0x35d75 (DONE in the three SLRs); FK33 OpenOCD pld load; YPCB-00338 openFPGALoader
+     on a Digilent HS2 cable. Never go on against a removed device
   7. boot + weights: XCU1525 = the DDR4 boot order of software/host/board.py (the BIOS calibrates
      controller 0, the host-side training fixes what it could not, the firmware boots without a
      CPU reset and calibrates 1..3, the host trains them too, engreset, the round trip), THEN the
-     weights (the loader writes to controllers the firmware initialises). FK33 = weights, then
-     the serial boot (retried)
+     weights (the loader writes to controllers the firmware initialises). YPCB-00338 = the same
+     order without host training: the BIOS calibrates DDR3 controller 0 (the S7HR CK-phase scan),
+     the firmware controller 1. FK33 = weights, then the serial boot (retried)
   8. tokens BEFORE numbers - wrong tokens stop here with a non-zero exit: a fast wrong answer is
      not a result
   9. bench
@@ -43,7 +46,9 @@ The sequence and its order:
 Images: models/bons/. The XCU1525's windows are 704 MB (1 GB stride): its 8B and 27B images are
 its own (bonsai-<model>-n16-xcu1525.img, trixium convert --board xcu1525); its 1.7B
 image is the FK33's, byte-identical. The FK33's image must match the bitstream's channel count
-(bonsai-<model>-n<channels>.img, from the build's soc.h).
+(bonsai-<model>-n<channels>.img, from the build's soc.h). The YPCB-00338's are its own
+(bonsai-<model>-n4-ypcb.img, trixium convert --board ypcb: four channels, two windows per DDR3
+controller).
 """
 
 import os
@@ -74,6 +79,13 @@ MODELS = {
     "1p7b": ("1.7b", "785 6722 315 9625 374", "12095 11 323 279 6722 315 17689 374 24081",    64,  1200), # " Paris, and the capital of Spain is Madrid"
     "8b"  : ("8b",   "785 6722 315 9625 374", "12095 13 576 6722 315 9625 374 12095 13 576",  32,  1200), # " Paris. The capital of France is Paris. The"
     "27b" : ("27b",  "760 6511 314 9338 369", "11751 13 198 760 6511 314 9564 369",            4,  7000), # " Paris.\nThe capital of Germany is" (PrismML's llama.cpp fork, CUDA, greedy)
+}
+
+# Boards: the LiteX platform name of each board's bitstream (build/<name>/gateware/<platform>.bit).
+PLATFORMS = {
+    "xcu1525" : "sqrl_xcu1525",
+    "fk33"    : "sqrl_fk33",
+    "ypcb"    : "ypcb_00338_1p1",
 }
 
 # Board Hosts --------------------------------------------------------------------------------------
@@ -267,6 +279,8 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     serializer_baseline="v8", bench=None):
     if board == "fk33" and model == "27b":
         raise DeployError("the 27B does not fit the FK33's 8 GB HBM")
+    if board == "ypcb" and model == "27b":
+        raise DeployError("the 27B does not fit the YPCB-00338's 4 GB DDR3 (nor its units)")
     tok, prompt, want, bench_n, timeout = MODELS[model]
     bench_n  = bench_n if bench is None else bench
     conf     = board_config(board)
@@ -274,14 +288,17 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     out      = os.path.join(REPO, "build", build)
     name     = os.path.basename(out)
     gw       = os.path.join(out, "gateware")
-    bit      = os.path.join(gw, f"sqrl_{board}.bit")
-    report   = os.path.join(gw, f"sqrl_{board}_timing.rpt")
+    platform = PLATFORMS.get(board, f"sqrl_{board}")
+    bit      = os.path.join(gw, f"{platform}.bit")
+    report   = os.path.join(gw, f"{platform}_timing.rpt")
     soc_h    = os.path.join(out, "software", "include", "generated", "soc.h")
     drv      = os.path.join(out, "driver", "kernel")
     sudo     = remote.sudo()
     board_py = f"{sudo} python3 -m software.host.board"
     if board == "xcu1525":
         image = f"bonsai-{model}-n16.img" if model == "1p7b" else f"bonsai-{model}-n16-xcu1525.img"
+    elif board == "ypcb":
+        image = f"bonsai-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '4')}-ypcb.img"
     else:
         image = f"bonsai-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '16')}.img"
     image = os.path.join(REPO, "models", "bons", image)
@@ -300,6 +317,8 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
             remote.local(timing + ["--strict", "--serializer-baseline", serializer_baseline, report], check=False)
             gate = timing + ["--experiment", "--serializer-baseline", serializer_baseline] + \
                 (["--approval", approval] if approval else []) + [report]
+        elif board == "ypcb":
+            gate = timing + ["--strict", "--board", "ypcb", report]
         else:
             gate = timing + [report]
         if remote.local(gate, check=False):
@@ -403,9 +422,9 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     remote.sync(image)
     img = os.path.basename(image)
     gen = f"16 {prompt} --want {shlex.quote(want)} --timeout {timeout}"
-    if board == "xcu1525":
+    if board in ["xcu1525", "ypcb"]:
         if reconfigure or boot:
-            if remote.ssh(f"{board_py} boot {tok} --board xcu1525")[0]:
+            if remote.ssh(f"{board_py} boot {tok} --board {board}")[0]:
                 raise DeployError("board boot or DDR training failed - refusing to load weights")
         if remote.ssh(f"{board_py} model {img} {gen}")[0]:
             raise DeployError("model load, generation or TOKENS failed - refusing to benchmark")
@@ -427,7 +446,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 
 def add_arguments(parser):
     parser.add_argument("build",                 nargs="?",                                      help="Build name in build/ (default: the board's).")
-    parser.add_argument("--board",               default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
+    parser.add_argument("--board",               default="xcu1525", choices=list(PLATFORMS), help="Board.")
     parser.add_argument("--model",               default="1p7b", choices=list(MODELS),           help="Model.")
     parser.add_argument("--no-reconfigure",      action="store_true",                            help="Board already deployed: firmware, weights, tokens and bench only.")
     parser.add_argument("--boot",                action="store_true",                            help="With --no-reconfigure: boot the (rebuilt) firmware first (XCU1525).")

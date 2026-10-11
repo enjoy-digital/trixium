@@ -10,6 +10,7 @@ copies software/ there: `trixium deploy`, software/lab/deploy.py).
   sudo python3 -m software.host.board reconfigure --board xcu1525 prog/csr.bit
   sudo python3 -m software.host.board boot 27b [--firmware trixium.bin]
   sudo python3 -m software.host.board boot 1.7b --board fk33
+  sudo python3 -m software.host.board boot 1.7b --board ypcb
   sudo python3 -m software.host.board load bonsai-1p7b-n16.img
   sudo python3 -m software.host.board gen 16 785 6722 315 9625 374 [--want "12095 11 ..."]
   sudo python3 -m software.host.board model bonsai-27b-n16-xcu1525.img 16 760 6511 314 9338 369
@@ -26,7 +27,9 @@ controller 0 -> memtest -> firmware boot without a CPU reset (-R) -> the firmwar
 controllers 1..3 -> host-side training of 1..3 -> engreset -> ddrtest. The host-side training
 (software/host/rdlevel.py) must never touch controller 0 while the firmware runs from it: `boot`
 trains it between the BIOS's calibration and the jump. On the FK33: trixium_chat -k (CPU reset,
-serial boot), retried once.
+serial boot), retried once. On the YPCB-00338 there is no host training: the BIOS calibrates DDR3
+controller 0 itself (the S7HR CK-phase scan, firmware/ddr_s7hr.c), the firmware boots without a
+CPU reset and calibrates controller 1 the same way, then engreset -> ddrtest.
 """
 
 import io
@@ -62,6 +65,10 @@ set _CHIPNAME xcvu9p
 jtag newtap $_CHIPNAME tap -irlen 18 -expected-id 0x04b31093 -ignore-version -ircapture 0x00 -irmask 0x3ffff
 """
 XCU1525_CONFIGURED = "0x35d75"
+
+# The YPCB-00338's JTAG: an external Digilent HS2-style FT232H cable on the card's header (its
+# chain shows the FPGA alone; a Xilinx Platform Cable's chain also has the card's CPLD).
+YPCB_PROGRAM = ["openFPGALoader", "-c", "digilent_hs2", "--fpga-part", "xc7k480tffg1156"]
 
 BENCH_LINES = (r"BENCH|SPTEST|^(op|embed|rmsnorm|qknorm|kvquant|scores|wv|quant8|norm_i32|silu_mul|"
     r"resid_add|lmhead|engine_wait|total|poll|dnhw|hybprof|dnprof|attnprof|floor|resprof|siluprof|"
@@ -154,6 +161,13 @@ def reconfigure(board, bitstream):
         if cap != XCU1525_CONFIGURED:
             say("NOT CONFIGURED - stop")
             return 1
+    elif board == "ypcb":
+        # openFPGALoader checks DONE after the load on this single-device chain.
+        out = run(YPCB_PROGRAM + [bitstream], 600)
+        grep(out, r"(?i)done|error|fail")
+        if re.search(r"(?i)error|fail", out) or not re.search(r"(?i)done", out):
+            say("NOT CONFIGURED - stop")
+            return 1
     else:
         # openFPGALoader reports "done 1" on the FK33 without configuring it: its JPROGRAM
         # restarts the master-SPI boot and the factory flash image wins. OpenOCD's pld load
@@ -239,6 +253,49 @@ def boot_xcu1525(tok, firmware):
     return 0
 
 
+def boot_ypcb(tok, firmware):
+    kill_consoles()
+    cpu_reset()
+    # The BIOS calibrates controller 0 (sdram_custom_init: the S7HR CK-phase scan, a BIST per
+    # step) then runs its memtest; only the text after the NEW banner counts.
+    acc = new = ""
+    for i in range(1, 31):
+        acc += "\n" + con([], wait=10, quiet_after=3)
+        new = acc[acc.rfind("BIOS built on"):] if "BIOS built on" in acc else ""
+        if new and re.search(r"Memtest (OK|KO)", new) and re.search(r"litex.*> ?$", new, re.M):
+            say(f"BIOS prompt after ~{i*10} s")
+            break
+    if not new:
+        say("no BIOS banner")
+        try:
+            say("\n".join(cpumon()[:20]))
+        except OSError as e:
+            say(str(e))
+        return 1
+    grep(new, r"^S7HR|Memtest")
+    if not re.search(r"S7HR: OK", new) or not re.search(r"Memtest OK", new):
+        say("STOP: controller 0 did not calibrate (S7HR) or main_ram fails the memtest")
+        return 1
+
+    # No model at boot (a staged header from a previous session points at stale weights); the
+    # firmware boots without a CPU reset, calibrates controller 1 and runs the round trip.
+    run(["./user/trixium_chat", "-C"], 60)
+    out = run(["stdbuf", "-oL", "./user/trixium_chat", "-R", "-W", "2000", "-k", firmware,
+        "-z", f"models/{tok}/tokenizer.bin"], 2400)
+    with open("/tmp/fw_boot.txt", "w", encoding="utf-8") as f:
+        f.write(out)
+    grep(out, r"\[boot\]|fastboot|^S7HR|ddr: controller|DDRTEST|SPTEST|VECTEST|READY|rror|ENGSTALL", 60)
+    if not re.search(r"ddr: controller 1 OK", out):
+        say("STOP: controller 1 did not calibrate")
+        return 1
+    out = con(["engreset", "ddrtest"], wait=200, quiet_after=5)
+    lines = grep(out, r"ENGRESET|DDRTEST")
+    if any("FAIL" in l for l in lines):
+        say("STOP: DDRTEST errors")
+        return 1
+    return 0
+
+
 def boot_fk33(tok, firmware):
     # trixium_chat -k: CPU reset, loader into main_ram, BIOS boot (~1.5 s); the serial boot
     # NAKs part-way often enough to retry.
@@ -317,11 +374,11 @@ def main(argv=None):
 
     p = sub.add_parser("reconfigure", help="Program the FPGA and warm-reboot the host.")
     p.add_argument("bitstream",                                                  help="Bitstream.")
-    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
+    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33", "ypcb"], help="Board.")
 
     p = sub.add_parser("boot", help="Boot the firmware (XCU1525: with the DDR4 training).")
     p.add_argument("tok",        default="1.7b", nargs="?",                      help="Tokenizer directory in models/.")
-    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33"], help="Board.")
+    p.add_argument("--board",    default="xcu1525", choices=["xcu1525", "fk33", "ypcb"], help="Board.")
     p.add_argument("--firmware", default="trixium.bin",                          help="Firmware binary.")
 
     p = sub.add_parser("load", help="Upload a weight image (trixium_load).")
@@ -351,7 +408,7 @@ def main(argv=None):
     if args.cmd == "reconfigure":
         rc = reconfigure(args.board, args.bitstream)
     elif args.cmd == "boot":
-        rc = {"xcu1525": boot_xcu1525, "fk33": boot_fk33}[args.board](args.tok, args.firmware)
+        rc = {"xcu1525": boot_xcu1525, "fk33": boot_fk33, "ypcb": boot_ypcb}[args.board](args.tok, args.firmware)
     elif args.cmd == "load":
         rc = load(args.image)
     elif args.cmd == "gen":

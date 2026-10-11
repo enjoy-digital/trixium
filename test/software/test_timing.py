@@ -146,3 +146,44 @@ def test_cli_experiment_verdicts(tmp_path):
     r = subprocess.run([sys.executable, str(tool), "--experiment", "--force", str(far)],
                        capture_output=True, text=True)
     assert r.returncode == 1 and "DO NOT DEPLOY" in r.stdout
+
+
+# Board clock coverage -----------------------------------------------------------------------------
+
+CLOCKS_YPCB = """Clock Summary
+-------------
+Clock                        Waveform(ns)         Period(ns)      Frequency(MHz)
+-----                        ------------         ----------      --------------
+clk50                        {0.000 10.000}       20.000          50.000
+  main_crg_clkout0           {0.000 3.333}        6.667           150.000
+  main_crg_clkout1           {0.000 3.750}        7.500           133.333
+    main_s7hrddrphy0_outs1   {0.000 0.937}        1.875           533.333
+  main_crg_clkout2           {0.000 2.500}        5.000           200.000
+pcie_x81_clk_p               {0.000 5.000}        10.000          100.000
+Intra Clock Table
+"""
+
+CLOCKS_PCIE_ONLY = """Clock Summary
+-------------
+Clock                        Waveform(ns)         Period(ns)      Frequency(MHz)
+pcie_x81_clk_p               {0.000 5.000}        10.000          100.000
+  main_s7pciephy_clkout0     {0.000 4.000}        8.000           125.000
+Intra Clock Table
+"""
+
+
+def test_board_clock_coverage(tmp_path):
+    """A report that does not time the board's clocks is refused before any verdict: the YPCB's
+    first build had its 50 MHz input unconstrained, and the summary (the PCIe clocks alone)
+    passed the strict gate."""
+    from software.lab.timing import gate, missing_clocks
+    good = report(tmp_path, trailer=CLOCKS_YPCB)
+    assert missing_clocks(good, "ypcb") == []
+    assert gate(good, strict=True, board="ypcb") == 0
+    bad = tmp_path / "bad.rpt"
+    bad.write_text("Design Timing Summary\n --- header ---\n" + PASS + "\n" + CLOCKS_PCIE_ONLY)
+    assert missing_clocks(bad, "ypcb") == [20.0, 7.5, 1.875, 5.0]
+    assert missing_clocks(good, "ypcb", clocks=[6.667]) == []
+    assert missing_clocks(good, "ypcb", clocks=[8.0]) == [8.0]
+    assert gate(bad, strict=True, board="ypcb") == 1
+    assert gate(bad, strict=True) == 0 # Without a board: the summary alone, as before.
