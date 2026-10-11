@@ -230,11 +230,11 @@ static int32_t resid_tail_pack(int nk, int nsa, int nsb, int nln, int wsh)
 // src = the engine results (the projection that just ran: its absmax is still in the tracker,
 // read before the norm-row fetch is submitted - the tracker resets on accept), eproj = their
 // exponent before the norm shift (input exponent - bias + rshift), *eres/*xamax = the residual
-// exponent/absmax (updated), w16 = the next norm's row. Returns the next norm's quant8 shift
+// exponent/absmax (updated), w16 = the next norm's row (fetched: already in SP_FET). Returns the next norm's quant8 shift
 // (int16 out in SP_H, x8 in SP_X), or RESID_TAIL_OFF with nothing run - an op off the hardware
 // or a shift that does not fit its field - and the caller runs the three ops.
 int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
-                  const struct bons_entry *w16, int n)
+                  const struct bons_entry *w16, int n, int fetched)
 {
 #ifdef CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR
     if (!w16 || !op_on_hw(OP_NORM_I32) || !op_on_hw(OP_RESID_ADD) || !op_on_hw(OP_RMSNORM)
@@ -251,10 +251,11 @@ int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
     int32_t a4 = resid_tail_pack(-k, *eres - eo, ed - eo, -ln, w16_shift(w16));
     if (a4 < 0)
         return RESID_TAIL_OFF;
-    uint32_t df = norm_fetch_submit(w16);
+    uint32_t df = fetched ? 0 : norm_fetch_submit(w16);
     int32_t args[8] = {(int32_t)src, (int32_t)SP_XR, (int32_t)SP_H, n/16, a4, eps_for(eo),
                        (int32_t)SP_FET, (int32_t)SP_X};
-    engine_join(df);
+    if (!fetched)
+        engine_join(df);
     perf_enter(OP_RESID_ADD);
     uint32_t r = (uint32_t)vec_run(PROG_RESID_RMSQ8, args, 8);
     perf_exit(OP_RESID_ADD);
@@ -262,7 +263,7 @@ int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
     *xamax = r >> 16;
     return quant8_shift(r & 0xFFFF);
 #else
-    (void)src; (void)eproj; (void)eres; (void)xamax; (void)w16; (void)n;
+    (void)src; (void)eproj; (void)eres; (void)xamax; (void)w16; (void)n; (void)fetched;
     return RESID_TAIL_OFF;
 #endif
 }
@@ -487,6 +488,23 @@ void kv_pack_prep_res(int l, int kvh, int kind, int es)
     kv_store_scale_prep(kvh, kind, e8);
     int idx = kv_ek_idx(l, kvh, kind);
     if (e8 > kv_ekmax[idx]) kv_ekmax[idx] = e8;
+}
+
+// kv_pack_prep_res for both kinds of every kv head of layer l (k at E_NORM, v at ev), the
+// per-head bookkeeping in one loop: a slot's scale beat is restaged only when its exponent
+// moved (k's never does after the first layer, v's once per layer).
+void kv_pack_prep_layer(int l, int ev)
+{
+    int e8k = E_NORM + 8, e8v = ev + 8;
+    int8_t *ek = &kv_ekmax[kv_ek_idx(l, 0, 0)];
+    for (int hh = 0; hh < n_kv_head; hh++) {
+        if (kvp_scale_e8[2*hh] != e8k)
+            kv_store_scale_prep(hh, 0, e8k);
+        if (kvp_scale_e8[2*hh + 1] != e8v)
+            kv_store_scale_prep(hh, 1, e8v);
+        if (e8k > ek[2*hh])     ek[2*hh]     = (int8_t)e8k;
+        if (e8v > ek[2*hh + 1]) ek[2*hh + 1] = (int8_t)e8v;
+    }
 }
 
 #ifndef CSR_TRIXIUM_ENGINE_CSR_REP_ADDR

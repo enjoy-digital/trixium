@@ -303,7 +303,7 @@ int op_rmsnorm_q8_sp(uint32_t src, int esrc, const float *w, const struct bons_e
 int op_silu_q8_sp(uint32_t gsrc, int eg, uint32_t usrc, int eu, int n, uint32_t dst8);
 #define RESID_TAIL_OFF (-1000) // resid_norm_q8 ran nothing (no quant8 shift is ever this).
 int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
-                  const struct bons_entry *w16, int n);
+                  const struct bons_entry *w16, int n, int fetched);
 int op_norm_i32_sp_a(uint32_t src, uint32_t dst, int n, uint32_t amax, uint32_t *omax);
 int op_norm_i32_sp_m(uint32_t src, uint32_t dst, int n, uint32_t *omax);
 static inline int op_norm_i32_sp(uint32_t src, uint32_t dst, int n)
@@ -314,6 +314,7 @@ int attn_all_hw(void);
 void vec_quant8_head(uint32_t sp, uint32_t dst, int n);
 uint32_t kvp_slot(int kvh, int kind);
 void kv_pack_prep_res(int l, int kvh, int kind, int es);
+void kv_pack_prep_layer(int l, int ev);
 int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst);
 
 /* infer_lists.c */
@@ -342,7 +343,7 @@ void seq_build_qkv(void);
 int seq_eps_int(int es);
 void attn_list_prep_token(int pos);
 void attn_patch_slots(int l, int h0, int nh, int chunked);
-void ffn_prep_layer(int l);
+void ffn_prep_layer(int l, const struct bons_entry *next_w16);
 void qkv_prep_layer(int l);
 
 // List-relative dcount ("descriptors completed") threshold after which head j's fold

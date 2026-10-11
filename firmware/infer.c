@@ -772,11 +772,11 @@ embed_done: ;
                     uint32_t chan   = (uint32_t)(pos % n_ch);
                     int wr_rb   = (kvst_rb_set   != (uint32_t)kv_rb);
                     int wr_chan = (kvst_chan_set != chan);
-                    for (int hh = 0; hh < n_kv_head; hh++) {
+                    if (kv_mstore_active) // One descriptor for all slots, patched below.
+                        kv_pack_prep_layer(l, ev_res);
+                    for (int hh = 0; hh < n_kv_head && !kv_mstore_active; hh++) {
                         kv_pack_prep_res(l, hh, 0, E_NORM);
                         kv_pack_prep_res(l, hh, 1, ev_res);
-                        if (kv_mstore_active)
-                            continue; // One descriptor for all slots, patched below.
                         for (int kind = 0; kind < 2; kind++) {
                             uint32_t sdi = seq_kvst_di[hh*2 + kind];
                             seq_patch(sdi, 4, kv_region_addr(l, hh, kind) + rowoff);
@@ -802,14 +802,11 @@ embed_done: ;
                     && op_on_hw(OP_SCORES) && op_on_hw(OP_SOFTMAX) && op_on_hw(OP_WV))) {
                     // Overlap (sideband slot): the attention list's per-layer patches
                     // run while the sequencer executes the qkr list.
+                    // (The FFN rebuild rides the output projection's stream instead: the
+                    // patches alone fill this window.)
                     seq_list_start(0, seq_qkr_count);
                     attn_patch_slots(l, 0, n_head, 0);
                     attn_prepatched = 1;
-                    if (seq_ffn_base >= 0 && op_on_hw(OP_NORM_I32)
-                        && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
-                        ffn_prep_layer(l); // The FFN rebuild rides the same window.
-                        ffn_prepatched = 1;
-                    }
                     seq_join();
                 } else {
                     seq_run(0, seq_qkr_count);
@@ -1187,6 +1184,10 @@ attn_heads_done: ;
         {
             const struct bons_entry *eo = model_entry(ROLE_ATTN_OUT, l);
             int ea8;
+            // The FFN norm's row streams under the scale8 work (the engine is idle there):
+            // the residual tail after the projection then starts on it.
+            const struct bons_entry *fn16 = nrm_ffn16[l];
+            uint32_t dfn = fn16 ? norm_fetch_submit(fn16) : 0;
             if (likely(attn_hw)) {
                 perf_enter(OP_QUANT8);
                 ea8 = 0;
@@ -1213,10 +1214,25 @@ attn_heads_done: ;
             dbg_sum("awp8", l, SP_AWP8, n_head*32, 0);
             dbg_sum("awam", l, SP_AWAM, n_head*32, 0);
             dbg_sum("scb",  l, SP_SCB2, 64, 0);
-            model_matvec(eo, SP_X, SP_Y);
+            if (fn16)
+                engine_join(dfn);
+            {
+                // The projection streams while the CPU rebuilds the FFN list's engine words.
+                struct engine_op mo = {0};
+                model_matvec_op(eo, SP_X, SP_Y, &mo);
+                perf_enter(OP_ENGINE_WAIT);
+                uint32_t dwo = engine_submit(&mo);
+                if (seq_use && seq_ffn_base >= 0 && !ffn_prepatched && op_on_hw(OP_NORM_I32)
+                    && op_on_hw(OP_SILU_MUL) && op_on_hw(OP_QUANT8)) {
+                    ffn_prep_layer(l, next_norm16(l));
+                    ffn_prepatched = 1;
+                }
+                engine_join(dwo);
+                perf_exit(OP_ENGINE_WAIT);
+            }
             // The residual tail and the FFN norm in one program when it can (resid_norm_q8).
             sx8_next = resid_norm_q8(SP_Y, ea8 - (int)eo->bias + (int)eo->rshift, &ex_state,
-                                     &x_amax, nrm_ffn16[l], n_embd);
+                                     &x_amax, fn16, n_embd, 1);
             if (sx8_next == RESID_TAIL_OFF) {
                 perf_enter(OP_NORM_I32);
                 uint32_t dmax = 0;
@@ -1248,7 +1264,7 @@ attn_heads_done: ;
                 // Whole-list time is charged to OP_SILU_MUL: per-op shares are documented as
                 // unreliable under sequencing; totals are the measurement.
                 if (!ffn_prepatched)
-                    ffn_prep_layer(l);
+                    ffn_prep_layer(l, next_norm16(l));
                 ffn_prepatched = 0;
                 // silu A4 = eg + 6 = imm + kg (VSHLS convention); the descriptor carries
                 // w0[11] so its kreg0 term ADDS.
@@ -1286,7 +1302,7 @@ attn_heads_done: ;
                 // final norm only when the logits will read it.
                 if (l + 1 < n_layer || want_logits)
                     sx8_next = resid_norm_q8(SP_Y, es8 - (int)ed_t->bias + (int)ed_t->rshift,
-                                             &ex_state, &x_amax, next_norm16(l), n_embd);
+                                             &ex_state, &x_amax, next_norm16(l), n_embd, 1);
                 if (sx8_next == RESID_TAIL_OFF) {
                     perf_enter(OP_NORM_I32);
                     uint32_t dmax = 0;

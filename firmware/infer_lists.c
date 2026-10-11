@@ -450,13 +450,14 @@ static int ffn_shape_base = -1; // seq_ffn_base the FFN engine shape images were
 // Byte-identical by construction (asm.py, test_silu_split_matches_fused). It relies on the
 // matvec result packer: without it the vector unit runs ~2.9x slower under an engine stream
 // and norm_g alone fills the window.
-static int ffn_di_down = 7; // Down matvec's descriptor (seq_build_ffn).
+static int ffn_di_down = 8; // Down matvec's descriptor (seq_build_ffn).
+static int ffn_di_fet  = 6; // Next norm row's fetch (seq_build_ffn).
 int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
 
 void seq_build_ffn(void)
 {
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
-    int len = 9;
+    int len = 10;
     if (di + len > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
@@ -472,9 +473,11 @@ void seq_build_ffn(void)
     //   3 norm_g SP_Y -> SP_G [k via KRES6]            <- runs under the up stream
     //   4 silu_gate SP_G in place [A4 = imm + kreg0]   <- runs under the up stream
     //   5 spill up-absmax (seed_abs: interlock waits the stream)
-    //   6 norm_mul_q8 SP_G x (SP_YU >> ku) -> SP_X [ku via KRES6; res6 = source absmax,
-    //     read by the CPU after the list - desc 7 is an engine op and leaves it alone]
-    //   7 down mv   8 stop
+    //   6 fetch NOWAIT: the next norm's int16 row -> SP_FET (the residual tail after the list
+    //     reads it), streaming under desc 7 - the engine is idle on this serial stretch
+    //   7 norm_mul_q8 SP_G x (SP_YU >> ku) -> SP_X [ku via KRES6; res6 = source absmax,
+    //     read by the CPU after the list - desc 8 is an engine op and leaves it alone]
+    //   8 down mv (waits the fetch: engine ready = idle)   9 stop
     // The up norm rides inside the multiply (prog_norm_mul_q8): no int16 up in SP_U, one pass
     // and one descriptor less on the serial tail between the up and down streams.
     struct engine_op z = {0};
@@ -503,6 +506,8 @@ void seq_build_ffn(void)
     }
     int32_t pb = (int32_t)(SP_FFSP + 32);
     seq_desc_vec_seed(d, PROG_SPILL, &pb, 1, 0, 1);                      // spill up-absmax
+    d++;
+    ffn_di_fet = d - di;                                                  // norm row fetch
     d++;
     {
         // norm_mul_q8: (silu * (up >> ku)) << A6, clamp, absmax (res6 for the CPU), quant8
@@ -751,7 +756,7 @@ static inline void ffn_patch_lw(uint32_t di, const struct engine_op *mo)
     seq_patch(di, 7, mo->bias | ((uint32_t)mo->rshift << 16) | ((uint32_t)mo->rshift2 << 22));
 }
 
-void ffn_prep_layer(int l)
+void ffn_prep_layer(int l, const struct bons_entry *next_w16)
 {
     // Only wbase (4) and bias|rshift (7) change with the layer; the 13 shape words are
     // per-role constants and the flag patches are build-time. Full images once per list
@@ -768,6 +773,20 @@ void ffn_prep_layer(int l)
     model_matvec_op(model_entry(ROLE_FFN_DOWN, l), SP_X, SP_Y, &mo);
     if (full) seq_desc_engine(b + (uint32_t)ffn_di_down, &mo);
     else ffn_patch_lw(b + (uint32_t)ffn_di_down, &mo);
+    // The next norm's row (a 1-beat stand-in when the image has none: the tail then runs
+    // the three ops, which fetch for themselves).
+    struct engine_op fo = {0};
+    fo.kind  = ENGINE_KIND_FETCH;
+    fo.wbase = TRIXIUM_CHAN_WEIGHT_BASE + (next_w16 ? next_w16->chan_base_beats*32 : 0);
+    fo.wlen  = next_w16 ? next_w16->chan_len_beats : 1;
+    fo.dst   = SP_FET;
+    if (full) {
+        seq_desc_engine(b + (uint32_t)ffn_di_fet, &fo);
+        seq_patch(b + (uint32_t)ffn_di_fet, 0, 1u | (1u << 9)); // NOWAIT.
+    } else {
+        seq_patch(b + (uint32_t)ffn_di_fet, 4, fo.wbase);
+        seq_patch(b + (uint32_t)ffn_di_fet, 5, fo.wlen);
+    }
     ffn_shape_base = seq_ffn_base;
 }
 
