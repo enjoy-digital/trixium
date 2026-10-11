@@ -80,12 +80,12 @@ class IntegerHadamard(LiteXModule):
 
         IDLE, LOAD, RUN, DRAIN, OUTPUT, FAILED, FINISH = range(7)
         state = Signal(3, reset=IDLE)
-        inverse, bank = Signal(), Signal()
+        inverse, bank = Signal(reset_less=True), Signal() # inverse: latched with the command.
         stage = Signal(max=stages)
         load_index = Signal(word_bits)
         pair = Signal(max=max(2, words//2))
         calc_valid = Signal()
-        write_a, write_b = Signal(word_bits), Signal(word_bits)
+        write_a, write_b = Signal(word_bits, reset_less=True), Signal(word_bits, reset_less=True)
         read_a, read_b = Signal(word_bits), Signal(word_bits)
         issued = Signal(max=words + 1)
         output_index = Signal(word_bits)
@@ -211,10 +211,10 @@ class IntegerHadamard(LiteXModule):
         maximum_last = self.source.last
         while len(magnitudes) > 1:
             level = []
-            valid, last = Signal(), Signal()
+            valid, last = Signal(), Signal(reset_less=True) # last: qualified by valid.
             capture = []
             for a, b in zip(magnitudes[::2], magnitudes[1::2]):
-                maximum = Signal(width)
+                maximum = Signal(width, reset_less=True)
                 capture.append(maximum.eq(Mux(a > b, a, b)))
                 level.append(maximum)
             # Pipeline each tree level, retaining one accepted word per cycle.
@@ -332,12 +332,12 @@ class HadamardScratchpad(LiteXModule):
         (IDLE, START, SIGN_REQ, SIGN_CAP, DATA_REQ, DATA_CAP, SEND, OUTPUT, STATS, NEXT, FINISH,
          FAILED) = range(12)
         state = Signal(4, reset=IDLE)
-        captured = {name: Signal(width) for name, width in HADAMARD_COMMAND}
+        captured = {name: Signal(width, reset_less=True) for name, width in HADAMARD_COMMAND}
         block = Signal(16)
         in_word = Signal(max=block_size//L)
         out_word = Signal(max=block_size//8)   # output beat
         out_sub = Signal(max=max(2, bpw))      # beat within the core word
-        inputs, signs = Signal(256), Signal(256)
+        inputs, signs = Signal(256, reset_less=True), Signal(256, reset_less=True)
         ends = {name: Signal(64) for name in ("src", "signs", "dst", "stats")}
         stats_bytes = Signal(64)
         config_bad, bounds_bad, overlap_bad = Signal(), Signal(), Signal()

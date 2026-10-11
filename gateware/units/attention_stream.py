@@ -113,9 +113,10 @@ class AttentionStream(LiteXModule):
 
         # # #
 
-        def dly(value, n, name):
+        def dly(value, n, name, reset_less=True):
+            # A datapath delay line by default; the valids pass reset_less=False.
             for i in range(n):
-                r = Signal.like(value, name=f"{name}_d{i}")
+                r = Signal.like(value, name=f"{name}_d{i}", reset_less=reset_less)
                 self.sync += r.eq(value)
                 value = r
             return value
@@ -124,28 +125,31 @@ class AttentionStream(LiteXModule):
             return Array([word[32*i:32*(i + 1)] for i in range(8)])[index]
 
         dat = self.sp_rd_dat
+        # The record's geometry is reset-less (decoded before params_ready lets anything run);
+        # the mode keeps its reset, it steers the output handshakes.
         run, mode = Signal(), Signal()
-        nq, n_rep, nkv = Signal(8), Signal(8), Signal(8)
-        T = Signal(16)
-        hd = Signal(16)                     # Floats per head.
-        hb = Signal(max=hb_max + 1)         # Beats per head.
-        src, sstr, dst, dstr = (Signal(adr_bits), Signal(adr_bits), Signal(adr_bits),
-                                Signal(adr_bits))
-        scale = Signal(32)
-        rowbeats = Signal(12)
-        tbeats = Signal(max=t_max//8 + 1)   # ceil(T/8)
-        ngroups = Signal(max=t_max//8 + 1)
+        nq, n_rep, nkv = (Signal(8, reset_less=True), Signal(8, reset_less=True),
+                          Signal(8, reset_less=True))
+        T = Signal(16, reset_less=True)
+        hd = Signal(16, reset_less=True)                     # Floats per head.
+        hb = Signal(max=hb_max + 1, reset_less=True)         # Beats per head.
+        src, sstr, dst, dstr = [Signal(adr_bits, reset_less=True) for _ in range(4)]
+        scale = Signal(32, reset_less=True)
+        rowbeats = Signal(12, reset_less=True)
+        tbeats = Signal(max=t_max//8 + 1, reset_less=True)   # ceil(T/8)
+        ngroups = Signal(max=t_max//8 + 1, reset_less=True)
 
         # Record, then the per-lane operands: registered read requests -----------------------------
         ld_st = Signal(3)       # 0 idle, 1 record, 2 decode, 3 operands, 4 last, 5 ready
-        rq_v, rq_adr, rq_lane, rq_word, rq_last = (Signal(), Signal(adr_bits), Signal(max=L),
-                                                   Signal(pw), Signal())
-        rsp_v, rsp_lane, rsp_word, rsp_last, rsp_rec = (Signal(), Signal(max=L), Signal(pw),
-                                                       Signal(), Signal())
+        # The request/response payloads are reset-less: qualified by rq_v / rsp_v.
+        rq_v, rq_adr, rq_lane, rq_word, rq_last = (Signal(), Signal(adr_bits, reset_less=True),
+            Signal(max=L, reset_less=True), Signal(pw, reset_less=True), Signal(reset_less=True))
+        rsp_v, rsp_lane, rsp_word, rsp_last, rsp_rec = (Signal(), Signal(max=L, reset_less=True),
+            Signal(pw, reset_less=True), Signal(reset_less=True), Signal())
         taken, free = Signal(), Signal()
         ld_lane, ld_word = Signal(max=L + 1), Signal(pw + 1)
         ld_words = Signal(pw + 1)           # Operand beats per lane.
-        lane_base = Signal(adr_bits)
+        lane_base = Signal(adr_bits, reset_less=True)
         params_ready = Signal()     # Record decoded, operands loaded, kv heads mapped.
         self.comb += [
             taken.eq(rq_v & self.sp_rd_ok),
@@ -289,8 +293,9 @@ class AttentionStream(LiteXModule):
             )
         )
         # Stage 1 (registered): the row word is on the memories; select per lane below.
-        s1_v, s1_sub, s1_first, s1_p, s1_i, s1_last, s1_unit = (Signal(), Signal(3), Signal(),
-            Signal(3), Signal(16), Signal(), Signal(16))
+        s1_v, s1_sub, s1_first, s1_p, s1_i, s1_last, s1_unit = (Signal(),
+            Signal(3, reset_less=True), Signal(reset_less=True), Signal(3, reset_less=True),
+            Signal(16, reset_less=True), Signal(reset_less=True), Signal(16, reset_less=True))
         self.sync += [
             s1_v.eq(issue), s1_sub.eq(is_i[:3]), s1_p.eq(is_p), s1_i.eq(is_i),
             s1_first.eq(Mux(mode, is_unit == 0, is_i == 0)),
@@ -298,12 +303,12 @@ class AttentionStream(LiteXModule):
         ]
         # Stage 2: operands registered per lane; the multiply issues.
         s2_v, s2_first, s2_p, s2_i, s2_last, s2_unit = (
-            dly(s1_v, 1, "s2v"), dly(s1_first, 1, "s2f"), dly(s1_p, 1, "s2p"),
+            dly(s1_v, 1, "s2v", False), dly(s1_first, 1, "s2f"), dly(s1_p, 1, "s2p"),
             dly(s1_i, 1, "s2i"), dly(s1_last, 1, "s2l"), dly(s1_unit, 1, "s2u"))
         # Add stage (after the multiply) and write-back stage (after the add).
-        a_v, a_first = dly(s2_v, Lm, "av"), dly(s2_first, Lm, "af")
+        a_v, a_first = dly(s2_v, Lm, "av", False), dly(s2_first, Lm, "af")
         a_p, a_i = dly(s2_p, Lm, "ap"), dly(s2_i, Lm, "ai")
-        w_v, w_p, w_i = dly(a_v, La, "wv"), dly(a_p, La, "wp"), dly(a_i, La, "wi")
+        w_v, w_p, w_i = dly(a_v, La, "wv", False), dly(a_p, La, "wp"), dly(a_i, La, "wi")
         w_last, w_unit = dly(s2_last, Lm + La, "wl"), dly(s2_unit, Lm + La, "wu")
         # mode 1 accumulator read, one clock ahead of the add stage (sync read).
         acc_rd_i = dly(s2_i, Lm - 1, "ari") if Lm > 1 else s2_i
@@ -315,10 +320,11 @@ class AttentionStream(LiteXModule):
             setattr(self.submodules, f"add{l}", adds[l])
 
         # Per-lane operand memory: q (mode 0, hd/8 words) or p (mode 1, ceil(T/8) words).
-        kv_of = [Signal(max=max(2, groups), name=f"attn_kv{l}") for l in range(L)]
-        acc0 = [[Signal(32, name=f"attn_acc{l}_{p}") for p in range(P)] for l in range(L)]
-        snap = [[[Signal(32, name=f"attn_snap{b}_{l}_{p}") for p in range(P)] for l in range(L)]
-                for b in range(2)]
+        kv_of = [Signal(max=max(2, groups), name=f"attn_kv{l}", reset_less=True) for l in range(L)]
+        acc0 = [[Signal(32, name=f"attn_acc{l}_{p}", reset_less=True) for p in range(P)]
+                for l in range(L)]
+        snap = [[[Signal(32, name=f"attn_snap{b}_{l}_{p}", reset_less=True) for p in range(P)]
+                 for l in range(L)] for b in range(2)]
         accmems = []
         capture = Signal()          # mode 0: a group's last add retires.
         cap_bank = Signal()
@@ -347,13 +353,13 @@ class AttentionStream(LiteXModule):
                 ow.we.eq(rsp_v & ~rsp_rec & (rsp_lane == l)),
                 orp.adr.eq(Mux(mode, is_unit[3:3 + pw], is_i[3:3 + pw])),
             ]
-            opnd = Signal(32, name=f"attn_opnd{l}")
-            opnd2 = Signal(32, name=f"attn_opnd2_{l}")
+            opnd = Signal(32, name=f"attn_opnd{l}", reset_less=True)
+            opnd2 = Signal(32, name=f"attn_opnd2_{l}", reset_less=True)
             self.sync += [
                 opnd.eq(fsel(orp.dat_r, Mux(mode, is_unit[:3], is_i[:3]))),
                 opnd2.eq(opnd),
             ]
-            row = Signal(32, name=f"attn_rowv{l}")
+            row = Signal(32, name=f"attn_rowv{l}", reset_less=True)
             self.sync += row.eq(fsel(Array([r.dat_r for r in rowrd])[kv_of[l]], s1_sub))
             am = Memory(256, hb_max, name=f"attn_acc{l}")
             aw = am.get_port(write_capable=True, we_granularity=32)
@@ -407,8 +413,10 @@ class AttentionStream(LiteXModule):
             )
         ]
         snap_sel = Array(Array(Array(snap[b][l]) for l in range(L)) for b in range(2))
-        h1_v, h1_a, h1_p, h1_adr = Signal(), Signal(32), Signal(3), Signal(adr_bits)
-        sc_ptr = Signal(adr_bits)   # Lane sc_l's beat of group sc_unit: dst + l*dstr + g.
+        h1_v, h1_a, h1_p, h1_adr = (Signal(), Signal(32, reset_less=True),
+            Signal(3, reset_less=True), Signal(adr_bits, reset_less=True))
+        # Lane sc_l's beat of group sc_unit: dst + l*dstr + g.
+        sc_ptr = Signal(adr_bits, reset_less=True)
         self.sync += [
             If(~sc_run & (caps > sc_unit),
                 sc_ptr.eq(dst + sc_unit),
@@ -420,15 +428,16 @@ class AttentionStream(LiteXModule):
             h1_p.eq(sc_p),
             h1_adr.eq(sc_ptr),
         ]
-        h2_v, h2_p, h2_adr = dly(h1_v, Lm, "h2v"), dly(h1_p, Lm, "h2p"), dly(h1_adr, Lm, "h2a")
-        pack = [Signal(32, name=f"attn_pack{i}") for i in range(7)]
+        h2_v, h2_p = dly(h1_v, Lm, "h2v", False), dly(h1_p, Lm, "h2p")
+        h2_adr = dly(h1_adr, Lm, "h2a")
+        pack = [Signal(32, name=f"attn_pack{i}", reset_less=True) for i in range(7)]
         self.comb += [mul_s.a.eq(h1_a), mul_s.b.eq(scale), mul_s.valid.eq(h1_v)]
         self.sync += If(h2_v, Case(h2_p, {i: pack[i].eq(mul_s.result) for i in range(7)}))
 
         # mode 1 output: drain the accumulators, hd/8 beats per lane -------------------------------
         dr_run, dr_l, dr_w, dr_v = Signal(), Signal(max=L + 1), Signal(max=hb_max + 1), Signal()
-        dr_adr, dr_lane = Signal(adr_bits), Signal(max=L)
-        dr_base = Signal(adr_bits)
+        dr_adr, dr_lane = Signal(adr_bits, reset_less=True), Signal(max=L, reset_less=True)
+        dr_base = Signal(adr_bits, reset_less=True)
         dr_done = Signal()
         v_retired = Signal(16)
         self.sync += If(self.start,

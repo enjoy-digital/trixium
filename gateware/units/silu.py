@@ -59,6 +59,7 @@ from litex.gen import LiteXModule
 
 from litex.soc.interconnect import stream
 
+from gateware.core.datapath import reset_less_registers
 from gateware.units.fp32 import _lzc
 
 # Constants ----------------------------------------------------------------------------------------
@@ -395,6 +396,8 @@ class SiluMulKernel(LiteXModule):
         # The input gate travels with its result: a client writes it back unchanged for a
         # fixup lane, so the CPU can recompute that element from the original inputs.
         self.comb += [source.r.eq(out_r), source.fixup.eq(out_fix), source.g.eq(g[n])]
+        # A pure pipeline: every register but the valids is datapath (no reset, out of `clear`).
+        reset_less_registers(self, keep=valid)
 
 # SiLU Scratchpad ----------------------------------------------------------------------------------
 
@@ -441,10 +444,11 @@ class SiluScratchpad(LiteXModule):
         # Command capture and validation.
         IDLE, VALIDATE, LOAD, RUN, FINISH, FAILED = range(6)
         state = Signal(3, reset=IDLE)
-        cap = {name: Signal(width) for name, width in SILU_COMMAND}
-        beats = Signal(14)                         # data beats of each vector
-        words = Signal(12)                         # bitmap words
-        fix_beats = Signal(10)
+        # The command and its sizes are reset-less: loaded on accept, read from VALIDATE on.
+        cap = {name: Signal(width, reset_less=True) for name, width in SILU_COMMAND}
+        beats = Signal(14, reset_less=True)        # data beats of each vector
+        words = Signal(12, reset_less=True)        # bitmap words
+        fix_beats = Signal(10, reset_less=True)
         ends = {name: Signal(64) for name in ("src_g", "src_m", "dst", "fixmap")}
         geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
 
@@ -459,7 +463,7 @@ class SiluScratchpad(LiteXModule):
         unit_m = cap["unit_m"]
         perm = cap["perm_a"] > 1
         perm_elems = Signal(40)
-        step_a = Signal(24)
+        step_a = Signal(24, reset_less=True)
         self.comb += perm_elems.eq(cap["seg_beats"]*cap["perm_a"]*cap["perm_b"]*8)
         self.comb += [
             ends["src_g"].eq(cap["src_g"] + Mux(load, C(LOAD_BEATS*32, 17), beats << 5)),
@@ -492,8 +496,8 @@ class SiluScratchpad(LiteXModule):
         self.pairs = pairs
         issued = Signal(14)                        # beats (pairs) requested
         rd_second = Signal()
-        rd_pending, rd_was_m = Signal(), Signal()
-        g_hold = Signal(256)
+        rd_pending, rd_was_m = Signal(), Signal(reset_less=True) # (qualified by rd_pending)
+        g_hold = Signal(256, reset_less=True)
         in_flight = Signal(3)                      # pairs requested but not yet in the FIFO
         can_issue = Signal()
         run_active = Signal()
@@ -512,7 +516,7 @@ class SiluScratchpad(LiteXModule):
         # LOAD: one beat at a time, eight table words out of it, then the next beat.
         ld_beat = Signal(11)
         ld_lane = Signal(4)
-        ld_data = Signal(256)
+        ld_data = Signal(256, reset_less=True)
         ld_have = Signal()
         ld_req = Signal()
         self.comb += ld_req.eq((state == LOAD) & ~ld_have & ~rd_pending & (ld_beat < LOAD_BEATS))
@@ -585,15 +589,17 @@ class SiluScratchpad(LiteXModule):
         # Collect results into output beats and bitmap words ---------------------------------------
         out_lane = Signal(3)
         got = Signal(17)                           # results collected
-        acc = Signal(256)
-        acc_we = Signal(8)
+        # The beat/word accumulators are cleared by `clear` (held in IDLE), the pending payloads
+        # are qualified by beat_full / word_full: all reset-less.
+        acc = Signal(256, reset_less=True)
+        acc_we = Signal(8, reset_less=True)
         beat_full = Signal()                       # an output beat waits for its write
-        beat_adr = Signal(13)
-        beat_dat, beat_we = Signal(256), Signal(8)
-        bits = Signal(32)
+        beat_adr = Signal(13, reset_less=True)
+        beat_dat, beat_we = Signal(256, reset_less=True), Signal(8, reset_less=True)
+        bits = Signal(32, reset_less=True)
         word_full = Signal()                       # a bitmap word waits for its write
-        word_idx = Signal(12)
-        word_val = Signal(32)
+        word_idx = Signal(12, reset_less=True)
+        word_val = Signal(32, reset_less=True)
         written_beats = Signal(14)
         written_words = Signal(12)
         take = Signal()
@@ -638,7 +644,7 @@ class SiluScratchpad(LiteXModule):
         # offset of segment s // a, `in_seg` the beat within the segment, `s_mod` = s % a.
         in_seg = Signal(16)
         s_mod = Signal(8)
-        seg_off, div_off = Signal(24), Signal(24)
+        seg_off, div_off = Signal(24, reset_less=True), Signal(24, reset_less=True) # (by clear)
         out_off = Signal(24)
         self.comb += out_off.eq(Mux(perm, seg_off + in_seg, closed_beats))
         self.sync += If(clear,

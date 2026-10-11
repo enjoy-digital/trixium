@@ -27,6 +27,8 @@ from migen import *
 
 from litex.gen import LiteXModule
 
+from gateware.core.datapath import reset_less_registers
+
 # Constants ----------------------------------------------------------------------------------------
 
 CANONICAL_NAN = 0x7FC00000
@@ -110,7 +112,7 @@ class _Unpack(LiteXModule):
 
 class FP32Mul(LiteXModule):
     """r = RNE(a * b). Register stages advance on `ce`; results are LATENCY enabled clocks
-    behind their operands."""
+    behind their operands. No reset: the caller tracks validity."""
     LATENCY = 5
 
     def __init__(self):
@@ -178,6 +180,7 @@ class FP32Mul(LiteXModule):
         self.pack = pack = _RoundPack(s4_sign, s4_q[:24], s4_g, s4_st,
                                        s4_esum, s4_s, bias=-150)
         self.sync += If(self.ce, self.r.eq(Mux(s4_special, s4_sval, pack.word)))
+        reset_less_registers(self)
 
 # Round Pack ---------------------------------------------------------------------------------------
 
@@ -212,7 +215,8 @@ class _RoundPack(LiteXModule):
 # FP32 Add -----------------------------------------------------------------------------------------
 
 class FP32Add(LiteXModule):
-    """r = RNE(a + b), IEEE signed-zero rules (x + -x = +0; -0 + -0 = -0)."""
+    """r = RNE(a + b), IEEE signed-zero rules (x + -x = +0; -0 + -0 = -0). No reset: the caller
+    tracks validity."""
     LATENCY = 5
 
     def __init__(self):
@@ -300,6 +304,7 @@ class FP32Add(LiteXModule):
                                        s4_e, C(0, 2), bias=0)
         self.sync += If(self.ce, self.r.eq(
             Mux(s4_special, s4_sval, Mux(s4_zero, Cat(C(0, 31), s4_zsign), pack.word))))
+        reset_less_registers(self)
 
 # FP32 Div/Sqrt ------------------------------------------------------------------------------------
 
@@ -317,9 +322,11 @@ class FP32DivSqrt(LiteXModule):
     """
 
     def __init__(self):
-        self.a, self.b, self.op = Signal(32), Signal(32), Signal()
+        # Operands: sampled with start (reset-less when a user registers them).
+        self.a, self.b = Signal(32, reset_less=True), Signal(32, reset_less=True)
+        self.op = Signal(reset_less=True)
         self.start, self.busy, self.done = Signal(), Signal(), Signal()
-        self.r = Signal(32)
+        self.r = Signal(32, reset_less=True)
 
         # # #
 
@@ -338,15 +345,16 @@ class FP32DivSqrt(LiteXModule):
             e_sq.eq(ex_a - 127),
         ]
 
-        # Iteration state.
-        op, sign, special = Signal(), Signal(), Signal()
-        sval = Signal(32)
-        rem = Signal(30)
-        den = Signal(24)
-        quo = Signal(27)
-        rad = Signal(52)
+        # Iteration state: the operands are loaded at start (reset-less), the state and the
+        # step count keep their reset.
+        op, sign, special = [Signal(reset_less=True) for _ in range(3)]
+        sval = Signal(32, reset_less=True)
+        rem = Signal(30, reset_less=True)
+        den = Signal(24, reset_less=True)
+        quo = Signal(27, reset_less=True)
+        rad = Signal(52, reset_less=True)
         cnt = Signal(5)
-        l0 = Signal((12, True))
+        l0 = Signal((12, True), reset_less=True)
         IDLE, RUN, PACK, PACK2 = range(4)
         state = Signal(2)
         self.comb += self.busy.eq(state != IDLE)
@@ -392,7 +400,8 @@ class FP32DivSqrt(LiteXModule):
         self.comb += shift_used.eq(Mux(s_sel < 0, s_sel, rsh))
         # The count/shift and the round/pack are split over two clocks (PACK, PACK2) for timing:
         # as one they are ~26 logic levels.
-        r_q, r_g, r_st, r_s = Signal(24), Signal(), Signal(), Signal((12, True))
+        r_q, r_g, r_st, r_s = (Signal(24, reset_less=True), Signal(reset_less=True),
+                               Signal(reset_less=True), Signal((12, True), reset_less=True))
         self.pack = pack = _RoundPack(sign, r_q, r_g, r_st, l0, r_s, bias=150)
 
         # Control.
@@ -509,7 +518,10 @@ class FP32ArgmaxTracker(LiteXModule):
 
         count = Signal(32)
         # S0: register the beat with its base index and whether it starts the stream.
-        s0_v, s0_d, s0_m, s0_base, s0_first = Signal(), Signal(256), Signal(8), Signal(32), Signal()
+        # The payloads are reset-less, the valids (and count/started/frozen) keep their reset.
+        s0_v = Signal()
+        s0_d, s0_m, s0_base, s0_first = (Signal(256, reset_less=True), Signal(8, reset_less=True),
+                                         Signal(32, reset_less=True), Signal(reset_less=True))
         started = Signal()
         active = Signal(4)                     # lanes in this beat (the mask is a prefix)
         self.comb += active.eq(sum(self.mask[j] for j in range(8)))
@@ -532,36 +544,41 @@ class FP32ArgmaxTracker(LiteXModule):
         for j in range(8):
             x = s0_d[32*j:32*j + 32]
             cands.append((s0_m[j] & ~nan(x), key(x), x, C(j, 3)))
+        def node():
+            return (Signal(reset_less=True), Signal(32, reset_less=True),
+                    Signal(32, reset_less=True), Signal(3, reset_less=True))
         s1 = []
         for a, b in zip(cands[0::2], cands[1::2]):
-            v, k, x, l = Signal(), Signal(32), Signal(32), Signal(3)
+            v, k, x, l = node()
             take_a = a[0] & (~b[0] | (a[1] >= b[1]))
             self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])),
                           x.eq(Mux(take_a, a[2], b[2])), l.eq(Mux(take_a, a[3], b[3]))]
             s1.append((v, k, x, l))
-        s1_v, s1_base, s1_first, s1_nan0 = Signal(), Signal(32), Signal(), Signal()
-        s1_x0 = Signal(32)
+        s1_v, s1_base, s1_first, s1_nan0 = (Signal(), Signal(32, reset_less=True),
+                                            Signal(reset_less=True), Signal(reset_less=True))
+        s1_x0 = Signal(32, reset_less=True)
         self.sync += [s1_v.eq(s0_v & ~self.clear), s1_base.eq(s0_base), s1_first.eq(s0_first),
                       s1_nan0.eq(nan(s0_d[:32])), s1_x0.eq(s0_d[:32])]
         level, pipe = s1, [(s1_v, s1_base, s1_first, s1_nan0, s1_x0)]
         for depth in (2, 3):
             nxt = []
             for a, b in zip(level[0::2], level[1::2]):
-                v, k, x, l = Signal(), Signal(32), Signal(32), Signal(3)
+                v, k, x, l = node()
                 take_a = a[0] & (~b[0] | (a[1] >= b[1]))
                 self.sync += [v.eq(a[0] | b[0]), k.eq(Mux(take_a, a[1], b[1])),
                               x.eq(Mux(take_a, a[2], b[2])), l.eq(Mux(take_a, a[3], b[3]))]
                 nxt.append((v, k, x, l))
             level = nxt
             pv, pb, pf, pn, px = pipe[-1]
-            q = (Signal(), Signal(32), Signal(), Signal(), Signal(32))
+            q = (Signal(), Signal(32, reset_less=True), Signal(reset_less=True),
+                 Signal(reset_less=True), Signal(32, reset_less=True))
             self.sync += [q[0].eq(pv & ~self.clear), q[1].eq(pb), q[2].eq(pf), q[3].eq(pn),
                           q[4].eq(px)]
             pipe.append(q)
         (wv, wk, wx, wl), = level
         bv, bbase, bfirst, bnan0, bx0 = pipe[-1]
         # Combine with the running best.
-        frozen, rkey = Signal(), Signal(32)
+        frozen, rkey = Signal(), Signal(32, reset_less=True)
         self.sync += If(self.clear,
             self.best_valid.eq(0), frozen.eq(0),
         ).Elif(bv,

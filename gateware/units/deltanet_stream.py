@@ -146,9 +146,10 @@ class DeltaNetStream(LiteXModule):
 
         # # #
 
-        def dly(value, n, name):
+        def dly(value, n, name, reset_less=True):
+            # A datapath delay line by default; the valids pass reset_less=False.
             for i in range(n):
-                r = Signal.like(value, name=f"{name}_d{i}")
+                r = Signal.like(value, name=f"{name}_d{i}", reset_less=reset_less)
                 self.sync += r.eq(value)
                 value = r
             return value
@@ -157,8 +158,8 @@ class DeltaNetStream(LiteXModule):
             return Array([word[32*i:32*(i + 1)] for i in range(8)])[index]
 
         run   = Signal()
-        heads = Signal(16)
-        table = Signal(adr_bits)
+        heads = Signal(16, reset_less=True)       # Latched with start.
+        table = Signal(adr_bits, reset_less=True)
         dat   = self.sp_rd_dat
 
         # Parameters: `slots` heads resident (loading, P1, P2/delta, scale+write).
@@ -171,10 +172,10 @@ class DeltaNetStream(LiteXModule):
         k_r2 = kmem.get_port(async_read=True)
         v_r  = vmem.get_port(async_read=True)
         self.specials += qmem, kmem, vmem, q_w, k_w, v_w, q_r, k_r1, k_r2, v_r
-        dec = Array(Signal(32, name=f"dns_decay{s}") for s in range(slots))
-        bet = Array(Signal(32, name=f"dns_beta{s}") for s in range(slots))
-        scl = Array(Signal(32, name=f"dns_scale{s}") for s in range(slots))
-        oad = Array(Signal(adr_bits, name=f"dns_out{s}") for s in range(slots))
+        dec = Array(Signal(32, name=f"dns_decay{s}", reset_less=True) for s in range(slots))
+        bet = Array(Signal(32, name=f"dns_beta{s}", reset_less=True) for s in range(slots))
+        scl = Array(Signal(32, name=f"dns_scale{s}", reset_less=True) for s in range(slots))
+        oad = Array(Signal(adr_bits, name=f"dns_out{s}", reset_less=True) for s in range(slots))
 
         # Head counters (all reset by start).
         ld_head  = Signal(16)   # Heads whose parameters are loaded.
@@ -188,14 +189,14 @@ class DeltaNetStream(LiteXModule):
         retired  = Signal(16)   # Heads whose outputs are in the scratchpad.
         em_cnt   = Signal(16)   # State groups emitted to the sources (all lanes).
 
-        zero_r = Signal()
+        zero_r = Signal(reset_less=True)
         self.sync += If(self.start, zero_r.eq(self.zero))
 
         # Loader: one registered read request (address from a flop, granted by sp_rd_ok),
         # a record then q, k, v beats per head; responses one clock after the grant.
         nvec = 2*G + VB
         ld_idx = Signal(max=nvec + 1)
-        ld_qb, ld_kb, ld_vb = Signal(adr_bits), Signal(adr_bits), Signal(adr_bits)
+        ld_qb, ld_kb, ld_vb = [Signal(adr_bits, reset_less=True) for _ in range(3)]
         ld_st = Signal(2)       # 0 idle, 1 record in flight, 2 vectors, 3 last vector in flight
         ld_slot = Signal(sb)
         self.comb += ld_slot.eq(ld_head[:sb])
@@ -203,9 +204,12 @@ class DeltaNetStream(LiteXModule):
         self.comb += If(ld_idx < G, vk.eq(0), voff.eq(ld_idx)
             ).Elif(ld_idx < 2*G, vk.eq(1), voff.eq(ld_idx - G)
             ).Else(vk.eq(2), voff.eq(ld_idx - 2*G))
-        rq_v, rq_adr, rq_kind, rq_off, rq_last = (Signal(), Signal(adr_bits), Signal(2),
-                                                  Signal(max(gb, vbb)), Signal())
-        rsp_v, rsp_kind, rsp_off, rsp_last = Signal(), Signal(2), Signal(max(gb, vbb)), Signal()
+        # The request/response payloads are reset-less: qualified by rq_v / rsp_v.
+        rq_v, rq_adr, rq_kind, rq_off, rq_last = (Signal(), Signal(adr_bits, reset_less=True),
+            Signal(2, reset_less=True), Signal(max(gb, vbb), reset_less=True),
+            Signal(reset_less=True))
+        rsp_v, rsp_kind, rsp_off, rsp_last = (Signal(), Signal(2, reset_less=True),
+            Signal(max(gb, vbb), reset_less=True), Signal(reset_less=True))
         taken, free = Signal(), Signal()
         self.comb += [
             taken.eq(rq_v & self.sp_rd_ok),
@@ -331,10 +335,11 @@ class DeltaNetStream(LiteXModule):
                 )
             )
         )
-        s1_v, s1_first, s1_last = Signal(), Signal(), Signal()
-        s1_r, s1_jj = Signal(rb), Signal(3)
-        s1_mda = Signal(rb + 3 + gb + 2)
-        s1_k, s1_dec = Signal(32), Signal(32)
+        # Stage 1: the valid keeps its reset, the payload (tags included) is reset-less.
+        s1_v, s1_first, s1_last = Signal(), Signal(reset_less=True), Signal(reset_less=True)
+        s1_r, s1_jj = Signal(rb, reset_less=True), Signal(3, reset_less=True)
+        s1_mda = Signal(rb + 3 + gb + 2, reset_less=True)
+        s1_k, s1_dec = Signal(32, reset_less=True), Signal(32, reset_less=True)
         self.sync += [
             s1_v.eq(p1_issue),
             s1_first.eq((p1_g == 0) & (p1_jj == 0)),
@@ -346,23 +351,31 @@ class DeltaNetStream(LiteXModule):
         ]
         # u: one register after the input buffer's float select (memory -> 8:1 mux ->
         # multiplier is not one clock at speed).
-        u_v, u_dec = dly(s1_v, 1, "uv"), dly(s1_dec, 1, "udec")
-        t2_v, t2_mda, t2_k = (dly(s1_v, Lm + 1, "t2v"), dly(s1_mda, Lm + 1, "t2mda"),
+        u_v, u_dec = dly(s1_v, 1, "uv", False), dly(s1_dec, 1, "udec")
+        t2_v, t2_mda, t2_k = (dly(s1_v, Lm + 1, "t2v", False), dly(s1_mda, Lm + 1, "t2mda"),
                               dly(s1_k, Lm + 1, "t2k"))
         t2_first, t2_last, t2_r = (dly(s1_first, Lm + 1, "t2f"), dly(s1_last, Lm + 1, "t2l"),
                                    dly(s1_r, Lm + 1, "t2r"))
-        t3_v, t3_first = dly(t2_v, Lm, "t3v"), dly(t2_first, Lm, "t3f")
+        t3_v, t3_first = dly(t2_v, Lm, "t3v", False), dly(t2_first, Lm, "t3f")
         t3_last, t3_r = dly(t2_last, Lm, "t3l"), dly(t2_r, Lm, "t3r")
-        t4_v, t4_last, t4_r = dly(t3_v, La, "t4v"), dly(t3_last, La, "t4l"), dly(t3_r, La, "t4r")
+        t4_v, t4_last, t4_r = (dly(t3_v, La, "t4v", False), dly(t3_last, La, "t4l"),
+                               dly(t3_r, La, "t4r"))
         p1_capture = Signal()
         self.comb += p1_capture.eq(t4_v & t4_last)
 
         # Per-lane accumulators and the snapshot the shared delta pipe drains.
-        dacc = [[Signal(32, name=f"dns_d{l}_{r}") for r in range(R)] for l in range(L)]
-        oacc = [[Signal(32, name=f"dns_o{l}_{r}") for r in range(R)] for l in range(L)]
-        dsnap = [Signal(32, name=f"dns_dsnap{i}") for i in range(rows)]     # i = r*L + l
-        osnap = [[Signal(32, name=f"dns_osnap{b}_{i}") for i in range(rows)] for b in range(2)]
-        dreg  = [[Signal(32, name=f"dns_delta{b}_{i}") for i in range(rows)] for b in range(2)]
+        # Reset-less: the accumulators start from +0 on a head's first column (t3_first,
+        # g4_first), the snapshots and delta registers are written before they are read.
+        dacc = [[Signal(32, name=f"dns_d{l}_{r}", reset_less=True) for r in range(R)]
+                for l in range(L)]
+        oacc = [[Signal(32, name=f"dns_o{l}_{r}", reset_less=True) for r in range(R)]
+                for l in range(L)]
+        dsnap = [Signal(32, name=f"dns_dsnap{i}", reset_less=True) # i = r*L + l
+                 for i in range(rows)]
+        osnap = [[Signal(32, name=f"dns_osnap{b}_{i}", reset_less=True) for i in range(rows)]
+                 for b in range(2)]
+        dreg  = [[Signal(32, name=f"dns_delta{b}_{i}", reset_less=True) for i in range(rows)]
+                 for b in range(2)]
 
         mdmems = []
         for l in range(L):
@@ -372,7 +385,7 @@ class DeltaNetStream(LiteXModule):
             self.specials += md, md_w, md_r
             mdmems.append(md_r)
             da = Array(dacc[l])
-            u_m = Signal(32, name=f"dns_um{l}")
+            u_m = Signal(32, name=f"dns_um{l}", reset_less=True)
             self.sync += u_m.eq(Mux(zero_r, 0, fsel(inbufs[l].dat_r, s1_jj)))
             self.comb += [
                 mul_dec[l].a.eq(u_m),
@@ -415,8 +428,9 @@ class DeltaNetStream(LiteXModule):
                 If(dl_idx == rows - 1, dl_run.eq(0), dl_head.eq(dl_head + 1)),
             )
         )
-        e1_v, e1_a, e1_b, e1_last = Signal(), Signal(32), Signal(32), Signal()
-        e1_slot, e1_bank = Signal(sb), Signal()
+        e1_v, e1_a, e1_b, e1_last = (Signal(), Signal(32, reset_less=True),
+            Signal(32, reset_less=True), Signal(reset_less=True))
+        e1_slot, e1_bank = Signal(sb, reset_less=True), Signal(reset_less=True)
         self.sync += [
             e1_v.eq(dl_issue),
             e1_a.eq(fsel(v_r.dat_r, dl_idx[:3])),
@@ -424,9 +438,9 @@ class DeltaNetStream(LiteXModule):
             e1_last.eq(dl_idx == rows - 1),
             e1_slot.eq(dl_slot), e1_bank.eq(dl_head[0]),
         ]
-        e2_v, e2_last = dly(e1_v, La, "e2v"), dly(e1_last, La, "e2l")
+        e2_v, e2_last = dly(e1_v, La, "e2v", False), dly(e1_last, La, "e2l")
         e2_slot, e2_bank = dly(e1_slot, La, "e2s"), dly(e1_bank, La, "e2b")
-        e3_v, e3_last, e3_bank = (dly(e2_v, Lm, "e3v"), dly(e2_last, Lm, "e3l"),
+        e3_v, e3_last, e3_bank = (dly(e2_v, Lm, "e3v", False), dly(e2_last, Lm, "e3l"),
                                   dly(e2_bank, Lm, "e3b"))
         self.comb += [
             add_v.a.eq(e1_a), add_v.b.eq(e1_b), add_v.valid.eq(e1_v),
@@ -480,9 +494,11 @@ class DeltaNetStream(LiteXModule):
                 )
             )
         )
-        f1_v, f1_first, f1_last, f1_glast = Signal(), Signal(), Signal(), Signal()
-        f1_r, f1_jj, f1_half, f1_bank = Signal(rb), Signal(3), Signal(), Signal()
-        f1_k, f1_q = Signal(32), Signal(32)
+        f1_v, f1_first, f1_last, f1_glast = (Signal(), Signal(reset_less=True),
+            Signal(reset_less=True), Signal(reset_less=True))
+        f1_r, f1_jj, f1_half, f1_bank = (Signal(rb, reset_less=True), Signal(3, reset_less=True),
+            Signal(reset_less=True), Signal(reset_less=True))
+        f1_k, f1_q = Signal(32, reset_less=True), Signal(32, reset_less=True)
         self.sync += [
             f1_v.eq(p2_issue),
             f1_first.eq((p2_g == 0) & (p2_jj == 0)),
@@ -492,18 +508,18 @@ class DeltaNetStream(LiteXModule):
             f1_k.eq(fsel(k_r2.dat_r, p2_jj)),
             f1_q.eq(fsel(q_r.dat_r, p2_jj)),
         ]
-        g2_v = dly(f1_v, Lm, "g2v")
-        g3_v, g3_r, g3_jj = (dly(g2_v, La, "g3v"), dly(f1_r, Lm + La, "g3r"),
+        g2_v = dly(f1_v, Lm, "g2v", False)
+        g3_v, g3_r, g3_jj = (dly(g2_v, La, "g3v", False), dly(f1_r, Lm + La, "g3r"),
                              dly(f1_jj, Lm + La, "g3jj"))
         g3_half, g3_glast = dly(f1_half, Lm + La, "g3h"), dly(f1_glast, Lm + La, "g3gl")
         g3_q = dly(f1_q, Lm + La, "g3q")
-        g4_v, g4_first, g4_r = (dly(g3_v, Lm, "g4v"), dly(f1_first, 2*Lm + La, "g4f"),
+        g4_v, g4_first, g4_r = (dly(g3_v, Lm, "g4v", False), dly(f1_first, 2*Lm + La, "g4f"),
                                 dly(g3_r, Lm, "g4r"))
         assert La >= 1
-        g5_ve, g5_r = dly(g4_v, La - 1, "g5ve"), dly(g4_r, La, "g5r")
+        g5_ve, g5_r = dly(g4_v, La - 1, "g5ve", False), dly(g4_r, La, "g5r")
         g5_laste = dly(f1_last, 2*Lm + 2*La - 1, "g5le")
         g5_banke = dly(f1_bank, 2*Lm + 2*La - 1, "g5be")
-        g5_v, g5_last, g5_bank = (dly(g5_ve, 1, "g5v"), dly(g5_laste, 1, "g5l"),
+        g5_v, g5_last, g5_bank = (dly(g5_ve, 1, "g5v", False), dly(g5_laste, 1, "g5l"),
                                   dly(g5_banke, 1, "g5b"))
         p2_capture = Signal()
         self.comb += p2_capture.eq(g5_v & g5_last)
@@ -519,7 +535,7 @@ class DeltaNetStream(LiteXModule):
             ob_r = ob.get_port()
             self.specials += ob, ob_w, ob_r
             outbufs.append(ob_r)
-            f1_delta = Signal(32, name=f"dns_f1delta{l}")
+            f1_delta = Signal(32, name=f"dns_f1delta{l}", reset_less=True)
             self.sync += f1_delta.eq(Mux(p2_head[0],
                 Array(dreg[1][r*L + l] for r in range(R))[p2_r],
                 Array(dreg[0][r*L + l] for r in range(R))[p2_r]))
@@ -607,8 +623,9 @@ class DeltaNetStream(LiteXModule):
             sc_idx.eq(sc_idx + 1),
             If(sc_idx == rows - 1, sc_run.eq(0), sc_head.eq(sc_head + 1)),
         )
-        h1_v, h1_a, h1_b, h1_i, h1_adr, h1_last = (Signal(), Signal(32), Signal(32), Signal(3),
-                                                  Signal(adr_bits), Signal())
+        h1_v, h1_a, h1_b, h1_i, h1_adr, h1_last = (Signal(), Signal(32, reset_less=True),
+            Signal(32, reset_less=True), Signal(3, reset_less=True),
+            Signal(adr_bits, reset_less=True), Signal(reset_less=True))
         self.sync += [
             h1_v.eq(sc_issue),
             h1_a.eq(Mux(sc_head[0], osnap[1][0], osnap[0][0])),
@@ -617,10 +634,10 @@ class DeltaNetStream(LiteXModule):
             h1_adr.eq(oad[sc_slot] + (sc_idx >> 3)),
             h1_last.eq(sc_idx == rows - 1),
         ]
-        h2_v, h2_i = dly(h1_v, Lm, "h2v"), dly(h1_i, Lm, "h2i")
+        h2_v, h2_i = dly(h1_v, Lm, "h2v", False), dly(h1_i, Lm, "h2i")
         h2_adr, h2_last = dly(h1_adr, Lm, "h2a"), dly(h1_last, Lm, "h2l")
         self.comb += [mul_s.a.eq(h1_a), mul_s.b.eq(h1_b), mul_s.valid.eq(h1_v)]
-        pack = [Signal(32, name=f"dns_pack{i}") for i in range(7)]
+        pack = [Signal(32, name=f"dns_pack{i}", reset_less=True) for i in range(7)]
         self.sync += If(h2_v, Case(h2_i, {i: pack[i].eq(mul_s.result) for i in range(7)}))
         self.comb += [
             ofifo.sink.valid.eq(h2_v & (h2_i == 7)),

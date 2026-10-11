@@ -22,6 +22,8 @@ from litex.gen import LiteXModule
 
 from litex.soc.interconnect import stream
 
+from gateware.core.datapath import reset_less_registers
+
 # Integer To Q8 ------------------------------------------------------------------------------------
 
 class IntegerToQ8(LiteXModule):
@@ -97,6 +99,8 @@ class IntegerToQ8(LiteXModule):
             If(ready[1], valid[1].eq(valid[0]), If(valid[0], *shift)),
             If(ready[2], valid[2].eq(valid[1]), If(valid[1], *finish)),
         )
+        # An elastic pipeline: every register but the stage valids is datapath (no reset).
+        reset_less_registers(self, keep=valid)
 
 # FP32 Absmax Word ---------------------------------------------------------------------------------
 
@@ -146,6 +150,8 @@ class Fp32AbsmaxWord(LiteXModule):
             self.sync += If(self.cancel, valid[level].eq(0)).Elif(ready[level],
                 valid[level].eq(previous_valid), If(previous_valid, *updates))
             values, errors = nxt_values, nxt_errors
+        # An elastic pipeline: every register but the stage valids is datapath (no reset).
+        reset_less_registers(self, keep=valid)
         self.comb += [self.sink.ready.eq(ready[0] & ~self.cancel),
                       self.source.valid.eq(valid[-1] & ~self.cancel),
                       self.source.absmax.eq(values[0]), self.source.error.eq(errors[0]),
@@ -243,6 +249,8 @@ class Fp32ToQ8(LiteXModule):
             If(ready[1], valid[1].eq(valid[0]), If(valid[0], *shift)),
             If(ready[2], valid[2].eq(valid[1]), If(valid[1], *finish)),
         )
+        # An elastic pipeline: every register but the stage valids is datapath (no reset).
+        reset_less_registers(self, keep=valid)
 
 # Activation Scratchpad ----------------------------------------------------------------------------
 
@@ -312,9 +320,10 @@ class ActivationScratchpad(LiteXModule):
          NEXT, FINISH, FAILED, META_E_REQ, META_E_CAPTURE, META_A_REQ, META_A_CAPTURE,
          META_CHECK, GLOBAL_CHOOSE, CACHE_READ, CACHE_CAPTURE, RESULT) = range(20)
         state = Signal(5, reset=IDLE)
-        captured = {name: Signal(width) for name, width in ACTIVATION_COMMAND}
+        # The command and its sizes are reset-less: loaded on accept, read from VALIDATE on.
+        captured = {name: Signal(width, reset_less=True) for name, width in ACTIVATION_COMMAND}
         rotation = captured["requantize"]
-        total = Signal(32)
+        total = Signal(32, reset_less=True)
         ends = {name: Signal(64)
                 for name in ("src", "dst", "exponents", "maxima", "result_exponent")}
         cache_depth = max(1, scratchpad_size//4096)
@@ -361,25 +370,26 @@ class ActivationScratchpad(LiteXModule):
 
         # Datapath: scratchpad reads -> scan/quantize -> packed output beats and exponents.
         block = Signal(16)
-        src_base, dst_base = Signal(13), Signal(13)
+        src_base, dst_base = Signal(13, reset_less=True), Signal(13, reset_less=True)
         issued, output_index = Signal(14), Signal(14)
         read_count = Signal(13)
-        read_pending, read_first, read_last = Signal(), Signal(), Signal()
+        read_pending = Signal()
+        read_first, read_last = Signal(reset_less=True), Signal(reset_less=True) # (read_pending)
         in_scan, in_convert, clear = Signal(), Signal(), Signal()
-        packed_word = Signal(256)
+        packed_word = Signal(256, reset_less=True)
         packed_index = Signal(2)
-        packed_pending, packed_last = Signal(), Signal()
+        packed_pending, packed_last = Signal(), Signal(reset_less=True) # (packed_pending)
         response_pop, write_word, convert_error = Signal(), Signal(), Signal()
         reserved = Signal(3)
         maximum = Signal(31)
         wide_exponent = Signal((32, True))
-        metadata_e = Signal((32, True))
-        metadata_a = Signal(32)
+        metadata_e = Signal((32, True), reset_less=True)
+        metadata_a = Signal(32, reset_less=True)
         metadata_length = Signal(6)
         metadata_candidate = Signal((34, True))
         metadata_bad, global_nonzero = Signal(), Signal()
-        input_exponent = Signal((10, True))
-        declared_maximum = Signal(18)
+        input_exponent = Signal((10, True), reset_less=True)
+        declared_maximum = Signal(18, reset_less=True)
         seen_equal = Signal()
         raw_bad, raw_equal = Signal(), Signal()
         raw_bad_lanes, raw_equal_lanes = Signal(8), Signal(8)

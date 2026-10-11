@@ -20,6 +20,7 @@ from litex.gen import LiteXModule
 
 from litex.soc.interconnect import stream
 
+from gateware.core.datapath import reset_less_registers
 from gateware.units.fp32 import FP32ArgmaxTracker
 
 # I32 To FP32 Scaled -------------------------------------------------------------------------------
@@ -139,6 +140,8 @@ class I32ToFp32Scaled(LiteXModule):
                 If(self.sink.valid if stage == 0 else valid[stage - 1], *updates[stage]))
             for stage in range(4)
         ])
+        # An elastic pipeline: every register but the stage valids is datapath (no reset).
+        reset_less_registers(self, keep=valid)
 
 # Projection Restore Scratchpad --------------------------------------------------------------------
 
@@ -181,7 +184,7 @@ class ProjectionRestoreScratchpad(LiteXModule):
         self.cancel, self.busy, self.done = Signal(), Signal(), Signal()
         self.error = Signal(8)
         self.read_beats, self.output_beats = Signal(32), Signal(32)
-        self.exponent = Signal((10, True))
+        self.exponent = Signal((10, True), reset_less=True) # Set in META_CHECK, before RUN.
 
         # Scratchpad client ports.
         self.sp_rd_req, self.sp_wr_req, self.sp_wr_gnt = Signal(), Signal(), Signal()
@@ -203,8 +206,9 @@ class ProjectionRestoreScratchpad(LiteXModule):
         # Command capture and validation.
         IDLE, VALIDATE, META_REQ, META_CAPTURE, META_CHECK, RUN, DRAIN, FINISH, FAILED = range(9)
         state = Signal(4, reset=IDLE)
-        captured = {name: Signal(width) for name, width in RESTORE_COMMAND}
-        count = Signal(14)
+        # The command and its beat count are reset-less: loaded on accept, read from VALIDATE on.
+        captured = {name: Signal(width, reset_less=True) for name, width in RESTORE_COMMAND}
+        count = Signal(14, reset_less=True)
         issued, retired = Signal(14), Signal(14)
         ends = {name: Signal(64) for name in ("src", "dst", "exponents")}
         geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
@@ -229,7 +233,7 @@ class ProjectionRestoreScratchpad(LiteXModule):
                 (captured["protect_start"] < ends["dst"])),
         ]
 
-        metadata = Signal((32, True))
+        metadata = Signal((32, True), reset_less=True)
         adjustment = Signal((32, True))
         combined = Signal((33, True))
         exponent_bad = Signal()
@@ -237,7 +241,8 @@ class ProjectionRestoreScratchpad(LiteXModule):
                       exponent_bad.eq((combined < -149) | (combined > 127))]
 
         # Datapath: scratchpad reads -> response FIFO -> converter -> masked writes + argmax.
-        active, clear, read_pending, read_first, read_last = (Signal() for _ in range(5))
+        active, clear, read_pending = Signal(), Signal(), Signal()
+        read_first, read_last = Signal(reset_less=True), Signal(reset_less=True) # (read_pending)
         pop, credit_error, conversion_error, overflow, failed, written = (
             Signal() for _ in range(6))
         reserved = Signal(3)

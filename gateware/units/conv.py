@@ -48,10 +48,11 @@ OP_CONV, OP_ADD = 0, 1
 
 # Helpers ------------------------------------------------------------------------------------------
 
-def _delay(module, value, cycles, name):
+def _delay(module, value, cycles, name, reset_less=True):
+    # A datapath delay line by default; the valids pass reset_less=False.
     prev = value
     for i in range(cycles):
-        r = Signal.like(value, name=f"{name}{i}")
+        r = Signal.like(value, name=f"{name}{i}", reset_less=reset_less)
         module.sync += r.eq(prev)
         prev = r
     return prev
@@ -79,7 +80,9 @@ class ConvScratchpad(LiteXModule):
         # # #
 
         # Command capture and validation.
-        cap = {name: Signal(width, name=f"cap_{name}") for name, width in CONV_COMMAND}
+        # Reset-less: loaded on accept, read from VALIDATE on.
+        cap = {name: Signal(width, name=f"cap_{name}", reset_less=True)
+               for name, width in CONV_COMMAND}
         groups = Signal(13)
         vbytes, wbytes = Signal(24), Signal(24)
         names = ("x0", "x1", "x2", "x3", "w", "dst")
@@ -116,8 +119,9 @@ class ConvScratchpad(LiteXModule):
         sub = Signal(3)                             # beat within the group
         bank_full = Array([Signal(name="bank_full0"), Signal(name="bank_full1")])
         rbank = Signal()                            # bank being filled
-        rd_pending, rd_sub, rd_bank = Signal(), Signal(3), Signal()
-        banks = [[Signal(256, name=f"gb{b}_{i}") for i in range(8)] for b in range(2)]
+        rd_pending, rd_sub, rd_bank = Signal(), Signal(3, reset_less=True), Signal(reset_less=True)
+        banks = [[Signal(256, name=f"gb{b}_{i}", reset_less=True) for i in range(8)]
+                 for b in range(2)]
 
         states = ["IDLE", "VALIDATE", "RUN", "FINISH", "FAILED"]
         S = {n: i for i, n in enumerate(states)}
@@ -212,9 +216,9 @@ class ConvScratchpad(LiteXModule):
             adds[2].a.eq(adds[1].r), adds[2].b.eq(p3),
         ]
         LAT = L_M + 3*L_A
-        y_valid = _delay(self, feed & ~add, LAT, "yv")
+        y_valid = _delay(self, feed & ~add, LAT, "yv", reset_less=False)
         y_lane = _delay(self, lane, LAT, "yl")
-        acc = [Signal(32, name=f"yacc{j}") for j in range(7)]
+        acc = [Signal(32, name=f"yacc{j}", reset_less=True) for j in range(7)]
         for j in range(7):
             self.sync += If(y_valid & (y_lane == j), acc[j].eq(adds[2].r))
         # ADD: x0 + x3, eight lanes at once.
@@ -223,7 +227,7 @@ class ConvScratchpad(LiteXModule):
         for j in range(8):
             self.comb += [vadds[j].a.eq(bank_sel[0][32*j:32*j + 32]),
                           vadds[j].b.eq(bank_sel[3][32*j:32*j + 32])]
-        v_valid = _delay(self, feed & add, L_A, "vv")
+        v_valid = _delay(self, feed & add, L_A, "vv", reset_less=False)
         self.comb += [
             ofifo.we.eq(((y_valid & (y_lane == 7)) | v_valid) & ~clear),
             ofifo.din.eq(Mux(add, Cat(*[v.r for v in vadds]), Cat(*acc, adds[2].r))),

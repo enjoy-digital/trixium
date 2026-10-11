@@ -60,8 +60,9 @@ F32_ONE = 0x3F800000
 
 # Helpers ------------------------------------------------------------------------------------------
 
-def _delay(module, value, cycles, name):
-    regs = [Signal.like(value, name=f"{name}{i}") for i in range(cycles)]
+def _delay(module, value, cycles, name, reset_less=True):
+    # A datapath delay line by default; the valids pass reset_less=False.
+    regs = [Signal.like(value, name=f"{name}{i}", reset_less=reset_less) for i in range(cycles)]
     prev = value
     for r in regs:
         module.sync += r.eq(prev)
@@ -91,7 +92,9 @@ class NormScratchpad(LiteXModule):
         # # #
 
         # Command capture and validation.
-        cap = {name: Signal(width, name=f"cap_{name}") for name, width in NORM_COMMAND}
+        # Reset-less: loaded on accept, read from VALIDATE on.
+        cap = {name: Signal(width, name=f"cap_{name}", reset_less=True)
+               for name, width in NORM_COMMAND}
         rms = cap["op"] == OP_RMS
         nbeats = Signal(13)                          # beats per segment
         seg_bytes = Signal(24)
@@ -142,7 +145,8 @@ class NormScratchpad(LiteXModule):
         self.submodules += sq + acc + m1 + m2 + [tree]
 
         # The 64 partials: P[8*slot + lane].
-        P = [Signal(32, name=f"part{k}") for k in range(64)]
+        # Reset-less: cleared at each segment's first pass-1 beat (and on clear).
+        P = [Signal(32, name=f"part{k}", reset_less=True) for k in range(64)]
 
         # Weight buffer: one 256-bit word per beat.
         wbuf = Memory(256, WMAX//8, name="norm_wbuf")
@@ -171,8 +175,8 @@ class NormScratchpad(LiteXModule):
         beat = Signal(13)                            # weight reads issued
         beat_a, beat_b = Signal(13), Signal(13)      # pass-1 / pass-2 reads issued
         rd_pending = Signal()
-        rd_kind = Signal(2)                          # 0 weight, 1 pass-1 x, 2 pass-2 x
-        rd_beat = Signal(13)
+        rd_kind = Signal(2, reset_less=True)         # 0 weight, 1 pass-1 x, 2 pass-2 x
+        rd_beat = Signal(13, reset_less=True)        # (both qualified by rd_pending)
         clear = Signal()
         self.comb += [
             clear.eq(self.cancel | (state == S["IDLE"])),
@@ -183,8 +187,8 @@ class NormScratchpad(LiteXModule):
         ]
         # Segment bases, advanced by one stride per segment: a seg*stride product feeding the
         # read address every clock was the unit's critical path.
-        src_a, dst_a = Signal(24), Signal(24)        # stage A's segment
-        src_b, dst_b = Signal(24), Signal(24)        # stage B's segment
+        src_a, dst_a = Signal(24, reset_less=True), Signal(24, reset_less=True) # stage A's segment
+        src_b, dst_b = Signal(24, reset_less=True), Signal(24, reset_less=True) # stage B's segment
 
         # Read issue: one scratchpad read per clock; pass 2 (it frees output credits and
         # ends a segment) before pass 1.
@@ -239,9 +243,9 @@ class NormScratchpad(LiteXModule):
         p1_valid = Signal()
         self.comb += p1_valid.eq(rd_pending & (rd_kind == 1))
         slot_sq = _delay(self, rd_beat[:3], L_MUL, "slot_sq")
-        valid_sq = _delay(self, p1_valid, L_MUL, "valid_sq")
+        valid_sq = _delay(self, p1_valid, L_MUL, "valid_sq", reset_less=False)
         slot_acc = _delay(self, slot_sq, L_ADD, "slot_acc")
-        valid_acc = _delay(self, valid_sq, L_ADD, "valid_acc")
+        valid_acc = _delay(self, valid_sq, L_ADD, "valid_acc", reset_less=False)
         p1_inflight = Signal(8)
         self.sync += If(clear, p1_inflight.eq(0)).Else(
             p1_inflight.eq(p1_inflight + p1_valid - valid_acc))
@@ -262,7 +266,7 @@ class NormScratchpad(LiteXModule):
             lane_mask.eq(Array([C(0xFF, 8)]*3 +
                                [C(0x0F, 8), C(0x03, 8), C(0x01, 8), C(0, 8), C(0, 8)])[level]),
         ]
-        tree_valid = _delay(self, tree_issue, L_ADD, "tree_valid")
+        tree_valid = _delay(self, tree_issue, L_ADD, "tree_valid", reset_less=False)
         tree_slot = _delay(self, tj[3:5], L_ADD, "tree_slot")
         tree_mask = _delay(self, lane_mask, L_ADD, "tree_mask")
         tree_inflight = Signal(4)
@@ -287,8 +291,8 @@ class NormScratchpad(LiteXModule):
         sc_add = Signal()
         sc_step = Signal(3)
         sc_wait = Signal()
-        ss, tmp, scale = Signal(32), Signal(32), Signal(32)
-        sc_add_valid = _delay(self, sc_add, L_ADD, "sc_add_valid")
+        ss, tmp, scale = [Signal(32, reset_less=True) for _ in range(3)]
+        sc_add_valid = _delay(self, sc_add, L_ADD, "sc_add_valid", reset_less=False)
         n_f32 = Signal(32)
         nlz, nlz_s = _lzc(cap["n"], 16)
         self.comb += nlz_s
@@ -319,7 +323,7 @@ class NormScratchpad(LiteXModule):
                 m1[lane].a.eq(self.sp_rd_dat[32*lane:32*lane + 32]), m1[lane].b.eq(scale),
                 m2[lane].a.eq(m1[lane].r), m2[lane].b.eq(w_hold[32*lane:32*lane + 32]),
             ]
-        out_valid = _delay(self, p2_valid, 2*L_MUL, "out_valid")
+        out_valid = _delay(self, p2_valid, 2*L_MUL, "out_valid", reset_less=False)
         out_beat = _delay(self, rd_beat, 2*L_MUL, "out_beat")
         y = Signal(256)
         self.comb += y.eq(Cat(*[m2[lane].r for lane in range(8)]))
@@ -355,11 +359,13 @@ class NormScratchpad(LiteXModule):
                 radd[1][lane].a.eq(rmul[2][lane].r), radd[1][lane].b.eq(rmul[3][lane].r),
             ]
         LR = L_MUL + L_ADD
-        pas_d, second_d = _delay(self, pas, LR, "rope_pas"), _delay(self, second, LR, "rope_second")
+        pas_d    = _delay(self, pas,    LR, "rope_pas",    reset_less=False)
+        second_d = _delay(self, second, LR, "rope_second", reset_less=False)
         beat_d, y_d = _delay(self, out_beat, LR, "rope_beat"), _delay(self, y, LR, "rope_y")
         o0 = Cat(*[radd[0][lane].r for lane in range(8)])
         o1 = Cat(*[radd[1][lane].r for lane in range(8)])
-        pend_v, pend_adr, pend_dat = Signal(), Signal(13), Signal(256)
+        pend_v = Signal()
+        pend_adr, pend_dat = Signal(13, reset_less=True), Signal(256, reset_less=True)
         self.sync += If(clear, pend_v.eq(0)).Else(
             pend_v.eq(second_d), pend_adr.eq(beat_d), pend_dat.eq(o1))
         wr_now = Signal()
@@ -379,7 +385,7 @@ class NormScratchpad(LiteXModule):
         # Output beats carry their own address: dst + segment offset + beat. The FIFO holds
         # only data; addresses follow the write counter within the segment.
         wr_beat = Signal(13)
-        wr_seg_base = Signal(13)
+        wr_seg_base = Signal(13, reset_less=True)
         drained = Signal()                           # every pass-2 beat issued so far written
         self.comb += [
             self.sp_wr_req.eq(ofifo.readable & ~self.cancel),
