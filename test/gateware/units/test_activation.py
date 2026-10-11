@@ -345,7 +345,10 @@ def valid_command(dut, arrays, stall=True):
     else:
         raise AssertionError('resident activation conversion did not complete')
     assert (yield dut.unit.blocks_done) == blocks
-    assert (yield dut.unit.read_beats) == len(words)//4  # Two passes, eight inputs/read.
+    # Eight inputs per read: two passes, or one in the ping-pong mode (several blocks of at
+    # most 1,024 elements: the convert pass reads the unit's block buffer).
+    passes = 1 if (blocks > 1 and elements <= 1024) else 2
+    assert (yield dut.unit.read_beats) == passes*len(words)//8
     assert (yield dut.unit.output_beats) == len(words)//32
     expected_bytes = b''.join(reference(array)[0] for array in arrays)
     for beat in range(len(words)//32):
@@ -744,3 +747,43 @@ def test_compiled_resident_conversion_rotation_full_ffn_and_reset():
     assert '$readmem file not found' not in result.stdout
     assert 'ACTIVATION_CLUSTER_PASS' in result.stdout
     print(result.stdout)
+
+
+def test_resident_quantization_ping_pong_rate():
+    # Several blocks of 1,024 FP32 (the rotated prepare's quantize): the convert pass reads
+    # the unit's block buffer while the next block's scan reads the scratchpad, so a block
+    # costs one scratchpad pass (128 reads) plus a few control clocks, not two. Bytes and
+    # exponents as the one-block reference.
+    elements, blocks = 1024, 4
+    rng = random.Random(77)
+    arrays = [[struct.unpack('<I', struct.pack('<f', rng.uniform(-3.0, 3.0)*(b + 1)))[0]
+               for _ in range(elements)] for b in range(blocks)]
+    words = [w for a in arrays for w in a]
+    dut = QuantSP(size=64*1024)
+    src, dst, exps = 0x400, 0x8400, 0xc400
+    cycles = []
+    def run():
+        for beat in range(len(words)//8):
+            yield dut.sp.mem[src//32 + beat].eq(pack(words[beat*8:beat*8 + 8], 32))
+        yield from submit(dut, src=src, dst=dst, exponents=exps, elements=elements, blocks=blocks,
+                          protect_start=0, protect_end=0)
+        for cycle in range(5000):
+            yield
+            assert not (yield dut.unit.error)
+            if (yield dut.unit.done):
+                cycles.append(cycle)
+                break
+        assert (yield dut.unit.read_beats) == len(words)//8
+        out = b''
+        for i in range(len(words)//32):
+            out += (yield dut.sp.mem[dst//32 + i]).to_bytes(32, 'little')
+        exp_beat = yield dut.sp.mem[exps//32]
+        exponents = [exp_beat >> (32*b) & 0xffffffff for b in range(blocks)]
+        for b, array in enumerate(arrays):
+            data, e8 = reference(array)
+            assert out[b*elements:(b + 1)*elements] == data, b
+            assert exponents[b] == e8 & 0xffffffff, (b, exponents[b], e8)
+    run_tb(dut, run())
+    per_block = cycles[0]/blocks
+    print(f"\nquantize: {per_block:.0f} clocks per 1,024-element block")
+    assert cycles[0] <= elements//8 + blocks*(elements//8 + 12) + 8, cycles[0]

@@ -314,6 +314,14 @@ class ActivationScratchpad(LiteXModule):
         self.quantize         = quantize = Fp32ToQ8()
         self.integer_quantize = integer_quantize = IntegerToQ8()
         self.responses        = responses = ResetInserter()(SyncFIFO(width=258, depth=2))
+        # Block buffer for the ping-pong mode (pp, per-block FP32 with <= 1,024 elements and
+        # several blocks): the scan pass copies the block into one half, so the convert pass
+        # reads it from there while the next block's scan reads the scratchpad into the other
+        # half - one scratchpad pass per block instead of two (~135 instead of ~262 clocks).
+        blkbuf = Memory(256, 256, name="activation_blkbuf")
+        buf_wr = blkbuf.get_port(write_capable=True)
+        buf_rd = blkbuf.get_port()
+        self.specials += blkbuf, buf_wr, buf_rd
 
         # Command capture and validation.
         (IDLE, VALIDATE, SCAN, SCAN_DRAIN, CHOOSE, CONVERT, CONVERT_DRAIN, EXPONENT,
@@ -396,6 +404,13 @@ class ActivationScratchpad(LiteXModule):
         metadata_error = Signal()
         selected_valid, selected_ready, selected_last = Signal(), Signal(), Signal()
         selected_data = Signal(64)
+        # Ping-pong mode: pp latched at VALIDATE; s_* the next block's scan under a convert.
+        pp, s_active, s_done, s_issuing = Signal(), Signal(), Signal(), Signal()
+        s_issued = Signal(14)
+        s_pend = Signal()
+        s_first, s_last = Signal(reset_less=True), Signal(reset_less=True) # (s_pend)
+        buf_pend, cnv_issue, issue_main = Signal(), Signal(), Signal()
+        buf_wadr = Signal(8, reset_less=True)                             # (write strobe)
         self.comb += metadata_length.eq(0)
         for bit in range(32):
             self.comb += If(metadata_a[bit], metadata_length.eq(bit + 1))
@@ -418,17 +433,25 @@ class ActivationScratchpad(LiteXModule):
             self.cmd.ready.eq((state == IDLE) & ~self.cancel), self.busy.eq(state != IDLE),
             in_scan.eq((state == SCAN) | (state == SCAN_DRAIN)),
             in_convert.eq((state == CONVERT) | (state == CONVERT_DRAIN)),
-            clear.eq(self.cancel | (~in_scan & ~in_convert)),
+            clear.eq(self.cancel | (~in_scan & ~in_convert & ~(s_active & (state != FAILED)))),
+            s_issuing.eq(s_active & (s_issued < read_count) & (state != FAILED) & ~self.cancel),
+            cnv_issue.eq((state == CONVERT) & ((reserved < 2) | response_pop) & ~self.cancel),
+            issue_main.eq(Mux(pp & in_convert, cnv_issue,
+                              self.sp_rd_req & ~s_issuing & (in_scan | in_convert))),
+            buf_rd.adr.eq(Cat(issued[:7], block[0])),
+            buf_wr.adr.eq(buf_wadr), buf_wr.dat_w.eq(self.sp_rd_dat),
+            buf_wr.we.eq(pp & ((read_pending & in_scan) | s_pend) & ~self.cancel),
             scan.cancel.eq(clear), quantize.cancel.eq(clear), integer_quantize.cancel.eq(clear),
             responses.reset.eq(clear),
             read_count.eq(captured["elements"] >> 3),
-            scan.sink.valid.eq(read_pending & in_scan & ~self.cancel),
-            scan.sink.data.eq(self.sp_rd_dat), scan.sink.first.eq(read_first),
-            scan.sink.last.eq(read_last),
+            scan.sink.valid.eq(((read_pending & in_scan) | s_pend) & ~self.cancel),
+            scan.sink.data.eq(self.sp_rd_dat),
+            scan.sink.first.eq(Mux(s_pend, s_first, read_first)),
+            scan.sink.last.eq(Mux(s_pend, s_last, read_last)),
             scan.source.ready.eq(1),
             maximum.eq(Mux(scan.source.absmax > self.absmax, scan.source.absmax, self.absmax)),
-            responses.we.eq(read_pending & in_convert & ~self.cancel),
-            responses.din.eq(Cat(self.sp_rd_dat, read_first, read_last)),
+            responses.we.eq(Mux(pp, buf_pend, read_pending) & in_convert & ~self.cancel),
+            responses.din.eq(Cat(Mux(pp, buf_rd.dat_r, self.sp_rd_dat), read_first, read_last)),
             quantize.sink.valid.eq(responses.readable & in_convert & ~rotation & ~self.cancel),
             quantize.sink.data.eq(responses.dout[:256]),
             quantize.sink.first.eq(responses.dout[256]),
@@ -441,13 +464,13 @@ class ActivationScratchpad(LiteXModule):
             response_pop.eq(Mux(rotation, integer_quantize.sink.valid & integer_quantize.sink.ready,
                                quantize.sink.valid & quantize.sink.ready)),
             responses.re.eq(response_pop),
-            reserved.eq(responses.level + read_pending),
+            reserved.eq(responses.level + Mux(pp, buf_pend, read_pending)),
             self.sp_rd_req.eq(~self.cancel & ((state == SCAN) |
-                ((state == CONVERT) & ((reserved < 2) | response_pop)) |
+                ((state == CONVERT) & ~pp & ((reserved < 2) | response_pop)) | s_issuing |
                 (state == META_E_REQ) | (state == META_A_REQ))),
             self.sp_rd_adr.eq(Mux(state == META_E_REQ, (captured["exponents"] >> 5) + (block >> 3),
                 Mux(state == META_A_REQ, (captured["maxima"] >> 5) + (block >> 3),
-                    src_base + issued))),
+                    Mux(s_issuing, src_base + read_count + s_issued, src_base + issued)))),
             convert_error.eq(in_convert & ((quantize.source.valid & (quantize.source.error != 0)) |
                 (responses.we & ~responses.writable))),
             raw_bad.eq(raw_bad_lanes != 0), raw_equal.eq(raw_equal_lanes != 0),
@@ -473,10 +496,17 @@ class ActivationScratchpad(LiteXModule):
                                   Replicate(wide_exponent, 8), packed_word)),
             write_word.eq(in_convert & self.sp_wr_req & self.sp_wr_gnt),
         ]
-        self.sync += If(clear, read_pending.eq(0)).Else(
-            read_pending.eq(self.sp_rd_req & (in_scan | in_convert)),
-            If(self.sp_rd_req, read_first.eq(issued == 0), read_last.eq(issued == read_count - 1)),
+        self.sync += If(clear, read_pending.eq(0), buf_pend.eq(0), s_pend.eq(0)).Else(
+            read_pending.eq(self.sp_rd_req & ~s_issuing & (in_scan | in_convert)),
+            buf_pend.eq(cnv_issue & pp),
+            s_pend.eq(s_issuing),
+            If(issue_main, read_first.eq(issued == 0), read_last.eq(issued == read_count - 1)),
         )
+        self.sync += [
+            If(s_issuing, s_first.eq(s_issued == 0), s_last.eq(s_issued == read_count - 1)),
+            If(s_issuing, buf_wadr.eq(Cat(s_issued[:7], ~block[0]))
+            ).Elif(self.sp_rd_req, buf_wadr.eq(Cat(issued[:7], block[0]))),
+        ]
         packing = [Case(packed_index, {index: packed_word[64*index:64*(index+1)].eq(selected_data)
                                       for index in range(4)}),
                    packed_index.eq(packed_index + 1),
@@ -485,12 +515,14 @@ class ActivationScratchpad(LiteXModule):
         self.sync += If(self.cancel,
             state.eq(IDLE), self.error.eq(0), self.done.eq(0), self.blocks_done.eq(0),
             self.read_beats.eq(0), self.output_beats.eq(0), packed_pending.eq(0),
+            s_active.eq(0), s_done.eq(0),
         ).Else(
             self.done.eq(0),
             If(self.sp_rd_req, self.read_beats.eq(self.read_beats + 1)),
-            If(self.sp_rd_req & (in_scan | in_convert), issued.eq(issued + 1),
+            If(issue_main, issued.eq(issued + 1),
                 If(issued == read_count - 1,
                     state.eq(Mux(state == SCAN, SCAN_DRAIN, CONVERT_DRAIN)))),
+            If(s_issuing, s_issued.eq(s_issued + 1)),
             If(write_word, packed_pending.eq(0), output_index.eq(output_index + 1),
                 self.output_beats.eq(self.output_beats + 1), If(packed_last,
                     If(rotation,
@@ -500,6 +532,9 @@ class ActivationScratchpad(LiteXModule):
             If(rotation & response_pop & raw_equal, seen_equal.eq(1)),
             If(in_scan & scan.source.valid,
                 self.absmax.eq(maximum), If(scan.source.last, state.eq(CHOOSE))),
+            # The next block's scan under this block's convert (pp): absmax and a done flag.
+            If(s_active & ~in_scan & scan.source.valid,
+                self.absmax.eq(maximum), If(scan.source.last, s_done.eq(1))),
             Case(state, {
                 IDLE: If(self.cmd.valid & self.cmd.ready,
                     *[value.eq(getattr(self.cmd, name)) for name, value in captured.items()],
@@ -510,11 +545,14 @@ class ActivationScratchpad(LiteXModule):
                     self.absmax.eq(0), self.exponent.eq(0), self.blocks_done.eq(0),
                     global_nonzero.eq(0), seen_equal.eq(0),
                     self.read_beats.eq(0), self.output_beats.eq(0), self.error.eq(0),
+                    s_active.eq(0), s_done.eq(0),
                     state.eq(VALIDATE)),
                 VALIDATE: If(config_bad | bounds_bad | overlap_bad | protected_bad,
                     self.error.eq(Cat(config_bad, bounds_bad, overlap_bad, C(0, 3), protected_bad)),
                     state.eq(FAILED),
-                ).Else(state.eq(Mux(rotation, META_E_REQ, SCAN))),
+                ).Else(
+                    pp.eq(~rotation & (captured["elements"] <= 1024) & (captured["blocks"] > 1)),
+                    state.eq(Mux(rotation, META_E_REQ, SCAN))),
                 META_E_REQ: state.eq(META_E_CAPTURE),
                 META_E_CAPTURE: [
                     metadata_e.eq(
@@ -541,21 +579,28 @@ class ActivationScratchpad(LiteXModule):
                 CHOOSE: If((self.absmax != 0) & (self.absmax[23:] < 6),
                     self.error.eq(16), state.eq(FAILED),
                 ).Else(self.exponent.eq(Mux(self.absmax == 0, 0, self.absmax[23:] - 133)),
-                       issued.eq(0), state.eq(CONVERT)),
+                       issued.eq(0), state.eq(CONVERT),
+                       # pp: the next block's scan starts with this block's convert.
+                       If(pp,
+                           self.absmax.eq(0),
+                           If(block != captured["blocks"] - 1,
+                               s_active.eq(1), s_issued.eq(0), s_done.eq(0)))),
                 EXPONENT: If(self.sp_wr_gnt,
                     self.blocks_done.eq(self.blocks_done + 1), state.eq(NEXT)),
                 NEXT: If(block == captured["blocks"] - 1,
                     state.eq(Mux(rotation, RESULT, FINISH)),
-                ).Else(
+                ).Elif(~pp | s_done,           # pp: the next block is scanned (absmax kept)
                     block.eq(block + 1), src_base.eq(src_base + read_count),
                     dst_base.eq(dst_base + (captured["elements"] >> 5)),
                     issued.eq(0), output_index.eq(0), packed_index.eq(0), packed_pending.eq(0),
-                    self.absmax.eq(0), state.eq(Mux(rotation, CACHE_READ, SCAN))),
+                    s_active.eq(0),
+                    If(~pp, self.absmax.eq(0)),
+                    state.eq(Mux(rotation, CACHE_READ, Mux(pp, CHOOSE, SCAN)))),
                 RESULT: If(self.sp_wr_gnt, state.eq(FINISH)),
                 FINISH: [self.done.eq(1), state.eq(IDLE)],
             }),
             # Failure wins over state transitions and never publishes success.
-            If(in_scan & scan.source.valid & scan.source.error,
+            If((in_scan | s_active) & scan.source.valid & scan.source.error,
                 self.error.eq(8), state.eq(FAILED)),
             If(convert_error, self.error.eq(32), state.eq(FAILED)),
             If(metadata_error, self.error.eq(128), state.eq(FAILED)),

@@ -105,7 +105,7 @@ static void complete(Vactivation_cluster &d, unsigned elements, unsigned blocks,
     }
     unsigned descriptors=rotate ? 3 : 1;
     require(cycles<100000 && ((d.seq_status >> 8) & 0xffff)==descriptors, "list did not retire exactly");
-    require(d.quant_blocks==blocks && d.quant_reads==(rotate ? blocks*130 : length/4) && d.quant_writes==length/32,
+    require(d.quant_blocks==blocks && d.quant_reads==(rotate ? blocks*130 : (blocks>1 && elements<=1024) ? length/8 : length/4) && d.quant_writes==length/32,
             "incorrect conversion counters");
     for (unsigned i=0; i<length; i+=4) {
         uint32_t word=0;
@@ -168,9 +168,9 @@ int main() {
     for (unsigned i=0; i<100; i++) tick(d);
     complete(d,1024,17,true); complete(d,1024,17,true,false);
     complete(d,17408,1); complete(d,5120,1); complete(d,32,5);
-    // Reset points across the 17-block list (12,919 cycles with the 32-lane Hadamard and its
-    // streamed input).
-    for (unsigned stop : {20u,160u,260u,1300u,6000u,11000u,12500u}) {
+    // Reset points across the 17-block list (10,807 cycles: the 32-lane Hadamard with its
+    // streamed input, the quantizer's ping-pong block buffer).
+    for (unsigned stop : {20u,160u,260u,1300u,6000u,9000u,10500u}) {
         start(d,quant(1024,17),true);
         for (unsigned i=0; i<stop; i++) tick(d);
         require(d.seq_status&1,"list completed before reset case");
@@ -202,6 +202,10 @@ int main() {
         require((d.seq_status&1) && d.seq_error && !((d.seq_status>>8)&0xffff),"invalid conversion was published");
         require(access(d,0,false)==words[0],"rejected command overwrote list");
         if (mode<13) require(access(d,0x4000,false)==0xdeadbeef,"rejected command wrote output");
+        // Two blocks run in the ping-pong mode: block 1's scan runs under block 0's convert, so
+        // its nonfinite input (13) fails before block 0 retires; its unsafe exponent (14) is
+        // chosen after block 0 is written - the partial prefix the failure must not publish.
+        else if (mode==13) require(d.quant_blocks==0,"next-block scan failure not seen under the convert");
         else require(d.quant_blocks==1 && access(d,0x4000,false)==0x40404040,"partial prefix failure not exercised");
         reset_cluster(d);
     }
