@@ -111,6 +111,7 @@ void resident_stats_reset(void)
 void resident_enable(int on) { resident_state()->enabled = on ? 1 : 0; }
 void resident_silu_enable(int on) { resident_state()->silu_enabled = on ? 1 : 0; }
 void resident_mark_act(void) { resident_state()->act_resident = 1; }
+void resident_keep_rsf(const void *dst) { resident_state()->keep_dst = dst; }
 
 int resident_available(void)
 {
@@ -141,24 +142,25 @@ static inline uint32_t eng_addr(const void *p)
     return (uint32_t)((uintptr_t)p - MAIN_RAM_BASE + TRIXIUM_MEM_CPU_OFFSET);
 }
 
-static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d)
-{
-    volatile uint32_t *w = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + idx*64);
-    for (int i = 0; i < 16; i++) w[i] = d->word[i];
-}
+// Descriptor slots: two banks of RS_DESC_MAX, so the CPU builds the next list in one while
+// the sequencer runs the other (rl_post, resident.h). `RLS->base` is the bank being built.
+static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d);
+static void desc_engine(uint32_t idx, const struct engine_op *op);
+static void desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n);
+static void desc_stop(uint32_t idx);
 
 static void desc_fetch(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_dst)
 {
     struct engine_op op = {0};
     op.kind = ENGINE_KIND_FETCH; op.wbase = addr; op.wlen = beats; op.dst = sp_dst;
-    seq_desc_engine(idx, &op);
+    desc_engine(idx, &op);
 }
 
 static void desc_store(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_src)
 {
     struct engine_op op = {0};
     op.kind = ENGINE_KIND_STORE; op.wbase = addr; op.wlen = beats; op.xsrc = sp_src;
-    seq_desc_engine(idx, &op);
+    desc_engine(idx, &op);
 }
 
 /* List Profile */
@@ -166,11 +168,15 @@ static void desc_store(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_
 
 // Per-descriptor list profile (console `stats`): cycles from one completed descriptor to
 // the next, accumulated per list name (the `what` pointer) and descriptor index. The
-// completion poll reads the sequencer anyway; one timer read per poll is the cost.
+// completion poll reads the sequencer anyway; one timer read per poll is the cost. `build`
+// is the CPU's time building the list (from its first descriptor to its start, the wait
+// for a list still in flight excluded), `post` its time after the list ended (cache
+// maintenance, fixups) until the caller moves on.
 struct list_prof {
     const char *what;
     uint32_t calls, n;
     uint64_t cyc[RS_DESC_MAX];
+    uint64_t build, post;
 };
 #define LISTPROF_N 16
 #define LP ((struct list_prof *)TRIXIUM_LISTPROF_ADDR)
@@ -187,8 +193,9 @@ void resident_listprof_print(uint32_t forwards)
         if (!p->calls || !forwards) continue;
         uint64_t total = 0;
         for (uint32_t d = 0; d < p->n; d++) total += p->cyc[d];
-        printf("listprof %s: %lu calls/fwd, %lu cycles/call:", p->what,
-               (unsigned long)(p->calls/forwards), (unsigned long)(total/p->calls));
+        printf("listprof %s: %lu calls/fwd, %lu cycles/call (build %lu, post %lu):", p->what,
+               (unsigned long)(p->calls/forwards), (unsigned long)(total/p->calls),
+               (unsigned long)(p->build/p->calls), (unsigned long)(p->post/p->calls));
         for (uint32_t d = 0; d < p->n; d++)
             printf(" %lu", (unsigned long)(p->cyc[d]/p->calls));
         puts("");
@@ -207,42 +214,86 @@ static struct list_prof *listprof_slot(const char *what)
 /* List Run */
 /*----------*/
 
-// A list in flight (run_list_start .. run_list_wait): the CPU may work in between, on
-// anything but the descriptor slots, the list's scratchpad regions and the engine.
-static struct {
+// At most one list in flight (run_list_start .. run_list_wait) while the CPU builds the next
+// one in the other descriptor bank: a list started with rl_post (or a posted resident_*
+// call) runs on while the caller builds its successor, whose start first waits for it. A
+// posted list's failure is reported by the next start or join. Between a post and that join
+// the CPU may work on anything but the posted list's scratchpad regions and main-RAM
+// buffers, and must not use the engine (resident_join() first). In the main_ram static
+// window: the SRAM .bss is at its stack floor.
+struct rl_state {
+    // The list in flight.
     struct list_prof *prof;
     const char *what;
-    uint32_t count, last_d;
-    uint64_t last_t;
-} LF;
+    uint32_t count, last_d, base, active;
+    uint64_t last_t, end_t;
+    uint32_t ninv;                  // its stores' main-RAM spans, invalidated when it ends
+    void *inv[16];
+    uint32_t inv_bytes[16];
+    // The list being built (rl_begin, or a resident_* call).
+    uint32_t bbase;                 // its bank's first slot
+    uint64_t t0;                    // its build start (0: not timed)
+    uint32_t n, nbinv, bad;
+    void *binv[16];
+    uint32_t binv_bytes[16];
+};
+#define RLS ((struct rl_state *)TRIXIUM_RL_STATE_ADDR)
+_Static_assert(sizeof(struct rl_state) <= 1024, "rl_state window is 1 KB");
 
-static int run_list_start(uint32_t count, const char *what)
+// Start building a list: the bank the list in flight does not use.
+static void build_begin(void)
 {
-    struct resident_state *R = resident_state();
-    LF.prof = listprof_slot(what);
-    LF.what = what;
-    LF.count = count;
-    LF.last_d = 0;
-    LF.last_t = perf_now64();
-    if (seq_wedged) {
-        R->disabled = 1;
-        return -1;
-    }
-    R->act_resident = 0;   // Every list may rewrite RS_F; resident_ffn_act re-arms it.
-    R->rsf_src = 0;
-    seq_list_start(RS_DESC0, count);
-    return 0;
+    RLS->bbase = (RLS->active && RLS->base == 0) ? RS_DESC_MAX : 0;
+    RLS->t0 = perf_now64();
+}
+
+// A list the CPU waits for at once (init, self-tests): nothing in flight first.
+static void build_sync(void)
+{
+    resident_join();
+    build_begin();
+}
+
+static volatile uint32_t *slot_w(uint32_t idx)
+{
+    return (volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + (RLS->bbase + idx)*64);
+}
+
+static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d)
+{
+    volatile uint32_t *w = slot_w(idx);
+    for (int i = 0; i < 16; i++) w[i] = d->word[i];
+}
+
+static void desc_engine(uint32_t idx, const struct engine_op *op)
+{
+    seq_desc_engine(RLS->bbase + idx, op);
+}
+
+static void desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n)
+{
+    seq_desc_vec(RLS->bbase + idx, pc, args, n, 0);
+}
+
+static void desc_stop(uint32_t idx)
+{
+    seq_desc_stop(RLS->bbase + idx);
 }
 
 // Report the resident units' failures at once instead of after the sequencer's stall
-// timeout: a failed unit parks the list busy until the engine reset.
+// timeout: a failed unit parks the list busy until the engine reset. Waits for the list in
+// flight (none: 0), then invalidates its stores.
 static int run_list_wait(void)
 {
+    struct rl_state *L = RLS;
+    if (!L->active)
+        return 0;
+    L->active = 0;
     struct resident_state *R = resident_state();
-    struct list_prof *prof = LF.prof;
-    const char *what = LF.what;
-    uint32_t count = LF.count, last_d = LF.last_d;
-    uint64_t last_t = LF.last_t;
+    struct list_prof *prof = L->prof;
+    const char *what = L->what;
+    uint32_t count = L->count, last_d = L->last_d;
+    uint64_t last_t = L->last_t;
     uint32_t spins = 0;
     for (;;) {
         uint32_t st = trixium_seq_status_read();
@@ -255,8 +306,9 @@ static int run_list_wait(void)
             }
         }
         if (!(st & 1)) {
+            L->end_t = perf_now64();
             if (prof) {
-                if (last_d < RS_DESC_MAX) prof->cyc[last_d] += perf_now64() - last_t;
+                if (last_d < RS_DESC_MAX) prof->cyc[last_d] += L->end_t - last_t;
                 prof->calls++;
                 if (count > prof->n) prof->n = count;
             }
@@ -284,6 +336,49 @@ static int run_list_wait(void)
             return -1;
         }
     }
+    for (uint32_t i = 0; i < L->ninv; i++)
+        invd_cpu_dcache_range(L->inv[i], L->inv_bytes[i]);
+    return 0;
+}
+
+// The CPU's work after the list ended (cache maintenance, fixups) until the caller resumes.
+static void lp_post(void)
+{
+    struct rl_state *L = RLS;
+    if (L->prof && L->end_t) L->prof->post += perf_now64() - L->end_t;
+    L->end_t = 0;
+}
+
+// Start the list built in slots [bbase, bbase + count): first waits for the list still in
+// flight (a posted one), then starts this one, which is in flight on return.
+static int run_list_start(uint32_t count, const char *what)
+{
+    struct rl_state *L = RLS;
+    struct resident_state *R = resident_state();
+    struct list_prof *prof = listprof_slot(what);
+    uint64_t now = perf_now64();
+    if (prof && L->t0) prof->build += now - L->t0;
+    L->t0 = 0;
+    if (run_list_wait())
+        return -1;
+    lp_post();
+    if (seq_wedged) {
+        R->disabled = 1;
+        return -1;
+    }
+    R->act_resident = 0;   // Every list may rewrite RS_F; resident_ffn_act re-arms it.
+    R->rsf_src = 0;
+    L->prof = prof;
+    L->what = what;
+    L->count = count;
+    L->last_d = 0;
+    L->base = L->bbase;
+    L->ninv = L->nbinv;
+    for (uint32_t i = 0; i < L->nbinv; i++) { L->inv[i] = L->binv[i]; L->inv_bytes[i] = L->binv_bytes[i]; }
+    L->nbinv = 0;
+    L->active = 1;
+    L->last_t = perf_now64();
+    seq_list_start(L->base, count);
     return 0;
 }
 
@@ -292,6 +387,16 @@ static int run_list(uint32_t count, const char *what)
     if (run_list_start(count, what))
         return -1;
     return run_list_wait();
+}
+
+int resident_join(void)
+{
+    uint64_t t = perf_now64();
+    int rc = run_list_wait();
+    lp_post();
+    if (RLS->t0)                       // a list being built: the wait is not its build time
+        RLS->t0 += perf_now64() - t;
+    return rc;
 }
 
 /* Projections */
@@ -368,6 +473,7 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     if (!resident_active() || width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)src & 31) ||
         (!src && !R->act_resident)) {
         R->fallbacks++;
+        resident_join();               // the caller's fallback may use the engine
         return -1;
     }
     int wi = -1;
@@ -376,10 +482,12 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
         wi = width_index(H, width);
         if (wi < 0 || width/B > 32) {
             R->fallbacks++;
+            resident_join();
             return -1;
         }
     }
     uint64_t t0 = perf_now64();
+    build_begin();
     struct bns_seq_descriptor d;
     uint32_t n = 0;
     if (src && src != R->rsf_src) {
@@ -403,8 +511,9 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     } else {
         bns_seq_desc_quantize(&d, RS_F, RS_XW, RS_E8, width, 1);              desc_words(n++, &d);
     }
-    seq_desc_stop(n++);
-    int rc = run_list(n, "prepare");
+    desc_stop(n++);
+    // Posted: only lists consume the prepared vector, and the next one waits for this.
+    int rc = run_list_start(n, "prepare");
     R->prepare_cycles += perf_now64() - t0;
     R->prepares++;
     return rc;
@@ -462,12 +571,12 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
         op.rshift = seg->rshift;
         op.xsrc   = RS_XW + xoff;
         op.dst    = ystage + (uint32_t)k*ystride;
-        seq_desc_engine((*n)++, &op);
+        desc_engine((*n)++, &op);
         if (k) {
             // Wrapping int32 sum of the segment partials, as the fused path's reduce_acc.
             int32_t a[4] = {(int32_t)ystage, (int32_t)(ystage + (uint32_t)k*ystride),
                             (int32_t)ystage, (int32_t)((rows + 7)/8)};
-            seq_desc_vec((*n)++, PROG_REDUCE_ACC, a, 4, 0);
+            desc_vec((*n)++, PROG_REDUCE_ACC, a, 4);
         }
         xoff += seg->cols;
     }
@@ -494,17 +603,31 @@ int resident_matvec(const struct bons_entry *e, float *dst)
 {
     struct resident_state *R = resident_state();
     uint32_t n = 0;
+    int keep = R->keep_dst == dst;
+    R->keep_dst = 0;
+    build_begin();
     if (!resident_active() || ((uintptr_t)dst & 31) || build_matvec(&n, e, RS_F)) {
         R->fallbacks++;
+        resident_join();               // the caller's fallback may use the engine
         return -1;
     }
     uint64_t t0 = perf_now64();
-    store_out(&n, dst, e->rows, RS_F);
-    seq_desc_stop(n++);
-    int rc = run_list(n, "matvec");
-    if (!rc) {
-        invd_cpu_dcache_range(dst, e->rows*4);
-        R->rsf_src = dst;                 // the FP32 result stays in RS_F (natural order)
+    int rc;
+    if (keep) {
+        // The result stays in RS_F for the caller's next list: posted, no store.
+        desc_stop(n++);
+        rc = run_list_start(n, "matvec");
+        if (!rc)
+            R->rsf_src = dst;
+    } else {
+        store_out(&n, dst, e->rows, RS_F);
+        desc_stop(n++);
+        rc = run_list(n, "matvec");
+        if (!rc) {
+            invd_cpu_dcache_range(dst, e->rows*4);
+            R->rsf_src = dst;             // the FP32 result stays in RS_F (natural order)
+            lp_post();
+        }
     }
     R->matvec_cycles += perf_now64() - t0;
     R->matvecs++;
@@ -516,14 +639,14 @@ int resident_matvec(const struct bons_entry *e, float *dst)
 
 // General lists (resident.h, "list builder"): hybrid.c composes whole-layer lists from
 // these. Every main-RAM transfer does its own cache maintenance; stores are invalidated
-// after a successful run.
-static struct {
-    uint32_t n, ninv, bad;
-    void *inv[16];
-    uint32_t inv_bytes[16];
-} RL;
-
-void rl_begin(void) { RL.n = RL.ninv = RL.bad = 0; resident_state()->rsf_list = resident_state()->rsf_src; }
+// when the list ends.
+void rl_begin(void)
+{
+    resident_state()->keep_dst = 0;
+    RLS->n = RLS->nbinv = RLS->bad = 0;
+    resident_state()->rsf_list = resident_state()->rsf_src;
+    build_begin();
+}
 void resident_rsf_set(const void *src) { resident_state()->rsf_src = src; }
 int rl_rsf_is(const void *src) { return src && resident_state()->rsf_list == src; }
 // A descriptor that may write RS_F: the list no longer holds rsf_src there.
@@ -531,37 +654,37 @@ static void rl_rsf_lost(void) { resident_state()->rsf_list = 0; }
 
 static int rl_room(uint32_t k)
 {
-    if (RL.n + k + 1 > RS_DESC_MAX) RL.bad = 1;
-    return !RL.bad;
+    if (RLS->n + k + 1 > RS_DESC_MAX) RLS->bad = 1;
+    return !RLS->bad;
 }
 
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp)
 {
-    if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
+    if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RLS->bad = 1; return; }
     clean_cpu_dcache_range((void *)src, bytes);
-    desc_fetch(RL.n++, eng_addr(src), bytes/32, sp);
+    desc_fetch(RLS->n++, eng_addr(src), bytes/32, sp);
     if (sp < RS_SP_END && sp + bytes > RS_F) rl_rsf_lost();
 }
 
 void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp)
 {
-    if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
-    desc_fetch(RL.n++, eng_addr(src), bytes/32, sp);
+    if (!rl_room(1) || ((uintptr_t)src & 31) || bytes % 32 || sp % 32) { RLS->bad = 1; return; }
+    desc_fetch(RLS->n++, eng_addr(src), bytes/32, sp);
     if (sp < RS_SP_END && sp + bytes > RS_F) rl_rsf_lost();
 }
 
 void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp)
 {
-    if (!rl_room(1) || ((uintptr_t)dst & 31) || bytes % 32 || sp % 32) { RL.bad = 1; return; }
-    desc_store(RL.n++, eng_addr(dst), bytes/32, sp);
+    if (!rl_room(1) || ((uintptr_t)dst & 31) || bytes % 32 || sp % 32) { RLS->bad = 1; return; }
+    desc_store(RLS->n++, eng_addr(dst), bytes/32, sp);
 }
 
 void rl_store(void *dst, uint32_t bytes, uint32_t sp)
 {
-    if (!rl_room(1) || ((uintptr_t)dst & 31) || bytes % 32 || sp % 32 || RL.ninv >= 16) { RL.bad = 1; return; }
+    if (!rl_room(1) || ((uintptr_t)dst & 31) || bytes % 32 || sp % 32 || RLS->nbinv >= 16) { RLS->bad = 1; return; }
     flush_cpu_dcache_range(dst, bytes);
-    desc_store(RL.n++, eng_addr(dst), bytes/32, sp);
-    RL.inv[RL.ninv] = dst; RL.inv_bytes[RL.ninv++] = bytes;
+    desc_store(RLS->n++, eng_addr(dst), bytes/32, sp);
+    RLS->binv[RLS->nbinv] = dst; RLS->binv_bytes[RLS->nbinv++] = bytes;
 }
 
 void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32_t dst_stride,
@@ -570,40 +693,40 @@ void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32
     struct engine_op op = {0};
     if (!rl_room(1) || ((uintptr_t)dst & 31) || packet_bytes % 32 || dst_stride % 32 ||
         sp % 32 || sp_stride % 32 || packets < 1 || packets > 31 || sp_stride/32 > 255 ||
-        dst_stride/32 >= (1u << 24) || (inv && RL.ninv >= 16)) { RL.bad = 1; return; }
+        dst_stride/32 >= (1u << 24) || (inv && RLS->nbinv >= 16)) { RLS->bad = 1; return; }
     if (inv)
         flush_cpu_dcache_range(inv, inv_bytes);
     op.kind = ENGINE_KIND_STORE; op.wbase = eng_addr(dst); op.wlen = packet_bytes/32;
     op.xsrc = sp; op.rep = (uint8_t)packets; op.dstride = dst_stride/32;
     op.sstride = (uint8_t)(sp_stride/32);
-    seq_desc_engine(RL.n++, &op);
-    if (inv) { RL.inv[RL.ninv] = inv; RL.inv_bytes[RL.ninv++] = inv_bytes; }
+    desc_engine(RLS->n++, &op);
+    if (inv) { RLS->binv[RLS->nbinv] = inv; RLS->binv_bytes[RLS->nbinv++] = inv_bytes; }
 }
 
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
 {
-    if (!rl_room(9) || build_matvec_at(&RL.n, e, ystage, dst_sp)) RL.bad = 1;
+    if (!rl_room(9) || build_matvec_at(&RLS->n, e, ystage, dst_sp)) RLS->bad = 1;
     if (dst_sp == RS_F) rl_rsf_lost();   // partials stay below RS_F (build_matvec_rows)
 }
 
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage,
                     uint32_t dst_sp)
 {
-    if (!rl_room(9) || build_matvec_rows(&RL.n, e, row0, rows, ystage, dst_sp)) RL.bad = 1;
+    if (!rl_room(9) || build_matvec_rows(&RLS->n, e, row0, rows, ystage, dst_sp)) RLS->bad = 1;
     if (dst_sp == RS_F) rl_rsf_lost();
 }
 
 void rl_desc(const struct bns_seq_descriptor *d)
 {
     if (!rl_room(1)) return;
-    desc_words(RL.n++, d);
+    desc_words(RLS->n++, d);
     rl_rsf_lost();                        // any unit may write RS_F
 }
 
 void rl_engine(const struct engine_op *op)
 {
     if (!rl_room(1)) return;
-    seq_desc_engine(RL.n++, op);
+    desc_engine(RLS->n++, op);
     rl_rsf_lost();
 }
 
@@ -620,7 +743,7 @@ static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t
     const struct bons_header *H = model_header();
     uint32_t B = (uint32_t)H->hadamard_block;
     struct bns_seq_descriptor d;
-    if (!rl_room(4) || width > RS_WIDTH_MAX || width % 32) { RL.bad = 1; return; }
+    if (!rl_room(4) || width > RS_WIDTH_MAX || width % 32) { RLS->bad = 1; return; }
     const float *vec = src ? src : (const float *)R->rsf_list;
     if (src && src == R->rsf_list)
         src = 0;                          // already in RS_F: resident_rsf_set, nothing since
@@ -628,14 +751,14 @@ static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t
         rl_fetch(src, width*4, RS_F);
     if (rotate) {
         int wi = width_index(H, width);
-        if (wi < 0 || width/B > 32) { RL.bad = 1; return; }
+        if (wi < 0 || width/B > 32) { RLS->bad = 1; return; }
         uint32_t blocks = width/B;
-        bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RL.n++, &d);
-        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(RL.n++, &d);
-        bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks); desc_words(RL.n++, &d);
+        bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RLS->n++, &d);
+        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(RLS->n++, &d);
+        bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks); desc_words(RLS->n++, &d);
         rl_rsf_lost();                    // the Hadamard wrote RS_F
     } else {
-        bns_seq_desc_quantize(&d, RS_F, xw, e8, width, 1);              desc_words(RL.n++, &d);
+        bns_seq_desc_quantize(&d, RS_F, xw, e8, width, 1);              desc_words(RLS->n++, &d);
         R->rsf_list = vec;                // a plain quantize leaves the source in RS_F
     }
 }
@@ -649,13 +772,20 @@ int rl_run(const char *what)
 
 int rl_start(const char *what)
 {
-    if (RL.bad || !resident_active())
+    if (RLS->bad || !resident_active()) {
+        resident_join();               // the caller's fallback may use the engine
         return -1;
-    seq_desc_stop(RL.n++);
-    return run_list_start(RL.n, what);
+    }
+    desc_stop(RLS->n++);
+    return run_list_start(RLS->n, what);
 }
 
-uint32_t rl_count(void) { return RL.n; }
+int rl_post(const char *what)
+{
+    return rl_start(what);
+}
+
+uint32_t rl_count(void) { return RLS->n; }
 
 // The first k descriptors of the started list have completed (the sequencer's dcount; the
 // serialized units advance it only once done), or the list stopped: 0; -1 on a timeout.
@@ -672,11 +802,7 @@ int rl_wait_desc(uint32_t k)
 
 int rl_wait(void)
 {
-    int rc = run_list_wait();
-    if (!rc)
-        for (uint32_t i = 0; i < RL.ninv; i++)
-            invd_cpu_dcache_range(RL.inv[i], RL.inv_bytes[i]);
-    return rc;
+    return resident_join();
 }
 
 /* SiLU Unit */
@@ -766,9 +892,10 @@ static int silu_selftest(void)
                (unsigned long)lost, (unsigned long)SILU_SELFTEST_N);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
+    build_sync();
     bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, SILU_SELFTEST_N);
     desc_words(n++, &d);
-    seq_desc_stop(n++);
+    desc_stop(n++);
     // The inputs are regenerated below; RS_F is overwritten in place.
     if (run_list(n, "silu self-test"))
         return -1;
@@ -820,11 +947,12 @@ static void silu_probe(uint32_t *stage, int half)
     clean_cpu_dcache_range(stage, 2*N*4);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
+    build_sync();
     desc_fetch(n++, eng_addr(stage), N*4/32, RS_F);
     desc_fetch(n++, eng_addr(stage + N), N*4/32, RS_Y);
     bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, N);
     desc_words(n++, &d);
-    seq_desc_stop(n++);
+    desc_stop(n++);
     if (run_list(n, "silu probe"))
         return;
     const volatile uint32_t *r = (const volatile uint32_t *)(SCRATCHPAD_BASE + RS_F);
@@ -864,10 +992,11 @@ int resident_silu_init(const float *lut, uint32_t *stage)
     clean_cpu_dcache_range(stage, SILU_IMAGE_WORDS*4);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
+    build_sync();
     desc_fetch(n++, eng_addr(stage), SILU_IMAGE_WORDS/8, RS_F);
     bns_seq_desc_silu_load(&d, RS_F);
     desc_words(n++, &d);
-    seq_desc_stop(n++);
+    desc_stop(n++);
     if (run_list(n, "silu table load"))
         return -1;
     // What the unit read must be the image: compare the scratchpad copy word for word.
@@ -923,10 +1052,11 @@ int resident_gate_init(const float *sig_lut, uint32_t *image)
         // A second resident table pair: load the sigmoid once, runs select it (no swaps).
         struct bns_seq_descriptor d;
         uint32_t n = 0;
+        build_sync();
         desc_fetch(n++, eng_addr(image), SILU_IMAGE_WORDS/8, RS_F);
         bns_seq_desc_silu_load_set(&d, RS_F, 1);
         desc_words(n++, &d);
-        seq_desc_stop(n++);
+        desc_stop(n++);
         if (run_list(n, "sigmoid table load"))
             return -1;
         R->gate_set = 1;
@@ -941,12 +1071,13 @@ int resident_silu_restore(void)
     struct resident_state *R = resident_state();
     struct bns_seq_descriptor d;
     uint32_t n = 0;
+    build_sync();
     if (!R->silu_ready || !R->silu_image)
         return -1;
     desc_fetch(n++, eng_addr(R->silu_image), SILU_IMAGE_WORDS/8, RS_F);
     bns_seq_desc_silu_load(&d, RS_F);
     desc_words(n++, &d);
-    seq_desc_stop(n++);
+    desc_stop(n++);
     if (run_list(n, "silu table restore")) {
         R->silu_enabled = 0;
         puts("resident: the SiLU table could not be restored - unit 11 off");
@@ -963,13 +1094,13 @@ int resident_gate_active(void)
 static void rl_table(const uint32_t *image, uint32_t img_sp)
 {
     struct bns_seq_descriptor d;
-    if (!resident_gate_active()) { RL.bad = 1; return; }
+    if (!resident_gate_active()) { RLS->bad = 1; return; }
     if (resident_state()->gate_set)
         return;                        // Both tables resident: nothing to swap.
     if (!rl_room(2)) return;
-    desc_fetch(RL.n++, eng_addr(image), SILU_IMAGE_WORDS/8, img_sp);
+    desc_fetch(RLS->n++, eng_addr(image), SILU_IMAGE_WORDS/8, img_sp);
     bns_seq_desc_silu_load(&d, img_sp);
-    desc_words(RL.n++, &d);
+    desc_words(RLS->n++, &d);
 }
 
 void rl_gate_begin(uint32_t img_sp) { rl_table(resident_state()->sig_image, img_sp); }
@@ -979,8 +1110,8 @@ void rl_gate_seg(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_
 {
     struct bns_seq_descriptor d;
     if (!rl_room(1) || bns_seq_desc_silu_table_set(&d, g_sp, m_sp, dst_sp, fixmap_sp, n,
-                                                   resident_state()->gate_set)) { RL.bad = 1; return; }
-    desc_words(RL.n++, &d);
+                                                   resident_state()->gate_set)) { RLS->bad = 1; return; }
+    desc_words(RLS->n++, &d);
 }
 
 uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, float *dst,
@@ -1016,10 +1147,13 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
         gate->rows > RS_WIDTH_MAX || ((uintptr_t)act & 31) ||
         ((uintptr_t)gate_out & 31) || ((uintptr_t)up_out & 31)) {
         R->fallbacks++;
+        resident_join();
         return -1;
     }
     uint32_t rows = gate->rows;
     uint64_t t0 = perf_now64();
+    build_begin();
+    R->keep_dst = 0;
     struct bns_seq_descriptor d;
     if (build_matvec(&n, gate, RS_F) || (gate_out && n > RS_DESC_MAX - 6u)) goto decline;
     if (gate_out) store_out(&n, gate_out, rows, RS_F);
@@ -1032,7 +1166,7 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     // stays in RS_F only, saving the store (70 KB per 27B layer: cache flush, invalidate, DMA).
     if (act)
         store_out(&n, act, rows, RS_F);
-    seq_desc_stop(n++);
+    desc_stop(n++);
     int rc = run_list(n, "ffn activation");
     if (!rc) {
         if (act) invd_cpu_dcache_range(act, rows*4);
@@ -1045,12 +1179,14 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
         if (fixups)
             silu_patch(rows, act);
         R->act_resident = 1;
+        lp_post();
     }
     R->silu_cycles += perf_now64() - t0;
     R->silu_lists++;
     return rc;
 decline:
     R->fallbacks++;
+    resident_join();                   // the caller's fallback may use the engine
     return -1;
 }
 
@@ -1125,6 +1261,8 @@ void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32
 int  rl_run(const char *what) { (void)what; return -1; }
 int  rl_start(const char *what) { (void)what; return -1; }
 int  rl_wait(void) { return -1; }
+int  rl_post(const char *what) { (void)what; return -1; }
+int  resident_join(void) { return 0; }
 uint32_t rl_count(void) { return 0; }
 int  rl_wait_desc(uint32_t k) { (void)k; return -1; }
 void resident_rsf_set(const void *src) { (void)src; }

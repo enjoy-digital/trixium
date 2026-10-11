@@ -61,6 +61,10 @@ void resident_silu_enable(int on);   // Console A/B.
 int  resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                       float *act, float *gate_out, float *up_out);
 void resident_mark_act(void);      // RS_F holds the next prepare's FP32 source (a list left it)
+// The next resident_matvec into dst leaves its result in RS_F only - no STORE, no cache
+// maintenance - for a caller whose next list reads it there (rl_rsf_is): dst's main-RAM copy
+// is then stale. The next rl_begin or resident_ffn_act forgets the request.
+void resident_keep_rsf(const void *dst);
 
 /* List Builder */
 /*--------------*/
@@ -112,11 +116,18 @@ int  resident_silu_restore(void);    // reload the SiLU table (after a failed ga
 uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, float *dst,
                              uint32_t n);
 int  rl_run(const char *what);
-// rl_run in two halves: the CPU may work between them on anything but the descriptor slots
-// (no other list is built), the list's scratchpad regions and the engine. A failed start
-// needs no rl_wait.
+// rl_run in two halves: the CPU may work between them on anything but the list's scratchpad
+// regions and main-RAM buffers and the engine - including building the next list (the slots
+// have two banks). A failed start needs no rl_wait.
 int  rl_start(const char *what);
 int  rl_wait(void);
+// rl_start without a wait: the list stays in flight while the caller builds the next one,
+// whose start (rl_start, rl_run, any resident_* list) waits for it first; resident_join()
+// waits for it explicitly (before the CPU reads what it wrote, or uses the engine). Its
+// failure is reported by that start or join. resident_prepare, and resident_matvec with
+// resident_keep_rsf, post their lists the same way.
+int  rl_post(const char *what);
+int  resident_join(void);
 // Descriptors built so far (an index for rl_wait_desc), and a wait inside a started list
 // until the first k have completed: the CPU may then read their scratchpad outputs.
 uint32_t rl_count(void);
@@ -154,6 +165,7 @@ struct resident_state {
     const float *sig_lut;
     uint8_t gate_ready, gate_set;   // gate_set: the sigmoid is resident in table set 1 (ABI 1.3)
     uint32_t gate_fixups;
+    const void *keep_dst;           // resident_keep_rsf
 };
 struct resident_state *resident_state(void);
 void resident_stats_reset(void);
