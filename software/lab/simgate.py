@@ -97,12 +97,24 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
     try:
         boot_text = boot(child)
         for cmd in pre:
+            # Wait for the command's own end marker before the prompt: `gen` answers the prompt
+            # before its tokens. engreset soft-resets the engine cluster; wedge does it in the
+            # middle of an op (stall reporter, soft reset, self-test).
             print(f"pre: {cmd}", flush=True)
-            answer = command(child, cmd, timeout=2*TIMEOUT)
-            # engreset soft-resets the engine cluster; wedge does it in the middle of an op.
-            expect = {"engreset": "ENGRESET ok", "wedge": "WEDGE: recovered"}.get(cmd)
-            if expect and expect not in answer:
+            done, ok = {"gen":      (r"GEN (DONE|ERR)",                "GEN DONE"),
+                        "engreset": (r"ENGRESET (ok|:)",               "ENGRESET ok"),
+                        "wedge":    (r"WEDGE: (recovered|the op|.*?reconfigure)",
+                                     "WEDGE: recovered")}.get(cmd.split()[0], (None, None))
+            child.sendline(cmd)
+            answer = ""
+            if done:
+                child.expect(done, timeout=2*TIMEOUT)
+                answer = child.before + child.after
+            child.expect(PROMPT, timeout=2*TIMEOUT)
+            answer += child.before
+            if ok and ok not in answer:
                 raise SystemExit(f"{cmd} failed: {answer[-300:]!r}")
+            print(f"pre: {cmd}: ok", flush=True)
         child.sendline(f"dbg {dbg}")
         child.expect(r"DBG armed for \d+ forwards", timeout=60)
         # `gen` takes the token COUNT first, then the prompt ids: "gen 1 1 2 3" is one token from
