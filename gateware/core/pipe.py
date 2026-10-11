@@ -37,11 +37,11 @@ KIND_OP_AXPY    = 2 # Weighted-V: acc[lane] += (p8 * v8) << (10 + e16 + B - Rpre
 
 # Helpers ------------------------------------------------------------------------------------------
 
-def _delay(module, sig, cycles):
-    """Return `sig` delayed by `cycles` sync stages."""
+def _delay(module, sig, cycles, reset_less=False):
+    """Return `sig` delayed by `cycles` sync stages (reset_less: a datapath delay line)."""
     cur = sig
     for _ in range(cycles):
-        nxt = Signal.like(cur)
+        nxt = Signal.like(cur, reset_less=reset_less)
         module.sync += nxt.eq(cur)
         cur = nxt
     return cur
@@ -64,7 +64,7 @@ def _adder_tree(module, lanes, reg_every=2):
         if n_lvl % reg_every == 0:
             regs = []
             for s in nxt:
-                r = Signal.like(s)
+                r = Signal.like(s, reset_less=True)
                 module.sync += r.eq(s)
                 regs.append(r)
             nxt = regs
@@ -77,15 +77,16 @@ def _adder_tree(module, lanes, reg_every=2):
 class ChannelPipe(LiteXModule):
     """One memory channel's compute pipeline: weight beats in, one int32 result per row out."""
     def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1):
-        # Op parameters (quasi-static while busy).
-        self.kind        = Signal(2)
-        self.rows        = Signal(16)
-        self.scale_beats = Signal(4)   # Scale beats per row (>= 1).
-        self.code_beats  = Signal(8)   # Code beats (= groups) per row.
-        self.bias        = Signal(7)   # B.
-        self.rshift      = Signal(6)   # R.
-        self.qn          = Signal()    # Dual-Q GQA mode (Q8/AXPY): 2 heads per stream.
-        self.rshift2     = Signal(6)   # Head-B AXPY pre-shift.
+        # Op parameters (quasi-static while busy; registered by the engine every cycle, reset-less:
+        # an op only reads them from `start` on).
+        self.kind        = Signal(2,  reset_less=True)
+        self.rows        = Signal(16, reset_less=True)
+        self.scale_beats = Signal(4,  reset_less=True) # Scale beats per row (>= 1).
+        self.code_beats  = Signal(8,  reset_less=True) # Code beats (= groups) per row.
+        self.bias        = Signal(7,  reset_less=True) # B.
+        self.rshift      = Signal(6,  reset_less=True) # R.
+        self.qn          = Signal(reset_less=True)     # Dual-Q GQA mode (Q8/AXPY): 2 heads/stream.
+        self.rshift2     = Signal(6,  reset_less=True) # Head-B AXPY pre-shift.
         self.start       = Signal()    # Pulse: reset counters/accumulator/error.
 
         # Weight beats in, results out.
@@ -188,11 +189,12 @@ class ChannelPipe(LiteXModule):
         ]
         self.comb += scale_r.adr.eq(Cat(g_cnt[4:7], row_cnt[0]))
 
-        codes_r  = Signal(256)
-        g_lo_r   = Signal(4) # Scale index within the 16-scale word.
-        q8_sub_r = Signal(2) # 256-bit slice of the 1024-bit x word (q8 mode).
-        pidx_r   = Signal(7) # AXPY: byte within the 1024-bit x word.
-        g_ax_r   = Signal(3) # AXPY: accumulator group of this beat.
+        # T0 payload (reset-less: qualified by v1 and the valid tags below).
+        codes_r  = Signal(256, reset_less=True)
+        g_lo_r   = Signal(4, reset_less=True) # Scale index within the 16-scale word.
+        q8_sub_r = Signal(2, reset_less=True) # 256-bit slice of the 1024-bit x word (q8 mode).
+        pidx_r   = Signal(7, reset_less=True) # AXPY: byte within the 1024-bit x word.
+        g_ax_r   = Signal(3, reset_less=True) # AXPY: accumulator group of this beat.
         self.sync += [
             If(t0_fire,
                 codes_r.eq(self.sink.data),
@@ -217,8 +219,8 @@ class ChannelPipe(LiteXModule):
         v1_tern  = [v1_rep(f"t{k}") for k in range(8)] # One per 16 ternary lanes.
         v1_q8    = [v1_rep(f"q{k}") for k in range(2)] # One per 16 Q8 lanes.
         v1_scale = v1_rep("scale")
-        row1      = _delay(self, row_cnt, 1)
-        row_last1 = _delay(self, row_last, 1)
+        row1      = _delay(self, row_cnt, 1, reset_less=True)
+        row_last1 = _delay(self, row_last, 1, reset_less=True) # A tag: qualified by v4.
 
         # T1: lane select + scale fp16 mux; register lanes -----------------------------------------
         # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error).
@@ -242,7 +244,7 @@ class ChannelPipe(LiteXModule):
                 }),
             ]
             code3_any.append(c_j == 3)
-            r = Signal((9, True))
+            r = Signal((9, True), reset_less=True)
             self.sync += If(v1_tern[j // 16], r.eq(lane))
             tern_lanes.append(r)
         self.comb += code3_seen.eq(v1 & (self.kind == KIND_OP_TERNARY) & reduce(or_, code3_any))
@@ -263,7 +265,7 @@ class ChannelPipe(LiteXModule):
         # Op-stable decode, registered: kind loads at START+1 and the first T1 use is at
         # START+5 or later, so a flop copy is exact and keeps the kind compare (and the
         # engine-side flop it would otherwise reach) out of the 32-lane operand mux.
-        is_axpy = Signal()
+        is_axpy = Signal(reset_less=True)
         self.sync += is_axpy.eq(self.kind == KIND_OP_AXPY)
         q8_lanes = []
         # The 32 signed 8x8 products go to DSPs (saves ~2.6k LUT per channel; Vivado folds
@@ -275,8 +277,8 @@ class ChannelPipe(LiteXModule):
         for j in range(32):
             w_j = Signal((8, True))
             x_j = Signal((8, True))
-            w_r = Signal((8, True))
-            x_r = Signal((8, True))
+            w_r = Signal((8, True), reset_less=True) # DSP A/B registers.
+            x_r = Signal((8, True), reset_less=True)
             p   = Signal((16, True))
             p.attr.add(("use_dsp", "yes"))
             self.comb += [
@@ -285,7 +287,7 @@ class ChannelPipe(LiteXModule):
                 p.eq(w_r*x_r),
             ]
             self.sync += If(v1_q8[j // 16], w_r.eq(w_j), x_r.eq(x_j))
-            r = Signal((16, True))
+            r = Signal((16, True), reset_less=True) # DSP P register.
             self.sync += If(v2_q8[j // 16], r.eq(p))
             q8_lanes.append(r)
 
@@ -295,7 +297,7 @@ class ChannelPipe(LiteXModule):
         scale_f16_t1 = Signal(16)
         self.comb += Case(g_lo_r, {i: scale_f16_t1.eq(scale_r.dat_r[16*i:16*(i+1)])
                                    for i in range(16)})
-        scale_f16 = Signal(16)
+        scale_f16 = Signal(16, reset_less=True)
         self.sync += If(v1_scale, scale_f16.eq(scale_f16_t1))
 
         # AXPY datapath (kind 2): per-lane shift + int32 accumulators + drain ----------------------
@@ -312,7 +314,7 @@ class ChannelPipe(LiteXModule):
         ax_c31n  = Signal((9, True), reset=-31)
         ax_bias  = Signal((8, True))
         ax_rpre  = Signal((8, True))
-        ax_bmr   = Signal((9, True)) # B - Rpre - 15, registered (op-stable inputs).
+        ax_bmr   = Signal((9, True), reset_less=True) # B - Rpre - 15, registered (op-stable).
         ax_exp   = Signal(5)
         ax_exp_s = Signal((7, True))
         ax_sh    = Signal((9, True)) # T1: exponent + (B - Rpre - 15), same range as before.
@@ -329,17 +331,17 @@ class ChannelPipe(LiteXModule):
             so they meet the products at T3; one dont_touch copy per 8 lanes."""
             copies = []
             for k in range(4):
-                neg1 = Signal(name=f"axneg1_{tag}{k}")
-                shl1 = Signal(4, name=f"axshl1_{tag}{k}")
-                shr1 = Signal(5, name=f"axshr1_{tag}{k}")
+                neg1 = Signal(name=f"axneg1_{tag}{k}", reset_less=True)
+                shl1 = Signal(4, name=f"axshl1_{tag}{k}", reset_less=True)
+                shr1 = Signal(5, name=f"axshr1_{tag}{k}", reset_less=True)
                 self.sync += If(v1_scale,
                     neg1.eq(sh < 0),
                     shl1.eq(Mux(sh >= 0, Mux(sh > 15, 15, sh[:4]), 0)),
                     shr1.eq(Mux(sh < 0, Mux(sh < ax_c31n, 31, (-sh)[:5]), 0)),
                 )
-                neg = Signal(name=f"axneg_{tag}{k}")
-                shl = Signal(4, name=f"axshl_{tag}{k}")
-                shr = Signal(5, name=f"axshr_{tag}{k}")
+                neg = Signal(name=f"axneg_{tag}{k}", reset_less=True)
+                shl = Signal(4, name=f"axshl_{tag}{k}", reset_less=True)
+                shr = Signal(5, name=f"axshr_{tag}{k}", reset_less=True)
                 for c in (neg, shl, shr):
                     c.attr.add(("dont_touch", "true"))
                 self.sync += [neg.eq(neg1), shl.eq(shl1), shr.eq(shr1)]
@@ -351,13 +353,14 @@ class ChannelPipe(LiteXModule):
         for j in range(32):
             neg, shl, shr = ax_amt[j // 8]
             sh_full = Signal((32, True))
-            r       = Signal((32, True))
+            r       = Signal((32, True), reset_less=True)
             self.comb += sh_full.eq(Mux(neg, q8_lanes[j] >> shr, q8_lanes[j] << shl))
             self.sync += If(v2a, r.eq(sh_full))
             ax_shifted.append(r)
 
         AX_GROUPS = 4 # head_dim <= 128 for AXPY ops (kvpack contract).
-        acc_ax = [[Signal((32, True), name=f"axacc{g}_{j}") for j in range(32)]
+        # Accumulators: cleared by `start`, reset-less.
+        acc_ax = [[Signal((32, True), name=f"axacc{g}_{j}", reset_less=True) for j in range(32)]
                   for g in range(AX_GROUPS)]
         acc_flat = Array([acc_ax[g][j] for g in range(AX_GROUPS) for j in range(32)])
 
@@ -404,12 +407,12 @@ class ChannelPipe(LiteXModule):
         # a row and rows are separated by at least one scale beat, so the same bank is never
         # updated on consecutive beats and the single-cycle read-modify-write sees its own
         # previous write. `start` keeps priority over the enables.
-        g_ax1 = _delay(self, g_ax_r, 2) # Beat group at T3 (decode below -> T4).
+        g_ax1 = _delay(self, g_ax_r, 2, reset_less=True) # Beat group at T3 (decode below -> T4).
         ax_we = [Signal(name=f"ax_we{g}") for g in range(AX_GROUPS)]
         self.sync += [ax_we[g].eq(v2a & is_axpy & (g_ax1[:2] == g)) for g in range(AX_GROUPS)]
         g_sel = []
         for k in range(4):
-            c = Signal(2, name=f"ax_gsel{k}")
+            c = Signal(2, name=f"ax_gsel{k}", reset_less=True)
             c.attr.add(("dont_touch", "true"))
             self.sync += c.eq(g_ax1[:2]) # The beat's group at T3, one copy per 8 lanes.
             g_sel.append(c)
@@ -433,8 +436,8 @@ class ChannelPipe(LiteXModule):
         # Q8 lanes are valid one cycle after the ternary lanes (the DSP operand stage).
         n_tree = max(tern_regs, q8_regs + 1)
         assert n_tree == 3 and q8_regs + 1 <= n_tree
-        tern_sum = _delay(self, tern_sum, n_tree - tern_regs)
-        q8_sum   = _delay(self, q8_sum,   n_tree - q8_regs - 1)
+        tern_sum = _delay(self, tern_sum, n_tree - tern_regs,  reset_less=True)
+        q8_sum   = _delay(self, q8_sum,   n_tree - q8_regs - 1, reset_less=True)
         gs = Signal((22, True))
         self.comb += gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum))
 
@@ -442,9 +445,9 @@ class ChannelPipe(LiteXModule):
         # the tree adds n_tree stages -> gs valid at T{2+n_tree}. v1 is high at T1, so tags
         # need n_tree+1 delays; scale_f16 (valid T2) needs n_tree.
         v2        = _delay(self, v1,        n_tree + 1)
-        row2      = _delay(self, row1,      n_tree + 1)
-        row_last2 = _delay(self, row_last1, n_tree + 1)
-        scale2    = _delay(self, scale_f16, n_tree)
+        row2      = _delay(self, row1,      n_tree + 1, reset_less=True)
+        row_last2 = _delay(self, row_last1, n_tree + 1, reset_less=True)
+        scale2    = _delay(self, scale_f16, n_tree,     reset_less=True)
 
         # fp16 decompose (comb) at the tree output. All arithmetic goes through dedicated
         # signed intermediates: Migen's Verilog emission computes sub-expressions at
@@ -472,14 +475,14 @@ class ChannelPipe(LiteXModule):
         ]
 
         # T+1: product (DSP) -----------------------------------------------------------------------
-        prod   = Signal((34, True))
+        prod   = Signal((34, True), reset_less=True)
         bias_s = Signal((8, True)) # Signed copy of B: signed-only arithmetic for sh_c.
         sh_c   = Signal((8, True)) # 12 - (e16 + B) in [0, 44] (comb).
-        shamt  = Signal(6)         # Saturated at T+1 (>>45 of a 46-bit value = sign only),
+        shamt  = Signal(6, reset_less=True) # Saturated at T+1 (>>45 of a 46-bit value = sign only),
                                    # so T+2 is register -> 46-bit shifter -> register.
         v3     = Signal()
-        row3   = Signal(16)
-        rlast3 = Signal()
+        row3   = Signal(16, reset_less=True)
+        rlast3 = Signal(reset_less=True)
         self.comb += [
             bias_s.eq(self.bias),
             sh_c.eq(12 - e16 - bias_s),
@@ -493,10 +496,10 @@ class ChannelPipe(LiteXModule):
         ]
 
         # T+2: shift to accumulator scale (contribution = prod << (e16+B), via <<12 then >>) -------
-        contrib = Signal((46, True))
+        contrib = Signal((46, True), reset_less=True)
         v4      = Signal()
-        row4    = Signal(16)
-        rlast4  = Signal()
+        row4    = Signal(16, reset_less=True)
+        rlast4  = Signal(reset_less=True)
         self.sync += [
             contrib.eq((prod << 12) >> shamt),
             v4.eq(v3),
@@ -505,7 +508,7 @@ class ChannelPipe(LiteXModule):
         ]
 
         # T+3: 48-bit accumulate; emit on row_last -------------------------------------------------
-        acc     = Signal((48, True))
+        acc     = Signal((48, True), reset_less=True) # Cleared by `start`.
         acc_new = Signal((48, True))
         result  = Signal((48, True))
         self.comb += result.eq(acc_new >> self.rshift)

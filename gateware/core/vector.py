@@ -181,7 +181,8 @@ class VectorUnit(LiteXModule):
         self.specials += vbank_a, vbank_b, vwa, vwb, *vra, *vrb
         vlvt = Array([Signal(name=f"vlvt{i}") for i in range(vregs)])
         # (Write enables/data are assigned below, once wb2/lut_r and the E-stage tags exist.)
-        S = Array([Signal((48, True), name=f"sr{i}") for i in range(8)])
+        # The scalar file is cleared at start (S7 seeded): reset-less.
+        S = Array([Signal((48, True), name=f"sr{i}", reset_less=True) for i in range(8)])
 
         def lane(sig, i):
             return sig[32*i:32*(i+1)]
@@ -208,18 +209,18 @@ class VectorUnit(LiteXModule):
         # F / D state ------------------------------------------------------------------------------
         pc         = Signal(16)     # Next word to fetch.
         fetch_en   = Signal()
-        insn_d     = Signal(32)
-        d_pc       = Signal(16)
+        insn_d     = Signal(32, reset_less=True) # (qualified by d_valid)
+        d_pc       = Signal(16, reset_less=True)
         d_valid    = Signal()
         use_lf     = Signal()       # D consumes loop_first instead of insn_d.
-        loop_first = Signal(32)
-        loop_start = Signal(16)
+        loop_first = Signal(32, reset_less=True) # Loaded by LOOPS before any LOOPE reads it.
+        loop_start = Signal(16, reset_less=True)
         loop_cnt   = Signal(32)
         lf_arm     = Signal()       # The word after a LOOPS is the loop's first instruction.
         # Second (outer) loop level: independent registers, same mechanism.
         use_lf2     = Signal()
-        loop_first2 = Signal(32)
-        loop_start2 = Signal(16)
+        loop_first2 = Signal(32, reset_less=True)
+        loop_start2 = Signal(16, reset_less=True)
         loop_cnt2   = Signal(32)
         lf2_arm     = Signal()
         # Run state.
@@ -330,79 +331,82 @@ class VectorUnit(LiteXModule):
         self.comb += sn_cases
 
         # E1 record --------------------------------------------------------------------------------
+        # Stage records (E1..E4): the valids keep their reset, every other field is payload they
+        # qualify (reset-less).
         e1_valid    = Signal()
-        e1_op       = Signal(6)
-        e1_vd       = Signal(VBITS)
-        e1_va       = Signal(VBITS)
-        e1_vb       = Signal(VBITS)
-        e1_sd       = Signal(3)
-        e1_imm      = Signal((11, True))
-        e1_va_r     = Signal(32*LANES)
-        e1_vb_r     = Signal(32*LANES)
-        e1_sa_r     = Signal((48, True))
-        e1_is_load  = Signal()
-        e1_is_store = Signal()
-        e1_is_lut   = Signal()
-        e1_is_red   = Signal()
-        e1_wr_v     = Signal()
-        e1_f = {n: Signal(name=f"e1_f_{n.lower()}") for n in VEC_WB + ST_OPS + RED_OPS}
+        e1_op       = Signal(6, reset_less=True)
+        e1_vd       = Signal(VBITS, reset_less=True)
+        e1_va       = Signal(VBITS, reset_less=True)
+        e1_vb       = Signal(VBITS, reset_less=True)
+        e1_sd       = Signal(3, reset_less=True)
+        e1_imm      = Signal((11, True), reset_less=True)
+        e1_va_r     = Signal(32*LANES, reset_less=True)
+        e1_vb_r     = Signal(32*LANES, reset_less=True)
+        e1_sa_r     = Signal((48, True), reset_less=True)
+        e1_is_load  = Signal(reset_less=True)
+        e1_is_store = Signal(reset_less=True)
+        e1_is_lut   = Signal(reset_less=True)
+        e1_is_red   = Signal(reset_less=True)
+        e1_wr_v     = Signal(reset_less=True)
+        e1_f = {n: Signal(name=f"e1_f_{n.lower()}", reset_less=True)
+                for n in VEC_WB + ST_OPS + RED_OPS}
         # Decoded at D, registered: no opcode compare in the E1 cone (timing: the scalar-B
         # select fans out to every lane's operand mux).
-        e1_scalar_b = Signal()
-        e1_redssq   = Signal()
-        e1_is_ldw   = Signal()
-        e1_is_mul   = Signal()
+        e1_scalar_b = Signal(reset_less=True)
+        e1_redssq   = Signal(reset_less=True)
+        e1_is_ldw   = Signal(reset_less=True)
+        e1_is_mul   = Signal(reset_less=True)
 
         # E2 record --------------------------------------------------------------------------------
         e2_valid    = Signal()
-        e2_op       = Signal(6)
-        e2_vd       = Signal(VBITS)
-        e2_sd       = Signal(3)
-        e2_is_load  = Signal()
-        e2_is_ldw   = Signal()
-        e2_is_store = Signal()
-        e2_is_lut   = Signal()
-        e2_is_red   = Signal()
-        e2_is_mul   = Signal()
-        e2_is_mulh  = Signal()
-        e2_wr_v     = Signal()
-        e2_f_lut    = {n: Signal(name=f"e2_f_{n.lower()}") for n in LUT_OPS}
-        e2_f_red    = {n: Signal(name=f"e2_f_{n.lower()}") for n in RED_OPS}
-        ex1_r       = Signal(32*LANES)
-        mul_r       = [Signal((64, True), name=f"mul_r{i}") for i in range(LANES)]
-        red1_sum    = [Signal((48, True), name=f"red1_sum{k}") for k in range(4)]
-        red1_max    = [Signal(32, name=f"red1_max{k}") for k in range(4)]
-        red1_smax   = [Signal((32, True), name=f"red1_smax{k}") for k in range(4)]
-        e2_st_adr   = Signal(13)
-        e2_st_we    = Signal(8)
-        e2_st_dat   = Signal(256)
-        e2_fr7      = [Signal(7, name=f"e2_fr7_{i}") for i in range(LANES)]
-        e2_fr6      = [Signal(6, name=f"e2_fr6_{i}") for i in range(LANES)]
-        e2_fq7      = [Signal(7, name=f"e2_fq7_{i}") for i in range(LANES)]
+        e2_op       = Signal(6, reset_less=True)
+        e2_vd       = Signal(VBITS, reset_less=True)
+        e2_sd       = Signal(3, reset_less=True)
+        e2_is_load  = Signal(reset_less=True)
+        e2_is_ldw   = Signal(reset_less=True)
+        e2_is_store = Signal(reset_less=True)
+        e2_is_lut   = Signal(reset_less=True)
+        e2_is_red   = Signal(reset_less=True)
+        e2_is_mul   = Signal(reset_less=True)
+        e2_is_mulh  = Signal(reset_less=True)
+        e2_wr_v     = Signal(reset_less=True)
+        e2_f_lut    = {n: Signal(name=f"e2_f_{n.lower()}", reset_less=True) for n in LUT_OPS}
+        e2_f_red    = {n: Signal(name=f"e2_f_{n.lower()}", reset_less=True) for n in RED_OPS}
+        ex1_r       = Signal(32*LANES, reset_less=True)
+        mul_r       = [Signal((64, True), name=f"mul_r{i}", reset_less=True) for i in range(LANES)]
+        red1_sum    = [Signal((48, True), name=f"red1_sum{k}", reset_less=True) for k in range(4)]
+        red1_max    = [Signal(32, name=f"red1_max{k}", reset_less=True) for k in range(4)]
+        red1_smax   = [Signal((32, True), name=f"red1_smax{k}", reset_less=True) for k in range(4)]
+        e2_st_adr   = Signal(13, reset_less=True)
+        e2_st_we    = Signal(8, reset_less=True)
+        e2_st_dat   = Signal(256, reset_less=True)
+        e2_fr7      = [Signal(7, name=f"e2_fr7_{i}", reset_less=True) for i in range(LANES)]
+        e2_fr6      = [Signal(6, name=f"e2_fr6_{i}", reset_less=True) for i in range(LANES)]
+        e2_fq7      = [Signal(7, name=f"e2_fq7_{i}", reset_less=True) for i in range(LANES)]
 
         # E3 record --------------------------------------------------------------------------------
         e3_valid    = Signal()
-        e3_vd       = Signal(VBITS)
-        e3_sd       = Signal(3)
-        e3_is_lut   = Signal()
-        e3_is_red   = Signal()
-        e3_f_red    = {n: Signal(name=f"e3_f_{n.lower()}") for n in RED_OPS}
+        e3_vd       = Signal(VBITS, reset_less=True)
+        e3_sd       = Signal(3, reset_less=True)
+        e3_is_lut   = Signal(reset_less=True)
+        e3_is_red   = Signal(reset_less=True)
+        e3_f_red    = {n: Signal(name=f"e3_f_{n.lower()}", reset_less=True) for n in RED_OPS}
         # LUT interpolation is split across E2/E3 for timing. E2 reads the ROM and selects
         # (e_a, e_b - e_a, frac) for the op; E3 multiplies and adds; the result lands in
         # lut_r at the E3/E4 edge and is written from E4. LUT latency is 4.
-        e3_lea      = [Signal((18, True), name=f"e3_lea{i}") for i in range(LANES)]
-        e3_ld       = [Signal((19, True), name=f"e3_ld{i}") for i in range(LANES)]
-        e3_lfr      = [Signal(8, name=f"e3_lfr{i}") for i in range(LANES)]
-        red2_sum    = Signal((48, True))
-        red2_ssq    = [Signal((64, True), name=f"red2_ssq{k}") for k in range(4)]
-        red2_max    = Signal(32)
-        red2_smax   = Signal((32, True))
+        e3_lea      = [Signal((18, True), name=f"e3_lea{i}", reset_less=True) for i in range(LANES)]
+        e3_ld       = [Signal((19, True), name=f"e3_ld{i}", reset_less=True) for i in range(LANES)]
+        e3_lfr      = [Signal(8, name=f"e3_lfr{i}", reset_less=True) for i in range(LANES)]
+        red2_sum    = Signal((48, True), reset_less=True)
+        red2_ssq    = [Signal((64, True), name=f"red2_ssq{k}", reset_less=True) for k in range(4)]
+        red2_max    = Signal(32, reset_less=True)
+        red2_smax   = Signal((32, True), reset_less=True)
 
         # E4 record (LUT writeback only) -----------------------------------------------------------
         e4_valid    = Signal()
-        e4_vd       = Signal(VBITS)
-        e4_is_lut   = Signal()
-        lut_r       = Signal(32*LANES)
+        e4_vd       = Signal(VBITS, reset_less=True)
+        e4_is_lut   = Signal(reset_less=True)
+        lut_r       = Signal(32*LANES, reset_less=True)
 
         # Hazards / pipeline control ---------------------------------------------------------------
         def vd_match(stage_vd):

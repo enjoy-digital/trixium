@@ -77,14 +77,14 @@ class _ResultPacker(LiteXModule):
 
         # # #
 
-        # Held entry.
+        # Held entry (the payload is reset-less: qualified by p_v).
         p_v       = Signal()
-        p_row     = Signal(16)
-        p_dat     = Signal(256)
-        p_wide    = Signal()
-        p_head    = Signal()
-        p_slot    = Signal(24)
-        p_lanes   = Signal(8)
+        p_row     = Signal(16,  reset_less=True)
+        p_dat     = Signal(256, reset_less=True)
+        p_wide    = Signal(reset_less=True)
+        p_head    = Signal(reset_less=True)
+        p_slot    = Signal(24,  reset_less=True)
+        p_lanes   = Signal(8,   reset_less=True)
         last_seen = Signal() # The pipe's final result has been consumed.
 
         # Merge / emit / accept decisions.
@@ -356,12 +356,14 @@ class MatVecEngine(LiteXModule):
             self.pipes.append(pipe)
 
         # Latched command --------------------------------------------------------------------------
+        # Reset-less but for the kind (its mode decodes steer the read and gather handshakes):
+        # every other field is loaded at accept and only read from START on.
         cmd_r = {}
         for name in (("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
                      "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
                      "rep", "dstride", "sstride",
                      "qn", "qstride", "rshift2", "xred")):
-            cmd_r[name] = Signal.like(getattr(self.cmd, name))
+            cmd_r[name] = Signal.like(getattr(self.cmd, name), reset_less=(name != "kind"))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
         command_accept = self.cmd.valid & self.cmd.ready
@@ -414,20 +416,20 @@ class MatVecEngine(LiteXModule):
 
         # Registered fill pipeline: address at T, data+write at T+1.
         fill_active_d = Signal()
-        fill_beat_d   = Signal(10)
+        fill_beat_d   = Signal(10, reset_less=True)
         st_cnt        = Signal(13) # STORE beat counter (address holds until accepted).
         # Multi-packet STORE state: packet index, running memory address, running source
         # beat offset (all reset on accept; advanced between packets).
         st_rep        = Signal(5)
-        st_addr_r     = Signal(32)
-        st_src_off    = Signal(13)
+        st_addr_r     = Signal(32, reset_less=True)
+        st_src_off    = Signal(13, reset_less=True)
         st_last_pkt   = Signal()
         st_next       = Signal()   # Pulse: advance to the next packet.
         self.comb += st_last_pkt.eq((st_rep + 1 >= cmd_r["rep"]))
         # Scratchpad read address for the fill and the STORE stream, kept as a counter (no
         # adder in front of the BRAM address, timing). Reset to xsrc at START, advanced
         # exactly when fill_beat / st_cnt advance, re-based on each STORE packet.
-        eng_fill_adr = Signal(len(scratchpad.fill.adr))
+        eng_fill_adr = Signal(len(scratchpad.fill.adr), reset_less=True)
         xsrc_w = Signal(len(scratchpad.fill.adr))
         self.comb += xsrc_w.eq(cmd_r["xsrc"] >> 5)
         # STORE stream through a 4-deep prefetch FIFO: reads are issued ahead (whenever the
@@ -471,8 +473,8 @@ class MatVecEngine(LiteXModule):
         # position/enable are delayed to stay aligned. The last writes land during ISSUE
         # (x-buffer reads only start once beats arrive).
         fill_act1 = Signal()
-        fill_pos1 = Signal(10)
-        fill_dat1 = Signal(256)
+        fill_pos1 = Signal(10,  reset_less=True)
+        fill_dat1 = Signal(256, reset_less=True)
         self.sync += [
             fill_act1.eq(fill_active_d),
             fill_pos1.eq(fill_pos),
@@ -480,8 +482,8 @@ class MatVecEngine(LiteXModule):
         ]
         for i, pipe in enumerate(self.pipes):
             fa2 = Signal(name=f"fill_act2_{i}")
-            fp2 = Signal(10, name=f"fill_pos2_{i}")
-            fd2 = Signal(256, name=f"fill_dat2_{i}")
+            fp2 = Signal(10, name=f"fill_pos2_{i}", reset_less=True)
+            fd2 = Signal(256, name=f"fill_dat2_{i}", reset_less=True)
             for sig in (fa2, fp2, fd2):
                 sig.attr.add(("dont_touch", "true"))
             self.sync += [
@@ -535,7 +537,7 @@ class MatVecEngine(LiteXModule):
             setattr(self, f"gin{i}", ib)
             pk = _ResultPacker()
             setattr(self, f"pack{i}", pk)
-            rows_last_i = Signal(16)
+            rows_last_i = Signal(16, reset_less=True)
             self.sync += rows_last_i.eq(cmd_r["rows"] - 1 + (i < cmd_r["rem"]))
             self.comb += [
                 ib.sink.valid.eq(pipe.source.valid),
@@ -588,7 +590,7 @@ class MatVecEngine(LiteXModule):
             # always lands one cycle later and the xred write below follows it.
             depth = (len(sigs) - 1).bit_length()
             if depth == 0:
-                r = Signal(32)
+                r = Signal(32, reset_less=True)
                 self.sync += r.eq(sigs[0])
                 return r
             reg_level = min(1, depth - 1)
@@ -597,7 +599,7 @@ class MatVecEngine(LiteXModule):
                 reg = (level == reg_level)
                 nxt = []
                 for a, b in zip(sigs[::2], sigs[1::2]):
-                    m = Signal(32)
+                    m = Signal(32, reset_less=True)
                     if reg:
                         self.sync += m.eq(a + b)
                     else:
@@ -605,7 +607,7 @@ class MatVecEngine(LiteXModule):
                     nxt.append(m)
                 if len(sigs) % 2:
                     if reg:
-                        r = Signal(32)
+                        r = Signal(32, reset_less=True)
                         self.sync += r.eq(sigs[-1])
                         nxt.append(r)
                     else:
@@ -620,7 +622,7 @@ class MatVecEngine(LiteXModule):
                 _addtree([g.data[32*l:32*l + 32] for g in gsrc]))
         # xred write follows the registered tree level by one cycle.
         xred_all_d  = Signal()
-        xred_slot_d = Signal(len(scratchpad.gather.adr))
+        xred_slot_d = Signal(len(scratchpad.gather.adr), reset_less=True)
 
         self.comb += [
             rr.request.eq(Cat(*[g.valid for g in gsrc])),
@@ -659,9 +661,9 @@ class MatVecEngine(LiteXModule):
         # (INT32_MIN, 0xFFFFFF), which no valid lane loses to. `done` waits for this
         # pipeline to empty (am_busy), so no reader can see a stale argmax.
         am_v_r = Signal()
-        am_l_r = Signal(8)
-        am_d_r = Signal(256)
-        am_b_r = Signal(24)
+        am_l_r = Signal(8,   reset_less=True)
+        am_d_r = Signal(256, reset_less=True)
+        am_b_r = Signal(24,  reset_less=True)
         self.sync += [
             am_v_r.eq(is_matvec & ~ilv_mode & grant_valid & ~grant_wide),
             am_l_r.eq(grant_lanes),
@@ -686,7 +688,8 @@ class MatVecEngine(LiteXModule):
         am_v2 = Signal(); l2 = []
         for k in range(4):
             v, i = _pick(*lv[2*k], *lv[2*k + 1])
-            vr = Signal((32, True), name=f"am_v2_{k}"); ir = Signal(24, name=f"am_i2_{k}")
+            vr = Signal((32, True), name=f"am_v2_{k}", reset_less=True)
+            ir = Signal(24, name=f"am_i2_{k}", reset_less=True)
             self.sync += [vr.eq(v), ir.eq(i)]
             l2.append((vr, ir))
         self.sync += am_v2.eq(am_v_r)
@@ -694,14 +697,15 @@ class MatVecEngine(LiteXModule):
         am_v3 = Signal(); l3 = []
         for k in range(2):
             v, i = _pick(*l2[2*k], *l2[2*k + 1])
-            vr = Signal((32, True), name=f"am_v3_{k}"); ir = Signal(24, name=f"am_i3_{k}")
+            vr = Signal((32, True), name=f"am_v3_{k}", reset_less=True)
+            ir = Signal(24, name=f"am_i3_{k}", reset_less=True)
             self.sync += [vr.eq(v), ir.eq(i)]
             l3.append((vr, ir))
         self.sync += am_v3.eq(am_v2)
         # Level 3: 2 -> 1 (registered).
         am_v4 = Signal()
         v, i = _pick(*l3[0], *l3[1])
-        am_s_r = Signal((32, True)); am_i_r = Signal(24)
+        am_s_r = Signal((32, True), reset_less=True); am_i_r = Signal(24, reset_less=True)
         self.sync += [am_s_r.eq(v), am_i_r.eq(i), am_v4.eq(am_v3)]
         am_busy = Signal()
         self.comb += am_busy.eq(am_v_r | am_v2 | am_v3 | am_v4)
@@ -721,7 +725,7 @@ class MatVecEngine(LiteXModule):
         fetch_valid = Signal()
         fetch_data  = Signal(256)
         fetch_cnt   = Signal(24)
-        fetch_wcnt  = Signal(24)
+        fetch_wcnt  = Signal(24, reset_less=True) # Write address offset, cleared at accept.
         fetch_take  = Signal() # A fetch beat is actually consumed this cycle.
         self.comb += [
             fetch_valid.eq(reduce_or(fetch_valids)),
@@ -739,9 +743,9 @@ class MatVecEngine(LiteXModule):
         eng_gw_adr_c = Signal(len(scratchpad.gather.adr))
         eng_gw_we_c  = Signal(8)
         eng_gw_dat_c = Signal(256)
-        eng_gw_adr   = Signal(len(scratchpad.gather.adr))
+        eng_gw_adr   = Signal(len(scratchpad.gather.adr), reset_less=True)
         eng_gw_we    = Signal(8)
-        eng_gw_dat   = Signal(256)
+        eng_gw_dat   = Signal(256, reset_less=True)
         self.sync += [
             eng_gw_adr.eq(eng_gw_adr_c),
             eng_gw_we.eq(eng_gw_we_c),
@@ -829,7 +833,7 @@ class MatVecEngine(LiteXModule):
         for l in range(8):
             ls = Signal((32, True), name=f"labs_s{l}")
             la = Signal(32, name=f"labs{l}")
-            lr = Signal(32, name=f"labsr{l}")
+            lr = Signal(32, name=f"labsr{l}", reset_less=True) # Rewritten every cycle.
             self.comb += [
                 ls.eq(eng_gw_dat[32*l:32*l+32]),
                 la.eq(Mux(eng_gw_we[l], Mux(ls < 0, -ls, ls), 0)),

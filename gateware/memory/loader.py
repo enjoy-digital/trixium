@@ -107,9 +107,10 @@ class Loader(LiteXModule):
         # 128-bit words into the up-converter would duplicate each one across both halves of
         # the beat; a data_width=256 simulation never exercises the converter).
         poke_ratio = 256//32
-        poke_sr    = Signal(256)
+        poke_sr    = Signal(256, reset_less=True)
         poke_cnt   = Signal(max=poke_ratio)
         self.poke_fifo = poke_fifo = stream.SyncFIFO([("data", 256)], 256)
+        poke_fifo.sink.data.reset_less = True # Registered here, qualified by its valid.
         self.sync += [
             poke_fifo.sink.valid.eq(0),
             If(self.poke.re,
@@ -150,12 +151,13 @@ class Loader(LiteXModule):
         beats = Signal(24)
         chan  = self.chan.storage
 
-        st_chan  = Signal(5)
-        st_addr  = Signal(33)
-        st_len   = Signal(24)
+        # Latched commands (reset-less: loaded in IDLE, read only in their EST_*/MST_* states).
+        st_chan  = Signal(5,  reset_less=True)
+        st_addr  = Signal(33, reset_less=True)
+        st_len   = Signal(24, reset_less=True)
         st_cnt   = Signal(24)
-        mst_addr = Signal(33)
-        mst_len  = Signal(24)
+        mst_addr = Signal(33, reset_less=True)
+        mst_len  = Signal(24, reset_less=True)
 
         # Stream resynchronisation.
         #

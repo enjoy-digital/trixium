@@ -215,11 +215,12 @@ class Scratchpad(LiteXModule):
         bus = wishbone.Interface(data_width=32, address_width=32, addressing="byte")
         # Request and read data are registered for timing: the CPU's bus decode reached the
         # BRAM address pins combinationally. Costs 2 cycles per CPU access.
-        adr_r  = Signal(len(self._sb_adr[0]))
-        sel_r  = Signal(3)
-        bsel_r = Signal(4)
-        wdat_r = Signal(32)
-        rdat_r = Signal(32)
+        # Reset-less: the request is latched in IDLE, the read data qualified by ack.
+        adr_r  = Signal(len(self._sb_adr[0]), reset_less=True)
+        sel_r  = Signal(3,  reset_less=True)
+        bsel_r = Signal(4,  reset_less=True)
+        wdat_r = Signal(32, reset_less=True)
+        rdat_r = Signal(32, reset_less=True)
         self.comb += [
             self._sb_adr[0].eq(adr_r),
             self._sb_sel[0].eq(sel_r),
@@ -281,7 +282,7 @@ class _ScratchpadCSR(LiteXModule):
         # # #
 
         sp         = scratchpad
-        sel_r      = Signal(3)
+        sel_r      = Signal(3, reset_less=True) # Registered every cycle.
         rd_p       = Signal() # Read pending (adr written, not yet granted).
         wr_p       = Signal() # Write pending.
         cap        = Signal() # Capture read data this cycle.

@@ -271,8 +271,8 @@ class Sequencer(LiteXModule):
         dptr   = Signal(13) # Beat index of the current descriptor.
         left   = Signal(16)
         dcount = Signal(16)
-        d0     = Signal(256)
-        d1     = Signal(256)
+        d0     = Signal(256, reset_less=True) # The descriptor beats: fetched before any use.
+        d1     = Signal(256, reset_less=True)
 
         def w(beat, i): # Word i of a captured beat.
             return (d0 if beat == 0 else d1)[32*(i % 8):32*(i % 8) + 32]
@@ -296,8 +296,8 @@ class Sequencer(LiteXModule):
         silu_dispatch, norm_dispatch, conv_dispatch = [], [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
-            list_base = Signal(24)
-            list_end  = Signal(32)
+            list_base = Signal(24, reset_less=True) # Latched at start.
+            list_end  = Signal(32, reset_less=True)
             start_end = Signal(32)
             self.comb += start_end.eq(self.base.storage + (self.count.storage << 6))
             list_ok = (self.base.storage[:5] == 0) & (start_end <= scratchpad_size)
@@ -566,9 +566,9 @@ class Sequencer(LiteXModule):
         # bus. The address is registered in FETCHL from a comb index (lut_adr_r), the
         # fetched beat is captured whole (lut_beat_r, like d0/d1) and the word select runs
         # off that register a cycle later.
-        lut_adr_r  = Signal(13)
-        lut_sel_r  = Signal(3)
-        lut_beat_r = Signal(256)
+        lut_adr_r  = Signal(13,  reset_less=True)
+        lut_sel_r  = Signal(3,   reset_less=True)
+        lut_beat_r = Signal(256, reset_less=True)
         self.comb += [
             lut_mode.eq((unit == 2) & w(0, 0)[12]),
             lut_base.eq(w(1, 10)[0:13]),

@@ -129,13 +129,15 @@ class PipelinedDDRCSR(LiteXModule):
 
         # # #
 
-        # Registered request, one copy per controller group; registered read data back.
-        adr, dat_w = Signal(address_width), Signal(data_width)
+        # Registered request, one copy per controller group; registered read data back. The
+        # address and data are reset-less (qualified by we/re), the strobes keep their reset.
+        adr, dat_w = Signal(address_width, reset_less=True), Signal(data_width, reset_less=True)
         we, re     = Signal(), Signal()
         rdats      = []
         for buses in groups:
             s = csr_bus.Interface(address_width=address_width, data_width=data_width)
-            rd = Signal(data_width)
+            s.adr.reset_less = s.dat_w.reset_less = True
+            rd = Signal(data_width, reset_less=True)
             self.sync += [s.adr.eq(adr), s.dat_w.eq(dat_w), s.we.eq(we), s.re.eq(re)]
             self.sync += rd.eq(reduce(or_, [b.dat_r for b in buses]))
             for b in buses:

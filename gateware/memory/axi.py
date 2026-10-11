@@ -74,7 +74,7 @@ class AXIReader(LiteXModule):
         beat_shift = log2_int(BEAT_BYTES)
 
         # Burst splitter ---------------------------------------------------------------------------
-        cur_addr   = Signal(axi.address_width)
+        cur_addr   = Signal(axi.address_width, reset_less=True) # Read only while active.
         beats_left = Signal(24)
         active     = Signal()
 
@@ -148,15 +148,16 @@ class AXIReader(LiteXModule):
         # sit at fixed die locations; a comb path from them into the fabric FIFO limited
         # timing. The slice holds beats outside the FIFO, so the AR credit accounting
         # (bounded by fifo_depth) stays conservative.
+        # The payloads are reset-less: qualified by r_valid / rs_valid.
         r_valid  = Signal()
-        r_data   = Signal(256)
-        r_last   = Signal()
-        r_id     = Signal(idbits)
+        r_data   = Signal(256, reset_less=True)
+        r_last   = Signal(reset_less=True)
+        r_id     = Signal(idbits, reset_less=True)
         r_ready  = Signal()
         rs_valid = Signal()
-        rs_data  = Signal(256)
-        rs_last  = Signal()
-        rs_id    = Signal(idbits)
+        rs_data  = Signal(256, reset_less=True)
+        rs_last  = Signal(reset_less=True)
+        rs_id    = Signal(idbits, reset_less=True)
         r_infire = Signal()
         self.comb += [
             axi.r.ready.eq(~rs_valid),
@@ -282,7 +283,7 @@ class AXIWriter(LiteXModule):
         beat_shift = log2_int(BEAT_BYTES)
 
         # Burst splitter (mirror of the reader's) --------------------------------------------------
-        cur_addr   = Signal(axi.address_width)
+        cur_addr   = Signal(axi.address_width, reset_less=True) # Read only while active.
         beats_left = Signal(24)
         active     = Signal()
 
@@ -352,12 +353,13 @@ class AXIWriter(LiteXModule):
         wi_valid = Signal()
         wi_last  = Signal()
         wi_ready = Signal()
+        # The payloads are reset-less: qualified by wo_valid / ws_valid.
         wo_valid = Signal()
-        wo_data  = Signal(len(axi.w.data))
-        wo_last  = Signal()
+        wo_data  = Signal(len(axi.w.data), reset_less=True)
+        wo_last  = Signal(reset_less=True)
         ws_valid = Signal()
-        ws_data  = Signal(len(axi.w.data))
-        ws_last  = Signal()
+        ws_data  = Signal(len(axi.w.data), reset_less=True)
+        ws_last  = Signal(reset_less=True)
         self.comb += [
             winfo.source.ready.eq(~w_active),
             wi_valid.eq(w_active & data.valid),
@@ -465,11 +467,11 @@ class AXIResetShim(LiteXModule):
 
         # AR skid: one request held valid until the port takes it.
         ar_v     = Signal()
-        ar_addr  = Signal(port.address_width)
-        ar_len   = Signal(8)
-        ar_size  = Signal(3)
-        ar_burst = Signal(2)
-        ar_id    = Signal(port.id_width)
+        ar_addr  = Signal(port.address_width, reset_less=True) # Payload: qualified by ar_v.
+        ar_len   = Signal(8, reset_less=True)
+        ar_size  = Signal(3, reset_less=True)
+        ar_burst = Signal(2, reset_less=True)
+        ar_id    = Signal(port.id_width, reset_less=True)
         ar_fire  = Signal()
         self.comb += [
             port.ar.valid.eq(ar_v),
@@ -525,11 +527,11 @@ class AXIResetShim(LiteXModule):
 
         # AW skid.
         aw_v     = Signal()
-        aw_addr  = Signal(port.address_width)
-        aw_len   = Signal(8)
-        aw_size  = Signal(3)
-        aw_burst = Signal(2)
-        aw_id    = Signal(port.id_width)
+        aw_addr  = Signal(port.address_width, reset_less=True) # Payload: qualified by aw_v.
+        aw_len   = Signal(8, reset_less=True)
+        aw_size  = Signal(3, reset_less=True)
+        aw_burst = Signal(2, reset_less=True)
+        aw_id    = Signal(port.id_width, reset_less=True)
         aw_fire  = Signal()
         self.comb += [
             port.aw.valid.eq(aw_v & wq.sink.ready), # Never more AWs than the W queue holds.
@@ -566,9 +568,9 @@ class AXIResetShim(LiteXModule):
         # either way. Bursts that completed ahead of their AW (`ahead`) skip the queue when the
         # AW fires.
         w_v       = Signal()
-        w_data    = Signal(port.data_width)
-        w_strb    = Signal(port.data_width//8)
-        w_last    = Signal()
+        w_data    = Signal(port.data_width, reset_less=True) # Payload: qualified by w_v.
+        w_strb    = Signal(port.data_width//8, reset_less=True)
+        w_last    = Signal(reset_less=True)
         w_fire    = Signal()
         pad       = Signal()
         w_cnt     = Signal(8)
