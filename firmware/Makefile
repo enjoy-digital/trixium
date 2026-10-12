@@ -27,6 +27,8 @@ CFLAGS += -ffp-contract=off
 # The portable descriptor encoders shared with the host tools (no MMIO, no board policy).
 PORTABLE_LIB = ../software/lib
 CFLAGS += -I$(PORTABLE_LIB)
+# Bring-up variants, e.g. EXTRA_CFLAGS=-DTRIXIUM_DDR_ONLY (main.c).
+CFLAGS += $(EXTRA_CFLAGS)
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o infer_float.o infer_bfp.o infer_lists.o perf.o \
           ops.o vec.o seq.o ddr.o hybrid.o resident.o trixium_sequence.o
@@ -40,9 +42,9 @@ OBJECTS = crt0.o main.o engine.o model.o infer.o infer_float.o infer_bfp.o infer
 # change.
 BUILD_STAMP := .build_dir_stamp
 -include $(BUILD_STAMP)
-ifneq ($(LAST_BUILD_KEY),$(BUILD_DIR) $(CPUFLAGS))
+ifneq ($(LAST_BUILD_KEY),$(BUILD_DIR) $(CPUFLAGS) $(EXTRA_CFLAGS))
 $(shell rm -f *.o *.d trixium.bin trixium.elf)
-$(shell echo "LAST_BUILD_KEY := $(BUILD_DIR) $(CPUFLAGS)" > $(BUILD_STAMP))
+$(shell echo "LAST_BUILD_KEY := $(BUILD_DIR) $(CPUFLAGS) $(EXTRA_CFLAGS)" > $(BUILD_STAMP))
 endif
 
 # Libraries ----------------------------------------------------------------------------------------

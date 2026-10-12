@@ -778,6 +778,18 @@ int main(void)
 #endif
     uart_init();
     SIM_MARK("main");                    // Reset to here: crt0 (no BIOS in the simulation).
+#ifdef TRIXIUM_DDR_ONLY
+    // Board bring-up: the memory controllers alone, before any unit is touched (no engine or
+    // vector-unit init; ddrtest drives the engine's STORE/FETCH only).
+    puts("\nTriXium DDR bring-up "__DATE__" "__TIME__"\n");
+#ifdef TRIXIUM_N_MEMCTRL
+    ddr_init_all();
+    ddr_test(-1);
+#endif
+    puts("ddr bring-up: done");
+    while (1)
+        console_service();
+#endif
     perf_init();
     infer_static_init();
     vec_init();
