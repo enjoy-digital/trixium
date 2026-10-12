@@ -114,6 +114,29 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
     mods.append(ClockDomainsRenamer("ddr")(bridge) if split else bridge)
     return mods
 
+# PHY Delay Controls -------------------------------------------------------------------------------
+
+def register_delay_controls(phy):
+    """Register the CE of each IDELAYE3/ODELAYE3 of a LiteDRAM US/US+ PHY next to it.
+
+    The PHY drives them with `dly_sel & csr.wr_stb`: decoded straight from the CSR bus address,
+    one net to the ~170 delay elements (data, strobes, clock, commands) over the channel's two
+    or three I/O banks, 5 ns of route at the DDR clock that no CSR pipelining can shorten. One
+    register per element (in the PHY's own domain, so call this before renaming it) lets each
+    sit by its delay; the increment lands one cycle after the CSR write, which the calibration
+    never sees (the PHY's own tap counters count the strobe itself). Returns the number of CEs registered."""
+    n = 0
+    for special in phy._fragment.specials:
+        if not isinstance(special, Instance) or special.of not in ("IDELAYE3", "ODELAYE3"):
+            continue
+        for item in special.items:
+            if isinstance(item, Instance.Input) and item.name == "CE" and not isinstance(item.expr, Constant):
+                ce = Signal(name_override=f"{special.of.lower()}_ce_q{n}")
+                phy.sync += ce.eq(item.expr)
+                item.expr = ce
+                n += 1
+    return n
+
 # DDR CSR ------------------------------------------------------------------------------------------
 
 class PipelinedDDRCSR(LiteXModule):

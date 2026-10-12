@@ -49,7 +49,7 @@ from litepcie.software import generate_litepcie_software
 
 from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
-from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
+from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, register_delay_controls
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
@@ -356,6 +356,7 @@ class TriXiumXCU1525SoC(SoCCore):
             # against the DQS), which the US+ PHY does not declare by default: without it,
             # controller 0's byte lane 7 comes out of write leveling at the edge of its write eye.
             phy.settings.write_dq_dqs_training = True
+            register_delay_controls(phy)
             phys.append(phy)
             modules.append(MT40A512M8(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
