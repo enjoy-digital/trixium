@@ -66,6 +66,20 @@ jtag newtap $_CHIPNAME tap -irlen 18 -expected-id 0x04b31093 -ignore-version -ir
 """
 XCU1525_CONFIGURED = "0x35d75"
 
+# The FK33's (FT2232H channel A, openocd_fk33.cfg's layout): one XCVU33P, IR capture 0x35 once
+# configured (DONE).
+FK33_IR_CHECK_CFG = """\
+adapter driver ftdi
+adapter speed 5000
+transport select jtag
+ftdi_vid_pid 0x0403 0x6010
+ftdi_channel 0
+ftdi_layout_init 0x00e8 0x60eb
+reset_config none
+jtag newtap xcvu33p tap -irlen 6 -ignore-version -expected-id 0x04b69093 -ircapture 0x00 -irmask 0x3f
+"""
+FK33_CONFIGURED = "0x35"
+
 # The YPCB-00338's JTAG: an external Digilent HS2-style FT232H cable on the card's header (its
 # chain shows the FPGA alone; a Xilinx Platform Cable's chain also has the card's CPLD).
 YPCB_PROGRAM = ["openFPGALoader", "-c", "digilent_hs2", "--fpga-part", "xc7k480tffg1156"]
@@ -172,10 +186,23 @@ def reconfigure(board, bitstream):
         # openFPGALoader reports "done 1" on the FK33 without configuring it: its JPROGRAM
         # restarts the master-SPI boot and the factory flash image wins. OpenOCD's pld load
         # (~34 s), with the configuration the deploy copies (trixium_fk33.py's).
-        out = run(["openocd", "-f", "openocd_fk33.cfg", "-c", f"init; pld load 0 {bitstream}; exit"], 300)
+        # Since OpenOCD 0.11 a -c command's report is its Tcl result, printed only when echoed.
+        out = run(["openocd", "-f", "openocd_fk33.cfg", "-c", f"init; echo [pld load 0 {bitstream}]; exit"], 300)
         grep(out, r"loaded|Error")
         if "loaded" not in out:
+            say("\n".join(out.strip().splitlines()[-15:]))
             say("NOT LOADED - stop")
+            return 1
+        # The load starts with JPROGRAM: DONE in the IR capture is this bitstream's.
+        with open("ir_check.cfg", "w", encoding="utf-8") as f:
+            f.write(FK33_IR_CHECK_CFG)
+        out = run(["openocd", "-f", "ir_check.cfg", "-c", "init", "-c", "irscan xcvu33p.tap 0x3f",
+            "-c", "shutdown"], 60)
+        cap = re.search(r"saw (0x[0-9a-f]*)", out)
+        cap = cap.group(1) if cap else "none"
+        say(f"IR capture: {cap} ({FK33_CONFIGURED} = DONE)")
+        if cap != FK33_CONFIGURED:
+            say("NOT CONFIGURED - stop")
             return 1
     # Warm reboot, detached: ssh drops with it.
     subprocess.Popen(["sh", "-c", "sleep 2; reboot"], start_new_session=True,
