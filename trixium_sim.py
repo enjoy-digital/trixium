@@ -68,7 +68,7 @@ from model.layout import HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
-from gateware.memory.s7hrddrphy import s7hr_model_settings, S7HRPHYModel
+from gateware.memory.s7hrddrphy import s7hr_model_settings, S7HRPHYModel, NoDMPHYModel
 from model.bons import BONSReader
 from gateware.common import set_main_ram_executable
 
@@ -92,6 +92,7 @@ DDR3_SIM_BANK_CYCLE  = 0x10000     # 8 banks x 8 KB rows: the windows' skew is 1
 DDR3_SIM_DDR_PERIOD  = 9000        # ps: the sim's clocks are integer picoseconds, ddr at 9 ns and
                                    # sys at the board's ratio (8 ns for 150 MHz, ddr3_sim_clocks()).
 DDR3_SIM_FREQ        = 400e6/3     # The controllers' timings: the board's DDR3-1066.
+YPCB_ENGINE_RMW      = True        # The board's DDR3 has no DM pins (trixium_ypcb.ENGINE_RMW).
 DDR3_SIM_SIZE        = 128 << 20   # Per controller, at least (2048 rows; more for big images).
 
 # The ROM holds no BIOS, only a jump to the firmware in main_ram (`lui t0, MAIN_RAM_BASE;
@@ -525,7 +526,8 @@ class TriXiumSimSoC(SoCCore):
             for j in range(chan_mod):
                 c = k*chan_mod + j
                 axi = AXIInterface(data_width=256, address_width=33, id_width=6)
-                for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port")):
+                for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port",
+                                                       rmw=YPCB_ENGINE_RMW)):
                     setattr(self, f"engport{c}_{jj}", m)
                 memory_ports.append(axi)
         set_main_ram_executable(self, MAIN_RAM_BASE)
@@ -547,8 +549,11 @@ class TriXiumSimSoC(SoCCore):
         for k in range(n_memctrl):
             size = ddr3_size(chan_mod, stride)
             phy, module = ddr3_phy(ddr3_content(k, ram, img, chan_mod, stride, size), size)
+            # The board has no DM pins: neither model lets a write mask reach the memory.
             if s7hr_model:
                 phy = S7HRPHYModel(phy, ideal=(k == 0), **S7HR_CHANNEL)
+            else:
+                phy = NoDMPHYModel(phy)
             split_phys.append(phy)
             split_modules.append(module)
         add_ddr_domain_controllers(self, split_phys, split_modules, DDR3_SIM_FREQ, MAIN_RAM_SIZE,
@@ -561,7 +566,8 @@ class TriXiumSimSoC(SoCCore):
             for j in range(chan_mod):
                 c = k*chan_mod + j
                 axi = AXIInterface(data_width=256, address_width=32, id_width=6)
-                for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port")):
+                for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port",
+                                                       rmw=YPCB_ENGINE_RMW)):
                     setattr(self, f"engport{c}_{jj}", m)
                 memory_ports.append(axi)
         set_main_ram_executable(self, MAIN_RAM_BASE)

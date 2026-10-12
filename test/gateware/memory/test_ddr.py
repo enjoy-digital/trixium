@@ -553,3 +553,98 @@ def test_engine_port_path_read_right_after_write():
 
     _run(dut, [driver(), collector(), dut.mem.write_handler(dut.ctrl_port),
                dut.mem.read_handler(dut.ctrl_port)], "verilator")
+
+
+# A memory without DM pins (the YPCB's DDR3): write masks never reach it.
+@pytest.mark.parametrize("rmw", [False, True])
+def test_engine_port_path_without_dm(rmw):
+    """The engine port path (256-bit AXI, merged reads, 512-bit controller) on a PHY model that
+    drops the write masks, as the YPCB's DDR3 has no DM pins: each 256-bit beat reaches the
+    controller as a half-strobed 512-bit word, so without the bridge's read-modify-write the
+    second half's write zeroes the first (the first card run: ddrtest's even beats read 0).
+    With rmw every beat is where it was put, including rows that start in a word's upper
+    half (KV rows of an odd number of beats)."""
+    from litedram.core import LiteDRAMCore
+    from litedram.modules import MT41K256M8
+    from litedram.phy.model import SDRAMPHYModel
+    from gateware.memory.ddr import engine_ddr_port
+    from gateware.memory.s7hrddrphy import NoDMPHYModel
+
+    class _SimDDR3(MT41K256M8):
+        nrows = 2048
+        ncols = 128
+
+    class _NoDMDUT(Module):
+        def __init__(self):
+            module = _SimDDR3(int(100e6), "1:4")
+            model  = SDRAMPHYModel(module=module, data_width=64, clk_freq=int(100e6), init=[])
+            self.submodules.phy  = NoDMPHYModel(model)
+            self.submodules.core = LiteDRAMCore(phy=self.phy, geom_settings=module.geom_settings,
+                                                timing_settings=module.timing_settings,
+                                                clk_freq=int(100e6))
+            axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+            for j, m in enumerate(engine_ddr_port(self.core, axi, port_width=512, merge=True,
+                                                  rmw=rmw)):
+                setattr(self.submodules, f"glue{j}", m)
+            self.submodules.reader = AXIReader(axi)
+            self.submodules.writer = AXIWriter(axi)
+            self.comb += self.reader.source.ready.eq(1)
+
+    dut  = _NoDMDUT()
+    rng  = np.random.default_rng(11)
+    rows = [(0x0A0_0000, 16), (0x0A0_1000, 5), (0x0A0_1000 + 5*32, 5), (0x0A0_1000 + 10*32, 5)]
+    data = [rng.integers(0, 256, 32*n, dtype=np.uint8).tobytes() for _, n in rows]
+    got  = []
+
+    def store(addr, payload):
+        wr = dut.writer
+        yield wr.sink_cmd.addr.eq(addr)
+        yield wr.sink_cmd.len.eq(len(payload)//32)
+        yield wr.sink_cmd.valid.eq(1)
+        yield
+        while not (yield wr.sink_cmd.ready):
+            yield
+        yield wr.sink_cmd.valid.eq(0)
+        for w in _beats_to_words(payload, 256):
+            yield wr.sink_data.data.eq(w)
+            yield wr.sink_data.valid.eq(1)
+            yield
+            while not (yield wr.sink_data.ready):
+                yield
+        yield wr.sink_data.valid.eq(0)
+        for _ in range(20000):
+            if (yield wr.idle):
+                return
+            yield
+        raise AssertionError("writer never went idle (write path stalls)")
+
+    def fetch(addr, n):
+        rd, out = dut.reader, []
+        yield rd.sink.addr.eq(addr)
+        yield rd.sink.len.eq(n)
+        yield rd.sink.valid.eq(1)
+        yield
+        while not (yield rd.sink.ready):
+            yield
+        yield rd.sink.valid.eq(0)
+        for _ in range(20000):
+            if (yield rd.source.valid):
+                out.append((yield rd.source.data))
+            if len(out) == n:
+                return out
+            yield
+        raise AssertionError(f"read of {n} beats returned {len(out)}")
+
+    def driver():
+        yield dut.core.dfii._control.storage.eq(0b1111)
+        yield
+        for (addr, _), payload in zip(rows, data):
+            yield from store(addr, payload)
+        for (addr, n), payload in zip(rows, data):
+            got.append((yield from fetch(addr, n)) == _beats_to_words(payload, 256))
+
+    _run(dut, [driver()], "verilator", extra={"dfii_control": dut.core.dfii._control.storage})
+    if rmw:
+        assert all(got), f"rows read back wrong with read-modify-write: {got}"
+    else:
+        assert not any(got), "a DM-less memory kept half-strobed writes: the model lets masks through"

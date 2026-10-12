@@ -755,11 +755,37 @@ class S7HRPHYModel(LiteXModule):
         for p in range(nphases):
             ours, theirs = dfi.phases[p], model.dfi.phases[p]
             for name in ["address", "bank", "cas_n", "cs_n", "ras_n", "we_n", "cke", "odt",
-                         "reset_n", "act_n", "wrdata_en", "wrdata_mask", "rddata_en"]:
+                         "reset_n", "act_n", "wrdata_en", "rddata_en"]:
                 if hasattr(ours, name) and hasattr(theirs, name):
                     self.comb += getattr(theirs, name).eq(getattr(ours, name))
             self.comb += [
+                theirs.wrdata_mask.eq(0), # No DM pins: a write stores the whole word.
                 theirs.wrdata.eq((ours.wrdata & ~wsel) | (wbad & wsel)),
                 ours.rddata.eq(theirs.rddata ^ rmask),
                 ours.rddata_valid.eq(rddata_valid),
+            ]
+
+
+class NoDMPHYModel(LiteXModule):
+    """LiteDRAM's SDRAMPHYModel as the YPCB's DDR3 has it: no DM pins, so the controller's write
+    masks never reach the memory and a partially-strobed write stores the whole word (the
+    unstrobed bytes with whatever the data bus carries). The ports that write partial words
+    need a read-modify-write (LiteDRAMAXI2Native's with_read_modify_write) on such a memory."""
+    def __init__(self, model):
+        self.model    = model
+        self.settings = model.settings
+        self.dfi = dfi = Interface(len(model.dfi.p0.address), len(model.dfi.p0.bank),
+            model.settings.nranks, len(model.dfi.p0.wrdata), model.settings.nphases)
+
+        # # #
+
+        for ours, theirs in zip(dfi.phases, model.dfi.phases):
+            for name in ["address", "bank", "cas_n", "cs_n", "ras_n", "we_n", "cke", "odt",
+                         "reset_n", "act_n", "wrdata_en", "wrdata", "rddata_en"]:
+                if hasattr(ours, name) and hasattr(theirs, name):
+                    self.comb += getattr(theirs, name).eq(getattr(ours, name))
+            self.comb += [
+                theirs.wrdata_mask.eq(0),
+                ours.rddata.eq(theirs.rddata),
+                ours.rddata_valid.eq(theirs.rddata_valid),
             ]

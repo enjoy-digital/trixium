@@ -82,7 +82,7 @@ class AXICrossing(LiteXModule):
 # Engine DDR Port ----------------------------------------------------------------------------------
 
 def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
-                    r_buffer_depth=256, clock_domain="sys"):
+                    r_buffer_depth=256, clock_domain="sys", rmw=False):
     """Return the modules (to register as submodules) that connect `axi` (the engine channel's
     256-bit AXI) to a `port_width`-bit crossbar port of `core`.
 
@@ -90,6 +90,9 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
                   one wide transaction per beat (LiteX's AXIUpConverter, twice the traffic).
     clock_domain: the port's side when the controller runs in its own `ddr` domain (the AXI
                   then crosses with AXICrossing; see the XCU1525 target's --ddr-clk-freq).
+    rmw:          read-modify-write the partially-strobed words (a memory without DM pins, the
+                  YPCB's DDR3: the 256-bit beats reach the 512-bit word with half strobes, and
+                  KV rows of an odd number of beats share words).
     """
     split = clock_domain != "sys"
     # Split: a native port on the controller's own side (the core renames its sys to ddr),
@@ -110,7 +113,7 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
         mods.append(AXICrossing(wide, far, "sys", "ddr"))
         wide = far
     bridge = LiteDRAMAXI2Native(wide, port, w_buffer_depth=w_buffer_depth,
-                                r_buffer_depth=r_buffer_depth)
+                                r_buffer_depth=r_buffer_depth, with_read_modify_write=rmw)
     mods.append(ClockDomainsRenamer("ddr")(bridge) if split else bridge)
     return mods
 
@@ -254,9 +257,13 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
                                       addressing="word")
         soc.bus.add_slave(name="main_ram", slave=wb_sdram)
         l2_size = 2**int(math.log2(max(l2_size, int(2*port.data_width/8))))
+        # reverse=False: word i of a line at bits [32*i +: 32], as the AXI paths (the CPU's
+        # memory bus, the engine) and LiteX's add_sdram have it; the default reversed the words
+        # of every line between the bus (PCIe/JTAG) and the DRAM.
         l2 = wishbone.Cache(cachesize=l2_size//4, master=wb_sdram,
             slave=wishbone.Interface(data_width=max(port.data_width, 128), address_width=32,
-                                     addressing="word"))
+                                     addressing="word"),
+            reverse=False)
         soc.l2_cache = FullMemoryWE()(l2)
         soc.add_config("L2_SIZE", l2_size)
         soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=soc.l2_cache.slave, port=port,

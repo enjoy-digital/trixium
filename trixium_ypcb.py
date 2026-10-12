@@ -57,6 +57,12 @@ from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 
+# The DDR3 has no DM pins: a write stores whole 512-bit controller words, so the engine ports
+# read-modify-write their partially-strobed words (256-bit beats, KV rows of an odd number of
+# beats; LiteDRAMAXI2Native's with_read_modify_write). Without it every STORE corrupts the
+# other half of its words (the first card run's ddrtest: half the words wrong).
+ENGINE_RMW = True
+
 # IOs ----------------------------------------------------------------------------------------------
 
 # litex-boards' pcie_x8 has lane 6's RX N on E3; the GTX pair is R4/R3 (MGTXRXN1_115). PERST#
@@ -192,7 +198,8 @@ class TriXiumYPCBSoC(SoCCore):
         memory_ports = []
         for c in range(engine_channels):
             axi = AXIInterface(data_width=256, address_width=32, id_width=6)
-            for j, m in enumerate(engine_ddr_port(self.sdrams[c//chan_mod], axi, clock_domain="sys_port")):
+            for j, m in enumerate(engine_ddr_port(self.sdrams[c//chan_mod], axi, clock_domain="sys_port",
+                                                  rmw=ENGINE_RMW)):
                 setattr(self, f"engport{c}_{j}", m)
             memory_ports.append(axi)
 
