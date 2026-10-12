@@ -32,7 +32,7 @@ from migen import *
 
 from litex.gen import *
 
-from litex.build.generic_platform import Subsignal, Pins, IOStandard
+from litex.build.generic_platform import Subsignal, Pins, IOStandard, Misc
 
 from litex_boards.platforms import ypcb_00338_1p1
 
@@ -59,12 +59,13 @@ from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 
 # IOs ----------------------------------------------------------------------------------------------
 
-# litex-boards' pcie_x8 has lane 6's RX N on E3; the GTX pair is R4/R3 (MGTXRXN1_115).
+# litex-boards' pcie_x8 has lane 6's RX N on E3; the GTX pair is R4/R3 (MGTXRXN1_115). PERST#
+# pulled up, as openTPU's constraints have it.
 _pcie_x8_io = [
     ("pcie_x8", 1,
         Subsignal("clk_p", Pins("J8")),
         Subsignal("clk_n", Pins("J7")),
-        Subsignal("rst_n", Pins("Y26"), IOStandard("LVCMOS18")),
+        Subsignal("rst_n", Pins("Y26"), IOStandard("LVCMOS18"), Misc("PULLUP=TRUE")),
         Subsignal("tx_p",  Pins("F2 H2 K2 M2 N4 P2 T2 U4")),
         Subsignal("tx_n",  Pins("F1 H1 K1 M1 N3 P1 T1 U3")),
         Subsignal("rx_p",  Pins("H6 J4 K6 L4 M6 P6 R4 T6")),
