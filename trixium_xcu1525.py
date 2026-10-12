@@ -121,7 +121,17 @@ class _CRG(LiteXModule):
             cd_ref = self.cd_idelay,
             cd_sys = self.cd_sys,
             locked = locked)
-        self.specials += AsyncResetSynchronizer(self.cd_ddr, self.cd_sys.rst)
+        # The ddr reset through a register tree: one synchronizer flop driving every controller,
+        # PHY and bridge reset over three SLRs missed timing by ~0.9 ns (one logic level, 5 ns of
+        # route). The last stage is replicated by synthesis (max_fanout) and each copy placed
+        # by its loads; the stage before has a full cycle to reach them.
+        self.cd_ddr_por = ClockDomain()
+        self.comb += self.cd_ddr_por.clk.eq(self.cd_ddr.clk)
+        self.specials += AsyncResetSynchronizer(self.cd_ddr_por, self.cd_sys.rst)
+        rst_pipe = Signal(reset=1, reset_less=True)
+        rst_tree = Signal(reset=1, reset_less=True, attr={("max_fanout", 64)})
+        self.sync.ddr_por += [rst_pipe.eq(ResetSignal("ddr_por")), rst_tree.eq(rst_pipe)]
+        self.comb += self.cd_ddr.rst.eq(rst_tree)
 
 # IDELAYCTRL ---------------------------------------------------------------------------------------
 
