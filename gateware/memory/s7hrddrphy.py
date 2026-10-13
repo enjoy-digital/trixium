@@ -10,8 +10,7 @@ LiteDRAM's A7DDRPHY structure (1:4, OSERDESE2/ISERDESE2, read leveling with IDEL
 per-lane write latency bitslip) for DDR3 on high-range banks, where there is no ODELAYE2 and
 therefore no per-lane write leveling. A fly-by command/clock bus (a DIMM-like layout, e.g. the
 nine x8 chips of an Inspur YPCB-00338 channel) puts each chip's CK at a different delay from
-its DQS: with a single static DQS phase only part of the lanes meet tDQSS. The technique
-(openTPU, FeSens, "WL7DDRPHY", docs/litedram.md; reimplemented here):
+its DQS: with a single static DQS phase only part of the lanes meet tDQSS. The technique:
 
 - CK and the command/address pins run on a pair of clocks with MMCM fine phase shift; DQ, DQS
   and the read capture run on static clocks of the same MMCM, so DQ keeps its DQS at 90 deg and

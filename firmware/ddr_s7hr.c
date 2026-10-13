@@ -8,7 +8,7 @@
  * controller is whichever CSR_BASE says.
  *
  * The PHY has no write leveling: CK moves against DQ/DQS instead (gateware/memory/s7hrddrphy.py).
- * The calibration, after openTPU's (FeSens, docs/litedram.md sections 7-10; reimplemented):
+ * The calibration:
  *
  *   for each CK phase over one tCK (fine MMCM steps, 16.7 ps at DDR3-1066):
  *       JEDEC init (DLL reset), then for each write latency (bitslip 0/2/4/6, all lanes):
