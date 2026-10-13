@@ -37,8 +37,8 @@ The sequence and its order:
      controller 0, the host-side training fixes what it could not, the firmware boots without a
      CPU reset and calibrates 1..3, the host trains them too, engreset, the round trip), THEN the
      weights (the loader writes to controllers the firmware initialises). YPCB-00338 = the same
-     order without host training: the BIOS calibrates DDR3 controller 0 (the S7HR CK-phase scan),
-     the firmware controller 1. FK33 = weights, then the serial boot (retried)
+     order without host training: the BIOS levels both DDR3 controllers (liblitedram's CK phase
+     leveling). FK33 = weights, then the serial boot (retried)
   8. tokens BEFORE numbers - wrong tokens stop here with a non-zero exit: a fast wrong answer is
      not a result
   9. bench

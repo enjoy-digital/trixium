@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 """The fly-by channel of the calibration's SoC simulation (trixium_sim.py --board ypcb
---s7hr-model, gateware/memory/s7hrddrphy.py S7HRChannelModel) against its Python reference.
+--ckphase-model, gateware/memory/ckphase_model.py CKPhaseChannelModel) against its Python reference.
 
 Compiled: the model's arithmetic must survive the Verilog conversion (a first version with
 signed arithmetic read every bit bad at a negative CK phase in the SoC simulation)."""
@@ -16,7 +16,7 @@ import pytest
 
 from migen import *
 
-from gateware.memory.s7hrddrphy import S7HRChannelModel
+from gateware.memory.ckphase_model import CKPhaseChannelModel
 
 from common.verilator import run
 
@@ -43,7 +43,7 @@ def reference(ck, wl, rb, tap, zone=3, half_eye=4):
 def test_channel_model_matches_its_reference(backend):
     class _DUT(Module):
         def __init__(self):
-            self.submodules.channel = ch = S7HRChannelModel(CROSS, BASE_WL, V0)
+            self.submodules.channel = ch = CKPhaseChannelModel(CROSS, BASE_WL, V0)
             self.ck, self.wl, self.rb, self.tap = ch.ck, ch.wl, ch.rb, ch.tap
             self.lane_bad, self.bit_bad = ch.lane_bad, ch.bit_bad
             tick = Signal(8) # The model is combinational: a clock for the compiled testbench.
@@ -77,4 +77,4 @@ def test_channel_model_matches_its_reference(backend):
             assert (yield dut.lane_bad) == lanes, (ck, wl)
             assert (yield dut.bit_bad) == bits, ck
 
-    run(dut, [gen()], backend, signals=signals, memories={}, name="s7hr_channel")
+    run(dut, [gen()], backend, signals=signals, memories={}, name="ckphase_channel")

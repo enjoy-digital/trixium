@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  *
- * TriXium extra DDR4 controllers (the XCU1525's four channels)
+ * TriXium extra DDR controllers (the XCU1525's four DDR4 channels, the YPCB's two DDR3)
  *
  * LiteX's own liblitedram, compiled once more here with the CSR base as a runtime variable.
  *
@@ -14,6 +14,10 @@
  * which is why a controller without a CPU window can be calibrated at all. sdram_init()'s final
  * memtest would use main_ram, so it is compiled out and replaced by ddr_test(): an engine
  * STORE/FETCH round trip through every channel's own window, the path the weights take.
+ *
+ * With SDRAM_CSR_STRIDE (the YPCB, CK phase leveling: SDRAM_PHY_CKPHASE_STEPS), liblitedram
+ * switches the CSR base itself and the BIOS levels every controller at boot (SDRAM_CONTROLLERS);
+ * ddr_init(k) re-levels controller k with sdram_ckphase_leveling(k).
  *
  * This file is part of TriXium.
  *
@@ -31,20 +35,20 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifndef SDRAM_CSR_STRIDE
 #include <generated/mem.h>              // CSR_BASE, the literal.
 static const unsigned long ddr_csr_base0 = CSR_BASE;
 #undef CSR_BASE
 unsigned long ddr_csr_base;             // The controller being talked to.
 #define CSR_BASE ddr_csr_base
-#include <generated/csr.h>              // Every accessor: ddr_csr_base + offset.
-
+#endif
+// No csr.h (or sdram_phy.h, which includes it) before sdram.c: its inline accessors would bind
+// to the literal base (with SDRAM_CSR_STRIDE, sdram.c includes it after its own CSR_BASE).
 #define SDRAM_TEST_DISABLE              // No main_ram memtest at the end of sdram_init().
 #include <liblitedram/sdram.c>          // The BIOS's init and calibration, at our base.
 #include <liblitedram/accessors.c>      // The PHY delay accessors the leveling uses.
-#ifdef TRIXIUM_DDR_S7HR
-#include "static_memory.h"
-#define S7HR_STATE_ADDR TRIXIUM_DDR_CAL_ADDR   // The scan state in main_ram (SRAM keeps the stack).
-#include "ddr_s7hr.c"                   // sdram_custom_init(): the YPCB's DDR3 calibration.
+#if defined(SDRAM_CSR_STRIDE) && !defined(SDRAM_PHY_CKPHASE_STEPS)
+#error "SDRAM_CSR_STRIDE: liblitedram levels other controllers with CK phase leveling only"
 #endif
 
 #include "engine.h"
@@ -63,18 +67,21 @@ int ddr_init(int k)
         printf("ddr: controller %d does not exist (0..%d)\n", k, TRIXIUM_N_MEMCTRL - 1);
         return 0;
     }
-#ifdef TRIXIUM_DDR_S7HR
-    // The calibration takes the controller out of hardware control for seconds: never the one
-    // the firmware runs from (the BIOS calibrates controller 0).
+#ifdef SDRAM_CSR_STRIDE
+    // The leveling takes the controller out of hardware control for seconds: never the one the
+    // firmware runs from (the BIOS levels controller 0).
     if (k == 0) {
-        printf("ddr: controller 0 holds main_ram (the BIOS calibrates it)\n");
+        printf("ddr: controller 0 holds main_ram (the BIOS levels it)\n");
         return 0;
     }
-#endif
+    printf("ddr: controller %d\n", k);
+    int ok = sdram_ckphase_leveling(k);
+#else
     ddr_csr_base = ddr_csr_base0 + (unsigned long)k*TRIXIUM_DDR_CSR_STRIDE;
     printf("ddr: controller %d (CSRs at %08lx)\n", k, (unsigned long)CSR_SDRAM_BASE);
     int ok = sdram_init();
     ddr_csr_base = ddr_csr_base0;
+#endif
     printf("ddr: controller %d %s\n", k, ok ? "OK" : "FAILED");
     return ok;
 }
@@ -85,6 +92,17 @@ int ddr_init_all(void)
     for (int k = 1; k < TRIXIUM_N_MEMCTRL; k++)
         ok &= ddr_init(k);
     return ok;
+}
+
+int ddr_boot_init(void)
+{
+#ifdef SDRAM_CSR_STRIDE
+    // The BIOS leveled every controller (SDRAM_CONTROLLERS) before the firmware was loaded.
+    printf("ddr: controllers 0..%d leveled by the BIOS\n", TRIXIUM_N_MEMCTRL - 1);
+    return 1;
+#else
+    return ddr_init_all();
+#endif
 }
 
 /* Test */

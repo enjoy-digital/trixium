@@ -11,9 +11,9 @@
 The TriXium core streams its weights from the two DDR3 channels (64 data bits each, the ECC
 lane unused): engine channel c reads from controller c // 2 through its own crossbar port, at
 two windows per controller. The DDR3 sits on HR banks (no ODELAY, a fly-by command bus over
-nine x8 chips): the PHY is gateware/memory/s7hrddrphy.py (write leveling by CK phase) and the
-calibration runs on the SoC's CPU (firmware/ddr_s7hr.c: the BIOS calibrates controller 0, the
-firmware controller 1). The defaults are the shipping recipe: the Qwen3 path's units (engine,
+nine x8 chips): the PHY is LiteDRAM's K7DDRPHY with its CK phase shift (write leveling by CK
+phase) and the BIOS calibrates both controllers at boot (liblitedram's CK phase leveling,
+SDRAM_CONTROLLERS). The defaults are the shipping recipe: the Qwen3 path's units (engine,
 sequencer, vector unit; the Ternary-Bonsai 1.7B and 8B), DDR3-1066 in a 133.33 MHz ddr domain,
 sys 125 MHz (the clock this K480T design closes timing at), the FK33's CPU configuration. Design notes: doc/boards.md.
 
@@ -44,6 +44,7 @@ from litex.soc.interconnect.axi import AXIInterface
 from litedram.common import PHYPadsReducer
 from litedram.modules import MT41K256M8, _SpeedgradeTimings
 from litedram.core.controller import ControllerSettings
+from litedram.phy.s7ddrphy import K7DDRPHY
 
 from litepcie.phy.s7pciephy import S7PCIEPHY
 from litepcie.software import generate_litepcie_software
@@ -51,7 +52,6 @@ from litepcie.software import generate_litepcie_software
 from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
-from gateware.memory.s7hrddrphy import S7HRDDRPHY
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
@@ -96,8 +96,8 @@ class _CRG(LiteXModule):
     """Clocks: `sys` (CPU, TriXium core), `ddr` (the two LiteDRAM controllers, DDR3 rate =
     8 x ddr) and the 200 MHz IDELAY reference, from one MMCM on the 50 MHz oscillator (the
     board's reset pin is not wired). Each DDR3 PHY makes its own interface clocks from `ddr`
-    (S7HRDDRPHY: one MMCM per channel). The memory ports cross sys <-> ddr at the AXI level
-    (memory/ddr.py), the controllers' CSRs behind a wishbone crossing.
+    (the K7DDRPHY in CK phase mode: one MMCM per channel). The memory ports cross sys <-> ddr at
+    the AXI level (memory/ddr.py), the controllers' CSRs behind a wishbone crossing.
     """
     def __init__(self, platform, sys_clk_freq, ddr_clk_freq):
         assert ddr_clk_freq != sys_clk_freq
@@ -128,7 +128,7 @@ class _CRG(LiteXModule):
 
 # The (sdram, ddrphy, sdram_generator, sdram_checker) CSR pages of the two controllers: their
 # own CSR bus in the ddr domain, behind a wishbone crossing at DDR_CSR_WINDOW, controller k's
-# registers at controller 0's + k*DDR_CSR_STRIDE (firmware/ddr.c).
+# registers at controller 0's + k*DDR_CSR_STRIDE (liblitedram's SDRAM_CSR_STRIDE).
 DDR_CSR_WINDOW = 0xF0020000
 DDR_CSR_STRIDE = 0x2000
 
@@ -159,7 +159,7 @@ class TriXiumYPCBSoC(SoCCore):
         if kwargs.get("uart_name", "serial") == "serial":
             kwargs["uart_name"] = "crossover" # Console over PCIe/JTAGBone.
         kwargs["with_jtagbone"] = True
-        # The BIOS's DDR3 calibration (firmware/ddr_s7hr.c) keeps its scan maps in SRAM.
+        # The BIOS's CK phase leveling keeps its scan maps in SRAM (~3.5 KB of .bss).
         kwargs["integrated_sram_size"] = max(kwargs.get("integrated_sram_size") or 0, 0x4000)
         SoCCore.__init__(self, platform, sys_clk_freq,
             ident = "TriXium on YPCB-00338-1P1", **kwargs)
@@ -256,27 +256,29 @@ class TriXiumYPCBSoC(SoCCore):
 
     def add_ddr_controllers(self, platform, n, ddr_clk_freq, main_ram_size, l2_size,
                             controller_settings):
-        """n S7HRDDRPHY + MT41K256M8 controllers in the `ddr` domain (memory/ddr.py), each with
-        a LiteDRAM BIST for the calibration's traffic test; the calibration replaces
-        liblitedram's (CONFIG_SDRAM_CUSTOM_INIT, firmware/ddr_s7hr.c)."""
+        """n K7DDRPHY (HR banks, CK phase shift) + MT41K256M8 controllers in the `ddr` domain
+        (memory/ddr.py), each with a LiteDRAM BIST for the CK phase leveling's traffic test; the
+        BIOS levels them all (SDRAM_CSR_STRIDE, SDRAM_CONTROLLERS)."""
         phys, modules = [], []
         for i in range(n):
-            phy = S7HRDDRPHY(
-                pads         = PHYPadsReducer(platform.request("ddram", i), list(range(8))),
-                sys_clk_freq = ddr_clk_freq,
-                cl           = DDR3_CL,
-                cwl          = DDR3_CWL,
-                name         = f"ddrphy{i}",
-                mmcm_loc     = DDR_MMCM_LOCS[i])
+            phy = K7DDRPHY(
+                pads                = PHYPadsReducer(platform.request("ddram", i), list(range(8))),
+                memtype             = "DDR3",
+                sys_clk_freq        = ddr_clk_freq,
+                cl                  = DDR3_CL,
+                cwl                 = DDR3_CWL,
+                with_odelay         = False, # HR banks.
+                with_ck_phase_shift = True,
+                name                = f"ddrphy{i}",
+                mmcm_loc            = DDR_MMCM_LOCS[i])
             phy.add_constraints(platform)
             phys.append(phy)
             modules.append(YPCBDDR3(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
             DDR_CSR_WINDOW, phy_renames={"sys": "ddr"}, controller_settings=controller_settings,
             with_bist=True)
-        self.add_config("SDRAM_CUSTOM_INIT")
-        self.add_constant("TRIXIUM_DDR_S7HR")
-        self.add_constant("TRIXIUM_DDR_CKPHASE_STEPS", phys[0].ps_steps_per_tck)
+        self.add_constant("SDRAM_CSR_STRIDE",  DDR_CSR_STRIDE)
+        self.add_constant("SDRAM_CONTROLLERS", n)
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -284,13 +286,6 @@ class TriXiumYPCBSoC(SoCCore):
 # (cache maintenance) and Zbb (clz).
 VEXII_ARGS = ("--fetch-l1-ways=4 --fetch-l1-sets=128 --lsu-l1-ways=4 --lsu-l1-sets=128 "
     "--with-btb --with-ras --with-gshare --with-rvZcbm --with-rvZbb")
-
-# The BIOS side of the DDR3 calibration: a software package the BIOS links (sdram_custom_init()).
-BIOS_DDR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware", "bios")
-
-def add_bios_ddr(builder):
-    builder.add_software_package("libtrixiumddr", BIOS_DDR_DIR)
-    builder.add_software_library("libtrixiumddr")
 
 def main():
     # VexiiRiscv's netlist cache key must not depend on set ordering: hash randomization is
@@ -341,7 +336,6 @@ def main():
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = os.path.join(builder_argd["output_dir"], "csr.csv")
     builder = Builder(soc, **builder_argd)
-    add_bios_ddr(builder)
     if args.build or args.driver:
         if not args.build:
             builder.compile_software = False

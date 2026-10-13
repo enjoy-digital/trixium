@@ -568,7 +568,7 @@ def test_engine_port_path_without_dm(rmw):
     from litedram.modules import MT41K256M8
     from litedram.phy.model import SDRAMPHYModel
     from gateware.memory.ddr import engine_ddr_port
-    from gateware.memory.s7hrddrphy import NoDMPHYModel
+    from gateware.memory.ckphase_model import NoDMPHYModel
 
     class _SimDDR3(MT41K256M8):
         nrows = 2048

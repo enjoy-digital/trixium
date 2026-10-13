@@ -24,7 +24,6 @@
 #define TRIXIUM_HYBPROF_ADDR        (TRIXIUM_HDR_ADDR + 0xc0a00) // struct hyb_prof (hybrid.c), 256 B
 #define TRIXIUM_EPS_MEMO_ADDR       (TRIXIUM_HDR_ADDR + 0xc0b00) // int32[128] seq_eps_int memo (infer_lists.c), 512 B
 #define TRIXIUM_LISTPROF_ADDR       (TRIXIUM_HDR_ADDR + 0xc2000) // struct list_prof[16] (resident.c), 8.25 KB
-#define TRIXIUM_DDR_CAL_ADDR        (TRIXIUM_HDR_ADDR + 0xc5000) // struct s7hr_state (ddr_s7hr.c), < 4 KB
 #define TRIXIUM_RL_STATE_ADDR       (TRIXIUM_HDR_ADDR + 0xc6000) // struct rl_state (resident.c), < 1 KB
 
 #endif

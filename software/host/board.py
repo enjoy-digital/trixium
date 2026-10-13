@@ -27,9 +27,9 @@ controller 0 -> memtest -> firmware boot without a CPU reset (-R) -> the firmwar
 controllers 1..3 -> host-side training of 1..3 -> engreset -> ddrtest. The host-side training
 (software/host/rdlevel.py) must never touch controller 0 while the firmware runs from it: `boot`
 trains it between the BIOS's calibration and the jump. On the FK33: trixium_chat -k (CPU reset,
-serial boot), retried once. On the YPCB-00338 there is no host training: the BIOS calibrates DDR3
-controller 0 itself (the S7HR CK-phase scan, firmware/ddr_s7hr.c), the firmware boots without a
-CPU reset and calibrates controller 1 the same way, then engreset -> ddrtest.
+serial boot), retried once. On the YPCB-00338 there is no host training: the BIOS levels both DDR3
+controllers itself (liblitedram's CK phase leveling, a BIST per step), the firmware boots without
+a CPU reset, then engreset -> ddrtest.
 """
 
 import io
@@ -280,16 +280,29 @@ def boot_xcu1525(tok, firmware):
     return 0
 
 
+def ckphase_results(text):
+    """{controller: leveled} from the BIOS's CK phase leveling output (liblitedram's sdram.c:
+    "CK phase leveling (controller k):" ... "  OK (BIST ..." or a failure line)."""
+    results = {}
+    for chunk in text.split("CK phase leveling (controller ")[1:]:
+        m = re.match(r"(\d+)\):", chunk)
+        if m:
+            results[int(m.group(1))] = "  OK (BIST" in chunk.split("Memtest")[0]
+    return results
+
+
 def boot_ypcb(tok, firmware):
     kill_consoles()
     cpu_reset()
-    # The BIOS calibrates controller 0 (sdram_custom_init: the S7HR CK-phase scan, a BIST per
-    # step) then runs its memtest; only the text after the NEW banner counts.
+    # The BIOS levels controller 0 (liblitedram's CK phase leveling, a BIST per step), runs its
+    # memtest, then levels controller 1 (SDRAM_CONTROLLERS); only the text after the NEW banner
+    # counts.
     acc = new = ""
     for i in range(1, 31):
         acc += "\n" + con([], wait=10, quiet_after=3)
         new = acc[acc.rfind("BIOS built on"):] if "BIOS built on" in acc else ""
-        if new and re.search(r"Memtest (OK|KO)", new) and re.search(r"litex.*> ?$", new, re.M):
+        if new and re.search(r"Memtest (OK|KO)", new) and re.search(r"litex.*> ?$", new, re.M) \
+                and ckphase_results(new).keys() >= {0, 1}:
             say(f"BIOS prompt after ~{i*10} s")
             break
     if not new:
@@ -299,22 +312,23 @@ def boot_ypcb(tok, firmware):
         except OSError as e:
             say(str(e))
         return 1
-    grep(new, r"^S7HR|Memtest")
-    if not re.search(r"S7HR: OK", new) or not re.search(r"Memtest OK", new):
-        say("STOP: controller 0 did not calibrate (S7HR) or main_ram fails the memtest")
+    grep(new, r"CK phase|  OK \(BIST|FAILED|Memtest")
+    results = ckphase_results(new)
+    if not results.get(0) or not re.search(r"Memtest OK", new):
+        say("STOP: controller 0 did not level (CK phase) or main_ram fails the memtest")
+        return 1
+    if not results.get(1):
+        say("STOP: controller 1 did not level (CK phase)")
         return 1
 
     # No model at boot (a staged header from a previous session points at stale weights); the
-    # firmware boots without a CPU reset, calibrates controller 1 and runs the round trip.
+    # firmware boots without a CPU reset and runs the round trip.
     run(["./user/trixium_chat", "-C"], 60)
     out = run(["stdbuf", "-oL", "./user/trixium_chat", "-R", "-W", "2000", "-k", firmware,
         "-z", f"models/{tok}/tokenizer.bin"], 2400)
     with open("/tmp/fw_boot.txt", "w", encoding="utf-8") as f:
         f.write(out)
-    grep(out, r"\[boot\]|fastboot|^S7HR|ddr: controller|DDRTEST|SPTEST|VECTEST|READY|rror|ENGSTALL", 60)
-    if not re.search(r"ddr: controller 1 OK", out):
-        say("STOP: controller 1 did not calibrate")
-        return 1
+    grep(out, r"\[boot\]|fastboot|ddr: controller|DDRTEST|SPTEST|VECTEST|READY|rror|ENGSTALL", 60)
     out = con(["engreset", "ddrtest"], wait=200, quiet_after=5)
     lines = grep(out, r"ENGRESET|DDRTEST")
     if any("FAIL" in l for l in lines):

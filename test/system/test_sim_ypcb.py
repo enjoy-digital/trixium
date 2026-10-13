@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 """Slow end-to-end check of the YPCB simulation (./trixium_sim.py --board ypcb): the Qwen3 path
-on the card's memory system - two LiteDRAM DDR3 controllers with the S7HRDDRPHY's latencies, the
+on the card's memory system - two LiteDRAM DDR3 controllers with the K7DDRPHY's latencies, the
 board's timings and controller settings, four engine channels at two bank-skewed windows per
 controller, the ddr clock at 8/9 of sys. The firmware's self-test checksums against the golden
 model + image bytes, the generated token ids against the hybrid reference (model/mirror.py), and
@@ -105,15 +105,16 @@ def test_sim_ypcb():
 
 @pytest.mark.slow
 def test_sim_ypcb_calibration():
-    """The board's DDR3 calibration (firmware/ddr_s7hr.c) in the SoC: the PHY models behind the
-    S7HRDDRPHY's CSRs (S7HRPHYModel, --s7hr-model), controller 1 a fly-by channel that needs it
-    (trixium_sim.S7HR_CHANNEL), calibrated from the console through the CSR window and the BIST
-    ports as on the card; then every channel's window and a generation must be right."""
+    """The board's DDR3 calibration (liblitedram's CK phase leveling) in the SoC: the PHY models
+    behind the K7DDRPHY's CK phase CSRs (CKPhasePHYModel, --ckphase-model), controller 1 a fly-by
+    channel that needs it (trixium_sim.CKPHASE_CHANNEL), calibrated from the console through the
+    CSR window and the BIST ports as on the card; then every channel's window and a generation
+    must be right."""
     import trixium_sim as ts
-    out_dir = os.path.join("build", "sim_ypcb_s7hr")
+    out_dir = os.path.join("build", "sim_ypcb_ckphase")
     sim_dir = os.path.join(out_dir, "gateware")
     if not os.path.exists(os.path.join(sim_dir, "obj_dir/Vsim")):
-        subprocess.run([sys.executable, "trixium_sim.py", "--board", "ypcb", "--s7hr-model",
+        subprocess.run([sys.executable, "trixium_sim.py", "--board", "ypcb", "--ckphase-model",
             "--image", IMAGE, "--out-dir", out_dir, "--build"], check=True)
     global SIM_DIR
     saved, SIM_DIR = SIM_DIR, sim_dir
@@ -121,12 +122,12 @@ def test_sim_ypcb_calibration():
         out = run_console(["ddrinit 1", "ddrtest"], timeout=90*60)
     finally:
         SIM_DIR = saved
-    assert "S7HR: OK" in out and "ddr: controller 1 OK" in out, out[-3000:]
+    assert "  OK (BIST" in out and "ddr: controller 1 OK" in out, out[-3000:]
 
     # The phase: inside the model's common window (every lane outside its crossing zone) and
     # each lane at the write latency the model needs there.
-    ch = ts.S7HR_CHANNEL
-    m  = re.search(r"S7HR: CK phase ([+-]\d+) \(run (\d+) steps\), write bitslips((?: \d)+)", out)
+    ch = ts.CKPHASE_CHANNEL
+    m  = re.search(r"  CK phase ([+-]\d+) \(run (\d+) steps\), write bitslips((?: \d)+)", out)
     assert m, out[-3000:]
     ck  = int(m.group(1))
     wls = [int(w) for w in m.group(3).split()]

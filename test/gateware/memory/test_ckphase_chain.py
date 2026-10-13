@@ -4,10 +4,11 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""The calibration's simulated channel behind LiteDRAM's DFII (trixium_sim.py --s7hr-model):
-LiteDRAMCore -> S7HRPHYModel -> SDRAMPHYModel, driven through the DFII and PHY CSRs as
-firmware/ddr_s7hr.c does: a DFI write/read round trip reads back right at a calibrated state
-(each lane at its write latency, each bit at its eye) and wrong at the reset state."""
+"""The calibration's simulated channel behind LiteDRAM's DFII (trixium_sim.py --ckphase-model):
+LiteDRAMCore -> CKPhasePHYModel -> SDRAMPHYModel, driven through the DFII and PHY CSRs as
+liblitedram's CK phase leveling does: a DFI write/read round trip reads back right at a
+calibrated state (each lane at its write latency, each bit at its eye) and wrong at the reset
+state."""
 
 import random
 
@@ -15,7 +16,7 @@ from migen import *
 
 from litedram.core import LiteDRAMCore
 
-from gateware.memory.s7hrddrphy import S7HRPHYModel
+from gateware.memory.ckphase_model import CKPhasePHYModel
 
 from common.verilator import run
 
@@ -26,7 +27,7 @@ def test_dfii_round_trip_through_the_channel_model():
     class _DUT(Module):
         def __init__(self):
             phy, module = ts.ddr3_phy(bytearray(64), ts.DDR3_SIM_SIZE)
-            self.submodules.phy  = S7HRPHYModel(phy, **ts.S7HR_CHANNEL)
+            self.submodules.phy  = CKPhasePHYModel(phy, **ts.CKPHASE_CHANNEL)
             self.submodules.core = LiteDRAMCore(phy=self.phy, geom_settings=module.geom_settings,
                 timing_settings=module.timing_settings, clk_freq=ts.DDR3_SIM_FREQ)
             self.port = self.core.crossbar.get_port() # Idle (the crossbar needs a master).
@@ -41,7 +42,7 @@ def test_dfii_round_trip_through_the_channel_model():
     dut  = _DUT()
     dfii = dut.core.dfii
     phy  = dut.phy
-    ch   = ts.S7HR_CHANNEL
+    ch   = ts.CKPHASE_CHANNEL
     pis  = [getattr(dfii, f"pi{p}") for p in range(4)]
     # Without a CSR bank the CSRStorages' field assignments are not in the design: the testbench
     # drives the fields themselves.
@@ -120,6 +121,6 @@ def test_dfii_round_trip_through_the_channel_model():
         results["calibrated"]  = yield from round_trip(2)
         results["calibrated2"] = yield from round_trip(3)
 
-    run(dut, [gen()], "verilator", signals=signals, memories={}, name="s7hr_chain")
+    run(dut, [gen()], "verilator", signals=signals, memories={}, name="ckphase_chain")
     assert not results["reset"], "the reset state must not read back right"
     assert results["calibrated"] and results["calibrated2"], results

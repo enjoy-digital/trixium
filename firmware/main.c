@@ -173,7 +173,7 @@ static void help(void)
     puts("  mvtest role [layer] - matvec one tensor with the test pattern, print checksum");
     puts("  mvbw role [layer] [reps] - engine streaming efficiency on one tensor");
 #ifdef TRIXIUM_N_MEMCTRL
-    puts("  ddrinit [k]       - re-init DDR4 controller k (default: 1..N-1, as at boot)");
+    puts("  ddrinit [k]       - re-init DDR controller k (default: 1..N-1)");
     puts("  ddrtest [c]       - engine store/fetch round trip through channel c's window (all)");
 #endif
     puts("  engreset          - soft reset of the engine cluster (automatic after a stall)");
@@ -783,7 +783,7 @@ int main(void)
     // vector-unit init; ddrtest drives the engine's STORE/FETCH only).
     puts("\nTriXium DDR bring-up "__DATE__" "__TIME__"\n");
 #ifdef TRIXIUM_N_MEMCTRL
-    ddr_init_all();
+    ddr_boot_init();
     ddr_test(-1);
 #endif
     puts("ddr bring-up: done");
@@ -797,10 +797,10 @@ int main(void)
     puts("\nTriXium firmware "__DATE__" "__TIME__"\n");
 #ifdef TRIXIUM_N_MEMCTRL
 #ifndef TRIXIUM_SIM
-    // The BIOS brought up controller 0 (main_ram); the other DDR4 controllers carry
-    // the engine channels' weights and have no BIOS support: init them here, then prove
-    // every channel's window with the path the weights take (ddr.c).
-    ddr_init_all();
+    // The BIOS brought up controller 0 (main_ram); the other controllers carry the engine
+    // channels' weights: init them here unless the BIOS did (the YPCB's CK phase leveling),
+    // then prove every channel's window with the path the weights take (ddr.c).
+    ddr_boot_init();
     ddr_test(-1);
 #else
     // Simulation: LiteDRAM's PHY model has no reset/MRS/ZQ/leveling state and the DFII

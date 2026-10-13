@@ -68,7 +68,7 @@ from model.layout import HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
-from gateware.memory.s7hrddrphy import s7hr_model_settings, S7HRPHYModel, NoDMPHYModel
+from gateware.memory.ckphase_model import ckphase_model_settings, CKPhasePHYModel, NoDMPHYModel
 from model.bons import BONSReader
 from gateware.common import set_main_ram_executable
 
@@ -81,12 +81,13 @@ HDR_OFFSET    = HDR_CPU_OFFSET # BONS header+table at main_ram + 4 MB (shared wi
 DDR4_SIM_CSR_WINDOW = 0xF0020000 # The target's DDR_CSR_WINDOW.
 DDR4_SIM_CSR_STRIDE = 0x1000
 
-# The YPCB's DDR3 flavor: two LiteDRAM controllers on LiteDRAM's PHY model with the S7HRDDRPHY's
-# latencies, the board's DDR3-1066 timings and controller settings, and the ddr clock at 8/9 of sys
-# (the board's 133.33/150 MHz). The geometry is the board's (8 banks x 1024 columns: 8 KB rows, the
-# bank in byte address bits 13..15) with 2048 rows, 128 MB per controller, so the windows' 32 KB bank
-# skew is the board's own. Windows from 12 MB at a power-of-two stride sized for the image (4 MB for
-# the tiny models; a truncated 1.7B for the performance runs needs 32 MB).
+# The YPCB's DDR3 flavor: two LiteDRAM controllers on LiteDRAM's PHY model with the K7DDRPHY's
+# latencies (CK phase mode), the board's DDR3-1066 timings and controller settings, and the ddr
+# clock at 8/9 of sys (the board's 133.33/150 MHz). The geometry is the board's (8 banks x 1024
+# columns: 8 KB rows, the bank in byte address bits 13..15) with 2048 rows, 128 MB per controller,
+# so the windows' 32 KB bank skew is the board's own. Windows from 12 MB at a power-of-two stride
+# sized for the image (4 MB for the tiny models; a truncated 1.7B for the performance runs needs
+# 32 MB).
 DDR3_SIM_WEIGHT_BASE = 0x00C0_0000 # 12 MB.
 DDR3_SIM_BANK_CYCLE  = 0x10000     # 8 banks x 8 KB rows: the windows' skew is 1/chan_mod of it.
 DDR3_SIM_DDR_PERIOD  = 9000        # ps: the sim's clocks are integer picoseconds, ddr at 9 ns and
@@ -218,10 +219,10 @@ def sim_ddr3(size):
     return type("SimDDR3", (YPCBDDR3,), {"nrows": size//(8*1024*8)})
 
 
-# The fly-by channel of the calibration's simulation (--s7hr-model): crossings ordered along the
+# The fly-by channel of the calibration's simulation (--ckphase-model): crossings ordered along the
 # chain, latencies 0 and 6 (-2), one bit of lane 3 framed a CLK late; the common window is
 # +9..-34 across the tCK boundary (the scan's stride-28 samples settle at -56).
-S7HR_CHANNEL = dict(
+CKPHASE_CHANNEL = dict(
     cross   = [-30, -25, -20, -15, -10, -5, 0, 5],
     base_wl = [0, 0, 6, 6, 0, 0, 6, 0],
     v0      = [40 + (b % 8) + (24 if b == 27 else 0) for b in range(64)],
@@ -276,7 +277,7 @@ def ddr3_content(k, ram, img, chan_mod, stride, size):
 
 def ddr3_phy(content, size):
     module   = sim_ddr3(size)(DDR3_SIM_FREQ, "1:4")
-    settings = s7hr_model_settings(DDR3_SIM_FREQ, 64, DDR3_CL, DDR3_CWL)
+    settings = ckphase_model_settings(DDR3_SIM_FREQ, 64, DDR3_CL, DDR3_CWL)
     phy      = SDRAMPHYModel(module=module, settings=settings, clk_freq=DDR3_SIM_FREQ,
                              init=words(content))
     return phy, module
@@ -332,7 +333,7 @@ class TriXiumSimSoC(SoCCore):
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
-                 ddr_settings=None, s7hr_model=False):
+                 ddr_settings=None, ckphase_model=False):
         assert mem in ("hbm", "ddr4", "ddr3")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
@@ -392,6 +393,8 @@ class TriXiumSimSoC(SoCCore):
             cpu_type                 = cpu_type,
             integrated_rom_size      = 0x20000,
             integrated_rom_init      = ROM_BOOT_STUB,
+            # The YPCB's 16 KB (trixium_ypcb.py): liblitedram's CK phase leveling state in .bss.
+            integrated_sram_size     = 0x4000 if mem == "ddr3" else 0x2000,
             integrated_main_ram_size = MAIN_RAM_SIZE if mem == "hbm" else 0,
             integrated_main_ram_init = words(ram) if mem == "hbm" else [],
             uart_name                = "sim")
@@ -432,7 +435,7 @@ class TriXiumSimSoC(SoCCore):
         else:
             stride   = ddr3_stride(img)
             chan_mod = self.add_ddr3(n_channels, n_memctrl, ram, img, memory_ports, stride,
-                ddr_settings or {}, s7hr_model)
+                ddr_settings or {}, ckphase_model)
 
         # TriXium ----------------------------------------------------------------------------------
         # Same integration as both hardware targets; only memory/physical policy differs.
@@ -474,17 +477,16 @@ class TriXiumSimSoC(SoCCore):
             self.add_constant("TRIXIUM_CHAN_SKEW",        ddr3_skew(chan_mod))
             self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
             self.add_constant("TRIXIUM_N_MEMCTRL",        n_memctrl)
-            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   2*DDR4_SIM_CSR_STRIDE if s7hr_model else DDR4_SIM_CSR_STRIDE)
+            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   2*DDR4_SIM_CSR_STRIDE if ckphase_model else DDR4_SIM_CSR_STRIDE)
             self.add_constant("SDRAM_TEST_DISABLE")
-            if s7hr_model:
-                # The board's calibration (firmware/ddr_s7hr.c) on the PHY model: `ddrinit 1` on
-                # the console. Scan stride and BIST sizes cut to simulation time.
-                self.add_config("SDRAM_CUSTOM_INIT")
-                self.add_constant("TRIXIUM_DDR_S7HR")
-                self.add_constant("TRIXIUM_DDR_CKPHASE_STEPS", 112)
-                self.add_constant("S7HR_SCAN_STRIDE",      28)
-                self.add_constant("S7HR_BIST_STEP_BYTES",  0x10000)
-                self.add_constant("S7HR_BIST_FINAL_BYTES", 0x40000)
+            if ckphase_model:
+                # The board's calibration (liblitedram's CK phase leveling, SDRAM_PHY_CKPHASE_STEPS
+                # from the model's settings) on the PHY model: `ddrinit 1` on the console. Scan
+                # stride and BIST sizes cut to simulation time.
+                self.add_constant("SDRAM_CSR_STRIDE",               2*DDR4_SIM_CSR_STRIDE)
+                self.add_constant("SDRAM_CKPHASE_SCAN_STRIDE",      28)
+                self.add_constant("SDRAM_CKPHASE_BIST_STEP_BYTES",  0x10000)
+                self.add_constant("SDRAM_CKPHASE_BIST_FINAL_BYTES", 0x40000)
         else:
             # The XCU1525's geometry, scaled to the simulated memories: the same constants the
             # firmware reads on the board, at the map's windows (DDR4Map).
@@ -534,12 +536,12 @@ class TriXiumSimSoC(SoCCore):
         return chan_mod
 
     def add_ddr3(self, n_channels, n_memctrl, ram, img, memory_ports, stride, ddr_settings,
-                 s7hr_model=False):
+                 ckphase_model=False):
         """The YPCB's memory system on LiteDRAM's PHY model; returns chan_mod.
 
-        s7hr_model: the PHY models behind the S7HRDDRPHY's CSRs (S7HRPHYModel), with a LiteDRAM
-        BIST per controller: controller 0 (main_ram, the firmware) without channel effects,
-        controller 1 as a fly-by channel to calibrate (S7HR_CHANNEL)."""
+        ckphase_model: the PHY models behind the K7DDRPHY's CSRs in CK phase mode (CKPhasePHYModel),
+        with a LiteDRAM BIST per controller: controller 0 (main_ram, the firmware) without channel effects,
+        controller 1 as a fly-by channel to calibrate (CKPHASE_CHANNEL)."""
         assert n_channels % n_memctrl == 0, "channels shard evenly over the controllers"
         chan_mod = n_channels//n_memctrl
         assert chan_mod & (chan_mod - 1) == 0
@@ -550,15 +552,15 @@ class TriXiumSimSoC(SoCCore):
             size = ddr3_size(chan_mod, stride)
             phy, module = ddr3_phy(ddr3_content(k, ram, img, chan_mod, stride, size), size)
             # The board has no DM pins: neither model lets a write mask reach the memory.
-            if s7hr_model:
-                phy = S7HRPHYModel(phy, ideal=(k == 0), **S7HR_CHANNEL)
+            if ckphase_model:
+                phy = CKPhasePHYModel(phy, ideal=(k == 0), **CKPHASE_CHANNEL)
             else:
                 phy = NoDMPHYModel(phy)
             split_phys.append(phy)
             split_modules.append(module)
         add_ddr_domain_controllers(self, split_phys, split_modules, DDR3_SIM_FREQ, MAIN_RAM_SIZE,
             8192, DDR4_SIM_CSR_WINDOW, controller_settings=ddr_controller_settings(**ddr_settings),
-            with_bist=s7hr_model)
+            with_bist=ckphase_model)
 
         # Engine ports: channel c -> controller c // chan_mod.
         for k in range(n_memctrl):
@@ -700,8 +702,8 @@ def build_sim(args, board, out_dir):
     sim_config.add_module("serial2console", "serial")
     soc_kwargs = dict(board, update_repo=args.update_repo,
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
-    if args.s7hr_model:
-        soc_kwargs["s7hr_model"] = True
+    if args.ckphase_model:
+        soc_kwargs["ckphase_model"] = True
     if args.ddr_settings:
         soc_kwargs["ddr_settings"] = {k: int(v) for k, v in
             (kv.split("=") for kv in args.ddr_settings.split(","))}
@@ -751,7 +753,7 @@ def main():
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
-    parser.add_argument("--s7hr-model",     action="store_true",                                   help="--board ypcb: the PHY models behind the S7HRDDRPHY's CSRs (calibration test: ddrinit 1).")
+    parser.add_argument("--ckphase-model",  action="store_true",                                   help="--board ypcb: the PHY models behind the K7DDRPHY's CK phase CSRs (calibration test: ddrinit 1).")
     parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")
     parser.add_argument("--gate-pre",       default="",                                            help="--gate: console commands before the traced generation, ';'-separated (e.g. 'gen 2 5 6 7;engreset').")
     parser.add_argument("--random-init",    default=None, type=int, metavar="SEED",               help="--build: never-reset registers start at random values from SEED (build/sim_<board>_ri<SEED>; software/lab/randinit.py).")
