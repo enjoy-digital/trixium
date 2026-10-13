@@ -110,7 +110,7 @@ def stream_bytes(image):
     n_ch  = r.header["n_channels"]
     roles = {}
     for e in r.entries:
-        if e["kind"] not in (layout.KIND_TERNARY, layout.KIND_Q8):
+        if e["kind"] not in (layout.KIND_TERNARY, layout.KIND_TERNARY5, layout.KIND_Q8):
             continue
         name = layout.ROLE_NAMES[e["role"]]
         roles[name] = roles.get(name, 0) + e["chan_len_beats"]*32*n_ch

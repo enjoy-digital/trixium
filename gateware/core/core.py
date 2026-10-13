@@ -54,6 +54,7 @@ class TriXiumConfig:
     with_dnstream: bool            = False # Engine op 5: the DeltaNet stream unit on every channel.
     dnstream_options: tuple        = ()    # (name, value) overrides of the unit's arguments.
     with_attnstream: bool          = False # Engine op 6: the attention passes (scores, weighted V).
+    with_trit5: bool               = False # Ternary codes 5 trits per byte (Trit5Unpacker per channel).
     attnstream_options: tuple      = ()    # (name, value) overrides of the unit's arguments.
 
     def __post_init__(self):
@@ -208,7 +209,10 @@ class TriXiumCore(LiteXModule):
             seq        = seq,
             dnstream   = config.with_dnstream   and (config.dnstream_options   or True),
             attnstream = config.with_attnstream and (config.attnstream_options or True),
+            trit5      = config.with_trit5,
             **placement))
+        if config.with_trit5:
+            self.add_constant("TRIXIUM_HAS_TRIT5")
         if config.with_attnstream:
             at = self.engine.attnstream
             self.add_constant("TRIXIUM_HAS_ATTNSTREAM")

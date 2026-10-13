@@ -1854,7 +1854,7 @@ static uint32_t lm_chunk_rows(void)
 static int lm_head_list(const struct bons_entry *head, float *dst)
 {
     if (!(H->hadamard_block && resident_active() && head &&
-          (head->kind == KIND_TERNARY || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)))
+          (head->kind == KIND_TERNARY || head->kind == KIND_TERNARY5 || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)))
         return -1;
     uint32_t unit = 8u*(uint32_t)n_ch, chunk = lm_chunk_rows();
     uint32_t nch = (uint32_t)n_ch, per = head->rows/nch;
@@ -1884,7 +1884,7 @@ static int lm_head_list(const struct bons_entry *head, float *dst)
 static int lm_head_argmax(const struct bons_entry *head, float *dst)
 {
     if (!(H->hadamard_block && resident_active() && head &&
-          (head->kind == KIND_TERNARY || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)))
+          (head->kind == KIND_TERNARY || head->kind == KIND_TERNARY5 || head->kind == KIND_Q8) && !(head->flags & FLAG_KSEG)))
         return -1;
     uint32_t unit = 8u*(uint32_t)n_ch, chunk = lm_chunk_rows();
     uint32_t nch = (uint32_t)n_ch, per = head->rows/nch, vocab = (uint32_t)H->vocab;

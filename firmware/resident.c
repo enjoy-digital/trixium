@@ -542,7 +542,7 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
 {
     struct resident_state *R = resident_state();
     if (!e || rows % 8 || rows > RS_ROWS_MAX || rows % (uint32_t)R->n_ch || row0 % (uint32_t)R->n_ch ||
-        row0 + rows > e->rows || (e->kind != KIND_TERNARY && e->kind != KIND_Q8))
+        row0 + rows > e->rows || (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5 && e->kind != KIND_Q8))
         return -1;
     int nseg = (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
     if (nseg < 1 || nseg > 4)
@@ -567,6 +567,7 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
         op.wlen   = rpc*rb;
         op.sbeats = bons_scale_beats(seg->cols, seg->group);
         op.cbeats = bons_code_beats(seg->cols, seg->kind);
+        op.pk     = (seg->kind == KIND_TERNARY5);
         op.bias   = seg->bias;
         op.rshift = seg->rshift;
         op.xsrc   = RS_XW + xoff;

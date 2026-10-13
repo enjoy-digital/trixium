@@ -57,6 +57,7 @@ static void matvec_engine_rows(const struct bons_entry *e, uint32_t row0, uint32
     op.wlen   = rows*rb;
     op.sbeats = bons_scale_beats(e->cols, e->group);
     op.cbeats = bons_code_beats(e->cols, e->kind);
+    op.pk     = (e->kind == KIND_TERNARY5);
     op.bias   = e->bias;
     op.rshift = e->rshift;
     op.xsrc   = SP_X;

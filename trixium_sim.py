@@ -64,7 +64,7 @@ from litedram.phy.model import SDRAMPHYModel
 
 from trixium_ypcb import YPCBDDR3, DDR3_CL, DDR3_CWL, ddr_controller_settings
 
-from model.layout import HDR_CPU_OFFSET
+from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
@@ -451,6 +451,9 @@ class TriXiumSimSoC(SoCCore):
             with_conv                = with_conv,
             with_dnstream            = bool(with_dnstream),
             with_attnstream          = attn_geometry is not None,
+            # An image with 5-trits-per-byte weights needs the unpacker in front of the pipes.
+            with_trit5               = img is not None and any(
+                e["kind"] == KIND_TERNARY5 for e in img.entries),
             attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
                 if attn_geometry else ())

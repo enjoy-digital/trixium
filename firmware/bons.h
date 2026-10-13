@@ -31,6 +31,7 @@
 #define KIND_F16     2
 #define KIND_F32     3
 #define KIND_NORM16  4 // int16 rows, the tensor's exponent in bias (layout.norm16_exp), for the vector unit.
+#define KIND_TERNARY5 5 // KIND_TERNARY's codes 5 trits per byte (26 bytes per group, rows beat-padded).
 
 #define FLAG_REPLICATED 0x01
 #define FLAG_KSEG       0x02 // One K-segment of a wide matvec (layout.FLAG_KSEG): siblings
@@ -137,7 +138,7 @@ static inline uint32_t bons_scale_beats(uint32_t cols, uint32_t group)
 
 static inline uint32_t bons_code_beats(uint32_t cols, uint8_t kind)
 {
-    if (kind == KIND_TERNARY) return cols/128;
+    if (kind == KIND_TERNARY || kind == KIND_TERNARY5) return cols/128; // Pipe beats.
     if (kind == KIND_Q8)      return cols/32;
     if (kind == KIND_F16)     return (2*cols + 31)/32;
     // NORM16 is int16 too (layout.code_beats agrees), not F32.
@@ -147,7 +148,10 @@ static inline uint32_t bons_code_beats(uint32_t cols, uint8_t kind)
 
 static inline uint32_t bons_row_beats(uint32_t cols, uint8_t kind, uint32_t group)
 {
-    uint32_t sb = (kind == KIND_TERNARY || kind == KIND_Q8) ? bons_scale_beats(cols, group) : 0;
+    uint32_t sb = (kind == KIND_TERNARY || kind == KIND_TERNARY5 || kind == KIND_Q8)
+                ? bons_scale_beats(cols, group) : 0;
+    if (kind == KIND_TERNARY5) // Memory beats: 26 bytes per 128-group, the row padded.
+        return sb + (26*(cols/128) + 31)/32;
     return sb + bons_code_beats(cols, kind);
 }
 

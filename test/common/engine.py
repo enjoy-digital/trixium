@@ -46,7 +46,7 @@ class EngineDUT(Module):
     """
     def __init__(self, n_channels, xbuf_groups=32, chan_stride=0, chan_mod=0, chan_skew=0,
                  loader=False, loader_width=128, vecunit=False, seq=False, seed7=True,
-                 front=False, overlap=False, sp_size=64*1024, hbm=None, sp_init=None):
+                 front=False, overlap=False, sp_size=64*1024, hbm=None, sp_init=None, trit5=False):
         self.axis = axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                             for _ in range(n_channels)]
         init = words_from_bytes(sp_init) if sp_init is not None else None
@@ -59,7 +59,7 @@ class EngineDUT(Module):
             self.submodules.seq = Sequencer()
         self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=xbuf_groups,
             chan_stride=chan_stride, chan_mod=chan_mod, chan_skew=chan_skew,
-            vecunit=self.vu if vecunit else None, seq=self.seq if seq else None)
+            vecunit=self.vu if vecunit else None, seq=self.seq if seq else None, trit5=trit5)
         if front:
             from gateware.core.csr import EngineCSR
             self.submodules.front = EngineCSR(self.engine, seq=self.seq if seq else None)

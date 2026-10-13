@@ -66,7 +66,8 @@ void seq_desc_engine(uint32_t idx, const struct engine_op *op)
     d[3]  = op->cols;
     d[4]  = op->wbase;
     d[5]  = op->wlen;
-    d[6]  = op->sbeats | ((uint32_t)op->cbeats << 8) | ((uint32_t)op->qstride << 16);
+    d[6]  = op->sbeats | ((uint32_t)op->pk << 4) | ((uint32_t)op->cbeats << 8)
+          | ((uint32_t)op->qstride << 16);
     d[7]  = op->bias | ((uint32_t)op->rshift << 16) | ((uint32_t)op->rshift2 << 22);
     d[8]  = op->xsrc;
     d[9]  = op->dst;

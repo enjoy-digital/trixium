@@ -42,7 +42,7 @@ def _i32(data):
     return np.frombuffer(data, dtype="<i4").astype(np.int64)
 
 def _run_engine(backend, n_channels, payloads, sp, cmd, n_results, dst, latency=8, stall_rate=0,
-                xbuf_groups=32, reorder_ids=0, absmax=False):
+                xbuf_groups=32, reorder_ids=0, absmax=False, trit5=False):
     """Results array, or (results, engine.absmax) when absmax=True."""
     s = Script()
     submit(s, cmd)
@@ -51,13 +51,15 @@ def _run_engine(backend, n_channels, payloads, sp, cmd, n_results, dst, latency=
     s.peek("error")
     s.peek("absmax")
     s.read("sp", dst, 4*n_results, "res")
-    r = EngineBench(n_channels, xbuf_groups=xbuf_groups).run(backend, s, sp=sp, payloads=payloads,
+    bench = EngineBench(n_channels, xbuf_groups=xbuf_groups, **({"trit5": True} if trit5 else {}))
+    r = bench.run(backend, s, sp=sp, payloads=payloads,
         latency=latency, stall_rate=stall_rate, reorder_ids=reorder_ids)
     assert r.peeks["error"] == 0
     arr = _i32(r.reads["res"])
     return (arr, r.peeks["absmax"]) if absmax else arr
 
-def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate, seed):
+def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate, seed,
+                  kind=layout.KIND_TERNARY, trit5=False, xbuf_groups=32):
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
     G      = cols//layout.GROUP_TERNARY
@@ -72,6 +74,7 @@ def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate,
 
     spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
                       scales=scales, values=codes)
+    spec.kind = kind # KIND_TERNARY5: the same tensor stored 5 trits per byte.
     payloads = []
     for c in range(n_channels):
         row0, nrows = layout.shard_rows(M, n_channels, c)
@@ -79,11 +82,14 @@ def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate,
 
     xsrc, dst = 0, 0x4000
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
-               wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
-               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
-               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+               wlen=rows_per_chan*layout.row_beats(cols, kind),
+               sbeats=layout.scale_beats(cols, kind),
+               cbeats=layout.code_beats(cols, kind),
                bias=B, rshift=R, xsrc=xsrc, dst=dst)
-    got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, dst, latency, stall_rate)
+    if trit5:
+        cmd["pk"] = int(kind == layout.KIND_TERNARY5)
+    got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, dst, latency, stall_rate,
+                      xbuf_groups=xbuf_groups, trit5=trit5)
     assert np.array_equal(got, expected), f"N={n_channels} rows={rows_per_chan} cols={cols}"
 
 @COMPILED
@@ -104,6 +110,35 @@ def test_matvec_ternary_n4_gather_pressure(backend):
     # pipes must throttle beat intake on result-FIFO headroom instead of dropping results
     # (without backpressure out_fifo overflows and the op never completes).
     _case_ternary(backend, n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=9)
+
+# Trit5 (KIND_TERNARY5 through the unpacker) ------------------------------------------------------
+
+T5 = layout.KIND_TERNARY5
+
+@COMPILED
+def test_matvec_trit5_aligned(backend):
+    # K = 2048: 16 groups in 13 memory beats, no row padding (the Qwen3 widths).
+    _case_ternary(backend, n_channels=2, rows_per_chan=6, cols=2048, latency=8, stall_rate=0, seed=21,
+                  kind=T5, trit5=True)
+
+@COMPILED
+def test_matvec_trit5_padded_stalls(backend):
+    # K = 384: 3 groups in 78 bytes, each row padded to a whole beat; stalls desynchronize the
+    # channels.
+    _case_ternary(backend, n_channels=4, rows_per_chan=8, cols=384, latency=8, stall_rate=3, seed=22,
+                  kind=T5, trit5=True)
+
+@COMPILED
+def test_matvec_trit5_gather_pressure(backend):
+    # One group per row (26 bytes in a padded beat): results faster than the gather drains.
+    _case_ternary(backend, n_channels=4, rows_per_chan=48, cols=128, latency=8, stall_rate=0, seed=23,
+                  kind=T5, trit5=True)
+
+@COMPILED
+def test_matvec_trit5_engine_unpacked_op(backend):
+    # A trit5 engine still runs 2-bit ternary ops (pk = 0: the unpacker passes beats through).
+    _case_ternary(backend, n_channels=2, rows_per_chan=8, cols=256, latency=8, stall_rate=2, seed=24,
+                  trit5=True)
 
 @BACKEND
 def test_matvec_slim_no_dual(backend):

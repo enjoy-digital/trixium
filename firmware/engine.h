@@ -45,6 +45,7 @@ struct engine_op {
     uint32_t wlen;        // Beats per channel.
     uint8_t  sbeats;
     uint8_t  cbeats;
+    uint8_t  pk;          // Ternary codes stored 5 trits per byte (KIND_TERNARY5, trit5 engines).
     uint8_t  bias;
     uint8_t  rshift;
     uint8_t  rshift_rpre; // Sequencer only: rshift = bitlen(prev vec res6) + 5 (AXPY Rpre).

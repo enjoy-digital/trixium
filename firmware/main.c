@@ -416,7 +416,7 @@ static void mvtest_cmd(char *str)
     int layer = (*l) ? (int)strtoul(l, NULL, 0) : 0;
     const struct bons_entry *e = model_entry(role, layer);
     if (!e) { printf("mvtest: no tensor role %d layer %d\n", role, layer); return; }
-    if (e->kind != KIND_TERNARY && e->kind != KIND_Q8) {
+    if (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5 && e->kind != KIND_Q8) {
         printf("mvtest: role %d layer %d is kind %u, not a matvec\n", role, layer, e->kind);
         return;
     }
@@ -439,7 +439,7 @@ static void mvbw_cmd(char *str)
     if (model_header()->magic != BONS_MAGIC) { puts("mvbw: no model"); return; }
     const struct bons_entry *e = model_entry((int)strtoul(r, NULL, 0), *l ? (int)strtoul(l, NULL, 0) : 0);
     int reps = *n ? (int)strtoul(n, NULL, 0) : 4;
-    if (!e || (e->kind != KIND_TERNARY && e->kind != KIND_Q8) || e->rows*4 > 0x30000) {
+    if (!e || (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5 && e->kind != KIND_Q8) || e->rows*4 > 0x30000) {
         puts("mvbw: no such matvec tensor (or its result does not fit the scratchpad)");
         return;
     }

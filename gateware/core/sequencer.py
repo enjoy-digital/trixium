@@ -48,7 +48,7 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           rpre(prev vec res6) instead of w7) | qn<<11 (dual-Q GQA)
           | xred<<12 (AXPY: sum the per-channel partials in hardware);
           w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;  w5 = wlen;
-          w6 = sbeats | cbeats<<8 | qstride<<16 (head-B result offset, words);
+          w6 = sbeats | pk<<4 | cbeats<<8 | qstride<<16 (head-B result offset, words);
           w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
           w8 = xsrc;  w9 = dst;  w10 = chan;
           w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE).
@@ -216,6 +216,7 @@ class Sequencer(LiteXModule):
         self.eng_wlen    = Signal(24)
         self.eng_sbeats  = Signal(4)
         self.eng_cbeats  = Signal(8)
+        self.eng_pk      = Signal()
         self.eng_bias    = Signal(7)
         self.eng_rshift  = Signal(6)
         self.eng_xsrc    = Signal(24)
@@ -619,6 +620,7 @@ class Sequencer(LiteXModule):
             self.eng_wlen.eq(w(0, 5)[0:24]),
             self.eng_sbeats.eq(w(0, 6)[0:4]),
             self.eng_cbeats.eq(w(0, 6)[8:16]),
+            self.eng_pk.eq(w(0, 6)[4]),
             self.eng_bias.eq(w(0, 7)[0:7]),
             self.eng_rshift.eq(Mux(w(0, 1)[10], rpre_v[0:6], w(0, 7)[16:22])),
             self.eng_qn.eq(w(0, 1)[11]),

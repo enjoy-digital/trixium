@@ -198,6 +198,7 @@ void model_matvec_op(const struct bons_entry *e, uint32_t xsrc, uint32_t dst,
     op->wlen   = e->chan_len_beats;
     op->sbeats = bons_scale_beats(e->cols, e->group);
     op->cbeats = bons_code_beats(e->cols, e->kind);
+    op->pk     = (e->kind == KIND_TERNARY5);
     op->bias   = e->bias;
     op->rshift = e->rshift;
     op->xsrc   = xsrc;

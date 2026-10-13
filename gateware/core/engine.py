@@ -32,6 +32,7 @@ from litex.soc.interconnect import stream
 
 from gateware.memory.axi import AXIReader
 from gateware.core.pipe import ChannelPipe
+from gateware.core.trit5 import Trit5Unpacker
 from gateware.units.deltanet_stream import DeltaNetStream
 from gateware.units.attention_stream import AttentionStream
 
@@ -156,7 +157,8 @@ class _ResultPacker(LiteXModule):
 class MatVecEngine(LiteXModule):
     """N-channel matvec engine: one AXIReader + ChannelPipe per memory channel (see module doc)."""
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
-                 chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False):
+                 chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
+                 trit5=False):
         # chan_stride: byte distance between consecutive channels' weight regions. With the
         # HBM AXI switch enabled the address (not the port) selects the pseudo-channel, so
         # each channel needs its own window; 0 when every channel has its own address space.
@@ -220,6 +222,7 @@ class MatVecEngine(LiteXModule):
             ("wlen",   24),  # Per-channel weight length in beats.
             ("sbeats", 4),   # Scale beats per row.
             ("cbeats", 8),   # Code beats per row.
+            ("pk",     1),   # Ternary codes stored 5 trits per byte (trit5: Trit5Unpacker).
             ("bias",   7),   # B.
             ("rshift", 6),   # R.
             ("xsrc",   24),  # x8 source byte address in scratchpad (32B aligned).
@@ -290,6 +293,7 @@ class MatVecEngine(LiteXModule):
 
         self.readers = []
         self.pipes   = []
+        self.unpackers = []
         read_cmds = []
         # Per-cycle port arbitration state. rd_free: the engine may put an address on the
         # scratchpad R port this cycle. fetch_rdy: the gather write FIFO has headroom for a
@@ -313,6 +317,15 @@ class MatVecEngine(LiteXModule):
             pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
             setattr(self, f"reader{i}", reader)
             setattr(self, f"pipe{i}",   pipe)
+            # trit5: the compute beats go through the unpacker (a pass-through unless the op's
+            # codes are packed), the pipe sees 2-bit code beats either way.
+            psink = pipe.sink
+            if trit5:
+                unp = Trit5Unpacker()
+                setattr(self, f"unpack{i}", unp)
+                self.comb += unp.source.connect(pipe.sink)
+                psink = unp.sink
+                self.unpackers.append(unp)
             # Relay register between the reader (its FIFO sits at the memory port) and the
             # pipe, for timing (route). Latency only.
             rbuf = stream.Buffer([("data", 256)])
@@ -338,13 +351,13 @@ class MatVecEngine(LiteXModule):
                 self.sync += is_at.eq(at_mode)
             self.comb += [
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
-                pipe.sink.valid.eq(rsrc.valid & ~is_fetch & ~is_dn & ~is_at),
-                pipe.sink.data.eq(rsrc.data),
+                psink.valid.eq(rsrc.valid & ~is_fetch & ~is_dn & ~is_at),
+                psink.data.eq(rsrc.data),
                 # Fetch beats honor the gather-FIFO headroom (a vec store can steal the
                 # W port for a cycle); compute beats honor the pipe's result-FIFO
                 # backpressure.
                 rsrc.ready.eq((is_fetch & fetch_rdy)
-                              | (~is_fetch & ~is_dn & ~is_at & pipe.sink.ready)
+                              | (~is_fetch & ~is_dn & ~is_at & psink.ready)
                               | (is_dn & (dn.sinks[i].ready if dnstream else 0))
                               | (is_at & at_take & (at_chan == i))),
             ]
@@ -359,7 +372,7 @@ class MatVecEngine(LiteXModule):
         # Reset-less but for the kind (its mode decodes steer the read and gather handshakes):
         # every other field is loaded at accept and only read from START on.
         cmd_r = {}
-        for name in (("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats",
+        for name in (("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats", "pk",
                      "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
                      "rep", "dstride", "sstride",
                      "qn", "qstride", "rshift2", "xred")):
@@ -396,6 +409,12 @@ class MatVecEngine(LiteXModule):
                 pipe.rshift.eq(cmd_r["rshift"]),
                 pipe.qn.eq(cmd_r["qn"]),
                 pipe.rshift2.eq(cmd_r["rshift2"]),
+            ]
+        for unp in self.unpackers:
+            self.sync += [
+                unp.packed.eq(cmd_r["pk"] & (cmd_r["kind"] == 0)),
+                unp.scale_beats.eq(cmd_r["sbeats"]),
+                unp.code_beats.eq(cmd_r["cbeats"]),
             ]
         # Overflow is included so any future rate mismatch fails loud (sticky error bit)
         # instead of dropping results and hanging the op.
@@ -974,6 +993,8 @@ class MatVecEngine(LiteXModule):
         self.comb += st_fifo.reset.eq(start_pulse | st_next)
         for i, pipe in enumerate(self.pipes):
             self.sync += pipe.start.eq(start_pulse & ~dn_mode & ~at_mode)
+        for unp in self.unpackers:
+            self.sync += unp.start.eq(start_pulse & ~dn_mode & ~at_mode)
         dn_fin = Signal() # The unit reported done for this op (sticky until the next).
         if dnstream:
             self.comb += [

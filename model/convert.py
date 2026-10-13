@@ -198,7 +198,7 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
             max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None,
-            window_reserve=0, kseg_max=layout.KSEG_MAX):
+            window_reserve=0, kseg_max=layout.KSEG_MAX, trit5=False):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
     try:
@@ -286,6 +286,7 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     t0 = time.time()
     manifest = write_image(cfg, specs, n_channels, out_path,
                            tokenizer_sha256=sha, manifest_path=manifest_path, emb16=emb16,
+                           trit5=trit5,
                            progress=lambda name: print(f"  {name}...", flush=True))
     print(f"  {time.time() - t0:.1f} s")
     print(f"image: {out_path} payload {manifest['payload_bytes_per_channel']/1e6:.1f} MB/channel"
@@ -349,6 +350,7 @@ def main():
     p.add_argument("--weight-base",    default=None, type=_int,           help="Weight base (TRIXIUM_CHAN_WEIGHT_BASE, default: FK33's).")
     p.add_argument("--window-reserve", default=0,    type=_int,           help="Bytes lost to the bank skew ((chan_mod-1)*TRIXIUM_CHAN_SKEW).")
     p.add_argument("--kseg-max",       default=layout.KSEG_MAX, type=int, help="Split matvecs wider than this (K-segments).")
+    p.add_argument("--trit5",          action="store_true",               help="Streamed ternary weights 5 trits per byte (with_trit5 engines).")
 
     # Verify.
     p = sub.add_parser("verify", help="Re-CRC all tensor payloads of a BONS image.")
@@ -362,7 +364,7 @@ def main():
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
                 args.layers, args.check, emb16=not args.no_emb16,
                 chan_stride=args.chan_stride, weight_base=args.weight_base,
-                window_reserve=args.window_reserve, kseg_max=args.kseg_max)
+                window_reserve=args.window_reserve, kseg_max=args.kseg_max, trit5=args.trit5)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 

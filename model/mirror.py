@@ -649,8 +649,8 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
                 ws = []
                 for t in segs:
                     scales, codes = img.tensor(t["name"])
-                    g = 128 if t["kind"] == layout.KIND_TERNARY else 32
-                    off = 1.0 if t["kind"] == layout.KIND_TERNARY else 0.0
+                    g = 128 if layout.is_ternary(t["kind"]) else 32
+                    off = 1.0 if layout.is_ternary(t["kind"]) else 0.0
                     w = (codes.astype(f32).reshape(t["rows"], -1, g) - f32(off))*scales.astype(f32)[:, :, None]
                     ws.append(w.reshape(t["rows"], t["cols"]))
                 wcache[e["name"]] = np.concatenate(ws, axis=1)
@@ -662,7 +662,7 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         for t in segs:
             scales, codes = img.tensor(t["name"])
             xs = x8[c0:c0 + t["cols"]]
-            if t["kind"] == layout.KIND_TERNARY:
+            if layout.is_ternary(t["kind"]):
                 r = bx.matvec_ternary(scales, codes, xs, t["bias"], t["rshift"])
             else:
                 r = bx.matvec_q8(scales, codes, xs, t["bias"], t["rshift"])

@@ -101,6 +101,9 @@ uint32_t engine_submit(const struct engine_op *op)
     ENG_WR(wlen);
     ENG_WR(sbeats);
     ENG_WR(cbeats);
+#ifdef TRIXIUM_HAS_TRIT5
+    ENG_WR(pk);
+#endif
     ENG_WR(bias);
     ENG_WR(rshift);
     ENG_WR(xsrc);

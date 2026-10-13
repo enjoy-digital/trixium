@@ -129,7 +129,7 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
 
 # Generate -----------------------------------------------------------------------------------------
 
-def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
+def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None, trit5=False):
     """kseg_max: split matvecs wider than this into K-segments (the 27B's FFN down projection
     path, exercised on the tiny model with e.g. 256); the image is named `-kseg`."""
     os.makedirs(out_dir, exist_ok=True)
@@ -141,12 +141,15 @@ def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None):
     if kseg_max is not None:
         tensors = [seg for t in tensors for seg in split_wide(t, kseg_max)]
         suffix += "-kseg"
+    if trit5:
+        suffix += "-t5"
     img_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.img")
     man_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.json")
-    manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path)
+    manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path,
+                           trit5=trit5)
     return img_path, man_path, manifest
 
-def generate_slice(out_dir, name, n_channels=16, seed=1234):
+def generate_slice(out_dir, name, n_channels=16, seed=1234, trit5=False):
     """A shape-true slice (model.configs.SLICE_OF): the real model's tensors at its real widths,
     K-segmented as the converter does (layout.KSEG_MAX), the int16 embedding table included;
     an untied model (the 8B) gets its own output.weight."""
@@ -157,9 +160,11 @@ def generate_slice(out_dir, name, n_channels=16, seed=1234):
     else:
         tensors = make_tiny_tensors(cfg, seed, lm_head=not cfg.tie_embeddings)
     tensors  = [seg for t in tensors for seg in split_wide(t, KSEG_MAX)]
-    img_path = os.path.join(out_dir, f"{cfg.name}-n{n_channels}.img")
-    man_path = os.path.join(out_dir, f"{cfg.name}-n{n_channels}.json")
-    manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path)
+    suffix   = "-t5" if trit5 else ""
+    img_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.img")
+    man_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.json")
+    manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path,
+                           trit5=trit5)
     return img_path, man_path, manifest
 
 # Run ----------------------------------------------------------------------------------------------
@@ -173,13 +178,16 @@ def main():
     parser.add_argument("--hybrid-1k", action="store_true",    help="bonsai-tiny-hybrid-1k (1024-wide rotation blocks).")
     parser.add_argument("--kseg-max",  default=None, type=int, help="Split matvecs wider than this (K-segments).")
     parser.add_argument("--slice",     default=None, choices=list(SLICE_OF), help="A shape-true slice (real widths, few layers).")
+    parser.add_argument("--trit5",     action="store_true",    help="Streamed ternary weights 5 trits per byte (KIND_TERNARY5).")
     args = parser.parse_args()
 
     if args.slice:
-        img, man, manifest = generate_slice(args.out, args.slice, args.channels, args.seed)
+        img, man, manifest = generate_slice(args.out, args.slice, args.channels, args.seed,
+                                            trit5=args.trit5)
     else:
         cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
-        img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg, kseg_max=args.kseg_max)
+        img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg,
+                                      kseg_max=args.kseg_max, trit5=args.trit5)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")
     print(f"manifest : {man}")
     print(f"payload  : {manifest['payload_beats']} beats/channel "

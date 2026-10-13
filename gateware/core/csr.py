@@ -33,6 +33,7 @@ class EngineCSR(LiteXModule):
         self.wlen    = CSRStorage(24, description="Per-channel weight length in beats.")
         self.sbeats  = CSRStorage(4,  description="Scale beats per row.")
         self.cbeats  = CSRStorage(8,  description="Code beats per row.")
+        self.pk      = CSRStorage(1,  description="Ternary codes stored 5 trits per byte (trit5).")
         self.bias    = CSRStorage(7,  description="Accumulator scale bias B.")
         self.rshift  = CSRStorage(6,  description="Result shift R.")
         self.xsrc    = CSRStorage(24, description="x8 source scratchpad byte address.")
@@ -156,6 +157,7 @@ class EngineCSR(LiteXModule):
                 engine.cmd.wlen.eq(0 if seq is None else seq.eng_wlen),
                 engine.cmd.sbeats.eq(0 if seq is None else seq.eng_sbeats),
                 engine.cmd.cbeats.eq(0 if seq is None else seq.eng_cbeats),
+                engine.cmd.pk.eq(0 if seq is None else seq.eng_pk),
                 engine.cmd.bias.eq(0 if seq is None else seq.eng_bias),
                 engine.cmd.rshift.eq(0 if seq is None else seq.eng_rshift),
                 engine.cmd.xsrc.eq(0 if seq is None else seq.eng_xsrc),
@@ -180,6 +182,7 @@ class EngineCSR(LiteXModule):
                 engine.cmd.wlen.eq(self.wlen.storage),
                 engine.cmd.sbeats.eq(self.sbeats.storage),
                 engine.cmd.cbeats.eq(self.cbeats.storage),
+                engine.cmd.pk.eq(self.pk.storage),
                 engine.cmd.bias.eq(self.bias.storage),
                 engine.cmd.rshift.eq(self.rshift.storage),
                 engine.cmd.xsrc.eq(self.xsrc.storage),

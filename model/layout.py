@@ -21,6 +21,10 @@ beat feeds the 128-lane adder tree for one cycle. Row packet = all group scales 
 
   row r: [scale beat 0 .. scale beat S-1][code beat 0 .. code beat G-1]   (S = ceil(G/16))
 
+KIND_TERNARY5 stores the same trits 5 per byte (base 3, 26 bytes per 128-group, lane 5i+k is
+digit k of byte i), the row padded to a whole beat: S + ceil(26G/32) beats in memory, still G
+code beats for the engine's pipe (the Trit5Unpacker rebuilds the 2-bit beats in front of it).
+
 Tensors are block-sharded by output row across N channels (channel c gets rows
 [c*M/N, (c+1)*M/N)), with the same relative addresses in every channel, so a single
 {base, len} descriptor drives all N weight streamers.
@@ -43,6 +47,7 @@ KIND_TERNARY = 0 # 2-bit codes {0,1,2}, group=128, w = (q-1)*scale.
 KIND_Q8      = 1 # int8 quants, group=32, w = q*scale.
 KIND_F16     = 2 # Raw fp16 rows (no scales).
 KIND_F32     = 3 # Raw fp32 rows (no scales; norms etc, consumed by CPU/vector unit).
+KIND_TERNARY5 = 5 # KIND_TERNARY's codes stored 5 trits per byte (with_trit5 engines).
 KIND_NORM16  = 4 # int16 rows; for the ".w16" norm companions the entry's bias byte is the
                  # tensor's exponent (int8): w = q * 2^bias. Rope/embedding NORM16 rows keep
                  # their own fixed formats and bias 0.
@@ -64,12 +69,20 @@ KIND_NAMES = {
     KIND_F16     : "f16",
     KIND_F32     : "f32",
     KIND_NORM16  : "norm16",
+    KIND_TERNARY5: "ternary5",
 }
 
 KIND_GROUP = {
     KIND_TERNARY : GROUP_TERNARY,
     KIND_Q8      : GROUP_Q8,
+    KIND_TERNARY5: GROUP_TERNARY,
 }
+
+TRIT5_GROUP_BYTES = 26 # ceil(128/5).
+
+def is_ternary(kind):
+    """Ternary codes, 2-bit (KIND_TERNARY) or 5 trits per byte (KIND_TERNARY5)."""
+    return kind in (KIND_TERNARY, KIND_TERNARY5)
 
 # Tensor flags.
 FLAG_REPLICATED = 0x01 # Tensor payload identical in every channel (not row-sharded).
@@ -113,6 +126,11 @@ def hadamard_layer(width_index, block_index):
     list, then the block)."""
     assert 0 <= width_index < 4 and 0 <= block_index < 256
     return width_index*256 + block_index
+
+# The ternary roles the engine streams that KIND_TERNARY5 stores packed (the token embedding stays
+# 2-bit: the firmware decodes its rows on the CPU when the int16 table is absent).
+TRIT5_ROLES = (ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
+               ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN, ROLE_LM_HEAD)
 
 ROLE_NAMES = {
     ROLE_TOK_EMB       : "tok_emb",
@@ -174,8 +192,8 @@ def scale_beats(cols, kind):
     return ceil_div(row_groups(cols, kind), SCALES_PER_BEAT)
 
 def code_beats(cols, kind):
-    """Beats of packed codes/values per row."""
-    if kind == KIND_TERNARY:
+    """Code beats per row as the engine's pipe counts them (one 128-group per ternary beat)."""
+    if is_ternary(kind):
         return cols//GROUP_TERNARY          # 32B of 2-bit codes per 128-group = 1 beat.
     if kind == KIND_Q8:
         return cols//GROUP_Q8               # 32 int8 per 32-group = 1 beat.
@@ -187,8 +205,15 @@ def code_beats(cols, kind):
         return ceil_div(2*cols, BEAT_BYTES)
     raise ValueError(kind)
 
+def mem_code_beats(cols, kind):
+    """Code beats per row in memory (KIND_TERNARY5: 26 bytes per group, the row padded)."""
+    if kind == KIND_TERNARY5:
+        return ceil_div(TRIT5_GROUP_BYTES*(cols//GROUP_TERNARY), BEAT_BYTES)
+    return code_beats(cols, kind)
+
 def row_beats(cols, kind):
-    return scale_beats(cols, kind) + code_beats(cols, kind)
+    """Beats per row in memory."""
+    return scale_beats(cols, kind) + mem_code_beats(cols, kind)
 
 def shard_rows(rows, n_channels, channel):
     """Row range [start, count) of `channel` for a block-sharded tensor."""

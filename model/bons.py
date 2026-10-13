@@ -23,7 +23,7 @@ import numpy as np
 from model import layout
 from model.layout import (
     BEAT_BYTES, BONS_NAME_BYTES,
-    KIND_TERNARY, KIND_Q8, KIND_F16, KIND_F32, KIND_NORM16, KIND_NAMES, ROLE_NAMES,
+    KIND_TERNARY, KIND_TERNARY5, KIND_Q8, KIND_F16, KIND_F32, KIND_NORM16, KIND_NAMES, ROLE_NAMES,
     FLAG_REPLICATED, ceil_div, scale_beats, code_beats, row_beats, shard_rows,
 )
 from model import bitexact as bx
@@ -112,14 +112,30 @@ def split_wide(spec, kseg_max=layout.KSEG_MAX):
                                fixed_point=(spec.bias, spec.rshift)))
     return segs
 
+def trit5_pack_rows(codes):
+    """(rows, cols) codes {0,1,2} -> (rows, 26*cols/128) bytes: per 128-group, lane 5i+k is
+    base-3 digit k of byte i (gateware/core/trit5.py's order)."""
+    rows, cols = codes.shape
+    g = codes.astype(np.uint16).reshape(rows, cols//128, 128)
+    g = np.concatenate([g, np.zeros((rows, cols//128, 2), np.uint16)], axis=2) # 130 lanes.
+    g = g.reshape(rows, cols//128, 26, 5)
+    b = (g*np.array([1, 3, 9, 27, 81], np.uint16)).sum(axis=3).astype(np.uint8)
+    return b.reshape(rows, -1)
+
+def trit5_unpack_rows(body, cols):
+    """Inverse of trit5_pack_rows on each row's code bytes (rows, >= 26*cols/128)."""
+    rows = body.shape[0]
+    b = body[:, :26*(cols//128)].astype(np.uint16).reshape(rows, cols//128, 26, 1)
+    d = (b//np.array([1, 3, 9, 27, 81], np.uint16)) % 3
+    return d.reshape(rows, cols//128, 130)[:, :, :128].reshape(rows, cols).astype(np.uint8)
+
 def encode_rows(spec, row0, nrows, values=None):
     """Encode rows [row0, row0+nrows) of a tensor as row-packet bytes -> (nrows*row_beats*32,).
     `values` overrides spec.values (the streaming writer passes one load for all channels)."""
     sb  = scale_beats(spec.cols, spec.kind)
-    cb  = code_beats(spec.cols, spec.kind)
-    out = np.zeros((nrows, (sb + cb)*BEAT_BYTES), dtype=np.uint8)
+    out = np.zeros((nrows, layout.row_beats(spec.cols, spec.kind)*BEAT_BYTES), dtype=np.uint8)
 
-    if spec.kind in (KIND_TERNARY, KIND_Q8):
+    if spec.kind in (KIND_TERNARY, KIND_TERNARY5, KIND_Q8):
         scales = np.ascontiguousarray(spec.scales[row0:row0+nrows].astype(np.float16))
         sbytes = scales.view(np.uint8).reshape(nrows, -1)
         out[:, :sbytes.shape[1]] = sbytes
@@ -131,6 +147,9 @@ def encode_rows(spec, row0, nrows, values=None):
         codes  = np.ascontiguousarray(v.astype(np.uint8)).reshape(nrows, spec.cols//4, 4)
         packed = (codes[:, :, 0] | (codes[:, :, 1] << 2) |
                   (codes[:, :, 2] << 4) | (codes[:, :, 3] << 6)).astype(np.uint8)
+        out[:, sb*BEAT_BYTES:sb*BEAT_BYTES + packed.shape[1]] = packed
+    elif spec.kind == KIND_TERNARY5:
+        packed = trit5_pack_rows(v)
         out[:, sb*BEAT_BYTES:sb*BEAT_BYTES + packed.shape[1]] = packed
     elif spec.kind == KIND_Q8:
         vbytes = np.ascontiguousarray(v.astype(np.int8)).view(np.uint8)
@@ -153,13 +172,12 @@ def decode_rows(spec_entry, payload):
     kind  = spec_entry["kind"]
     cols  = spec_entry["cols"]
     sb    = scale_beats(cols, kind)
-    cb    = code_beats(cols, kind)
-    rb    = (sb + cb)*BEAT_BYTES
+    rb    = layout.row_beats(cols, kind)*BEAT_BYTES
     data  = np.frombuffer(payload, dtype=np.uint8).reshape(-1, rb)
     nrows = data.shape[0]
 
     scales = None
-    if kind in (KIND_TERNARY, KIND_Q8):
+    if kind in (KIND_TERNARY, KIND_TERNARY5, KIND_Q8):
         group  = layout.KIND_GROUP[kind]
         scales = data[:, :2*(cols//group)].copy().view(np.float16)
 
@@ -167,6 +185,8 @@ def decode_rows(spec_entry, payload):
     if kind == KIND_TERNARY:
         qs     = body[:, :cols//4]
         values = np.stack([(qs >> (2*j)) & 3 for j in range(4)], axis=-1).reshape(nrows, cols)
+    elif kind == KIND_TERNARY5:
+        values = trit5_unpack_rows(body, cols)
     elif kind == KIND_Q8:
         values = body[:, :cols].copy().view(np.int8)
     elif kind == KIND_F16:
@@ -283,7 +303,7 @@ def _emb16_specs(emb, block=8192, restore=None):
                        erows, 16, loader=load_etab, flags=FLAG_REPLICATED)]
 
 def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_path=None,
-                emb16=True, progress=None):
+                emb16=True, progress=None, trit5=False):
     """Write a BONS image + JSON manifest. Returns the manifest dict.
 
     Streams: the metadata pass sizes every tensor from rows/cols/kind (the scales are
@@ -291,8 +311,14 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
     loads one tensor (TensorSpec.loader), encodes it for all channels, writes each chunk
     at its place and drops it. Peak memory is one tensor, not the model.
     emb16=False leaves out the 622 MB int16 embedding table (the firmware decodes the
-    ternary row itself then: ~2.6% slower per token, 4.5 s instead of 10 to upload)."""
+    ternary row itself then: ~2.6% slower per token, 4.5 s instead of 10 to upload).
+    trit5: the streamed ternary roles (layout.TRIT5_ROLES) stored 5 trits per byte
+    (KIND_TERNARY5, for engines built with_trit5)."""
     tensors = list(tensors)
+    if trit5:
+        for spec in tensors:
+            if spec.kind == KIND_TERNARY and spec.role in layout.TRIT5_ROLES:
+                spec.kind = KIND_TERNARY5
 
     # Rope tables baked into the image: one NORM16 row per position, [c14 | s14] Q14
     # halves (Q14 absorbs YaRN's mscale > 1), computed with golden.rope_tables (float64
