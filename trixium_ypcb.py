@@ -32,7 +32,6 @@ from migen import *
 
 from litex.gen import *
 
-from litex.build.generic_platform import Subsignal, Pins, IOStandard, Misc
 
 from litex_boards.platforms import ypcb_00338_1p1
 
@@ -62,22 +61,6 @@ from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 # beats; LiteDRAMAXI2Native's with_read_modify_write). Without it every STORE corrupts the
 # other half of its words (the first card run's ddrtest: half the words wrong).
 ENGINE_RMW = True
-
-# IOs ----------------------------------------------------------------------------------------------
-
-# litex-boards' pcie_x8 has lane 6's RX N on E3; the GTX pair is R4/R3 (MGTXRXN1_115). PERST#
-# pulled up, as openTPU's constraints have it.
-_pcie_x8_io = [
-    ("pcie_x8", 1,
-        Subsignal("clk_p", Pins("J8")),
-        Subsignal("clk_n", Pins("J7")),
-        Subsignal("rst_n", Pins("Y26"), IOStandard("LVCMOS18"), Misc("PULLUP=TRUE")),
-        Subsignal("tx_p",  Pins("F2 H2 K2 M2 N4 P2 T2 U4")),
-        Subsignal("tx_n",  Pins("F1 H1 K1 M1 N3 P1 T1 U3")),
-        Subsignal("rx_p",  Pins("H6 J4 K6 L4 M6 P6 R4 T6")),
-        Subsignal("rx_n",  Pins("H5 J3 K5 L3 M5 P5 R3 T5")),
-    ),
-]
 
 # DDR3 ---------------------------------------------------------------------------------------------
 
@@ -168,7 +151,6 @@ class TriXiumYPCBSoC(SoCCore):
         chan_mod = engine_channels//ddram_channels
         assert chan_mod & (chan_mod - 1) == 0, "channels per controller must be a power of two"
         platform = ypcb_00338_1p1.Platform()
-        platform.add_extension(_pcie_x8_io)
 
         # CRG --------------------------------------------------------------------------------------
         self.crg = _CRG(platform, sys_clk_freq, ddr_clk_freq=ddr_clk_freq)
@@ -204,7 +186,7 @@ class TriXiumYPCBSoC(SoCCore):
             memory_ports.append(axi)
 
         # PCIe -------------------------------------------------------------------------------------
-        self.pcie_phy = S7PCIEPHY(platform, platform.request("pcie_x8", 1),
+        self.pcie_phy = S7PCIEPHY(platform, platform.request("pcie_x8"),
             data_width = 128,
             bar0_size  = 0x40000) # Covers DDR_CSR_WINDOW (CSR region + 0x20000): PHY status.
         self.pcie_phy.update_config({"PCIe_Blk_Locn": "X0Y0"})

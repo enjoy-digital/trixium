@@ -572,16 +572,17 @@ class S7HRDDRPHY(LiteXModule):
 
         The commands leave sys on its falling edge and enter the shifted CLKDIV: the CK phase
         range (+-1/2 tCK) goes in as clock uncertainty on that crossing, setup and hold. The
-        MMCM reset is asynchronous."""
+        MMCM's output clocks only exist once the netlist is linked, so the uncertainty is set
+        before placement rather than in the XDC."""
         sys_clk = f"[get_clocks -of_objects [get_pins -hierarchical -filter {{{{NAME =~ *{self.name}_mmcm/CLKIN1}}}}]]"
         c_clk   = f"[get_clocks -of_objects [get_pins -hierarchical -filter {{{{NAME =~ *{self.name}_mmcm/CLKOUT0}}}}]]"
         for kind in ("setup", "hold"):
-            platform.add_platform_command(f"set_clock_uncertainty -{kind} 1.0 -from {sys_clk} -to {c_clk}")
-        platform.add_platform_command(
-            f"set_false_path -to [get_pins -hierarchical -filter {{{{NAME =~ *{self.name}_mmcm/RST}}}}]")
+            platform.toolchain.pre_placement_commands.append(
+                f"set_clock_uncertainty -{kind} 1.0 -from {sys_clk} -to {c_clk}")
         if self.mmcm_loc is not None:
             platform.add_platform_command(
                 f"set_property LOC {self.mmcm_loc} [get_cells -hierarchical -filter {{{{NAME =~ *{self.name}_mmcm}}}}]")
+
 
 # S7HRChannelModel ---------------------------------------------------------------------------------
 
