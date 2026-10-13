@@ -648,3 +648,50 @@ def test_engine_port_path_without_dm(rmw):
         assert all(got), f"rows read back wrong with read-modify-write: {got}"
     else:
         assert not any(got), "a DM-less memory kept half-strobed writes: the model lets masks through"
+
+# DDR CSR ------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("hops", [1, 2])
+def test_pipelined_ddr_csr_reaches_every_group(hops):
+    """Wishbone writes then reads back one storage register in each of three controller groups
+    (page k: word address k*0x200 of a 14-bit CSR space), through the bridge's registered copies."""
+    from litex.soc.interconnect import csr_bus, wishbone
+    from litex.soc.interconnect.csr import CSRStorage
+    from gateware.memory.ddr import PipelinedDDRCSR
+
+    class DUT(Module):
+        def __init__(self):
+            self.wb   = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+            self.regs = [CSRStorage(32, name=f"r{k}") for k in range(3)]
+            banks = [csr_bus.CSRBank([r], address=k, paging=0x800,
+                                     bus=csr_bus.Interface(data_width=32, address_width=14))
+                     for k, r in enumerate(self.regs)]
+            self.submodules += self.regs + banks
+            self.submodules.bridge = PipelinedDDRCSR(self.wb, [[b.bus] for b in banks], 14, 32,
+                                                     hops=hops)
+
+    dut = DUT()
+    def access(adr, dat=None):
+        yield dut.wb.adr.eq(adr)
+        yield dut.wb.we.eq(dat is not None)
+        yield dut.wb.dat_w.eq(dat or 0)
+        yield dut.wb.sel.eq(0xf)
+        yield dut.wb.cyc.eq(1)
+        yield dut.wb.stb.eq(1)
+        yield
+        while not (yield dut.wb.ack):
+            yield
+        value = (yield dut.wb.dat_r)
+        yield dut.wb.cyc.eq(0)
+        yield dut.wb.stb.eq(0)
+        yield
+        return value
+
+    def gen():
+        for k in range(3):
+            yield from access(k*0x200, 0x1000_0000*(k + 1) + 0x55)
+        for k in range(3):
+            assert (yield dut.regs[k].storage) == 0x1000_0000*(k + 1) + 0x55
+            assert (yield from access(k*0x200)) == 0x1000_0000*(k + 1) + 0x55
+
+    run_simulation(dut, gen())

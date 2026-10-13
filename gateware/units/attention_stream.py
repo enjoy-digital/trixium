@@ -166,6 +166,16 @@ class AttentionStream(LiteXModule):
             (rec_w[0][8:16] > rec_w[0][16:24]*rec_w[0][24:32]) |
             (rec_w[1] == 0) | (rec_w[1] > t_max) |
             (rec_w[2] < 8) | (rec_w[2] > 8*hb_max) | ((rec_w[2] & (rec_w[2] - 1)) != 0))
+        # The operand writes one cycle after the response, from registers: the scratchpad's
+        # BRAM output reached the lanes' operand LUT RAMs directly (zero logic levels, the
+        # sys clock's thinnest margin: BRAM clock-to-out plus the route to 24 memories).
+        op_v, op_last = Signal(), Signal()
+        op_lane, op_word = Signal(max=L, reset_less=True), Signal(pw, reset_less=True)
+        op_dat = Signal(256, reset_less=True)
+        self.sync += [
+            op_v.eq(rsp_v & ~rsp_rec), op_last.eq(rsp_last), op_lane.eq(rsp_lane),
+            op_word.eq(rsp_word), op_dat.eq(dat),
+        ]
         self.sync += [
             rsp_v.eq(taken), rsp_lane.eq(rq_lane), rsp_word.eq(rq_word), rsp_last.eq(rq_last),
             rsp_rec.eq(taken & (ld_st == 1)),
@@ -210,7 +220,7 @@ class AttentionStream(LiteXModule):
                             )
                         )
                     ),
-                    4: If(rsp_v & rsp_last, ld_st.eq(5)),   # Written at this edge.
+                    4: If(op_v & op_last, ld_st.eq(5)),     # Written at this edge.
                     5: If(self.done | self.error, ld_st.eq(0)),
                 })
             )
@@ -349,8 +359,8 @@ class AttentionStream(LiteXModule):
             orp = om.get_port(async_read=True)
             self.specials += om, ow, orp
             self.comb += [
-                ow.adr.eq(rsp_word), ow.dat_w.eq(dat),
-                ow.we.eq(rsp_v & ~rsp_rec & (rsp_lane == l)),
+                ow.adr.eq(op_word), ow.dat_w.eq(op_dat),
+                ow.we.eq(op_v & (op_lane == l)),
                 orp.adr.eq(Mux(mode, is_unit[3:3 + pw], is_i[3:3 + pw])),
             ]
             opnd = Signal(32, name=f"attn_opnd{l}", reset_less=True)

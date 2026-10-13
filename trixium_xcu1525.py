@@ -49,7 +49,7 @@ from litepcie.software import generate_litepcie_software
 
 from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
 from gateware.core.core import TriXiumConfig, TriXiumCore
-from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
+from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, register_delay_controls
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
@@ -121,7 +121,17 @@ class _CRG(LiteXModule):
             cd_ref = self.cd_idelay,
             cd_sys = self.cd_sys,
             locked = locked)
-        self.specials += AsyncResetSynchronizer(self.cd_ddr, self.cd_sys.rst)
+        # The ddr reset through a register tree: one synchronizer flop driving every controller,
+        # PHY and bridge reset over three SLRs missed timing by ~0.9 ns (one logic level, 5 ns of
+        # route). The last stage is replicated by synthesis (max_fanout) and each copy placed
+        # by its loads; the stage before has a full cycle to reach them.
+        self.cd_ddr_por = ClockDomain()
+        self.comb += self.cd_ddr_por.clk.eq(self.cd_ddr.clk)
+        self.specials += AsyncResetSynchronizer(self.cd_ddr_por, self.cd_sys.rst)
+        rst_pipe = Signal(reset=1, reset_less=True)
+        rst_tree = Signal(reset=1, reset_less=True, attr={("max_fanout", 64)})
+        self.sync.ddr_por += [rst_pipe.eq(ResetSignal("ddr_por")), rst_tree.eq(rst_pipe)]
+        self.comb += self.cd_ddr.rst.eq(rst_tree)
 
 # IDELAYCTRL ---------------------------------------------------------------------------------------
 
@@ -346,6 +356,7 @@ class TriXiumXCU1525SoC(SoCCore):
             # against the DQS), which the US+ PHY does not declare by default: without it,
             # controller 0's byte lane 7 comes out of write leveling at the edge of its write eye.
             phy.settings.write_dq_dqs_training = True
+            register_delay_controls(phy)
             phys.append(phy)
             modules.append(MT40A512M8(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,

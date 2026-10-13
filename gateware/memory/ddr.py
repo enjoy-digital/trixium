@@ -117,6 +117,29 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
     mods.append(ClockDomainsRenamer("ddr")(bridge) if split else bridge)
     return mods
 
+# PHY Delay Controls -------------------------------------------------------------------------------
+
+def register_delay_controls(phy):
+    """Register the CE of each IDELAYE3/ODELAYE3 of a LiteDRAM US/US+ PHY next to it.
+
+    The PHY drives them with `dly_sel & csr.wr_stb`: decoded straight from the CSR bus address,
+    one net to the ~170 delay elements (data, strobes, clock, commands) over the channel's two
+    or three I/O banks, 5 ns of route at the DDR clock that no CSR pipelining can shorten. One
+    register per element (in the PHY's own domain, so call this before renaming it) lets each
+    sit by its delay; the increment lands one cycle after the CSR write, which the calibration
+    never sees (the PHY's own tap counters count the strobe itself). Returns the number of CEs registered."""
+    n = 0
+    for special in phy._fragment.specials:
+        if not isinstance(special, Instance) or special.of not in ("IDELAYE3", "ODELAYE3"):
+            continue
+        for item in special.items:
+            if isinstance(item, Instance.Input) and item.name == "CE" and not isinstance(item.expr, Constant):
+                ce = Signal(name_override=f"{special.of.lower()}_ce_q{n}")
+                phy.sync += ce.eq(item.expr)
+                item.expr = ce
+                n += 1
+    return n
+
 # DDR CSR ------------------------------------------------------------------------------------------
 
 class PipelinedDDRCSR(LiteXModule):
@@ -124,32 +147,41 @@ class PipelinedDDRCSR(LiteXModule):
 
     A shared CSR bus decoded straight into the PHYs' IDELAY/ODELAY CE pins of four
     controllers over three SLRs does not meet timing at the DDR clock (long routes). Here each
-    controller's banks get their own registered adr/we/re/dat_w and a registered dat_r, so
-    every hop is one register to the next: an access takes 4 cycles instead of 2 (the
-    controllers' CSRs are only touched by calibration and the BIOS)."""
-    def __init__(self, wb, groups, address_width, data_width):
+    controller's banks get their own `hops` registered copies of adr/we/re/dat_w and as many
+    registered stages of dat_r: with two, one copy can sit by the shared logic and one by the
+    PHY's I/O in its own SLR. An access takes 2*hops + 2 cycles (the controllers' CSRs are only
+    touched by calibration and the BIOS)."""
+    def __init__(self, wb, groups, address_width, data_width, hops=2):
         assert wb.data_width == data_width and wb.addressing == "word"
 
         # # #
 
-        # Registered request, one copy per controller group; registered read data back. The
-        # address and data are reset-less (qualified by we/re), the strobes keep their reset.
+        # Registered request, `hops` copies per controller group; registered read data back.
+        # The address and data are reset-less (qualified by we/re), the strobes keep their reset.
         adr, dat_w = Signal(address_width, reset_less=True), Signal(data_width, reset_less=True)
         we, re     = Signal(), Signal()
         rdats      = []
         for buses in groups:
-            s = csr_bus.Interface(address_width=address_width, data_width=data_width)
-            s.adr.reset_less = s.dat_w.reset_less = True
-            rd = Signal(data_width, reset_less=True)
-            self.sync += [s.adr.eq(adr), s.dat_w.eq(dat_w), s.we.eq(we), s.re.eq(re)]
-            self.sync += rd.eq(reduce(or_, [b.dat_r for b in buses]))
+            src = SimpleNamespace(adr=adr, dat_w=dat_w, we=we, re=re)
+            for h in range(hops):
+                s = csr_bus.Interface(address_width=address_width, data_width=data_width)
+                s.adr.reset_less = s.dat_w.reset_less = True
+                self.sync += [s.adr.eq(src.adr), s.dat_w.eq(src.dat_w), s.we.eq(src.we),
+                              s.re.eq(src.re)]
+                src = s
             for b in buses:
                 self.comb += [b.adr.eq(s.adr), b.dat_w.eq(s.dat_w), b.we.eq(s.we), b.re.eq(s.re)]
+            rd = reduce(or_, [b.dat_r for b in buses])
+            for h in range(hops):
+                rd_h = Signal(data_width, reset_less=True)
+                self.sync += rd_h.eq(rd)
+                rd = rd_h
             rdats.append(rd)
         rdat = Signal(data_width)
         self.comb += rdat.eq(reduce(or_, rdats))
 
-        # Wishbone FSM: request, 3 cycles of pipeline, ack with the registered read data.
+        # Wishbone FSM: request, 2*hops + 1 cycles of pipeline (adr, the hops out, the bank's
+        # registered dat_r, the hops back), ack with the registered read data.
         self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(wb.cyc & wb.stb,
@@ -157,19 +189,18 @@ class PipelinedDDRCSR(LiteXModule):
                 NextValue(dat_w, wb.dat_w),
                 NextValue(we,    wb.we  & (wb.sel != 0)),
                 NextValue(re,    ~wb.we & (wb.sel != 0)),
-                NextState("S0"),
+                NextState("WAIT"),
             )
         )
-        fsm.act("S0",
+        wait = Signal(max=2*hops + 2)
+        fsm.act("WAIT",
             NextValue(we, 0),
             NextValue(re, 0),
-            NextState("S1"),
-        )
-        fsm.act("S1",
-            NextState("S2"),
-        )
-        fsm.act("S2",
-            NextState("ACK"),
+            NextValue(wait, wait + 1),
+            If(wait == 2*hops,
+                NextValue(wait, 0),
+                NextState("ACK"),
+            )
         )
         fsm.act("ACK",
             wb.ack.eq(1),
