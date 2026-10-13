@@ -496,6 +496,11 @@ void infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n)
 // Embedding row: fetch the row packet from HBM and dequantize (ternary).
 COLD void embed_row_f(const struct bons_entry *e, int row, float *dst)
 {
+    if (e->kind == KIND_TERNARY5) { // Packed rows only come with the int16 table (bons.py).
+        printf("embed: 5-trit token embedding without the int16 table\n");
+        memset(dst, 0, e->cols*sizeof(float));
+        return;
+    }
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
     uint32_t rpc = e->rows/n_ch; // Rows per channel.
     uint32_t ch  = row/rpc;

@@ -130,7 +130,8 @@ def hadamard_layer(width_index, block_index):
 # The ternary roles the engine streams that KIND_TERNARY5 stores packed (the token embedding stays
 # 2-bit: the firmware decodes its rows on the CPU when the int16 table is absent).
 TRIT5_ROLES = (ROLE_ATTN_Q, ROLE_ATTN_K, ROLE_ATTN_V, ROLE_ATTN_OUT,
-               ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN, ROLE_LM_HEAD)
+               ROLE_FFN_GATE, ROLE_FFN_UP, ROLE_FFN_DOWN, ROLE_LM_HEAD,
+               ROLE_ATTN_QKV, ROLE_ATTN_ZGATE, ROLE_SSM_OUT)
 
 ROLE_NAMES = {
     ROLE_TOK_EMB       : "tok_emb",

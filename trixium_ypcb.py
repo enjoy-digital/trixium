@@ -144,6 +144,7 @@ class TriXiumYPCBSoC(SoCCore):
         read_time      = 256,
         write_time     = 128,
         refresh_postponing = 1,
+        trit5          = False,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -228,7 +229,8 @@ class TriXiumYPCBSoC(SoCCore):
         config = TriXiumConfig(scratchpad_xpm=True,
             chan_stride = chan_stride,
             chan_mod    = chan_mod,
-            chan_skew   = chan_skew)
+            chan_skew   = chan_skew,
+            with_trit5  = trit5) # Ternary codes 5 trits per byte (convert --trit5 images).
         self.trixium = TriXiumCore(memory_ports, config)
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
@@ -303,6 +305,8 @@ def main():
     parser.add_target_argument("--read-time",          default=256,      type=int,                            help="LiteDRAM read time (cycles before a pending write wins).")
     parser.add_target_argument("--write-time",         default=128,      type=int,                            help="LiteDRAM write time.")
     parser.add_target_argument("--refresh-postponing", default=1,        type=int,                            help="LiteDRAM refresh postponing (1-8).")
+    parser.add_target_argument("--chan-stride",        default=0x4000_0000, type=lambda x: int(x, 0),       help="Engine window stride (0x20000000 with 8 engine channels).")
+    parser.add_target_argument("--trit5",              action="store_true",                                   help="Unpackers for 5-trits-per-byte weights (convert --trit5 images).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
@@ -327,6 +331,8 @@ def main():
         read_time          = args.read_time,
         write_time         = args.write_time,
         refresh_postponing = args.refresh_postponing,
+        trit5              = args.trit5,
+        chan_stride        = args.chan_stride,
         **parser.soc_argdict)
     add_zbb_constant(soc, args)
 

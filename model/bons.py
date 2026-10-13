@@ -313,12 +313,9 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
     emb16=False leaves out the 622 MB int16 embedding table (the firmware decodes the
     ternary row itself then: ~2.6% slower per token, 4.5 s instead of 10 to upload).
     trit5: the streamed ternary roles (layout.TRIT5_ROLES) stored 5 trits per byte
-    (KIND_TERNARY5, for engines built with_trit5)."""
+    (KIND_TERNARY5, for engines built with_trit5); the token embedding too when the int16 table
+    is in the image (the CPU then never decodes its rows; a tied LM head streams it)."""
     tensors = list(tensors)
-    if trit5:
-        for spec in tensors:
-            if spec.kind == KIND_TERNARY and spec.role in layout.TRIT5_ROLES:
-                spec.kind = KIND_TERNARY5
 
     # Rope tables baked into the image: one NORM16 row per position, [c14 | s14] Q14
     # halves (Q14 absorbs YaRN's mscale > 1), computed with golden.rope_tables (float64
@@ -352,6 +349,13 @@ def write_image(cfg, tensors, n_channels, path, tokenizer_sha256=b"", manifest_p
             # The rotated table is restored offline: the firmware never sees the rotation.
             restore = (cfg.hadamard_signs[emb[0].cols], cfg.hadamard_block)
         tensors.extend(_emb16_specs(emb[0], restore=restore))
+
+    if trit5:
+        has_emb16 = any(t.role == layout.ROLE_TOK_EMB16 for t in tensors)
+        for spec in tensors:
+            if spec.kind == KIND_TERNARY and (spec.role in layout.TRIT5_ROLES
+                                              or (spec.role == layout.ROLE_TOK_EMB and has_emb16)):
+                spec.kind = KIND_TERNARY5
 
     # Metadata pass: offsets from shapes alone.
     bases, base = [], 0

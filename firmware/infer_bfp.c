@@ -558,6 +558,10 @@ int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
 // Pure integer (~6 ops/element vs ~50 soft-float ones); exponent returned.
 COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
+    if (e->kind == KIND_TERNARY5) { // Packed rows only come with the int16 table (bons.py).
+        printf("embed: 5-trit token embedding without the int16 table\n");
+        return 0;
+    }
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
     uint32_t rpc = e->rows/n_ch;
     engine_fetch(row/rpc,
