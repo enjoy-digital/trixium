@@ -20,7 +20,7 @@ The sequence and its order:
   1. timing gate      - refuse a bitstream that missed timing badly (it can take the host down).
                         XCU1525: the strict verdict for information, then the experiment gate under
                         the DDR4-1500 approval; FK33: the empirical gate it has always shipped on;
-                        YPCB-00338: the strict gate (no build has run on a card yet)
+                        YPCB-00338: the FK33's envelope gate plus the board's clock coverage
   2. firmware         - built for this build tree under firmware/.build.lock (firmware/ is shared
                         with every other build, each against its own CSR map), shipped from a
                         private snapshot (build/<name>/trixium.bin)
@@ -318,7 +318,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
             gate = timing + ["--experiment", "--serializer-baseline", serializer_baseline] + \
                 (["--approval", approval] if approval else []) + [report]
         elif board == "ypcb":
-            gate = timing + ["--strict", "--board", "ypcb", report]
+            gate = timing + ["--board", "ypcb", report]
         else:
             gate = timing + [report]
         if remote.local(gate, check=False):

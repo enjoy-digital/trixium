@@ -55,7 +55,7 @@ def test_ypcb_deploy_dry_run(monkeypatch):
         out = out.getvalue()
         assert rc == 0
         assert "ypcb_00338_1p1.bit" in out and "ypcb_00338_1p1_timing.rpt" in out
-        assert "--strict" in out
+        assert "--board ypcb" in out and "--strict" not in out   # The envelope gate.
         assert "reconfigure --board ypcb prog/csr.bit" in out
         assert "boot " in out and "--board ypcb" in out
         assert image in out
