@@ -81,8 +81,21 @@ jtag newtap xcvu33p tap -irlen 6 -ignore-version -expected-id 0x04b69093 -ircapt
 FK33_CONFIGURED = "0x35"
 
 # The YPCB-00338's JTAG: an external Digilent HS2-style FT232H cable on the card's header (its
-# chain shows the FPGA alone; a Xilinx Platform Cable's chain also has the card's CPLD).
-YPCB_PROGRAM = ["openFPGALoader", "-c", "digilent_hs2", "--fpga-part", "xc7k480tffg1156"]
+# chain shows the FPGA alone; a Xilinx Platform Cable's chain also has the card's CPLD). OpenOCD's
+# pld load, not openFPGALoader: releases before v0.12 do not know the XC7K480T.
+YPCB_JTAG_CFG = """\
+adapter driver ftdi
+adapter speed 10000
+transport select jtag
+ftdi_vid_pid 0x0403 0x6014
+ftdi_channel 0
+ftdi_layout_init 0x00e8 0x60eb
+reset_config none
+jtag newtap xc7k480t tap -irlen 6 -ignore-version -expected-id 0x03751093{ir}
+"""
+YPCB_PROGRAM_CFG  = YPCB_JTAG_CFG.format(ir="") + "pld device virtex2 xc7k480t.tap\n"
+YPCB_IR_CHECK_CFG = YPCB_JTAG_CFG.format(ir=" -ircapture 0x00 -irmask 0x3f")
+YPCB_CONFIGURED   = "0x35"
 
 BENCH_LINES = (r"BENCH|SPTEST|^(op|embed|rmsnorm|qknorm|kvquant|scores|wv|quant8|norm_i32|silu_mul|"
     r"resid_add|lmhead|engine_wait|total|poll|dnhw|hybprof|dnprof|attnprof|floor|resprof|siluprof|"
@@ -176,10 +189,23 @@ def reconfigure(board, bitstream):
             say("NOT CONFIGURED - stop")
             return 1
     elif board == "ypcb":
-        # openFPGALoader checks DONE after the load on this single-device chain.
-        out = run(YPCB_PROGRAM + [bitstream], 600)
-        grep(out, r"(?i)done|error|fail")
-        if re.search(r"(?i)error|fail", out) or not re.search(r"(?i)done", out):
+        # OpenOCD's pld load (~16 s), then DONE in the IR capture (as the FK33's).
+        with open("openocd_ypcb.cfg", "w", encoding="utf-8") as f:
+            f.write(YPCB_PROGRAM_CFG)
+        out = run(["openocd", "-f", "openocd_ypcb.cfg", "-c", f"init; echo [pld load 0 {bitstream}]; exit"], 300)
+        grep(out, r"loaded|Error")
+        if "loaded" not in out:
+            say("\n".join(out.strip().splitlines()[-15:]))
+            say("NOT LOADED - stop")
+            return 1
+        with open("ir_check.cfg", "w", encoding="utf-8") as f:
+            f.write(YPCB_IR_CHECK_CFG)
+        out = run(["openocd", "-f", "ir_check.cfg", "-c", "init", "-c", "irscan xc7k480t.tap 0x3f",
+            "-c", "shutdown"], 60)
+        cap = re.search(r"saw (0x[0-9a-f]*)", out)
+        cap = cap.group(1) if cap else "none"
+        say(f"IR capture: {cap} ({YPCB_CONFIGURED} = DONE)")
+        if cap != YPCB_CONFIGURED:
             say("NOT CONFIGURED - stop")
             return 1
     else:
