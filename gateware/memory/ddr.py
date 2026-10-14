@@ -57,26 +57,40 @@ from gateware.memory.axi import AXIWide
 # AXI Crossing -------------------------------------------------------------------------------------
 
 class AXICrossing(LiteXModule):
-    """An AXI interface from cd_from to cd_to, one async FIFO per channel (LiteX's
-    AXIClockDomainCrossing with a depth and output buffers).
+    """An AXI interface from cd_from to cd_to: LiteX's AXIClockDomainCrossing (one buffered async
+    FIFO per channel), and with register=True a register slice (valid and ready piped) on each
+    request channel (AW, W, AR) on the cd_to side.
 
     The split DDR domain crosses here, not with the crossbar's native-port CDC: that one's
     read-data FIFO (16 words) has no backpressure - the controller cannot be stalled - so a
     LiteDRAMAXI2Native holding more reads in flight than it (the engine ports: 256) loses
     data once the ddr clock outruns sys. The AXI R channel has a ready; the bridge then sits
-    in the ddr domain on a native port with no CDC at all."""
-    def __init__(self, master, slave, cd_from, cd_to, depth=16):
+    in the ddr domain on a native port with no CDC at all.
+
+    The slices take the FIFOs' block RAMs off the bridge's paths: a FIFO's output is its RAM's
+    clock-to-out, and its ready computes the RAM's next read address. Without them, a bridge
+    with read-modify-write runs a W FIFO's strobes through its partial-write detect, the RMW
+    request and the command into the AW FIFO's read address in one ddr cycle."""
+    def __init__(self, master, slave, cd_from, cd_to, depth=16, register=False):
         # # #
 
-        for ch, a, b in (("aw", cd_from, cd_to), ("w", cd_from, cd_to), ("ar", cd_from, cd_to),
-                         ("b", cd_to, cd_from), ("r", cd_to, cd_from)):
-            src, dst = (master, slave) if a == cd_from else (slave, master)
-            cdc = stream.ClockDomainCrossing(getattr(src, ch).description, a, b,
-                                             depth=depth, buffered=True)
-            self.add_module(f"{ch}_cdc", cdc)
+        mid = slave
+        if register:
+            mid = AXIInterface(data_width=slave.data_width, address_width=slave.address_width,
+                               id_width=slave.id_width, version=slave.version)
+        self.cdc = axi.AXIClockDomainCrossing(master, mid, cd_from, cd_to, depth=depth,
+                                              buffered=True)
+        if register:
+            for ch in ("aw", "w", "ar"):
+                buf = stream.Buffer(getattr(mid, ch).description, pipe_valid=True, pipe_ready=True)
+                self.add_module(f"{ch}_slice", ClockDomainsRenamer(cd_to)(buf))
+                self.comb += [
+                    getattr(mid, ch).connect(buf.sink),
+                    buf.source.connect(getattr(slave, ch)),
+                ]
             self.comb += [
-                getattr(src, ch).connect(cdc.sink),
-                cdc.source.connect(getattr(dst, ch)),
+                slave.b.connect(mid.b),
+                slave.r.connect(mid.r),
             ]
 
 # Engine DDR Port ----------------------------------------------------------------------------------
@@ -110,7 +124,7 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
     if split:
         far = AXIInterface(data_width=port_width, address_width=axi.address_width,
                            id_width=axi.id_width, version=wide.version)
-        mods.append(AXICrossing(wide, far, "sys", "ddr"))
+        mods.append(AXICrossing(wide, far, "sys", "ddr", register=True))
         wide = far
     bridge = LiteDRAMAXI2Native(wide, port, w_buffer_depth=w_buffer_depth,
                                 r_buffer_depth=r_buffer_depth, with_read_modify_write=rmw)

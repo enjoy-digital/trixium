@@ -245,10 +245,18 @@ class AXIReader(LiteXModule):
         ]
 
         # Perf counters ----------------------------------------------------------------------------
+        # The events are registered first (the counts lag a cycle): ar.valid comes out of the
+        # address/length compares, a carry chain on its own, ahead of the 32-bit incrementer.
+        ev_beat     = Signal()
+        ev_ar_stall = Signal()
+        ev_r_stall  = Signal()
         self.sync += [
-            If(out_fire,                     self.total_beats.eq(self.total_beats + 1)),
-            If(axi.ar.valid & ~axi.ar.ready, self.ar_stalls.eq(self.ar_stalls + 1)),
-            If(axi.r.valid & ~axi.r.ready,   self.r_stalls.eq(self.r_stalls + 1)),
+            ev_beat.eq(out_fire),
+            ev_ar_stall.eq(axi.ar.valid & ~axi.ar.ready),
+            ev_r_stall.eq(axi.r.valid & ~axi.r.ready),
+            If(ev_beat,     self.total_beats.eq(self.total_beats + 1)),
+            If(ev_ar_stall, self.ar_stalls.eq(self.ar_stalls + 1)),
+            If(ev_r_stall,  self.r_stalls.eq(self.r_stalls + 1)),
         ]
 
         # Idle (all issued data consumed, no command in flight).

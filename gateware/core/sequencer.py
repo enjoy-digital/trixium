@@ -581,7 +581,12 @@ class Sequencer(LiteXModule):
             lut_word.eq(Array([lut_beat_r[32*j:32*j + 32] for j in range(8)])[lut_sel_r]),
         ]
 
-        # Vector-unit arguments.
+        # Vector-unit arguments, registered: the absmax -> bit length -> k -> kreg add/sub cone
+        # ends at a flop, not in the vector unit's scalar file. A program reads its args (ARG,
+        # at D) two cycles after vec_start at the earliest, so it sees the values of
+        # vec_start + 1: its descriptor and kregs are settled by vec_start (the interlock
+        # above), and the engine absmax by done + 2 <= vec_start + 1, the cycle the kreg
+        # capture reads it too.
         for i in range(8):
             src  = Signal(2)
             imm  = Signal(32)
@@ -605,8 +610,8 @@ class Sequencer(LiteXModule):
                     base + Mux(kadd == 0, 0, kregs[kadd - 1]),
                     base - Mux(kadd == 0, 0, kregs[kadd - 1]))),
                 # LUT mode replaces the whole A5 formula (its kreg is the index).
-                self.vec_args[i].eq(Mux(lut_mode, lut_word, full) if i == 5 else full),
             ]
+            self.sync += self.vec_args[i].eq(Mux(lut_mode, lut_word, full) if i == 5 else full)
 
         # Engine fields straight from the descriptor.
         self.comb += [

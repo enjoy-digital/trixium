@@ -354,6 +354,8 @@ class VectorUnit(LiteXModule):
         # select fans out to every lane's operand mux).
         e1_scalar_b = Signal(reset_less=True)
         e1_redssq   = Signal(reset_less=True)
+        e1_fwd_a    = Signal(reset_less=True) # E1 operand a/b from ex1_r (decided at D).
+        e1_fwd_b    = Signal(reset_less=True)
         e1_is_ldw   = Signal(reset_less=True)
         e1_is_mul   = Signal(reset_less=True)
 
@@ -506,22 +508,21 @@ class VectorUnit(LiteXModule):
         vb_d = d_operand(d_vb, 1)
 
         # E1 datapath ------------------------------------------------------------------------------
-        fwd_a     = Signal()
-        fwd_b     = Signal()
-        e2_fwd_ok = Signal()
-        self.comb += [
-            e2_fwd_ok.eq(e2_valid & e2_wr_v & ~e2_is_load & ~e2_is_lut & ~e2_is_mul),
-            fwd_a.eq(e2_fwd_ok & (e2_vd == e1_va)),
-            fwd_b.eq(e2_fwd_ok & (e2_vd == e1_vb)),
-        ]
+        # E1 forwards from E2 (the instruction one ahead) when it writes a vector the E1 one
+        # reads: E2 valid, a vector write, not a load, LUT op or multiply. E1 and E2 advance
+        # on the same edge (~hold_e2), so the E2 of the next cycle is the E1 of this one: the
+        # compare runs at D against E1 and lands registered (e1_fwd_a/b), off the operand
+        # mux -> multiplier path.
+        e1_fwd_ok = Signal()
+        self.comb += e1_fwd_ok.eq(e1_valid & e1_wr_v & ~e1_is_load & ~e1_is_lut & ~e1_is_mul)
         a_flat = Signal(32*LANES)
         b_flat = Signal(32*LANES)
-        # Forward from ex1_r only: e2_fwd_ok already excludes muls, so for every case
-        # fwd_a/fwd_b can select wb2_nl equals ex1_r, and keeping mul_val out of this mux
-        # keeps the DSP cone off the static timing paths.
+        # Forward from ex1_r only: the forward excludes muls, so for every case it selects
+        # wb2_nl equals ex1_r, and keeping mul_val out of this mux keeps the DSP cone off the
+        # static timing paths.
         self.comb += [
-            a_flat.eq(Mux(fwd_a, ex1_r, e1_va_r)),
-            b_flat.eq(Mux(fwd_b, ex1_r, e1_vb_r)),
+            a_flat.eq(Mux(e1_fwd_a, ex1_r, e1_va_r)),
+            b_flat.eq(Mux(e1_fwd_b, ex1_r, e1_vb_r)),
         ]
         a_l, b_l = [], []
         for i in range(LANES):
@@ -882,6 +883,8 @@ class VectorUnit(LiteXModule):
                 e1_imm.eq(d_imm),
                 e1_va_r.eq(va_d),
                 e1_vb_r.eq(vb_d),
+                e1_fwd_a.eq(e1_fwd_ok & (e1_vd == d_va)),
+                e1_fwd_b.eq(e1_fwd_ok & (e1_vd == d_vb)),
                 e1_sa_r.eq(sa_d),
                 e1_is_load.eq(d_is_load),
                 e1_is_store.eq(d_is_store),
