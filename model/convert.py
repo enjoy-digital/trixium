@@ -19,6 +19,7 @@ import time
 import zlib
 import hashlib
 import argparse
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -262,7 +263,13 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
     kv_rb    = 1 + cfg.head_dim//32
     kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
     dn_bytes = layout.deltanet_state_bytes_per_channel(cfg, n_channels)
-    weights  = sum(_tensor_beats(t, n_channels) for t in specs)*32
+    def _beats(t): # As stored: write_image packs the streamed ternary roles with trit5 (and
+                   # the embedding when the int16 table stays: not counted, conservative).
+        kind = layout.KIND_TERNARY5 if (trit5 and t.kind == layout.KIND_TERNARY
+                                        and t.role in layout.TRIT5_ROLES) else t.kind
+        return _tensor_beats(SimpleNamespace(rows=t.rows, cols=t.cols, flags=t.flags, kind=kind),
+                             n_channels)
+    weights  = sum(_beats(t) for t in specs)*32
     emb16_b  = 0
     if emb16:
         erows   = (vocab_pad + 15)//16
