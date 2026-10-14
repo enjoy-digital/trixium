@@ -63,10 +63,12 @@ class TriXiumConfig:
                 (not self.with_vecunit or self.scratchpad_size > 256*1024):
             raise ValueError("Resident clients need the vector/sequencer arbiter and at most "
                              "256 KiB scratchpad")
-        for name in ("chan_stride", "chan_mod"):
-            value = getattr(self, name)
-            if value < 0 or value & (value - 1):
-                raise ValueError(name + " must be zero or a power of two")
+        if self.chan_mod < 0 or self.chan_mod & (self.chan_mod - 1):
+            raise ValueError("chan_mod must be zero or a power of two")
+        # Without chan_mod the STORE/upload paths shift the channel index by the stride; with it
+        # they add a constant per window, so any beat-aligned stride works.
+        if self.chan_stride < 0 or (not self.chan_mod and self.chan_stride & (self.chan_stride - 1)):
+            raise ValueError("chan_stride must be zero or a power of two without chan_mod")
         if self.chan_skew < 0 or (self.chan_skew and not self.chan_mod):
             raise ValueError("nonnegative chan_skew requires chan_mod")
         if self.chan_stride % 32 or self.chan_skew % 32:
