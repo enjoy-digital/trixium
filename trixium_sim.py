@@ -734,6 +734,14 @@ def build_sim(args, board, out_dir):
               f"{bits} bits")
     subprocess.run(["bash", "build_sim.sh"], cwd=os.path.join(out_dir, "gateware"), check=True)
 
+    # Only obj_dir/Vsim is run. The objects (with -ggdb debug info), their archive and the
+    # precompiled headers are ~10x its size (4.5 GB for the board-timing model), and
+    # build_sim.sh starts from an empty obj_dir anyway.
+    obj_dir = os.path.join(out_dir, "gateware", "obj_dir")
+    for name in os.listdir(obj_dir):
+        if name.endswith((".o", ".a", ".gch")):
+            os.remove(os.path.join(obj_dir, name))
+
 # Run ----------------------------------------------------------------------------------------------
 
 def main():
