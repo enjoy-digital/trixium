@@ -69,6 +69,14 @@ ENGINE_RMW = True
 DDR3_CL  = 7
 DDR3_CWL = 6
 
+def ddr3_latencies(ddr_clk_freq):
+    """(CL, CWL) at a ddr clock (DDR3 rate = 8 x ddr): the DDR3-1066 bin's 7 / 6 up to 133.33 MHz,
+    the DDR3-1333 bin's 9 / 7 for the overclocked rates up to 166.67 MHz (DDR3-1200: 150 MHz)."""
+    if ddr_clk_freq <= 400e6/3 + 1e3:
+        return DDR3_CL, DDR3_CWL
+    assert ddr_clk_freq <= 500e6/3 + 1e3, "past the DDR3-1333 bin"
+    return 9, 7
+
 class YPCBDDR3(MT41K256M8):
     """The card's MT41K256M8 (2 Gb x8, DDR3-1600 parts run at DDR3-1066 by the HR banks), with
     the 2 Gb tRFC of 160 ns (LiteDRAM's class has 128 tCK, 240 ns at DDR3-1066)."""
@@ -273,8 +281,8 @@ class TriXiumYPCBSoC(SoCCore):
                 pads                = PHYPadsReducer(platform.request("ddram", i), list(range(8))),
                 memtype             = "DDR3",
                 sys_clk_freq        = ddr_clk_freq,
-                cl                  = DDR3_CL,
-                cwl                 = DDR3_CWL,
+                cl                  = ddr3_latencies(ddr_clk_freq)[0],
+                cwl                 = ddr3_latencies(ddr_clk_freq)[1],
                 with_odelay         = False, # HR banks.
                 with_ck_phase_shift = True,
                 name                = f"ddrphy{i}",
