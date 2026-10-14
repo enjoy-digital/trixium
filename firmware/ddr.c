@@ -119,9 +119,14 @@ int ddr_boot_init(void)
 #ifndef TRIXIUM_CHAN_SKEW
 #define TRIXIUM_CHAN_SKEW 0
 #endif
-// The smallest window of a controller: the last one, which the bank skew shortens.
+// The smallest window of a controller: the last one, which the bank skew shortens. A target
+// that does not end its windows at a stride boundary (the YPCB's even split) exports it.
+#ifdef TRIXIUM_CHAN_WINDOW
+#define DDR_TEST_WINDOW TRIXIUM_CHAN_WINDOW
+#else
 #define DDR_TEST_WINDOW (TRIXIUM_CHAN_STRIDE - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) \
                          - (TRIXIUM_CHAN_MOD ? (TRIXIUM_CHAN_MOD - 1)*TRIXIUM_CHAN_SKEW : 0))
+#endif
 #define DDR_TEST_ADDR   (TRIXIUM_CHAN_WEIGHT_BASE + DDR_TEST_WINDOW - 0x1000u)
 #define DDR_TEST_SRC    0x0000u // Scratchpad: the pattern (2 KB).
 #define DDR_TEST_DST    0x4000u // Scratchpad: the readback.

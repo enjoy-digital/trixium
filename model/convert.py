@@ -198,7 +198,7 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
             max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None,
-            window_reserve=0, kseg_max=layout.KSEG_MAX, trit5=False):
+            window=None, window_reserve=0, kseg_max=layout.KSEG_MAX, trit5=False):
     reader = GGUFReader(gguf_path)
     cfg    = config_from_gguf(reader)
     try:
@@ -254,7 +254,11 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
         chan_stride = HBM_CHAN_STRIDE
     if weight_base is None:
         weight_base = HBM_WEIGHT_BASE
-    window   = chan_stride - (weight_base % chan_stride) - 0x1000 - window_reserve
+    # window: a channel's room from its base (TRIXIUM_CHAN_WINDOW); by default up to the next
+    # stride boundary (the HBM layout). A DDR controller split evenly passes its stride.
+    if window is None:
+        window = chan_stride - (weight_base % chan_stride)
+    window   = window - 0x1000 - window_reserve
     kv_rb    = 1 + cfg.head_dim//32
     kv_bytes = cfg.n_layer*cfg.n_kv_head*2*((cfg.max_ctx + n_channels - 1)//n_channels)*kv_rb*32
     dn_bytes = layout.deltanet_state_bytes_per_channel(cfg, n_channels)
@@ -348,6 +352,7 @@ def main():
     p.add_argument("--no-emb16",       action="store_true",               help="Leave out the int16 embedding table (~2.6%% slower).")
     p.add_argument("--chan-stride",    default=None, type=_int,           help="Per-channel stride (TRIXIUM_CHAN_STRIDE, default: FK33's).")
     p.add_argument("--weight-base",    default=None, type=_int,           help="Weight base (TRIXIUM_CHAN_WEIGHT_BASE, default: FK33's).")
+    p.add_argument("--window",         default=None, type=_int,           help="Channel window from its base (TRIXIUM_CHAN_WINDOW, default: up to the next stride boundary).")
     p.add_argument("--window-reserve", default=0,    type=_int,           help="Bytes lost to the bank skew ((chan_mod-1)*TRIXIUM_CHAN_SKEW).")
     p.add_argument("--kseg-max",       default=layout.KSEG_MAX, type=int, help="Split matvecs wider than this (K-segments).")
     p.add_argument("--trit5",          action="store_true",               help="Streamed ternary weights 5 trits per byte (with_trit5 engines).")
@@ -364,7 +369,7 @@ def main():
         convert(args.gguf, args.channels, args.out, manifest, args.tokenizer,
                 args.layers, args.check, emb16=not args.no_emb16,
                 chan_stride=args.chan_stride, weight_base=args.weight_base,
-                window_reserve=args.window_reserve, kseg_max=args.kseg_max, trit5=args.trit5)
+                window=args.window, window_reserve=args.window_reserve, kseg_max=args.kseg_max, trit5=args.trit5)
     elif args.cmd == "verify":
         sys.exit(0 if verify(args.image) else 1)
 

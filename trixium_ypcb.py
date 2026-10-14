@@ -9,8 +9,8 @@
 """TriXium on the Inspur YPCB-00338-1P1 (XC7K480T-2, two 72-bit DDR3 channels, PCIe Gen2 x8).
 
 The TriXium core streams its weights from the two DDR3 channels (64 data bits each, the ECC
-lane unused): engine channel c reads from controller c // 2 through its own crossbar port, at
-two windows per controller. The DDR3 sits on HR banks (no ODELAY, a fly-by command bus over
+lane unused): engine channel c reads from controller c // (channels/2) through its own crossbar port, at
+channels/2 windows per controller. The DDR3 sits on HR banks (no ODELAY, a fly-by command bus over
 nine x8 chips): the PHY is LiteDRAM's K7DDRPHY with its CK phase shift (write leveling by CK
 phase) and the BIOS calibrates both controllers at boot (liblitedram's CK phase leveling,
 SDRAM_CONTROLLERS). The defaults are the shipping recipe: the Qwen3 path's units (engine,
@@ -49,7 +49,7 @@ from litedram.phy.s7ddrphy import K7DDRPHY
 from litepcie.phy.s7pciephy import S7PCIEPHY
 from litepcie.software import generate_litepcie_software
 
-from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET
+from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET, ddr_chan_stride
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
 from gateware.common import add_cluster_constraints, add_zbb_constant
@@ -139,7 +139,7 @@ DDR_MMCM_LOCS = ["MMCME2_ADV_X0Y2", "MMCME2_ADV_X0Y6"]
 class TriXiumYPCBSoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, ddr_clk_freq=400e6/3, engine_channels=4,
         main_ram_size  = 0x1000_0000,
-        chan_stride    = 0x4000_0000,
+        chan_stride    = None,
         chan_skew      = None,
         read_time      = 256,
         write_time     = 128,
@@ -208,20 +208,25 @@ class TriXiumYPCBSoC(SoCCore):
 
         # TriXium ----------------------------------------------------------------------------------
         # Per-channel windows: controller c // chan_mod's local HBM_WEIGHT_BASE (320 MB) +
-        # (c % chan_mod)*chan_stride + (c % chan_mod)*chan_skew: 704 MB per channel, the second
-        # ending at the controller's 2 GB. LiteDRAM's ROW_BANK_COL mapping on a 64-bit DDR3
-        # channel (1024 columns, 8 KB rows) puts the bank in byte address bits 13..15: a stream
-        # moves to the next bank every 8 KB and round the 8 banks every 64 KB. Both windows of a
-        # controller stream the same relative addresses at the same time; the 32 KB skew keeps
-        # them four banks apart, so the two crossbar ports never wait on each other's bank (nor
-        # thrash one bank's row). The second window loses 32 KB (the converter's
-        # --window-reserve). main_ram is controller 0's 0..256 MB, below every window; the BONS
-        # staging area is the MB below channel 0's window.
+        # (c % chan_mod)*(chan_stride + chan_skew), the controller above the weight base split
+        # evenly (ddr_chan_stride: 864 MB per window at 4 channels, 432 MB at 8; the STORE and
+        # upload paths add a constant per window, so no power of two). LiteDRAM's ROW_BANK_COL
+        # mapping on a 64-bit DDR3 channel (1024 columns, 8 KB rows) puts the bank in byte
+        # address bits 13..15: a stream moves to the next bank every 8 KB and round the 8 banks
+        # every 64 KB. A controller's windows stream the same relative addresses at the same
+        # time; the skew (64 KB / windows, a 64 KB-multiple stride) spreads them over the banks,
+        # so the crossbar ports never wait on each other's bank (nor thrash one bank's row). The
+        # last window loses (chan_mod - 1)*chan_skew (the converter's --window-reserve).
+        # main_ram is controller 0's 0..256 MB, below every window; the BONS staging area is the
+        # MB below channel 0's window.
         ctrl_size = 2 << 30
+        if chan_stride is None:
+            chan_stride = ddr_chan_stride(ctrl_size, chan_mod)
         if chan_skew is None:
             chan_skew = 0x10000//chan_mod # The 8 banks' 64 KB cycle, spread over the windows.
-        assert chan_stride & (chan_stride - 1) == 0 and HBM_WEIGHT_BASE < chan_stride
-        assert HBM_WEIGHT_BASE + chan_stride*chan_mod - (HBM_WEIGHT_BASE % chan_stride) <= ctrl_size
+        chan_window = chan_stride - (chan_mod - 1)*chan_skew # The smallest (last) window.
+        assert chan_stride % 0x10000 == 0
+        assert HBM_WEIGHT_BASE + chan_mod*chan_stride <= ctrl_size
         assert chan_skew % 0x1000 == 0 and (chan_mod - 1)*chan_skew < chan_stride // 64
         assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000
 
@@ -249,6 +254,7 @@ class TriXiumYPCBSoC(SoCCore):
         self.add_constant("TRIXIUM_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
         self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
         self.add_constant("TRIXIUM_CHAN_STRIDE",      chan_stride)
+        self.add_constant("TRIXIUM_CHAN_WINDOW",      chan_window)
         self.add_constant("TRIXIUM_N_CHANNELS",       engine_channels)
         self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
         self.add_constant("TRIXIUM_CHAN_SKEW",        chan_skew)
@@ -305,7 +311,7 @@ def main():
     parser.add_target_argument("--read-time",          default=256,      type=int,                            help="LiteDRAM read time (cycles before a pending write wins).")
     parser.add_target_argument("--write-time",         default=128,      type=int,                            help="LiteDRAM write time.")
     parser.add_target_argument("--refresh-postponing", default=1,        type=int,                            help="LiteDRAM refresh postponing (1-8).")
-    parser.add_target_argument("--chan-stride",        default=0x4000_0000, type=lambda x: int(x, 0),       help="Engine window stride (0x20000000 with 8 engine channels).")
+    parser.add_target_argument("--chan-stride",        default=None,     type=lambda x: int(x, 0),            help="Engine window stride (default: each controller above the weight base split evenly).")
     parser.add_target_argument("--trit5",              action="store_true",                                   help="Unpackers for 5-trits-per-byte weights (convert --trit5 images).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")

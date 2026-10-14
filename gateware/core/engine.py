@@ -164,8 +164,11 @@ class MatVecEngine(LiteXModule):
         # each channel needs its own window; 0 when every channel has its own address space.
         # When a VectorUnit is passed, the scratchpad fill/gather ports are arbitrated per
         # cycle between the engine, the vector unit and the sequencer (see below).
-        assert chan_stride == 0 or (chan_stride & (chan_stride - 1)) == 0, \
-            "chan_stride must be 0 or a power of two (the STORE path shifts by it)"
+        # Without chan_mod the STORE path shifts the channel index by it (a power of two);
+        # with chan_mod it adds a mux of per-window constants, so any multiple of 32 works
+        # (e.g. a DDR controller split evenly between its windows).
+        assert chan_stride == 0 or chan_mod or (chan_stride & (chan_stride - 1)) == 0, \
+            "chan_stride must be 0 or a power of two without chan_mod (the STORE path shifts by it)"
         chan_shift = chan_stride.bit_length() - 1 if chan_stride else 0
         # chan_mod: channels per memory controller, a power of two (0 = one flat address
         # space, e.g. HBM). With several controllers (e.g. four DDR4 channels) engine channel
@@ -185,8 +188,8 @@ class MatVecEngine(LiteXModule):
             return local*chan_stride + local*chan_skew
         def _chan_sel(c): # Signal: the STORE path's per-op channel.
             return (c & (chan_mod - 1)) if chan_mod else c
-        def _chan_skew_of(sel): # Signal: the STORE path's skew, a mux of constants.
-            return Array([k*chan_skew for k in range(chan_mod)])[sel]
+        def _chan_off_of(sel): # Signal: the STORE path's window offset, a mux of constants.
+            return Array([k*chan_stride + k*chan_skew for k in range(chan_mod)])[sel]
 
         # Keep the vector unit's busy signal, not the module: assigning a Module to an
         # attribute would register it as a submodule a second time (and rename its CSRs).
@@ -1059,12 +1062,12 @@ class MatVecEngine(LiteXModule):
             )
         )
         # STORE targets the one channel in cmd.chan, so it needs the same per-channel
-        # offset the readers get; a power-of-two stride keeps that a shift, not a multiply.
-        # Built term by term: with chan_skew=0 the expression has no skew term.
-        _store_addr = st_addr_r + (
-            _chan_sel(cmd_r["chan"]) << chan_shift if chan_stride else 0)
-        if chan_skew:
-            _store_addr = _store_addr + _chan_skew_of(_chan_sel(cmd_r["chan"]))
+        # offset the readers get: with chan_mod a mux of the windows' constant offsets
+        # (stride + skew), without it a shift of the channel index (power-of-two stride).
+        if chan_mod and (chan_stride or chan_skew):
+            _store_addr = st_addr_r + _chan_off_of(_chan_sel(cmd_r["chan"]))
+        else:
+            _store_addr = st_addr_r + (cmd_r["chan"] << chan_shift if chan_stride else 0)
         fsm.act("ST_CMD",
             self.busy.eq(1),
             self.store_cmd.valid.eq(1),

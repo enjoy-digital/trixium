@@ -922,10 +922,12 @@ def test_engine_fetch(backend):
 # addresses untouched.
 
 @COMPILED
-@pytest.mark.parametrize("chan_mod, chan_skew", [(0, 0), (4, 0), (4, 0x2000)])
-def test_chan_mod_addresses_every_path(chan_mod, chan_skew, backend):
+@pytest.mark.parametrize("chan_mod, chan_skew, chan_stride", [(0, 0, HBM_CHAN_STRIDE),
+    (4, 0, HBM_CHAN_STRIDE), (4, 0x2000, HBM_CHAN_STRIDE), (4, 0x4000, 432 << 20)])
+def test_chan_mod_addresses_every_path(chan_mod, chan_skew, chan_stride, backend):
     """Read (FETCH), STORE and host upload each add (c % chan_mod)*stride + (c % chan_mod)*skew
-    in hardware - the bank skew (XCU1525: 8 KB) on top of the window stride."""
+    in hardware - the bank skew (XCU1525: 8 KB) on top of the window stride. With chan_mod the
+    stride need not be a power of two (the YPCB's even split of a controller: 432 MB)."""
     n_channels = 8
     wbase = HBM_WEIGHT_BASE + 0x8000
 
@@ -933,7 +935,7 @@ def test_chan_mod_addresses_every_path(chan_mod, chan_skew, backend):
         return (c % chan_mod) if chan_mod else c
 
     def off(c):
-        return local(c)*HBM_CHAN_STRIDE + local(c)*chan_skew
+        return local(c)*chan_stride + local(c)*chan_skew
 
     s = Script()
     # FETCH from channel 6: one reader's AR carries wbase + local(6)*stride.
@@ -955,7 +957,7 @@ def test_chan_mod_addresses_every_path(chan_mod, chan_skew, backend):
     s.wait("loader_done", cap=2000, tag="upload_done", fatal=False)
     s.step(20)
 
-    bench = EngineBench(n_channels, chan_stride=HBM_CHAN_STRIDE, chan_mod=chan_mod,
+    bench = EngineBench(n_channels, chan_stride=chan_stride, chan_mod=chan_mod,
                         chan_skew=chan_skew, loader=True, loader_width=256)
     r = bench.run(backend, s, sp=np.arange(1024, dtype=np.uint8).tobytes(), latency=4,
                   axi_log=[5, 6, 7])

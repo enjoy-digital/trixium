@@ -9,6 +9,8 @@ one shared core construction every target uses."""
 
 import ast
 
+import pytest
+
 from migen import *
 
 from common import ROOT
@@ -169,17 +171,19 @@ def test_targets_use_one_cluster_implementation():
 
 # YPCB ---------------------------------------------------------------------------------------------
 
-def test_ypcb_windows_and_banks():
-    """The YPCB's four channel windows: two per 2 GB controller, inside it, above main_ram and
-    the header staging area, and the two windows of a controller four DDR3 banks apart at every
-    offset under LiteDRAM's ROW_BANK_COL mapping (8 KB rows on a 64-bit channel: bank = byte
-    address bits 13..15), so its two crossbar ports never meet in a bank."""
+@pytest.mark.parametrize("engine_channels", [4, 8])
+def test_ypcb_windows_and_banks(engine_channels):
+    """The YPCB's channel windows: each 2 GB controller above the weight base split evenly
+    between its channels/2 windows, inside it, above main_ram and the header staging area, and
+    a controller's windows in distinct DDR3 banks at every offset under LiteDRAM's ROW_BANK_COL
+    mapping (8 KB rows on a 64-bit channel: bank = byte address bits 13..15), so its crossbar
+    ports never meet in a bank."""
     import inspect
     from trixium_ypcb import TriXiumYPCBSoC, YPCBDDR3
-    from model.layout import HBM_WEIGHT_BASE
+    from model.layout import HBM_WEIGHT_BASE, ddr_chan_stride
 
     d        = {k: v.default for k, v in inspect.signature(TriXiumYPCBSoC.__init__).parameters.items()}
-    chan_mod = d["engine_channels"]//2
+    chan_mod = engine_channels//2
     module   = YPCBDDR3(400e6/3, "1:4")
     g        = module.geom_settings
     ctrl     = (1 << (g.bankbits + g.rowbits + g.colbits))*8
@@ -190,16 +194,19 @@ def test_ypcb_windows_and_banks():
     def bank(addr):
         return (addr // row_bytes) % (1 << g.bankbits)
 
-    windows = []
-    for j in range(chan_mod):
-        base = HBM_WEIGHT_BASE + j*d["chan_stride"] + j*(d["chan_skew"] or 0x10000//chan_mod)
-        end  = HBM_WEIGHT_BASE + (j + 1)*d["chan_stride"] - (HBM_WEIGHT_BASE % d["chan_stride"])
-        windows.append((base, end))
+    assert d["chan_stride"] is None and d["chan_skew"] is None # The target derives both.
+    stride = ddr_chan_stride(ctrl, chan_mod)
+    skew   = 0x10000//chan_mod
+    window = stride - (chan_mod - 1)*skew # TRIXIUM_CHAN_WINDOW, the converter's window.
+    windows = [(HBM_WEIGHT_BASE + j*(stride + skew),) for j in range(chan_mod)]
+    windows = [(base, base + window) for (base,) in windows]
     assert windows[0][0] >= d["main_ram_size"] + 0x100000  # Staging MB above main_ram.
     assert windows[-1][1] <= ctrl
     assert all(a[1] <= b[0] for a, b in zip(windows, windows[1:]))
     for off in range(0, 1 << 20, 4096):
-        assert (bank(windows[1][0] + off) - bank(windows[0][0] + off)) % 8 == 4
+        banks = [bank(w[0] + off) for w in windows]
+        assert len(set(banks)) == chan_mod
+        assert (banks[1] - banks[0]) % 8 == 8//chan_mod
 
 
 def test_ypcb_crg_clocks():

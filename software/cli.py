@@ -36,31 +36,35 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Commands -----------------------------------------------------------------------------------------
 
-# Per-board weight windows of `trixium convert --board` (convert(): chan_stride, window_reserve
-# and the image name suffix). The FK33's are convert()'s defaults (256 MB HBM stride); the
-# XCU1525 has 704 MB windows at a 1 GB stride, the last one 96 KB short (the bank-group skew);
-# the YPCB-00338 the same windows, two per 2 GB DDR3 controller, the second 32 KB short (its bank
-# skew).
-BOARD_WINDOWS = {
-    "fk33"    : (None,       0,       ""),
-    "xcu1525" : (0x40000000, 0x18000, "-xcu1525"),
-    "ypcb"    : (0x40000000, 0x8000,  "-ypcb"),
-}
+# Each board's weight windows (convert's chan_stride/window/window_reserve) and image name
+# suffix. The FK33's are convert()'s defaults (256 MB HBM stride); the XCU1525 has 704 MB windows
+# at a 1 GB stride, the last one 96 KB short (the bank-group skew); the YPCB-00338 splits each
+# 2 GB DDR3 controller above the weight base evenly between its windows (trixium_ypcb.py: 864 MB
+# at 4 channels, 432 MB at 8), the last one short of its bank skew (64 KB / windows each).
+BOARD_SUFFIX = {"fk33": "", "xcu1525": "-xcu1525", "ypcb": "-ypcb"}
 
 # Engine channels of each board's bitstream (convert's default --channels).
 BOARD_CHANNELS = {"fk33": 16, "xcu1525": 16, "ypcb": 4}
 
 
+def board_windows(board, channels):
+    """(chan_stride, window, window_reserve) of `board`'s images at `channels` engine channels."""
+    if board == "xcu1525":
+        return 0x4000_0000, None, 0x18000
+    if board == "ypcb":
+        from model.layout import ddr_chan_stride
+        chan_mod = channels//2
+        stride   = ddr_chan_stride(2 << 30, chan_mod)
+        return stride, stride, (chan_mod - 1)*(0x10000//chan_mod)
+    return None, None, 0
+
+
 def cmd_convert(args):
     from model.convert import convert
-    chan_stride, window_reserve, suffix = BOARD_WINDOWS[args.board]
     if args.channels is None:
         args.channels = BOARD_CHANNELS[args.board]
-    if args.board == "ypcb":
-        # The bank skew spreads a controller's windows over its 8 banks (64 KB / windows):
-        # 32 KB at the default 4 channels, 16 KB x 3 at 8 (trixium_ypcb.py --engine-channels).
-        chan_mod       = args.channels//2
-        window_reserve = (chan_mod - 1)*(0x10000//chan_mod)
+    chan_stride, window, window_reserve = board_windows(args.board, args.channels)
+    suffix = BOARD_SUFFIX[args.board]
     out = args.out
     if out is None:
         name = os.path.basename(args.gguf)
@@ -73,7 +77,8 @@ def cmd_convert(args):
         tokenizer = candidate if os.path.exists(candidate) else None
     manifest = out.rsplit(".", 1)[0] + ".json"
     convert(args.gguf, args.channels, out, manifest, tokenizer, args.layers, args.check,
-            emb16=not args.no_emb16, chan_stride=chan_stride, window_reserve=window_reserve)
+            emb16=not args.no_emb16, chan_stride=chan_stride, window=window,
+            window_reserve=window_reserve, trit5=args.trit5)
     print(f"{out}\n{manifest}")
 
 
@@ -201,12 +206,13 @@ def main(argv=None):
     p = subparsers.add_parser("convert", help="GGUF -> BONS image (streams; ~13 s, ~2 GB for the 1.7B).")
     p.add_argument("gguf",                              help="Source GGUF.")
     p.add_argument("--channels",  default=None, type=int, help="Engine channels of the bitstream (default: the board's, 16; ypcb: 4).")
-    p.add_argument("--board",     default="fk33",       choices=sorted(BOARD_WINDOWS), help="Target board's weight windows (default: fk33).")
+    p.add_argument("--board",     default="fk33",       choices=sorted(BOARD_SUFFIX), help="Target board's weight windows (default: fk33).")
     p.add_argument("--out",                             help="Image (default: models/bons/bonsai-<model>-n<channels>[-<board>].img).")
     p.add_argument("--tokenizer",                       help="tokenizer.json hashed into the image (default: next to the GGUF).")
     p.add_argument("--layers",    type=int,             help="Truncate to the first K layers.")
     p.add_argument("--check",     action="store_true",  help="Read two tensors back and compare.")
     p.add_argument("--no-emb16",  action="store_true",  help="Leave out the int16 embedding table (-622 MB, ~2.6%% slower per token).")
+    p.add_argument("--trit5",     action="store_true",  help="Ternary weights 5 trits per byte (bitstreams built with --trit5).")
     p.set_defaults(fn=cmd_convert)
 
     # Verify.

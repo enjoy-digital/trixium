@@ -15,16 +15,19 @@ from model.layout import HBM_WEIGHT_BASE
 # Convert ------------------------------------------------------------------------------------------
 
 def test_ypcb_windows():
-    """The YPCB-00338's images: 4 channels, two 704 MB windows per 2 GB DDR3 controller at a 1 GB
-    stride, the second one short of the 32 KB bank skew (trixium_ypcb.py's constants)."""
-    from software.cli import BOARD_WINDOWS, BOARD_CHANNELS
-    stride, reserve, suffix = BOARD_WINDOWS["ypcb"]
-    assert (stride, reserve, suffix) == (0x4000_0000, 0x8000, "-ypcb")
+    """The YPCB-00338's images: each 2 GB DDR3 controller above the weight base split evenly
+    between its windows (864 MB at 4 channels, 432 MB at 8), the last one short of the bank skew
+    (64 KB / windows per extra window), as trixium_ypcb.py lays them out."""
+    from software.cli import board_windows, BOARD_CHANNELS
     assert BOARD_CHANNELS == {"fk33": 16, "xcu1525": 16, "ypcb": 4}
-    chan_mod, chan_skew = 2, 0x8000
-    assert reserve == (chan_mod - 1)*chan_skew
-    # The last window of a controller ends at its 2 GB.
-    assert HBM_WEIGHT_BASE + chan_mod*stride - (HBM_WEIGHT_BASE % stride) <= 2 << 30
+    for channels, stride_mb in [(4, 864), (8, 432)]:
+        stride, window, reserve = board_windows("ypcb", channels)
+        chan_mod, chan_skew = channels//2, 0x10000//(channels//2)
+        assert stride == window == stride_mb << 20
+        assert reserve == (chan_mod - 1)*chan_skew
+        # The last window of a controller ends at its 2 GB.
+        last = HBM_WEIGHT_BASE + (chan_mod - 1)*(stride + chan_skew)
+        assert last + window - reserve == HBM_WEIGHT_BASE + chan_mod*stride <= 2 << 30
 
 
 def test_convert_default_channels(monkeypatch):
@@ -33,14 +36,14 @@ def test_convert_default_channels(monkeypatch):
     import model.convert
     seen = {}
     def fake_convert(gguf, channels, out, *args, **kwargs):
-        seen[kwargs["chan_stride"], kwargs["window_reserve"]] = (channels, out)
+        seen[kwargs["chan_stride"], kwargs["window"], kwargs["window_reserve"]] = (channels, out)
     monkeypatch.setattr(model.convert, "convert", fake_convert)
     for board in ["fk33", "xcu1525", "ypcb"]:
         with contextlib.redirect_stdout(io.StringIO()):
             cli.main(["convert", "--board", board, "--out", f"/tmp/x-{board}.img", "Ternary-Bonsai-1.7B-PQ2_0.gguf"])
-    assert seen[(None, 0)][0]                == 16
-    assert seen[(0x4000_0000, 0x18000)][0]   == 16
-    assert seen[(0x4000_0000, 0x8000)][0]    == 4
+    assert seen[(None, None, 0)][0]                 == 16
+    assert seen[(0x4000_0000, None, 0x18000)][0]    == 16
+    assert seen[(864 << 20, 864 << 20, 0x8000)][0]  == 4
 
 # Deploy -------------------------------------------------------------------------------------------
 

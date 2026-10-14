@@ -356,6 +356,15 @@ def crc32(data):
 HBM_WEIGHT_BASE = 0x1400_0000 # PC(c+1) + 64 MB per channel c (port-matched, CPU-safe).
 HBM_CHAN_STRIDE = 0x1000_0000 # 256 MB per channel, matching the pseudo-channel size.
 
+
+def ddr_chan_stride(ctrl_size, chan_mod, weight_base=HBM_WEIGHT_BASE):
+    """Window stride for chan_mod windows on one DDR controller: the controller above
+    weight_base split evenly (no power of two needed when the hardware knows chan_mod: the
+    STORE/upload paths add a constant per window). A 64 KB multiple, so the bank skew alone
+    sets the windows' bank offsets. Each window is the stride minus the skew's
+    (chan_mod - 1)*chan_skew (the last one ends at the controller's end)."""
+    return ((ctrl_size - weight_base)//chan_mod) & ~0xFFFF
+
 # Where the firmware keeps its CPU-side copy of the BONS header+table, as an offset into
 # main_ram. This is a CPU address, unrelated to the HBM weight base (deriving it from
 # HBM_WEIGHT_BASE can put it outside main_ram). The firmware places its heap 1 MB above.
