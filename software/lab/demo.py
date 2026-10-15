@@ -55,17 +55,24 @@ def capture(pane):
     """The pane's visible lines, with their SGR colour sequences."""
     return tmux("capture-pane", "-p", "-e", "-t", f"demo:0.{pane}", check=False).split("\n")[:ROWS]
 
+def capture_both():
+    """Both panes in one tmux call (each prints exactly ROWS lines): half the capture time."""
+    out = tmux("capture-pane", "-p", "-e", "-t", "demo:0.0", ";",
+               "capture-pane", "-p", "-e", "-t", "demo:0.1", check=False).split("\n")
+    return out[:ROWS], out[ROWS:2*ROWS]
+
 def plain(lines):
     return "\n".join(re.sub(r"\x1b\[[0-9;]*m", "", l) for l in lines)
 
 class Recorder:
     def __init__(self):
-        self.frames = [] # (time, left lines, right lines)
+        self.frames = [] # (time, left lines, right lines, typed)
+        self.typing = False
 
     def snap(self):
-        left, right = capture(0), capture(1)
-        if not self.frames or self.frames[-1][1:] != (left, right):
-            self.frames.append((time.time(), left, right))
+        left, right = capture_both()
+        if not self.frames or self.frames[-1][1:3] != (left, right):
+            self.frames.append((time.time(), left, right, self.typing))
         return left
 
     def wait(self, seconds, until=None):
@@ -79,10 +86,14 @@ class Recorder:
         return until is None
 
     def type(self, text, cps=28):
+        # Each key's echo crosses ssh twice (~0.35 s here): the GIF plays these frames at the
+        # typing rate (write_gif), not at the link's; the replies stay in real time.
+        self.typing = True
         for ch in text:
             tmux("send-keys", "-t", "demo:0.0", "-l", ch)
             self.wait(1/cps)
         self.wait(0.4)
+        self.typing = False
         tmux("send-keys", "-t", "demo:0.0", "Enter")
 
 def record_scene(conf, scene, rec, ntok):
@@ -181,16 +192,23 @@ class Renderer:
         draw.text(((self.w - sw)/2, self.h/2 + 12), sub, font=self.font, fill=DIM)
         return img
 
-def write_gif(path, scenes, renderer, max_hold=2.0):
-    """scenes: [(title image, [(time, left, right), ...])]: one GIF, idle stretches capped."""
+def write_gif(path, scenes, renderer, max_hold=2.0, key_ms=45):
+    """scenes: [(title image, [(time, left, right, typed), ...])]: one GIF, idle stretches
+    capped, keystroke frames at key_ms each."""
     images, durations = [], []
     for title, frames in scenes:
         images.append(title); durations.append(1800)
-        for (t, l, r), nxt in zip(frames, frames[1:] + [None]):
+        for (t, l, r, typed), nxt in zip(frames, frames[1:] + [None]):
             dt = (nxt[0] - t) if nxt else 2.5
             images.append(renderer.frame(l, r))
-            durations.append(int(1000*min(max(dt, 0.06), max_hold)))
-    pal = images[1 if len(images) > 1 else 0].convert("P", palette=Image.ADAPTIVE, colors=64)
+            durations.append(key_ms if typed else int(1000*min(max(dt, 0.06), max_hold)))
+    # One palette for all frames, from a strip of frames across the GIF (the first frames
+    # alone have no teal or gold yet).
+    picks = images[::max(1, len(images)//8)] + images[-1:]
+    strip = Image.new("RGB", (renderer.w, renderer.h*len(picks)))
+    for k, im in enumerate(picks):
+        strip.paste(im, (0, k*renderer.h))
+    pal = strip.convert("P", palette=Image.ADAPTIVE, colors=64)
     frames = [im.quantize(palette=pal, dither=Image.NONE) for im in images]
     frames[0].save(path, save_all=True, append_images=frames[1:], duration=durations, loop=0,
                    optimize=True, disposal=1)
