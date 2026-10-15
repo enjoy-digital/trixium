@@ -406,7 +406,7 @@ static void status(int devnum, double interval, int json)
     status_line("Engine  %s %3.0f%%     Vector  %s %3.0f%%     Overlap %3.0f%%",
                 bar, 100*u_eng, bar2, 100*u_vec, 100*u_both);
 #ifdef CSR_TRIXIUM_ENGINE_CSR_PF_HITS_ADDR
-    status_line("%-10.0f engine ops/s   %.0f served from prefetch/s", ops_s, pf_s);
+    status_line("%.0f engine ops/s · %.0f served from prefetch/s", ops_s, pf_s);
 #else
     status_line("%.0f engine ops/s", ops_s);
 #endif
@@ -449,8 +449,11 @@ static void status(int devnum, double interval, int json)
         /* The reply's decode rate (live while generating) and its time to first token. */
         double rate = state_num(chat, "tok_s");
         status_bar(bar, rate > 0 ? (rate >= 40 ? 1.0 : rate/40) : 0, 10);
-        status_line("%-12s%s %6.2f tok/s   first token %.2f s", "Decode", bar, rate,
-                    state_num(chat, "ttft"));
+        if (rate == 0 && !strcmp(state, "generating"))
+            status_line("%-12s%s   prefill, waiting for the first token", "Decode", bar);
+        else
+            status_line("%-12s%s %6.2f tok/s   first token %.2f s", "Decode", bar, rate,
+                        state_num(chat, "ttft"));
     } else
         status_line("%-12snone", "Process");
     printf("%s╰", UI_DIM);

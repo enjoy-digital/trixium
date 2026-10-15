@@ -973,9 +973,10 @@ static void reply_stats(int ng, double dt, double first, double rate, int ctx, i
     if (fill > cells) fill = cells;
     for (int i = 0; i < cells; i++) strcat(bar, i < fill ? "█" : "░");
     (void)dt;
-    printf("\n%s  %d tokens · first %.2f s · %s%.1f tok/s%s%s · context %d/2048 %s%s%s%s\n\n",
-           UI_DIM, ng, first, UI_TEAL, rate, UI_RESET, UI_DIM, ctx, UI_TEAL, bar, UI_RESET,
-           cut ? " capped" : "");
+    /* Fits the 72-column box: the header already gives the 2048-token context. */
+    printf("\n%s  %d tokens%s · first %.2f s · %s%.1f tok/s%s%s · context %d %s%s%s\n\n",
+           UI_DIM, ng, cut ? ", capped" : "", first, UI_TEAL, rate, UI_RESET, UI_DIM, ctx,
+           UI_TEAL, bar, UI_RESET);
 }
 
 static void usage(FILE *f)
