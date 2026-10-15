@@ -34,8 +34,8 @@ trixium_smi: liblitepcie.a trixium_smi.o
 trixium_load: trixium_loader.o trixium_load.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-trixium_chat: trixium_loader.o trixium_chat.o
-	$(CC) $(LDFLAGS) -o $@ $^
+trixium_chat: liblitepcie.a trixium_loader.o trixium_chat.o
+	$(CC) $(LDFLAGS) -o $@ $^ -L. -llitepcie
 
 clean:
 	rm -f $(PROGS) *.o *.a *.d *~

@@ -19,6 +19,7 @@
     trixium chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
     trixium chat      --remote --board fk33                      # on a lab board host, over ssh
     trixium console   "stats" "bench 64"                         # raw firmware commands
+    trixium demo      --board ypcb --build ypcb                 # the README's chat + smi GIF
 
 `deploy` drives a lab board from the workstation (software/lab/deploy.py, board hosts in
 ~/.config/trixium/boards.ini); `chat` and `console` run where the card's /dev/ttyLXU0 is.
@@ -201,6 +202,10 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["smi"]:
         cmd_smi(argv[1:])
+    if argv[:1] == ["demo"]:
+        # demo passes everything through to software/lab/demo.py (its own options).
+        from software.lab.demo import main as demo_main
+        return demo_main(argv[1:])
 
     parser = argparse.ArgumentParser(prog="trixium", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -280,6 +285,7 @@ def main(argv=None):
 
     # SMI.
     subparsers.add_parser("smi", help="Card status and diagnostics (runs trixium_smi; -h for its options).")
+    subparsers.add_parser("demo", help="Record the README's chat + smi demo GIF on a lab board (-h for its options).")
 
     args = parser.parse_args(argv)
     args.fn(args)

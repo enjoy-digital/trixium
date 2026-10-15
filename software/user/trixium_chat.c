@@ -34,10 +34,13 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
 
 #include "soc.h"
 #include "mem.h"
+#include "csr.h"
+#include "liblitepcie.h"
 #include "trixium_loader.h"
 
 /* Parameters */
@@ -51,6 +54,21 @@
 
 /* Variables */
 /*-----------*/
+
+/* Terminal style: the diagrams' palette (teal TriXium, gold memory, muted grey), off when stdout
+ * is not a terminal or NO_COLOR is set. */
+static int g_color;
+static const char *ui(const char *seq) { return g_color ? seq : ""; }
+#define UI_TEAL  ui("\033[38;2;53;194;174m")
+#define UI_GOLD  ui("\033[38;2;216;178;94m")
+#define UI_DIM   ui("\033[38;2;140;158;152m")
+#define UI_BOLD  ui("\033[1m")
+#define UI_RESET ui("\033[0m")
+
+static int  g_devnum;
+static char g_model[48] = "Bonsai"; /* From the firmware's `info` (layers x embd). */
+static char g_short[16] = "bonsai";
+static int  g_layers;
 
 /* -r: 0 = raw completion, the text goes to the model as typed. */
 static int g_chat = 1;
@@ -523,11 +541,12 @@ static int serialboot(const char *fw)
 /* Card state for trixium_smi */
 /*----------------------------*/
 
-static void chat_state(int devnum, const char *state, long tokens, double tok_s)
+static void chat_state(int devnum, const char *state, long tokens, double tok_s, double ttft)
 {
     loader_state_write(devnum, "chat",
-        "\"tool\": \"trixium_chat\", \"state\": \"%s\", \"tokens\": %ld, \"tok_s\": %.3f, \"time\": %ld",
-        state, tokens, tok_s, (long)time(NULL));
+        "\"tool\": \"trixium_chat\", \"model\": \"%s\", \"state\": \"%s\", \"tokens\": %ld, "
+        "\"tok_s\": %.3f, \"ttft\": %.3f, \"time\": %ld",
+        g_model, state, tokens, tok_s, ttft, (long)time(NULL));
 }
 
 /* Weight upload and fast boot, through the shared loader (trixium_loader.c) */
@@ -640,6 +659,55 @@ static int utf8_len(unsigned char c)
     return 1;
 }
 
+/* Reply text with word wrap: whole words go to the terminal, a word that would cross the right
+ * edge starts a new line (indented under the reply). No wrap when stdout is not a terminal. */
+static int  g_wrap_width, g_wrap_col, g_wrap_indent;
+static char g_word[1024];
+static int  g_wlen, g_wcols;
+
+static void wrap_start(int indent)
+{
+    struct winsize ws;
+    g_wrap_width  = (isatty(STDOUT_FILENO) && ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) ? ws.ws_col : 0;
+    g_wrap_col    = indent;
+    g_wrap_indent = indent;
+    g_wlen = g_wcols = 0;
+}
+
+static void wrap_flush(void)
+{
+    if (!g_wlen)
+        return;
+    if (g_wrap_width && g_wrap_col > g_wrap_indent && g_wrap_col + g_wcols > g_wrap_width - 1) {
+        printf("\n%*s", g_wrap_indent, "");
+        g_wrap_col = g_wrap_indent;
+    }
+    fwrite(g_word, 1, g_wlen, stdout);
+    g_wrap_col += g_wcols;
+    g_wlen = g_wcols = 0;
+}
+
+/* One complete UTF-8 character of the reply. */
+static void wrap_char(const unsigned char *c, size_t n)
+{
+    if (n == 1 && (c[0] == ' ' || c[0] == '\n')) {
+        wrap_flush();
+        if (c[0] == '\n') {
+            printf("\n%*s", g_wrap_indent, "");
+            g_wrap_col = g_wrap_indent;
+        } else if (g_wrap_col > g_wrap_indent) { /* No space at the start of a line. */
+            putchar(' ');
+            g_wrap_col++;
+        }
+        return;
+    }
+    if (g_wlen + (int)n >= (int)sizeof(g_word))
+        wrap_flush();
+    memcpy(g_word + g_wlen, c, n);
+    g_wlen  += (int)n;
+    g_wcols += 1;
+}
+
 /* Read the generation as it arrives and print each token the moment it lands.
  *
  * The firmware emits one printf per token. The only real work here is UTF-8: the vocabulary
@@ -649,8 +717,9 @@ static int utf8_len(unsigned char c)
  *
  * Returns the token count, or -1 on timeout. *first_dt gets the time to the first token,
  * which is the latency a user actually feels. */
-static int stream_generate(double timeout, int *ids, int max, double *first_dt)
+static int stream_generate(double timeout, int *ids, int max, double *first_dt, long tokens_before)
 {
+    double last_state = 0;        /* trixium_smi's live view: the reply's rate so far. */
     double t0 = now_s();
     char win[16];                 /* sliding window, to spot "GEN:" then "GEN DONE" */
     size_t ww = 0;
@@ -693,6 +762,12 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
         if (n < max) ids[n] = (int)acc;
         n++;
         if (n == 1) *first_dt = now_s() - t0;
+        if (n > 1 && now_s() - last_state > 0.25) {
+            double el = now_s() - t0 - *first_dt;
+            chat_state(g_devnum, "generating", tokens_before + n, el > 0 ? (n - 1)/el : 0.0,
+                       *first_dt);
+            last_state = now_s();
+        }
         if (acc == g_im_end || acc == g_im_start) {
             /* Template tokens are structure, not text (the firmware stops on <|im_end|>). */
         } else if (acc >= 0 && (uint32_t)acc < g_nvocab) {
@@ -701,7 +776,7 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
                 if (pendn < sizeof(pend)) pend[pendn++] = (unsigned char)t->bytes[i];
                 size_t need = utf8_len(pend[0]);
                 if (pendn >= need) {           /* character complete: emit it */
-                    fwrite(pend, 1, need, stdout);
+                    wrap_char(pend, need);
                     memmove(pend, pend + need, pendn - need);
                     pendn -= need;
                 }
@@ -710,7 +785,9 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt)
         }
         acc = -1;
     }
-    if (pendn) { fwrite(pend, 1, pendn, stdout); fflush(stdout); }   /* malformed tail */
+    if (pendn) wrap_char(pend, pendn);                               /* malformed tail */
+    wrap_flush();
+    fflush(stdout);
     return (now_s() - t0 < timeout) ? n : -1;
 }
 
@@ -789,6 +866,117 @@ static int self_test(const char *tests_path)
 
 /* Help */
 /*------*/
+
+/* Header */
+/*--------*/
+
+/* The model's name from `info` ("BONS vN: L layers, embd E, ..."): the Bonsai family's shapes. */
+static void model_name(const char *info)
+{
+    const char *p = strstr(info, "BONS v");
+    unsigned v, layers = 0, embd = 0;
+    if (!p || sscanf(p, "BONS v%u: %u layers, embd %u", &v, &layers, &embd) != 3)
+        return;
+    g_layers = (int)layers;
+    const char *name = NULL, *s = NULL;
+    if (layers == 28 && embd == 2048) { name = "Ternary-Bonsai 1.7B"; s = "1.7B"; }
+    if (layers == 36 && embd == 4096) { name = "Ternary-Bonsai 8B";   s = "8B";   }
+    if (embd == 5120)                 { name = "Bonsai 27B";          s = "27B";  }
+    if (name) {
+        snprintf(g_model, sizeof(g_model), "%s", name);
+        snprintf(g_short, sizeof(g_short), "%s", s);
+    } else {
+        snprintf(g_model, sizeof(g_model), "Bonsai %ux%u", layers, embd);
+        snprintf(g_short, sizeof(g_short), "bonsai");
+    }
+}
+
+/* The card's SoC identifier ("TriXium on <board> ..."), read over /dev/trixiumN (no root). */
+static void card_name(int devnum, char *out, size_t n)
+{
+    char dev[64];
+    snprintf(dev, sizeof(dev), "/dev/trixium%d", devnum);
+    snprintf(out, n, "%s", dev);
+    int fd = open(dev, O_RDWR);
+    if (fd < 0)
+        return;
+    char id[256];
+    for (int i = 0; i < 255; i++)
+        id[i] = (char)litepcie_readl(fd, CSR_IDENTIFIER_MEM_BASE + 4*i);
+    id[255] = 0;
+    close(fd);
+    const char *on = strstr(id, " on ");   /* "TriXium on YPCB-00338-1P1 2026-..." */
+    if (on) {
+        char board[64];
+        if (sscanf(on + 4, "%63s", board) == 1)
+            snprintf(out, n, "%s · %s", board, dev);
+    }
+}
+
+/* Visible width of a UTF-8 string (box drawing): colour escapes take no column. */
+static int vis_len(const char *s)
+{
+    int w = 0;
+    for (; *s; s++) {
+        if (*s == '\033') {
+            while (*s && *s != 'm') s++;
+            if (!*s) break;
+            continue;
+        }
+        if (((unsigned char)*s & 0xC0) != 0x80) w++;
+    }
+    return w;
+}
+
+static void box_line(int width, const char *fmt, ...)
+{
+    char text[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+    printf("%s│%s %s", UI_TEAL, UI_RESET, text);
+    for (int i = vis_len(text); i < width - 3; i++) putchar(' ');
+    printf("%s│%s\n", UI_TEAL, UI_RESET);
+}
+
+static void box_rule(int width, const char *left, const char *title, const char *right)
+{
+    printf("%s%s─", UI_TEAL, left);
+    int w = 2;
+    if (title) { printf(" %s%s%s%s ", UI_BOLD, title, UI_RESET, UI_TEAL); w += vis_len(title) + 2; }
+    for (; w < width - 1; w++) printf("─");
+    printf("%s%s\n", right, UI_RESET);
+}
+
+static void header(int devnum, int ntok, const char *sampling)
+{
+    const int W = 72;
+    char card[160];
+    card_name(devnum, card, sizeof(card));
+    putchar('\n');
+    box_rule(W, "╭", "TriXium chat", "╮");
+    box_line(W, "%s%s%s  ·  %s", UI_BOLD, g_model, UI_RESET, card);
+    box_line(W, "%s%d layers · 2048-token context · %s · replies up to %d tokens%s", UI_DIM,
+             g_layers, sampling ? "sampled" : "greedy", ntok, UI_RESET);
+    box_line(W, "%sthe model runs on the card, this host only tokenizes%s%s", UI_DIM,
+             g_chat ? " · thinking off" : " · raw completion", UI_RESET);
+    box_rule(W, "╰", NULL, "╯");
+    printf("%s  /reset clears the conversation · /stats card profile · Ctrl-D quits%s\n\n",
+           UI_DIM, UI_RESET);
+}
+
+static void reply_stats(int ng, double dt, double first, double rate, int ctx, int cut)
+{
+    char bar[64] = "";
+    int cells = 8, fill = (ctx*cells + 2047)/2048;
+    if (fill > cells) fill = cells;
+    for (int i = 0; i < cells; i++) strcat(bar, i < fill ? "█" : "░");
+    (void)dt;
+    printf("\n%s  %d tokens · first %.2f s · %s%.1f tok/s%s%s · context %d/2048 %s%s%s%s\n\n",
+           UI_DIM, ng, first, UI_TEAL, rate, UI_RESET, UI_DIM, ctx, UI_TEAL, bar, UI_RESET,
+           cut ? " capped" : "");
+}
 
 static void usage(FILE *f)
 {
@@ -916,17 +1104,22 @@ int main(int argc, char **argv)
             tty, g_prompt_wait);
         return 1;
     }
-    printf("[init] firmware is up; loading the model header\n");
+    g_color  = isatty(STDOUT_FILENO) && !getenv("NO_COLOR");
+    g_devnum = devnum;
+    /* "\r\e[K": over the firmware prompt the sync just echoed. */
+    printf("%s%s[init] firmware is up; loading the model header%s\n", g_color ? "\r\033[K" : "",
+           UI_DIM, UI_RESET);
     send_line("hdrload");
     char cap[4096];
     tty_expect("trixium>", 30.0, cap, sizeof(cap), 0);
     if (strstr(cap, "inference ready") == NULL)
         fprintf(stderr, "[warn] hdrload did not report 'inference ready':\n%s\n", cap);
+    send_line("info");
+    tty_expect("trixium>", 10.0, cap, sizeof(cap), 0);
+    model_name(cap);
     if (g_tok_sha_ok) {
         /* The image header carries the converter's tokenizer hash; a mismatch means the
          * ids sent and the ids the model was converted with do not agree. */
-        send_line("info");
-        tty_expect("trixium>", 10.0, cap, sizeof(cap), 0);
         char *p = strstr(cap, "tokenizer sha256 ");
         char hex[65];
         for (int i = 0; i < 32; i++) sprintf(hex + 2*i, "%02x", g_tok_sha[i]);
@@ -937,7 +1130,7 @@ int main(int argc, char **argv)
                             "       (convert with --tokenizer <the json this .bin came from>)\n",
                     p + 17, tokf, hex);
         else
-            printf("[init] tokenizer matches the image (%.16s...)\n", hex);
+            printf("%s[init] tokenizer matches the image (%.16s...)%s\n", UI_DIM, hex, UI_RESET);
     }
 
     if (g_chat && g_im_start < 0) {
@@ -951,28 +1144,27 @@ int main(int argc, char **argv)
                   (int)(r*1000 + 0.5), seed);
         tty_expect("trixium>", 5.0, cap, sizeof(cap), 0);
         char *nl = strchr(cap, '\n');
-        printf("[init] %s", nl ? nl + 1 : cap);
+        printf("%s[init] %s%s", UI_DIM, nl ? nl + 1 : cap, UI_RESET);
     }
-    printf("\nTriXium chat - type a prompt, Ctrl-D to quit.\n"
-           "(%s; each turn continues the conversation on-card; /reset clears it)\n\n",
-           g_chat ? "chat template, thinking off" : "raw completion, -r");
+    header(devnum, ntok, sampling);
 
     long tokens_total = 0;
-    chat_state(devnum, "idle", 0, 0.0);
+    int  ctx = 0;                       /* Tokens of the conversation on the card. */
+    chat_state(devnum, "idle", 0, 0.0, 0.0);
 
     char *linebuf = NULL; size_t linecap = 0;
     int   ids[2048], out[2048];         /* PBUF_N in firmware/main.c: the on-card buffer. */
     int   fresh = 1, prev_closed = 1;
 
     while (1) {
-        printf("you> "); fflush(stdout);
+        printf("%s%syou ›%s ", UI_BOLD, UI_TEAL, UI_RESET); fflush(stdout);
         ssize_t ln = getline(&linebuf, &linecap, stdin);
         if (ln <= 0) break;
         if (linebuf[ln-1] == '\n') linebuf[--ln] = 0;
         /* Multi-line input: a trailing backslash continues the prompt on the next line. */
         while (ln > 0 && linebuf[ln-1] == '\\') {
             linebuf[ln-1] = '\n';
-            printf("...> "); fflush(stdout);
+            printf("%s    ›%s ", UI_TEAL, UI_RESET); fflush(stdout);
             char *more = NULL; size_t morecap = 0;
             ssize_t lm = getline(&more, &morecap, stdin);
             if (lm <= 0) { free(more); break; }
@@ -989,7 +1181,8 @@ int main(int argc, char **argv)
         if (!strcmp(linebuf, "/reset")) {
             fresh = 1;
             prev_closed = 1;
-            printf("[context cleared]\n");
+            ctx = 0;
+            printf("%s  conversation cleared%s\n\n", UI_DIM, UI_RESET);
             continue;
         }
         if (!strcmp(linebuf, "/help"))  { strcpy(linebuf, "/cmd help"); }
@@ -1028,6 +1221,9 @@ int main(int argc, char **argv)
         if (n == 0) { printf("[empty after tokenizing]\n"); continue; }
 
         double t0 = now_s();
+        if (fresh)
+            ctx = 0;
+        ctx += n;
         if (fresh) {
             if (send_prompt(ids, n) < 0) { fprintf(stderr, "prompt send failed\n"); break; }
             fresh = 0;
@@ -1047,13 +1243,14 @@ int main(int argc, char **argv)
             }
         }
 
-        chat_state(devnum, "generating", tokens_total, 0.0);
+        chat_state(devnum, "generating", tokens_total, 0.0, 0.0);
         if (g_chat) send_line("genb %d %d", ntok, g_im_end);   /* stop at <|im_end|> */
         else        send_line("genb %d", ntok);
-        printf("bot> ");
+        printf("%s%s%s ›%s ", UI_BOLD, UI_GOLD, g_short, UI_RESET);
         fflush(stdout);
+        wrap_start(vis_len(g_short) + 3);
         double first_dt = 0;
-        int ng = stream_generate(600.0, out, 2048, &first_dt);
+        int ng = stream_generate(600.0, out, 2048, &first_dt, tokens_total);
         if (ng < 0) {
             fprintf(stderr, "\n[timeout waiting for generation]\n");
             continue;
@@ -1065,9 +1262,9 @@ int main(int argc, char **argv)
          * KV cache across turns), so folding it in would misreport the decode. */
         double rate = (ng > 1 && dt > first_dt) ? (ng - 1)/(dt - first_dt) : 0.0;
         tokens_total += ng;
-        chat_state(devnum, "idle", tokens_total, rate);
-        printf("\n     [%d tokens in %.1f s: first after %.2f s, then %.1f tok/s%s]\n\n",
-               ng, dt, first_dt, rate, prev_closed || !g_chat ? "" : ", cut by -n");
+        ctx += ng;
+        chat_state(devnum, "idle", tokens_total, rate, first_dt);
+        reply_stats(ng, dt, first_dt, rate, ctx, !(prev_closed || !g_chat));
         tty_expect("trixium>", 5.0, NULL, 0, 0);
     }
     free(linebuf);

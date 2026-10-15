@@ -98,6 +98,7 @@ struct status_sample {
     uint32_t cyc_total, cyc_eng, cyc_vec, cyc_both, done;
     uint32_t beats[TRIXIUM_N_CHANNELS];
     uint32_t ar_wait[TRIXIUM_N_CHANNELS];
+    uint32_t pf_hits;
 };
 
 static double now_s(void)
@@ -115,6 +116,11 @@ static void status_sample(int fd, struct status_sample *s)
     s->cyc_vec   = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_CYC_VEC_ADDR);
     s->cyc_both  = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_CYC_BOTH_ADDR);
     s->done      = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_DONE_COUNT_ADDR);
+#ifdef CSR_TRIXIUM_ENGINE_CSR_PF_HITS_ADDR
+    s->pf_hits   = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_PF_HITS_ADDR);
+#else
+    s->pf_hits   = 0;
+#endif
     for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
         litepcie_writel(fd, CSR_TRIXIUM_ENGINE_CSR_PERF_CHAN_ADDR, c);
         s->beats[c]   = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_PERF_BEATS_ADDR);
@@ -209,12 +215,26 @@ static void state_str(const char *buf, const char *key, char *out, size_t n)
     }
 }
 
-/* Table output (UTF-8 box drawing, padded by visible characters). */
+/* Table output (UTF-8 box drawing, padded by visible characters). In a terminal (NO_COLOR
+ * unset): the diagrams' palette, teal bars and section titles, muted frame. */
+static int g_color;
+static const char *ui(const char *seq) { return g_color ? seq : ""; }
+#define UI_TEAL  ui("\033[38;2;53;194;174m")
+#define UI_DIM   ui("\033[38;2;95;120;113m")
+#define UI_BOLD  ui("\033[1m")
+#define UI_RESET ui("\033[0m")
+
 static int utf8_width(const char *s)
 {
     int n = 0;
-    for (; *s; s++)
+    for (; *s; s++) {
+        if (*s == '\033') {                     /* Colour escapes take no column. */
+            while (*s && *s != 'm') s++;
+            if (!*s) break;
+            continue;
+        }
         n += ((*s & 0xc0) != 0x80);
+    }
     return n;
 }
 
@@ -226,29 +246,33 @@ static void status_line(const char *fmt, ...)
     vsnprintf(text, sizeof(text), fmt, ap);
     va_end(ap);
     int pad = STATUS_WIDTH - 4 - utf8_width(text);
-    printf("│ %s%*s │\n", text, pad > 0 ? pad : 0, "");
+    printf("%s│%s %s%*s %s│%s\n", UI_DIM, UI_RESET, text, pad > 0 ? pad : 0, "", UI_DIM, UI_RESET);
 }
 
 static void status_head(const char *title, int first)
 {
     int n = STATUS_WIDTH - 2;
-    printf("%s", first ? "╭" : "├");
+    printf("%s%s", UI_DIM, first ? "╭" : "├");
     if (title[0]) {
-        printf("─ %s ", title);
+        printf("─ %s%s%s%s%s ", UI_RESET, UI_BOLD, UI_TEAL, title, UI_DIM);
         n -= utf8_width(title) + 3;
     }
     for (int i = 0; i < n; i++)
         printf("─");
-    printf("%s\n", first ? "╮" : "┤");
+    printf("%s%s\n", first ? "╮" : "┤", UI_RESET);
 }
 
 static void status_bar(char *out, double x, int n)
 {
     int k = (int)(x*n + 0.5);
     k = k < 0 ? 0 : k > n ? n : k;
-    out[0] = 0;
-    for (int i = 0; i < n; i++)
+    strcpy(out, UI_TEAL);
+    for (int i = 0; i < n; i++) {
+        if (i == k)
+            strcat(out, UI_DIM);
         strcat(out, i < k ? "█" : "░");
+    }
+    strcat(out, UI_RESET);
 }
 
 static void status(int devnum, double interval, int json)
@@ -301,15 +325,27 @@ static void status(int devnum, double interval, int json)
         ar_wait   += cycles ? (double)(uint32_t)(s1.ar_wait[c] - s0.ar_wait[c])/cycles : 0;
     }
     ar_wait /= TRIXIUM_N_CHANNELS;
-    double peak_gbs = TRIXIUM_N_CHANNELS*BEAT_BYTES*clk/1e9;
+    double peak_gbs = TRIXIUM_N_CHANNELS*BEAT_BYTES*clk/1e9; /* The engine ports'. */
+    double pf_s     = dt > 0 ? (uint32_t)(s1.pf_hits - s0.pf_hits)/dt : 0;
+    /* The memory and, where the engine ports outrun it, the DRAM's own peak (the bar's
+     * reference): the YPCB's two 64-bit DDR3-1066 channels, 17.1 GB/s. */
 #ifdef HBM_CHANNELS
     const char *memory = "HBM2";
+    const char *peak_what = "port peak";
 #else
     const char *memory = "DDR4";
+    const char *peak_what = "port peak";
+#ifdef CONFIG_PLATFORM_NAME
+    if (strstr(CONFIG_PLATFORM_NAME, "ypcb")) {
+        memory    = "DDR3-1066";
+        peak_gbs  = SDRAM_CONTROLLERS*8*(3200e6/3)/1e9;
+        peak_what = "DRAM peak";
+    }
+#endif
 #endif
 
     /* Host records. */
-    char load[2048], chat[2048], image[1024] = "", tool[64] = "", state[32] = "";
+    char load[2048], chat[2048], image[1024] = "", tool[64] = "", state[32] = "", model[64] = "";
     int has_load = state_read(devnum, "load", load, sizeof(load));
     int has_chat = state_read(devnum, "chat", chat, sizeof(chat));
     int chat_alive = 0;
@@ -318,6 +354,7 @@ static void status(int devnum, double interval, int json)
     if (has_chat) {
         state_str(chat, "tool",  tool,  sizeof(tool));
         state_str(chat, "state", state, sizeof(state));
+        state_str(chat, "model", model, sizeof(model));
         chat_alive = kill((pid_t)state_num(chat, "pid"), 0) == 0 || errno == EPERM;
     }
 
@@ -327,7 +364,7 @@ static void status(int devnum, double interval, int json)
         printf(" \"clock_mhz\": %.3f, \"cpu\": \"%s\", \"bus_errors\": %u, \"engine_error\": %d, "
                "\"vector_bad_op\": %d,\n", clk/1e6, cpu, bus_errors, eng_error, vec_bad);
         printf(" \"seconds\": %.3f, \"engine\": %.4f, \"vector\": %.4f, \"overlap\": %.4f, "
-               "\"ops_s\": %.1f,\n", dt, u_eng, u_vec, u_both, ops_s);
+               "\"ops_s\": %.1f, \"prefetch_s\": %.1f,\n", dt, u_eng, u_vec, u_both, ops_s, pf_s);
         printf(" \"memory\": \"%s\", \"channels\": %d, \"gbs\": %.3f, \"peak_gbs\": %.3f, "
                "\"request_wait\": %.4f, \"channel_util\": [", memory, TRIXIUM_N_CHANNELS, gbs,
                peak_gbs, ar_wait);
@@ -338,7 +375,7 @@ static void status(int devnum, double interval, int json)
         return;
     }
 
-    char bar[64], title[160], date[64];
+    char bar[192], title[160], date[64];
     time_t t = time(NULL);
     strftime(date, sizeof(date), "%a %b %d %H:%M:%S %Y", localtime(&t));
     printf("%-*s%s\n", STATUS_WIDTH - (int)strlen(date), "trixium_smi", date);
@@ -363,20 +400,24 @@ static void status(int devnum, double interval, int json)
 
     snprintf(title, sizeof(title), "Utilization over %.0f ms", dt*1e3);
     status_head(title, 0);
-    char bar2[64];
+    char bar2[192];
     status_bar(bar, u_eng, 10);
     status_bar(bar2, u_vec, 10);
     status_line("Engine  %s %3.0f%%     Vector  %s %3.0f%%     Overlap %3.0f%%",
                 bar, 100*u_eng, bar2, 100*u_vec, 100*u_both);
+#ifdef CSR_TRIXIUM_ENGINE_CSR_PF_HITS_ADDR
+    status_line("%-10.0f engine ops/s   %.0f served from prefetch/s", ops_s, pf_s);
+#else
     status_line("%.0f engine ops/s", ops_s);
+#endif
 
     snprintf(title, sizeof(title), "Memory · %s · %d channels", memory, TRIXIUM_N_CHANNELS);
     status_head(title, 0);
     status_bar(bar, peak_gbs > 0 ? gbs/peak_gbs : 0, 10);
-    status_line("Read    %s %6.2f GB/s of %.1f GB/s port peak   request wait %3.0f%%",
-                bar, gbs, peak_gbs, 100*ar_wait);
+    status_line("Read    %s %6.2f GB/s of %.1f GB/s %s   request wait %3.0f%%",
+                bar, gbs, peak_gbs, peak_what, 100*ar_wait);
     for (int c0 = 0; c0 < TRIXIUM_N_CHANNELS; c0 += 6) {
-        char row[512] = "", cell[64];
+        char row[1536] = "", cell[256];
         for (int c = c0; c < c0 + 6 && c < TRIXIUM_N_CHANNELS; c++) {
             status_bar(bar, ch_util[c], 4);
             snprintf(cell, sizeof(cell), "%s%2d %s%3.0f%%", c > c0 ? "  " : "", c, bar,
@@ -401,16 +442,21 @@ static void status(int devnum, double interval, int json)
                     state_num(load, "bytes")/(1 << 30), ago);
     } else
         status_line("%-12sunknown (no upload recorded)", "Weights");
-    if (has_chat && chat_alive)
-        status_line("%-12spid %.0f %s  %s, %.0f tokens, %.2f tok/s", "Process",
-                    state_num(chat, "pid"), tool, state, state_num(chat, "tokens"),
-                    state_num(chat, "tok_s"));
-    else
+    if (has_chat && chat_alive) {
+        status_line("%-12spid %.0f %s%s%s  %s, %.0f tokens", "Process",
+                    state_num(chat, "pid"), tool, model[0] ? " · " : "", model, state,
+                    state_num(chat, "tokens"));
+        /* The reply's decode rate (live while generating) and its time to first token. */
+        double rate = state_num(chat, "tok_s");
+        status_bar(bar, rate > 0 ? (rate >= 40 ? 1.0 : rate/40) : 0, 10);
+        status_line("%-12s%s %6.2f tok/s   first token %.2f s", "Decode", bar, rate,
+                    state_num(chat, "ttft"));
+    } else
         status_line("%-12snone", "Process");
-    printf("╰");
+    printf("%s╰", UI_DIM);
     for (int i = 0; i < STATUS_WIDTH - 2; i++)
         printf("─");
-    printf("╯\n");
+    printf("╯%s\n", UI_RESET);
 }
 
 /* Scratch */
@@ -850,6 +896,7 @@ static void help(int status)
 
 int main(int argc, char **argv)
 {
+    g_color = isatty(STDOUT_FILENO) && !getenv("NO_COLOR");
     const char *cmd;
     int c;
     static uint8_t litepcie_device_zero_copy;
@@ -916,6 +963,7 @@ int main(int argc, char **argv)
         do {
             if (status_loop > 0 && !status_json)
                 printf("\033[H\033[J");
+            if (status_json) g_color = 0;
             status(litepcie_device_num, status_interval, status_json);
             fflush(stdout);
             if (status_loop > 0)
