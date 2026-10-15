@@ -197,17 +197,15 @@ class Remote:
         self.ssh(cmd, cd=False, input=script, capture=True, check=True)
 
     def wait(self, interval=30, tries=None):
-        """Until the host answers ping and ssh."""
+        """Until the host answers ssh (BatchMode, ConnectTimeout: no ping first, so ssh's own host
+        config applies, e.g. a ProxyCommand pinning the route to a lab interface)."""
         host = self.conf["host"]
         if self.dry_run:
-            self.show(["ping", "-c", "1", "-W", "3", host])
             self.show(SSH + [self.target, "true"])
             return
         n = 0
         while True:
-            ping = subprocess.run(["ping", "-c", "1", "-W", "3", host], stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL).returncode == 0
-            if ping and subprocess.run(SSH + [self.target, "true"], stdout=subprocess.DEVNULL,
+            if subprocess.run(SSH + [self.target, "true"], stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL).returncode == 0:
                 return
             n += 1
