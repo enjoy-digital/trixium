@@ -592,10 +592,24 @@ def bank_inits(content, dmap=SIM_DDR4_MAP):
     return inits
 
 
-def rebake_firmware(gateware_dir, image, firmware, n_memctrl, dmap=SIM_DDR4_MAP):
-    """Rewrite the bank init files holding the firmware in a built DDR4 simulation (seconds).
+def ddr3_bank_inits(content, size):
+    """The init lines of each bank Memory of the YPCB sim's DDR3 PHY model holding `content`
+    (LiteDRAM's ROW_BANK_COL layout of 512-bit words, as bank_words)."""
+    module = sim_ddr3(size)(DDR3_SIM_FREQ, "1:4")
+    nbanks = 2**module.geom_settings.bankbits
+    col    = 2**module.geom_settings.colbits*8//64 # 512-bit words per bank row.
+    n      = -(-len(content)//64)                  # The model stops at the content's end.
+    inits  = []
+    for b, words in enumerate(bank_words(content, module)):
+        keep = sum(max(0, min(col, n - (r*nbanks + b)*col)) for r in range(len(words)//col))
+        inits.append([f"{v:0128x}" for v in words[:keep]])
+    return inits
 
-    The firmware lives in DDR4 controller 0's memory model: one sim_mem_N.init per bank, read at
+
+def rebake_firmware(gateware_dir, image, firmware, n_memctrl, dmap=SIM_DDR4_MAP, mem="ddr4"):
+    """Rewrite the bank init files holding the firmware in a built DDR4/DDR3 simulation (seconds).
+
+    The firmware lives in controller 0's memory model: one sim_mem_N.init per bank, read at
     simulation start ($readmemh). Controller 0's contents are rebuilt as the SoC does, each bank's
     file is found by matching every line outside the firmware area, and rewritten."""
     img      = BONSReader(image)
@@ -604,6 +618,10 @@ def rebake_firmware(gateware_dir, image, firmware, n_memctrl, dmap=SIM_DDR4_MAP)
         fw = f.read()
     def inits(fw):
         ram = main_ram_content(img, fw, size=dmap.main_ram_size)
+        if mem == "ddr3":
+            stride = ddr3_stride(img)
+            size   = ddr3_size(chan_mod, stride)
+            return ddr3_bank_inits(ddr3_content(0, ram, img, chan_mod, stride, size), size)
         return bank_inits(ddr4_content(0, ram, img, chan_mod, dmap), dmap)
     new   = inits(fw)
     blank = inits(None)
@@ -754,7 +772,7 @@ def main():
     parser.add_argument("--board-timing",   action="store_true",                                   help="--board xcu1525: the board's clocks, DDR4 timings/map, CPU and stream geometry (shape-true slices, doc/simulation.md).")
     parser.add_argument("--build",          action="store_true",                                   help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
     parser.add_argument("--run",            action="store_true",                                   help="Run the built simulation (console on stdin/stdout).")
-    parser.add_argument("--firmware",       action="store_true",                                   help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525).")
+    parser.add_argument("--firmware",       action="store_true",                                   help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525/ypcb).")
     parser.add_argument("--tprof",          action="store_true",                                   help="Token trace of a bench token and where the engine sits idle (software/lab/tprof.py).")
     parser.add_argument("--gate",           action="store_true",                                   help="Traced generation compared with the Python mirror.")
     parser.add_argument("--bench",          action="store_true",                                   help="Cycles per forward with --bench-toggle off, then on (none: one run, W/P split and the board prediction).")
@@ -809,11 +827,11 @@ def main():
 
     # Firmware.
     if args.firmware:
-        if board["mem"] != "ddr4":
-            raise SystemExit("--firmware re-bakes the DDR4 model memories (--board xcu1525): use --build.")
+        if board["mem"] not in ("ddr4", "ddr3"):
+            raise SystemExit("--firmware re-bakes the DDR4/DDR3 model memories (--board xcu1525/ypcb): use --build.")
         build_firmware(out_dir)
         rebake_firmware(gateware_dir, args.image, FIRMWARE, board["n_memctrl"],
-            BOARD_DDR4_MAP if args.board_timing else SIM_DDR4_MAP)
+            BOARD_DDR4_MAP if args.board_timing else SIM_DDR4_MAP, mem=board["mem"])
 
     # Run.
     if args.run:
