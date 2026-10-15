@@ -61,7 +61,7 @@ LANES = 16
 
 class VectorUnit(LiteXModule):
     """16-lane SIMD vector unit running model.asm microcode (see the module doc)."""
-    def __init__(self, imem_depth=None, vregs=16):
+    def __init__(self, imem_depth=None, vregs=16, fused=False):
         # Kept in step with model.asm.IMEM_DEPTH, which asserts the programs fit: an
         # overflowing upload wraps and silently overwrites the program at offset 0.
         if imem_depth is None:
@@ -205,6 +205,16 @@ class VectorUnit(LiteXModule):
         USES_SA = ["SMOV", "SADD", "SSHLV", "SNORME", "LOOPS", "LOOPS2", "LDV", "LDW",
                    "STV", "STB", "STW", "VSHLS", "VMULS", "BCAST"]
         USES_SD = SCW_OPS # Non-reduction readers/writers of S[sd] (reductions read late).
+        # Fused forms (fused=True): the base ALU op in E1, its clamp/round in E2 (latency 2,
+        # like a multiply: not forwarded into E1, a dependent one behind takes the D-side wb2).
+        FUSED_BASE = {"VADDC16": "VADD", "VSHLVC16": "VSHLV", "VSHLSC16": "VSHLS", "VQ8V": "VSHLV"}
+        FUSED_OPS  = list(FUSED_BASE) if fused else []
+        self.fused = fused
+        VEC_WB  = VEC_WB + FUSED_OPS
+        USES_VA = USES_VA + FUSED_OPS
+        USES_VB = USES_VB + [n for n in FUSED_OPS if n != "VSHLSC16"]
+        USES_SA = USES_SA + [n for n in FUSED_OPS if n == "VSHLSC16"]
+        KNOWN   = [n for n in vasm.OPCODES if n not in FUSED_BASE or fused]
 
         # F / D state ------------------------------------------------------------------------------
         pc         = Signal(16)     # Next word to fetch.
@@ -282,7 +292,7 @@ class VectorUnit(LiteXModule):
             d_uses_vb.eq(is_in(d_op, USES_VB)),
             d_uses_sa.eq(is_in(d_op, USES_SA)),
             d_uses_sd.eq(is_in(d_op, USES_SD)),
-            d_is_known.eq(is_in(d_op, vasm.OPCODES)),
+            d_is_known.eq(is_in(d_op, KNOWN)),
         ]
 
         # D-stage scalar reads and scalar-op results.
@@ -349,7 +359,7 @@ class VectorUnit(LiteXModule):
         e1_is_red   = Signal(reset_less=True)
         e1_wr_v     = Signal(reset_less=True)
         e1_f = {n: Signal(name=f"e1_f_{n.lower()}", reset_less=True)
-                for n in VEC_WB + ST_OPS + RED_OPS}
+                for n in VEC_WB + ST_OPS + RED_OPS if n not in FUSED_OPS}
         # Decoded at D, registered: no opcode compare in the E1 cone (timing: the scalar-B
         # select fans out to every lane's operand mux).
         e1_scalar_b = Signal(reset_less=True)
@@ -358,6 +368,7 @@ class VectorUnit(LiteXModule):
         e1_fwd_b    = Signal(reset_less=True)
         e1_is_ldw   = Signal(reset_less=True)
         e1_is_mul   = Signal(reset_less=True)
+        e1_is_post  = Signal(reset_less=True) # A fused op (its E2 half pending).
 
         # E2 record --------------------------------------------------------------------------------
         e2_valid    = Signal()
@@ -372,6 +383,9 @@ class VectorUnit(LiteXModule):
         e2_is_mul   = Signal(reset_less=True)
         e2_is_mulh  = Signal(reset_less=True)
         e2_wr_v     = Signal(reset_less=True)
+        e2_is_post  = Signal(reset_less=True)
+        e2_post_q8  = Signal(reset_less=True) # VQ8V (else a clamp16 form).
+        e2_post_sh  = Signal(5, reset_less=True) # VQ8V's round shift.
         e2_f_lut    = {n: Signal(name=f"e2_f_{n.lower()}", reset_less=True) for n in LUT_OPS}
         e2_f_red    = {n: Signal(name=f"e2_f_{n.lower()}", reset_less=True) for n in RED_OPS}
         ex1_r       = Signal(32*LANES, reset_less=True)
@@ -443,7 +457,7 @@ class VectorUnit(LiteXModule):
             # Multiply results are not forwarded into E1 (timing: DSP output -> mulh select ->
             # forward mux -> ALU). A dependent one behind waits a cycle and takes the D-side
             # wb2 path instead.
-            stall_mul.eq(e1_valid & e1_is_mul & vd_match(e1_vd)),
+            stall_mul.eq(e1_valid & (e1_is_mul | e1_is_post) & vd_match(e1_vd)),
             stall_lut.eq((e1_valid & e1_is_lut & vd_match(e1_vd))
                          | (e2_valid & e2_is_lut & vd_match(e2_vd))
                          | (e3_valid & e3_is_lut & vd_match(e3_vd))),
@@ -482,10 +496,33 @@ class VectorUnit(LiteXModule):
         mul_val = Signal(32*LANES)
         for i in range(LANES):
             self.comb += lane(mul_val, i).eq(Mux(e2_is_mulh, mul_r[i][15:47], mul_r[i][0:32]))
+        # Fused forms' E2 half on the registered E1 result: clamp16, or quant8's rescale tail
+        # (round-to-nearest-even by the immediate, clamp8) - VRNE's and VCLAMP's lane logic.
+        post_val = Signal(32*LANES)
+        if fused:
+            for i in range(LANES):
+                x = Signal((32, True), name=f"post_x{i}")
+                self.comb += x.eq(lane(ex1_r, i))
+                sh, shm1 = e2_post_sh, Signal(5, name=f"post_shm1_{i}")
+                q, rbit, sticky, r = (Signal((32, True), name=f"post_q{i}"), Signal(name=f"post_rbit{i}"),
+                                      Signal(name=f"post_sticky{i}"), Signal((32, True), name=f"post_r{i}"))
+                p16n, p16p = Signal((32, True), reset=-32767), Signal((32, True), reset=32767)
+                p8n,  p8p  = Signal((32, True), reset=-127),   Signal((32, True), reset=127)
+                self.comb += [
+                    shm1.eq(Mux(sh != 0, sh - 1, 0)),
+                    q.eq(x >> sh),
+                    rbit.eq(Mux(sh != 0, (x >> shm1) & 1, 0)),
+                    sticky.eq(Mux(sh > 1, (x & ~(C(0xFFFFFFFF, 32) << shm1)[0:32]) != 0, 0)),
+                    r.eq(Mux(sh == 0, x, q + (rbit & (sticky | q[0])))),
+                    lane(post_val, i).eq(Mux(e2_post_q8,
+                        Mux(r > p8p, p8p, Mux(r < p8n, p8n, r)),
+                        Mux(x > p16p, p16p, Mux(x < p16n, p16n, x)))),
+                ]
         wb2_nl = Signal(32*LANES) # Non-load writeback: what E1 may forward.
         wb2    = Signal(32*LANES)
         self.comb += [
-            wb2_nl.eq(Mux(e2_is_mul, mul_val, ex1_r)),
+            wb2_nl.eq(Mux(e2_is_mul, mul_val, Mux(e2_is_post, post_val, ex1_r))
+                      if fused else Mux(e2_is_mul, mul_val, ex1_r)),
             wb2.eq(Mux(e2_is_load, ld_val, wb2_nl)),
             # Register-file write ports (one bank per writer; see the LVT above).
             vwa.adr.eq(e2_vd), vwa.dat_w.eq(wb2), vwa.we.eq(e2_valid & ~hold_e2 & e2_wr_v),
@@ -514,7 +551,8 @@ class VectorUnit(LiteXModule):
         # compare runs at D against E1 and lands registered (e1_fwd_a/b), off the operand
         # mux -> multiplier path.
         e1_fwd_ok = Signal()
-        self.comb += e1_fwd_ok.eq(e1_valid & e1_wr_v & ~e1_is_load & ~e1_is_lut & ~e1_is_mul)
+        self.comb += e1_fwd_ok.eq(e1_valid & e1_wr_v & ~e1_is_load & ~e1_is_lut & ~e1_is_mul
+                                  & ~e1_is_post)
         a_flat = Signal(32*LANES)
         b_flat = Signal(32*LANES)
         # Forward from ex1_r only: the forward excludes muls, so for every case it selects
@@ -891,8 +929,11 @@ class VectorUnit(LiteXModule):
                 e1_is_lut.eq(d_is_lut),
                 e1_is_red.eq(d_is_red),
                 e1_wr_v.eq(d_wr_v),
-                *[e1_f[n].eq(d_op == OP[n]) for n in e1_f],
-                e1_scalar_b.eq((d_op == OP["VSHLS"]) | (d_op == OP["VMULS"])),
+                # A fused op selects its base ALU result.
+                *[e1_f[n].eq(is_in(d_op, [n] + [f for f in FUSED_OPS if FUSED_BASE[f] == n]))
+                  for n in e1_f],
+                e1_scalar_b.eq(is_in(d_op, ["VSHLS", "VMULS"] + [n for n in FUSED_OPS if n == "VSHLSC16"])),
+                e1_is_post.eq(is_in(d_op, FUSED_OPS) if fused else 0),
                 e1_redssq.eq(d_op == OP["REDSSQ"]),
                 e1_is_ldw.eq(d_op == OP["LDW"]),
                 e1_is_mul.eq(is_in(d_op, MUL_OPS)),
@@ -907,6 +948,9 @@ class VectorUnit(LiteXModule):
                 e2_is_red.eq(e1_is_red),
                 e2_is_mul.eq(e1_is_mul),
                 e2_is_mulh.eq(e1_op == OP["VMULH15"]),
+                e2_is_post.eq(e1_is_post),
+                e2_post_q8.eq((e1_op == OP["VQ8V"]) if fused else 0),
+                e2_post_sh.eq(e1_imm[0:5]),
                 e2_wr_v.eq(e1_wr_v),
                 *[e2_f_lut[n].eq(e1_f[n]) for n in LUT_OPS],
                 *[e2_f_red[n].eq(e1_f[n]) for n in RED_OPS],

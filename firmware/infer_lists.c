@@ -452,12 +452,17 @@ static int ffn_shape_base = -1; // seq_ffn_base the FFN engine shape images were
 // and norm_g alone fills the window.
 static int ffn_di_down = 8; // Down matvec's descriptor (seq_build_ffn).
 static int ffn_di_fet  = 6; // Next norm row's fetch (seq_build_ffn).
+static int ffn_di_pfd  = -1; // Down's weight prefetch (TRIXIUM_HAS_PREFETCH), -1 = none.
 int ffn_di_a4   = 6; // Descriptor whose A4 takes the per-layer gate shift.
 
 void seq_build_ffn(void)
 {
     int di = seq_qkr_count + attn_list_len(seq_attn_heads);
+#ifdef TRIXIUM_HAS_PREFETCH
+    int len = 11;
+#else
     int len = 10;
+#endif
     if (di + len > 192 || seq_attn_heads == 0)
         return;
     seq_ffn_base = di;
@@ -478,6 +483,8 @@ void seq_build_ffn(void)
     //   7 norm_mul_q8 SP_G x (SP_YU >> ku) -> SP_X [ku via KRES6; res6 = source absmax,
     //     read by the CPU after the list - desc 8 is an engine op and leaves it alone]
     //   8 down mv (waits the fetch: engine ready = idle)   9 stop
+    // With the weight prefetch, a descriptor after the fetch issues down's reads (wlen 0 when
+    // off): they stream under norm_mul_q8 and down starts on buffered beats.
     // The up norm rides inside the multiply (prog_norm_mul_q8): no int16 up in SP_U, one pass
     // and one descriptor less on the serial tail between the up and down streams.
     struct engine_op z = {0};
@@ -509,6 +516,11 @@ void seq_build_ffn(void)
     d++;
     ffn_di_fet = d - di;                                                  // norm row fetch
     d++;
+#ifdef TRIXIUM_HAS_PREFETCH
+    seq_desc_engine(d, &z);                                               // down's prefetch
+    ffn_di_pfd = d - di;
+    d++;
+#endif
     {
         // norm_mul_q8: (silu * (up >> ku)) << A6, clamp, absmax (res6 for the CPU), quant8
         // -> SP_X; A4 = ku from the spill's res6 (KRES6), as norm_u took it.
@@ -773,6 +785,19 @@ void ffn_prep_layer(int l, const struct bons_entry *next_w16)
     model_matvec_op(model_entry(ROLE_FFN_DOWN, l), SP_X, SP_Y, &mo);
     if (full) seq_desc_engine(b + (uint32_t)ffn_di_down, &mo);
     else ffn_patch_lw(b + (uint32_t)ffn_di_down, &mo);
+    if (ffn_di_pfd >= 0) {
+        // Down's prefetch: the same span (wlen 0, a no-op, with the prefetch off).
+        uint32_t wlen = engine_pf_use ? mo.wlen : 0;
+        if (full) {
+            struct engine_op po = mo;
+            po.kind = ENGINE_KIND_PREFETCH;
+            po.wlen = wlen;
+            seq_desc_engine(b + (uint32_t)ffn_di_pfd, &po);
+        } else {
+            seq_patch(b + (uint32_t)ffn_di_pfd, 4, mo.wbase);
+            seq_patch(b + (uint32_t)ffn_di_pfd, 5, wlen);
+        }
+    }
     // The next norm's row (a 1-beat stand-in when the image has none: the tail then runs
     // the three ops, which fetch for themselves).
     struct engine_op fo = {0};

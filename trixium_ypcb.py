@@ -155,6 +155,8 @@ class TriXiumYPCBSoC(SoCCore):
         write_time     = 128,
         refresh_postponing = 1,
         trit5          = True,
+        prefetch       = 2048,
+        vec_fused      = True,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -245,7 +247,13 @@ class TriXiumYPCBSoC(SoCCore):
             chan_stride = chan_stride,
             chan_mod    = chan_mod,
             chan_skew   = chan_skew,
-            with_trit5  = trit5) # Ternary codes 5 trits per byte (convert --trit5 images).
+            with_trit5  = trit5, # Ternary codes 5 trits per byte (convert --trit5 images).
+            # Weight prefetch (engine op 7): a matvec's reads issued under the serial work
+            # before it, into 64 KB reader FIFOs per channel (block RAM).
+            with_prefetch     = bool(prefetch),
+            reader_fifo_depth = prefetch or 512,
+            # Fused vector instructions (the clamp/round after an ALU op in one instruction).
+            with_vec_fused    = vec_fused)
         self.trixium = TriXiumCore(memory_ports, config)
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
@@ -323,6 +331,8 @@ def main():
     parser.add_target_argument("--refresh-postponing", default=1,        type=int,                            help="LiteDRAM refresh postponing (1-8).")
     parser.add_target_argument("--chan-stride",        default=None,     type=lambda x: int(x, 0),            help="Engine window stride (default: each controller above the weight base split evenly).")
     parser.add_target_argument("--trit5",              action=argparse.BooleanOptionalAction, default=True,  help="Unpackers for 5-trits-per-byte weights (the default; --no-trit5: 2-bit images, convert --board ypcb --no-trit5).")
+    parser.add_target_argument("--prefetch",           default=2048,     type=int,                            help="Weight prefetch: reader FIFO beats per channel (0: no prefetch).")
+    parser.add_target_argument("--vec-fused",          action=argparse.BooleanOptionalAction, default=True,  help="Vector unit with the fused clamp/round instructions.")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
@@ -348,6 +358,8 @@ def main():
         write_time         = args.write_time,
         refresh_postponing = args.refresh_postponing,
         trit5              = args.trit5,
+        prefetch           = args.prefetch,
+        vec_fused          = args.vec_fused,
         chan_stride        = args.chan_stride,
         **parser.soc_argdict)
     add_zbb_constant(soc, args)

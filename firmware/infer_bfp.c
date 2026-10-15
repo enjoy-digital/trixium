@@ -232,8 +232,10 @@ static int32_t resid_tail_pack(int nk, int nsa, int nsb, int nln, int wsh)
 // exponent before the norm shift (input exponent - bias + rshift), *eres/*xamax = the residual
 // exponent/absmax (updated), w16 = the next norm's row (fetched: already in SP_FET). Returns the next norm's quant8 shift
 // (int16 out in SP_H, x8 in SP_X), or RESID_TAIL_OFF with nothing run - an op off the hardware
-// or a shift that does not fit its field - and the caller runs the three ops.
-int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
+// or a shift that does not fit its field - and the caller runs the three ops. pf (or NULL): the
+// next matvec, prefetched under the program once it is sure to run (the three ops' fallback
+// fetches for itself, so nothing is prefetched then).
+int resid_norm_q8(const struct engine_op *pf, uint32_t src, int eproj, int *eres, uint32_t *xamax,
                   const struct bons_entry *w16, int n, int fetched)
 {
 #ifdef CSR_TRIXIUM_ENGINE_CSR_ABSMAX_ADDR
@@ -256,6 +258,8 @@ int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
                        (int32_t)SP_FET, (int32_t)SP_X};
     if (!fetched)
         engine_join(df);
+    if (pf)
+        engine_prefetch(pf);
     perf_enter(OP_RESID_ADD);
     uint32_t r = (uint32_t)vec_run(PROG_RESID_RMSQ8, args, 8);
     perf_exit(OP_RESID_ADD);
@@ -263,7 +267,7 @@ int resid_norm_q8(uint32_t src, int eproj, int *eres, uint32_t *xamax,
     *xamax = r >> 16;
     return quant8_shift(r & 0xFFFF);
 #else
-    (void)src; (void)eproj; (void)eres; (void)xamax; (void)w16; (void)n; (void)fetched;
+    (void)pf; (void)src; (void)eproj; (void)eres; (void)xamax; (void)w16; (void)n; (void)fetched;
     return RESID_TAIL_OFF;
 #endif
 }

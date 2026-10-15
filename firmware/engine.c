@@ -61,6 +61,24 @@ int engine_recover(void)
 // itself stays: without the snapshot it shows absolute beat counters, which still name the
 // channel that came up short.
 int engine_diag;
+#ifdef TRIXIUM_HAS_PREFETCH
+int engine_pf_use = 1;
+#else
+int engine_pf_use = 0;
+#endif
+
+void engine_prefetch(const struct engine_op *op)
+{
+#ifdef TRIXIUM_HAS_PREFETCH
+    if (!engine_pf_use)
+        return;
+    struct engine_op p = *op;
+    p.kind = ENGINE_KIND_PREFETCH;
+    engine_join(engine_submit(&p));
+#else
+    (void)op;
+#endif
+}
 
 // Completion-poll census (spins x ~70 cycles per CSR read: the IRQ opportunity, upper bound).
 uint32_t eng_poll_spins, eng_poll_waits;

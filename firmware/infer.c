@@ -1202,8 +1202,18 @@ attn_heads_done: ;
                                       (int32_t)(SP_X + hh*head_dim), head_dim/16, Mh};
                     vec_run(PROG_SCALE8, sa2, 5);
                 }
-                if (likely(seq_use && seq_scale8_base >= 0))
+                if (likely(seq_use && seq_scale8_base >= 0)) {
+                    // The output projection's weights stream under the scale8 list (the FFN
+                    // norm row's fetch first: one op at a time on the readers).
+                    if (engine_pf_use) {
+                        if (fn16)
+                            engine_join(dfn);
+                        struct engine_op pfo = {0};
+                        model_matvec_op(eo, SP_X, SP_Y, &pfo);
+                        engine_prefetch(&pfo);
+                    }
                     seq_run((uint32_t)seq_scale8_base, (uint32_t)n_head);
+                }
                 perf_exit(OP_QUANT8);
             } else {
                 ea8 = quantize_f_pow2(attn, q_dim, SP_X);
@@ -1230,9 +1240,12 @@ attn_heads_done: ;
                 engine_join(dwo);
                 perf_exit(OP_ENGINE_WAIT);
             }
-            // The residual tail and the FFN norm in one program when it can (resid_norm_q8).
-            sx8_next = resid_norm_q8(SP_Y, ea8 - (int)eo->bias + (int)eo->rshift, &ex_state,
-                                     &x_amax, fn16, n_embd, 1);
+            // The residual tail and the FFN norm in one program when it can (resid_norm_q8),
+            // the FFN gate's weights prefetched under it.
+            struct engine_op pfg = {0};
+            model_matvec_op(model_entry(ROLE_FFN_GATE, l), SP_X, SP_Y, &pfg);
+            sx8_next = resid_norm_q8(&pfg, SP_Y, ea8 - (int)eo->bias + (int)eo->rshift,
+                                     &ex_state, &x_amax, fn16, n_embd, 1);
             if (sx8_next == RESID_TAIL_OFF) {
                 perf_enter(OP_NORM_I32);
                 uint32_t dmax = 0;
@@ -1300,8 +1313,16 @@ attn_heads_done: ;
                 dbg_sum("silu_x8", l, SP_X, ffn_dim, es8);
                 // The residual tail and the next norm in one program - the last layer's
                 // final norm only when the logits will read it.
+                // The next layer's first projection prefetched under it: the qkv list's first
+                // matvec (v with qkvx's v-k-q order, else q, as the op paths).
+                struct engine_op pfq = {0};
+                int qkv_first = (seq_use && seq_qkv_base >= 0 && qkvx_ok && op_on_hw(OP_NORM_I32))
+                              ? ROLE_ATTN_V : ROLE_ATTN_Q;
+                if (l + 1 < n_layer)
+                    model_matvec_op(model_entry(qkv_first, l + 1), SP_X, SP_Y, &pfq);
                 if (l + 1 < n_layer || want_logits)
-                    sx8_next = resid_norm_q8(SP_Y, es8 - (int)ed_t->bias + (int)ed_t->rshift,
+                    sx8_next = resid_norm_q8(l + 1 < n_layer ? &pfq : 0, SP_Y,
+                                             es8 - (int)ed_t->bias + (int)ed_t->rshift,
                                              &ex_state, &x_amax, next_norm16(l), n_embd, 1);
                 if (sx8_next == RESID_TAIL_OFF) {
                     perf_enter(OP_NORM_I32);

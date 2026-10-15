@@ -55,6 +55,9 @@ class TriXiumConfig:
     dnstream_options: tuple        = ()    # (name, value) overrides of the unit's arguments.
     with_attnstream: bool          = False # Engine op 6: the attention passes (scores, weighted V).
     with_trit5: bool               = False # Ternary codes 5 trits per byte (Trit5Unpacker per channel).
+    with_prefetch: bool            = False # Engine op 7: a matvec's weight reads issued ahead.
+    reader_fifo_depth: int         = 512   # Beats buffered per channel reader (the prefetch's reach).
+    with_vec_fused: bool           = False # Vector unit: fused clamp/round instructions (asm.fuse).
     attnstream_options: tuple      = ()    # (name, value) overrides of the unit's arguments.
 
     def __post_init__(self):
@@ -121,7 +124,7 @@ class TriXiumCore(LiteXModule):
         # Vector unit / Sequencer.
         vecunit = seq = None
         if config.with_vecunit:
-            vecunit = self.vecunit = ClockDomainsRenamer("eng")(VectorUnit())
+            vecunit = self.vecunit = ClockDomainsRenamer("eng")(VectorUnit(fused=config.with_vec_fused))
             seq = self.seq = ClockDomainsRenamer("eng")(Sequencer(
                 with_hadamard            = config.with_hadamard,
                 with_activation_quantize = config.with_activation_quantize,
@@ -144,6 +147,8 @@ class TriXiumCore(LiteXModule):
                          "TRIXIUM_SEQ_LUT", "TRIXIUM_HAS_SEQ", "TRIXIUM_SEQ_OVERLAP"):
                 self.add_constant(name)
             self.add_constant("TRIXIUM_VEC_VREGS", vecunit.vregs)
+            if config.with_vec_fused:
+                self.add_constant("TRIXIUM_VEC_FUSED") # firmware/Makefile: asm --fused 1.
 
         # Scratchpad units: scratchpad clients besides the vector unit, in attach order (the
         # last busy one owns the port). One flat ScratchpadArbiter is built after all of them,
@@ -212,9 +217,14 @@ class TriXiumCore(LiteXModule):
             dnstream   = config.with_dnstream   and (config.dnstream_options   or True),
             attnstream = config.with_attnstream and (config.attnstream_options or True),
             trit5      = config.with_trit5,
+            prefetch   = config.with_prefetch,
+            reader_fifo_depth = config.reader_fifo_depth,
             **placement))
         if config.with_trit5:
             self.add_constant("TRIXIUM_HAS_TRIT5")
+        if config.with_prefetch:
+            self.add_constant("TRIXIUM_HAS_PREFETCH")
+            self.add_constant("TRIXIUM_READER_FIFO_DEPTH", config.reader_fifo_depth)
         if config.with_attnstream:
             at = self.engine.attnstream
             self.add_constant("TRIXIUM_HAS_ATTNSTREAM")

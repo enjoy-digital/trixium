@@ -69,8 +69,10 @@ all: trixium.bin
 # rule is forced rather than dependency-driven.
 VREGS := $(shell grep -oE 'define TRIXIUM_VEC_VREGS [0-9]+' $(BUILD_DIR)/software/include/generated/soc.h 2>/dev/null | grep -oE '[0-9]+$$')
 VREGS := $(if $(VREGS),$(VREGS),8)
+# Fused vector instructions when the bitstream has them (TRIXIUM_VEC_FUSED in soc.h).
+FUSED := $(if $(shell grep -s 'define TRIXIUM_VEC_FUSED' $(BUILD_DIR)/software/include/generated/soc.h),1,0)
 progs.h: FORCE
-	cd .. && $(PYTHON) -m model.asm firmware/progs.h --vregs $(VREGS)
+	cd .. && $(PYTHON) -m model.asm firmware/progs.h --vregs $(VREGS) --fused $(FUSED)
 FORCE:
 infer.o infer_bfp.o infer_lists.o main.o vec.o resident.o: progs.h
 

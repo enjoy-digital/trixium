@@ -714,6 +714,18 @@ static void console_service(void)
         if (str[0] == 0)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
+    } else if (strcmp(token, "prefetch") == 0) {
+        if (strncmp(str, "on", 2) == 0)  engine_pf_use = 1;
+        if (strncmp(str, "off", 3) == 0) engine_pf_use = 0;
+#ifdef TRIXIUM_HAS_PREFETCH
+        printf("PREFETCH %s (hits %lu, mismatch %lu, reader FIFO %d beats)\n",
+               engine_pf_use ? "on" : "off",
+               (unsigned long)trixium_engine_csr_pf_hits_read(),
+               (unsigned long)trixium_engine_csr_pf_mismatch_read(), TRIXIUM_READER_FIFO_DEPTH);
+#else
+        engine_pf_use = 0;
+        puts("PREFETCH off (no weight prefetch in this bitstream)");
+#endif
     } else if (strcmp(token, "mmio") == 0) {
         // Cycles per CPU access on each path the per-token firmware uses: a TriXium CSR read /
         // write, a scratchpad word read / write (posted), and a main_ram (cached) read.

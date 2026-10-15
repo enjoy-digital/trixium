@@ -967,3 +967,57 @@ def test_chan_mod_addresses_every_path(chan_mod, chan_skew, chan_stride, backend
     assert aw7 and aw7[0] == wbase + off(7), [hex(a) for a in aw7[:2]]
     # Nothing else was addressed on the probed channels' write side.
     assert not r.axi_addresses("axi6", "aw")
+
+
+@COMPILED
+def test_engine_weight_prefetch(backend):
+    """Op 7 issues a matvec's reads ahead: during an idle gap the readers fill their FIFOs, the
+    matvec that follows skips ISSUE and runs faster, bit-exact; a prefetch is consumed once,
+    and the next matvec issues its own reads again."""
+    n_channels, rows, cols = 4, 8, 512
+    rng    = np.random.default_rng(77)
+    M      = n_channels*rows
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    payloads = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+                for c in range(n_channels)]
+    cmd = dict(kind=0, rows=rows, cols=cols, wbase=0,
+               wlen=rows*layout.row_beats(cols, layout.KIND_TERNARY),
+               sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
+               cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
+               bias=B, rshift=R, xsrc=0, dst=0x4000)
+    s = Script()
+    for tag, pre, dst in (("plain", False, 0x4000), ("pref", True, 0x5000), ("again", False, 0x6000)):
+        if pre:
+            s.peek("absmax", "am_before")
+            submit(s, dict(cmd, kind=7, dst=dst))
+            s.wait("done", cap=5000, tag="prefetch_done")
+            s.step(2)
+            s.peek("absmax", "am_after") # The tracker survives a prefetch.
+        s.step(400) # The serial gap the prefetch fills.
+        s.peek("cyc_total", f"{tag}_t0")
+        submit(s, dict(cmd, dst=dst))
+        s.wait("done", cap=50000, tag=f"{tag}_done")
+        s.peek("cyc_total", f"{tag}_t1")
+        s.step(2)
+        s.read("sp", dst, 4*M, tag)
+    s.peek("pf_hits")
+    s.peek("pf_mismatch")
+    s.peek("error")
+    r = EngineBench(n_channels, prefetch=True).run(backend, s, sp=x8.tobytes(),
+                                                   payloads=payloads, latency=40)
+    for tag in ("plain", "pref", "again"):
+        assert np.array_equal(_i32(r.reads[tag]), expected), tag
+    assert r.peeks["pf_hits"] == 1 and r.peeks["pf_mismatch"] == 0 and r.peeks["error"] == 0
+    assert r.peeks["am_after"] == r.peeks["am_before"] != 0
+    t = {tag: r.peeks[f"{tag}_t1"] - r.peeks[f"{tag}_t0"] for tag in ("plain", "pref", "again")}
+    assert t["pref"] < t["plain"] - 30, t     # The reads' latency and first beats were hidden.
+    assert abs(t["again"] - t["plain"]) <= 4, t

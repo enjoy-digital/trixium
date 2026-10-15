@@ -18,8 +18,17 @@ from model import asm, bitexact as bx, asm as vasm
 # (semantics + accuracy), before any RTL exists.
 
 def _run(prog_name, sp, args):
-    words = asm.assemble(asm.PROGRAMS[prog_name]())
-    return asm.VecInterp(sp).run(words, args)
+    """Run a program; its fused form (asm.fuse) runs on a copy and must leave the scratchpad
+    and the scalar results byte-identical."""
+    prog  = asm.PROGRAMS[prog_name]()
+    ref   = bytearray(sp)
+    res   = asm.VecInterp(sp).run(asm.assemble(prog), args)
+    fused = asm.fuse(prog)
+    if fused != prog:
+        res_f = asm.VecInterp(ref).run(asm.assemble(fused), args)
+        assert bytes(ref) == bytes(sp), f"{prog_name}: fused scratchpad differs"
+        assert list(res_f[0]) == list(res[0]), f"{prog_name}: fused scalars differ"
+    return res
 
 def test_assembler_encodes():
     words = asm.assemble(asm.prog_quant8())
@@ -418,6 +427,10 @@ def test_silu_split_matches_fused():
     fused_x2 = asm.assemble(asm.prog_silu_q8_x2())
     gate, gate_x2 = asm.assemble(asm.prog_silu_gate()), asm.assemble(asm.prog_silu_gate_x2())
     mul, mul_x2   = asm.assemble(asm.prog_mul_q8()), asm.assemble(asm.prog_mul_q8_x2())
+    # The fused-instruction forms (asm.fuse) of all six.
+    ff, ffx = (asm.assemble(asm.fuse(p())) for p in (asm.prog_silu_q8, asm.prog_silu_q8_x2))
+    gf, gfx = (asm.assemble(asm.fuse(p())) for p in (asm.prog_silu_gate, asm.prog_silu_gate_x2))
+    mf, mfx = (asm.assemble(asm.fuse(p())) for p in (asm.prog_mul_q8, asm.prog_mul_q8_x2))
     cases = 0
     for trial in range(6):
         base = bytearray(16*1024)
@@ -431,7 +444,8 @@ def test_silu_split_matches_fused():
         base[0x1000:0x1000 + 2*n] = u.tobytes()
         for a4 in (-14, -12, -8, -4, 0, 2):        # gate shift (imm + k)
             for a6 in (-15, -13, -10):             # output shift
-                for f, gp, mp in ((fused, gate, mul), (fused_x2, gate_x2, mul_x2)):
+                for f, gp, mp in ((fused, gate, mul), (fused_x2, gate_x2, mul_x2),
+                                  (ff, gf, mf), (ffx, gfx, mfx)):
                     ref = bytearray(base)
                     Sr, _ = _run_words(f, ref, [0, 0x1000, 0, n//16, a4, 0, a6, 0x3000])
                     got = bytearray(base)
@@ -440,7 +454,7 @@ def test_silu_split_matches_fused():
                     assert bytes(got) == bytes(ref), (trial, a4, a6, len(f))
                     assert Sg[6] == Sr[6], (trial, a4, a6, Sg[6], Sr[6])
                     cases += 1
-    assert cases == 6*6*3*2
+    assert cases == 6*6*3*4
 
 
 def test_resid_rmsnorm_q8_matches_the_three_programs():
@@ -451,7 +465,8 @@ def test_resid_rmsnorm_q8_matches_the_three_programs():
     rng = np.random.default_rng(47)
     n = 512
     X, D, H, W, Y, X8 = 0x0000, 0x1000, 0x2000, 0x3000, 0x4000, 0x6000
-    fused = (asm.assemble(asm.prog_resid_rmsnorm_q8()), asm.assemble(asm.prog_resid_rmsnorm_q8_x2()))
+    fused = tuple(asm.assemble(f(p())) for p in (asm.prog_resid_rmsnorm_q8, asm.prog_resid_rmsnorm_q8_x2)
+                  for f in (list, asm.fuse))
     cases = 0
     for trial in range(5):
         base = bytearray(32*1024)
@@ -482,7 +497,7 @@ def test_resid_rmsnorm_q8_matches_the_three_programs():
                         assert bytes(got) == bytes(ref), (trial, k, sa, sb, eps)
                         assert Sg[6] == (Sr1[6] << 16) | Sr2[6], (Sg[6], Sr1[6], Sr2[6])
                         cases += 1
-    assert cases == 5*3*5*2*2
+    assert cases == 5*3*5*2*4
 
 
 def test_norm_mul_q8_matches_norm_i32_then_mul_q8():
@@ -492,7 +507,8 @@ def test_norm_mul_q8_matches_norm_i32_then_mul_q8():
     rng = np.random.default_rng(49)
     n = 512
     G, U, YU, X8 = 0x0000, 0x1000, 0x2000, 0x4000
-    fused = (asm.assemble(asm.prog_norm_mul_q8()), asm.assemble(asm.prog_norm_mul_q8_x2()))
+    fused = tuple(asm.assemble(f(p())) for p in (asm.prog_norm_mul_q8, asm.prog_norm_mul_q8_x2)
+                  for f in (list, asm.fuse))
     cases = 0
     for trial in range(4):
         base = bytearray(24*1024)
@@ -511,7 +527,7 @@ def test_norm_mul_q8_matches_norm_i32_then_mul_q8():
                     assert bytes(got) == bytes(ref), (trial, k, a6)
                     assert Sg[6] == Sr[6]
                     cases += 1
-    assert cases == 4*3*3*2
+    assert cases == 4*3*3*4
 
 
 def test_resid_tail_pack_fields():

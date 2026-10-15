@@ -30,9 +30,9 @@ from common.verilator import Script, Simulator, run_migen
 SP_SIZE = 16*1024
 
 class _DUT(Module):
-    def __init__(self, sp_init=None):
+    def __init__(self, sp_init=None, fused=False):
         self.submodules.sp = Scratchpad(size=SP_SIZE, init=sp_init)
-        self.submodules.vu = VectorUnit()
+        self.submodules.vu = VectorUnit(fused=fused)
         self.comb += [
             self.sp.fill.adr.eq(self.vu.sp_rd_adr),
             self.vu.sp_rd_dat.eq(self.sp.fill.dat_r),
@@ -65,13 +65,18 @@ def _csr_write(s, name, value):
     s.set(name + "_re", 0)
     s.step()
 
-def _simulator():
-    def build():
-        dut = _DUT()
-        return dict(dut=dut, ios=dut.signals, memories={"sp": dut.sp.mem})
-    return Simulator(build, name="vecunit", key="test_vector._DUT")
+_simulators = {}
 
-def _vec_run(backend, words, sp_bytes, args, withhold_seed=None, max_cycles=200000):
+def _simulator(fused=False):
+    if fused not in _simulators:
+        def build():
+            dut = _DUT(fused=fused)
+            return dict(dut=dut, ios=dut.signals, memories={"sp": dut.sp.mem})
+        _simulators[fused] = Simulator(build, name="vecunit_fused" if fused else "vecunit",
+                                       key=f"test_vector._DUT(fused={fused})")
+    return _simulators[fused]
+
+def _vec_run(backend, words, sp_bytes, args, withhold_seed=None, max_cycles=200000, fused=False):
     """Upload `words`, run them on `args` over the scratchpad image; withhold_seed: withhold
     the store grant ~40% of the cycles while the program runs."""
     s = Script()
@@ -94,10 +99,10 @@ def _vec_run(backend, words, sp_bytes, args, withhold_seed=None, max_cycles=2000
     for name in ("res5", "res6", "res7", "bad_op", "done_count"):
         s.peek(f"vu_{name}", name)
     if backend == "migen":
-        dut = _DUT(words_from_bytes(bytes(sp_bytes)))
+        dut = _DUT(words_from_bytes(bytes(sp_bytes)), fused=fused)
         r = run_migen(dut, dut.signals, s, memories={"sp": dut.sp.mem})
     else:
-        r = _simulator().run(s, images={"sp": bytes(sp_bytes)})
+        r = _simulator(fused).run(s, images={"sp": bytes(sp_bytes)})
     p = r.peeks
     return dict(sp=r.reads["sp"], s5=p["res5"], s6=p["res6"], s7=p["res7"], bad=p["bad_op"],
                 dc=p["done_count"])
@@ -403,7 +408,7 @@ VCONST = f"v{asm.VREGS - 1}"
 VMAX   = asm.VREGS - 2
 
 
-def gen_program(rng):
+def gen_program(rng, fused=False):
     """One random program. v7 holds a positive constant (LUTRECIP operands must be
     nonzero); s0/s1 are load pointers, s2 the store pointer, s3 the loop count, s4 a
     constant, s5..s7 the reduction/scalar scratch."""
@@ -438,9 +443,18 @@ def gen_program(rng):
         for _ in range(n):
             k = rng.random()
             if k < 0.34:
-                op = rng.choice(["VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX",
-                                 "VSHLV", "VPACK"])
-                d = vdst(); out.append((op, d, vsrc(), vsrc())); wrote(d)
+                ops = ["VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK"]
+                if fused:
+                    ops += ["VADDC16", "VSHLVC16", "VQ8V", "VSHLSC16"]*2
+                op = rng.choice(ops)
+                d = vdst()
+                if op == "VQ8V":
+                    out.append((op, d, vsrc(), vsrc(), rng.randint(0, 12)))
+                elif op == "VSHLSC16":
+                    out.append((op, d, vsrc(), rng.choice(sregs + ["s4"])))
+                else:
+                    out.append((op, d, vsrc(), vsrc()))
+                wrote(d)
             elif k < 0.50:
                 op = rng.choice(["VSHRI", "VSHLI", "VRNE"])
                 d = vdst()
@@ -526,16 +540,16 @@ def _seeded_sp(rng):
     return sp
 
 
-def _check(backend, seed, withhold):
+def _check(backend, seed, withhold, fused=False):
     rng  = random.Random(seed)
-    prog = gen_program(rng)
+    prog = gen_program(rng, fused)
     words = asm.assemble(prog)
     sp   = _seeded_sp(rng)
     args = [SRC0, SRC1, DST, rng.randint(2, 4)]
     ref  = bytearray(sp)
     S, _ = asm.VecInterp(ref).run(words, list(args))
     got  = _vec_run(backend, words, sp, args, withhold_seed=seed + 7 if withhold else None,
-                    max_cycles=100000)
+                    max_cycles=100000, fused=fused)
     m48  = (1 << 48) - 1
     diffs = [i for i in range(SP_SIZE) if got["sp"][i] != ref[i]]
     assert not diffs, (seed, prog, f"first diffs at {diffs[:8]}")
@@ -591,3 +605,49 @@ def test_rtl_rmsnorm_h_shift_range(e16, backend):
     sp[0:2*hd*H] = rng.integers(-20000, 20000, hd*H).astype("<i2").tobytes()
     sp[0x2000:0x2000 + 2*hd] = rng.integers(-32000, 32000, hd).astype("<i2").tobytes()
     _compare_words(backend, asm.prog_rmsnorm_h(), sp, [0, 0x2000, 0, hd//16, -7, 17, e16 - E_NORM - 15, H])
+
+
+# Fused Instructions ---------------------------------------------------------------------------------
+# A vector unit built with fused=True: the fused forms (asm.fuse) of the stock programs and random
+# programs mixing them with every other op (their latency-2 hazards), against the interpreter.
+
+@COMPILED
+@pytest.mark.parametrize("seed", list(range(300, 316)))
+def test_random_fused_program_matches_interpreter(seed, backend):
+    _check(backend, seed, withhold=seed % 2 == 1, fused=True)
+
+
+@COMPILED
+def test_rtl_fused_stock_programs(backend):
+    """The fused forms of the residual tail, the FFN tail, the SiLU split and rmsnorm_q8 (x1 and
+    x2) on the fused unit leave the scratchpad and S6 as the unfused programs do."""
+    rng = np.random.default_rng(301)
+    n = 256
+    cases = []
+    for prog in (asm.prog_resid_rmsnorm_q8(), asm.prog_resid_rmsnorm_q8_x2()):
+        sp = bytearray(SP_SIZE)
+        sp[0:2*n] = rng.integers(-30000, 30000, n).astype("<i2").tobytes()
+        sp[0x2000:0x2000 + 2*n] = rng.integers(-8000, 8000, n).astype("<i2").tobytes()
+        sp[0x3400:0x3400 + 4*n] = rng.integers(-(1 << 16), 1 << 16, n).astype("<i4").tobytes()
+        cases.append((prog, sp, [0x3400, 0, 0x1000, n//16, asm.resid_tail_pack(-3, 0, 1, -8, -17),
+                                 17, 0x2000, 0x3000]))
+    for prog in (asm.prog_norm_mul_q8(), asm.prog_norm_mul_q8_x2()):
+        sp = bytearray(SP_SIZE)
+        sp[0:2*n] = rng.integers(-32768, 32768, n).astype("<i2").tobytes()
+        sp[0x1000:0x1000 + 4*n] = rng.integers(-(1 << 18), 1 << 18, n).astype("<i4").tobytes()
+        cases.append((prog, sp, [0, 0x1000, 0, n//16, 5, 0, -15, 0x3000]))
+    for prog in (asm.prog_mul_q8_x2(), asm.prog_rmsnorm_q8_x2(), asm.prog_quant8()):
+        sp = bytearray(SP_SIZE)
+        sp[0:2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
+        sp[0x1000:0x1000 + 2*n] = rng.integers(-20000, 20000, n).astype("<i2").tobytes()
+        sp[0x2000:0x2000 + 2*n] = rng.integers(-8000, 8000, n).astype("<i2").tobytes()
+        cases.append((prog, sp, [0, 0x1000, 0x1800, n//16, -12, 17, -15, 0x3000]))
+    for prog, sp, args in cases:
+        fused = asm.fuse(prog)
+        assert fused != prog
+        ref  = bytearray(sp)
+        S, _ = asm.VecInterp(ref).run(asm.assemble(prog), list(args))
+        out  = _vec_run(backend, asm.assemble(fused), sp, args, fused=True)
+        assert out["sp"] == bytes(ref), "fused RTL differs from the unfused interpreter"
+        assert out["s6"] & 0xFFFFFFFF == S[6] & 0xFFFFFFFF
+        assert out["bad"] == 0

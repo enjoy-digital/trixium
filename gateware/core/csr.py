@@ -96,6 +96,13 @@ class EngineCSR(LiteXModule):
         self.cyc_eng    = CSRStatus(32, description="Cycles with the engine busy.")
         self.cyc_vec    = CSRStatus(32, description="Cycles with the vector unit busy.")
         self.cyc_both   = CSRStatus(32, description="Cycles with BOTH busy (overlap).")
+        if getattr(engine, "with_prefetch", False):
+            self.pf_hits     = CSRStatus(32, description="Matvecs served from a weight prefetch (op 7).")
+            self.pf_mismatch = CSRStatus(1,  description="Sticky: an op followed a prefetch of another span.")
+            self.comb += [
+                self.pf_hits.status.eq(engine.pf_hits),
+                self.pf_mismatch.status.eq(engine.pf_mismatch),
+            ]
 
         # 64-bit snapshot: one strobe freezes all counters on the same edge (a 64-bit CSR
         # read takes several bus transactions on RV32). Stable until the next snapshot.

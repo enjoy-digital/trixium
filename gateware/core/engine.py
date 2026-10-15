@@ -158,7 +158,7 @@ class MatVecEngine(LiteXModule):
     """N-channel matvec engine: one AXIReader + ChannelPipe per memory channel (see module doc)."""
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
-                 trit5=False):
+                 trit5=False, prefetch=False, reader_fifo_depth=512):
         # chan_stride: byte distance between consecutive channels' weight regions. With the
         # HBM AXI switch enabled the address (not the port) selects the pseudo-channel, so
         # each channel needs its own window; 0 when every channel has its own address space.
@@ -219,6 +219,9 @@ class MatVecEngine(LiteXModule):
                              # 6: attention stream (attnstream only: xsrc = the unit's record;
                              # K or V rows position-striped: rows/rem/wbase/wlen as the KV ops,
                              # sbeats + cbeats = beats per row, merged in position order).
+                             # 7: weight prefetch (prefetch only: the next matvec's read
+                             # commands - wbase/wlen/rem/sbeats/cbeats as that op - issued now,
+                             # its beats wait in the readers' FIFOs; done at once).
             ("rows",   16),  # Rows per channel.
             ("cols",   14),  # K.
             ("wbase",  32),  # Per-channel weight byte address (beat-aligned).
@@ -293,6 +296,8 @@ class MatVecEngine(LiteXModule):
         # Channels ---------------------------------------------------------------------------------
         fetch_mode = Signal() # kind == 2 for the latched command.
         fetch_chan = Signal(5)
+        run_state  = Signal() # The FSM is in RUN (the gate of prefetched beats).
+        self.with_prefetch = prefetch
 
         self.readers = []
         self.pipes   = []
@@ -316,7 +321,7 @@ class MatVecEngine(LiteXModule):
         for i, axi in enumerate(hbm_axis):
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
             # per round trip); round-robin ARIDs let it pipeline.
-            reader = AXIReader(axi, n_ids=4)
+            reader = AXIReader(axi, n_ids=4, fifo_depth=reader_fifo_depth)
             pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
             setattr(self, f"reader{i}", reader)
             setattr(self, f"pipe{i}",   pipe)
@@ -352,6 +357,19 @@ class MatVecEngine(LiteXModule):
             if attnstream:
                 is_at = Signal(name=f"is_at{i}")
                 self.sync += is_at.eq(at_mode)
+            # Prefetch: beats may arrive before their op runs (a kind-7 op issued the reads), so
+            # every consumer takes them only while an op is in RUN (registered per channel).
+            # Without prefetch the reads are issued in ISSUE, beats never arrive earlier.
+            if prefetch:
+                consume = Signal(name=f"consume{i}")
+                self.sync += consume.eq(run_state)
+                rsrc_gated = stream.Endpoint([("data", 256)])
+                self.comb += [
+                    rsrc_gated.valid.eq(rbuf.source.valid & consume),
+                    rsrc_gated.data.eq(rbuf.source.data),
+                    rbuf.source.ready.eq(rsrc_gated.ready & consume),
+                ]
+                rsrc = rsrc_gated
             self.comb += [
                 # Normal: beats feed the compute pipe. Fetch: beats go to the scratchpad.
                 psink.valid.eq(rsrc.valid & ~is_fetch & ~is_dn & ~is_at),
@@ -383,9 +401,14 @@ class MatVecEngine(LiteXModule):
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
         command_accept = self.cmd.valid & self.cmd.ready
+        # The result trackers (absmax, argmax) reset on an op's accept, but not on a prefetch's:
+        # it slips between a matvec and the firmware's read of its absmax.
+        tracker_reset = command_accept & ((self.cmd.kind != 7) if prefetch else 1)
         store_mode = Signal()
         axpy_mode  = Signal()
+        pf_mode    = Signal()
         self.comb += [
+            pf_mode.eq(cmd_r["kind"] == 7 if prefetch else 0),
             fetch_mode.eq(cmd_r["kind"] == 2),
             store_mode.eq(cmd_r["kind"] == 3),
             axpy_mode.eq(cmd_r["kind"] == 4),
@@ -732,7 +755,7 @@ class MatVecEngine(LiteXModule):
         am_busy = Signal()
         self.comb += am_busy.eq(am_v_r | am_v2 | am_v3 | am_v4)
         self.sync += [
-            If(self.cmd.valid & self.cmd.ready,
+            If(tracker_reset,
                 self.argmax_val.eq(-(1 << 31)),
                 self.argmax_idx.eq(0xFFFFFF),
             ).Elif(am_v4 &
@@ -873,7 +896,7 @@ class MatVecEngine(LiteXModule):
             return sigs[0]
         wr_absmax = _maxtree(lane_abs)
         self.sync += [
-            If(command_accept,
+            If(tracker_reset,
                 self.absmax.eq(0),
             ).Elif(~fetch_mode & ~dn_mode & ~at_mode & (wr_absmax > self.absmax),
                 self.absmax.eq(wr_absmax),
@@ -1057,6 +1080,8 @@ class MatVecEngine(LiteXModule):
                 NextState("DN_CMD" if dnstream else "IDLE"),
             ).Elif(at_mode,
                 NextState("ISSUE" if attnstream else "IDLE"),
+            ).Elif(pf_mode,
+                NextState("PF_ISSUE" if prefetch else "IDLE"),
             ).Else(
                 NextState("FILL"),
             )
@@ -1124,22 +1149,61 @@ class MatVecEngine(LiteXModule):
             self.busy.eq(1),
             NextState("ISSUE"),
         )
-        fsm.act("ISSUE",
-            self.busy.eq(1),
-            *[c.valid.eq(~fetch_mode | (fetch_chan == i))
-              for i, c in enumerate(read_cmds)],
+        read_cmd_fields = [
             *[c.addr.eq(cmd_r["wbase"] + _chan_off(i))
               for i, c in enumerate(read_cmds)],
             *[c.len.eq(cmd_r["wlen"]
                 + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
               for i, c in enumerate(read_cmds)],
-            # Waits on readers[0] alone. A reader only accepts while idle, so a reader still
-            # draining could in principle miss its command; not observed on hardware, and a
-            # per-reader wait costs timing.
-            If(read_cmds[0].ready,
+        ]
+        # Prefetch bookkeeping: a kind-7 op leaves its reads pending for the next matvec, whose
+        # ISSUE then only checks the address (pf_mismatch, sticky: a firmware ordering bug) and
+        # goes straight to RUN.
+        pf_pending  = Signal()
+        pf_wbase    = Signal(32, reset_less=True)
+        self.pf_hits     = Signal(32) # Matvecs served from a prefetch.
+        self.pf_mismatch = Signal()   # Sticky: a matvec (or another op) followed a prefetch
+                                      # of a different span.
+        pf_skip = Signal()
+        if prefetch:
+            self.comb += pf_skip.eq(pf_pending)
+        fsm.act("ISSUE",
+            self.busy.eq(1),
+            If(pf_skip,
                 NextState("RUN"),
+            ).Else(
+                *[c.valid.eq(~fetch_mode | (fetch_chan == i))
+                  for i, c in enumerate(read_cmds)],
+                *read_cmd_fields,
+                # Waits on readers[0] alone. A reader only accepts while idle, so a reader
+                # still draining could in principle miss its command; not observed on
+                # hardware, and a per-reader wait costs timing.
+                If(read_cmds[0].ready,
+                    NextState("RUN"),
+                )
             )
         )
+        if prefetch:
+            fsm.act("PF_ISSUE",
+                self.busy.eq(1),
+                *[c.valid.eq(1) for c in read_cmds],
+                *read_cmd_fields,
+                If(read_cmds[0].ready,
+                    self.done.eq(1),
+                    NextState("IDLE"),
+                )
+            )
+            self.sync += [
+                If(fsm.ongoing("PF_ISSUE") & read_cmds[0].ready,
+                    pf_pending.eq(cmd_r["wlen"] != 0), # wlen 0: a no-op (a list's unused slot).
+                    pf_wbase.eq(cmd_r["wbase"]),
+                ).Elif(fsm.ongoing("ISSUE") & pf_pending,
+                    pf_pending.eq(0),
+                    self.pf_hits.eq(self.pf_hits + 1),
+                    If((cmd_r["wbase"] != pf_wbase) | fetch_mode | at_mode | dn_mode,
+                        self.pf_mismatch.eq(1)),
+                ),
+            ]
         mv_total = Signal(24)
         ax_total = Signal(24)
         # Test-visible aliases (no hardware: same signals under a name a testbench can find).
@@ -1157,6 +1221,7 @@ class MatVecEngine(LiteXModule):
             ax_total.eq(Mux(cmd_r["xred"], cmd_r["cols"],
                             cmd_r["cols"]*self.n_channels)),
         ]
+        self.comb += run_state.eq(fsm.ongoing("RUN"))
         fsm.act("RUN",
             self.busy.eq(1),
             If(Mux(at_mode, at_fin, Mux(dn_mode, dn_fin & ~self.store_busy, Mux(fetch_mode,

@@ -334,7 +334,7 @@ class TriXiumSimSoC(SoCCore):
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
-                 ddr_settings=None, ckphase_model=False):
+                 ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False):
         assert mem in ("hbm", "ddr4", "ddr3")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
@@ -452,6 +452,9 @@ class TriXiumSimSoC(SoCCore):
             with_conv                = with_conv,
             with_dnstream            = bool(with_dnstream),
             with_attnstream          = attn_geometry is not None,
+            with_prefetch            = bool(prefetch),
+            with_vec_fused           = vec_fused,
+            reader_fifo_depth        = prefetch or 512,
             # An image with 5-trits-per-byte weights needs the unpacker in front of the pipes.
             with_trit5               = img is not None and any(
                 e["kind"] == KIND_TERNARY5 for e in img.entries),
@@ -727,6 +730,10 @@ def build_sim(args, board, out_dir):
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     if args.ckphase_model:
         soc_kwargs["ckphase_model"] = True
+    if args.prefetch:
+        soc_kwargs["prefetch"] = args.prefetch
+    if args.vec_fused:
+        soc_kwargs["vec_fused"] = True
     if args.ddr_settings:
         soc_kwargs["ddr_settings"] = {k: int(v) for k, v in
             (kv.split("=") for kv in args.ddr_settings.split(","))}
@@ -785,6 +792,8 @@ def main():
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
+    parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
+    parser.add_argument("--vec-fused",      action="store_true",                                   help="Vector unit with the fused clamp/round instructions (TRIXIUM_VEC_FUSED).")
     parser.add_argument("--ckphase-model",  action="store_true",                                   help="--board ypcb: the PHY models behind the K7DDRPHY's CK phase CSRs (calibration test: ddrinit 1).")
     parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")
     parser.add_argument("--gate-pre",       default="",                                            help="--gate: console commands before the traced generation, ';'-separated (e.g. 'gen 2 5 6 7;engreset').")

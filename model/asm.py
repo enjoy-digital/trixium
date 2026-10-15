@@ -155,6 +155,13 @@ OPCODES = [
     # rules as LOOPS/LOOPE.
     "LOOPS2", # loop2 count = S[sa] if imm == 0 else imm; body starts at the next instr.
     "LOOPE2", # if --count2 > 0: pc = loop2 start.
+    # Fused forms (vector units built with fused=True, TRIXIUM_VEC_FUSED): an ALU op and the
+    # clamp/round that always follows it, one instruction, byte-identical to the pair/triple.
+    # fuse() rewrites programs into them; latency 2 (the second half runs in E2, as VMUL).
+    "VADDC16",  # vd = VCLAMP16(VADD(va, vb)).
+    "VSHLVC16", # vd = VCLAMP16(VSHLV(va, vb)).
+    "VSHLSC16", # vd = VCLAMP16(VSHLS(va, S[sa])).
+    "VQ8V",     # vd = VCLAMP8(VRNE(VSHLV(va, vb), imm)) (quant8's rescale).
 ]
 OP = {name: i for i, name in enumerate(OPCODES)}
 
@@ -209,15 +216,21 @@ def assemble(program):
         elif op in ("STV", "STB", "STW"):
             va = take_v()
             sa = take_s()
-        elif op in ("VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK"):
+        elif op in ("VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK",
+                    "VADDC16", "VSHLVC16"):
             vd = take_v()
             va = take_v()
             vb = take_v()
+        elif op == "VQ8V":
+            vd  = take_v()
+            va  = take_v()
+            vb  = take_v()
+            imm = take_i()
         elif op in ("VSHRI", "VSHLI", "VRNE"):
             vd  = take_v()
             va  = take_v()
             imm = take_i()
-        elif op in ("VSHLS", "VMULS"):
+        elif op in ("VSHLS", "VMULS", "VSHLSC16"):
             vd = take_v()
             va = take_v()
             sa = take_s()
@@ -361,6 +374,20 @@ class VecInterp:
                 S[sa] = _s48(S[sa] + 16)
             elif op == "BCAST":
                 V[vd] = np.full(LANES, _s32(S[sa]), dtype=np.int64)
+            elif op in ("VADDC16", "VSHLVC16", "VSHLSC16", "VQ8V"):
+                a = V[va]
+                b = np.full(LANES, _s32(S[sa]), dtype=np.int64) if op == "VSHLSC16" else V[vb]
+                if op == "VADDC16":
+                    r = a + b
+                else:
+                    amt = np.clip(b, -31, 31)
+                    r = np.where(amt >= 0, a << np.maximum(amt, 0), a >> np.maximum(-amt, 0))
+                r = np.asarray([_s32(x) for x in r], dtype=np.int64)
+                if op == "VQ8V":
+                    r = np.clip([_s32(bx.rne_shift(int(x), imm)) for x in r], -127, 127)
+                else:
+                    r = np.clip(r, -32767, 32767)
+                V[vd] = np.asarray(r, dtype=np.int64)
             elif op in ("VADD", "VSUB", "VMUL", "VMULH15", "VMIN", "VMAX", "VSHLV", "VPACK",
                         "VSHLS", "VMULS"):
                 a = V[va]
@@ -1745,6 +1772,67 @@ PROGRAMS = {
 
 # Emit ---------------------------------------------------------------------------------------------
 
+# Fusion -------------------------------------------------------------------------------------------
+
+FUSED = False # Emit fused forms (fuse()) for a vector unit built with fused=True.
+
+def set_fused(on):
+    global FUSED
+    FUSED = bool(on)
+
+_CTRL_OPS = ("LOOPS", "LOOPE", "LOOPS2", "LOOPE2", "DONE", "NOP")
+
+def _vregs(ins):
+    """(vector registers read, vector register written or None) of one instruction tuple."""
+    op, args = ins[0].upper(), ins[1:]
+    v = [a for a in args if isinstance(a, str) and a[0].lower() == "v"]
+    if op in ("LDV", "LDW", "BCAST"):
+        return [], v[0]
+    if op in ("STV", "STB", "STW", "REDSUM", "REDSSQ", "REDMAX", "REDSMAX"):
+        return v, None
+    if v:
+        return v[1:], v[0]
+    return [], None
+
+def _next_use(prog, i, reg):
+    """Index of the next instruction after i that reads or writes reg, None past a loop edge."""
+    for j in range(i + 1, len(prog)):
+        if prog[j][0].upper() in _CTRL_OPS:
+            return None
+        rd, wr = _vregs(prog[j])
+        if reg in rd or reg == wr:
+            return j
+    return None
+
+def fuse(program):
+    """Rewrite VADD/VSHLV/VSHLS + VCLAMP16 and VSHLV + VRNE + VCLAMP8 chains into the fused
+    forms. A chain fuses when each next instruction touching the register is the next link,
+    in place (vd == va == the register), within one loop body: the fused op then writes the
+    final value where the first link was, and nothing in between can see the difference."""
+    prog = [tuple(ins) for ins in program]
+    drop = set()
+    for i, ins in enumerate(prog):
+        if i in drop:
+            continue
+        op = ins[0].upper()
+        if op not in ("VADD", "VSHLV", "VSHLS"):
+            continue
+        d = ins[1]
+        j = _next_use(prog, i, d)
+        if j is None:
+            continue
+        nj = prog[j]
+        if nj[0].upper() == "VCLAMP16" and nj[1] == d and nj[2] == d:
+            prog[i] = ({"VADD": "VADDC16", "VSHLV": "VSHLVC16", "VSHLS": "VSHLSC16"}[op],) + ins[1:]
+            drop.add(j)
+        elif op == "VSHLV" and nj[0].upper() == "VRNE" and nj[1] == d and nj[2] == d:
+            k = _next_use(prog, j, d)
+            if k is not None and prog[k][0].upper() == "VCLAMP8" and prog[k][1] == d \
+                    and prog[k][2] == d:
+                prog[i] = ("VQ8V",) + ins[1:] + (nj[3],)
+                drop.update((j, k))
+    return [ins for i, ins in enumerate(prog) if i not in drop]
+
 def emit_c(out):
     """Emit firmware/progs.h with assembled program words + entry offsets."""
     lines = ["// Generated by model.asm - do not edit.", "#pragma once",
@@ -1752,11 +1840,12 @@ def emit_c(out):
     all_words = []
     offsets   = {}
     lines.append(f"#define TRIXIUM_PROGS_VREGS {VREGS}")
+    lines.append(f"#define TRIXIUM_PROGS_FUSED {int(FUSED)}")
     for name, fn in PROGRAMS.items():
         offsets[name] = len(all_words)
         if VREGS == 16 and name in UNROLL16:
             fn = UNROLL16[name]
-        all_words += assemble(fn())
+        all_words += assemble(fuse(fn()) if FUSED else fn())
     assert len(all_words) <= IMEM_DEPTH, (
         f"programs need {len(all_words)} words but the instruction BRAM holds {IMEM_DEPTH}: "
         f"the upload would wrap and silently overwrite the first program")
@@ -1776,12 +1865,14 @@ def main():
     parser = argparse.ArgumentParser(description="Assemble the vector unit programs into a C header.")
     parser.add_argument("out",     nargs="?", default="firmware/progs.h",    help="Output header.")
     parser.add_argument("--vregs", type=int,  default=None, choices=(8, 16), help="Vector register count (encoding).")
+    parser.add_argument("--fused", type=int,  default=0,    choices=(0, 1),  help="Fused instruction forms (TRIXIUM_VEC_FUSED).")
     args = parser.parse_args()
 
     if args.vregs is not None:
         set_vregs(args.vregs)
+    set_fused(args.fused)
     emit_c(args.out)
-    print(f"emitted (VREGS={VREGS})")
+    print(f"emitted (VREGS={VREGS}, FUSED={int(FUSED)})")
 
 if __name__ == "__main__":
     main()

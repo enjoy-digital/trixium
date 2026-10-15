@@ -25,6 +25,9 @@
                                // xsrc = head records, wbase/wlen = state span.
 #define ENGINE_KIND_ATTN     6 // Attention passes (TRIXIUM_HAS_ATTNSTREAM): xsrc = the unit's
                                // record, K/V rows position-striped (rows/rem, cbeats per row).
+#define ENGINE_KIND_PREFETCH 7 // Weight prefetch (TRIXIUM_HAS_PREFETCH): a matvec's reads issued
+                               // ahead (its wbase/wlen/rows/rem/sbeats/cbeats); the next op must
+                               // be that matvec (wlen 0: a no-op).
 
 // Scratchpad CPU window (uncached; generated/mem.h defines it too when included first).
 #ifndef SCRATCHPAD_BASE
@@ -77,5 +80,12 @@ void engine_store(uint8_t chan, uint32_t addr, uint32_t beats, uint32_t src);
 extern int engine_wedged; // Set once an op stalled (see ENGSTALL in engine.c).
 int engine_recover(void); // Soft reset of the engine cluster; 0 = recovered, <0 = reconfigure.
 extern int engine_diag;   // Opt-in per-op stall diagnostics (~2k cycles/op).
+
+// Weight prefetch: issue `op`'s reads now (submitted and joined: done once the readers took
+// them), so they stream under the serial work before the matvec itself. The readers stay
+// busy until that matvec consumes them: nothing else may use the engine's readers in between
+// (no fetch, store or KV op). No-op without the hardware or with engine_pf_use = 0.
+extern int engine_pf_use;
+void engine_prefetch(const struct engine_op *op);
 
 #endif
