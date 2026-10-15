@@ -83,6 +83,6 @@ void tprof_begin(void);
 void tprof_end(void);
 void tprof_event(uint32_t tag);
 void tprof_dcount(uint32_t st); // Feed seq_status; logs kind-4 on dcount change.
-void tprof_dump(void);          // TP <tag> <t> <eng> <vec> lines over the console.
+void tprof_dump(void);          // TP <tag> <t> <eng> <vec> <both> lines over the console.
 
 #endif

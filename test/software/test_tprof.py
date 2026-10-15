@@ -23,13 +23,14 @@ TP 70000000 3500 1000 1007
 
 def test_tprof_breakdown():
     res = tprof.analyze(tprof.parse(TRACE))
-    cycles, idle, vec = res["total"]
+    cycles, idle, vec, neither = res["total"]
     assert cycles == 2500
     assert idle == 2500 - 950
     assert vec == 1000
     # The list interval inside norm_i32: 1000 cycles, 880 of them streaming.
-    assert res["by_op"]["norm_i32"] == [1100, 1100 - 950, 200]
-    assert res["by_op"]["resid_add"] == [1000, 1000, 800]
+    assert neither == 0 # No both-busy counter in this trace.
+    assert res["by_op"]["norm_i32"] == [1100, 1100 - 950, 200, 0]
+    assert res["by_op"]["resid_add"] == [1000, 1000, 800, 0]
     assert res["by_list"]["list@0+5"][0] == 1000 + 100 + 1000 + 100
     assert res["gaps"][0][:2] == (1000, 1000) and res["gaps"][0][3] == "resid_add"
 
@@ -39,3 +40,10 @@ def test_tprof_counter_wrap():
     text = "TP 60000000 4294967200 4294967290 0\nTP 70000000 104 10 0\n"
     res  = tprof.analyze(tprof.parse(text))
     assert res["total"][:2] == [200, 200 - 16]
+
+
+def test_tprof_neither():
+    """With the both-busy counter: neither = cycles - engine - vector + both."""
+    text = "TP 60000000 0 0 0 0\nTP 70000000 100 60 50 30\n"
+    res  = tprof.analyze(tprof.parse(text))
+    assert res["total"] == [100, 40, 50, 20]

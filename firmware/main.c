@@ -714,6 +714,43 @@ static void console_service(void)
         if (str[0] == 0)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
+    } else if (strcmp(token, "mmio") == 0) {
+        // Cycles per CPU access on each path the per-token firmware uses: a TriXium CSR read /
+        // write, a scratchpad word read / write (posted), and a main_ram (cached) read.
+        volatile uint32_t *sp = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + 191*64);
+        uint32_t keep = sp[0], acc = 0, n = 256;
+        uint32_t t0 = perf_now();
+        for (uint32_t i = 0; i < n; i++) acc += trixium_seq_status_read();
+        uint32_t t1 = perf_now();
+        for (uint32_t i = 0; i < n; i++) trixium_seq_count_write(i & 1);
+        uint32_t t2 = perf_now();
+        for (uint32_t i = 0; i < n; i++) acc += sp[i & 15];
+        uint32_t t3 = perf_now();
+        for (uint32_t i = 0; i < n; i++) sp[i & 7] = i;
+        uint32_t t4 = perf_now();
+        static volatile uint32_t ram[16];
+        for (uint32_t i = 0; i < n; i++) acc += ram[i & 15];
+        uint32_t t5 = perf_now();
+        extern uint8_t *heap;
+        volatile uint32_t *mr = (volatile uint32_t *)heap; // main_ram (cached, behind the L2).
+        uint32_t m0 = perf_now();
+        for (uint32_t i = 0; i < n; i++) acc += mr[i & 15];
+        uint32_t m1 = perf_now();
+        for (uint32_t i = 0; i < n; i++) mr[i & 15] = i;
+        uint32_t m2 = perf_now();
+        uint32_t t5b = perf_now();
+        for (uint32_t i = 0; i < n; i++) __asm__ volatile("");
+        uint32_t t6 = perf_now();
+        sp[0] = keep;
+        uint32_t loop = (t6 - t5b);
+        printf("MMIO main_ram (heap) rd %lu, wr %lu; sram .bss at %p, heap at %p\n",
+               (unsigned long)((m1 - m0 - loop)/n), (unsigned long)((m2 - m1 - loop)/n),
+               (void *)ram, (void *)heap);
+        printf("MMIO cycles/access: csr rd %lu, csr wr %lu, sp rd %lu, sp wr %lu, ram rd %lu (loop %lu/%lu, acc %lx)\n",
+               (unsigned long)((t1 - t0 - loop)/n), (unsigned long)((t2 - t1 - loop)/n),
+               (unsigned long)((t3 - t2 - loop)/n), (unsigned long)((t4 - t3 - loop)/n),
+               (unsigned long)((t5 - t4 - loop)/n), (unsigned long)loop, (unsigned long)n,
+               (unsigned long)acc);
     } else if (strcmp(token, "seq") == 0) {
         if (strncmp(str, "on", 2) == 0)
             infer_seq(1);

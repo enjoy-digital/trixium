@@ -159,25 +159,27 @@ void perf_exit(enum perf_op op)
 
 int tprof_armed, tprof_active;
 static uint32_t *tprof_buf;
-static int tprof_n, tprof_cap; // Words used / word capacity (4 words per event).
+static int tprof_n, tprof_cap; // Words used / word capacity (5 words per event).
 static uint32_t tprof_last_dc;
 
 void tprof_setbuf(void *p, int max_events)
 {
     tprof_buf = (uint32_t *)p;
-    tprof_cap = max_events*4;
+    tprof_cap = max_events*5;
 }
 
 void tprof_event(uint32_t tag)
 {
-    if (!tprof_active || !tprof_buf || tprof_n > tprof_cap - 4)
+    if (!tprof_active || !tprof_buf || tprof_n > tprof_cap - 5)
         return;
     tprof_buf[tprof_n++] = tag;
     tprof_buf[tprof_n++] = perf_now();
 #ifdef CSR_TRIXIUM_ENGINE_CSR_CYC_ENG_ADDR
     tprof_buf[tprof_n++] = trixium_engine_csr_cyc_eng_read();
     tprof_buf[tprof_n++] = trixium_engine_csr_cyc_vec_read();
+    tprof_buf[tprof_n++] = trixium_engine_csr_cyc_both_read();
 #else
+    tprof_buf[tprof_n++] = 0;
     tprof_buf[tprof_n++] = 0;
     tprof_buf[tprof_n++] = 0;
 #endif
@@ -211,12 +213,13 @@ void tprof_dcount(uint32_t st)
 
 void tprof_dump(void)
 {
-    printf("TPROF %d events (cap %d)%s\n", tprof_n/4, tprof_cap/4,
-           tprof_n > tprof_cap - 4 ? " TRUNCATED" : "");
-    for (int i = 0; i < tprof_n; i += 4)
-        printf("TP %08lx %lu %lu %lu\n",
+    printf("TPROF %d events (cap %d)%s\n", tprof_n/5, tprof_cap/5,
+           tprof_n > tprof_cap - 5 ? " TRUNCATED" : "");
+    for (int i = 0; i < tprof_n; i += 5)
+        printf("TP %08lx %lu %lu %lu %lu\n",
                (unsigned long)tprof_buf[i],   (unsigned long)tprof_buf[i+1],
-               (unsigned long)tprof_buf[i+2], (unsigned long)tprof_buf[i+3]);
+               (unsigned long)tprof_buf[i+2], (unsigned long)tprof_buf[i+3],
+               (unsigned long)tprof_buf[i+4]);
 }
 
 /* Print */

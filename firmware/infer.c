@@ -1595,7 +1595,7 @@ int infer_init(void)
         }
     }
     norm16_cache_build();
-    tprof_setbuf(halloc(6000*16), 6000); // 96 KB trace buffer (main_ram, not sram .bss).
+    tprof_setbuf(halloc(6000*20), 6000); // 120 KB trace buffer (main_ram, not sram .bss).
     {
         // kv_scores_br's R: depends only on head_dim.
         uint64_t bound = (uint64_t)(head_dim/32)*32u*127u*127u*1024u << 12;
