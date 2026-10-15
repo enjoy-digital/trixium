@@ -14,12 +14,14 @@ the engine/vector overlap counters), normalizes it per layer and extrapolates th
     token = sum(per-layer phase x the model's layers) + embed + LM head (its chunk lists x the
             vocabulary ratio) + the rest of the measured decode token outside those phases
 
-and compares it with the XCU1525 v30b board measurements (doc/simulation.md).
+and compares it with the board's measurements (doc/simulation.md): the XCU1525 v30b, or the
+YPCB-00338's 8-channel trit5 build (--board ypcb).
 
 W/P: W is the engine-busy time (weight streams, and the DeltaNet state / K/V streams of ops 5/6),
 P the rest (CPU, vector unit, scratchpad units with the engine idle), from the overlap counters.
-Stream efficiency: weight bytes over the DDR4 peak (4 controllers x 64 B per ddr clock = 384 B per
-sys clock at 187.5:125 MHz) for the time they take; per phase where a phase is one weight stream.
+Stream efficiency: weight bytes over the board's DRAM peak (XCU1525: 4 controllers x 64 B per ddr
+clock = 384 B per sys clock at 187.5:125 MHz; YPCB: 2 x 64 B at 133.33:125 MHz, 136.5 B) for the
+time they take; per phase where a phase is one weight stream.
 """
 
 import os
@@ -45,6 +47,20 @@ BOARD_V30B = {
                       "outproj": 1.75e6}),
     "8B"   : dict(cycles=SYS_CLK_FREQ/14.9, weights=2.010e9),
     "1.7B" : dict(cycles=SYS_CLK_FREQ/53.8, weights=0.457e9),
+}
+
+# YPCB-00338, build/ypcb_t5n8c (8 channels, trit5, sys 125 MHz, DDR3-1066; doc/boards.md): the
+# decode cycles per token of `bench`, 3-token prompt.
+BOARD_YPCB_T5N8 = {
+    "8B"   : dict(cycles=15973678),
+    "1.7B" : dict(cycles=3890287),
+}
+
+# Per board: DRAM peak bytes per sys clock, its label, the reference build and its measurements.
+BOARDS = {
+    "xcu1525" : dict(peak=PEAK_BYTES, label="DDR4 peak, 384 B/clock", ref="v30b", meas=BOARD_V30B),
+    "ypcb"    : dict(peak=2*64*(400/3)/125, label="DDR3 peak, 136.5 B/clock", ref="ypcb_t5n8c",
+                     meas=BOARD_YPCB_T5N8),
 }
 
 # Which per-layer phases a layer kind has (hybprof), and the weight roles each stream phase reads.
@@ -122,7 +138,7 @@ def stream_bytes(image):
 
 # Predict -------------------------------------------------------------------------------------------
 
-def predict(profile, image):
+def predict(profile, image, board="xcu1525"):
     """Per-layer cycles of the slice run and the full-model prediction (a decode token) -> dict."""
     model     = SLICE_OF.get(_slice_name(image))
     if model is None or "cycles_fwd" not in profile:
@@ -145,6 +161,7 @@ def predict(profile, image):
     # The decode token: measured when the bench decoded (bench >= 2), else a forward.
     dec       = ph["decode_cycles"]/ph["decode_tokens"] if ph.get("decode_tokens") else fwd
     res       = dict(model=model["model"], fwd=fwd, dec=dec, layers={}, phases={}, eff={})
+    peak      = BOARDS[board]["peak"]
 
     hyb = profile.get("hybprof")
     if hyb:
@@ -173,7 +190,7 @@ def predict(profile, image):
         for p, rs in STREAMS.items():
             b = sum(roles.get(r, 0) for r in rs)
             if b and cyc.get(p):
-                res["eff"][p] = b/(cyc[p]*PEAK_BYTES)
+                res["eff"][p] = b/(cyc[p]*peak)
     else:
         # Qwen3: the LM head (one argmax op over every row: scales with them) and the embedding
         # per call from the op table, the rest of the decode token per layer.
@@ -186,7 +203,7 @@ def predict(profile, image):
         res["layers"] = {"layer": per, "head": head}
         res["phases"] = {"layers": per*n_layer, "embed": embed, "logits": head*vocab}
         if roles.get("lm_head") and head:
-            res["eff"]["logits"] = roles["lm_head"]/(head*PEAK_BYTES)
+            res["eff"]["logits"] = roles["lm_head"]/(head*peak)
     res["predicted"] = sum(res["phases"].values())
 
     # Weight bytes extrapolated like the cycles; W/P from the overlap counters (the engine-busy
@@ -198,9 +215,9 @@ def predict(profile, image):
         res["w"] = ovl["eng"]/100*dec
         res["p"] = dec - res["w"]
         slice_b  = layer_b + roles.get("lm_head", 0)*(heads/nf)
-        eff      = slice_b*nf/(ovl["eng"]/100*ovl["total"]*PEAK_BYTES)
+        eff      = slice_b*nf/(ovl["eng"]/100*ovl["total"]*peak)
         res["eff"]["forward (W)"] = eff
-        res["w_full"] = res["weights"]/(eff*PEAK_BYTES)
+        res["w_full"] = res["weights"]/(eff*peak)
         res["p_full"] = res["predicted"] - res["w_full"]
     return res
 
@@ -216,27 +233,28 @@ def _m(v):
 def _err(sim, board):
     return f"{100*(sim - board)/board:+6.1f}%"
 
-def report(profile, image, out=print):
+def report(profile, image, out=print, board="xcu1525"):
     """Print the prediction and the board comparison; returns the prediction dict (or None)."""
-    res = predict(profile, image)
+    res = predict(profile, image, board)
     if res is None:
         out("calibration: not a shape-true slice image (model/configs.py SLICE_OF) or no BENCH line")
         return None
-    board = BOARD_V30B.get(res["model"], {})
+    b     = BOARDS[board]
+    board = b["meas"].get(res["model"], {})
     out(f"slice: {res['fwd']} cycles/fwd, {res['dec']:.0f} cycles/decode token; per layer: " +
         ", ".join(f"{k} {v:.0f}" for k, v in res["layers"].items()))
     if "w" in res:
         out(f"slice W/P: W (engine busy) {res['w']:.0f} ({100*res['w']/res['dec']:.0f}%), "
             f"P {res['p']:.0f} cycles/token")
     if res["eff"]:
-        out("stream efficiency (of the DDR4 peak, 384 B/clock): " +
+        out(f"stream efficiency (of the {b['label']}): " +
             ", ".join(f"{k} {100*v:.0f}%" for k, v in res["eff"].items()))
     out(f"predicted {res['model']} (board, 125 MHz): {res['predicted']/1e6:.2f} M cycles/token = "
         f"{SYS_CLK_FREQ/res['predicted']:.2f} tok/s, {res['weights']/1e9:.3f} GB/token" +
         (f"; W {res['w_full']/1e6:.2f} M, P {res['p_full']/1e6:.2f} M" if "w_full" in res else ""))
     if not board:
         return res
-    out(f"board v30b: {board['cycles']/1e6:.2f} M cycles/token = {SYS_CLK_FREQ/board['cycles']:.2f} tok/s "
+    out(f"board {b['ref']}: {board['cycles']/1e6:.2f} M cycles/token = {SYS_CLK_FREQ/board['cycles']:.2f} tok/s "
         f"(prediction {_err(res['predicted'], board['cycles'])})")
     if "layers" in res["phases"]:
         # Qwen3: the board's per layer, its token less the predicted head and embedding.
@@ -262,9 +280,10 @@ def main():
     parser = argparse.ArgumentParser(description="Board prediction from a board-timing bench log.")
     parser.add_argument("log",   help="bench log (build/sim_xcu1525_bt_<image>/bench/bench-as-built.log).")
     parser.add_argument("image", help="The slice image the simulation was built with.")
+    parser.add_argument("--board", default="xcu1525", choices=sorted(BOARDS), help="The board simulated.")
     args = parser.parse_args()
     with open(args.log, encoding="utf-8") as f:
-        report(parse_bench(f.read()), args.image)
+        report(parse_bench(f.read()), args.image, board=args.board)
 
 if __name__ == "__main__":
     main()

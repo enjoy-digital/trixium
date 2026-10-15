@@ -63,6 +63,7 @@ from litedram.modules import MT40A512M8
 from litedram.phy.model import SDRAMPHYModel
 
 from trixium_ypcb import YPCBDDR3, DDR3_CL, DDR3_CWL, ddr_controller_settings
+from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS
 
 from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
@@ -644,9 +645,10 @@ BOARDS = {
     # The FK33: HBM channels, the engine/sequencer/vector unit only (the Qwen3 path).
     "fk33": dict(mem="hbm",
         cpu_type="vexiiriscv", icache_kb=32, vexii_extra="--with-rvZcbm"),
-    # The YPCB: two DDR3 controllers, the FK33's units and CPU (the Qwen3 path).
+    # The YPCB: two DDR3 controllers, the FK33's units (the Qwen3 path), the board target's CPU
+    # (caches, branch prediction, Zbb: the per-op CPU work between the lists is board-true).
     "ypcb": dict(mem="ddr3", n_memctrl=2,
-        cpu_type="vexiiriscv", icache_kb=32, vexii_extra="--with-rvZcbm"),
+        cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS),
 }
 
 # The image each board's simulation bakes in by default (--image).
@@ -753,6 +755,7 @@ def main():
     parser.add_argument("--build",          action="store_true",                                   help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
     parser.add_argument("--run",            action="store_true",                                   help="Run the built simulation (console on stdin/stdout).")
     parser.add_argument("--firmware",       action="store_true",                                   help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525).")
+    parser.add_argument("--tprof",          action="store_true",                                   help="Token trace of a bench token and where the engine sits idle (software/lab/tprof.py).")
     parser.add_argument("--gate",           action="store_true",                                   help="Traced generation compared with the Python mirror.")
     parser.add_argument("--bench",          action="store_true",                                   help="Cycles per forward with --bench-toggle off, then on (none: one run, W/P split and the board prediction).")
     parser.add_argument("--bench-toggle",   default=None,                                          help="--bench: console toggle to A/B (resident, silu, dnstream, none; default: resident, none with --board-timing).")
@@ -769,7 +772,7 @@ def main():
     parser.add_argument("--gate-pre",       default="",                                            help="--gate: console commands before the traced generation, ';'-separated (e.g. 'gen 2 5 6 7;engreset').")
     parser.add_argument("--random-init",    default=None, type=int, metavar="SEED",               help="--build: never-reset registers start at random values from SEED (build/sim_<board>_ri<SEED>; software/lab/randinit.py).")
     args = parser.parse_args()
-    if not (args.build or args.run or args.firmware or args.gate or args.bench):
+    if not (args.build or args.run or args.firmware or args.gate or args.bench or args.tprof):
         parser.error("nothing to do: --build, --run, --firmware, --gate or --bench.")
 
     # Reproducible builds: the generated sources follow set/dict orders, hence the hash seed.
@@ -826,9 +829,14 @@ def main():
             pre=[c.strip() for c in args.gate_pre.split(";") if c.strip()])
         if rc:
             sys.exit(rc)
+    if args.tprof:
+        rc = simgate.tprof(gateware_dir, os.path.join(out_dir, "tprof"))
+        if rc or not args.bench:
+            sys.exit(rc)
     if args.bench:
         sys.exit(simgate.bench(gateware_dir, os.path.join(out_dir, "bench"),
-            toggle=args.bench_toggle, tokens=args.bench_tokens, image=args.image))
+            toggle=args.bench_toggle, tokens=args.bench_tokens, image=args.image,
+            board=args.board))
 
 if __name__ == "__main__":
     main()

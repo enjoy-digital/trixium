@@ -155,7 +155,7 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
 
 PROFILE_LINES = r"^(resprof|siluprof|listprof|hybprof|attnprof|floor|dnprof|dnhw|quant8|norm_i32|embed|lmhead|overlap|total \(sum)"
 
-def bench(gateware_dir, out_dir, toggle="resident", tokens=2, image=None):
+def bench(gateware_dir, out_dir, toggle="resident", tokens=2, image=None, board="xcu1525"):
     """A/B a console toggle on cycles/forward; returns 0 when both runs reported.
 
     toggle "none": one run as built, then the W/P split and, for a shape-true slice image (a
@@ -192,10 +192,32 @@ def bench(gateware_dir, out_dir, toggle="resident", tokens=2, image=None):
         if image is not None:
             from software.lab import simcal
             with open(os.path.join(out_dir, "bench-as-built.log"), encoding="utf-8") as f:
-                simcal.report(simcal.parse_bench(f.read()), image)
+                simcal.report(simcal.parse_bench(f.read()), image, board=board)
         return 0
     off, on = results.get("off"), results.get("on")
     if not (off and on):
         return 1
     print(f"cycles/forward: {toggle} off {off}, on {on} ({off/on:.3f}x, {100*(on - off)/off:+.1f}%)")
     return 0
+
+# Token trace --------------------------------------------------------------------------------------
+
+def tprof(gateware_dir, out_dir, token=2, tokens=3):
+    """The token trace of generated token #token of a bench, and its engine-idle breakdown
+    (software/lab/tprof.py); returns 0 when a trace came back."""
+    from software.lab import tprof as tp
+    child = spawn(gateware_dir, out_dir)
+    try:
+        boot(child)
+        child.expect(PROMPT)
+        command(child, f"tprof arm {token}")
+        command(child, f"bench {tokens}", timeout=2*TIMEOUT)
+        text = command(child, "tprof dump", timeout=900)
+    finally:
+        child.sendline("")
+        child.close(force=True)
+    with open(os.path.join(out_dir, "tprof.log"), "w", encoding="utf-8") as f:
+        f.write(text)
+    res = tp.analyze(tp.parse(text))
+    tp.report(res)
+    return 0 if res["total"][0] else 1
