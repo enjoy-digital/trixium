@@ -871,9 +871,10 @@ class MatVecEngine(LiteXModule):
 
         # Result absmax tracker, write-stage (norm_i32's shift argument; reset on command
         # accept). Runs over every written lane so merged/wide retirement is covered.
-        # Per-lane |value| is registered before the max tree (timing). The tracker lags the
-        # write by two cycles; every reader (CSR, sequencer k(absmax) at DISPATCH) trails
-        # done by more.
+        # Per-lane |value| is registered before the max tree and the tree's result before the
+        # compare (timing: the tree and the 32-bit compare were one 24-level cone). The tracker
+        # lags the write by three cycles; done waits for it (absmax_busy), so every reader (CSR,
+        # sequencer k(absmax) at DISPATCH) sees the op's final value.
         lane_abs = []
         for l in range(8):
             ls = Signal((32, True), name=f"labs_s{l}")
@@ -894,14 +895,22 @@ class MatVecEngine(LiteXModule):
                     nxt.append(m)
                 sigs = nxt
             return sigs[0]
-        wr_absmax = _maxtree(lane_abs)
+        wr_absmax_c = _maxtree(lane_abs)
+        wr_absmax   = Signal(32, reset_less=True)
+        am_w1, am_w2 = Signal(), Signal() # A write's |value| in the lane / tree registers.
+        absmax_busy  = Signal()
         self.sync += [
+            # Zeroed with the tracker: a value in flight belongs to the op before the reset.
+            If(tracker_reset, wr_absmax.eq(0)).Else(wr_absmax.eq(wr_absmax_c)),
+            am_w1.eq(eng_gw_we != 0),
+            am_w2.eq(am_w1),
             If(tracker_reset,
                 self.absmax.eq(0),
             ).Elif(~fetch_mode & ~dn_mode & ~at_mode & (wr_absmax > self.absmax),
                 self.absmax.eq(wr_absmax),
             ),
         ]
+        self.comb += absmax_busy.eq(am_w1 | am_w2)
 
         # The engine's R-port address: the fill/STORE counter, or a stream unit's registered
         # request while its op runs.
@@ -1231,7 +1240,7 @@ class MatVecEngine(LiteXModule):
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
                        Mux(axpy_mode, ax_total, mv_total)))))
                & ~gw_pending  # Queued writes must be in RAM before done.
-               & ~am_busy,
+               & ~am_busy & ~absmax_busy,
                 self.done.eq(1),
                 NextState("IDLE"),
             )
