@@ -14,7 +14,8 @@ channels/2 windows per controller. The DDR3 sits on HR banks (no ODELAY, a fly-b
 nine x8 chips): the PHY is LiteDRAM's K7DDRPHY with its CK phase shift (write leveling by CK
 phase) and the BIOS calibrates both controllers at boot (liblitedram's CK phase leveling,
 SDRAM_CONTROLLERS). The defaults are the shipping recipe: the Qwen3 path's units (engine,
-sequencer, vector unit; the Ternary-Bonsai 1.7B and 8B), DDR3-1066 in a 133.33 MHz ddr domain,
+sequencer, vector unit; the Ternary-Bonsai 1.7B and 8B) on eight engine channels with 5-trit
+weight codes (--trit5: images from trixium convert --board ypcb), DDR3-1066 in a 133.33 MHz ddr domain,
 sys 125 MHz (the clock this K480T design closes timing at), the FK33's CPU configuration. Design notes: doc/boards.md.
 
 From the repository root:
@@ -27,6 +28,7 @@ Vivado 2024.1 (--vivado-settings). A K480T route needs ~12 GB of RAM.
 
 import os
 import sys
+import argparse
 
 from migen import *
 
@@ -145,14 +147,14 @@ DDR_CSR_STRIDE = 0x2000
 DDR_MMCM_LOCS = ["MMCME2_ADV_X0Y2", "MMCME2_ADV_X0Y6"]
 
 class TriXiumYPCBSoC(SoCCore):
-    def __init__(self, sys_clk_freq=125e6, ddr_clk_freq=400e6/3, engine_channels=4,
+    def __init__(self, sys_clk_freq=125e6, ddr_clk_freq=400e6/3, engine_channels=8,
         main_ram_size  = 0x1000_0000,
         chan_stride    = None,
         chan_skew      = None,
         read_time      = 256,
         write_time     = 128,
         refresh_postponing = 1,
-        trit5          = False,
+        trit5          = True,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -315,12 +317,12 @@ def main():
     parser = LiteXArgumentParser(platform=ypcb_00338_1p1.Platform, description="TriXium on the Inspur YPCB-00338-1P1.")
     parser.add_target_argument("--sys-clk-freq",       default=125e6,    type=float,                          help="System clock frequency (CPU, TriXium core).")
     parser.add_target_argument("--ddr-clk-freq",       default=400e6/3,  type=float,                          help="DDR3 controller clock frequency (DDR3 rate = 8x: 133.33e6 = DDR3-1066).")
-    parser.add_target_argument("--engine-channels",    default=4,        type=int,                            help="Engine channels (multiple of 2).")
+    parser.add_target_argument("--engine-channels",    default=8,        type=int,                            help="Engine channels (multiple of 2).")
     parser.add_target_argument("--read-time",          default=256,      type=int,                            help="LiteDRAM read time (cycles before a pending write wins).")
     parser.add_target_argument("--write-time",         default=128,      type=int,                            help="LiteDRAM write time.")
     parser.add_target_argument("--refresh-postponing", default=1,        type=int,                            help="LiteDRAM refresh postponing (1-8).")
     parser.add_target_argument("--chan-stride",        default=None,     type=lambda x: int(x, 0),            help="Engine window stride (default: each controller above the weight base split evenly).")
-    parser.add_target_argument("--trit5",              action="store_true",                                   help="Unpackers for 5-trits-per-byte weights (convert --trit5 images).")
+    parser.add_target_argument("--trit5",              action=argparse.BooleanOptionalAction, default=True,  help="Unpackers for 5-trits-per-byte weights (the default; --no-trit5: 2-bit images, convert --board ypcb --no-trit5).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).

@@ -10,7 +10,7 @@
     trixium convert   models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf  # -> models/bons/bonsai-1p7b-n16.img
     trixium convert   models/8b/Ternary-Bonsai-8B-PQ2_0.gguf      # -> models/bons/bonsai-8b-n16.img
     trixium convert   --board xcu1525 models/27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf  # -> ...-n16-xcu1525.img
-    trixium convert   --board ypcb models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf   # -> ...-n4-ypcb.img
+    trixium convert   --board ypcb models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf   # -> ...-n8-ypcb.img (5-trit codes)
     trixium verify    models/bons/bonsai-1p7b-n16.img
     trixium tokenizer models/1.7b/tokenizer.json                 # -> models/1.7b/tokenizer.bin
     trixium deploy    xcu1525 --board xcu1525 --model 27b       # bitstream + boot + tokens + bench
@@ -43,8 +43,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # at 4 channels, 432 MB at 8), the last one short of its bank skew (64 KB / windows each).
 BOARD_SUFFIX = {"fk33": "", "xcu1525": "-xcu1525", "ypcb": "-ypcb"}
 
-# Engine channels of each board's bitstream (convert's default --channels).
-BOARD_CHANNELS = {"fk33": 16, "xcu1525": 16, "ypcb": 4}
+# Engine channels of each board's bitstream (convert's default --channels), and the boards whose
+# bitstream unpacks 5-trit codes (convert's default --trit5).
+BOARD_CHANNELS = {"fk33": 16, "xcu1525": 16, "ypcb": 8}
+BOARD_TRIT5    = {"fk33": False, "xcu1525": False, "ypcb": True}
 
 
 def board_windows(board, channels):
@@ -63,6 +65,8 @@ def cmd_convert(args):
     from model.convert import convert
     if args.channels is None:
         args.channels = BOARD_CHANNELS[args.board]
+    if args.trit5 is None:
+        args.trit5 = BOARD_TRIT5[args.board]
     chan_stride, window, window_reserve = board_windows(args.board, args.channels)
     suffix = BOARD_SUFFIX[args.board]
     out = args.out
@@ -205,14 +209,14 @@ def main(argv=None):
     # Convert.
     p = subparsers.add_parser("convert", help="GGUF -> BONS image (streams; ~13 s, ~2 GB for the 1.7B).")
     p.add_argument("gguf",                              help="Source GGUF.")
-    p.add_argument("--channels",  default=None, type=int, help="Engine channels of the bitstream (default: the board's, 16; ypcb: 4).")
+    p.add_argument("--channels",  default=None, type=int, help="Engine channels of the bitstream (default: the board's, 16; ypcb: 8).")
     p.add_argument("--board",     default="fk33",       choices=sorted(BOARD_SUFFIX), help="Target board's weight windows (default: fk33).")
     p.add_argument("--out",                             help="Image (default: models/bons/bonsai-<model>-n<channels>[-<board>].img).")
     p.add_argument("--tokenizer",                       help="tokenizer.json hashed into the image (default: next to the GGUF).")
     p.add_argument("--layers",    type=int,             help="Truncate to the first K layers.")
     p.add_argument("--check",     action="store_true",  help="Read two tensors back and compare.")
     p.add_argument("--no-emb16",  action="store_true",  help="Leave out the int16 embedding table (-622 MB, ~2.6%% slower per token).")
-    p.add_argument("--trit5",     action="store_true",  help="Ternary weights 5 trits per byte (bitstreams built with --trit5).")
+    p.add_argument("--trit5",     action=argparse.BooleanOptionalAction, default=None, help="Ternary weights 5 trits per byte (bitstreams built with --trit5; default: the board's, on for ypcb).")
     p.set_defaults(fn=cmd_convert)
 
     # Verify.

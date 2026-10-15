@@ -47,8 +47,8 @@ Images: models/bons/. The XCU1525's windows are 704 MB (1 GB stride): its 8B and
 its own (bonsai-<model>-n16-xcu1525.img, trixium convert --board xcu1525); its 1.7B
 image is the FK33's, byte-identical. The FK33's image must match the bitstream's channel count
 (bonsai-<model>-n<channels>.img, from the build's soc.h). The YPCB-00338's are its own
-(bonsai-<model>-n4-ypcb.img, trixium convert --board ypcb: four channels, two windows per DDR3
-controller).
+(bonsai-<model>-n<channels>-ypcb.img, trixium convert --board ypcb: eight channels with 5-trit
+codes by default, four windows per DDR3 controller).
 """
 
 import os
@@ -296,7 +296,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     if board == "xcu1525":
         image = f"bonsai-{model}-n16.img" if model == "1p7b" else f"bonsai-{model}-n16-xcu1525.img"
     elif board == "ypcb":
-        image = f"bonsai-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '4')}-ypcb.img"
+        image = f"bonsai-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '8')}-ypcb.img"
     else:
         image = f"bonsai-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '16')}.img"
     image = os.path.join(REPO, "models", "bons", image)
