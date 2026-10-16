@@ -11,8 +11,8 @@ signed-integer or FP32 quantization without floating-point IP or board memory ma
 
 ActivationScratchpad is the resident unit built on them over the shared scratchpad: per
 block it scans the FP32 absmax, selects e8, then rereads and packs the block into Q8; in
-requantize mode it instead rescales raw 1024-element int32 Hadamard blocks to a single
-whole-vector exponent. Its command (ACTIVATION_COMMAND) is the firmware's descriptor layout.
+requantize mode it instead rescales raw 1024- (or 512-) element int32 Hadamard blocks to a
+single whole-vector exponent. Its command (ACTIVATION_COMMAND) is the firmware's descriptor layout.
 """
 
 from migen import *
@@ -274,7 +274,9 @@ class ActivationScratchpad(LiteXModule):
     grants every read, returns it one cycle later and gates writes with gnt;
     no other owner may change these buffers while the command is active.
 
-    requantize selects raw 1024-element int32 Hadamard blocks instead of FP32.
+    requantize selects raw 1024-element int32 Hadamard blocks instead of FP32 (or 512-element
+    ones: the rotation's normalization is then 2**-4, not 2**-5 - the image folds the remaining
+    2**-0.5 into the rotated weights' scales).
     exponents/maxima then hold input signed int32 e8/uint32 raw absmax per block;
     result_exponent receives a single whole-vector signed int32 scale. All
     metadata is validated and cached before writes. Read-only input spans may
@@ -359,7 +361,8 @@ class ActivationScratchpad(LiteXModule):
                 (captured["blocks"] == 0) | (captured["src"][:5] != 0) |
                 (captured["dst"][:5] != 0) | (captured["exponents"][:5] != 0) |
                 (captured["protect_start"] > captured["protect_end"]) |
-                (rotation & ((captured["elements"] != 1024) | (captured["maxima"][:5] != 0) |
+                (rotation & (((captured["elements"] != 1024) & (captured["elements"] != 512)) |
+                             (captured["maxima"][:5] != 0) |
                              (captured["result_exponent"][:5] != 0)))),
             bounds_bad.eq((ends["src"] > scratchpad_size) | (ends["dst"] > scratchpad_size) |
                 (ends["exponents"] > scratchpad_size) |
@@ -425,7 +428,9 @@ class ActivationScratchpad(LiteXModule):
                 integer_quantize.sink.data[19*lane:19*(lane+1)].eq(raw[:19]),
             ]
         self.comb += [
-            metadata_candidate.eq(metadata_e + metadata_length - 12),
+            # int8 (7 magnitude bits) of the block's raw sums, normalized by 2**-5 (1024: 1/32)
+            # or 2**-4 (512).
+            metadata_candidate.eq(metadata_e + metadata_length - Mux(captured["elements"] == 512, 11, 12)),
             metadata_bad.eq((metadata_e < -127) | (metadata_e > 121) | (metadata_a > 131072)),
             cache_wr.adr.eq(block), cache_wr.dat_w.eq(Cat(metadata_e[:10], metadata_a[:18])),
             cache_wr.we.eq((state == META_CHECK) & ~metadata_bad & ~self.cancel),
@@ -460,7 +465,8 @@ class ActivationScratchpad(LiteXModule):
                                            ~self.cancel),
             integer_quantize.sink.first.eq(responses.dout[256]),
             integer_quantize.sink.last.eq(responses.dout[257]),
-            integer_quantize.sink.e8.eq(self.exponent - input_exponent + 5),
+            integer_quantize.sink.e8.eq(self.exponent - input_exponent +
+                                        Mux(captured["elements"] == 512, 4, 5)),
             response_pop.eq(Mux(rotation, integer_quantize.sink.valid & integer_quantize.sink.ready,
                                quantize.sink.valid & quantize.sink.ready)),
             responses.re.eq(response_pop),

@@ -30,7 +30,9 @@ from litex.soc.interconnect import stream
 class IntegerHadamard(LiteXModule):
     """One fixed-size block, natural Sylvester order, no normalization/rounding.
 
-    cmd.inverse=0 computes H*(sign*x); inverse=1 computes sign*(H*x).
+    cmd.inverse=0 computes H*(sign*x); inverse=1 computes sign*(H*x). cmd.half=1 transforms
+    a block of block_size/2 instead (the first words/2 words, one stage less: the Sylvester
+    sub-transform, e.g. 512-element blocks on a 1,024 kernel).
     sink carries ``lanes`` little-endian signed integers and one negate bit per
     lane (1 means sign=-1). last must mark exactly the final input word. Output
     integers have input_width + log2(block_size) + 1 bits: sign negation of the
@@ -64,7 +66,7 @@ class IntegerHadamard(LiteXModule):
         self.block_size, self.lanes, self.input_width = block_size, lanes, input_width
 
         # Streams.
-        self.cmd    = stream.Endpoint([("inverse", 1)])
+        self.cmd    = stream.Endpoint([("inverse", 1), ("half", 1)])
         self.sink   = stream.Endpoint([("data", lanes*input_width), ("negate", lanes)])
         self.source = stream.Endpoint([("data", lanes*width)])
 
@@ -81,6 +83,15 @@ class IntegerHadamard(LiteXModule):
         IDLE, LOAD, RUN, DRAIN, OUTPUT, FAILED, FINISH = range(7)
         state = Signal(3, reset=IDLE)
         inverse, bank = Signal(reset_less=True), Signal() # inverse: latched with the command.
+        half = Signal(reset_less=True)                     # (latched with the command)
+        last_word  = Signal(word_bits)                     # words (or words/2) - 1
+        last_pair  = Signal(max=max(2, words//2))          # pairs per stage - 1
+        last_stage = Signal(max=stages)
+        self.comb += [
+            last_word.eq(Mux(half, words//2 - 1, words - 1)),
+            last_pair.eq(Mux(half, max(words//4, 1) - 1, words//2 - 1)),
+            last_stage.eq(Mux(half, stages - 2, stages - 1)),
+        ]
         stage = Signal(max=stages)
         load_index = Signal(word_bits)
         pair = Signal(max=max(2, words//2))
@@ -111,10 +122,10 @@ class IntegerHadamard(LiteXModule):
             self.sink.ready.eq((state == LOAD) & ~self.cancel),
             self.source.valid.eq((state == OUTPUT) & output_valid & ~self.cancel),
             self.source.first.eq(output_index == 0),
-            self.source.last.eq(output_index == words - 1),
+            self.source.last.eq(output_index == last_word),
             self.busy.eq(state != IDLE),
             output_read.eq((state == OUTPUT) & (~output_valid | self.source.ready) &
-                           (issued < words) & ~self.cancel),
+                           (issued <= last_word) & ~self.cancel),
             sign_write.adr.eq(load_index), sign_write.dat_w.eq(self.sink.negate),
             sign_write.we.eq(self.sink.valid & self.sink.ready),
             sign_read.adr.eq(issued), sign_read.re.eq(output_read),
@@ -239,24 +250,26 @@ class IntegerHadamard(LiteXModule):
             ),
             Case(state, {
                 IDLE: If(self.cmd.valid & self.cmd.ready,
-                    inverse.eq(self.cmd.inverse), bank.eq(0), stage.eq(0), load_index.eq(0),
+                    # A half block needs two pairs of words (words >= 4); else ignored.
+                    inverse.eq(self.cmd.inverse), half.eq(self.cmd.half & (words >= 4)),
+                    bank.eq(0), stage.eq(0), load_index.eq(0),
                     pair.eq(0), calc_valid.eq(0), output_valid.eq(0), issued.eq(0),
                     self.error.eq(0), self.cancelled.eq(0), self.absmax.eq(0), state.eq(LOAD),
                 ),
                 LOAD: If(self.sink.valid & self.sink.ready,
-                    If(self.sink.last != (load_index == words - 1),
+                    If(self.sink.last != (load_index == last_word),
                         self.error.eq(1), state.eq(FAILED),
-                    ).Elif(load_index == words - 1,
+                    ).Elif(load_index == last_word,
                         state.eq(RUN),
                     ).Else(load_index.eq(load_index + 1)),
                 ),
                 RUN: [
                     calc_valid.eq(1), write_a.eq(read_a), write_b.eq(read_b),
-                    If(pair == words//2 - 1, state.eq(DRAIN)).Else(pair.eq(pair + 1)),
+                    If(pair == last_pair, state.eq(DRAIN)).Else(pair.eq(pair + 1)),
                 ],
                 DRAIN: [
                     calc_valid.eq(0), bank.eq(~bank), pair.eq(0),
-                    If(stage == stages - 1,
+                    If(stage == last_stage,
                         state.eq(OUTPUT),
                     ).Else(stage.eq(stage + 1), state.eq(RUN)),
                 ],
@@ -272,13 +285,14 @@ class IntegerHadamard(LiteXModule):
 # Hadamard Scratchpad ------------------------------------------------------------------------------
 
 HADAMARD_COMMAND = [("src", 24), ("signs", 24), ("dst", 24), ("stats", 24),
-                    ("blocks", 16), ("inverse", 1)]
+                    ("blocks", 16), ("inverse", 1), ("half", 1)]
 
 class HadamardScratchpad(LiteXModule):
     """Transform complete int8 blocks into raw signed int32 scratchpad vectors.
 
     All four byte bases are 32-byte aligned. Signs are packed low-bit first,
-    1=negate. stats receives one uint32 raw absmax per block, preserving unused
+    1=negate. half=1: blocks of block_size/2 (ABI 1.1; block_size >= 512, so a block's signs
+    stay whole beats), packed back to back like full blocks. stats receives one uint32 raw absmax per block, preserving unused
     lanes in its last beat. No normalization, exponent selection or quantization
     is performed. Output and rounded-up stats spans must not overlap each other
     or either input span; the complete command is validated before any access.
@@ -325,6 +339,7 @@ class HadamardScratchpad(LiteXModule):
         # Kernel.
         self.core = core = IntegerHadamard(block_size=block_size, lanes=lanes)
         L = lanes
+        half_ok = block_size >= 512 and block_size//L >= 4 # Else half=1 is a config error.
         wpb, wps = 32//L, 256//L      # core words per data beat, per sign beat
         bpw = L//8                    # output beats per core word
 
@@ -349,13 +364,28 @@ class HadamardScratchpad(LiteXModule):
         ends = {name: Signal(64) for name in ("src", "signs", "dst", "stats")}
         stats_bytes = Signal(64)
         config_bad, bounds_bad, overlap_bad = Signal(), Signal(), Signal()
+        # Per-block strides (bytes, beats) of the command being validated / the captured one.
+        cmd_bsz = Signal(max=block_size + 1)
+        half = captured["half"] if half_ok else C(0, 1)
+        src_beats  = Signal(max=block_size//32 + 1)   # src beats (core words when streamed)
+        sign_beats = Signal(max=nsb + 1)
+        dst_beats  = Signal(max=block_size//8 + 1)
+        last_in    = Signal(max=block_size//L)
+        self.comb += [
+            cmd_bsz.eq(Mux(self.cmd.half & half_ok, block_size//2, block_size)),
+            src_beats.eq(Mux(half, block_size//64, block_size//32)),
+            sign_beats.eq(Mux(half, nsb//2, nsb)),
+            dst_beats.eq(Mux(half, block_size//16, block_size//8)),
+            last_in.eq(Mux(half, block_size//(2*L) - 1, block_size//L - 1)),
+        ]
         self.comb += [
             stats_bytes.eq(((self.cmd.blocks + C(7, 17)) >> 3) << 5),
-            ends["src"].eq(self.cmd.src + self.cmd.blocks*block_size),
-            ends["signs"].eq(self.cmd.signs + self.cmd.blocks*(block_size//8)),
-            ends["dst"].eq(self.cmd.dst + self.cmd.blocks*(block_size*4)),
+            ends["src"].eq(self.cmd.src + self.cmd.blocks*cmd_bsz),
+            ends["signs"].eq(self.cmd.signs + self.cmd.blocks*(cmd_bsz >> 3)),
+            ends["dst"].eq(self.cmd.dst + self.cmd.blocks*(cmd_bsz << 2)),
             ends["stats"].eq(self.cmd.stats + stats_bytes),
             config_bad.eq((self.cmd.blocks == 0) | (self.cmd.src[:5] != 0) |
+                          (self.cmd.half & (not half_ok)) |
                           (self.cmd.signs[:5] != 0) | (self.cmd.dst[:5] != 0) |
                           (self.cmd.stats[:5] != 0)),
             bounds_bad.eq((ends["src"] > scratchpad_size) | (ends["signs"] > scratchpad_size) |
@@ -374,25 +404,26 @@ class HadamardScratchpad(LiteXModule):
             core.cancel.eq(self.cancel | (state == FAILED)),
             core.cmd.valid.eq((state == START) & ~self.cancel),
             core.cmd.inverse.eq(captured["inverse"]),
+            core.cmd.half.eq(half),
             core.source.ready.eq((state == OUTPUT) & self.sp_wr_gnt & (out_sub == bpw - 1) &
                                  ~self.cancel),
             self.sp_wr_req.eq(((state == OUTPUT) & core.source.valid | (state == STATS)) &
                               ~self.cancel),
             self.sp_wr_adr.eq(Mux(state == STATS,
                 (captured["stats"] >> 5) + (block >> 3),
-                (captured["dst"] >> 5) + block*(block_size//8) + out_word)),
+                (captured["dst"] >> 5) + block*dst_beats + out_word)),
             self.sp_wr_we.eq(Mux(state == STATS, C(1, 8) << block[:3], 0xff)),
         ]
         if not streamed:
             self.comb += [
                 core.sink.valid.eq((state == SEND) & ~self.cancel),
                 core.sink.data.eq(inputs[:8*L]), core.sink.negate.eq(signs[:L]),
-                core.sink.last.eq(in_word == block_size//L - 1),
+                core.sink.last.eq(in_word == last_in),
                 self.sp_rd_req.eq(((state == SIGN_REQ) | (state == DATA_REQ)) & ~self.cancel),
                 self.sp_rd_adr.eq(Mux(state == SIGN_REQ,
-                    (captured["signs"] >> 5) + block*(block_size//256) +
+                    (captured["signs"] >> 5) + block*sign_beats +
                     (in_word >> (wps.bit_length() - 1)),
-                    (captured["src"] >> 5) + block*(block_size//32) +
+                    (captured["src"] >> 5) + block*src_beats +
                     (in_word >> (wpb.bit_length() - 1)))),
             ]
         else:
@@ -406,11 +437,11 @@ class HadamardScratchpad(LiteXModule):
                 core.sink.data.eq(self.sp_rd_dat[:8*L]),
                 core.sink.negate.eq(sign_shift[:L]),
                 core.sink.last.eq(data_last),
-                self.sp_rd_req.eq((((state == SIGNS) & (issue < nsb)) |
-                                   ((state == STREAM) & (issue < words))) & ~self.cancel),
+                self.sp_rd_req.eq((((state == SIGNS) & (issue < sign_beats)) |
+                                   ((state == STREAM) & (issue <= last_in))) & ~self.cancel),
                 self.sp_rd_adr.eq(Mux(state == SIGNS,
-                    (captured["signs"] >> 5) + block*nsb + issue,
-                    (captured["src"] >> 5) + block*words + issue)),
+                    (captured["signs"] >> 5) + block*sign_beats + issue,
+                    (captured["src"] >> 5) + block*src_beats + issue)),
             ]
             self.sync += [
                 If(self.cancel | (state == FAILED),
@@ -419,12 +450,17 @@ class HadamardScratchpad(LiteXModule):
                     sign_pend.eq(self.sp_rd_req & (state == SIGNS)),
                     data_pend.eq(self.sp_rd_req & (state == STREAM)),
                 ),
-                If(self.sp_rd_req, data_last.eq(issue == words - 1)),
+                If(self.sp_rd_req, data_last.eq(issue == last_in)),
                 # Sign beats arrive in order: shift each in from the top, so after nsb beats
                 # beat 0 sits at the bottom; each accepted data word then consumes L bits.
+                # A half block's nsb/2 beats shift in at the middle instead.
                 If(sign_pend,
-                    sign_shift.eq(Cat(sign_shift[256:], self.sp_rd_dat) if nsb > 1 else
-                                  self.sp_rd_dat),
+                    If(half,
+                        sign_shift.eq(Cat(sign_shift[256:block_size//2], self.sp_rd_dat,
+                                          sign_shift[block_size//2:])),
+                    ).Else(
+                        sign_shift.eq(Cat(sign_shift[256:], self.sp_rd_dat) if nsb > 1 else
+                                      self.sp_rd_dat)),
                 ).Elif(core.sink.valid & core.sink.ready,
                     sign_shift.eq(sign_shift >> L)),
             ]
@@ -474,7 +510,7 @@ class HadamardScratchpad(LiteXModule):
                 DATA_CAP: [inputs.eq(self.sp_rd_dat), state.eq(SEND)],
                 SEND: If(core.sink.ready,
                     inputs.eq(inputs >> 8*L), signs.eq(signs >> L),
-                    If(in_word == block_size//L - 1, state.eq(OUTPUT)).Else(
+                    If(in_word == last_in, state.eq(OUTPUT)).Else(
                         in_word.eq(in_word + 1),
                         If((in_word & (wps - 1)) == wps - 1, state.eq(SIGN_REQ)
                         ).Elif((in_word & (wpb - 1)) == wpb - 1, state.eq(DATA_REQ)),

@@ -440,17 +440,17 @@ FIELDS = dict(src=0x1000, dst=0xc000, exponents=0x400, maxima=0x440,
 SENTINEL = pack([0xdeadbeef]*8, 32)
 
 
-def prepare(dut, arrays, exponents, maxima=None):
+def prepare(dut, arrays, exponents, maxima=None, n=1024):
     for index, array in enumerate(arrays):
-        assert len(array) == 1024
-        for beat in range(128):
-            yield dut.sp.mem[FIELDS['src']//32 + index*128 + beat].eq(pack(array[beat*8:beat*8+8], 32))
+        assert len(array) == n
+        for beat in range(n//8):
+            yield dut.sp.mem[FIELDS['src']//32 + index*(n//8) + beat].eq(pack(array[beat*8:beat*8+8], 32))
     if maxima is None:
         maxima = [max(map(abs, array)) for array in arrays]
     for name, values in (('exponents', exponents), ('maxima', maxima)):
         for start in range(0, len(values), 8):
             yield dut.sp.mem[FIELDS[name]//32 + start//8].eq(pack(values[start:start+8], 32))
-    for addr in (FIELDS['result_exponent'], FIELDS['dst'] - 32, FIELDS['dst'] + len(arrays)*1024):
+    for addr in (FIELDS['result_exponent'], FIELDS['dst'] - 32, FIELDS['dst'] + len(arrays)*n):
         yield dut.sp.mem[addr//32].eq(SENTINEL)
 
 
@@ -460,9 +460,10 @@ def command(dut, block_count, **changes):
     yield from submit(dut, **fields)
 
 
-def verify(dut, arrays, exponents, stalls=True):
-    yield from prepare(dut, arrays, exponents)
-    yield from command(dut, len(arrays))
+def verify(dut, arrays, exponents, stalls=True, n=1024):
+    # n: elements per block, 1024 (normalization 2**-5) or 512 (2**-4, quant ABI 1.2).
+    yield from prepare(dut, arrays, exponents, n=n)
+    yield from command(dut, len(arrays), elements=n)
     rng, held = random.Random(527), None
     for cycle in range(len(arrays)*1000 + 100):
         yield dut.grant.eq(not stalls or (cycle % 71 not in range(11, 41) and rng.randrange(3) != 0))
@@ -481,7 +482,8 @@ def verify(dut, arrays, exponents, stalls=True):
         raise AssertionError('post-rotation requantization did not complete')
     # This oracle materializes the exact dequantized FP32 values, chooses a
     # whole-vector floating-point absmax and runs the independent FP32 oracle.
-    words = [bits(math.ldexp(value, exponent - 5)) for array, exponent in zip(arrays, exponents) for value in array]
+    norm = {1024: 5, 512: 4}[n]
+    words = [bits(math.ldexp(value, exponent - norm)) for array, exponent in zip(arrays, exponents) for value in array]
     expected_bytes, exponent = reference(words)
     for beat in range(len(words)//32):
         assert (yield dut.sp.mem[FIELDS['dst']//32 + beat]) == int.from_bytes(expected_bytes[32*beat:32*(beat+1)], 'little')
@@ -490,9 +492,9 @@ def verify(dut, arrays, exponents, stalls=True):
     assert result >> 32 == SENTINEL >> 32
     assert (yield dut.unit.exponent) == exponent
     assert (yield dut.unit.blocks_done) == len(arrays)
-    assert (yield dut.unit.read_beats) == len(arrays)*130
-    assert (yield dut.unit.output_beats) == len(arrays)*32
-    for addr in (FIELDS['dst'] - 32, FIELDS['dst'] + len(arrays)*1024):
+    assert (yield dut.unit.read_beats) == len(arrays)*(n//8 + 2)
+    assert (yield dut.unit.output_beats) == len(arrays)*(n//32)
+    for addr in (FIELDS['dst'] - 32, FIELDS['dst'] + len(arrays)*n):
         assert (yield dut.sp.mem[addr//32]) == SENTINEL
     yield
 
@@ -510,6 +512,21 @@ def test_requantization_global_scale_negative_ties_nine_blocks_and_zero_reuse():
         yield from verify(dut, [[0]*1024]*2, [-127, 121])
         yield from verify(dut, [[1, -1, 2, -2, 3, -3, 63, -63]*128], [-121], stalls=False)
         yield from verify(dut, [[4095, -4095]*512], [121], stalls=False)
+    run_tb(dut, run())
+
+
+def test_requantization_of_512_element_blocks():
+    """Blocks of 512 (the Bonsai 2 2B/4B's Hadamard block on the 1,024 unit's half mode): the
+    rotation's 2**-4 normalization, mixed exponents and a zero block."""
+    dut = QuantSP(size=65536)
+    rng = random.Random(512)
+    arrays = [[rng.randrange(-65000, 65001) for _ in range(512)] for _ in range(5)]
+    arrays[1][7] = 65024
+    exponents = [-30, -12, -11, 0, 7]
+    def run():
+        yield from verify(dut, arrays, exponents, n=512)
+        yield from verify(dut, [[0]*512]*3, [-127, 0, 121], n=512)
+        yield from verify(dut, [[1, -1, 2, -2, 3, -3, 63, -63]*64], [-121], stalls=False, n=512)
     run_tb(dut, run())
 
 
@@ -647,7 +664,7 @@ def test_requantization_dispatch_without_hadamard_and_completion_publication(fai
     dut.specials += mem, port
     dut.comb += [port.adr.eq(seq.sp_adr), seq.sp_dat.eq(port.dat_r)]
     def run():
-        assert (yield seq.activation_quantize_abi.status) == 0x10001
+        assert (yield seq.activation_quantize_abi.status) == 0x10002
         yield from write(seq.base, 0)
         yield from write(seq.count, 1)
         yield from write(seq.start, 1)

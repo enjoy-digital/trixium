@@ -54,13 +54,15 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
           w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE).
   vec:    w1 = pc;  w2..w9 = args 0..7.
   had:    Optional unit 3, always serialized; w0 exactly 3, w1 src, w2 signs,
-          w3 dst, w4 block count, w5 stats, w6 inverse (0/1), w7..w15 zero.
+          w3 dst, w4 block count, w5 stats, w6 inverse (bit 0) | half blocks (bit 1, ABI 1.1),
+          w7..w15 zero.
           See doc/units.md for bounds, ownership and raw numerics.
   quant:  Optional unit 4, always serialized; w0 exactly 4, w1 FP32 src,
           w2 Q8 dst, w3 exponent array, w4 elements/block, w5 blocks, w6..w15 zero.
   requant: Unit 5 (quant ABI >=1.1), serialized; w0 exactly 5, w1 raw int32 src,
            w2 Q8 dst, w3 input exponent array, w4 raw absmax array, w5 result
-           exponent, w6 blocks of 1024, w7..w15 zero. See doc/units.md.
+           exponent, w6 blocks of 1024 (bits 15:0) | blocks of 512 (bit 16, quant ABI 1.2),
+           w7..w15 zero. See doc/units.md.
   restore: Optional unit 8, serialized; w0 exactly 8, w1 int32 src, w2 FP32 dst,
            w3 resident exponent beat, w4 elements, w5 signed adjustment (R-B),
            w6..w15 zero. See doc/units.md.
@@ -136,7 +138,7 @@ class Sequencer(LiteXModule):
             self.hadamard_cmd    = stream.Endpoint(HADAMARD_COMMAND)
             self.hadamard_done   = Signal()
             self.hadamard_failed = Signal(8)
-            self.hadamard_abi    = CSRStatus(32, reset=0x00010000, description="ABI version (16.16).")
+            self.hadamard_abi    = CSRStatus(32, reset=0x00010001, description="ABI version (16.16).")
             self.hadamard_error  = CSRStatus(32, description=
                 "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
                 "descriptor, bit2 output overlaps descriptor list, bits8..15 rotation-unit "
@@ -146,7 +148,7 @@ class Sequencer(LiteXModule):
             self.activation_quantize_cmd    = stream.Endpoint(ACTIVATION_COMMAND)
             self.activation_quantize_done   = Signal()
             self.activation_quantize_failed = Signal(8)
-            self.activation_quantize_abi    = CSRStatus(32, reset=0x00010001, description="ABI version (16.16).")
+            self.activation_quantize_abi    = CSRStatus(32, reset=0x00010002, description="ABI version (16.16).")
             self.activation_quantize_error  = CSRStatus(32, description=
                 "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
                 "descriptor, bits8..15 conversion-unit error (bit14 protects descriptor list; "
@@ -314,11 +316,11 @@ class Sequencer(LiteXModule):
             dst_end, stats_end = Signal(64), Signal(64)
             malformed, list_overlap = Signal(), Signal()
             self.comb += [
-                dst_end.eq(w(0, 3) + (w(0, 4) << 12)),
+                dst_end.eq(w(0, 3) + Mux(w(0, 6)[1], w(0, 4) << 11, w(0, 4) << 12)),
                 stats_end.eq(w(0, 5) + (((w(0, 4) + C(7, 33)) >> 3) << 5)),
                 malformed.eq((w0u != 3) | (w(0, 1)[24:] != 0) |
                     (w(0, 2)[24:] != 0) | (w(0, 3)[24:] != 0) | (w(0, 4)[16:] != 0) |
-                    (w(0, 5)[24:] != 0) | (w(0, 6)[1:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
+                    (w(0, 5)[24:] != 0) | (w(0, 6)[2:] != 0) | (w(0, 7) != 0) | (d1 != 0)),
                 list_overlap.eq(((w(0, 3) < list_end) & (list_base < dst_end)) |
                                 ((w(0, 5) < list_end) & (list_base < stats_end))),
                 self.hadamard_cmd.src.eq(w(0, 1)[:24]),
@@ -327,6 +329,7 @@ class Sequencer(LiteXModule):
                 self.hadamard_cmd.blocks.eq(w(0, 4)[:16]),
                 self.hadamard_cmd.stats.eq(w(0, 5)[:24]),
                 self.hadamard_cmd.inverse.eq(w(0, 6)[0]),
+                self.hadamard_cmd.half.eq(w(0, 6)[1]),
             ]
             had_dispatch = [If(malformed | list_overlap,
                 NextValue(self.hadamard_error.status, Cat(C(0, 1), malformed, list_overlap)),
@@ -341,12 +344,12 @@ class Sequencer(LiteXModule):
                 malformed.eq((w0u != Mux(requantize, 5, 4)) | (w(0, 1)[24:] != 0) |
                     (w(0, 2)[24:] != 0) | (w(0, 3)[24:] != 0) | (w(0, 7) != 0) | (d1 != 0) |
                     Mux(requantize,
-                        (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) | (w(0, 6)[16:] != 0),
+                        (w(0, 4)[24:] != 0) | (w(0, 5)[24:] != 0) | (w(0, 6)[17:] != 0),
                         (w(0, 4)[16:] != 0) | (w(0, 5)[16:] != 0) | (w(0, 6) != 0))),
                 command.src.eq(w(0, 1)[:24]),
                 command.dst.eq(w(0, 2)[:24]),
                 command.exponents.eq(w(0, 3)[:24]),
-                command.elements.eq(Mux(requantize, 1024, w(0, 4)[:16])),
+                command.elements.eq(Mux(requantize, Mux(w(0, 6)[16], 512, 1024), w(0, 4)[:16])),
                 command.blocks.eq(Mux(requantize, w(0, 6)[:16], w(0, 5)[:16])),
                 command.requantize.eq(requantize),
                 command.maxima.eq(Mux(requantize, w(0, 4)[:24], 0)),

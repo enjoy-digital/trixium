@@ -47,8 +47,9 @@ def unpacked(value, width, count):
     return [word - (1 << width) if word & (1 << (width-1)) else word for word in words]
 
 
-def begin(dut, inverse=False):
+def begin(dut, inverse=False, half=False):
     yield dut.cmd.inverse.eq(inverse)
+    yield dut.cmd.half.eq(half)
     yield dut.cmd.valid.eq(1)
     yield
     assert (yield dut.cmd.ready)
@@ -57,12 +58,12 @@ def begin(dut, inverse=False):
     assert (yield dut.busy)
 
 
-def command(dut, values, signs, inverse=False, stalls=True, seed=7):
+def command(dut, values, signs, inverse=False, stalls=True, seed=7, half=False):
     rng = random.Random(seed)
     expected = dense(values, signs, inverse)
     yield dut.sink.valid.eq(0)
     yield dut.source.ready.eq(0)
-    yield from begin(dut, inverse)
+    yield from begin(dut, inverse, half)
     sent, received, held = 0, [], None
     lanes, count = dut.lanes, len(values)//dut.lanes
     offered = False
@@ -70,6 +71,7 @@ def command(dut, values, signs, inverse=False, stalls=True, seed=7):
     for cycle in range(10*len(values) + 100):
         # Changing the command payload while busy must not affect the latched mode.
         yield dut.cmd.inverse.eq(not inverse)
+        yield dut.cmd.half.eq(not half)
         # Withdraw the extra offer once the final result is transferred; leaving
         # valid high after returning to IDLE would legitimately start a new block.
         yield dut.cmd.valid.eq(len(received) < len(values))
@@ -122,6 +124,24 @@ def test_integer_hadamard_dense_equivalence(size, lanes, width, inverse):
     signs = [rng.choice([-1, 1]) for _ in range(size)]
     dut = IntegerHadamard(size, lanes, width)
     run_tb(dut, command(dut, values, signs, inverse))
+
+
+@pytest.mark.parametrize("size,lanes", [(16, 2), (64, 4), (1024, 8), (1024, 32)])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_integer_hadamard_half_block_then_full_block(size, lanes, inverse):
+    """cmd.half: a block of size/2 on the size kernel (the 2B/4B's 512 on the 1,024 unit), equal
+    to the dense size/2 transform; then a full block on the same instance (reuse)."""
+    rng = random.Random(size + lanes)
+    def block(n):
+        values = [rng.randrange(-128, 128) for _ in range(n)]
+        values[0] = -128
+        return values, [rng.choice([-1, 1]) for _ in range(n)]
+    dut = IntegerHadamard(size, lanes, 8)
+    def bench():
+        yield from command(dut, *block(size//2), inverse, half=True)
+        yield from command(dut, *block(size), inverse, seed=8)
+        yield from command(dut, *block(size//2), inverse, seed=9, half=True)
+    run_tb(dut, bench())
 
 
 @pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
@@ -248,9 +268,9 @@ def test_compiled_integer_hadamard():
 # HadamardScratchpad -------------------------------------------------------------------------------
 
 class RotationSP(LiteXModule):
-    def __init__(self, size=8192, block_size=256):
+    def __init__(self, size=8192, block_size=256, lanes=32):
         self.sp = Scratchpad(size=size)
-        self.unit = HadamardScratchpad(size, block_size)
+        self.unit = HadamardScratchpad(size, block_size, lanes)
         self.grant = Signal(reset=1)
         self.comb += [self.sp.fill.adr.eq(self.unit.sp_rd_adr), self.unit.sp_rd_dat.eq(self.sp.fill.dat_r),
                      self.unit.sp_wr_gnt.eq(self.grant & self.unit.sp_wr_req),
@@ -268,9 +288,10 @@ def submit(dut, **fields):
     yield
 
 
-def run_command(dut, blocks=3, inverse=False, size=256, seed=3):
+def run_command(dut, blocks=3, inverse=False, size=256, seed=3, half=False,
+                bases=(0x100, 0x500, 0x800, 0x1800)):
     rng = random.Random(seed)
-    src, signs, dst, stats = 0x100, 0x500, 0x800, 0x1800
+    src, signs, dst, stats = bases
     values = [rng.randrange(-128, 128) for _ in range(blocks*size)]
     sg = [rng.choice([-1, 1]) for _ in values]
     expected = [dense(values[b*size:(b+1)*size], sg[b*size:(b+1)*size], inverse) for b in range(blocks)]
@@ -282,7 +303,8 @@ def run_command(dut, blocks=3, inverse=False, size=256, seed=3):
     yield dut.sp.mem[stats//32].eq(sentinel)
     yield dut.sp.mem[dst//32 - 1].eq(sentinel)
     yield dut.sp.mem[(dst + blocks*size*4)//32].eq(sentinel)
-    yield from submit(dut, src=src, signs=signs, dst=dst, stats=stats, blocks=blocks, inverse=inverse)
+    yield from submit(dut, src=src, signs=signs, dst=dst, stats=stats, blocks=blocks, inverse=inverse,
+                      half=half)
     held = None
     for cycle in range(10000):
         yield dut.grant.eq(rng.randrange(4) != 0)
@@ -311,6 +333,19 @@ def run_command(dut, blocks=3, inverse=False, size=256, seed=3):
     assert stat_words[blocks:] == [0xdeadbeef - (1 << 32)]*(8 - blocks)
     assert (yield dut.sp.mem[dst//32 - 1]) == sentinel
     assert (yield dut.sp.mem[(dst + blocks*size*4)//32]) == sentinel
+
+
+@pytest.mark.parametrize("lanes", [8, 32])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_hadamard_half_blocks_on_the_1024_unit(lanes, inverse):
+    """ABI 1.1 half=1: 512-element blocks (the Bonsai 2 2B/4B) on the 1,024 unit, packed back to
+    back (src, signs, dst), streamed (32 lanes) and word by word (8); then a full block."""
+    dut = RotationSP(size=32768, block_size=1024, lanes=lanes)
+    bases = (0x100, 0x1000, 0x2000, 0x7000)
+    def bench():
+        yield from run_command(dut, blocks=3, inverse=inverse, size=512, half=True, bases=bases)
+        yield from run_command(dut, blocks=1, inverse=inverse, size=1024, seed=4, bases=bases)
+    run_simulation(dut, bench())
 
 
 @pytest.mark.parametrize('inverse', [False, True])
@@ -394,7 +429,7 @@ def test_sequenced_fetch_nowait_rotate_store_uses_actual_shared_ports(backend):
 
 
 @pytest.mark.parametrize('field,value,error', [(1, 1 << 24, 2), (4, 65536, 2),
-    (6, 2, 2), (7, 1, 2), (15, 1, 2), (3, 0, 4), (5, 0, 4), (1, 0x801, 1 << 8)])
+    (6, 4, 2), (7, 1, 2), (15, 1, 2), (3, 0, 4), (5, 0, 4), (1, 0x801, 1 << 8)])
 def test_sequenced_rotation_invalid_descriptor_is_not_completed(field, value, error):
     dut = SoC(TriXiumConfig(with_hadamard=True, scratchpad_size=16*1024), n=1, backend="verilator")
     words = scratchpad_rotation_descriptor(src=0x800, signs=0x600, dst=0x2000, stats=0x700, blocks=1)
