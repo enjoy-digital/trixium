@@ -1,0 +1,33 @@
+# TriXium lab board hosts, for `trixium deploy`, `trixium validate` and `trixium chat --remote`.
+#
+# Copy to ~/.config/trixium/boards.ini (chmod 600: it can hold a sudo password), one section per
+# board. Every key can be overridden from the environment: TRIXIUM_<BOARD>_<KEY>, e.g.
+# TRIXIUM_XCU1525_HOST=192.0.2.42; TRIXIUM_BOARDS_INI points at another file.
+#
+# The deploy runs on the workstation and drives the host over ssh in BatchMode: install an ssh
+# key on the host first (ssh-copy-id user@host).
+
+[xcu1525]
+# Board host (name or address) and ssh user (default: ssh's own).
+host          = 192.0.2.10
+user          = lab
+# Deploy directory on the host (bitstream, firmware, driver, host tools, images, software/).
+dir           = /home/lab/trixium
+# Remote sudo (driver, BAR0 access, reconfiguration): the deploy writes an askpass helper
+# (mode 700) at `askpass` on the host. Leave sudo_password out for passwordless sudo (sudo -n).
+sudo_password = changeme
+askpass       = /tmp/trixium-askpass
+
+[fk33]
+host          = 192.0.2.11
+user          = lab
+dir           = /home/lab/trixium
+sudo_password = changeme
+askpass       = /tmp/trixium-askpass
+
+[ypcb]
+host          = 192.0.2.12
+user          = lab
+dir           = /home/lab/trixium
+sudo_password = changeme
+askpass       = /tmp/trixium-askpass
