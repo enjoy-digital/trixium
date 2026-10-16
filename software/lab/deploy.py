@@ -79,6 +79,7 @@ MODELS = {
     "1p7b": ("1.7b", "785 6722 315 9625 374", "12095 11 323 279 6722 315 17689 374 24081",    64,  1200), # " Paris, and the capital of Spain is Madrid"
     "8b"  : ("8b",   "785 6722 315 9625 374", "12095 13 576 6722 315 9625 374 12095 13 576",  32,  1200), # " Paris. The capital of France is Paris. The"
     "27b" : ("27b",  "760 6511 314 9338 369", "11751 13 198 760 6511 314 9564 369",            4,  7000), # " Paris.\nThe capital of Germany is" (PrismML's llama.cpp fork, CUDA, greedy)
+    "2b"  : ("2b",   "760 6511 314 9338 369", "11751 13 198 760 6511 314 9338 369",            64,  1200), # " Paris.\nThe capital of France is" (Ternary-Bonsai-2-2B, model/golden.py, greedy)
 }
 
 # Boards: the LiteX platform name of each board's bitstream (build/<name>/gateware/<platform>.bit).
@@ -279,6 +280,8 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
         raise DeployError("the 27B does not fit the FK33's 8 GB HBM")
     if board == "ypcb" and model == "27b":
         raise DeployError("the 27B does not fit the YPCB-00338's 4 GB DDR3 (nor its units)")
+    if board == "fk33" and model == "2b":
+        raise DeployError("the FK33 bitstream has no hybrid-model units")
     tok, prompt, want, bench_n, timeout = MODELS[model]
     bench_n  = bench_n if bench is None else bench
     conf     = board_config(board)
@@ -293,10 +296,13 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     drv      = os.path.join(out, "driver", "kernel")
     sudo     = remote.sudo()
     board_py = f"{sudo} python3 -m software.host.board"
+    stem = f"bonsai2-{model}" if model == "2b" else f"bonsai-{model}" # cli.image_stem's names.
     if board == "xcu1525":
-        image = f"bonsai-{model}-n16.img" if model == "1p7b" else f"bonsai-{model}-n16-xcu1525.img"
+        image = f"{stem}-n16.img" if model == "1p7b" else f"{stem}-n16-xcu1525.img"
     elif board == "ypcb":
-        image = f"bonsai-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '8')}-ypcb.img"
+        image = f"{stem}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '8')}-ypcb.img"
+        if model == "2b" and soc_constant(soc_h, "TRIXIUM_DNSTREAM_LANES") is None:
+            raise DeployError(f"{name} has no hybrid-model units (build trixium_ypcb.py --hybrid)")
     else:
         image = f"bonsai-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '16')}.img"
     image = os.path.join(REPO, "models", "bons", image)
@@ -384,7 +390,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
         remote.scp([os.path.join("software", "user", f) for f in ["trixium_loader.c", "trixium_loader.h",
             "trixium_load.c", "trixium_chat.c", "trixium_smi.c", "Makefile"]], "user/")
         # The tokenizers (the C chat tool wants the .bin, the Python client the .json).
-        for m in ["1.7b", "8b", "27b"]:
+        for m in ["1.7b", "8b", "27b", "2b"]:
             if os.path.exists(os.path.join(REPO, "models", m, "tokenizer.bin")):
                 remote.scp([os.path.join("models", m, f) for f in ["tokenizer.bin", "tokenizer.json"]], f"models/{m}/")
         rc, _ = remote.ssh("cd gen/driver/kernel && rm -f *.ko *.o *.mod* .*.cmd && (make 2>&1 | grep -iE ' error' | head -3); "
