@@ -117,8 +117,8 @@ def _driver(top, dut):
         progress_args=", ".join(f"(unsigned)d.progress{i}" for i in range(len(dut.progress))))
 
 
-def layout(rng, nq, n_rep, nkv, hd, T, mode, specials=True):
-    """Scratchpad image, row stream and expected image for one command."""
+def layout(rng, nq, n_rep, nkv, hd, T, mode, specials=True, kv0=0):
+    """Scratchpad image, row stream and expected image for one command (kv heads from kv0)."""
     mem = rng.integers(0, 1 << 32, SP//4, dtype=np.uint64).astype(np.uint32)
     put = lambda a, v: mem.__setitem__(slice(a//4, a//4 + len(v)), np.asarray(v, f32).view(np.uint32))
     rows = rng.normal(0, 1, (T, nkv, hd)).astype(f32)
@@ -132,7 +132,7 @@ def layout(rng, nq, n_rep, nkv, hd, T, mode, specials=True):
         for l in range(nq):
             put(SRC + l*sstr, q[l])
         scale = f32(1/np.sqrt(hd))
-        want = scores_reference(q, rows, scale)
+        want = scores_reference(q, rows[:, kv0:kv0 + -(-nq//n_rep)], scale)
     else:
         p = rng.uniform(0, 1, (nq, T)).astype(f32)
         p[0, :min(2, T)] = [0, 1e-39][:T]
@@ -140,8 +140,9 @@ def layout(rng, nq, n_rep, nkv, hd, T, mode, specials=True):
         for l in range(nq):
             put(SRC + l*sstr, p[l])
         scale = f32(0)
-        want = values_reference(p, rows)
-    rec = np.array([mode | nq << 8 | n_rep << 16 | nkv << 24, T, hd, SRC, sstr, DST, dstr, 0], np.uint32)
+        want = values_reference(p, rows[:, kv0:kv0 + -(-nq//n_rep)])
+    rec = np.array([mode | kv0 << 1 | nq << 8 | n_rep << 16 | nkv << 24, T, hd, SRC, sstr, DST, dstr, 0],
+                   np.uint32)
     rec[7] = np.array([scale], f32).view(np.uint32)[0]
     mem[REC//4:REC//4 + 8] = rec
     expect = mem.copy()
@@ -203,6 +204,32 @@ def test_small_geometry(tmp_path, small, mode, nq, n_rep, nkv, hd, T, pcts):
 def test_bad_geometry_is_an_error(tmp_path, small):
     mem, rows, rec, expect, care = layout(np.random.default_rng(1), 4, 2, 2, 32, 13, MODE_SCORES)
     mem[rec*8 + 2] = 48                                     # hd not a power of two
+    run(small, tmp_path, mem, rows[:0], rec, want_error=1)
+
+
+@pytest.mark.parametrize("mode", [MODE_SCORES, MODE_VALUES])
+@pytest.mark.parametrize("nq,n_rep,nkv,kv0,hd,T", [
+    (4, 4, 2, 1, 32, 13),      # the second kv group of an 8/2 model on 4 lanes
+    (4, 2, 3, 1, 16, 9),       # heads 1..2 of a 3-head row: more heads than buffers
+    (4, 2, 4, 2, 32, 17),      # the second slice of a 4-head row (a 4B on 2 buffers)
+])
+def test_kv_slice(tmp_path, small, mode, nq, n_rep, nkv, kv0, hd, T):
+    """A command over kv heads kv0..: the other heads' beats of each row are dropped."""
+    mem, rows, rec, expect, care = layout(np.random.default_rng(T*3 + kv0), nq, n_rep, nkv, hd, T, mode,
+                                          kv0=kv0)
+    got, cycles = run(small, tmp_path, mem, rows, rec, (80, 60))
+    check(got, expect, care)
+
+
+@pytest.mark.parametrize("nq,n_rep,nkv,kv0", [
+    (4, 2, 2, 2),              # kv0 past the row
+    (4, 2, 3, 2),              # the slice runs past the row (heads 2, 3 of 3)
+    (4, 1, 4, 0),              # four heads on two buffers
+])
+def test_bad_kv_slice_is_an_error(tmp_path, small, nq, n_rep, nkv, kv0):
+    mem, rows, rec, expect, care = layout(np.random.default_rng(2), nq, n_rep, max(nkv, kv0 + 1), 16, 5,
+                                          MODE_SCORES)
+    mem[rec*8] = MODE_SCORES | kv0 << 1 | nq << 8 | n_rep << 16 | nkv << 24
     run(small, tmp_path, mem, rows[:0], rec, want_error=1)
 
 

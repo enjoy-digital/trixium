@@ -20,11 +20,16 @@ The softmax between them (max, exp, sum, p = e/sum) stays with the caller, so bo
 are bit-exact against the firmware's own loops. Operands come from the scratchpad:
 ``rec`` points at one 256-bit record::
 
-    w0 = mode | nq << 8 | n_rep << 16 | nkv << 24
+    w0 = mode | kv0 << 1 | nq << 8 | n_rep << 16 | nkv << 24
     w1 = T (positions)     w2 = hd (8, 16, 32, ... 8*hb_max floats; a power of two)
     w3 = src byte address  (mode 0: q rows, mode 1: p rows)   w4 = src lane stride (bytes)
     w5 = dst byte address  (mode 0: scores, mode 1: outputs)  w6 = dst lane stride (bytes)
     w7 = scale (mode 0)
+
+A command may serve a slice of the kv heads: lane ``l`` then reads kv head ``kv0 + l // n_rep``
+and the row buffers keep only heads ``kv0 ..`` (the other beats of each row are dropped), so
+``nkv`` (the row's heads) may exceed ``groups``: a model with more heads than lanes runs one
+command per slice, its K/V streamed once per command.
 
 Scores are written as whole beats of 8 positions (a row of ceil(T/8) beats per lane; the
 padding positions hold junk), outputs as hd/8 beats per lane.
@@ -130,6 +135,7 @@ class AttentionStream(LiteXModule):
         run, mode = Signal(), Signal()
         nq, n_rep, nkv = (Signal(8, reset_less=True), Signal(8, reset_less=True),
                           Signal(8, reset_less=True))
+        kv0 = Signal(7, reset_less=True)                     # First kv head of the command.
         T = Signal(16, reset_less=True)
         hd = Signal(16, reset_less=True)                     # Floats per head.
         hb = Signal(max=hb_max + 1, reset_less=True)         # Beats per head.
@@ -162,8 +168,10 @@ class AttentionStream(LiteXModule):
         geometry_bad = Signal()
         self.comb += geometry_bad.eq(
             (rec_w[0][8:16] == 0) | (rec_w[0][8:16] > L) | (rec_w[0][16:24] == 0) |
-            (rec_w[0][24:32] == 0) | (rec_w[0][24:32] > groups) |
-            (rec_w[0][8:16] > rec_w[0][16:24]*rec_w[0][24:32]) |
+            (rec_w[0][24:32] == 0) | (rec_w[0][1:8] >= rec_w[0][24:32]) |
+            (rec_w[0][8:16] > rec_w[0][16:24]*groups) |                          # buffers
+            (rec_w[0][8:16] > rec_w[0][16:24]*(rec_w[0][24:32] - rec_w[0][1:8])) | # the row
+            (rec_w[0][24:32]*(rec_w[2] >> 3) > 4095) |                           # rowbeats
             (rec_w[1] == 0) | (rec_w[1] > t_max) |
             (rec_w[2] < 8) | (rec_w[2] > 8*hb_max) | ((rec_w[2] & (rec_w[2] - 1)) != 0))
         # The operand writes one cycle after the response, from registers: the scratchpad's
@@ -188,7 +196,7 @@ class AttentionStream(LiteXModule):
                         If(geometry_bad,
                             self.error.eq(1), ld_st.eq(0),
                         ).Else(
-                            mode.eq(rec_w[0][0]),
+                            mode.eq(rec_w[0][0]), kv0.eq(rec_w[0][1:8]),
                             nq.eq(rec_w[0][8:16]), n_rep.eq(rec_w[0][16:24]),
                             nkv.eq(rec_w[0][24:32]),
                             T.eq(rec_w[1]), hd.eq(rec_w[2]), hb.eq(rec_w[2] >> 3),
@@ -234,7 +242,7 @@ class AttentionStream(LiteXModule):
         fill_row = Signal(16)           # Rows accepted.
         fill_units = Signal(2)          # Completed units (groups or rows), mod 4.
         cons_units = Signal(2)          # Units consumed by the issue, mod 4.
-        fill_j, fill_idx = Signal(max=max(2, groups)), Signal(hbb if hbb else 1)
+        fill_j, fill_idx = Signal(8), Signal(hbb if hbb else 1)
         fill_p, fill_half = Signal(3), Signal()
         unit_done = Signal()
         self.comb += [
@@ -267,7 +275,7 @@ class AttentionStream(LiteXModule):
             self.comb += [
                 wp.adr.eq(Cat(fill_idx, fill_p, fill_half)),
                 wp.dat_w.eq(self.sink.data),
-                wp.we.eq(self.sink.valid & self.sink.ready & (fill_j == j)),
+                wp.we.eq(self.sink.valid & self.sink.ready & (fill_j == kv0 + j)),
                 rp.adr.eq(rd_adr),
             ]
 

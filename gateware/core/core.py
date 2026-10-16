@@ -238,6 +238,7 @@ class TriXiumCore(LiteXModule):
             self.add_constant("TRIXIUM_ATTN_GROUPS", at.groups)
             self.add_constant("TRIXIUM_ATTN_HD_MAX", 8*at.hb_max)
             self.add_constant("TRIXIUM_ATTN_T_MAX",  at.t_max)
+            self.add_constant("TRIXIUM_ATTN_KV_SLICE") # Record kv0: one command per kv-head slice.
         if config.with_dnstream:
             self.add_constant("TRIXIUM_HAS_DNSTREAM")
             self.add_constant("TRIXIUM_DNSTREAM_LANES", len(axis))

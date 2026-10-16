@@ -791,6 +791,7 @@ def main():
     parser.add_argument("--image",          default=None,                                          help="BONS image to bake in (default: the board's, DEFAULT_IMAGES).")
     parser.add_argument("--out-dir",        default=None,                                          help="Build directory (default: build/sim_<board>, build/sim_<board>_bt_<image> with --board-timing).")
     parser.add_argument("--board-timing",   action="store_true",                                   help="--board xcu1525: the board's clocks, DDR4 timings/map, CPU and stream geometry (shape-true slices, doc/simulation.md).")
+    parser.add_argument("--attn-geometry",  default=None,                                          help="Attention stream lanes,groups,head_dim,t_max (default: the board's; e.g. 4,1,128,256: one command per kv-head slice).")
     parser.add_argument("--build",          action="store_true",                                   help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
     parser.add_argument("--run",            action="store_true",                                   help="Run the built simulation (console on stdin/stdout).")
     parser.add_argument("--firmware",       action="store_true",                                   help="Rebuild the firmware and re-bake it into the built simulation (--board xcu1525/ypcb).")
@@ -845,6 +846,8 @@ def main():
         board.update(HYBRID_UNITS, vexii_extra=board["vexii_extra"] + " --with-rvf")
         out_dir      = args.out_dir or out_dir + "_hybrid"
         gateware_dir = os.path.join(out_dir, "gateware")
+    if args.attn_geometry is not None:
+        board.update(attn_geometry=tuple(int(v) for v in args.attn_geometry.split(",")))
     if args.cpu_type is not None:
         board.update(cpu_type=args.cpu_type, icache_kb=0, vexii_extra="")
     if args.bench_toggle is None:

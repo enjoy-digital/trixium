@@ -95,6 +95,7 @@ static int      dn_hw;
 #ifdef TRIXIUM_HAS_ATTNSTREAM
 static uint32_t at_hbm_base, at_slots, at_rowbeats;
 static int at_geom_ok;
+static int at_sg;                      // kv heads per op-6 command (n_kv_head: one command)
 static float *at_buf;
 #endif
 
@@ -544,9 +545,23 @@ int hybrid_init(void)
         at_slots = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
         uint64_t end = base + (uint64_t)n_attn*2u*at_slots*at_rowbeats*32u;
         at_hbm_base = (uint32_t)base;
-        at_geom_ok = n_attn && n_head <= TRIXIUM_ATTN_LANES && n_kv_head <= TRIXIUM_ATTN_GROUPS &&
-                     head_dim >= 8 && head_dim <= TRIXIUM_ATTN_HD_MAX && !(head_dim & (head_dim - 1)) &&
+        // kv heads per command: all of them, or (TRIXIUM_ATTN_KV_SLICE) as many as the unit's
+        // buffers and lanes hold, one command per slice (K/V streamed once per slice).
+        at_sg = n_kv_head;
+#ifdef TRIXIUM_ATTN_KV_SLICE
+        if (n_kv_head && n_head % n_kv_head == 0) {
+            int rep = n_head/n_kv_head, sg = TRIXIUM_ATTN_GROUPS;
+            if (sg > TRIXIUM_ATTN_LANES/rep) sg = TRIXIUM_ATTN_LANES/rep;
+            while (sg > 1 && n_kv_head % sg) sg--;
+            if (sg >= 1 && sg < n_kv_head && n_kv_head/sg <= 16) at_sg = sg;
+        }
+#endif
+        at_geom_ok = n_attn && at_sg >= 1 && at_sg*(n_head/n_kv_head) <= TRIXIUM_ATTN_LANES &&
+                     at_sg <= TRIXIUM_ATTN_GROUPS && head_dim >= 8 && head_dim <= TRIXIUM_ATTN_HD_MAX && !(head_dim & (head_dim - 1)) &&
                      n_head % n_kv_head == 0 && at_rowbeats <= 255 && end <= limit;
+        if (at_geom_ok && at_sg < n_kv_head)
+            printf("hybrid: attention stream in %d kv-head slices of %d (one command each)\n",
+                   n_kv_head/at_sg, at_sg);
         if (n_attn && !at_geom_ok)
             printf("hybrid: attention stream off (geometry or K/V span %08lx..%08lx past %08lx)\n",
                    (unsigned long)base, (unsigned long)end, (unsigned long)limit);
@@ -1519,18 +1534,27 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     o.wbase = kspan + p/nch*rowbytes; o.xsrc = KB; rl_engine(&o);
     o.wbase = vspan + p/nch*rowbytes; o.xsrc = VB; rl_engine(&o);
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + AT_REC);
+    // One scores and one values record per kv-head slice (at_sg heads, ns query heads): the
+    // scores records at AT_REC, the values records after them.
+    uint32_t nsl = nkv/(uint32_t)at_sg, ns = nq/nsl, vrec = AT_REC + 32u*nsl;
     if (fits) {
-        uint32_t w0 = nq << 8 | (nq/nkv) << 16 | nkv << 24;
-        rec[0] = w0 | 0;  rec[1] = (uint32_t)T; rec[2] = hd; rec[3] = QB; rec[4] = qstride*4u;
-        rec[5] = AT_SP;   rec[6] = Tp*4u; rec[7] = f32_bits(scale);
-        rec[8] = w0 | 1;  rec[9] = (uint32_t)T; rec[10] = hd; rec[11] = AT_SP; rec[12] = Tp*4u;
-        rec[13] = AT_O;   rec[14] = hd*4u; rec[15] = 0;
+        for (uint32_t sl = 0; sl < nsl; sl++) {
+            volatile uint32_t *rs = rec + 8u*sl, *rv = rec + 8u*(nsl + sl);
+            uint32_t w0 = (sl*(uint32_t)at_sg) << 1 | ns << 8 | (nq/nkv) << 16 | nkv << 24;
+            rs[0] = w0 | 0;  rs[1] = (uint32_t)T; rs[2] = hd; rs[3] = QB + sl*ns*qstride*4u;
+            rs[4] = qstride*4u; rs[5] = AT_SP + sl*ns*Tp*4u; rs[6] = Tp*4u; rs[7] = f32_bits(scale);
+            rv[0] = w0 | 1;  rv[1] = (uint32_t)T; rv[2] = hd; rv[3] = AT_SP + sl*ns*Tp*4u;
+            rv[4] = Tp*4u;   rv[5] = AT_O + sl*ns*hd*4u; rv[6] = hd*4u; rv[7] = 0;
+        }
         if (!qsp)
             rl_fetch(q, nq*qstride*4u, AT_Q);
         memset(&o, 0, sizeof o);
         o.kind = ENGINE_KIND_ATTN; o.rows = (uint16_t)((uint32_t)T/nch); o.rem = (uint8_t)((uint32_t)T % nch);
-        o.wbase = kspan; o.wlen = (uint32_t)o.rows*rb; o.cbeats = (uint8_t)rb; o.xsrc = AT_REC;
-        rl_engine(&o);
+        o.wbase = kspan; o.wlen = (uint32_t)o.rows*rb; o.cbeats = (uint8_t)rb;
+        for (uint32_t sl = 0; sl < nsl; sl++) {
+            o.xsrc = AT_REC + 32u*sl;
+            rl_engine(&o);
+        }
         rl_store(at_buf, nq*Tp*4u, AT_SP);
     }
     AT_SUB(1);
@@ -1551,8 +1575,11 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
                     nq*hd*4u <= AT_FX - AT_D && nq*32u <= AT_IMG - AT_FX;
     rl_begin();
     rl_fetch_raw(at_buf, nq*Tp*4u, AT_SP);   // cleaned after the softmax
-    o.wbase = vspan; o.xsrc = AT_REC + 32u;
-    rl_engine(&o);
+    o.wbase = vspan;
+    for (uint32_t sl = 0; sl < nsl; sl++) {
+        o.xsrc = vrec + 32u*sl;
+        rl_engine(&o);
+    }
     if (unit_gate) {
         rl_gate_begin(AT_IMG);
         for (uint32_t hh = 0; hh < nq; hh++)
