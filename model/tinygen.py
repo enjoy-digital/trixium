@@ -29,7 +29,7 @@ from model.layout import (
 from model.layout import KSEG_MAX
 from model.bons import TensorSpec, write_image, split_wide
 from model.convert import _hadamard_specs
-from model.configs import BONSAI_TINY, BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K
+from model.configs import BONSAI_TINY, BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K, BONSAI2_TINY
 from model.configs import CONFIGS, SLICE_OF
 
 # Helpers ------------------------------------------------------------------------------------------
@@ -122,7 +122,8 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
         t.append(_ternary(rng, p+"ffn_up.weight",   ROLE_FFN_UP,   l, cfg.ffn_dim, cfg.n_embd))
         t.append(_ternary(rng, p+"ffn_down.weight", ROLE_FFN_DOWN, l, cfg.n_embd,  cfg.ffn_dim))
     t.append(_norm(rng, "output_norm.weight", ROLE_OUT_NORM, 0, cfg.n_embd))
-    t.append(_ternary(rng, "output.weight", ROLE_LM_HEAD, 0, cfg.vocab, cfg.n_embd))
+    if not cfg.tie_embeddings: # Tied (the Bonsai 2 2B/4B): the head is the rotated token_embd.
+        t.append(_ternary(rng, "output.weight", ROLE_LM_HEAD, 0, cfg.vocab, cfg.n_embd))
     # The rotation tensors, exactly as convert._hadamard_specs builds them.
     t += _hadamard_specs(cfg)
     return t

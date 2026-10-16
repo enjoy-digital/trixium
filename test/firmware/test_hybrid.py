@@ -10,6 +10,7 @@ the image is a hybrid; the tests below pin it to the fp32 golden on the tiny hyb
 to an archived RV32F firmware trace.
 """
 
+import pytest
 import numpy as np
 
 from model import layout
@@ -20,16 +21,17 @@ from common import DATA
 
 # Tests --------------------------------------------------------------------------------------------
 
-def test_mirror_agrees_with_the_fp32_golden_on_the_tiny_hybrid():
+@pytest.mark.parametrize("name", ["bonsai-tiny-hybrid", "bonsai2-tiny"])
+def test_mirror_agrees_with_the_fp32_golden_on_the_tiny_hybrid(name):
     """The mirror's structure against the fp32 golden: run exact (fp32 weights, no activation
     quantization) it must reproduce the golden's tokens on the tiny hybrid model, which pins
     the recurrence, the head order, the gates and the rotation independently of the int8
     noise. The sim then compares the firmware to the quantized mirror exactly."""
     import tempfile
-    from model.configs import BONSAI_TINY_HYBRID
+    from model.configs import CONFIGS
     from model.tinygen import generate, make_tiny_hybrid_tensors
     from model.golden import FloatModel
-    cfg = BONSAI_TINY_HYBRID
+    cfg = CONFIGS[name]
     with tempfile.TemporaryDirectory() as d:
         img_path, _, _ = generate(d, 2, 1234, cfg=cfg)
         img = BONSReader(img_path)

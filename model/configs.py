@@ -175,6 +175,35 @@ BONSAI_TINY_HYBRID_1K = ModelConfig(
     hadamard_signs = None,
 )
 
+# bonsai2-tiny: the Ternary-Bonsai-2 2B/4B's traits at sim size - the hybrid topology, the LM head
+# tied to the (rotated) token embedding (prism.hadamard.version 2: the head's input is rotated like
+# every folded weight's, the lookup restored), as many DeltaNet value heads as key heads (the 2B),
+# and a rotation block other than the hardware FWHT's 1024 (the 2B/4B: 512), which the firmware
+# runs as the image's dense rotation matrices.
+BONSAI2_TINY = ModelConfig(
+    name           = "bonsai2-tiny",
+    n_layer        = 3,
+    n_embd         = 256,
+    n_head         = 4,
+    n_kv_head      = 1,
+    head_dim       = 64,
+    ffn_dim        = 768,
+    vocab          = 512,
+    max_ctx        = 64,
+    rope_theta     = 10000000.0,
+    tie_embeddings = True,
+    layer_types    = ("deltanet", "deltanet", "attn"),
+    dn_num_v_heads = 4,
+    dn_num_k_heads = 4,
+    dn_k_head_dim  = 64,
+    dn_v_head_dim  = 64,
+    dn_conv_kernel = 4,
+    rope_dims      = 16,
+    attn_gated     = True,
+    hadamard_block = 128,
+    hadamard_signs = None,   # filled by tinygen
+)
+
 # Shape-true slices: random weights at the real models' widths and head counts, a few layers and
 # a truncated vocabulary, for the board-timing simulation (trixium_sim.py --board-timing): the
 # per-layer cycles are the board's, the full model is extrapolated from them (doc/simulation.md).
@@ -239,5 +268,5 @@ SLICE_OF = {
 }
 
 CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B, BONSAI_TINY_HYBRID,
-                               BONSAI_TINY_HYBRID_1K, BONSAI_27B_SLICE, BONSAI_8B_SLICE,
+                               BONSAI_TINY_HYBRID_1K, BONSAI2_TINY, BONSAI_27B_SLICE, BONSAI_8B_SLICE,
                                BONSAI_1P7B_SLICE)}

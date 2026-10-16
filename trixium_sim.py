@@ -672,6 +672,12 @@ BOARDS = {
         cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS),
 }
 
+# --hybrid (--board ypcb): the YPCB with the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B fit its
+# 4 GB): every scratchpad unit, the DeltaNet and attention streams, and an FPU for the CPU's share
+# of the hybrid forward (the XCU1525's set; the attention stream at the tiny models' geometry).
+HYBRID_UNITS = dict(with_hadamard=True, with_activation_quantize=True, with_projection_restore=True,
+    with_silu=True, with_norm=True, with_conv=True, with_dnstream=True, attn_geometry=(8, 2, 128, 256))
+
 # The image each board's simulation bakes in by default (--image).
 DEFAULT_IMAGES = {
     "xcu1525": "models/tiny/bonsai-tiny-hybrid-1k-n8.img",
@@ -774,6 +780,7 @@ def build_sim(args, board, out_dir):
 def main():
     parser = argparse.ArgumentParser(description="TriXium Verilator simulation.")
     parser.add_argument("--board",          default="xcu1525", choices=list(BOARDS),               help="Hardware to mirror.")
+    parser.add_argument("--hybrid",         action="store_true",                                   help="--board ypcb: with the hybrid models' units (DeltaNet/attention streams, FWHT, ...; build/sim_ypcb_hybrid).")
     parser.add_argument("--image",          default=None,                                          help="BONS image to bake in (default: the board's, DEFAULT_IMAGES).")
     parser.add_argument("--out-dir",        default=None,                                          help="Build directory (default: build/sim_<board>, build/sim_<board>_bt_<image> with --board-timing).")
     parser.add_argument("--board-timing",   action="store_true",                                   help="--board xcu1525: the board's clocks, DDR4 timings/map, CPU and stream geometry (shape-true slices, doc/simulation.md).")
@@ -825,6 +832,12 @@ def main():
             parser.error(f"--board-timing: the board has {board['engine_channels']} engine "
                          f"channels, the image {n_channels}.")
     gateware_dir = os.path.join(out_dir, "gateware")
+    if args.hybrid:
+        if args.board != "ypcb":
+            parser.error("--hybrid is the YPCB's (the XCU1525 has every unit already).")
+        board.update(HYBRID_UNITS, vexii_extra=board["vexii_extra"] + " --with-rvf")
+        out_dir      = args.out_dir or out_dir + "_hybrid"
+        gateware_dir = os.path.join(out_dir, "gateware")
     if args.cpu_type is not None:
         board.update(cpu_type=args.cpu_type, icache_kb=0, vexii_extra="")
     if args.bench_toggle is None:
