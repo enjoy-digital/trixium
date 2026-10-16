@@ -649,6 +649,9 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
                 ws = []
                 for t in segs:
                     scales, codes = img.tensor(t["name"])
+                    if t["kind"] == layout.KIND_F32: # The real models' beta/alpha (tinygen: Q8).
+                        ws.append(np.asarray(codes, dtype=f32).reshape(t["rows"], t["cols"]))
+                        continue
                     g = 128 if layout.is_ternary(t["kind"]) else 32
                     off = 1.0 if layout.is_ternary(t["kind"]) else 0.0
                     w = (codes.astype(f32).reshape(t["rows"], -1, g) - f32(off))*scales.astype(f32)[:, :, None]
