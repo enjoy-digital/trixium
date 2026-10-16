@@ -23,7 +23,7 @@ setup(
     python_requires  = ">=3.10",
     install_requires = ["numpy", "tokenizers", "pyserial", "huggingface_hub"],
     extras_require   = {"dev": ["pytest", "pytest-xdist", "pexpect"]},
-    py_modules       = ["trixium_xcu1525", "trixium_fk33", "trixium_sim"],
+    py_modules       = ["trixium_xcu1525", "trixium_fk33", "trixium_ypcb", "trixium_sim"],
     packages         = find_packages(exclude=["test*"]),
     package_data     = {"gateware": ["memory/*.xci"]},
     entry_points     = {"console_scripts": ["trixium=software.cli:main"]},
