@@ -27,7 +27,7 @@ from model.layout import (
     FLAG_REPLICATED, ceil_div, scale_beats, code_beats, row_beats, shard_rows,
 )
 from model import bitexact as bx
-from model.golden import hadamard_restore, rope_tables
+from model.golden import hadamard_restore, hadamard_image_gain, rope_tables
 
 # TensorSpec ---------------------------------------------------------------------------------------
 
@@ -249,7 +249,9 @@ def restored_bfp_rows(scales, codes, signs, hblock):
     G = cols//layout.GROUP_TERNARY
     z = (codes.astype(np.float32).reshape(rows, G, layout.GROUP_TERNARY) - 1.0) \
         * scales.astype(np.float32)[:, :, None]
-    e = hadamard_restore(z.reshape(rows, cols), signs, hblock).astype(np.float64)
+    # The image's gain (sqrt(2) for an odd block, whose rows carry the converter's 2**-0.5).
+    e = (hadamard_restore(z.reshape(rows, cols), signs, hblock)
+         *np.float32(hadamard_image_gain(hblock))).astype(np.float64)
     amax = np.abs(e).max(axis=1)
     exps = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30))).astype(np.int64) - 14, 0)
     # A row's absmax lands in [2^14, 2^15) before rounding; rounding can push it to 2^15

@@ -142,8 +142,8 @@ def test_invalid_fields_and_null_never_modify_output(encoder, name):
         if field in ('src', 'signs', 'dst', 'stats', 'xsrc', 'exponents', 'maxima', 'result_exponent',
                          'src_g', 'src_m', 'fixmap', 'x0', 'x1', 'x2', 'x3', 'w', 'weight', 'a', 'b'):
             cases += [dict(args, **{field: value}) for value in (1, 1 << 24, 0xffffffff)]
-        elif field == 'inverse':
-            cases.append(dict(args, **{field: 2}))
+        elif field == 'inverse':   # bit 1 is the half-block flag (C: BNS_SEQ_HAD_HALF)
+            cases.append(dict(args, **{field: 4}))
         elif field in ('adjustment', 'eps'): pass  # Full C width is encodable.
         elif field == 'l2': cases.append(dict(args, l2=2))
         elif field == 'n' and name == 'add': cases += [dict(args, n=v) for v in (0, 12, 65536)]

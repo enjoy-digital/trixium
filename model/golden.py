@@ -268,6 +268,20 @@ def hadamard_rotate(x, signs, block):
     xs = (x*np.asarray(signs, dtype=np.float32)).reshape(*x.shape[:-1], -1, block)
     return (xs @ R.T).reshape(x.shape)
 
+def hadamard_image_scales(block):
+    """(rotation tensor scale, weight fold) of an image's rotation: a power-of-two scale the
+    integer FWHT reproduces exactly - 1/sqrt(block) for an even power of two (1/32 for 1024),
+    2**-floor(log2(block)/2) for an odd one (1/16 for the 2B/4B's 512) with the remaining
+    2**-0.5 folded into every rotated weight's scales by the converter."""
+    k = int(block).bit_length() - 1
+    assert block == 1 << k, block
+    return 2.0**-(k//2), (1.0 if k % 2 == 0 else 2.0**-0.5)
+
+def hadamard_image_gain(block):
+    """What the image's rotation tensors (and the restored embedding table) carry over the
+    normalized transform: sqrt(2) for an odd power-of-two block, else 1."""
+    return hadamard_image_scales(block)[0]*np.sqrt(float(block))
+
 def hadamard_restore(z, signs, block):
     """e = s * (R z) per block (the embedding table's inverse-after-lookup)."""
     R  = hadamard_matrix(block)
@@ -336,7 +350,12 @@ class FloatModel:
     def _embed(self, tokens):
         e = np.asarray(self.t["token_embd.weight"][np.asarray(tokens)], dtype=np.float32)
         if self.cfg.hadamard_block:
-            e = hadamard_restore(e, self.cfg.hadamard_signs[e.shape[-1]], self.cfg.hadamard_block)
+            B = self.cfg.hadamard_block
+            e = hadamard_restore(e, self.cfg.hadamard_signs[e.shape[-1]], B)
+            if f"had.{e.shape[-1]}.0" in self.t:
+                # An image's table (the converter folded 2**-0.5 into it for an odd block):
+                # restored as the image's rotation tensors / the firmware's table do.
+                e = (e*np.float32(hadamard_image_gain(B))).astype(np.float32)
         return e
 
     def _attn(self, l, h, cos, sin, P):

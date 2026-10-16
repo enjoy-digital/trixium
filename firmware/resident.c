@@ -113,6 +113,10 @@ void resident_silu_enable(int on) { resident_state()->silu_enabled = on ? 1 : 0;
 void resident_mark_act(void) { resident_state()->act_resident = 1; }
 void resident_keep_rsf(const void *dst) { resident_state()->keep_dst = dst; }
 
+// Half-block descriptor flags (units 3/5) of the resident model.
+static inline uint32_t had_flags(const struct resident_state *R) { return R->half ? BNS_SEQ_HAD_HALF : 0; }
+static inline uint32_t req_flags(const struct resident_state *R) { return R->half ? BNS_SEQ_REQ_HALF : 0; }
+
 int resident_available(void)
 {
 #if RESIDENT_BUILT
@@ -421,7 +425,12 @@ int resident_init(void)
     if (!resident_available())
         return -1;
     int B = H->hadamard_block;
-    if (B != (int)TRIXIUM_HADAMARD_BLOCK) {
+    // Half blocks (the Bonsai 2 2B/4B's 512 on the 1,024 unit): Hadamard ABI >= 1.1 and the
+    // 512-block requantize (activation_quantize >= 1.2).
+    R->half = 2*B == (int)TRIXIUM_HADAMARD_BLOCK &&
+              (trixium_seq_hadamard_abi_read() & 0xffff) >= 1 &&
+              (trixium_seq_activation_quantize_abi_read() & 0xffff) >= 2;
+    if (B != (int)TRIXIUM_HADAMARD_BLOCK && !R->half) {
         printf("resident: image block %d, hardware %d - off\n", B, (int)TRIXIUM_HADAMARD_BLOCK);
         return -1;
     }
@@ -434,7 +443,7 @@ int resident_init(void)
         uint32_t width = H->hadamard_widths[wi];
         if (!width || width % (uint32_t)B)
             continue;
-        if (off + (width/(uint32_t)B)*128u > RS_SIGN_END) {
+        if (off + (width/(uint32_t)B)*((uint32_t)B/8) > RS_SIGN_END) {
             printf("resident: no room for the %lu-wide sign bits - off\n", (unsigned long)width);
             return -1;
         }
@@ -459,7 +468,7 @@ int resident_init(void)
                 }
                 signs[j/32] = word;
             }
-            off += 128;
+            off += (uint32_t)B/8;   // Back to back: the unit reads block b's at b*B/8.
         }
     }
     R->ready = 1;
@@ -506,8 +515,8 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
         // with the wrong block boundaries and reads past the vector.
         uint32_t blocks = width/B;
         bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(n++, &d);
-        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(n++, &d);
-        bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks); desc_words(n++, &d);
+        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, had_flags(R)); desc_words(n++, &d);
+        bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks | req_flags(R)); desc_words(n++, &d);
     } else {
         bns_seq_desc_quantize(&d, RS_F, RS_XW, RS_E8, width, 1);              desc_words(n++, &d);
     }
@@ -768,8 +777,8 @@ static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t
         if (wi < 0 || width/B > 32) { RLS->bad = 1; return; }
         uint32_t blocks = width/B;
         bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RLS->n++, &d);
-        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, 0); desc_words(RLS->n++, &d);
-        bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks); desc_words(RLS->n++, &d);
+        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, had_flags(R)); desc_words(RLS->n++, &d);
+        bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks | req_flags(R)); desc_words(RLS->n++, &d);
         rl_rsf_lost();                    // the Hadamard wrote RS_F
     } else {
         bns_seq_desc_quantize(&d, RS_F, xw, e8, width, 1);              desc_words(RLS->n++, &d);

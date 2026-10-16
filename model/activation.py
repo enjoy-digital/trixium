@@ -34,7 +34,8 @@ def scratchpad_quantize_descriptor(*, src, dst, exponents, elements, blocks=1):
         raise ValueError("blocks must be in [1, 65535]")
     return [4, src, dst, exponents, elements, blocks] + [0]*10
 
-def scratchpad_requantize_descriptor(*, src, dst, exponents, maxima, result_exponent, blocks):
+def scratchpad_requantize_descriptor(*, src, dst, exponents, maxima, result_exponent, blocks,
+                                     half=False):
     """Encode unit 5 (activation_quantize ABI major 1, minor >= 1).
 
     Raw signed int32 Hadamard blocks each contain 1024 elements. Input metadata
@@ -48,7 +49,9 @@ def scratchpad_requantize_descriptor(*, src, dst, exponents, maxima, result_expo
         _sp_address(name, value)
     if not isinstance(blocks, int) or not 1 <= blocks < 65536:
         raise ValueError("blocks must be in [1, 65535]")
-    return [5, src, dst, exponents, maxima, result_exponent, blocks] + [0]*9
+    if half not in (False, True):   # minor >= 2: 512-element blocks (normalization 2**-4)
+        raise ValueError("half must be boolean")
+    return [5, src, dst, exponents, maxima, result_exponent, blocks | int(half) << 16] + [0]*9
 
 # SiLU (unit 11) -----------------------------------------------------------------------------------
 

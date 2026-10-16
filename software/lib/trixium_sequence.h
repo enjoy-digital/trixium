@@ -51,7 +51,9 @@ int bns_seq_desc_stop(struct bns_seq_descriptor *out);
 /* Hadamard (unit 3) */
 /*-------------------*/
 
-/* ABI 1: 1024-element int8 blocks -> raw int32 + absmax. */
+/* ABI 1: 1024-element int8 blocks -> raw int32 + absmax. inverse: 0/1, | BNS_SEQ_HAD_HALF
+ * (ABI 1.1) for blocks of 512 on the 1,024 unit. */
+#define BNS_SEQ_HAD_HALF 2u
 int bns_seq_desc_hadamard(struct bns_seq_descriptor *out, uint32_t src, uint32_t signs,
                           uint32_t dst, uint32_t stats, uint32_t blocks, uint32_t inverse);
 
@@ -63,7 +65,9 @@ int bns_seq_desc_quantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t
                           uint32_t exponents, uint32_t elements, uint32_t blocks);
 
 /* Unit 5, needs activation_quantize ABI 1, minor >= 1: whole-vector post-Hadamard exponent
- * over ALL 1024-element blocks, before any projection K segmentation. */
+ * over ALL 1024-element blocks, before any projection K segmentation. blocks | BNS_SEQ_REQ_HALF
+ * (minor >= 2): 512-element blocks (normalization 2**-4). */
+#define BNS_SEQ_REQ_HALF (1u << 16)
 int bns_seq_desc_requantize(struct bns_seq_descriptor *out, uint32_t src, uint32_t dst,
                             uint32_t exponents, uint32_t maxima, uint32_t result_exponent,
                             uint32_t blocks);

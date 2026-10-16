@@ -137,7 +137,7 @@ def test_hadamard_block_tensors_match_the_golden():
     from model import layout
     from model.configs import BONSAI_TINY_HYBRID
     from model.tinygen import make_tiny_hybrid_tensors
-    from model.golden import hadamard_rotate
+    from model.golden import hadamard_rotate, hadamard_image_gain
     cfg   = BONSAI_TINY_HYBRID
     specs = {s.name: s for s in make_tiny_hybrid_tensors(cfg, 7)}
     rng   = np.random.default_rng(9)
@@ -152,5 +152,7 @@ def test_hadamard_block_tensors_match_the_golden():
             T = (s.get_values().astype(np.float32).reshape(B, -1, 128) - 1.0) \
                 * s.scales.astype(np.float32)[:, :, None]
             got[b*B:(b + 1)*B] = T.reshape(B, B) @ x[b*B:(b + 1)*B]
-        # fp16 holds 1/sqrt(128) to 1e-4 (the 27B's 1/32 exactly).
-        assert np.allclose(got, want, rtol=2e-3, atol=1e-3), width
+        # The image's power-of-two scale: exactly the golden's rotation times its gain
+        # (sqrt(2) for this odd 128 block, whose weights the converter folds by 2**-0.5; 1
+        # for the 27B's 1024).
+        assert np.allclose(got, want*hadamard_image_gain(B), rtol=1e-5, atol=1e-5), width

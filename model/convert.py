@@ -37,6 +37,7 @@ from model.layout import (
 from model import qformats
 from model.bons import TensorSpec, BONSReader, write_image, split_wide, _tensor_beats
 from model.golden import config_from_gguf, check_engine_support, hadamard_matrix
+from model.golden import hadamard_image_scales
 from model.gguf_reader import GGUFReader, inspect as gguf_inspect
 
 # GGUF name -> (role, replicated) ------------------------------------------------------------------
@@ -97,8 +98,8 @@ def _mb(nbytes):
 
 def _hadamard_specs(cfg):
     """PrismML's rotation as ternary tensors, one per (input width, block): rows = cols =
-    block, row i = R[i] * s[b*block + i], scale 1/sqrt(block) (exact in fp16 for a power-of-
-    two block). The runtime computes x' blockwise: block b of x' = tensor (w, b) against
+    block, row i = R[i] * s[b*block + i], scale golden.hadamard_image_scales: 1/sqrt(block) for
+    an even power of two, 2**-floor(log2(block)/2) for an odd one (exact in fp16 either way). The runtime computes x' blockwise: block b of x' = tensor (w, b) against
     x[b*block : (b+1)*block] - one engine matvec per block with the x slice as its input,
     the tensor sharded over the channels like any other. Entry layer = width index * 256 +
     block index (layout.hadamard_layer); the widths are listed in the header."""
@@ -109,8 +110,8 @@ def _hadamard_specs(cfg):
         s = np.asarray(cfg.hadamard_signs[width], dtype=np.float32)
         for b in range(width//block):
             codes  = (R*s[b*block:(b + 1)*block][None, :] + 1).astype(np.uint8)
-            scales = np.full((block, block//layout.GROUP_TERNARY), 1.0/np.sqrt(float(block)),
-                             np.float16)
+            scales = np.full((block, block//layout.GROUP_TERNARY),
+                             hadamard_image_scales(block)[0], np.float16)
             specs.append(TensorSpec(f"had.{width}.{b}", ROLE_HADAMARD, layout.hadamard_layer(wi, b),
                                     KIND_TERNARY, block, block, scales=scales, values=codes,
                                     flags=0))
@@ -231,6 +232,16 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
 
     specs = [_spec_from_gguf(reader, name, n_channels, vocab_pad) for name in names]
     if cfg.hadamard_block:
+        # An odd power-of-two block (the 2B/4B's 512): the rotation tensors carry 2**-4, not
+        # 2**-4.5, so every rotated ternary tensor - each projection, the LM head and the
+        # token table (its rows are restored through the same rotation) - takes the 2**-0.5.
+        fold = hadamard_image_scales(cfg.hadamard_block)[1]
+        if fold != 1.0:
+            for spec in specs:
+                if spec.kind == KIND_TERNARY:
+                    spec.scales = (spec.scales.astype(np.float32)*np.float32(fold)).astype(np.float16)
+            print(f"  hadamard block {cfg.hadamard_block}: rotation 2**-{(cfg.hadamard_block.bit_length() - 1)//2}, "
+                  f"weights x 2**-0.5")
         specs += _hadamard_specs(cfg)
     # Matvecs wider than one engine op (the 27B's FFN down projection, K = 17408) become
     # K-segments the firmware sums (layout.FLAG_KSEG).

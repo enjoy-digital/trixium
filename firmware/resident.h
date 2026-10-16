@@ -170,6 +170,7 @@ struct resident_state {
     uint8_t gate_ready, gate_set;   // gate_set: the sigmoid is resident in table set 1 (ABI 1.3)
     uint32_t gate_fixups;
     const void *keep_dst;           // resident_keep_rsf
+    uint8_t half;                   // The image's block is half the unit's (512 on 1,024).
 };
 struct resident_state *resident_state(void);
 void resident_stats_reset(void);

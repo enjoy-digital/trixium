@@ -43,7 +43,7 @@ int bns_seq_desc_hadamard(struct bns_seq_descriptor *out, uint32_t src, uint32_t
 {
     struct bns_seq_descriptor d = {{0}};
     if (!out || !sp_address(src, 32) || !sp_address(signs, 32) || !sp_address(dst, 32)
-        || !sp_address(stats, 32) || !count16(blocks) || inverse > 1)
+        || !sp_address(stats, 32) || !count16(blocks) || inverse > (1u | BNS_SEQ_HAD_HALF))
         return BNS_SEQ_DESC_INVALID;
     d.word[0] = 3;
     d.word[1] = src;
@@ -82,7 +82,8 @@ int bns_seq_desc_requantize(struct bns_seq_descriptor *out, uint32_t src, uint32
 {
     struct bns_seq_descriptor d = {{0}};
     if (!out || !sp_address(src, 32) || !sp_address(dst, 32) || !sp_address(exponents, 32)
-        || !sp_address(maxima, 32) || !sp_address(result_exponent, 32) || !count16(blocks))
+        || !sp_address(maxima, 32) || !sp_address(result_exponent, 32)
+        || !count16(blocks & ~BNS_SEQ_REQ_HALF) || blocks > (BNS_SEQ_REQ_HALF | 0xffffu))
         return BNS_SEQ_DESC_INVALID;
     d.word[0] = 5;
     d.word[1] = src;
