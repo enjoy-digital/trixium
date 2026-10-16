@@ -63,7 +63,7 @@ from litedram.modules import MT40A512M8
 from litedram.phy.model import SDRAMPHYModel
 
 from trixium_ypcb import YPCBDDR3, DDR3_CL, DDR3_CWL, ddr_controller_settings
-from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS, YPCB_HYBRID_UNIT_OPTIONS
+from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS, YPCB_HYBRID_UNIT_OPTIONS, YPCB_HYBRID_ATTN
 
 from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
@@ -682,8 +682,8 @@ BOARDS = {
 # as trixium_ypcb.py's YPCB_HYBRID_UNIT_OPTIONS (the K7-480T's area: RoPE on the CPU, narrower
 # Hadamard and SiLU units).
 HYBRID_UNITS = dict(with_hadamard=True, with_activation_quantize=True, with_projection_restore=True,
-    with_silu=True, with_norm=True, with_conv=True, with_dnstream=True, attn_geometry=(8, 2, 128, 256),
-    unit_options=YPCB_HYBRID_UNIT_OPTIONS)
+    with_silu=True, with_norm=True, with_conv=True, with_dnstream=True,
+    attn_geometry=YPCB_HYBRID_ATTN + (128, 256), unit_options=YPCB_HYBRID_UNIT_OPTIONS)
 
 # The image each board's simulation bakes in by default (--image).
 DEFAULT_IMAGES = {

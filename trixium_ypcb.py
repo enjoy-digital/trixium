@@ -65,10 +65,15 @@ from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 ENGINE_RMW = True
 
 # --hybrid unit sizing for the K7-480T (out-of-context LUTs, K7 -2): unit 12 without its RoPE stage
-# (the CPU rotates the 2B's 6 attention layers' q/k; ~half of its 41k), unit 1 at 16 lanes (6.7k
-# against 14.3k at 32, ~2x the clocks per block) and unit 11 at 2 ways (4.6k against 7.0k). With
-# every unit at the XCU1525's sizes the 4-channel SoC is 325k of 298.6k LUTs.
-YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", False), ("hadamard_lanes", 16), ("silu_ways", 2))
+# (the CPU rotates the attention layers' q/k; ~half of its 41k), unit 1 at 8 lanes (3.5k against
+# 14.3k at 32, ~4x the clocks per block) and unit 11 at 2 ways (4.6k against 7.0k). With every unit
+# at the XCU1525's sizes the 4-channel SoC is 325k of 298.6k LUTs; with these and an 8/2 attention
+# stream 258k placed, but 55k sys endpoints failed (WNS -3.9 ns at 127 MHz: arbiter grant chains
+# across the scratchpad clients, and long routes in the full die).
+YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", False), ("hadamard_lanes", 8), ("silu_ways", 2))
+# The attention stream: 4 lanes, 1 kv group (17k LUTs against 33k at 8/2): the 2B's 8/2 and the
+# 4B's 16/4 run as one command per kv head (TRIXIUM_ATTN_KV_SLICE), K/V streamed once per slice.
+YPCB_HYBRID_ATTN = (4, 1)
 
 # DDR3 ---------------------------------------------------------------------------------------------
 
@@ -166,7 +171,7 @@ class TriXiumYPCBSoC(SoCCore):
         prefetch       = 2048,
         vec_fused      = True,
         hybrid         = False,
-        attn_geometry  = (8, 2, 256, 2048),
+        attn_geometry  = YPCB_HYBRID_ATTN + (256, 2048),
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -255,8 +260,8 @@ class TriXiumYPCBSoC(SoCCore):
         # Core: engine, sequencer and vector unit (the Qwen3 path needs no scratchpad unit).
         # --hybrid: also the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B, which fit the 4 GB):
         # every scratchpad unit (sized by YPCB_HYBRID_UNIT_OPTIONS), the DeltaNet stream, and the
-        # attention stream at the 2B's geometry (8 query heads, 2 kv heads, head_dim 256; the
-        # 4B's 16/4 needs 16 lanes, 33k LUTs more; context up to attn_geometry[3] positions).
+        # attention stream at YPCB_HYBRID_ATTN (head_dim up to 256, context up to
+        # attn_geometry[3] positions; wider models in kv-head slices).
         units = {}
         if hybrid:
             units = dict(
