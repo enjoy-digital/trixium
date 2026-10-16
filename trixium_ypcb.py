@@ -159,6 +159,8 @@ class TriXiumYPCBSoC(SoCCore):
         trit5          = True,
         prefetch       = 2048,
         vec_fused      = True,
+        hybrid         = False,
+        attn_geometry  = (16, 4, 256, 2048),
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -245,7 +247,24 @@ class TriXiumYPCBSoC(SoCCore):
         assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000
 
         # Core: engine, sequencer and vector unit (the Qwen3 path needs no scratchpad unit).
-        config = TriXiumConfig(scratchpad_xpm=True,
+        # --hybrid: also the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B, which fit the 4 GB):
+        # every scratchpad unit, the DeltaNet stream, and the attention stream at the Bonsai 2
+        # small models' geometry (16 query heads, 4 kv heads, head_dim 256: the 2B's 8/2 run on
+        # it too; attention context up to attn_geometry[3] positions).
+        units = {}
+        if hybrid:
+            units = dict(
+                with_hadamard            = True,
+                with_activation_quantize = True,
+                with_projection_restore  = True,
+                with_silu                = True,
+                with_norm                = True,
+                with_conv                = True,
+                with_dnstream            = True,
+                with_attnstream          = True,
+                attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
+                    (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3]))))
+        config = TriXiumConfig(scratchpad_xpm=True, **units,
             chan_stride = chan_stride,
             chan_mod    = chan_mod,
             chan_skew   = chan_skew,
@@ -319,6 +338,7 @@ class TriXiumYPCBSoC(SoCCore):
 # (cache maintenance) and Zbb (clz).
 VEXII_ARGS = ("--fetch-l1-ways=4 --fetch-l1-sets=128 --lsu-l1-ways=4 --lsu-l1-sets=128 "
     "--with-btb --with-ras --with-gshare --with-rvZcbm --with-rvZbb")
+VEXII_ARGS_HYBRID = VEXII_ARGS + " --with-rvf" # The hybrid forward's CPU share is FP32.
 
 def main():
     # VexiiRiscv's netlist cache key must not depend on set ordering: hash randomization is
@@ -342,13 +362,15 @@ def main():
     parser.add_target_argument("--vec-fused",          action=argparse.BooleanOptionalAction, default=True,  help="Vector unit with the fused clamp/round instructions.")
     parser.add_target_argument("--ddr-ecc",            action=argparse.BooleanOptionalAction, default=True,  help="DDR3 ECC: SECDED on each channel's ninth byte lane (the default; corrects the rare read errors under full streaming).")
     parser.add_target_argument("--ddr-ibuf-low-power", action="store_true",                                   help="DQ/DQS input buffers in low-power mode (Vivado's default; not for sustained reads).")
+    parser.add_target_argument("--hybrid",             action="store_true",                                   help="With the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B: DeltaNet/attention streams, FWHT, ...) and a CPU FPU.")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
     parser.set_defaults(
         cpu_type                             = "vexiiriscv",
         update_repo                          = "no",
-        vexii_args                           = VEXII_ARGS,
+        # LiteX applies the CPU arguments inside parse_args: pick the FPU variant up front.
+        vexii_args                           = VEXII_ARGS_HYBRID if "--hybrid" in sys.argv else VEXII_ARGS,
         vivado_synth_directive               = "PerformanceOptimized",
         vivado_opt_directive                 = "ExploreWithRemap",
         vivado_place_directive               = "ExtraTimingOpt",
@@ -372,6 +394,7 @@ def main():
         chan_stride        = args.chan_stride,
         ddr_ibuf_hp        = not args.ddr_ibuf_low_power,
         ddr_ecc            = args.ddr_ecc,
+        hybrid             = args.hybrid,
         **parser.soc_argdict)
     add_zbb_constant(soc, args)
 
