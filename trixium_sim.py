@@ -603,7 +603,9 @@ def ddr3_bank_inits(content, size):
     module = sim_ddr3(size)(DDR3_SIM_FREQ, "1:4")
     nbanks = 2**module.geom_settings.bankbits
     col    = 2**module.geom_settings.colbits*8//64 # 512-bit words per bank row.
-    n      = -(-len(content)//64)                  # The model stops at the content's end.
+    # The model stops at the content's end, padded as SDRAMPHYModel pads its init: to a multiple
+    # of data_width_bytes 32-bit words (64 words = 256 bytes = four 512-bit words here).
+    n      = -(-len(content)//256)*4
     inits  = []
     for b, words in enumerate(bank_words(content, module)):
         keep = sum(max(0, min(col, n - (r*nbanks + b)*col)) for r in range(len(words)//col))
