@@ -18,6 +18,7 @@ setup(
     long_description = open("README.md", encoding="utf-8").read(),
     long_description_content_type = "text/markdown",
     author           = "Enjoy-Digital",
+    url              = "https://github.com/enjoy-digital/trixium",
     license          = "BSD-2-Clause",
     python_requires  = ">=3.10",
     install_requires = ["numpy", "tokenizers", "pyserial", "huggingface_hub"],
