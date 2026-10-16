@@ -73,7 +73,9 @@ def _delay(module, value, cycles, name, reset_less=True):
 
 class NormScratchpad(LiteXModule):
     """Resident RMSNorm / L2 norm with optional RoPE (see the module docstring)."""
-    def __init__(self, scratchpad_size=256*1024):
+    def __init__(self, scratchpad_size=256*1024, with_rope=True):
+        # with_rope=False: no RoPE stage (its 32 multipliers and 16 adders, about half the
+        # unit); a command with rope_hb != 0 is then a geometry error (ABI 1.1).
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be aligned within the 13-bit client "
                              "address space")
@@ -115,7 +117,7 @@ class NormScratchpad(LiteXModule):
             ends["dst"].eq(cap["dst"] + d_span),
             ends["weight"].eq(cap["weight"] + seg_bytes),
             geometry_bad.eq((cap["n"][:3] != 0) | (cap["n"] == 0) | (cap["n"] > WMAX) |
-                            (cap["rope_hb"] > HB_MAX) | ((cap["rope_hb"] << 1) > nbeats) |
+                            (cap["rope_hb"] > (HB_MAX if with_rope else 0)) | ((cap["rope_hb"] << 1) > nbeats) |
                             (s_stride < nbeats) | (d_stride < nbeats) |
                             (cap["nseg"] == 0) | (cap["src"][:5] != 0) | (cap["dst"][:5] != 0) |
                             (rms & (cap["weight"][:5] != 0)) |
@@ -199,7 +201,7 @@ class NormScratchpad(LiteXModule):
         after2 = Signal()        # a RoPE second-half beat issued last clock: it writes two beats
         self.comb += can_p2.eq((ofifo.level + inflight) < FIFO_DEPTH)
         self.comb += [
-            rope.eq(hb != 0),
+            rope.eq((hb != 0) if with_rope else 0),
             issue_w.eq(~self.cancel & (state == S["WLOAD"]) & (beat < nbeats)),
             issue_t.eq(~self.cancel & (state == S["TLOAD"]) & (beat < (hb << 1))),
             issue_b.eq(run & (b_st == B["P2"]) & (beat_b < nbeats) & can_p2 & ~after2),

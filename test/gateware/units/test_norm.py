@@ -194,3 +194,31 @@ def test_rope_after_the_norm_equals_the_firmware(tmp_path, binary):
     print("\n".join(lines))
     bad = np.nonzero(got != want)[0]
     assert not len(bad), [(hex(4*i), hex(int(got[i])), hex(int(want[i]))) for i in bad[:12]]
+
+
+def test_without_rope_norms_unchanged_and_rope_rejected(tmp_path):
+    """with_rope=False (small FPGAs, norm ABI 1.1): the norms stay bit-exact, any command
+    with rope_hb != 0 is a geometry error and leaves its output untouched."""
+    binary = build_client(lambda: NormScratchpad(SIZE, with_rope=False), NORM_COMMAND, "norm_sp",
+                          key=f"NormScratchpad({SIZE}, with_rope=False)")
+    rng = np.random.default_rng(47)
+    mem = rng.integers(0, 1 << 32, SIZE//4, dtype=np.uint64).astype(np.uint32)
+    def put(addr, values):
+        mem[addr//4:addr//4 + len(values)] = np.asarray(values, f32).view(np.uint32)
+    put(0x00000, np.concatenate([activations(rng, 256, "normal") for _ in range(8)]))
+    put(0x18000, rng.normal(1, 0.3, 256))
+    put(0x20000, np.concatenate([activations(rng, 128, "normal") for _ in range(16)]))
+    put(0x3E000, rng.uniform(-1, 1, 64))
+    cmds = [
+        (command(OP_RMS, 0x00000, 0x08000, 256, 8, weight=0x18000), 0),
+        (command(OP_L2, 0x20000, 0x24000, 128, 16), 0),
+        (command(OP_RMS, 0x00000, 0x10000, 256, 8, weight=0x18000, rope_hb=4, rope_tab=0x3E000//32), 1),
+    ]
+    want = mem.copy()
+    for c, err in cmds:
+        if not err:
+            reference(want, c)
+    got, lines = run_client(binary, NORM_COMMAND, mem, cmds, tmp_path)
+    print("\n".join(lines))
+    bad = np.nonzero(got != want)[0]
+    assert not len(bad), [(hex(4*i), hex(int(got[i])), hex(int(want[i]))) for i in bad[:12]]

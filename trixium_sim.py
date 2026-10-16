@@ -63,7 +63,7 @@ from litedram.modules import MT40A512M8
 from litedram.phy.model import SDRAMPHYModel
 
 from trixium_ypcb import YPCBDDR3, DDR3_CL, DDR3_CWL, ddr_controller_settings
-from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS
+from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS, YPCB_HYBRID_UNIT_OPTIONS
 
 from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
@@ -334,7 +334,8 @@ class TriXiumSimSoC(SoCCore):
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
-                 ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False):
+                 ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False,
+                 unit_options=()):
         assert mem in ("hbm", "ddr4", "ddr3")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
@@ -460,7 +461,8 @@ class TriXiumSimSoC(SoCCore):
                 e["kind"] == KIND_TERNARY5 for e in img.entries),
             attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
-                if attn_geometry else ())
+                if attn_geometry else (),
+            **dict(unit_options)) # Unit sizing (TriXiumConfig fields), as the board target's.
         self.trixium = TriXiumCore(memory_ports, config)
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
@@ -674,9 +676,12 @@ BOARDS = {
 
 # --hybrid (--board ypcb): the YPCB with the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B fit its
 # 4 GB): every scratchpad unit, the DeltaNet and attention streams, and an FPU for the CPU's share
-# of the hybrid forward (the XCU1525's set; the attention stream at the tiny models' geometry).
+# of the hybrid forward (the XCU1525's set; the attention stream at the tiny models' geometry), sized
+# as trixium_ypcb.py's YPCB_HYBRID_UNIT_OPTIONS (the K7-480T's area: RoPE on the CPU, narrower
+# Hadamard and SiLU units).
 HYBRID_UNITS = dict(with_hadamard=True, with_activation_quantize=True, with_projection_restore=True,
-    with_silu=True, with_norm=True, with_conv=True, with_dnstream=True, attn_geometry=(8, 2, 128, 256))
+    with_silu=True, with_norm=True, with_conv=True, with_dnstream=True, attn_geometry=(8, 2, 128, 256),
+    unit_options=YPCB_HYBRID_UNIT_OPTIONS)
 
 # The image each board's simulation bakes in by default (--image).
 DEFAULT_IMAGES = {

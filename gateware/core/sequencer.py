@@ -112,7 +112,7 @@ class Sequencer(LiteXModule):
     """Descriptor-list executor (see the module doc for the descriptor format)."""
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False,
-                 with_conv=False, scratchpad_size=256*1024):
+                 with_conv=False, norm_rope=True, scratchpad_size=256*1024):
         extended = (with_hadamard or with_activation_quantize or with_projection_restore or
                     with_silu or with_norm or with_conv)
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024
@@ -181,7 +181,9 @@ class Sequencer(LiteXModule):
         if with_norm:
             self.norm_cmd   = stream.Endpoint(NORM_COMMAND)
             self.norm_done, self.norm_failed = Signal(), Signal(8)
-            self.norm_abi   = CSRStatus(32, reset=0x00010002, description="ABI version (16.16).")
+            # ABI 1.2: RoPE on unit 12; 1.1 without (norm_rope=False).
+            self.norm_abi   = CSRStatus(32, reset=0x00010002 if norm_rope else 0x00010001,
+                description="ABI version (16.16).")
             self.norm_error = CSRStatus(32, description=
                 "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
                 "descriptor, bits8..15 norm-client error (bit14 protects the full descriptor "

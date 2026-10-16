@@ -64,6 +64,12 @@ from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 # other half of its words (the first card run's ddrtest: half the words wrong).
 ENGINE_RMW = True
 
+# --hybrid unit sizing for the K7-480T (out-of-context LUTs, K7 -2): unit 12 without its RoPE stage
+# (the CPU rotates the 2B's 6 attention layers' q/k; ~half of its 41k), unit 1 at 16 lanes (6.7k
+# against 14.3k at 32, ~2x the clocks per block) and unit 11 at 2 ways (4.6k against 7.0k). With
+# every unit at the XCU1525's sizes the 4-channel SoC is 325k of 298.6k LUTs.
+YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", False), ("hadamard_lanes", 16), ("silu_ways", 2))
+
 # DDR3 ---------------------------------------------------------------------------------------------
 
 # DDR3-1066 bin (CL 7 / CWL 6, the timings the board's MIG project used); LiteDRAM's defaults at
@@ -160,7 +166,7 @@ class TriXiumYPCBSoC(SoCCore):
         prefetch       = 2048,
         vec_fused      = True,
         hybrid         = False,
-        attn_geometry  = (16, 4, 256, 2048),
+        attn_geometry  = (8, 2, 256, 2048),
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -248,9 +254,9 @@ class TriXiumYPCBSoC(SoCCore):
 
         # Core: engine, sequencer and vector unit (the Qwen3 path needs no scratchpad unit).
         # --hybrid: also the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B, which fit the 4 GB):
-        # every scratchpad unit, the DeltaNet stream, and the attention stream at the Bonsai 2
-        # small models' geometry (16 query heads, 4 kv heads, head_dim 256: the 2B's 8/2 run on
-        # it too; attention context up to attn_geometry[3] positions).
+        # every scratchpad unit (sized by YPCB_HYBRID_UNIT_OPTIONS), the DeltaNet stream, and the
+        # attention stream at the 2B's geometry (8 query heads, 2 kv heads, head_dim 256; the
+        # 4B's 16/4 needs 16 lanes, 33k LUTs more; context up to attn_geometry[3] positions).
         units = {}
         if hybrid:
             units = dict(
@@ -264,6 +270,8 @@ class TriXiumYPCBSoC(SoCCore):
                 with_attnstream          = True,
                 attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                     (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3]))))
+        if hybrid:
+            units.update(YPCB_HYBRID_UNIT_OPTIONS)
         config = TriXiumConfig(scratchpad_xpm=True, **units,
             chan_stride = chan_stride,
             chan_mod    = chan_mod,

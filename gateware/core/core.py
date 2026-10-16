@@ -50,6 +50,9 @@ class TriXiumConfig:
     with_silu: bool                = False
     with_norm: bool                = False
     with_conv: bool                = False
+    norm_rope: bool                = True  # Unit 12's RoPE stage (off: CPU RoPE, norm ABI 1.1).
+    hadamard_lanes: int            = 32    # Unit 1 butterflies per clock (8, 16, 32).
+    silu_ways: int                 = 4     # Unit 11 kernels in lockstep (elements per clock/2).
     scratchpad_xpm: bool           = False # Xilinx: the scratchpad as an explicit XPM block RAM.
     with_dnstream: bool            = False # Engine op 5: the DeltaNet stream unit on every channel.
     dnstream_options: tuple        = ()    # (name, value) overrides of the unit's arguments.
@@ -132,6 +135,7 @@ class TriXiumCore(LiteXModule):
                 with_silu                = config.with_silu,
                 with_norm                = config.with_norm,
                 with_conv                = config.with_conv,
+                norm_rope                = config.norm_rope,
                 scratchpad_size          = config.scratchpad_size))
             self.comb += [
                 vecunit.seq_en.eq(seq.busy),
@@ -159,7 +163,7 @@ class TriXiumCore(LiteXModule):
         extensions = []
         if config.with_hadamard:
             self.hadamard = ClockDomainsRenamer("eng")(
-                HadamardScratchpad(config.scratchpad_size))
+                HadamardScratchpad(config.scratchpad_size, lanes=config.hadamard_lanes))
             sp_clients.append(self.hadamard)
             extensions.append(("hadamard", self.hadamard))
             self.add_constant("TRIXIUM_HAS_HADAMARD")
@@ -183,13 +187,15 @@ class TriXiumCore(LiteXModule):
             ]
             self.add_constant("TRIXIUM_HAS_PROJECTION_RESTORE")
         if config.with_silu:
-            self.silu = ClockDomainsRenamer("eng")(SiluScratchpad(config.scratchpad_size))
+            self.silu = ClockDomainsRenamer("eng")(SiluScratchpad(config.scratchpad_size,
+                ways=config.silu_ways))
             sp_clients.append(self.silu)
             extensions.append(("silu", self.silu))
             self.comb += seq.silu_unit_fixups.eq(self.silu.fixups)
             self.add_constant("TRIXIUM_HAS_SILU")
         if config.with_norm:
-            self.norm = ClockDomainsRenamer("eng")(NormScratchpad(config.scratchpad_size))
+            self.norm = ClockDomainsRenamer("eng")(NormScratchpad(config.scratchpad_size,
+                with_rope=config.norm_rope))
             sp_clients.append(self.norm)
             extensions.append(("norm", self.norm))
             self.add_constant("TRIXIUM_HAS_NORM")
