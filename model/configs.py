@@ -204,6 +204,33 @@ BONSAI2_TINY = ModelConfig(
     hadamard_signs = None,   # filled by tinygen
 )
 
+# bonsai2-tiny-512: the same traits on the hardware paths - 128-wide DeltaNet heads (the
+# recurrence unit's), every rotation width a multiple of 512, the block 512 (the 2B/4B's: the
+# resident path runs it as half blocks of the 1,024 FWHT unit). n_rep 4 like the 2B (8/2).
+BONSAI2_TINY_512 = ModelConfig(
+    name           = "bonsai2-tiny-512",
+    n_layer        = 3,
+    n_embd         = 512,
+    n_head         = 4,
+    n_kv_head      = 1,
+    head_dim       = 128,
+    ffn_dim        = 1536,
+    vocab          = 512,
+    max_ctx        = 64,
+    rope_theta     = 10000000.0,
+    tie_embeddings = True,
+    layer_types    = ("deltanet", "deltanet", "attn"),
+    dn_num_v_heads = 4,
+    dn_num_k_heads = 4,
+    dn_k_head_dim  = 128,
+    dn_v_head_dim  = 128,
+    dn_conv_kernel = 4,
+    rope_dims      = 32,
+    attn_gated     = True,
+    hadamard_block = 512,
+    hadamard_signs = None,
+)
+
 # Shape-true slices: random weights at the real models' widths and head counts, a few layers and
 # a truncated vocabulary, for the board-timing simulation (trixium_sim.py --board-timing): the
 # per-layer cycles are the board's, the full model is extrapolated from them (doc/simulation.md).
@@ -268,5 +295,5 @@ SLICE_OF = {
 }
 
 CONFIGS = {c.name: c for c in (BONSAI_TINY, BONSAI_1P7B, BONSAI_8B, BONSAI_TINY_HYBRID,
-                               BONSAI_TINY_HYBRID_1K, BONSAI2_TINY, BONSAI_27B_SLICE, BONSAI_8B_SLICE,
+                               BONSAI_TINY_HYBRID_1K, BONSAI2_TINY, BONSAI2_TINY_512, BONSAI_27B_SLICE, BONSAI_8B_SLICE,
                                BONSAI_1P7B_SLICE)}

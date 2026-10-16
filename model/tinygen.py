@@ -30,6 +30,7 @@ from model.layout import KSEG_MAX
 from model.bons import TensorSpec, write_image, split_wide
 from model.convert import _hadamard_specs
 from model.configs import BONSAI_TINY, BONSAI_TINY_HYBRID, BONSAI_TINY_HYBRID_1K, BONSAI2_TINY
+from model.configs import BONSAI2_TINY_512
 from model.configs import CONFIGS, SLICE_OF
 
 # Helpers ------------------------------------------------------------------------------------------

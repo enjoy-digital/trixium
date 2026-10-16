@@ -128,7 +128,7 @@ MODELS_FREE_GB = 8 # Disk guard.
 
 # The tiny random models the tests and the simulation use (seconds): (channels, config).
 TINY_MODELS = [(2, "tiny"), (4, "tiny"), (8, "tiny"), (16, "tiny"),
-               (2, "hybrid"), (8, "hybrid"), (8, "hybrid-1k"), (4, "bonsai2")]
+               (2, "hybrid"), (8, "hybrid"), (8, "hybrid-1k"), (4, "bonsai2"), (4, "bonsai2-512")]
 
 
 def cmd_models(args):
@@ -136,7 +136,8 @@ def cmd_models(args):
     if args.tiny:
         from model import tinygen
         configs = {"tiny": tinygen.BONSAI_TINY, "hybrid": tinygen.BONSAI_TINY_HYBRID,
-                   "hybrid-1k": tinygen.BONSAI_TINY_HYBRID_1K, "bonsai2": tinygen.BONSAI2_TINY}
+                   "hybrid-1k": tinygen.BONSAI_TINY_HYBRID_1K, "bonsai2": tinygen.BONSAI2_TINY,
+                   "bonsai2-512": tinygen.BONSAI2_TINY_512}
         for channels, name in TINY_MODELS:
             img, _, _ = tinygen.generate(out, channels, cfg=configs[name])
             print(img)

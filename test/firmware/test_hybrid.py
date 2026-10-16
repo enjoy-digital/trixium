@@ -21,7 +21,7 @@ from common import DATA
 
 # Tests --------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", ["bonsai-tiny-hybrid", "bonsai2-tiny"])
+@pytest.mark.parametrize("name", ["bonsai-tiny-hybrid", "bonsai2-tiny", "bonsai2-tiny-512"])
 def test_mirror_agrees_with_the_fp32_golden_on_the_tiny_hybrid(name):
     """The mirror's structure against the fp32 golden: run exact (fp32 weights, no activation
     quantization) it must reproduce the golden's tokens on the tiny hybrid model, which pins
