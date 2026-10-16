@@ -335,7 +335,7 @@ static void status(int devnum, double interval, int json)
 #else
     const char *memory = "DDR4";
     const char *peak_what = "port peak";
-#ifdef CONFIG_PLATFORM_NAME
+#if defined(CONFIG_PLATFORM_NAME) && defined(SDRAM_CONTROLLERS)
     if (strstr(CONFIG_PLATFORM_NAME, "ypcb")) {
         memory    = "DDR3-1066";
         peak_gbs  = SDRAM_CONTROLLERS*8*(3200e6/3)/1e9;
