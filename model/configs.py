@@ -206,13 +206,15 @@ BONSAI2_TINY = ModelConfig(
 
 # bonsai2-tiny-512: the same traits on the hardware paths - 128-wide DeltaNet heads (the
 # recurrence unit's), every rotation width a multiple of 512, the block 512 (the 2B/4B's: the
-# resident path runs it as half blocks of the 1,024 FWHT unit). n_rep 4 like the 2B (8/2).
+# resident path runs it as half blocks of the 1,024 FWHT unit). Attention 8/2 like the 2B (the
+# YPCB attention stream's geometry); 8 DeltaNet heads, as the resident layer's beta/alpha
+# matvecs need rows % 8 (the 2B has 16).
 BONSAI2_TINY_512 = ModelConfig(
     name           = "bonsai2-tiny-512",
     n_layer        = 3,
     n_embd         = 512,
-    n_head         = 4,
-    n_kv_head      = 1,
+    n_head         = 8,
+    n_kv_head      = 2,
     head_dim       = 128,
     ffn_dim        = 1536,
     vocab          = 512,
@@ -220,8 +222,8 @@ BONSAI2_TINY_512 = ModelConfig(
     rope_theta     = 10000000.0,
     tie_embeddings = True,
     layer_types    = ("deltanet", "deltanet", "attn"),
-    dn_num_v_heads = 4,
-    dn_num_k_heads = 4,
+    dn_num_v_heads = 8,
+    dn_num_k_heads = 8,
     dn_k_head_dim  = 128,
     dn_v_head_dim  = 128,
     dn_conv_kernel = 4,
