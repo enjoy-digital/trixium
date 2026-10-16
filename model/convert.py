@@ -305,7 +305,11 @@ def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=
 
     if check:
         img = BONSReader(out_path)
-        for name in ("blk.0.attn_q.weight", "blk.0.ffn_gate.weight"):
+        # Layer 0's first projection (attn_q on the Qwen3 models, the DeltaNet attn_qkv on the
+        # hybrids) and its FFN gate.
+        first = next(n for n in ("blk.0.attn_q.weight", "blk.0.attn_qkv.weight")
+                     if any(spec.name == n for spec in specs))
+        for name in (first, "blk.0.ffn_gate.weight"):
             s_img, v_img = img.tensor(name)
             # The streaming writer leaves the codes to the spec's loader.
             spec  = next(spec for spec in specs if spec.name == name)

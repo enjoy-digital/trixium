@@ -78,8 +78,12 @@ REQUIRED_CLOCKS = {
     # clk50, ddr 133.33 (and each DDR3 PHY's CLKDIV pair), the PHYs' 4x clocks, IDELAY 200; the
     # target adds its sys clock (gate(clocks=)). Reference build (strict PASS, 2026-10-11, sys
     # 125 MHz): WNS +0.001 ns, WHS +0.017 ns, 359,171 endpoints; sys 150 MHz: WNS -1.33 ns.
-    "ypcb" : (20.0, 7.5, 1.875, 5.0),
+    "ypcb" : (20.0, 5.0),
 }
+
+# Boards whose DDR clock follows the build (--ddr-clk-freq): the report must time a DDR clock P
+# and the PHYs' 4x clock P/4 (DDR3-1066: 7.5 / 1.875 ns; DDR3-933: 8.571 / 2.143 ns).
+DDR_CLOCK_PAIR = {"ypcb": (6.0, 10.0)}
 
 # Report Parsing -----------------------------------------------------------------------------------
 
@@ -138,8 +142,13 @@ def parse_clocks(path):
 def missing_clocks(path, board, clocks=()):
     """The required clock periods of `board` (and `clocks`) the report does not time."""
     periods = [p for _, p in parse_clocks(path)]
-    return [r for r in tuple(REQUIRED_CLOCKS.get(board, ())) + tuple(clocks)
-            if not any(abs(p - r) < 0.01 for p in periods)]
+    missing = [r for r in tuple(REQUIRED_CLOCKS.get(board, ())) + tuple(clocks)
+               if not any(abs(p - r) < 0.01 for p in periods)]
+    if board in DDR_CLOCK_PAIR:
+        lo, hi = DDR_CLOCK_PAIR[board]
+        if not any(lo <= p <= hi and any(abs(q - p/4) < 0.01 for q in periods) for p in periods):
+            missing.append(f"a DDR clock in [{lo}, {hi}] with its 4x clock")
+    return missing
 
 # Gates --------------------------------------------------------------------------------------------
 

@@ -154,6 +154,8 @@ COLD int quantize_f_pow2(const float *src, int n, uint32_t sp_off)
 // (position t -> channel t % n_ch, local row t / n_ch). All groups of a row share one
 // power-of-two scale 2^ek, stored as an exactly-representable fp16 ((ek+15)<<10), so the
 // engine's Q8 scale path applies it bit-exactly and the exponent algebra stays integer.
+uint32_t attn_delay = 0; // Console `attndelay`: cycles of wait before attention (diagnostic).
+int attn_fold_early = 1; // Console `foldearly`: fold heads under the list (1) or after it (0).
 static uint32_t kv_base;    // Per-channel byte address of the KV region (4 KB aligned).
 uint32_t kv_rb;      // Beats per KV row packet (cols = head_dim, Q8).
 uint32_t kv_region;  // Beats per (layer, kv-head, K|V) region.
@@ -908,6 +910,7 @@ cpu_kv_full: ;
         perf_exit(OP_KVQUANT);
 
 attn_scores: ;
+        if (attn_delay) { uint64_t t0 = perf_now64(); while (perf_now64() - t0 < attn_delay); }
         // Resident attention output: per-head int16 in SP_H + per-head value scales,
         // aligned to a common ea8 and scale8-ed into SP_X after the head loop.
         aw_hvalid = 0; // The fold starts empty for every path below (the list paths reset
@@ -941,7 +944,7 @@ attn_scores: ;
                 perf_enter(OP_WV);
                 aw_hvalid = 0;
                 for (int hh = 0; hh < n_head; hh++) {
-                    uint32_t ready = attn_fold_ready(hh, n_head), spins = 0;
+                    uint32_t ready = attn_fold_early ? attn_fold_ready(hh, n_head) : 0xFFFFFFu, spins = 0;
                     for (;;) {
                         uint32_t st = trixium_seq_status_read();
                         tprof_dcount(st);
@@ -1810,6 +1813,28 @@ static int gen_is_stop(int tok)
 
 static uint32_t gen_serial;   // Bumped per generation: a continuation must follow its own.
 static struct infer_prefill_profile last_prefill;
+
+// Diagnostic (`kvfill`): overwrite every channel's KV region with `pattern` (0: zeros, else a
+// pseudo-random stream seeded by it), so a generation's dependence on stale rows shows.
+void infer_kv_fill(uint32_t pattern)
+{
+    // Source: the KV row-packet staging (8 KB, rebuilt every forward); not SP_FET, which
+    // keeps resident norm rows across forwards.
+    volatile uint32_t *src = (volatile uint32_t *)(SCRATCHPAD_BASE + SP_KVP);
+    uint32_t x = pattern;
+    for (int i = 0; i < 0x2000/4; i++) {
+        if (pattern) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; }
+        src[i] = pattern ? x : 0;
+    }
+    uint32_t beats = (uint32_t)n_layer*n_kv_head*2*kv_region;
+    for (int c = 0; c < n_ch; c++)
+        for (uint32_t b = 0; b < beats; b += 256) {
+            uint32_t n = beats - b < 256 ? beats - b : 256;
+            engine_store((uint8_t)c, kv_base + b*32, n, SP_KVP);
+        }
+    n_pos = 0;
+    printf("KVFILL %08lx: %lu beats per channel\n", (unsigned long)pattern, (unsigned long)beats);
+}
 
 int infer_kv_resident(void)
 {

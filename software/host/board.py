@@ -303,7 +303,40 @@ def boot_xcu1525(tok, firmware):
     for k in [1, 2, 3]:
         say(f"ctrl {k}:{clean_lanes(k)}/8 lanes clean")
     grep(con(["engreset", "ddrtest"], wait=200, quiet_after=5), r"ENGRESET|DDRTEST")
-    return 0
+    # The 64-beat ddrtest misses a controller trained on a marginal spot that corrupts a fraction
+    # of its writes (2026-10-15: one controller per boot, the uploaded weights silently wrong).
+    # The deep test (destructive: before the upload) writes 512 blocks over every window; a
+    # failing controller 1..3 is retrained and retested, controller 0 (main_ram, the firmware's)
+    # cannot be retrained under the firmware: boot again.
+    return 0 if deep_test_and_retrain() else 1
+
+
+def deep_mask():
+    out  = con(["ddrdeep 512"], wait=300, quiet_after=5)
+    grep(out, r"DDRDEEP (chan .*FAIL|OK|FAIL)")
+    m = re.findall(r"DDRDEEP (?:OK|FAIL) \(failing controllers mask 0x([0-9a-f]+)\)", out)
+    return int(m[-1], 16) if m else None
+
+
+def deep_test_and_retrain(tries=3):
+    for n in range(tries + 1):
+        mask = deep_mask()
+        if mask is None:
+            say("STOP: no deep DDR test result (ddrdeep)")
+            return False
+        if mask == 0:
+            return True
+        if mask & 1:
+            say("STOP: controller 0 corrupts writes (deep test) - reboot to retrain it")
+            return False
+        if n == tries:
+            break
+        for k in [1, 2, 3]:
+            if mask & (1 << k):
+                say(f"deep test: controller {k} corrupts writes - retraining it (try {n + 1})")
+                train(k, r"FAIL|found")
+    say(f"STOP: deep DDR test still failing (mask 0x{mask:x}) after {tries} retrains")
+    return False
 
 
 def ckphase_results(text):

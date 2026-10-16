@@ -182,7 +182,7 @@ def test_board_clock_coverage(tmp_path):
     assert gate(good, strict=True, board="ypcb") == 0
     bad = tmp_path / "bad.rpt"
     bad.write_text("Design Timing Summary\n --- header ---\n" + PASS + "\n" + CLOCKS_PCIE_ONLY)
-    assert missing_clocks(bad, "ypcb") == [20.0, 7.5, 1.875, 5.0]
+    assert missing_clocks(bad, "ypcb") == [20.0, 5.0, "a DDR clock in [6.0, 10.0] with its 4x clock"]
     assert missing_clocks(good, "ypcb", clocks=[6.667]) == []
     assert missing_clocks(good, "ypcb", clocks=[8.0]) == [8.0]
     assert gate(bad, strict=True, board="ypcb") == 1

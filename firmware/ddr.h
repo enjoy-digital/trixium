@@ -14,6 +14,10 @@
 int ddr_init(int k);       // liblitedram's init/leveling on controller k (0 = the BIOS's).
 int ddr_init_all(void);    // Controllers 1..N-1.
 int ddr_boot_init(void);   // At boot: ddr_init_all() unless the BIOS levels them all.
-int ddr_test(int chan);  // Engine STORE/FETCH round trip per channel window (-1 = all).
+int ddr_test(int chan);
+uint32_t ddr_test_deep(int blocks, int chan); // Destructive deep test: failing controllers mask.
+void ddr_tap_offset(int k, int off);
+int ddr_bit_offset(int k, int dq, int off); // One DQ bit's read tap = leveled + off.
+void ddr_mode_register(int k, int mr, int value); // Diagnostic: MRS on controller k > 0. // Diagnostic: last leveling's read taps + off.  // Engine STORE/FETCH round trip per channel window (-1 = all).
 
 #endif

@@ -230,7 +230,7 @@ class _DDRCSRHolder(Module):
 
 def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_size,
                                csr_window, phy_renames={"sys": "ddr"}, controller_settings=None,
-                               with_bist=False):
+                               with_bist=False, with_ecc=False):
     """Add one LiteDRAM controller per phy/module in the `ddr` domain (controller 0 carries
     main_ram). Fills soc.sdrams; returns the per-controller memory sizes.
 
@@ -240,6 +240,8 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
                          port (sdram_generator{k}/sdram_checker{k}), for the calibration's
                          traffic test; their CSR pages follow the controller's two, so
                          controller k's CSRs sit at controller 0's + k*4 pages.
+    with_ecc:            LiteDRAM's DFI ECC (SECDED on each PHY's ECC byte lane, 72-bit beats;
+                         the controllers see 64-bit beats, the calibration the raw 72).
     """
     n            = len(phys)
     holder       = _DDRCSRHolder()
@@ -249,14 +251,14 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
     for i, (phy, module) in enumerate(zip(phys, modules)):
         sfx = "" if i == 0 else str(i)
         g   = module.geom_settings
-        memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits)) *
-                            phy.settings.nranks*phy.settings.databits//8)
-        core_kwargs = {}
+        core_kwargs = {"with_ecc": True} if with_ecc else {}
         if controller_settings is not None:
             core_kwargs["controller_settings"] = controller_settings()
         core = LiteDRAMCore(phy=phy, geom_settings=module.geom_settings,
                             timing_settings=module.timing_settings, clk_freq=clk_freq,
                             **core_kwargs)
+        memory_sizes.append((1 << (g.bankbits + g.rowbits + g.colbits)) *
+                            core.controller.settings.phy.nranks*core.controller.settings.phy.databits//8)
         setattr(holder, f"ddrphy{sfx}", phy)
         setattr(holder, f"sdram{sfx}", core)
         soc.submodules += ClockDomainsRenamer(phy_renames)(phy)

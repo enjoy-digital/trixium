@@ -26,6 +26,7 @@
 """
 
 import os
+import re
 import sys
 import shlex
 import argparse
@@ -62,6 +63,16 @@ def board_windows(board, channels):
     return None, None, 0
 
 
+def image_stem(gguf_name):
+    """The image name of a GGUF: bonsai-1p7b / -8b / -27b, bonsai2-2b / -4b / -9b (Bonsai 2 small)."""
+    if "27B" in gguf_name:
+        return "bonsai-27b"
+    m = re.search(r"Bonsai-2-(\d+)B", gguf_name)
+    if m:
+        return f"bonsai2-{m.group(1)}b"
+    return "bonsai-8b" if "8B" in gguf_name else "bonsai-1p7b"
+
+
 def cmd_convert(args):
     from model.convert import convert
     if args.channels is None:
@@ -73,7 +84,7 @@ def cmd_convert(args):
     out = args.out
     if out is None:
         name = os.path.basename(args.gguf)
-        stem = "bonsai-27b" if "27B" in name else "bonsai-8b" if "8B" in name else "bonsai-1p7b"
+        stem = image_stem(name)
         out  = os.path.join(REPO, "models", "bons", f"{stem}-n{args.channels}{suffix}.img")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     tokenizer = args.tokenizer
@@ -101,10 +112,18 @@ def cmd_tokenizer(args):
 # PrismML Ternary-Bonsai models: GGUF PQ2_0 (ggml type 142: 2-bit codes + one fp16 scale per 128
 # weights, the block earlier releases shipped as "Q2_0"; the *_Q2_0_g64 files do not convert) +
 # the tokenizer/config of the matching "unpacked" repo.
+# Ternary-Bonsai-2 2B/4B/9B (Qwen3.5 hybrids, like the 27B): the dense-trit PTQ1_0 files (the same
+# weights as PQ2_0, smaller downloads); they have no "unpacked" repo, so the tokenizer comes from
+# the Qwen3.5 base model (the 27B's tokenizer too).
 MODELS = {
-    "1.7b": ("Ternary-Bonsai-1.7B", ["Ternary-Bonsai-1.7B-PQ2_0.gguf"]),
-    "8b":   ("Ternary-Bonsai-8B",   ["Ternary-Bonsai-8B-PQ2_0.gguf"]),
+    # name   GGUF repo                 files                                  tokenizer repo
+    "1.7b": ("Ternary-Bonsai-1.7B",   ["Ternary-Bonsai-1.7B-PQ2_0.gguf"],    None),
+    "8b":   ("Ternary-Bonsai-8B",     ["Ternary-Bonsai-8B-PQ2_0.gguf"],      None),
+    "2b":   ("Ternary-Bonsai-2-2B",   ["Ternary-Bonsai-2-2B-PTQ1_0.gguf"],   "Qwen/Qwen3.5-2B"),
+    "4b":   ("Ternary-Bonsai-2-4B",   ["Ternary-Bonsai-2-4B-PTQ1_0.gguf"],   "Qwen/Qwen3.5-4B"),
+    "9b":   ("Ternary-Bonsai-2-9B",   ["Ternary-Bonsai-2-9B-PTQ1_0.gguf"],   "Qwen/Qwen3.5-9B"),
 }
+DEFAULT_MODELS = ["1.7b", "8b"]
 MODELS_FREE_GB = 8 # Disk guard.
 
 # The tiny random models the tests and the simulation use (seconds): (channels, config).
@@ -128,12 +147,15 @@ def cmd_models(args):
     free = shutil.disk_usage(out).free/1e9
     if free < MODELS_FREE_GB:
         sys.exit(f"only {free:.0f} GB free in {out}, need >= {MODELS_FREE_GB} GB.")
-    for name, (repo, ggufs) in MODELS.items():
+    for name in args.names or DEFAULT_MODELS:
+        if name not in MODELS:
+            sys.exit(f"unknown model {name} (known: {', '.join(MODELS)})")
+        repo, ggufs, tokenizer_repo = MODELS[name]
         local_dir = os.path.join(out, name)
         for filename in ggufs:
             print(hf_hub_download(f"prism-ml/{repo}-gguf", filename, local_dir=local_dir))
         for filename in ["config.json", "tokenizer.json", "tokenizer_config.json"]:
-            print(hf_hub_download(f"prism-ml/{repo}-unpacked", filename, local_dir=local_dir))
+            print(hf_hub_download(tokenizer_repo or f"prism-ml/{repo}-unpacked", filename, local_dir=local_dir))
 
 
 def cmd_deploy(args):
@@ -236,7 +258,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_tokenizer)
 
     # Models.
-    p = subparsers.add_parser("models", help="Download the PrismML models (~2.6 GB) or generate the tiny test models.")
+    p = subparsers.add_parser("models", help="Download PrismML models (default: the 1.7B + 8B, ~2.6 GB) or generate the tiny test models.")
+    p.add_argument("names", nargs="*",           help=f"Models to download (default: {' '.join(DEFAULT_MODELS)}; known: {' '.join(MODELS)}).")
     p.add_argument("--tiny", action="store_true", help="Generate the tiny random models (tests, simulation) instead.")
     p.add_argument("--out",                       help="Output directory (default: models/, models/tiny/ with --tiny).")
     p.set_defaults(fn=cmd_models)

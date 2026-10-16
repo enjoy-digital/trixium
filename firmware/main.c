@@ -172,6 +172,8 @@ static void help(void)
     puts("  peek c addr       - dump one weight-memory beat of channel c via the engine (hex addr)");
     puts("  mvtest role [layer] - matvec one tensor with the test pattern, print checksum");
     puts("  mvbw role [layer] [reps] - engine streaming efficiency on one tensor");
+    puts("  mvdiff role [layer] [reps] - repeat one matvec, report the rows that change");
+    puts("  fetchtest role [layer] [reps] - re-read a tensor's weights, compare chunk checksums");
 #ifdef TRIXIUM_N_MEMCTRL
     puts("  ddrinit [k]       - re-init DDR controller k (default: 1..N-1)");
     puts("  ddrtest [c]       - engine store/fetch round trip through channel c's window (all)");
@@ -457,6 +459,234 @@ static void mvbw_cmd(char *str)
            (unsigned long)(beats*100/dt));
 }
 
+// Weight read consistency: `fetchtest <role> <layer> [reps]` fetches a tensor's beats on
+// each channel (one channel at a time, 32 KB chunks) and checksums every chunk; later passes
+// must match the first. Catches read errors ddrtest's small window does not reach.
+static void fetchtest_cmd(char *str)
+{
+    char *r = get_token(&str), *l = get_token(&str), *n = get_token(&str);
+    if (*r == 0) { puts("usage: fetchtest <role> <layer> [reps]"); return; }
+    if (model_header()->magic != BONS_MAGIC) { puts("fetchtest: no model"); return; }
+    const struct bons_entry *e = model_entry((int)strtoul(r, NULL, 0), *l ? (int)strtoul(l, NULL, 0) : 0);
+    if (!e) { puts("fetchtest: no such tensor"); return; }
+    int reps = *n ? (int)strtoul(n, NULL, 0) : 4;
+    enum { CHUNK = 1024, MAXCK = 256, DST = 0x10000, REF = 0x20000 }; // REF: 8 KB per 8 channels
+    volatile uint32_t (*ref)[MAXCK] = (volatile uint32_t (*)[MAXCK])(SCRATCHPAD_BASE + REF);
+    uint32_t beats = e->chan_len_beats, nck = (beats + CHUNK - 1)/CHUNK;
+    if (nck > MAXCK) nck = MAXCK;
+    uint32_t base = TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
+    int bad_total = 0;
+    for (int rep = 0; rep <= reps; rep++) {
+        int bad = 0;
+        for (int c = 0; c < TRIXIUM_N_CHANNELS; c++)
+            for (uint32_t k = 0; k < nck; k++) {
+                uint32_t nb = (k + 1)*CHUNK > beats ? beats - k*CHUNK : CHUNK;
+                engine_fetch(c, base + k*CHUNK*32, nb, DST);
+                uint32_t h = fnv1a((volatile uint8_t *)(SCRATCHPAD_BASE + DST), nb*32);
+                if (rep == 0) ref[c][k] = h;
+                else if (h != ref[c][k]) {
+                    if (bad < 4) printf("  pass %d chan %d chunk %lu differs\n", rep, c, (unsigned long)k);
+                    bad++;
+                }
+            }
+        bad_total += bad;
+    }
+    printf("FETCHTEST role=%u layer=%u %lu beats/channel x %d passes: %d chunk mismatches\n",
+           e->role, e->layer, (unsigned long)beats, reps, bad_total);
+}
+
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+#define BIST(k, reg) (CSR_SDRAM_##reg##_ADDR + (unsigned long)(k)*SDRAM_CSR_STRIDE)
+// Controller k's BIST checker re-reading the 32 MB that `ddrstress` wrote (background load and
+// an error count): bist_kick restarts it when done, bist_report prints the total.
+static const uint32_t bist_len = 32u << 20, bist_base = (2u << 30) - (32u << 20) - (64u << 20);
+static uint32_t bist_errs, bist_runs;
+static void bist_kick(int k)
+{
+    if (bist_runs && !csr_read_simple(BIST(k, CHECKER_DONE))) return;
+    if (bist_runs) bist_errs += csr_read_simple(BIST(k, CHECKER_ERRORS));
+    csr_write_simple(1, BIST(k, CHECKER_RESET)); csr_write_simple(0, BIST(k, CHECKER_RESET));
+    csr_write_simple(1, BIST(k, CHECKER_RANDOM));
+    csr_write_simple(bist_base, BIST(k, CHECKER_BASE));
+    csr_write_simple(bist_base + bist_len, BIST(k, CHECKER_END));
+    csr_write_simple(bist_len, BIST(k, CHECKER_LENGTH));
+    csr_write_simple(1, BIST(k, CHECKER_START));
+    bist_runs++;
+}
+static void bist_report(int k)
+{
+    while (!csr_read_simple(BIST(k, CHECKER_DONE)));
+    bist_errs += csr_read_simple(BIST(k, CHECKER_ERRORS));
+    printf("BIST ctrl %d under load: %lu runs, %lu errors\n", k, (unsigned long)bist_runs,
+           (unsigned long)bist_errs);
+    bist_errs = bist_runs = 0;
+}
+#endif
+
+// Matvec repeatability: `mvdiff <role> <layer> [reps]` runs one matvec as the reference, then
+// reps more on the same input, and reports the output rows that changed (row, old, new).
+static void mvdiff_cmd(char *str)
+{
+    char *r = get_token(&str), *l = get_token(&str), *n = get_token(&str), *m = get_token(&str);
+    if (*r == 0) { puts("usage: mvdiff <role> <layer> [reps] [mode: 1 refill x, 2 idle 2 ms, 4 zero dst]"); return; }
+    int mode = *m ? (int)strtoul(m, NULL, 0) : 0;
+    if (model_header()->magic != BONS_MAGIC) { puts("mvdiff: no model"); return; }
+    const struct bons_entry *e = model_entry((int)strtoul(r, NULL, 0), *l ? (int)strtoul(l, NULL, 0) : 0);
+    if (!e || e->rows*4 > 0x18000) { puts("mvdiff: no such tensor (or too many rows)"); return; }
+    int reps = *n ? (int)strtoul(n, NULL, 0) : 8;
+    enum { REF = 0x8000, DST = 0x20000 };
+    volatile int32_t *ref = (volatile int32_t *)(SCRATCHPAD_BASE + REF);
+    volatile int32_t *out = (volatile int32_t *)(SCRATCHPAD_BASE + DST);
+    fill_x_pattern(0, e->cols);
+    model_matvec(e, 0, REF);
+    int bad_runs = 0;
+    for (int rep = 0; rep < reps; rep++) {
+        if (mode & 4) for (uint32_t i = 0; i < e->rows; i++) out[i] = 0x5a5a5a5a;
+        if (mode & 2) { uint64_t t0 = perf_now64(); while (perf_now64() - t0 < CONFIG_CLOCK_FREQUENCY/500); }
+        if (mode & 1) fill_x_pattern(0, e->cols);
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+        if (mode & 8) bist_kick(1);
+#endif
+        model_matvec(e, 0, DST);
+        int bad = 0;
+        for (uint32_t i = 0; i < e->rows; i++)
+            if (out[i] != ref[i]) {
+                if (bad < 6) printf("  run %d row %lu: %ld -> %ld\n", rep, (unsigned long)i,
+                                    (long)ref[i], (long)out[i]);
+                bad++;
+            }
+        if (bad) { printf("  run %d: %d rows differ\n", rep, bad); bad_runs++; }
+    }
+    printf("MVDIFF role=%u layer=%u rows=%lu mode=%d: %d of %d runs differ from the first\n",
+           e->role, e->layer, (unsigned long)e->rows, mode, bad_runs, reps);
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+    if (mode & 8) bist_report(1);
+#endif
+}
+
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+// DDR read margin under load: `ddrstress <ctrl> <role> <layer> [passes]`. The controller's
+// LiteDRAM BIST writes 32 MB of random data at its top (above the weights), then its checker
+// re-reads that region in the background while the engine fetches the tensor's chunks on the
+// controller's channels; every fetch is compared word by word with a quiet fetch of the same
+// chunk, and the differing words are printed with their XOR (the failing DQ bits).
+static void ddrstress_cmd(char *str)
+{
+    char *kk = get_token(&str), *r = get_token(&str), *l = get_token(&str), *n = get_token(&str);
+    if (*kk == 0 || *r == 0) { puts("usage: ddrstress <ctrl> <role> <layer> [passes]"); return; }
+    int k = (int)strtoul(kk, NULL, 0);
+    const struct bons_entry *e = model_entry((int)strtoul(r, NULL, 0), *l ? (int)strtoul(l, NULL, 0) : 0);
+    if (!e || k < 0 || k >= SDRAM_CONTROLLERS) { puts("ddrstress: no such tensor or controller"); return; }
+    int passes = *n ? (int)strtoul(n, NULL, 0) : 4;
+    const uint32_t len = 32u << 20, base = (2u << 30) - len - (64u << 20); // controller bytes
+    csr_write_simple(1, BIST(k, GENERATOR_RESET)); csr_write_simple(0, BIST(k, GENERATOR_RESET));
+    csr_write_simple(1, BIST(k, GENERATOR_RANDOM));
+    csr_write_simple(base, BIST(k, GENERATOR_BASE));
+    csr_write_simple(base + len, BIST(k, GENERATOR_END));
+    csr_write_simple(len, BIST(k, GENERATOR_LENGTH));
+    csr_write_simple(1, BIST(k, GENERATOR_START));
+    while (!csr_read_simple(BIST(k, GENERATOR_DONE)));
+    enum { CHUNK = 1024, REF = 0x20000, DST = 0x10000 };
+    volatile uint32_t *ref = (volatile uint32_t *)(SCRATCHPAD_BASE + REF);
+    volatile uint32_t *got = (volatile uint32_t *)(SCRATCHPAD_BASE + DST);
+    uint32_t beats = e->chan_len_beats, wbase = TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
+    uint32_t bad = 0, checks = 0, bist_err = 0, bist_runs = 0;
+    uint64_t bitmask = 0;
+    int c0 = TRIXIUM_CHAN_MOD ? k*TRIXIUM_CHAN_MOD : 0, c1 = TRIXIUM_CHAN_MOD ? c0 + TRIXIUM_CHAN_MOD : TRIXIUM_N_CHANNELS;
+    for (int c = c0; c < c1; c++)
+        for (uint32_t ck = 0; ck*CHUNK < beats; ck++) {
+            uint32_t nb = (ck + 1)*CHUNK > beats ? beats - ck*CHUNK : CHUNK;
+            engine_fetch(c, wbase + ck*CHUNK*32, nb, REF);       // quiet reference
+            for (int p = 0; p < passes; p++) {
+                if (csr_read_simple(BIST(k, CHECKER_DONE)) || bist_runs == 0) {
+                    if (bist_runs) bist_err += csr_read_simple(BIST(k, CHECKER_ERRORS));
+                    csr_write_simple(1, BIST(k, CHECKER_RESET)); csr_write_simple(0, BIST(k, CHECKER_RESET));
+                    csr_write_simple(1, BIST(k, CHECKER_RANDOM));
+                    csr_write_simple(base, BIST(k, CHECKER_BASE));
+                    csr_write_simple(base + len, BIST(k, CHECKER_END));
+                    csr_write_simple(len, BIST(k, CHECKER_LENGTH));
+                    csr_write_simple(1, BIST(k, CHECKER_START));
+                    bist_runs++;
+                }
+                engine_fetch(c, wbase + ck*CHUNK*32, nb, DST);
+                checks++;
+                for (uint32_t i = 0; i < nb*8; i++)
+                    if (got[i] != ref[i]) {
+                        uint32_t x = got[i] ^ ref[i];
+                        // Word i of a 256-bit beat: the beat spans 4 DFI 64-bit words (2 per
+                        // DDR edge pair); bit b of 64-bit word w = DQ b.
+                        bitmask |= (uint64_t)x << (32*(i & 1));
+                        if (bad < 12) printf("  chan %d chunk %lu word %lu: %08lx ^ %08lx\n", c,
+                                             (unsigned long)ck, (unsigned long)i, (unsigned long)ref[i], (unsigned long)x);
+                        bad++;
+                    }
+            }
+        }
+    while (!csr_read_simple(BIST(k, CHECKER_DONE)));
+    bist_err += csr_read_simple(BIST(k, CHECKER_ERRORS));
+    printf("DDRSTRESS ctrl %d: %lu fetches, %lu bad words, DQ mask %08lx%08lx; BIST %lu runs, %lu errors\n",
+           k, (unsigned long)checks, (unsigned long)bad, (unsigned long)(bitmask >> 32),
+           (unsigned long)bitmask, (unsigned long)bist_runs, (unsigned long)bist_err);
+}
+#endif
+
+// `mvdump <role> <layer>`: one matvec on the self-test input, every output row in hex (16 per
+// line), to compare boards row by row.
+static void mvdump_cmd(char *str)
+{
+    char *r = get_token(&str), *l = get_token(&str);
+    const struct bons_entry *e = (*r && model_header()->magic == BONS_MAGIC) ?
+        model_entry((int)strtoul(r, NULL, 0), *l ? (int)strtoul(l, NULL, 0) : 0) : 0;
+    if (!e || e->rows*4 > 0x18000) { puts("usage: mvdump <role> <layer> (a loaded matvec tensor)"); return; }
+    fill_x_pattern(0, e->cols);
+    model_matvec(e, 0, 0x8000);
+    volatile uint32_t *out = (volatile uint32_t *)(SCRATCHPAD_BASE + 0x8000);
+    for (uint32_t i = 0; i < e->rows; i++)
+        printf("%08lx%c", (unsigned long)out[i], (i % 16 == 15) ? '\n' : ' ');
+    printf("MVDUMP role=%u layer=%u rows=%lu\n", e->role, e->layer, (unsigned long)e->rows);
+}
+
+// `wsum <role> <layer>`: FNV-1a of the tensor's bytes on every channel (fetched in 32 KB
+// chunks), to compare with the image file (the weights as they are in memory).
+static void wsum_cmd(char *str)
+{
+    char *r = get_token(&str), *l = get_token(&str);
+    const struct bons_entry *e = (*r && model_header()->magic == BONS_MAGIC) ?
+        model_entry((int)strtoul(r, NULL, 0), *l ? (int)strtoul(l, NULL, 0) : 0) : 0;
+    if (!e) { puts("usage: wsum <role> <layer> (a loaded tensor)"); return; }
+    uint32_t beats = e->chan_len_beats, base = TRIXIUM_CHAN_WEIGHT_BASE + e->chan_base_beats*32;
+    printf("WSUM role=%u layer=%u beats=%lu:", e->role, e->layer, (unsigned long)beats);
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        uint32_t h = 2166136261u;
+        for (uint32_t b = 0; b < beats; b += 1024) {
+            uint32_t n = beats - b < 1024 ? beats - b : 1024;
+            engine_fetch(c, base + b*32, n, 0x10000);
+            volatile uint8_t *d = (volatile uint8_t *)(SCRATCHPAD_BASE + 0x10000);
+            for (uint32_t i = 0; i < n*32; i++) { h ^= d[i]; h *= 16777619u; }
+        }
+        printf(" %08lx", (unsigned long)h);
+    }
+    printf("\n");
+}
+
+// `chdump <chan> <beat> [n]`: n beats (default 1, max 64) of a channel's weight window from
+// payload beat `beat`, as 8 words each - the raw memory behind wsum.
+static void chdump_cmd(char *str)
+{
+    char *c = get_token(&str), *b = get_token(&str), *nn = get_token(&str);
+    if (*c == 0 || *b == 0) { puts("usage: chdump <chan> <beat> [n]"); return; }
+    int ch = (int)strtoul(c, NULL, 0);
+    uint32_t beat = (uint32_t)strtoul(b, NULL, 0), n = *nn ? (uint32_t)strtoul(nn, NULL, 0) : 1;
+    if (n > 64) n = 64;
+    engine_fetch(ch, TRIXIUM_CHAN_WEIGHT_BASE + beat*32, n, 0x10000);
+    volatile uint32_t *d = (volatile uint32_t *)(SCRATCHPAD_BASE + 0x10000);
+    for (uint32_t i = 0; i < n; i++) {
+        printf("CH%d %lu:", ch, (unsigned long)(beat + i));
+        for (int w = 0; w < 8; w++) printf(" %08lx", (unsigned long)d[8*i + w]);
+        printf("\n");
+    }
+}
+
 static int parse_int(const char *s)
 {
     int v = 0;
@@ -636,6 +866,84 @@ static void console_service(void)
         mvtest_cmd(str);
     else if (strcmp(token, "mvbw") == 0)
         mvbw_cmd(str);
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+    else if (strcmp(token, "ddrstress") == 0)
+        ddrstress_cmd(str);
+#endif
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+    else if (strcmp(token, "bistload") == 0) { // bistload <k> <runs>: the BIST alone, no engine
+        char *kk = get_token(&str), *nn = get_token(&str);
+        int k = (int)strtoul(kk, NULL, 0), runs = *nn ? (int)strtoul(nn, NULL, 0) : 16;
+        for (int i = 0; i < runs; i++) {
+            bist_kick(k);
+            while (!csr_read_simple(BIST(k, CHECKER_DONE)));
+        }
+        bist_report(k);
+    }
+#endif
+#if defined(SDRAM_CSR_STRIDE)
+    else if (strcmp(token, "ddrmr") == 0) { // ddrmr <k> <mr> <value>
+        char *kk = get_token(&str), *m = get_token(&str), *v = get_token(&str);
+        ddr_mode_register((int)strtoul(kk, NULL, 0), (int)strtoul(m, NULL, 0), (int)strtoul(v, NULL, 0));
+    }
+    else if (strcmp(token, "ddrbit") == 0) { // ddrbit <k> <dq> <off>
+        char *kk = get_token(&str), *d = get_token(&str), *o = get_token(&str);
+        int off = *o == '-' ? -(int)strtoul(o + 1, NULL, 0) : (int)strtoul(o, NULL, 0);
+        int t = ddr_bit_offset((int)strtoul(kk, NULL, 0), (int)strtoul(d, NULL, 0), off);
+        printf("DDRBIT ctrl %s dq %s off %+d -> tap %d\n", kk, d, off, t);
+    }
+    else if (strcmp(token, "ddrtap") == 0) {
+        char *kk = get_token(&str), *o = get_token(&str);
+        ddr_tap_offset((int)strtoul(kk, NULL, 0), *o == '-' ? -(int)strtoul(o + 1, NULL, 0) : (int)strtoul(o, NULL, 0));
+    }
+#endif
+    else if (strcmp(token, "attndelay") == 0) {
+        extern uint32_t attn_delay;
+        char *v = get_token(&str);
+        if (*v) attn_delay = (uint32_t)strtoul(v, NULL, 0);
+        printf("ATTNDELAY %lu\n", (unsigned long)attn_delay);
+    }
+    else if (strcmp(token, "kvfill") == 0) {
+        extern void infer_kv_fill(uint32_t pattern);
+        char *v = get_token(&str);
+        infer_kv_fill(*v ? (uint32_t)strtoul(v, NULL, 0) : 0);
+    }
+    else if (strcmp(token, "foldearly") == 0) {
+        extern int attn_fold_early;
+        char *v = get_token(&str);
+        if (*v) attn_fold_early = (int)strtoul(v, NULL, 0);
+        printf("FOLDEARLY %d\n", attn_fold_early);
+    }
+    else if (strcmp(token, "chdump") == 0)
+        chdump_cmd(str);
+    else if (strcmp(token, "wsum") == 0)
+        wsum_cmd(str);
+#if defined(CSR_SDRAM_ECC_BITSEL_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
+    else if (strcmp(token, "eccbits") == 0) { // eccbits [clear]: ECC counters, per DQ bit
+        char *c = get_token(&str);
+        for (int k = 0; k < SDRAM_CONTROLLERS; k++) {
+            unsigned long st = (unsigned long)k*SDRAM_CSR_STRIDE;
+            if (c && strcmp(c, "clear") == 0) { csr_write_simple(1, CSR_SDRAM_ECC_CLEAR_ADDR + st); continue; }
+            printf("ECC ctrl %d: %lu corrected, %lu uncorrectable; per DQ (nonzero):", k,
+                   (unsigned long)csr_read_simple(CSR_SDRAM_ECC_SEC_ADDR + st),
+                   (unsigned long)csr_read_simple(CSR_SDRAM_ECC_DED_ADDR + st));
+            for (int b = 0; b < 72; b++) {
+                csr_write_simple(b, CSR_SDRAM_ECC_BITSEL_ADDR + st);
+                (void)csr_read_simple(CSR_SDRAM_ECC_BITCNT_ADDR + st); // registered mux: settle
+                uint32_t n = csr_read_simple(CSR_SDRAM_ECC_BITCNT_ADDR + st);
+                if (n) printf(" %s%d:%lu", b >= 64 ? "E" : "", b >= 64 ? b - 64 : b, (unsigned long)n);
+            }
+            printf("\n");
+        }
+        if (c && strcmp(c, "clear") == 0) puts("ECC counters cleared");
+    }
+#endif
+    else if (strcmp(token, "mvdump") == 0)
+        mvdump_cmd(str);
+    else if (strcmp(token, "mvdiff") == 0)
+        mvdiff_cmd(str);
+    else if (strcmp(token, "fetchtest") == 0)
+        fetchtest_cmd(str);
     else if (strcmp(token, "selftest") == 0)
         selftest();
     else if (strcmp(token, "gen") == 0)
@@ -668,6 +976,9 @@ static void console_service(void)
     } else if (strcmp(token, "ddrtest") == 0) {
         char *arg = get_token(&str);
         ddr_test((arg && *arg) ? parse_int(arg) : -1);
+    } else if (strcmp(token, "ddrdeep") == 0) { // ddrdeep <blocks> [chan]: destructive
+        char *b = get_token(&str), *c = get_token(&str);
+        ddr_test_deep((b && *b) ? parse_int(b) : 256, (c && *c) ? parse_int(c) : -1);
     }
 #endif
     else if (strcmp(token, "wedge") == 0) {

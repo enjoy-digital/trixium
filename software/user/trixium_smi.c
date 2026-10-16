@@ -309,6 +309,13 @@ static void status(int devnum, double interval, int json)
     status_sample(fd, &s0);
     usleep((useconds_t)(interval*1e6));
     status_sample(fd, &s1);
+#if defined(CSR_SDRAM_ECC_SEC_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
+    uint32_t ecc_sec[SDRAM_CONTROLLERS], ecc_ded[SDRAM_CONTROLLERS];
+    for (int k = 0; k < SDRAM_CONTROLLERS; k++) {
+        ecc_sec[k] = litepcie_readl(fd, CSR_SDRAM_ECC_SEC_ADDR + k*SDRAM_CSR_STRIDE);
+        ecc_ded[k] = litepcie_readl(fd, CSR_SDRAM_ECC_DED_ADDR + k*SDRAM_CSR_STRIDE);
+    }
+#endif
     close(fd);
     double   dt     = s1.time - s0.time;
     uint32_t cycles = s1.cyc_total - s0.cyc_total;
@@ -427,6 +434,20 @@ static void status(int devnum, double interval, int json)
         status_line("%s", row);
     }
 
+#if defined(CSR_SDRAM_ECC_SEC_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
+    {
+        /* DDR ECC (SECDED on the ECC byte lane): read cycles with a corrected single-bit
+         * error / an uncorrectable double-bit error, per controller, since its leveling. */
+        char row[256] = "", cell[64];
+        for (int k = 0; k < SDRAM_CONTROLLERS; k++) {
+            uint32_t sec = ecc_sec[k], ded = ecc_ded[k];
+            snprintf(cell, sizeof(cell), "%sctrl %d: %u corrected, %u uncorrectable", k ? "   " : "",
+                     k, sec, ded);
+            strcat(row, cell);
+        }
+        status_line("ECC     %s", row);
+    }
+#endif
     status_head("Model", 0);
     if (has_load) {
         const char *name = strrchr(image, '/');

@@ -149,6 +149,8 @@ DDR_MMCM_LOCS = ["MMCME2_ADV_X0Y2", "MMCME2_ADV_X0Y6"]
 class TriXiumYPCBSoC(SoCCore):
     def __init__(self, sys_clk_freq=125e6, ddr_clk_freq=400e6/3, engine_channels=8,
         main_ram_size  = 0x1000_0000,
+        ddr_ibuf_hp    = True,
+        ddr_ecc        = True,
         chan_stride    = None,
         chan_skew      = None,
         read_time      = 256,
@@ -184,7 +186,7 @@ class TriXiumYPCBSoC(SoCCore):
         self.sdrams = []
         self.add_ddr_controllers(platform, ddram_channels, ddr_clk_freq, main_ram_size,
             kwargs.get("l2_size", 8192),
-            ddr_controller_settings(read_time, write_time, refresh_postponing))
+            ddr_controller_settings(read_time, write_time, refresh_postponing), ddr_ibuf_hp, ddr_ecc)
         set_main_ram_executable(self)
 
         # TriXium Memory Ports ---------------------------------------------------------------------
@@ -281,14 +283,15 @@ class TriXiumYPCBSoC(SoCCore):
         self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   DDR_CSR_STRIDE)
 
     def add_ddr_controllers(self, platform, n, ddr_clk_freq, main_ram_size, l2_size,
-                            controller_settings):
+                            controller_settings, ddr_ibuf_hp=True, ddr_ecc=True):
         """n K7DDRPHY (HR banks, CK phase shift) + MT41K256M8 controllers in the `ddr` domain
         (memory/ddr.py), each with a LiteDRAM BIST for the CK phase leveling's traffic test; the
         BIOS levels them all (SDRAM_CSR_STRIDE, SDRAM_CONTROLLERS)."""
         phys, modules = [], []
         for i in range(n):
             phy = K7DDRPHY(
-                pads                = PHYPadsReducer(platform.request("ddram", i), list(range(8))),
+                # ECC: all nine byte lanes (SECDED on the ninth); without, the ECC lane unused.
+                pads                = PHYPadsReducer(platform.request("ddram", i), list(range(9 if ddr_ecc else 8))),
                 memtype             = "DDR3",
                 sys_clk_freq        = ddr_clk_freq,
                 cl                  = ddr3_latencies(ddr_clk_freq)[0],
@@ -298,11 +301,15 @@ class TriXiumYPCBSoC(SoCCore):
                 name                = f"ddrphy{i}",
                 mmcm_loc            = DDR_MMCM_LOCS[i])
             phy.add_constraints(platform)
+            if ddr_ibuf_hp:
+                # Full-performance input buffers on DQ/DQS (Xilinx's MIG sets the same; the
+                # low-power default narrows the read eye under sustained reads).
+                platform.add_platform_command(f"set_property IBUF_LOW_PWR FALSE [get_ports ddram{i}_dq*]")
             phys.append(phy)
             modules.append(YPCBDDR3(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
             DDR_CSR_WINDOW, phy_renames={"sys": "ddr"}, controller_settings=controller_settings,
-            with_bist=True)
+            with_bist=True, with_ecc=ddr_ecc)
         self.add_constant("SDRAM_CSR_STRIDE",  DDR_CSR_STRIDE)
         self.add_constant("SDRAM_CONTROLLERS", n)
 
@@ -333,6 +340,8 @@ def main():
     parser.add_target_argument("--trit5",              action=argparse.BooleanOptionalAction, default=True,  help="Unpackers for 5-trits-per-byte weights (the default; --no-trit5: 2-bit images, convert --board ypcb --no-trit5).")
     parser.add_target_argument("--prefetch",           default=2048,     type=int,                            help="Weight prefetch: reader FIFO beats per channel (0: no prefetch).")
     parser.add_target_argument("--vec-fused",          action=argparse.BooleanOptionalAction, default=True,  help="Vector unit with the fused clamp/round instructions.")
+    parser.add_target_argument("--ddr-ecc",            action=argparse.BooleanOptionalAction, default=True,  help="DDR3 ECC: SECDED on each channel's ninth byte lane (the default; corrects the rare read errors under full streaming).")
+    parser.add_target_argument("--ddr-ibuf-low-power", action="store_true",                                   help="DQ/DQS input buffers in low-power mode (Vivado's default; not for sustained reads).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
@@ -361,6 +370,8 @@ def main():
         prefetch           = args.prefetch,
         vec_fused          = args.vec_fused,
         chan_stride        = args.chan_stride,
+        ddr_ibuf_hp        = not args.ddr_ibuf_low_power,
+        ddr_ecc            = args.ddr_ecc,
         **parser.soc_argdict)
     add_zbb_constant(soc, args)
 

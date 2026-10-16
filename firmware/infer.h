@@ -24,6 +24,7 @@ int  infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(i
 // call (check infer_gen_serial() has not moved), the rest is new. resident 0 = fresh.
 int  infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok));
 int  infer_kv_resident(void);       // Tokens in the KV cache after a generation (= n_pos).
+void infer_kv_fill(uint32_t pattern); // Diagnostic (`kvfill`): every channel's KV region <- pattern.
 uint32_t infer_gen_serial(void);    // Bumped by every generation.
 int  infer_context_capacity(void); // Actual allocation, not the image's requested max_ctx.
 struct infer_prefill_profile {
