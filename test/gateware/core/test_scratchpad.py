@@ -417,7 +417,7 @@ def test_overlap_fetch_under_vec(backend):
 
 @COMPILED
 def test_overlap_vec_throughput_under_stream(backend):
-    # The mechanism behind the result packer (doc/history.md, "The result packer"): with one
+    # The mechanism behind the result packer (doc/method.md, "Lessons from the climb"): with one
     # result per W-port write, a saturating plain-matvec stream held the port ~92% of the
     # time and a vector STORE was granted about one cycle in twelve - norm_i32 ran 2.9x
     # slower under the up projection than idle. This pins the property: the same

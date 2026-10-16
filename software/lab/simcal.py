@@ -36,7 +36,7 @@ from model import layout
 SYS_CLK_FREQ = 125e6
 PEAK_BYTES   = 4*64*187.5/125 # DDR4 bytes per sys clock: four x64 controllers at DDR4-1500.
 
-# XCU1525 v30b (sys 125 MHz, DDR4-1500, doc/history.md): decode cycles per token and, for the
+# XCU1525 v30b (sys 125 MHz, DDR4-1500, doc/timeline.md): decode cycles per token and, for the
 # 27B, the per-forward profile of `bench 4` (hybprof/dnprof averaged over 6 forwards, 4 of them
 # with the LM head: logits is 0.87 M per forward, 1.305 M per head).
 BOARD_V30B = {
