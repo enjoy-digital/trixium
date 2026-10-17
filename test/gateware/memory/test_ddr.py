@@ -560,8 +560,9 @@ def test_engine_port_path_read_right_after_write():
 def test_engine_port_path_without_dm(rmw):
     """The engine port path (256-bit AXI, merged reads, 512-bit controller) on a PHY model that
     drops the write masks, as the YPCB's DDR3 has no DM pins: each 256-bit beat reaches the
-    controller as a half-strobed 512-bit word, so without the bridge's read-modify-write the
-    second half's write zeroes the first (the first card run: ddrtest's even beats read 0).
+    controller as a half-strobed 512-bit word unless merged with its partner (AXIWriteMerge),
+    so without the bridge's read-modify-write a half word's write zeroes the other half (the
+    first card run: ddrtest's even beats read 0).
     With rmw every beat is where it was put, including rows that start in a word's upper
     half (KV rows of an odd number of beats)."""
     from litedram.core import LiteDRAMCore
@@ -647,7 +648,11 @@ def test_engine_port_path_without_dm(rmw):
     if rmw:
         assert all(got), f"rows read back wrong with read-modify-write: {got}"
     else:
-        assert not any(got), "a DM-less memory kept half-strobed writes: the model lets masks through"
+        # Merged writes (AXIWriteMerge): full words are right even without read-modify-write
+        # (the aligned 16-beat row); row 1 ends in a half word that row 2, starting in that
+        # word's upper half, zeroes.
+        assert got[0], "an aligned burst of full words read back wrong"
+        assert not got[1], "a DM-less memory kept half-strobed writes: the model lets masks through"
 
 # DDR CSR ------------------------------------------------------------------------------------------
 

@@ -749,27 +749,96 @@ class AXIReadMerge(LiteXModule):
             )
         )
 
+# AXIWriteMerge ------------------------------------------------------------------------------------
+
+class AXIWriteMerge(LiteXModule):
+    """A 256-bit AXI master onto a 512-bit slave with its write bursts MERGED, two beats per
+    word: AXIReadMerge's counterpart, the write channels only (aw/w/b).
+
+    LiteX's AXIUpConverter writes every narrow beat as its own half-strobed wide word. On a
+    memory without DM pins (the YPCB's DDR3) the bridge's read-modify-write then reads every
+    word before writing it: the DeltaNet stream's state write-back (half of its traffic) ran at
+    a quarter of its rate. Here a 16-beat burst becomes one wide burst of 8 or 9 words, each
+    word full-strobed except a first word entered in its upper half and a last word left in
+    its lower half. One B per burst, passed through (IDs too; one wide burst per narrow one).
+    """
+    def __init__(self, axi_from, axi_to, depth=16):
+        dw_from = len(axi_from.w.data)
+        dw_to   = len(axi_to.w.data)
+        assert dw_to == 2*dw_from, "two narrow beats per wide word"
+        sw_from = dw_from//8
+        lsb     = log2_int(sw_from)
+
+        # # #
+
+        # AW: one wide burst over the words the narrow beats touch (as AXIReadMerge's AR).
+        info = stream.SyncFIFO([("upper", 1)], depth)
+        self += info
+        aw = axi_from.aw
+        nbeats     = Signal(9)
+        first_word = Signal(len(aw.addr))
+        last_word  = Signal(len(aw.addr))
+        self.comb += [
+            nbeats.eq(aw.len + 1),
+            first_word.eq(aw.addr >> (lsb + 1)),
+            last_word.eq((aw.addr + (nbeats << lsb) - 1) >> (lsb + 1)),
+            axi_to.aw.valid.eq(aw.valid & info.sink.ready),
+            axi_to.aw.addr.eq(first_word << (lsb + 1)),
+            axi_to.aw.len.eq(last_word - first_word),
+            axi_to.aw.size.eq(log2_int(dw_to//8)),
+            axi_to.aw.burst.eq(BURST_INCR),
+            axi_to.aw.id.eq(aw.id),
+            axi_to.aw.lock.eq(aw.lock), axi_to.aw.prot.eq(aw.prot), axi_to.aw.cache.eq(aw.cache),
+            axi_to.aw.qos.eq(aw.qos), axi_to.aw.region.eq(aw.region),
+            aw.ready.eq(axi_to.aw.ready & info.sink.ready),
+            info.sink.valid.eq(aw.valid & axi_to.aw.ready),
+            info.sink.upper.eq(aw.addr[lsb]),
+        ]
+
+        # W: a lower-half beat waits in lo/lo_strb for its upper partner; a word goes out at
+        # an upper-half beat (with the waiting lower half, or none: a burst entered in the upper
+        # half) or at the burst's last beat (a lower half alone).
+        w        = axi_from.w
+        half     = Signal()        # 0: the next beat fills a lower half, 1: an upper half.
+        first    = Signal(reset=1) # At the first beat of the burst.
+        cur_half = Signal()
+        lo       = Signal(dw_from, reset_less=True)
+        lo_strb  = Signal(sw_from)
+        emit     = Signal()
+        self.comb += [
+            cur_half.eq(Mux(first & info.source.upper, 1, half)),
+            emit.eq(cur_half | w.last),
+            axi_to.w.valid.eq(w.valid & info.source.valid & emit),
+            axi_to.w.data.eq(Mux(cur_half, Cat(lo, w.data), Cat(w.data, C(0, dw_from)))),
+            axi_to.w.strb.eq(Mux(cur_half, Cat(lo_strb, w.strb), Cat(w.strb, C(0, sw_from)))),
+            axi_to.w.last.eq(w.last),
+            w.ready.eq(info.source.valid & (~emit | axi_to.w.ready)),
+            info.source.ready.eq(w.valid & w.ready & w.last),
+        ]
+        self.sync += If(w.valid & w.ready,
+            If(emit,
+                lo_strb.eq(0),
+            ).Else(
+                lo.eq(w.data),
+                lo_strb.eq(w.strb),
+            ),
+            If(w.last,
+                half.eq(0),
+                first.eq(1),
+            ).Else(
+                half.eq(~cur_half),
+                first.eq(0),
+            )
+        )
+
+        # B: one per burst, as it comes.
+        self.comb += axi_to.b.connect(axi_from.b)
+
 # AXIWide ------------------------------------------------------------------------------------------
 
 class AXIWide(LiteXModule):
-    """A 256-bit master onto a 512-bit slave: writes through LiteX's beat-wise up-converter,
-    reads merged (AXIReadMerge)."""
+    """A 256-bit master onto a 512-bit slave: reads and writes merged two beats per word
+    (AXIReadMerge, AXIWriteMerge)."""
     def __init__(self, axi_from, axi_to):
-        w_to = AXIInterface(data_width=len(axi_to.r.data), address_width=axi_to.address_width,
-                            id_width=axi_to.id_width)
-        w_from = AXIInterface(data_width=len(axi_from.r.data),
-                              address_width=axi_from.address_width,
-                              id_width=axi_from.id_width)
-        self.writes = AXIUpConverter(w_from, w_to)
         self.reads  = AXIReadMerge(axi_from, axi_to)
-        self.comb += [
-            axi_from.aw.connect(w_from.aw),
-            axi_from.w.connect(w_from.w),
-            w_from.b.connect(axi_from.b),
-            w_to.aw.connect(axi_to.aw),
-            w_to.w.connect(axi_to.w),
-            axi_to.b.connect(w_to.b),
-            # The converter's own read channels stay idle.
-            w_from.ar.valid.eq(0),
-            w_to.r.ready.eq(0),
-        ]
+        self.writes = AXIWriteMerge(axi_from, axi_to)
