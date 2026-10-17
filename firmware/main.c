@@ -935,7 +935,12 @@ static void console_service(void)
             }
             printf("\n");
         }
-        if (c && strcmp(c, "clear") == 0) puts("ECC counters cleared");
+        printf("ECC forward retries %lu, unrecovered %lu\n", (unsigned long)infer_ecc_retries,
+               (unsigned long)infer_ecc_unrecovered);
+        if (c && strcmp(c, "clear") == 0) {
+            infer_ecc_retries = infer_ecc_unrecovered = 0;
+            puts("ECC counters cleared");
+        }
     }
 #endif
     else if (strcmp(token, "mvdump") == 0)

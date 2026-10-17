@@ -61,6 +61,10 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 /* Init */
 /*------*/
 
+// The controller whose per-bit read taps the `ckphase` table holds: the last one the FIRMWARE
+// leveled (-1: only the BIOS has, and its table is not ours - ddrtap/ddrbit refuse).
+static int ckphase_ctrl = -1;
+
 int ddr_init(int k)
 {
     if (k < 0 || k >= TRIXIUM_N_MEMCTRL) {
@@ -76,6 +80,7 @@ int ddr_init(int k)
     }
     printf("ddr: controller %d\n", k);
     int ok = sdram_ckphase_leveling(k);
+    ckphase_ctrl = ok ? k : -1;
 #else
     ddr_csr_base = ddr_csr_base0 + (unsigned long)k*TRIXIUM_DDR_CSR_STRIDE;
     printf("ddr: controller %d (CSRs at %08lx)\n", k, (unsigned long)CSR_SDRAM_BASE);
@@ -110,6 +115,10 @@ int ddr_boot_init(void)
 // last one leveled) shifted by `off` taps; off 0 restores them.
 void ddr_tap_offset(int k, int off)
 {
+    if (k != ckphase_ctrl) {
+        printf("ddr: controller %d's taps are not the firmware's last leveling (ddrinit %d first)\n", k, k);
+        return;
+    }
     sdram_csr_base = sdram_csr_base0 + (unsigned long)k*SDRAM_CSR_STRIDE;
     for (int l = 0; l < CKPHASE_LANES; l++)
         for (int i = 0; i < 8; i++) {
@@ -126,7 +135,7 @@ void ddr_tap_offset(int k, int off)
 // + off (the others untouched); returns the tap set, -1 when out of range.
 int ddr_bit_offset(int k, int dq, int off)
 {
-    if (dq < 0 || dq >= CKPHASE_BITS) return -1;
+    if (dq < 0 || dq >= CKPHASE_BITS || k != ckphase_ctrl) return -1;
     int t = ckphase.bit[dq].tap + off;
     if (t < 0 || t > SDRAM_PHY_DELAYS - 1) return -1;
     sdram_csr_base = sdram_csr_base0 + (unsigned long)k*SDRAM_CSR_STRIDE;

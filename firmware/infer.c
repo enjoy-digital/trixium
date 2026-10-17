@@ -1856,6 +1856,51 @@ const struct infer_prefill_profile *infer_last_prefill(void)
     return &last_prefill;
 }
 
+/* ECC retry */
+/*-----------*/
+
+// With DDR ECC (the YPCB): a forward during which a controller flagged an uncorrectable read
+// is run again. The weights in DRAM are intact (the errors are transient read errors under
+// streaming), and a Qwen3 forward is idempotent once its position and the KV exponent
+// ratchet are restored: it rewrites the same KV row. The hybrid forward updates its
+// recurrent state in place, so it is not retried.
+uint32_t infer_ecc_retries, infer_ecc_unrecovered;
+#if defined(CSR_SDRAM_ECC_DED_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
+#define ECC_RETRY_MAX 2
+static uint32_t ecc_uncorrectable(void)
+{
+    uint32_t n = 0;
+    for (int k = 0; k < SDRAM_CONTROLLERS; k++)
+        n += csr_read_simple(CSR_SDRAM_ECC_DED_ADDR + (unsigned long)k*SDRAM_CSR_STRIDE);
+    return n;
+}
+static int forward_checked(int token, int want_logits)
+{
+    if (hybrid_present())
+        return forward(token, want_logits);
+    static int8_t saved[1024];   // n_layer*n_kv_head*2: the 8B's 576
+    int nk = n_layer*n_kv_head*2;
+    int keep = kv_ekmax && nk <= (int)sizeof saved;
+    int pos0 = n_pos;
+    if (keep) memcpy(saved, kv_ekmax, nk);
+    for (int attempt = 0; ; attempt++) {
+        uint32_t d0 = ecc_uncorrectable();
+        int t = forward(token, want_logits);
+        if (ecc_uncorrectable() == d0)
+            return t;
+        if (attempt == ECC_RETRY_MAX || !keep) {
+            infer_ecc_unrecovered++;
+            return t;
+        }
+        infer_ecc_retries++;
+        n_pos = pos0;
+        memcpy(kv_ekmax, saved, nk);
+    }
+}
+#else
+#define forward_checked forward
+#endif
+
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {
     return infer_generate_from(prompt, n_prompt, 0, max_new, emit);
@@ -1909,7 +1954,7 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
     uint32_t prefill_f0 = infer_forwards;
     uint64_t prefill_start = perf_now64();
     for (int i = resident; i < n; i++) {
-        tok = forward(buf[i], i == n - 1);
+        tok = forward_checked(buf[i], i == n - 1);
         if (engine_wedged) { printf(" [engine wedged during the prompt]"); return -1; }
     }
     last_prefill.prefill_cycles = perf_now64() - prefill_start;
@@ -1929,7 +1974,7 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
         // stores a KV row nobody reads (a continuation forwards that token itself), so skip
         // it.
         if (i + 1 < max_new)
-            tok = forward(tok, 1);
+            tok = forward_checked(tok, 1);
     }
     return count;
 }
