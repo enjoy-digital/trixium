@@ -91,6 +91,10 @@ struct resident_state *resident_state(void)
     struct resident_state *R = (struct resident_state *)TRIXIUM_RESIDENT_STATE_ADDR;
     if (!initialized) {
         memset(R, 0, sizeof *R);
+        // The list state too: main_ram's static area is not .bss, and on a card it holds
+        // whatever the last run (or the BIOS memtest) left - a stale `active` with a junk
+        // name and invalidate spans hung the first run_list_wait (the sim's DRAM starts zero).
+        memset((void *)TRIXIUM_RL_STATE_ADDR, 0, 1024);
         R->enabled = 1;
         R->silu_enabled = 1;
         initialized = 1;

@@ -160,6 +160,12 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
         return TensorSpec(name, role, layer, KIND_TERNARY, rows + pad, cols,
                           scales=scales, loader=load, flags=flags)
 
+    if t.type_name == "F32" and role in (ROLE_SSM_BETA, ROLE_SSM_ALPHA):
+        # Ternary-Bonsai-2 2B/4B/9B keep the head projections in F32 (the 27B in BF16): Q8
+        # rows for the engine all the same (the resident DeltaNet layer streams them).
+        w = qformats.f32_dequant(reader.tensor_bytes(name)).reshape(t.shape).astype(np.float32)
+        return _q8_head_projection(name, role, layer, w)
+
     if t.type_name == "F32":
         values = qformats.f32_dequant(reader.tensor_bytes(name)).reshape(t.shape)
         if values.ndim == 1:
@@ -187,16 +193,21 @@ def _spec_from_gguf(reader, name, n_channels, vocab_pad):
         assert role in (ROLE_SSM_BETA, ROLE_SSM_ALPHA), name
         rows, cols = t.shape
         raw    = np.frombuffer(reader.tensor_bytes(name), dtype=np.uint16).astype(np.uint32) << 16
-        w      = raw.view(np.float32).reshape(rows, cols)
-        g      = w.reshape(rows, cols//layout.GROUP_Q8, layout.GROUP_Q8)
-        amax   = np.abs(g).max(axis=2)
-        scales = (amax/127.0).astype(np.float16)
-        sc     = scales.astype(np.float32)[:, :, None]
-        q      = np.where(sc > 0, np.round(g/np.where(sc > 0, sc, 1.0)), 0).clip(-127, 127)
-        return TensorSpec(name, role, layer, KIND_Q8, rows, cols, scales=scales,
-                          values=q.reshape(rows, cols).astype(np.int8), flags=0)
+        return _q8_head_projection(name, role, layer, raw.view(np.float32).reshape(rows, cols))
 
     raise NotImplementedError(f"{name}: unsupported tensor type {t.type_name}")
+
+def _q8_head_projection(name, role, layer, w):
+    """A DeltaNet head projection (beta/alpha: value heads x n_embd) as Q8 rows for the engine:
+    one fp16 scale per 32 weights, rounded to nearest."""
+    rows, cols = w.shape
+    g      = w.reshape(rows, cols//layout.GROUP_Q8, layout.GROUP_Q8)
+    amax   = np.abs(g).max(axis=2)
+    scales = (amax/127.0).astype(np.float16)
+    sc     = scales.astype(np.float32)[:, :, None]
+    q      = np.where(sc > 0, np.round(g/np.where(sc > 0, sc, 1.0)), 0).clip(-127, 127)
+    return TensorSpec(name, role, layer, KIND_Q8, rows, cols, scales=scales,
+                      values=q.reshape(rows, cols).astype(np.int8), flags=0)
 
 def convert(gguf_path, n_channels, out_path, manifest_path=None, tokenizer_path=None,
             max_layers=None, check=False, emb16=True, chan_stride=None, weight_base=None,
