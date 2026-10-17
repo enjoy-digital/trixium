@@ -38,7 +38,12 @@ void seq_desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_
 void seq_desc_vec_seed(uint32_t idx, uint16_t pc, const int32_t *args, int n, uint16_t srcs,
                        int seed_abs)
 {
-    volatile uint32_t *d = desc_w(idx);
+    seq_desc_vec_seed_at(desc_w(idx), pc, args, n, srcs, seed_abs);
+}
+
+void seq_desc_vec_seed_at(volatile uint32_t *d, uint16_t pc, const int32_t *args, int n,
+                          uint16_t srcs, int seed_abs)
+{
     d[0] = 2u | (seed_abs ? (1u << 4) : 0u) | ((uint32_t)srcs << 16);
     d[1] = pc;
     for (int i = 0; i < 8; i++)
@@ -57,7 +62,11 @@ void seq_desc_vec_lut(uint32_t idx, uint16_t pc, const int32_t *args, int n,
 
 void seq_desc_engine(uint32_t idx, const struct engine_op *op)
 {
-    volatile uint32_t *d = desc_w(idx);
+    seq_desc_engine_at(desc_w(idx), op);
+}
+
+void seq_desc_engine_at(volatile uint32_t *d, const struct engine_op *op)
+{
     d[0]  = 1;
     d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9)
                      | ((uint32_t)op->rshift_rpre << 10) | ((uint32_t)op->qn << 11)

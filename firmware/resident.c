@@ -150,8 +150,15 @@ static inline uint32_t eng_addr(const void *p)
     return (uint32_t)((uintptr_t)p - MAIN_RAM_BASE + TRIXIUM_MEM_CPU_OFFSET);
 }
 
-// Descriptor slots: two banks of RS_DESC_MAX, so the CPU builds the next list in one while
-// the sequencer runs the other (rl_post, resident.h). `RLS->base` is the bank being built.
+// Descriptor slots: two banks of RS_DESC_MAX, so the CPU builds the next list while the
+// sequencer runs the other (rl_post, resident.h). `RLS->bbase` is the bank being built.
+// A list is built in main RAM (TRIXIUM_LIST_STAGE_ADDR, cached: ~2 cycles a word against
+// ~20 for a scratchpad word over the CPU bus) at the slots it will occupy, and slot bbase
+// holds a resident loader: an engine fetch of the staged descriptors into slots bbase+1..,
+// run as the list's first descriptor (the sequencer reads each descriptor only when it
+// reaches it, and a fetch's done waits for its scratchpad writes). Building a 30-descriptor
+// list this way costs ~4k cycles instead of ~13k; the loader itself ~400.
+#define STAGE ((volatile uint32_t *)TRIXIUM_LIST_STAGE_ADDR)   // [2*RS_DESC_MAX][16]
 static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d);
 static void desc_engine(uint32_t idx, const struct engine_op *op);
 static void desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n);
@@ -175,7 +182,8 @@ static void desc_store(uint32_t idx, uint32_t addr, uint32_t beats, uint32_t sp_
 /*--------------*/
 
 // Per-descriptor list profile (console `stats`): cycles from one completed descriptor to
-// the next, accumulated per list name (the `what` pointer) and descriptor index. The
+// the next, accumulated per list name (the `what` pointer) and descriptor index (0 is the
+// bank's loader: the fetch of the staged list, see STAGE). The
 // completion poll reads the sequencer anyway; one timer read per poll is the cost. `build`
 // is the CPU's time building the list (from its first descriptor to its start, the wait
 // for a list still in flight excluded), `post` its time after the list ended (cache
@@ -239,6 +247,7 @@ struct rl_state {
     void *inv[16];
     uint32_t inv_bytes[16];
     // The list being built (rl_begin, or a resident_* call).
+    uint32_t loaders;               // both banks' loaders are in their slots
     uint32_t bbase;                 // its bank's first slot
     uint64_t t0;                    // its build start (0: not timed)
     uint32_t n, nbinv, bad;
@@ -262,30 +271,42 @@ static void build_sync(void)
     build_begin();
 }
 
-static volatile uint32_t *slot_w(uint32_t idx)
+// The staged copy of the list's descriptor idx: scratchpad slot bbase + 1 + idx once loaded.
+static volatile uint32_t *stage_w(uint32_t idx)
 {
-    return (volatile uint32_t *)(SCRATCHPAD_BASE + SP_DESC + (RLS->bbase + idx)*64);
+    return STAGE + (RLS->bbase + 1 + idx)*16;
 }
 
 static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d)
 {
-    volatile uint32_t *w = slot_w(idx);
+    volatile uint32_t *w = stage_w(idx);
     for (int i = 0; i < 16; i++) w[i] = d->word[i];
 }
 
 static void desc_engine(uint32_t idx, const struct engine_op *op)
 {
-    seq_desc_engine(RLS->bbase + idx, op);
+    seq_desc_engine_at(stage_w(idx), op);
 }
 
 static void desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n)
 {
-    seq_desc_vec(RLS->bbase + idx, pc, args, n, 0);
+    seq_desc_vec_seed_at(stage_w(idx), pc, args, n, 0, 0);
 }
 
 static void desc_stop(uint32_t idx)
 {
-    seq_desc_stop(RLS->bbase + idx);
+    seq_desc_stop_at(stage_w(idx));
+}
+
+// Bank `bbase`'s loader, in scratchpad slot bbase: fetches the staged slots bbase+1.. into
+// place. wlen (word 5) is patched to the list's length at every start.
+static void loader_write(uint32_t bbase)
+{
+    struct engine_op op = {0};
+    op.kind  = ENGINE_KIND_FETCH;
+    op.wbase = eng_addr((const void *)(STAGE + (bbase + 1)*16));
+    op.dst   = SP_DESC + (bbase + 1)*64;
+    seq_desc_engine(bbase, &op);
 }
 
 // Report the resident units' failures at once instead of after the sequencer's stall
@@ -376,6 +397,22 @@ static int run_list_start(uint32_t count, const char *what)
     }
     R->act_resident = 0;   // Every list may rewrite RS_F; resident_ffn_act re-arms it.
     R->rsf_src = 0;
+    if (count + 1 > RS_DESC_MAX) {    // rl_room keeps rl_* lists short enough; resident_* are
+        printf("resident: %s list of %lu descriptors does not fit its bank - resident path off\n",
+               what, (unsigned long)count);
+        R->disabled = 1;
+        return -1;
+    }
+    if (!L->loaders) {
+        loader_write(0);
+        loader_write(RS_DESC_MAX);
+        L->loaders = 1;
+    }
+    // The staged descriptors to memory for the loader (slot bbase: its length), which is the
+    // list's descriptor 0 (listprof's and rl_wait_desc's counts include it).
+    clean_cpu_dcache_range((void *)(STAGE + (L->bbase + 1)*16), count*64);
+    seq_patch(L->bbase, 5, count*2);
+    count++;
     L->prof = prof;
     L->what = what;
     L->count = count;
@@ -425,6 +462,7 @@ int resident_init(void)
     const struct bons_header *H = model_header();
     R->n_ch = (uint8_t)H->n_channels;
     R->ready = R->disabled = 0;
+    RLS->loaders = 0;                  // the slots may hold another model's lists
     memset(R->sign_base, 0, sizeof R->sign_base);
     if (!resident_available())
         return -1;
@@ -668,7 +706,7 @@ static void rl_rsf_lost(void) { resident_state()->rsf_list = 0; }
 
 static int rl_room(uint32_t k)
 {
-    if (RLS->n + k + 1 > RS_DESC_MAX) RLS->bad = 1;
+    if (RLS->n + k + 2 > RS_DESC_MAX) RLS->bad = 1;   // + stop + the loader
     return !RLS->bad;
 }
 
@@ -726,7 +764,7 @@ void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
 void rl_nowait(void)
 {
     if (RLS->n)
-        seq_patch(RLS->bbase + RLS->n - 1, 0, 1u | (1u << 9));
+        stage_w(RLS->n - 1)[0] = 1u | (1u << 9);
 }
 
 void rl_desc_overlap(const struct bns_seq_descriptor *d)
@@ -814,11 +852,12 @@ int rl_post(const char *what)
 
 uint32_t rl_count(void) { return RLS->n; }
 
-// The first k descriptors of the started list have completed (the sequencer's dcount; the
-// serialized units advance it only once done), or the list stopped: 0; -1 on a timeout.
-// Errors are rl_wait's to report.
+// The first k descriptors of the started list have completed (the sequencer's dcount, which
+// counts the loader too; the serialized units advance it only once done), or the list
+// stopped: 0; -1 on a timeout. Errors are rl_wait's to report.
 int rl_wait_desc(uint32_t k)
 {
+    k++;
     for (uint32_t spins = 0; spins < 20000000u; spins++) {
         uint32_t st = trixium_seq_status_read();
         if (((st >> 8) & 0xFFFFu) >= k || !(st & 1))

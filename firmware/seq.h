@@ -37,6 +37,12 @@ void     seq_desc_vec_lut(uint32_t idx, uint16_t pc, const int32_t *args, int n,
                           uint16_t srcs, uint32_t lut_beat, int lut_kreg);
 void     seq_desc_engine(uint32_t idx, const struct engine_op *op);
 void     seq_desc_stop(uint32_t idx);
+// The same writers into any 16-word slot `d` (a list staged in main RAM, fetched into its
+// scratchpad slots by the list's own first descriptor: resident.c).
+void     seq_desc_vec_seed_at(volatile uint32_t *d, uint16_t pc, const int32_t *args, int n,
+                              uint16_t srcs, int seed_abs);
+void     seq_desc_engine_at(volatile uint32_t *d, const struct engine_op *op);
+static inline void seq_desc_stop_at(volatile uint32_t *d) { d[0] = 0; }
 // Patch one descriptor word. Inline: it is one posted store, issued ~150 times a layer.
 static inline void seq_patch(uint32_t idx, int word, uint32_t value)
 {

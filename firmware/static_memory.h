@@ -27,5 +27,6 @@
 #define TRIXIUM_RL_STATE_ADDR       (TRIXIUM_HDR_ADDR + 0xc6000) // struct rl_state (resident.c), < 1 KB
 #define TRIXIUM_ECC_SAVED_ADDR      (TRIXIUM_HDR_ADDR + 0xc6400) // int8[1024] KV exponents for a re-run (infer.c), 1 KB
 #define TRIXIUM_HYB_CKPT_ADDR       (TRIXIUM_HDR_ADDR + 0xc6800) // hybrid forward checkpoint (hybrid.c), < 1 KB
+#define TRIXIUM_LIST_STAGE_ADDR     (TRIXIUM_HDR_ADDR + 0xc8000) // uint32[128][16] staged descriptor lists (resident.c), 8 KB
 
 #endif
