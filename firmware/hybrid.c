@@ -1915,7 +1915,12 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
         return -1;
     uint32_t unit = 8u*(uint32_t)n_ch, chunk = lm_chunk_rows();
     uint32_t nch = (uint32_t)n_ch, per = head->rows/nch, vocab = (uint32_t)H->vocab;
-    if (head->rows % unit || chunk/nch*4u > 8160u)
+    // At most 8160 bytes of logits per channel and chunk: with few channels (the YPCB's 4)
+    // the default chunk is smaller here, not a fallback to the CPU's pass over the vocabulary.
+    uint32_t cap = 8160u/4u*nch/unit*unit;
+    if (chunk > cap)
+        chunk = cap;
+    if (head->rows % unit || !chunk)
         return -1;
     int have = 0, frozen = 0;
     float bv = 0.0f;
