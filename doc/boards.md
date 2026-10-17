@@ -59,8 +59,9 @@ design and its simulation are exact; two boards' memory systems are not always:
   Behind it, the firmware re-runs a forward during which a controller flagged an uncorrectable
   read: the weights in DRAM are intact, the errors are transient. A Qwen3 forward is idempotent
   once its position is restored; a hybrid one (Bonsai 2) once its DeltaNet state is
-  double-buffered (engine op 5 writes the other set), which is validated in simulation
-  (`eccforce N` re-runs forwards on demand); its bitstream has not closed timing yet.
+  double-buffered (engine op 5 writes the other set). On the card (build `ypcb_hyb6_a`, WNS
+  −0.360 ns, 2B 12.61 and 4B 5.76 tok/s): `eccforce 8` forces eight forwards to run twice and
+  the generation stays golden (retries 8, unrecovered 0).
 - **XCU1525: one DDR4 controller trains marginally on some boots.** The weights read back from
   that controller's four channels differ from the image (stably, so the writes are wrong), and
   its KV-cache writes make attention vary from run to run; about half the boots of 2026-10-15
