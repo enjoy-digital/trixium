@@ -2217,7 +2217,10 @@ int hybrid_forward(int token, int want_logits)
     // runs layer l+1's attention norm in the same list.
     HP->keep_out = xres && !traced;
     int normed = 0;                       // hb already holds layer l's attention norm
+    int out_normed = 0;                   // ... and after the loop the LM head's norm
     (void)normed;
+    if (xres && want_logits && !out_norm)
+        out_norm = fetch_f32(model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32));
     for (int l = 0; l < n_layer; l++) {
         t0 = perf_now64();
         perf_enter(OP_RMSNORM);
@@ -2274,9 +2277,14 @@ int hybrid_forward(int token, int want_logits)
         perf_enter(OP_RESID_ADD);
         if (xres) {
 #ifdef DNRES_BUILT
-            // The last layer brings xb up to date for the LM head.
-            normed = HP->keep_out && l + 1 < n_layer;
-            if (xres_list(tmp_h, normed ? norm_attn[l + 1] : NULL, 0, traced || l == n_layer - 1))
+            // The last layer's list runs the LM head's norm (hb in RS_F for its prepare; the
+            // CPU's rmsnorm_fv below was the forward's largest engine-idle gap, ~90k cycles);
+            // traced, or without the resident outputs, it brings xb up to date for the CPU.
+            int last = l + 1 == n_layer;
+            normed = HP->keep_out && !last;
+            out_normed = HP->keep_out && last && want_logits;
+            if (xres_list(tmp_h, normed ? norm_attn[l + 1] : out_normed ? out_norm : NULL, 0,
+                          traced || (last && !out_normed)))
                 return -1;
 #endif
         } else {
@@ -2292,10 +2300,11 @@ int hybrid_forward(int token, int want_logits)
     hyb_forwards_profiled++;
     if (!want_logits) return -1;
     t0 = perf_now64();
-    const struct bons_entry *on = model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32);
-    if (!out_norm) out_norm = fetch_f32(on);
+    if (!out_norm)                        // model_entry_kind scans the table: once
+        out_norm = fetch_f32(model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32));
     perf_enter(OP_LMHEAD);
-    rmsnorm_fv(hb, xb, out_norm, n_embd);
+    if (!out_normed)
+        rmsnorm_fv(hb, xb, out_norm, n_embd);
     infer_dbg_f32("out_norm", -1, hb, n_embd);
     int r = head_argmax(t0);
     perf_exit(OP_LMHEAD);

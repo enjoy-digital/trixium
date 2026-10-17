@@ -632,7 +632,19 @@ int infer_embed_f(int token, float *dst)
     if (!emb) return -1;
     int e = embed_row_fetch(emb, token, SP_XR);
     float s = ldexpf(1.0f, e);
-    // Two int16 per scratchpad read: each is an uncached bus transaction (~30 cycles).
+    // The row to main RAM by one engine STORE (~1.5k cycles with the dispatch) and converted
+    // from cached memory: read from the scratchpad it was 1,024 uncached bus reads of two
+    // int16 (~30 cycles each), the hybrid forward's second-largest engine-idle gap (45k).
+    uint32_t bytes = (2u*(uint32_t)n_embd + 31u) & ~31u;
+    if (bytes <= 16384u) {
+        int16_t *row = (int16_t *)TRIXIUM_EMB16_ROW_ADDR;
+        engine_store(0, (uint32_t)((uintptr_t)row - MAIN_RAM_BASE + TRIXIUM_MEM_CPU_OFFSET),
+                     bytes/32u, SP_XR);
+        invd_cpu_dcache_range(row, bytes);
+        for (int i = 0; i < n_embd; i++)
+            dst[i] = (float)row[i]*s;
+        return 0;
+    }
     const volatile uint32_t *p = (const volatile uint32_t *)(SCRATCHPAD_BASE + SP_XR);
     int i = 0;
     for (; i + 1 < n_embd; i += 2) {
