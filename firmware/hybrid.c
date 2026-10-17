@@ -116,6 +116,12 @@ static float *at_buf;
 #endif
 
 static uint32_t dn_hbm_base;
+// Two state sets per channel (TRIXIUM_DNSTREAM_WOFF): a forward reads set dn_par and writes
+// the other, so a forward that saw an uncorrectable ECC read can run again from intact state
+// (hybrid_ckpt_save). dn_set_bytes: one set's span per channel; 0 = one set, in place.
+static uint32_t dn_set_bytes;
+static int dn_par;
+static int dn_hw_written;              // the span was cleared once since the boot
 // DeltaNet slots whose state is still the reset's zero (bit s): with the stream layout the
 // layer's op 5 takes it as +0.0 (TRIXIUM_DNSTREAM_ZERO) instead of hybrid_reset clearing the
 // 144 MiB in engine DDR at every generation's first token.
@@ -205,8 +211,8 @@ static void dn_hw_reset(void)
     uint32_t total = (uint32_t)n_dn*(uint32_t)nv;
     for (uint32_t c = 0; c < (uint32_t)n_ch; c++) {
         // Every channel's full span: the stream layout uses total*DN_STREAM_BEATS beats of
-        // each, i.e. at most ceil(total/n_ch) head-sized slots.
-        uint32_t count = (total + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
+        // each, i.e. at most ceil(total/n_ch) head-sized slots (per set).
+        uint32_t count = (total + (uint32_t)n_ch - 1u)/(uint32_t)n_ch*(dn_set_bytes ? 2u : 1u);
         uint32_t slot = 0;
         while (slot < count) {
             uint32_t batch = count - slot;
@@ -525,6 +531,14 @@ int hybrid_init(void)
         dn_hbm_base = (uint32_t)((base + 0xFFFu) & ~0xFFFull);
         uint64_t state_per_channel = ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
         uint64_t limit = chan_limit();
+        dn_set_bytes = 0;
+#ifdef TRIXIUM_DNSTREAM_WOFF
+        // The second set when it fits (the write offset is a signed 24-bit beat count).
+        if ((uint64_t)dn_hbm_base + 2u*state_per_channel <= limit && state_per_channel < (8ull << 20)*32u) {
+            dn_set_bytes = (uint32_t)state_per_channel;
+            state_per_channel *= 2u;
+        }
+#endif
         if ((uint64_t)dn_hbm_base + state_per_channel > limit) {
             printf("hybrid: DeltaNet state reaches %08lx, past channel limit %08lx - "
                    "reconvert for this board\n",
@@ -547,7 +561,8 @@ int hybrid_init(void)
         uint64_t base = (uint64_t)kv_base + (uint64_t)n_lay*n_kv_head*2u*kv_region*32u;
 #ifdef DN_STATE_HW
         if (dn_hw)
-            base = (uint64_t)dn_hbm_base + ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
+            base = (uint64_t)dn_hbm_base + ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES
+                 *(dn_set_bytes ? 2u : 1u);
 #endif
         base = (base + 0xFFFu) & ~0xFFFull;
         uint64_t limit = chan_limit();
@@ -577,7 +592,9 @@ int hybrid_init(void)
                    (unsigned long)base, (unsigned long)end, (unsigned long)limit);
     }
 #endif
-    dn_conv_w = conv_k - 1;
+    // The four-tap kernel's ring has a fourth slot: the new input never overwrites the window
+    // it was computed from, so a forward can be re-run (hybrid_ckpt_save).
+    dn_conv_w = conv_k == 4 ? 4 : conv_k - 1;
     // FP32 state. The matrix lives in engine DDR when the stream op can update it; the
     // short causal-convolution history remains in main RAM either way.
     uint64_t matrix_b = (uint64_t)n_dn*nv*hv*hk*4;
@@ -806,6 +823,7 @@ void hybrid_reset(void)
     if (dn_hw) {
         int cleared = 0;
         dn_state_zero = 0;
+        dn_par = 0;
 #ifdef TRIXIUM_HAS_DNSTREAM
         HP->dnstream_active = HP->dnstream_enabled && hybrid_dnres_enabled()
                             && TRIXIUM_DNSTREAM_LANES == n_ch && DN_HEAD_BEATS % (uint32_t)n_ch == 0;
@@ -823,11 +841,15 @@ void hybrid_reset(void)
         // zero-fill of 64 KB of scratchpad, then engine STOREs) would write zeros over the
         // memory model's power-on zeros. Every later reset clears as on the board.
         if (power_on_reset)
-            cleared = 1;
+            cleared = dn_hw_written = 1;
 #endif
 #ifdef DN_STATE_HW
-        if (!cleared)
+        // Once per boot even when op 5 takes the state as zero: never-written DDR holds no
+        // valid ECC, so those reads would count as uncorrectable (and re-run the forward).
+        if (!cleared || !dn_hw_written) {
             dn_hw_reset();
+            dn_hw_written = !engine_wedged;
+        }
 #endif
         (void)cleared;
     } else if (dn_state) {
@@ -1352,7 +1374,9 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         struct engine_op o = {0};
         o.kind  = ENGINE_KIND_DNSTREAM;
         o.rows  = (uint16_t)nv;
-        o.wbase = dn_hbm_base + (uint32_t)s*(uint32_t)nv*DN_STREAM_BEATS*32u;
+        o.wbase = dn_hbm_base + (uint32_t)dn_par*dn_set_bytes + (uint32_t)s*(uint32_t)nv*DN_STREAM_BEATS*32u;
+        // Written back into the other set (0: in place).
+        o.dstride = (dn_par ? -(int32_t)(dn_set_bytes/32u) : (int32_t)(dn_set_bytes/32u)) & 0xFFFFFF;
         o.wlen  = (uint32_t)nv*DN_STREAM_BEATS;
         o.xsrc  = SLOT0;
         o.bias  = (uint8_t)(dn_state_zero >> s & 1u);    // the state is still the reset's zero
@@ -2101,6 +2125,43 @@ static void ffn_tok(int l, uint64_t t0)
 /* Forward */
 /*---------*/
 
+/* Forward Checkpoint */
+/*--------------------*/
+
+// What a forward changes besides memory it rewrites identically when run again: the
+// position, the DeltaNet set parity and zero flags, the conv ring positions, the CPU-side
+// K/V row counts. The state matrices are double-buffered (dn_set_bytes), the conv ring has a
+// spare slot, the K/V row at the position is rewritten.
+static struct {
+    int pos, par;
+    uint64_t zero;
+    uint8_t conv_pos[64];
+    uint16_t kc_rows[64];
+} ckpt;
+
+int hybrid_ckpt_save(void)
+{
+    if (n_dn > 64 || n_attn > 64)
+        return 0;
+    if (n_dn && !(dn_hw && dn_set_bytes && HP->dnstream_active && dn_conv_w == conv_k))
+        return 0;
+    ckpt.pos  = pos;
+    ckpt.par  = dn_par;
+    ckpt.zero = dn_state_zero;
+    if (dn_conv_pos) memcpy(ckpt.conv_pos, dn_conv_pos, (size_t)n_dn);
+    if (kc_rows) memcpy(ckpt.kc_rows, kc_rows, (size_t)n_attn*2);
+    return 1;
+}
+
+void hybrid_ckpt_restore(void)
+{
+    pos           = ckpt.pos;
+    dn_par        = ckpt.par;
+    dn_state_zero = ckpt.zero;
+    if (dn_conv_pos) memcpy(dn_conv_pos, ckpt.conv_pos, (size_t)n_dn);
+    if (kc_rows) memcpy(kc_rows, ckpt.kc_rows, (size_t)n_attn*2);
+}
+
 int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
@@ -2180,6 +2241,8 @@ int hybrid_forward(int token, int want_logits)
         infer_dbg_f32("ffn_res", l, xb, n_embd);
     }
     pos++;
+    if (dn_set_bytes)
+        dn_par ^= 1;                      // every layer's state is now in the other set
     hyb_forwards_profiled++;
     if (!want_logits) return -1;
     t0 = perf_now64();

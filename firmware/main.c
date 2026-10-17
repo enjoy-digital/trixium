@@ -918,6 +918,12 @@ static void console_service(void)
         chdump_cmd(str);
     else if (strcmp(token, "wsum") == 0)
         wsum_cmd(str);
+    else if (strcmp(token, "eccforce") == 0) { // eccforce N: re-run each of the next N forwards
+        char *c = get_token(&str);
+        infer_ecc_force = c ? (uint32_t)strtoul(c, NULL, 0) : 0;
+        printf("ECC retry forced on the next %lu forwards (retries so far %lu)\n",
+               (unsigned long)infer_ecc_force, (unsigned long)infer_ecc_retries);
+    }
 #if defined(CSR_SDRAM_ECC_BITSEL_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
     else if (strcmp(token, "eccbits") == 0) { // eccbits [clear]: ECC counters, per DQ bit
         char *c = get_token(&str);

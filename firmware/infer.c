@@ -1862,31 +1862,36 @@ const struct infer_prefill_profile *infer_last_prefill(void)
 // With DDR ECC (the YPCB): a forward during which a controller flagged an uncorrectable read
 // is run again. The weights in DRAM are intact (the errors are transient read errors under
 // streaming), and a Qwen3 forward is idempotent once its position and the KV exponent
-// ratchet are restored: it rewrites the same KV row. The hybrid forward updates its
-// recurrent state in place, so it is not retried.
-uint32_t infer_ecc_retries, infer_ecc_unrecovered;
-#if defined(CSR_SDRAM_ECC_DED_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
+// ratchet are restored: it rewrites the same KV row. A hybrid forward is when its
+// checkpoint holds (hybrid_ckpt_save: the recurrent state double-buffered).
+// Without ECC only the console's `eccforce N` re-runs forwards (each of the next N once):
+// the simulation's check that a re-run forward gives the same tokens.
+uint32_t infer_ecc_retries, infer_ecc_unrecovered, infer_ecc_force;
 #define ECC_RETRY_MAX 2
 static uint32_t ecc_uncorrectable(void)
 {
     uint32_t n = 0;
+#if defined(CSR_SDRAM_ECC_DED_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
     for (int k = 0; k < SDRAM_CONTROLLERS; k++)
         n += csr_read_simple(CSR_SDRAM_ECC_DED_ADDR + (unsigned long)k*SDRAM_CSR_STRIDE);
+#endif
     return n;
 }
 static int forward_checked(int token, int want_logits)
 {
-    if (hybrid_present())
-        return forward(token, want_logits);
+    int hyb = hybrid_present();
     static int8_t saved[1024];   // n_layer*n_kv_head*2: the 8B's 576
     int nk = n_layer*n_kv_head*2;
-    int keep = kv_ekmax && nk <= (int)sizeof saved;
-    int pos0 = n_pos;
-    if (keep) memcpy(saved, kv_ekmax, nk);
+    int keep = hyb ? hybrid_ckpt_save() : kv_ekmax && nk <= (int)sizeof saved;
+    int pos0 = n_pos, dbg0 = dbg_armed;   // a re-run traces its position again
+    if (keep && !hyb) memcpy(saved, kv_ekmax, nk);
     for (int attempt = 0; ; attempt++) {
         uint32_t d0 = ecc_uncorrectable();
         int t = forward(token, want_logits);
-        if (ecc_uncorrectable() == d0)
+        int forced = !attempt && infer_ecc_force;
+        if (forced)
+            infer_ecc_force--;
+        if (ecc_uncorrectable() == d0 && !(forced && keep))
             return t;
         if (attempt == ECC_RETRY_MAX || !keep) {
             infer_ecc_unrecovered++;
@@ -1894,12 +1899,13 @@ static int forward_checked(int token, int want_logits)
         }
         infer_ecc_retries++;
         n_pos = pos0;
-        memcpy(kv_ekmax, saved, nk);
+        dbg_armed = dbg0;
+        if (hyb)
+            hybrid_ckpt_restore();
+        else
+            memcpy(kv_ekmax, saved, nk);
     }
 }
-#else
-#define forward_checked forward
-#endif
 
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))
 {

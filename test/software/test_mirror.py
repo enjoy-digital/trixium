@@ -43,8 +43,8 @@ def test_matching_trace_with_chatter(tmp_path):
     (EMBED, "no supported trace points\n"),
     (EMBED, EMBED.replace("e=-12", "e=-11")),
     (EMBED, EMBED.replace("1234abcd", "1234abce")),
-    (EMBED, EMBED + EMBED),               # don't silently overwrite duplicate keys
-    (EMBED + EMBED, EMBED),
+    (EMBED, EMBED + EMBED.replace("1234abcd", "1234abce")),   # a re-run that differs
+    (EMBED + EMBED.replace("1234abcd", "1234abce"), EMBED),
     (EMBED, EMBED.replace("1234abcd", "1234abcd0")),
     (EMBED, "DBG broken or truncated line\n"),
 ])
@@ -66,9 +66,13 @@ def test_card_only_spills_are_not_compared(tmp_path):
 
 
 def test_parse_reports_line_and_key(tmp_path):
+    # A re-run forward (ECC retry) traces again: identical checkpoints are accepted once,
+    # a differing one reports its line and key.
     path = tmp_path / "trace"
     path.write_text(EMBED + EMBED)
-    with pytest.raises(ValueError, match=r":2: duplicate checkpoint .*embed"):
+    assert len(parse(path)[1]) == 1
+    path.write_text(EMBED + EMBED.replace("1234abcd", "0badf00d"))
+    with pytest.raises(ValueError, match=r":2: checkpoint .*embed.* differs when re-run"):
         parse(path)
 
 

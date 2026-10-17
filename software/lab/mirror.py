@@ -165,11 +165,16 @@ def parse(path):
             if m is None:
                 raise ValueError(f"{path}:{lineno}: malformed DBG checkpoint")
             key = (int(m.group(1)), int(m.group(2)), m.group(3))
+            cp = Checkpoint(int(m.group(6)), m.group(7).lower(), m.group(4),
+                            int(m.group(5)) if m.group(5) else None,
+                            (m.group(8) or "").strip())
             if key in d:
-                raise ValueError(f"{path}:{lineno}: duplicate checkpoint {key}")
-            d[key] = Checkpoint(int(m.group(6)), m.group(7).lower(), m.group(4),
-                                int(m.group(5)) if m.group(5) else None,
-                                (m.group(8) or "").strip())
+                # A forward run again (the firmware's ECC retry, `eccforce`) traces again:
+                # it must reproduce every checkpoint.
+                if d[key].signature != cp.signature:
+                    raise ValueError(f"{path}:{lineno}: checkpoint {key} differs when re-run")
+                continue
+            d[key] = cp
             order.append(key)
     if not order:
         raise ValueError(f"{path}: no DBG checkpoints (empty or unsupported trace)")

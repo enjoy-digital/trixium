@@ -20,6 +20,8 @@ void hybrid_reset(void);                         // New generation: states and p
 int  hybrid_pos(void);                           // Positions processed since the reset.
 int  hybrid_context_capacity(void);              // Actual KV allocation after heap-fit reduction.
 int  hybrid_forward(int token, int want_logits); // Next token (argmax) or -1.
+int  hybrid_ckpt_save(void);                     // 1: the next forward can be re-run ...
+void hybrid_ckpt_restore(void);                  // ... from here (ECC retry).
 
 /* Profiling */
 /*-----------*/

@@ -215,7 +215,8 @@ class MatVecEngine(LiteXModule):
                              # 4: axpy (weighted-V: per-lane accumulate, cols results/chan),
                              # 5: DeltaNet stream (dnstream only: rows = heads, xsrc = the
                              # head record table, wbase/wlen = every channel's state span,
-                             # read and rewritten in place through the loader's writers),
+                             # read there and written back through the loader's writers at
+                             # wbase + dstride beats, dstride signed: 0 rewrites in place),
                              # 6: attention stream (attnstream only: xsrc = the unit's record;
                              # K or V rows position-striped: rows/rem/wbase/wlen as the KV ops,
                              # sbeats + cbeats = beats per row, merged in position order).
@@ -1141,7 +1142,8 @@ class MatVecEngine(LiteXModule):
             fsm.act("DN_CMD",
                 self.busy.eq(1),
                 self.mstore_cmd.valid.eq(1),
-                self.mstore_cmd.addr.eq(cmd_r["wbase"]),
+                self.mstore_cmd.addr.eq(cmd_r["wbase"] + Cat(Replicate(0, 5), cmd_r["dstride"],
+                    Replicate(cmd_r["dstride"][23], 3))),
                 self.mstore_cmd.len.eq(cmd_r["wlen"]),
                 If(self.mstore_cmd.ready, NextState("ISSUE")),
             )

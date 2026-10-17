@@ -61,6 +61,7 @@ int  infer_dbg_armed(void);   // Typed traces on: callers that skip a main-RAM c
 void infer_attn_chunk(int cap); // Debug: cap the heads per attention list (attnchunk N).
 extern uint32_t infer_forwards;  // Forwards run since boot.
 extern uint32_t infer_ecc_retries, infer_ecc_unrecovered; // DDR ECC: forwards re-run / still bad.
+extern uint32_t infer_ecc_force;                          // Console `eccforce N`: re-run the next N.
 void infer_qkvx_report(void);     // Print the qkvx state (at init; never mid-generation).
 void infer_seq(int on);           // Sequencer lists on/off (seq); rebuilds the lists.
 

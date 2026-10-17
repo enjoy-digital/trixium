@@ -278,11 +278,15 @@ def int_reference(m, q, k, v, decay, beta, scale):
 
 
 # Compiled cluster; the plain placement also on Migen's simulator (~2 min).
-@pytest.mark.parametrize('placement,backend', [
-    pytest.param(dict(), "verilator", id="placement0-verilator"),
-    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", id="placement1-verilator"),
-    pytest.param(dict(), "migen", marks=pytest.mark.slow, id="placement0-migen")])
-def test_dnstream_op_through_the_cluster(placement, backend):
+# woff: the write-back offset in beats (dstride, signed): the other state set.
+@pytest.mark.parametrize('placement,backend,woff', [
+    pytest.param(dict(), "verilator", 0, id="placement0-verilator"),
+    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", 0, id="placement1-verilator"),
+    pytest.param(dict(), "verilator", 0x200, id="placement0-woff-verilator"),
+    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", -0x100,
+                 id="placement1-woff-neg-verilator"),
+    pytest.param(dict(), "migen", 0, marks=pytest.mark.slow, id="placement0-migen")])
+def test_dnstream_op_through_the_cluster(placement, backend, woff):
     L, rows, cols, heads = 2, 16, 16, 5
     R, G = rows//L, cols//8
     config = TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024, with_dnstream=True,
@@ -321,7 +325,8 @@ def test_dnstream_op_through_the_cluster(placement, backend):
         for l in range(L):
             for i, value in enumerate(lane_beats(states, l)):
                 yield dut.models[l].mem[(offset[l] + wbase)//32 + i].eq(value)
-        for name, value in dict(kind=5, rows=heads, wbase=wbase, wlen=wlen, xsrc=T).items():
+        for name, value in dict(kind=5, rows=heads, wbase=wbase, wlen=wlen, xsrc=T,
+                                dstride=woff & 0xFFFFFF).items():
             yield from write(getattr(dut.engine_csr, name), value)
         yield from write(dut.engine_csr.submit, 1)
         for cycle in range(20000):
@@ -333,10 +338,13 @@ def test_dnstream_op_through_the_cluster(placement, backend):
         print("op 5:", cycle, "cycles for", heads, "heads")
         yield
         for l in range(L):
-            got = []
+            got, src = [], []
             for i in range(wlen):
-                got.append((yield dut.models[l].mem[(offset[l] + wbase)//32 + i]))
+                got.append((yield dut.models[l].mem[(offset[l] + wbase)//32 + woff + i]))
+                src.append((yield dut.models[l].mem[(offset[l] + wbase)//32 + i]))
             assert got == lane_beats([w[0] for w in want], l), l
+            if woff:
+                assert src == lane_beats(states, l), l      # the read set is untouched
         for h in range(heads):
             got = []
             for b in range(rows//8):
