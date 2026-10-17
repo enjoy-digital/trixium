@@ -35,6 +35,17 @@ enum perf_op {
     OP_SILU_MUL,
     OP_RESID_ADD,
     OP_LMHEAD,      // Chunked LM head scan + argmax.
+    // The hybrid forward's phases (hybrid.c; its attention softmax/scores use the ops above).
+    OP_DN_PROJ,     // DeltaNet in-projections list (qkv, z, beta, alpha).
+    OP_DN_ACT,      // Per-head sigmoid/softplus scalars and the stream records (CPU).
+    OP_DN_CONV,     // Causal conv + SiLU list (its build included).
+    OP_DN_PREP,     // q/k L2 norm list.
+    OP_DN_HEADS,    // The recurrence: op 5 stream or the CPU path.
+    OP_DN_GATE,     // Gated RMSNorm x SiLU(z) list.
+    OP_DN_OUT,      // Out-projection prepare + matvec.
+    OP_ATTN,        // An attention layer (softmax inside as OP_SOFTMAX).
+    OP_FFN_PROJ,    // Gate/up projections (+ act when fused).
+    OP_FFN_DOWN,    // Down projection (prepare + matvec).
     OP_ENGINE_WAIT, // Engine polling; may overlap op brackets, not always enclosed by one.
     OP_COUNT,
 };

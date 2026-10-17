@@ -52,7 +52,15 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 #endif
 
 #include "engine.h"
+#include "bons.h"
 #include "ddr.h"
+
+// ECC-guided per-bit read tap centring (ddr_ecc_scan): a leveling the firmware owns, the
+// controller's ECC per-bit counters and its BIST.
+#if defined(SDRAM_CSR_STRIDE) && defined(SDRAM_PHY_CKPHASE_STEPS) && \
+    defined(CSR_SDRAM_ECC_BITSEL_ADDR) && defined(CSR_SDRAM_GENERATOR_BASE_ADDR)
+#define DDR_ECC_SCAN 1
+#endif
 
 #ifndef TRIXIUM_CHAN_MOD
 #define TRIXIUM_CHAN_MOD 0
@@ -81,6 +89,10 @@ int ddr_init(int k)
     printf("ddr: controller %d\n", k);
     int ok = sdram_ckphase_leveling(k);
     ckphase_ctrl = ok ? k : -1;
+#ifdef DDR_ECC_SCAN
+    if (ok)
+        ddr_ecc_scan(k, 6, 4);
+#endif
 #else
     ddr_csr_base = ddr_csr_base0 + (unsigned long)k*TRIXIUM_DDR_CSR_STRIDE;
     printf("ddr: controller %d (CSRs at %08lx)\n", k, (unsigned long)CSR_SDRAM_BASE);
@@ -104,7 +116,13 @@ int ddr_boot_init(void)
 #ifdef SDRAM_CSR_STRIDE
     // The BIOS leveled every controller (SDRAM_CONTROLLERS) before the firmware was loaded.
     printf("ddr: controllers 0..%d leveled by the BIOS\n", TRIXIUM_N_MEMCTRL - 1);
+#ifdef DDR_ECC_SCAN
+    // ... in an eye its pattern test overestimates: level controllers 1.. again here, where the
+    // ECC scan can then centre every bit (ddr_ecc_scan). Controller 0 holds main_ram: the BIOS's.
+    return ddr_init_all();
+#else
     return 1;
+#endif
 #else
     return ddr_init_all();
 #endif
@@ -130,6 +148,114 @@ void ddr_tap_offset(int k, int off)
     sdram_csr_base = sdram_csr_base0;
     printf("ddr: controller %d read taps %+d from the leveling\n", k, off);
 }
+
+#ifdef DDR_ECC_SCAN
+// Read-eye scan under inference-like traffic, per DQ bit, with the controller's ECC as the
+// oracle. Every bit's read tap goes to its leveled tap + off for off in [-range, range]; at
+// each offset the engine streams (`passes` times, a ternary matvec with its result writes
+// suppressed) a 32 MB region at the start of every channel window, written once by each
+// controller's LiteDRAM BIST generator (ECC words: each corrected error is charged to its DQ by
+// the per-bit counters); a bit is then set to the centre of its longest clean run of offsets
+// (ties: toward the leveled tap). Why this traffic: the leveling's own window
+// (ckphase_dfi_check: a few DFI-injected bursts per tap) is 10-13 taps wide and the BIST
+// checker's single stream sees 6-8, where the engine's concurrent channel streams see 2-3 (the
+// YPCB at DDR3-933); the leveling centred DQ14 one tap from that edge (~600 corrected / 2-7
+// uncorrectable reads per 24 tokens on some boots, 64k / 26k on a bad one; none with every tap
+// one earlier). Writes do not depend on the read taps. Destroys the first 32 MB of every
+// channel's weights: at boot (before any model), or reload the model after. Returns the number
+// of bits moved, -1 when controller k's taps are not the firmware's leveling (ddrinit k first).
+int ddr_ecc_scan(int k, int range, int passes)
+{
+    if (k != ckphase_ctrl) {
+        printf("ddr: controller %d's taps are not the firmware's last leveling (ddrinit %d first)\n", k, k);
+        return -1;
+    }
+    if (range < 1) range = 1;
+    if (range > 8) range = 8;
+    if (passes < 1) passes = 1;
+    // The engine op: trit5 rows of 2,048 columns, as many as fill 32 MB per channel.
+    const uint32_t cols = 2048, group = 128, len = 32u << 20;
+    uint32_t rb = bons_row_beats(cols, KIND_TERNARY5, group);   // memory beats per row
+    uint32_t rows = len/(rb*32u);
+    if (rows > 65535u) rows = 65535u;
+    struct engine_op op = {0};
+    op.kind = ENGINE_KIND_TERNARY; op.rows = (uint16_t)rows; op.cols = (uint16_t)cols;
+    op.wbase = TRIXIUM_CHAN_WEIGHT_BASE; op.wlen = rows*rb;
+    op.sbeats = (uint8_t)bons_scale_beats(cols, group);
+    op.cbeats = (uint8_t)bons_code_beats(cols, KIND_TERNARY5);     // pipe beats per row
+    op.pk = 1; op.supw = 1;
+    // The region in every window of every controller (the op streams every channel).
+    for (int c = 0; c < TRIXIUM_N_MEMCTRL; c++) {
+        sdram_csr_base = sdram_csr_base0 + (unsigned long)c*SDRAM_CSR_STRIDE;
+        for (int j = 0; j < (TRIXIUM_CHAN_MOD ? TRIXIUM_CHAN_MOD : 1); j++) {
+            uint32_t base = (uint32_t)j*TRIXIUM_CHAN_STRIDE + TRIXIUM_CHAN_WEIGHT_BASE;
+            sdram_generator_reset_write(1); sdram_generator_reset_write(0);
+            sdram_generator_random_write(1);
+            sdram_generator_base_write(base); sdram_generator_end_write(base + len);
+            sdram_generator_length_write(len);
+            sdram_generator_start_write(1);
+            while (!sdram_generator_done_read());
+        }
+    }
+    sdram_csr_base = sdram_csr_base0 + (unsigned long)k*SDRAM_CSR_STRIDE;
+    uint32_t clean[CKPHASE_BITS];               // bit (off + range): no corrected error on DQ b
+    memset(clean, 0, sizeof clean);
+    for (int off = -range; off <= range; off++) {
+        for (int b = 0; b < CKPHASE_BITS; b++) {
+            int t = ckphase.bit[b].tap + off;
+            if (t < 0) t = 0;
+            if (t > SDRAM_PHY_DELAYS - 1) t = SDRAM_PHY_DELAYS - 1;
+            ckphase_set_tap(1u << (b/8), 1u << (b%8), t);
+        }
+        sdram_ecc_clear_write(1);
+        for (int p = 0; p < passes; p++)
+            engine_run(&op);
+        for (int b = 0; b < CKPHASE_BITS; b++) {
+            sdram_ecc_bitsel_write(b);
+            (void)sdram_ecc_bitcnt_read();      // registered mux: settle
+            if (sdram_ecc_bitcnt_read() == 0)
+                clean[b] |= 1u << (off + range);
+        }
+    }
+    int moved = 0;
+    printf("ddr: controller %d read eye under engine traffic, offsets %+d..%+d from the leveling "
+           "(. error, # clean), each bit's tap moved by:\n", k, -range, range);
+    for (int l = 0; l < CKPHASE_LANES; l++) {
+        printf("ddr:  m%d:", l);
+        for (int i = 0; i < 8; i++) {
+            int b = 8*l + i, lo = 0, hi = -1, run_lo = 0;
+            // The longest clean run; on a tie the one holding the leveled tap wins.
+            for (int o = -range; o <= range + 1; o++) {
+                int c = o <= range && (clean[b] >> (o + range) & 1);
+                if (c && (o == -range || !(clean[b] >> (o - 1 + range) & 1)))
+                    run_lo = o;
+                if (!c && o > -range && (clean[b] >> (o - 1 + range) & 1)) {
+                    int run_hi = o - 1;
+                    if (run_hi - run_lo > hi - lo ||
+                        (run_hi - run_lo == hi - lo && run_lo <= 0 && run_hi >= 0)) {
+                        lo = run_lo; hi = run_hi;
+                    }
+                }
+            }
+            int c = hi < lo ? 0 : (lo + hi)/2;   // no clean offset: the leveled tap stays
+            int t = ckphase.bit[b].tap + c;
+            if (t < 0) t = 0;
+            if (t > SDRAM_PHY_DELAYS - 1) t = SDRAM_PHY_DELAYS - 1;
+            ckphase_set_tap(1u << l, 1u << i, t);
+            if (c) moved++;
+            printf(" ");
+            for (int o = -range; o <= range; o++)
+                printf("%c", clean[b] >> (o + range) & 1 ? '#' : '.');
+            printf("%+d", c);
+        }
+        printf("\n");
+    }
+    sdram_ecc_clear_write(1);
+    sdram_csr_base = sdram_csr_base0;
+    printf("ddr: controller %d: %d of %d bits moved\n", k, moved, CKPHASE_BITS);
+    return moved;
+}
+#endif
 
 // Diagnostic / retune: DQ bit `dq` of controller k (the last one leveled) at its leveled read tap
 // + off (the others untouched); returns the tap set, -1 when out of range.

@@ -22,7 +22,9 @@ import re
 import argparse
 
 OPS = ("embed", "rmsnorm", "qknorm", "rope", "kvquant", "scores", "softmax", "wv", "quant8",
-       "norm_i32", "silu_mul", "resid_add", "lmhead", "engine_wait")
+       "norm_i32", "silu_mul", "resid_add", "lmhead",
+       "dn_proj", "dn_act", "dn_conv", "dn_prep", "dn_heads", "dn_gate", "dn_out", "attn",
+       "ffn_proj", "ffn_down", "engine_wait")   # firmware/perf.h's enum perf_op
 
 M32 = 1 << 32
 

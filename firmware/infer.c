@@ -554,7 +554,11 @@ static int forward(int token, int want_logits)
 {
     if (hybrid_present()) {          // The 27B's layers: the hybrid forward (hybrid.c).
         infer_forwards++;
+        if (tprof_armed && want_logits && --tprof_armed == 0)
+            tprof_begin();           // as below: armed=N traces the Nth generated token
         int t = hybrid_forward(token, want_logits);
+        if (tprof_active)
+            tprof_end();
         if (dbg_armed) {
             if (want_logits) {
                 uint32_t token_bits = (uint32_t)t;

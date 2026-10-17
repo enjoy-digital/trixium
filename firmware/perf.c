@@ -84,7 +84,9 @@ static int overlap_delta(const struct overlap_snapshot *start,
 
 static const char *op_names[OP_COUNT] = {
     "embed", "rmsnorm", "qknorm", "rope", "kvquant", "scores", "softmax", "wv",
-    "quant8", "norm_i32", "silu_mul", "resid_add", "lmhead", "engine_wait",
+    "quant8", "norm_i32", "silu_mul", "resid_add", "lmhead",
+    "dn_proj", "dn_act", "dn_conv", "dn_prep", "dn_heads", "dn_gate", "dn_out", "attn",
+    "ffn_proj", "ffn_down", "engine_wait",
 };
 
 void perf_init(void)

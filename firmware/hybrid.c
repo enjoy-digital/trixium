@@ -1278,6 +1278,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         bns_seq_desc_silu_ex(&d, DNR_QKV, DNR_QKV, DNR_QKV, FIX, C, 1, 0, 0, 0);                 \
         rl_desc(&d);                                                                             \
     } while (0)
+    perf_enter(OP_DN_PROJ);           // the token trace's phases (tprof): nested brackets
     rl_begin();
     if (early) {
         rl_prepare(h, (uint32_t)n_embd, 0);                          // beta/alpha are not folded
@@ -1291,6 +1292,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             return -1;
         if (rl_wait_desc(k_ba) == 0) {
             uint64_t ta = perf_now64();
+            perf_enter(OP_DN_ACT);
             const volatile float *bsp = (const volatile float *)(SCRATCHPAD_BASE + BA);
             const volatile float *asp = (const volatile float *)(SCRATCHPAD_BASE + AL);
             for (int hh = 0; hh < nv; hh++) {
@@ -1298,11 +1300,14 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
                 gb[hh]    = softplusf(asp[hh] + ssm_dt[l][hh])*ssm_a[l][hh];
             }
             dn_stream_records(SLOT0, HO, scale, rep);
+            perf_exit(OP_DN_ACT);
             act_dt = perf_now64() - ta;
         }
         // The conv list into the other descriptor bank while qkv and z stream.
         uint64_t tc = perf_now64();
+        perf_enter(OP_DN_CONV);
         DN_CONV_LIST();
+        perf_exit(OP_DN_CONV);
         conv_dt = perf_now64() - tc;
         if (rl_wait())
             return -1;                 // nothing of the layer's state has moved yet
@@ -1322,17 +1327,20 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     }
     dn_cyc_act += act_dt;
     dn_cyc_inproj += perf_now64() - t0 - act_dt - conv_dt;
+    perf_exit(OP_DN_PROJ);
 
     // B: causal conv in chunks, then SiLU. Without the early projections the list runs while
     // the CPU computes the per-head scalars and the stream op's records (none of it touches
     // the list's regions or the descriptor slots).
     t0 = perf_now64() - conv_dt;
+    perf_enter(OP_DN_CONV);
     if (!early)
         DN_CONV_LIST();
 #undef DN_CONV_LIST
     if (rl_start("deltanet conv"))
         goto fatal;
     uint64_t ta = perf_now64();
+    perf_enter(OP_DN_ACT);
     if (!early) {
         for (int hh = 0; hh < nv; hh++) {
             betab[hh] = sigmoidf(betab[hh]);
@@ -1343,13 +1351,16 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             dn_stream_records(SLOT0, HO, scale, rep);
 #endif
     }
+    perf_exit(OP_DN_ACT);
     act_dt = perf_now64() - ta;
     dn_cyc_act += act_dt;
     // The q/k L2 list into the other bank while the conv runs.
     uint64_t tl = perf_now64();
+    perf_enter(OP_DN_PREP);
     rl_begin();
     bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
     rl_desc(&d);
+    perf_exit(OP_DN_PREP);
     uint64_t l2_dt = perf_now64() - tl;
     if (resident_join())
         goto fatal;
@@ -1357,13 +1368,17 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     if (trixium_seq_silu_fixups_read())
         resident_silu_patch(DNR_QKV, 0, DNR_QKV, FIX, C, 0, 0, 0);
     dn_cyc_conv += perf_now64() - t0 - act_dt - l2_dt;
+    perf_exit(OP_DN_CONV);
+    perf_enter(OP_DN_PREP);
     t0 = perf_now64() - l2_dt;
     if (rl_run("deltanet q/k l2"))
         goto fatal;
     dn_cyc_prep += perf_now64() - t0;
+    perf_exit(OP_DN_PREP);
 
     // Heads: outputs in natural head order at HO.
     t0 = perf_now64();
+    perf_enter(OP_DN_HEADS);
 #ifdef TRIXIUM_HAS_DNSTREAM
     if (dn_hw && HP->dnstream_active) {
         // Every head in one engine op, the records written during the conv list; the
@@ -1423,9 +1438,11 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             goto fatal;
     }
     dn_cyc_heads += perf_now64() - t0;
+    perf_exit(OP_DN_HEADS);
 
     // C: gated RMSNorm over the heads, x SiLU(z), into the grouped order at RS_F (og).
     t0 = perf_now64();
+    perf_enter(OP_DN_GATE);
     rl_begin();
     rl_fetch_raw(norm_ssm[l], dnr_align(4*(uint32_t)hv), NW);
     if (!z_stays)
@@ -1442,8 +1459,10 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // og stays in RS_F for the out projection's prepare (never stored to main RAM): a failure
     // past this point invalidates the token anyway - the layer's window and state have moved.
     dn_cyc_gate += perf_now64() - t0;
+    perf_exit(OP_DN_GATE);
 
     t0 = perf_now64();
+    perf_enter(OP_DN_OUT);
     struct resident_state *R = resident_state();
     R->prep_src = og; R->prep_width = nvh; R->prep_rotate = 1;
     resident_mark_act();
@@ -1454,6 +1473,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     if (resident_matvec(model_entry(ROLE_SSM_OUT, l), out))
         goto fatal;
     dn_cyc_outproj += perf_now64() - t0;
+    perf_exit(OP_DN_OUT);
     return 0;
 fatal:
     // A list failed after the layer's window/state started to move: the forward cannot be
@@ -1631,6 +1651,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     }
     AT_SUB(2);
     // The softmax exactly as the CPU loop computes it.
+    perf_enter(OP_SOFTMAX);
     for (uint32_t hh = 0; hh < nq; hh++) {
         float *sc = at_buf + hh*Tp, mx = -1e30f, sum = 0;
         for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
@@ -1638,6 +1659,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
         for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
     }
     clean_cpu_dcache_range(at_buf, nq*Tp*4u);
+    perf_exit(OP_SOFTMAX);
     AT_SUB(3);
     if (rl_run(unit_gate ? "attention values+gate" : "attention values")) {
         HP->attnstream_active = 0;
@@ -2061,12 +2083,15 @@ static int head_argmax(uint64_t t0)
 static void ffn_tok(int l, uint64_t t0)
 {
     int e8;
+    perf_enter(OP_QUANT8);
     if (H->hadamard_block)
         e8 = rotate_quantize_f(hb, n_embd);
     else
         e8 = quantize_f(hb, n_embd);
     hyb_cyc_fprep += perf_now64() - t0;
+    perf_exit(OP_QUANT8);
     t0 = perf_now64();
+    perf_enter(OP_FFN_PROJ);
     const struct bons_entry *down = model_entry(ROLE_FFN_DOWN, l);
     // Resident FFN: gate, up and act = up*silu(gate) in one scratchpad list, the act
     // then prepared for the down projection where it already is (no FETCH). The gate
@@ -2082,10 +2107,12 @@ static void ffn_tok(int l, uint64_t t0)
     }
     if (fused) {
         hyb_cyc_fproj += perf_now64() - t0;
+        perf_exit(OP_FFN_PROJ);
         infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
         infer_dbg_f32("ffn_up", l, upb, ffn_dim);
         infer_dbg_f32("ffn_act", l, (const float *)(SCRATCHPAD_BASE + RS_F_ADDR), ffn_dim);
         t0 = perf_now64();
+        perf_enter(OP_FFN_DOWN);
         struct resident_state *R = resident_state();
         R->prep_src = actb; R->prep_width = ffn_dim; R->prep_rotate = 1;
         int down_done = 0;
@@ -2106,19 +2133,25 @@ static void ffn_tok(int l, uint64_t t0)
             proj_f(down, actb, tmp_h);
         }
         hyb_cyc_fdown += perf_now64() - t0;
+        perf_exit(OP_FFN_DOWN);
     } else {
         matvec_q(model_entry(ROLE_FFN_GATE, l), e8, gateb);
         matvec_q(model_entry(ROLE_FFN_UP, l), e8, upb);
         hyb_cyc_fproj += perf_now64() - t0;
+        perf_exit(OP_FFN_PROJ);
         infer_dbg_f32("ffn_gate", l, gateb, ffn_dim);
         infer_dbg_f32("ffn_up", l, upb, ffn_dim);
         t0 = perf_now64();
+        perf_enter(OP_SILU_MUL);
         silu_mul_fv(gateb, upb, gateb, ffn_dim);
         hyb_cyc_fact += perf_now64() - t0;
+        perf_exit(OP_SILU_MUL);
         infer_dbg_f32("ffn_act", l, gateb, ffn_dim);
         t0 = perf_now64();
+        perf_enter(OP_FFN_DOWN);
         proj_f(down, gateb, tmp_h);
         hyb_cyc_fdown += perf_now64() - t0;
+        perf_exit(OP_FFN_DOWN);
     }
 }
 
@@ -2168,8 +2201,10 @@ int hybrid_forward(int token, int want_logits)
 {
     if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
     uint64_t t0 = perf_now64();
+    perf_enter(OP_EMBED);
     if (infer_embed_f(token, xb) < 0) return -1;
     hyb_cyc_embed += perf_now64() - t0;
+    perf_exit(OP_EMBED);
     infer_dbg_f32("emb", -1, xb, n_embd);
     int xres = 0;
 #ifdef DNRES_BUILT
@@ -2185,6 +2220,7 @@ int hybrid_forward(int token, int want_logits)
     (void)normed;
     for (int l = 0; l < n_layer; l++) {
         t0 = perf_now64();
+        perf_enter(OP_RMSNORM);
         if (xres) {
 #ifdef DNRES_BUILT
             if (!normed && xres_list(NULL, norm_attn[l], l == 0, 0)) return -1;
@@ -2193,6 +2229,7 @@ int hybrid_forward(int token, int want_logits)
             rmsnorm_fv(hb, xb, norm_attn[l], n_embd);
         }
         hyb_cyc_anorm += perf_now64() - t0;
+        perf_exit(OP_RMSNORM);
         infer_dbg_f32("attn_norm", l, hb, n_embd);
         t0 = perf_now64();
         if (dn_slot[l] >= 0) {
@@ -2205,22 +2242,27 @@ int hybrid_forward(int token, int want_logits)
                 deltanet_layer(l, hb, tmp_h);
             hyb_cyc_dn += perf_now64() - t0;
         } else {
+            perf_enter(OP_ATTN);
             attention_layer(l, hb, tmp_h);
             hyb_cyc_attn += perf_now64() - t0;
+            perf_exit(OP_ATTN);
         }
         infer_dbg_f32(dn_slot[l] >= 0 ? "dn_out" : "attn_out", l, tmp_h, n_embd);
         t0 = perf_now64();
+        perf_enter(OP_RESID_ADD);
         if (xres) {
 #ifdef DNRES_BUILT
             // Residual add, the FFN norm, and xb for the trace when traced.
             if (xres_list(tmp_h, norm_ffn[l], 0, traced)) return -1;
 #endif
             hyb_cyc_resid += perf_now64() - t0;
+            perf_exit(OP_RESID_ADD);
             infer_dbg_f32("attn_res", l, xb, n_embd);
             t0 = perf_now64();
         } else {
             add_fv(xb, tmp_h, n_embd);
             hyb_cyc_resid += perf_now64() - t0;
+            perf_exit(OP_RESID_ADD);
             infer_dbg_f32("attn_res", l, xb, n_embd);
             t0 = perf_now64();
             rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
@@ -2229,6 +2271,7 @@ int hybrid_forward(int token, int want_logits)
         ffn_tok(l, t0);
         infer_dbg_f32("ffn_down", l, tmp_h, n_embd);
         t0 = perf_now64();
+        perf_enter(OP_RESID_ADD);
         if (xres) {
 #ifdef DNRES_BUILT
             // The last layer brings xb up to date for the LM head.
@@ -2240,6 +2283,7 @@ int hybrid_forward(int token, int want_logits)
             add_fv(xb, tmp_h, n_embd);
         }
         hyb_cyc_resid += perf_now64() - t0;
+        perf_exit(OP_RESID_ADD);
         infer_dbg_f32("ffn_res", l, xb, n_embd);
     }
     pos++;
@@ -2250,7 +2294,10 @@ int hybrid_forward(int token, int want_logits)
     t0 = perf_now64();
     const struct bons_entry *on = model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32);
     if (!out_norm) out_norm = fetch_f32(on);
+    perf_enter(OP_LMHEAD);
     rmsnorm_fv(hb, xb, out_norm, n_embd);
     infer_dbg_f32("out_norm", -1, hb, n_embd);
-    return head_argmax(t0);
+    int r = head_argmax(t0);
+    perf_exit(OP_LMHEAD);
+    return r;
 }
