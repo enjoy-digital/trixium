@@ -95,6 +95,22 @@ static int      dn_hw;
 #ifdef TRIXIUM_HAS_ATTNSTREAM
 static uint32_t at_hbm_base, at_slots, at_rowbeats;
 static int at_geom_ok;
+
+// The end (local address, a page below) of a channel's weight window, the smallest of a
+// controller's (the last, shortened by the bank skew): TRIXIUM_CHAN_WINDOW when the target
+// exports it (the YPCB's windows start at base + j*stride, not at stride multiples), else
+// the stride boundary above the weight base (as ddr.c's DDR_TEST_WINDOW).
+static uint64_t chan_limit(void)
+{
+#ifdef TRIXIUM_CHAN_WINDOW
+    return (uint64_t)TRIXIUM_CHAN_WEIGHT_BASE + TRIXIUM_CHAN_WINDOW - 0x1000u;
+#else
+    uint32_t skew_count = TRIXIUM_CHAN_MOD ? TRIXIUM_CHAN_MOD - 1u : 0u;
+    return (uint64_t)TRIXIUM_CHAN_WEIGHT_BASE + TRIXIUM_CHAN_STRIDE
+         - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) - 0x1000u
+         - (uint64_t)skew_count*TRIXIUM_CHAN_SKEW;
+#endif
+}
 static int at_sg;                      // kv heads per op-6 command (n_kv_head: one command)
 static float *at_buf;
 #endif
@@ -508,10 +524,7 @@ int hybrid_init(void)
                       + (uint64_t)n_lay*n_kv_head*2u*kv_region*32u;
         dn_hbm_base = (uint32_t)((base + 0xFFFu) & ~0xFFFull);
         uint64_t state_per_channel = ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
-        uint32_t skew_count = TRIXIUM_CHAN_MOD ? TRIXIUM_CHAN_MOD - 1u : 0u;
-        uint64_t limit = (uint64_t)TRIXIUM_CHAN_WEIGHT_BASE + TRIXIUM_CHAN_STRIDE
-                       - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) - 0x1000u
-                       - (uint64_t)skew_count*TRIXIUM_CHAN_SKEW;
+        uint64_t limit = chan_limit();
         if ((uint64_t)dn_hbm_base + state_per_channel > limit) {
             printf("hybrid: DeltaNet state reaches %08lx, past channel limit %08lx - "
                    "reconvert for this board\n",
@@ -537,10 +550,7 @@ int hybrid_init(void)
             base = (uint64_t)dn_hbm_base + ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES;
 #endif
         base = (base + 0xFFFu) & ~0xFFFull;
-        uint32_t skew_count = TRIXIUM_CHAN_MOD ? TRIXIUM_CHAN_MOD - 1u : 0u;
-        uint64_t limit = (uint64_t)TRIXIUM_CHAN_WEIGHT_BASE + TRIXIUM_CHAN_STRIDE
-                       - (TRIXIUM_CHAN_WEIGHT_BASE % TRIXIUM_CHAN_STRIDE) - 0x1000u
-                       - (uint64_t)skew_count*TRIXIUM_CHAN_SKEW;
+        uint64_t limit = chan_limit();
         at_rowbeats = (uint32_t)(n_kv_head*head_dim)/8u;
         at_slots = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
         uint64_t end = base + (uint64_t)n_attn*2u*at_slots*at_rowbeats*32u;
