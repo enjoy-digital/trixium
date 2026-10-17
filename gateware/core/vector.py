@@ -821,6 +821,27 @@ class VectorUnit(LiteXModule):
             self.done.eq(finish),
         ]
 
+        # The S[sd] writers' data as one parallel mux (timing: one write port instead of a
+        # priority chain of per-op writes behind the SSHLV shifter).
+        s_wd  = Signal((48, True))
+        s_we  = Signal()
+        s_inc = Signal(6)                                   # LDV/LDW/STV/STW/STB post-increment
+        self.comb += [
+            s_we.eq(0), s_wd.eq(0), s_inc.eq(0),
+            Case(d_op, {
+                OP["MOVSI"]:  [s_we.eq(1), s_wd.eq(d_imm)],
+                OP["ARG"]:    [s_we.eq(1), s_wd.eq(Cat(arg_sel, Replicate(arg_sel[31], 16)))],
+                OP["SADDI"]:  [s_we.eq(1), s_wd.eq(sd_d + d_imm)],
+                OP["SMOV"]:   [s_we.eq(1), s_wd.eq(sa_d)],
+                OP["SADD"]:   [s_we.eq(1), s_wd.eq(sd_d + sa_d)],
+                OP["SSHLV"]:  [s_we.eq(1), s_wd.eq(sshlv_res)],
+                OP["SNORME"]: [s_we.eq(1), s_wd.eq(snorme_res)],
+                OP["LDV"]: s_inc.eq(32), OP["LDW"]: s_inc.eq(32),
+                OP["STV"]: s_inc.eq(32), OP["STW"]: s_inc.eq(32),
+                OP["STB"]: s_inc.eq(16),
+            }),
+        ]
+
         # Sequential: F/D advance, D commits, E1/E2/E3 records -------------------------------------
         self.sync += [
             # F / D.
@@ -869,13 +890,7 @@ class VectorUnit(LiteXModule):
             ),
             # D commits (exactly once, on d_go).
             If(d_go,
-                If(d_op == OP["MOVSI"],  S[d_sd].eq(d_imm)),
-                If(d_op == OP["ARG"],    S[d_sd].eq(Cat(arg_sel, Replicate(arg_sel[31], 16)))),
-                If(d_op == OP["SADDI"],  S[d_sd].eq(sd_d + d_imm)),
-                If(d_op == OP["SMOV"],   S[d_sd].eq(sa_d)),
-                If(d_op == OP["SADD"],   S[d_sd].eq(sd_d + sa_d)),
-                If(d_op == OP["SSHLV"],  S[d_sd].eq(sshlv_res)),
-                If(d_op == OP["SNORME"], S[d_sd].eq(snorme_res)),
+                If(s_we, S[d_sd].eq(s_wd)),
                 If(d_is_loops,
                     If(d_imm == 0,
                         loop_cnt.eq(sa_d[0:32]),
@@ -896,11 +911,7 @@ class VectorUnit(LiteXModule):
                     lf2_arm.eq(1),
                 ),
                 If(loope2_taken, loop_cnt2.eq(loop_cnt2 - 1)),
-                If((d_op == OP["LDV"]) | (d_op == OP["LDW"]) | (d_op == OP["STV"])
-                   | (d_op == OP["STW"]),
-                    S[d_sa].eq(sa_d + 32),
-                ),
-                If(d_op == OP["STB"], S[d_sa].eq(sa_d + 16)),
+                If(s_inc != 0, S[d_sa].eq(sa_d + s_inc)),
                 If(d_is_done, fetch_en.eq(0), finish.eq(1)),
                 If(~d_is_known, bad_op.eq(1)),
             ),

@@ -403,6 +403,7 @@ class ActivationScratchpad(LiteXModule):
         declared_maximum = Signal(18, reset_less=True)
         seen_equal = Signal()
         raw_bad, raw_equal = Signal(), Signal()
+        raw_bad_r = Signal()                         # raw_bad on a readable response, a cycle later
         raw_bad_lanes, raw_equal_lanes = Signal(8), Signal(8)
         metadata_error = Signal()
         selected_valid, selected_ready, selected_last = Signal(), Signal(), Signal()
@@ -481,9 +482,11 @@ class ActivationScratchpad(LiteXModule):
                 (responses.we & ~responses.writable))),
             raw_bad.eq(raw_bad_lanes != 0), raw_equal.eq(raw_equal_lanes != 0),
             # Do not depend on sink.ready/pop: write grants can feed back into
-            # pipeline readiness, so pop->error->write request creates a loop.
-            metadata_error.eq(rotation & in_convert & ((responses.readable & raw_bad) |
-                (packed_pending & packed_last & ~seen_equal))),
+            # pipeline readiness, so pop->error->write request creates a loop. raw_bad is
+            # registered (timing: the 33-bit compares fed the scratchpad requests); the bad
+            # response's block cannot finish within that cycle (quantizer latency).
+            metadata_error.eq(raw_bad_r |
+                (rotation & in_convert & packed_pending & packed_last & ~seen_equal)),
             selected_valid.eq(Mux(rotation, integer_quantize.source.valid, quantize.source.valid)),
             selected_data.eq(Mux(rotation, integer_quantize.source.data, quantize.source.data)),
             selected_last.eq(Mux(rotation, integer_quantize.source.last, quantize.source.last)),
@@ -502,6 +505,8 @@ class ActivationScratchpad(LiteXModule):
                                   Replicate(wide_exponent, 8), packed_word)),
             write_word.eq(in_convert & self.sp_wr_req & self.sp_wr_gnt),
         ]
+        self.sync += If(clear, raw_bad_r.eq(0)).Else(
+            raw_bad_r.eq(rotation & in_convert & responses.readable & raw_bad))
         self.sync += If(clear, read_pending.eq(0), buf_pend.eq(0), s_pend.eq(0)).Else(
             read_pending.eq(self.sp_rd_req & ~s_issuing & (in_scan | in_convert)),
             buf_pend.eq(cnv_issue & pp),

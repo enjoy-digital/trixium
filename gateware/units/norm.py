@@ -102,9 +102,11 @@ class NormScratchpad(LiteXModule):
         seg_bytes = Signal(24)
         total = Signal(64)                           # bytes of all segments
         s_stride, d_stride = Signal(16), Signal(16)  # beats between segment starts
+        # Validation is pipelined (timing): SPAN registers the ends, CHECK the verdicts, VALIDATE
+        # acts on them. Both are reset-less, recomputed every cycle from cap.
         s_span, d_span = Signal(64), Signal(64)      # bytes from the first to the last's end
-        ends = {k: Signal(64, name=f"end_{k}") for k in ("src", "dst", "weight")}
-        geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal() for _ in range(4))
+        ends = {k: Signal(64, name=f"end_{k}", reset_less=True) for k in ("src", "dst", "weight")}
+        geometry_bad, bounds_bad, overlap_bad, protected_bad = (Signal(reset_less=True) for _ in range(4))
         self.comb += [
             nbeats.eq(cap["n"][3:16]),
             seg_bytes.eq(cap["n"] << 2),
@@ -113,9 +115,13 @@ class NormScratchpad(LiteXModule):
             d_stride.eq(Mux(cap["dst_stride"] == 0, nbeats, cap["dst_stride"])),
             s_span.eq(((cap["nseg"] - 1)*s_stride << 5) + seg_bytes),
             d_span.eq(((cap["nseg"] - 1)*d_stride << 5) + seg_bytes),
+        ]
+        self.sync += [
             ends["src"].eq(cap["src"] + s_span),
             ends["dst"].eq(cap["dst"] + d_span),
             ends["weight"].eq(cap["weight"] + seg_bytes),
+        ]
+        self.sync += [
             geometry_bad.eq((cap["n"][:3] != 0) | (cap["n"] == 0) | (cap["n"] > WMAX) |
                             (cap["rope_hb"] > (HB_MAX if with_rope else 0)) | ((cap["rope_hb"] << 1) > nbeats) |
                             (s_stride < nbeats) | (d_stride < nbeats) |
@@ -167,11 +173,11 @@ class NormScratchpad(LiteXModule):
         # chain, pass 2) finishes segment i. A hands B the sum of squares and the segment
         # addresses once B is waiting; B changes `scale` and the output base only after
         # its previous segment's writes drained.
-        states = ["IDLE", "VALIDATE", "WLOAD", "TLOAD", "RUN", "FINISH", "FAILED"]
+        states = ["IDLE", "SPAN", "CHECK", "VALIDATE", "WLOAD", "TLOAD", "RUN", "FINISH", "FAILED"]
         S = {name: i for i, name in enumerate(states)}
         A = {name: i for i, name in enumerate(["P1", "DRAIN", "TREE", "HAND", "DONE"])}
         B = {name: i for i, name in enumerate(["WAIT", "SCALAR", "P2"])}
-        state, a_st, b_st = Signal(3), Signal(3), Signal(2)
+        state, a_st, b_st = Signal(max=len(states)), Signal(3), Signal(2)
         run = Signal()
         seg_a, seg_b = Signal(16), Signal(16)        # segments handed off / issued by B
         beat = Signal(13)                            # weight reads issued
@@ -462,7 +468,9 @@ class NormScratchpad(LiteXModule):
                     *[v.eq(getattr(self.cmd, k)) for k, v in cap.items()],
                     self.error.eq(0), self.read_beats.eq(0), self.output_beats.eq(0),
                     beat.eq(0),
-                    state.eq(S["VALIDATE"])),
+                    state.eq(S["SPAN"])),
+                S["SPAN"]:  state.eq(S["CHECK"]),
+                S["CHECK"]: state.eq(S["VALIDATE"]),
                 S["VALIDATE"]: If(geometry_bad | bounds_bad | overlap_bad | protected_bad,
                     self.error.eq(Cat(geometry_bad, bounds_bad, overlap_bad, C(0, 3),
                                       protected_bad)),
