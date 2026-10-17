@@ -47,6 +47,8 @@ the board's timings and clock ratio, four channels, the tiny 4-channel model).
 ./trixium_fk33.py --load          # OpenOCD (openFPGALoader does not configure the FK33)
 ./trixium_ypcb.py --build         # -> build/ypcb/
 ./trixium_ypcb.py --load          # openFPGALoader (Digilent HS2 cable)
+./trixium_ypcb.py --hybrid --engine-channels 4 --ddr-clk-freq 116.6667e6 --sys-clk-freq 100e6 \
+    --build --output-dir build/ypcb_hybrid    # the Bonsai 2 2B / 4B build
 ```
 
 The defaults are the configurations of the results above; `--help` lists the few knobs
@@ -62,6 +64,7 @@ trixium models                                       # the 1.7B and 8B GGUFs + t
 trixium convert models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf    # -> models/bons/bonsai-1p7b-n16.img
 trixium convert models/8b/Ternary-Bonsai-8B-PQ2_0.gguf        # -> models/bons/bonsai-8b-n16.img
 trixium convert --board ypcb models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf  # -> ...-n8-ypcb.img (5-trit codes)
+trixium convert --board ypcb --channels 4 models/2b/Ternary-Bonsai-2-2B-PTQ1_0.gguf  # -> bonsai2-2b-n4-ypcb.img (./trixium_ypcb.py --hybrid)
 trixium tokenizer models/1.7b/tokenizer.json                  # -> models/1.7b/tokenizer.bin
 trixium verify models/bons/bonsai-1p7b-n16.img
 ```
@@ -108,6 +111,7 @@ trixium deploy --board xcu1525 --model 27b                    # build/xcu1525 on
 trixium deploy --board xcu1525 --model 8b --no-reconfigure    # next model, board already deployed
 trixium deploy --board fk33 --model 1p7b                      # build/fk33 on the FK33 host
 trixium deploy --board ypcb --model 8b                        # build/ypcb on the YPCB-00338 host
+trixium deploy ypcb_hybrid --board ypcb --model 2b            # the hybrid build, Ternary-Bonsai-2 2B
 trixium deploy --board xcu1525 --model 27b --dry-run          # print every command, run nothing
 ```
 

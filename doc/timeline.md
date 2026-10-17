@@ -39,6 +39,7 @@ old per-day logs are in git history.
 | 2026-10-16 | DDR3 ECC (SECDED on the ninth byte lane) on a LiteX-Boards design, then in TriXium; XCU1525 boot-time deep memory test with retraining (development branch) | ECC corrects every injected single-bit fault on the card; five XCU1525 boots in a row clean |
 | 2026-10-16 | Per-DQ ECC counters; a DDR3-933 YPCB build | DDR3-1066 errors on controller 1 drift with temperature, a few bits per calibration; DDR3-933 cuts them ~400x (31.8 tok/s on the 1.7B) |
 | 2026-10-16 | Docs restructure, a new cut of the video | |
+| 2026-10-17 | Ternary-Bonsai-2 2B / 4B on the YPCB-00338 (hybrid build, 4 channels, DDR3-933); ECC upstream; engine writes merged to full DRAM words; forward retry for hybrids (simulation) | 2B 7.41 then 12.40 tok/s, 4B 3.16 then 5.71, tokens exact |
 
 ## Measurement ladders
 

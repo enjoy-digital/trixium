@@ -12,12 +12,12 @@ Builds need Vivado **2024.1** (the 2025.2 install lacks the VU33P).
 | memory | 4x DDR4 x64, 4 GB each (LiteDRAM, USPDDRPHY) | 8 GB HBM2, 16 of 32 pseudo-channels | 2x DDR3 x64 (the ninth, ECC lane used by the ECC build), 2 GB each (LiteDRAM, K7DDRPHY on HR banks, CK phase shift) |
 | clocks | sys 125 MHz, DDR4 controllers 187.5 MHz (DDR4-1500) | sys = HBM AXI 212.5 MHz, HBM 800 MHz | sys 125 MHz, DDR3 controllers 133.33 MHz (DDR3-1066) |
 | PCIe | Gen3 x4 (LitePCIe) | Gen3 x4 (LitePCIe) | Gen2 x8 (LitePCIe) |
-| units | every scratchpad unit, DeltaNet + attention streams | engine, sequencer, vector unit (no scratchpad units) | as the FK33 |
-| models | Ternary-Bonsai-2 27B, Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B |
+| units | every scratchpad unit, DeltaNet + attention streams | engine, sequencer, vector unit (no scratchpad units) | as the FK33; `--hybrid`: the hybrid models' units, trimmed to fit (4 channels, attention 4 lanes in kv-head slices, Hadamard 8 lanes, norm without RoPE) |
+| models | Ternary-Bonsai-2 27B, Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B; `--hybrid`: Ternary-Bonsai-2 2B / 4B |
 | target | [`trixium_xcu1525.py`](../trixium_xcu1525.py) | [`trixium_fk33.py`](../trixium_fk33.py) | [`trixium_ypcb.py`](../trixium_ypcb.py) |
 | build | `./trixium_xcu1525.py --build` | `./trixium_fk33.py --build` | `./trixium_ypcb.py --build` |
 | load | `./trixium_xcu1525.py --load` (openFPGALoader) | `./trixium_fk33.py --load` (OpenOCD) | `./trixium_ypcb.py --load` (openFPGALoader, HS2 cable) |
-| deploy | `trixium deploy --board xcu1525 --model 27b` | `trixium deploy --board fk33 --model 1p7b` | `trixium deploy --board ypcb --model 1p7b` |
+| deploy | `trixium deploy --board xcu1525 --model 27b` | `trixium deploy --board fk33 --model 1p7b` | `trixium deploy --board ypcb --model 1p7b` (hybrid build: `--model 2b`) |
 
 ## Known issues
 
@@ -42,8 +42,13 @@ design and its simulation are exact; two boards' memory systems are not always:
   with every calibration and drift as the card warms, with enough double-bit errors to defeat
   SECDED; controller 0 stays almost clean. **A DDR3-933 build** (DDR 116.67 MHz, sys 127.27 MHz)
   cuts controller 1's errors about 400x at 31.8 tok/s on the 1.7B; its remaining errors sit on
-  two bits, the target of an ECC-guided per-bit retune being evaluated. All of this lives on the
-  development branch, in progress.
+  two bits, the target of an ECC-guided per-bit retune being evaluated. The ECC is upstream since
+  2026-10-17 (LiteDRAM #423, LiteX #2679, LiteX-Boards #928), and the firmware re-runs a forward
+  during which a controller flagged an uncorrectable read: the weights in DRAM are intact, the
+  errors are transient. A Qwen3 forward is idempotent once its position is restored; a hybrid
+  one (Bonsai 2) once its DeltaNet state is double-buffered (engine op 5 writes the other set),
+  which is validated in simulation (`eccforce N` re-runs forwards on demand) and next on the
+  card.
 - **XCU1525: one DDR4 controller trains marginally on some boots.** The weights read back from
   that controller's four channels differ from the image (stably, so the writes are wrong), and
   its KV-cache writes make attention vary from run to run; about half the boots of 2026-10-15
