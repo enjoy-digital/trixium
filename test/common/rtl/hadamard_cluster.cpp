@@ -111,7 +111,7 @@ int main() {
     }
     for (unsigned mode=0; mode<4; mode++) {
         auto words=descriptor(1, false);
-        if (mode==0) words[6]=2;
+        if (mode==0) words[6]=4;   // w6 bit 2: reserved (bit 1 is the half-block flag, ABI 1.1)
         if (mode==1) words[5]=0;
         if (mode==2) words[4]=65535;
         if (mode==3) words[1]=0xffffe0;
