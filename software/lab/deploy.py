@@ -393,6 +393,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
         # The tokenizers (the C chat tool wants the .bin, the Python client the .json).
         for m in ["1.7b", "8b", "27b", "2b", "4b"]:
             if os.path.exists(os.path.join(REPO, "models", m, "tokenizer.bin")):
+                remote.ssh(f"mkdir -p models/{m}")
                 remote.scp([os.path.join("models", m, f) for f in ["tokenizer.bin", "tokenizer.json"]], f"models/{m}/")
         rc, _ = remote.ssh("cd gen/driver/kernel && rm -f *.ko *.o *.mod* .*.cmd && (make 2>&1 | grep -iE ' error' | head -3); "
             "ls trixium.ko liteuart.ko")
