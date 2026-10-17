@@ -340,6 +340,11 @@ class ScratchpadArbiter(LiteXModule):
         self.sp_wr_we  = Signal.like(base.sp_wr_we)
         self.sp_wr_dat = Signal.like(base.sp_wr_dat)
         self.sp_wr_gnt = Signal()
+        # Write room, driven by the integrator (its grant without the request): a client's
+        # grant is room & select & its own request - the same as sp_wr_gnt & select, as the
+        # integrator grants sp_wr_req & room and the selects are one-hot, but no client's
+        # request reaches another client's grant (a 24-level cross-client chain on the K7).
+        self.sp_wr_room = Signal()
         self.aux_busy  = Signal() # Any attached (non-base) client busy.
 
         # # #
@@ -369,7 +374,8 @@ class ScratchpadArbiter(LiteXModule):
             self.comb += getattr(self, field).eq(pick(field))
         self.comb += [
             base.sp_rd_dat.eq(self.sp_rd_dat),
-            base.sp_wr_gnt.eq(self.sp_wr_gnt & base_sel),
+            base.sp_wr_gnt.eq(self.sp_wr_room & base_sel & base.sp_wr_req),
         ]
         for i, c in enumerate(clients):
-            self.comb += [c.sp_rd_dat.eq(self.sp_rd_dat), c.sp_wr_gnt.eq(self.sp_wr_gnt & sel[i])]
+            self.comb += [c.sp_rd_dat.eq(self.sp_rd_dat),
+                          c.sp_wr_gnt.eq(self.sp_wr_room & sel[i] & c.sp_wr_req)]

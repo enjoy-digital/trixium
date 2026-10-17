@@ -994,6 +994,8 @@ class MatVecEngine(LiteXModule):
                 rd_free.eq(~vec_rd & ~grant_seq & ~scratchpad.sbr_gnt_any),
                 vec_wr.eq(vecunit.sp_wr_req & (wr_fifo.level < 6)),
                 vecunit.sp_wr_gnt.eq(vec_wr),
+                # A ScratchpadArbiter takes the room instead (per-client grants, scratchpad.py).
+                *([vecunit.sp_wr_room.eq(wr_fifo.level < 6)] if hasattr(vecunit, "sp_wr_room") else []),
                 fetch_rdy.eq(wr_fifo.level < 6),
                 gw_pending.eq(wr_fifo.readable | (sp_gw_we != 0)),
                 wr_fifo.din.eq(Cat(eng_gw_adr, sp_gw_we, eng_gw_dat)),

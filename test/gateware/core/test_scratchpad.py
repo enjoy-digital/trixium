@@ -88,10 +88,13 @@ class DUT(Module):
             top = mux
         self.chain_top = top
         self.submodules.arb = ScratchpadArbiter(self.flat_base, self.flat)
-        # The scratchpad side feeds both trees the same read data and write grant.
+        # The scratchpad side feeds both trees the same read data and write room, as the engine
+        # does: the chain gets the grant sp_wr_req & room, the flat arbiter the room itself
+        # (its per-client grants must equal the chain's).
         self.rd_dat, self.wr_gnt = Signal(256), Signal()
-        self.comb += [self.chain_top.sp_rd_dat.eq(self.rd_dat), self.chain_top.sp_wr_gnt.eq(self.wr_gnt),
-                      self.arb.sp_rd_dat.eq(self.rd_dat), self.arb.sp_wr_gnt.eq(self.wr_gnt)]
+        self.comb += [self.chain_top.sp_rd_dat.eq(self.rd_dat),
+                      self.chain_top.sp_wr_gnt.eq(self.chain_top.sp_wr_req & self.wr_gnt),
+                      self.arb.sp_rd_dat.eq(self.rd_dat), self.arb.sp_wr_room.eq(self.wr_gnt)]
 
 
 @pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 6])
@@ -139,6 +142,8 @@ def test_priority_is_last_attached():
         for k, c in enumerate(dut.flat):
             yield c.sp_rd_adr.eq(0x100 + k)
         yield dut.flat_base.sp_rd_adr.eq(0x0FF)
+        for c in [dut.flat_base] + dut.flat:      # a grant answers the client's own request
+            yield c.sp_wr_req.eq(1)
         yield dut.flat[0].busy.eq(1)
         yield dut.flat[2].busy.eq(1)
         yield dut.wr_gnt.eq(1)
