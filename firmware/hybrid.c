@@ -2132,12 +2132,14 @@ static void ffn_tok(int l, uint64_t t0)
 // position, the DeltaNet set parity and zero flags, the conv ring positions, the CPU-side
 // K/V row counts. The state matrices are double-buffered (dn_set_bytes), the conv ring has a
 // spare slot, the K/V row at the position is rewritten.
-static struct {
+struct hyb_ckpt {
     int pos, par;
     uint64_t zero;
     uint8_t conv_pos[64];
     uint16_t kc_rows[64];
-} ckpt;
+};
+#define CK (*(struct hyb_ckpt *)TRIXIUM_HYB_CKPT_ADDR)
+_Static_assert(sizeof(struct hyb_ckpt) <= 1024, "hybrid checkpoint window is 1 KB");
 
 int hybrid_ckpt_save(void)
 {
@@ -2145,21 +2147,21 @@ int hybrid_ckpt_save(void)
         return 0;
     if (n_dn && !(dn_hw && dn_set_bytes && HP->dnstream_active && dn_conv_w == conv_k))
         return 0;
-    ckpt.pos  = pos;
-    ckpt.par  = dn_par;
-    ckpt.zero = dn_state_zero;
-    if (dn_conv_pos) memcpy(ckpt.conv_pos, dn_conv_pos, (size_t)n_dn);
-    if (kc_rows) memcpy(ckpt.kc_rows, kc_rows, (size_t)n_attn*2);
+    CK.pos  = pos;
+    CK.par  = dn_par;
+    CK.zero = dn_state_zero;
+    if (dn_conv_pos) memcpy(CK.conv_pos, dn_conv_pos, (size_t)n_dn);
+    if (kc_rows) memcpy(CK.kc_rows, kc_rows, (size_t)n_attn*2);
     return 1;
 }
 
 void hybrid_ckpt_restore(void)
 {
-    pos           = ckpt.pos;
-    dn_par        = ckpt.par;
-    dn_state_zero = ckpt.zero;
-    if (dn_conv_pos) memcpy(dn_conv_pos, ckpt.conv_pos, (size_t)n_dn);
-    if (kc_rows) memcpy(kc_rows, ckpt.kc_rows, (size_t)n_attn*2);
+    pos           = CK.pos;
+    dn_par        = CK.par;
+    dn_state_zero = CK.zero;
+    if (dn_conv_pos) memcpy(dn_conv_pos, CK.conv_pos, (size_t)n_dn);
+    if (kc_rows) memcpy(kc_rows, CK.kc_rows, (size_t)n_attn*2);
 }
 
 int hybrid_forward(int token, int want_logits)

@@ -1880,9 +1880,9 @@ static uint32_t ecc_uncorrectable(void)
 static int forward_checked(int token, int want_logits)
 {
     int hyb = hybrid_present();
-    static int8_t saved[1024];   // n_layer*n_kv_head*2: the 8B's 576
+    int8_t *saved = (int8_t *)TRIXIUM_ECC_SAVED_ADDR;   // 1 KB, n_layer*n_kv_head*2: the 8B's 576
     int nk = n_layer*n_kv_head*2;
-    int keep = hyb ? hybrid_ckpt_save() : kv_ekmax && nk <= (int)sizeof saved;
+    int keep = hyb ? hybrid_ckpt_save() : kv_ekmax && nk <= 1024;
     int pos0 = n_pos, dbg0 = dbg_armed;   // a re-run traces its position again
     if (keep && !hyb) memcpy(saved, kv_ekmax, nk);
     for (int attempt = 0; ; attempt++) {

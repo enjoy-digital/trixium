@@ -495,7 +495,7 @@ static void fetchtest_cmd(char *str)
            e->role, e->layer, (unsigned long)beats, reps, bad_total);
 }
 
-#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
 #define BIST(k, reg) (CSR_SDRAM_##reg##_ADDR + (unsigned long)(k)*SDRAM_CSR_STRIDE)
 // Controller k's BIST checker re-reading the 32 MB that `ddrstress` wrote (background load and
 // an error count): bist_kick restarts it when done, bist_report prints the total.
@@ -544,7 +544,7 @@ static void mvdiff_cmd(char *str)
         if (mode & 4) for (uint32_t i = 0; i < e->rows; i++) out[i] = 0x5a5a5a5a;
         if (mode & 2) { uint64_t t0 = perf_now64(); while (perf_now64() - t0 < CONFIG_CLOCK_FREQUENCY/500); }
         if (mode & 1) fill_x_pattern(0, e->cols);
-#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
         if (mode & 8) bist_kick(1);
 #endif
         model_matvec(e, 0, DST);
@@ -559,12 +559,12 @@ static void mvdiff_cmd(char *str)
     }
     printf("MVDIFF role=%u layer=%u rows=%lu mode=%d: %d of %d runs differ from the first\n",
            e->role, e->layer, (unsigned long)e->rows, mode, bad_runs, reps);
-#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
     if (mode & 8) bist_report(1);
 #endif
 }
 
-#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
 // DDR read margin under load: `ddrstress <ctrl> <role> <layer> [passes]`. The controller's
 // LiteDRAM BIST writes 32 MB of random data at its top (above the weights), then its checker
 // re-reads that region in the background while the engine fetches the tensor's chunks on the
@@ -866,11 +866,11 @@ static void console_service(void)
         mvtest_cmd(str);
     else if (strcmp(token, "mvbw") == 0)
         mvbw_cmd(str);
-#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
     else if (strcmp(token, "ddrstress") == 0)
         ddrstress_cmd(str);
 #endif
-#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE)
+#if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
     else if (strcmp(token, "bistload") == 0) { // bistload <k> <runs>: the BIST alone, no engine
         char *kk = get_token(&str), *nn = get_token(&str);
         int k = (int)strtoul(kk, NULL, 0), runs = *nn ? (int)strtoul(nn, NULL, 0) : 16;
