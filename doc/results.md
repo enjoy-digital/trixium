@@ -15,8 +15,8 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | FK33 | Ternary-Bonsai 1.7B | 106.3 | 2.00 M | sys 212.5 MHz |
 | YPCB-00338 (2x DDR3-1066) | Ternary-Bonsai 8B | 8.11 | 15.41 M | sys 125 MHz |
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
-| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels) | Ternary-Bonsai-2 4B | 5.71 | 17.5 M | sys 100 MHz |
-| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 12.40 | 8.07 M | sys 100 MHz |
+| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels) | Ternary-Bonsai-2 4B | 5.76 | 17.4 M | sys 100 MHz |
+| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 12.61 | 7.93 M | sys 100 MHz |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate
@@ -26,10 +26,12 @@ approved overclock), and the builds close timing to the project's empirical gate
 [`performance-next-steps.md`](performance-next-steps.md).
 
 The Bonsai 2 2B/4B on the YPCB-00338 are far from its memory limit: the 2B streams ~0.41 GB per
-token, so 12.4 tok/s uses about a third of the DDR3-933 bandwidth (7.8 M cycles per forward
-against a 3.2 M streaming floor). The rest is per-token work that does not overlap the weight
-streams yet: the DeltaNet recurrence unit (compute-bound at 4 lanes on this card), CPU softmax
-and activations, list round trips. openTPU's numbers on the same card (Qwen3.5-2B 12.1, 4B 5.9
+token, so 12.6 tok/s uses about a third of the DDR3-933 bandwidth (7.7 M cycles per forward
+against a 3.2 M streaming floor). The token trace (`tprof`) puts the rest at: the DeltaNet
+recurrence unit, compute-bound at 4 lanes on this card (16%); the engine idle while the
+scratchpad units, the vector unit and the CPU work on each layer's serial chain of norms,
+convolution, activations and list round trips (27%); the stream itself at 0.83 of the
+512-bit port's rate, which at sys 100 MHz is 86% of DDR3-933. openTPU's numbers on the same card (Qwen3.5-2B 12.1, 4B 5.9
 tok/s) are not a like-for-like comparison: the same architecture, but the original weights at 4
 bits (~2.5x the bytes per token) and DDR3-1066.
 

@@ -42,13 +42,25 @@ design and its simulation are exact; two boards' memory systems are not always:
   with every calibration and drift as the card warms, with enough double-bit errors to defeat
   SECDED; controller 0 stays almost clean. **A DDR3-933 build** (DDR 116.67 MHz, sys 127.27 MHz)
   cuts controller 1's errors about 400x at 31.8 tok/s on the 1.7B; its remaining errors sit on
-  two bits, the target of an ECC-guided per-bit retune being evaluated. The ECC is upstream since
-  2026-10-17 (LiteDRAM #423, LiteX #2679, LiteX-Boards #928), and the firmware re-runs a forward
-  during which a controller flagged an uncorrectable read: the weights in DRAM are intact, the
-  errors are transient. A Qwen3 forward is idempotent once its position is restored; a hybrid
-  one (Bonsai 2) once its DeltaNet state is double-buffered (engine op 5 writes the other set),
-  which is validated in simulation (`eccforce N` re-runs forwards on demand) and next on the
-  card.
+  a few bits that change with every leveling (one boot: ~600 corrected and 2-7 uncorrectable
+  reads per 24 tokens, 91% on one bit; a bad one: 64k and 26k). **Root cause and fix
+  (2026-10-17): the leveling centres each bit in the wrong eye.** Its per-bit window comes
+  from a few DFI-injected bursts per tap and is 10-13 taps wide; the LiteDRAM BIST's single
+  stream sees 6-8; the engine's concurrent channel streams see 2-3, so a bit "centred" by the
+  leveling sits on the real edge (DQ14 at tap 15: taps 13-14 clean, 15 = 1,633 errors per 24
+  tokens, 16 = 789,690). The firmware now re-levels controllers 1.. at boot and runs an
+  ECC-guided scan (`ddr_ecc_scan`, console `eccscan [k] [range] [passes]`): every bit's tap at
+  leveled + off for off in -6..+6, a synthetic trit5 matvec streaming a BIST-written 32 MB
+  region of every channel window at each offset, the ECC per-bit counters marking the bits in
+  error, each bit then moved to the centre of its clean run. On the card (2B, 64 tokens):
+  8 corrected, 0 uncorrectable, where the same boot's leveling alone gave 346 and 4 and a bad
+  one 63,685 and 25,902. The ECC is upstream since 2026-10-17 (LiteDRAM #423, LiteX #2679,
+  LiteX-Boards #928); the per-bit scan under real traffic is the next LiteDRAM contribution.
+  Behind it, the firmware re-runs a forward during which a controller flagged an uncorrectable
+  read: the weights in DRAM are intact, the errors are transient. A Qwen3 forward is idempotent
+  once its position is restored; a hybrid one (Bonsai 2) once its DeltaNet state is
+  double-buffered (engine op 5 writes the other set), which is validated in simulation
+  (`eccforce N` re-runs forwards on demand); its bitstream has not closed timing yet.
 - **XCU1525: one DDR4 controller trains marginally on some boots.** The weights read back from
   that controller's four channels differ from the image (stably, so the writes are wrong), and
   its KV-cache writes make attention vary from run to run; about half the boots of 2026-10-15
