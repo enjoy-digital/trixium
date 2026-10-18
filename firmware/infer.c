@@ -29,6 +29,8 @@
 #include "bons.h"
 #include "engine.h"
 #include "hybrid.h"
+#include "resident.h"
+#include "ddr.h"
 #include "model.h"
 #include "infer.h"
 #include "static_memory.h"
@@ -1802,6 +1804,13 @@ int infer_init(void)
             return -1;
         }
     }
+#if defined(SDRAM_CSR_STRIDE) && defined(CSR_SDRAM_ECC_BITSEL_ADDR) && defined(TRIXIUM_N_MEMCTRL)
+    // Every bit's read tap to the centre of its eye under this model's own forwards (ddr.c): the
+    // boot's synthetic scan can leave bits on an edge the inference traffic finds.
+    if (hybrid_present())
+        for (int k = 1; k < TRIXIUM_N_MEMCTRL; k++)
+            ddr_eye_scan(k, 4, 2);
+#endif
     return 0;
 }
 
@@ -1917,6 +1926,26 @@ static int forward_checked(int token, int want_logits)
         else
             memcpy(kv_ekmax, saved, nk);
     }
+}
+
+// One forward of a fixed token from the current state and back, as a retry re-runs one: the
+// read eye scan's traffic (ddr.c ddr_eye_scan). -1 when the model cannot be re-run from here
+// (no hybrid checkpoint) or the engine wedged.
+int infer_eye_forward(void)
+{
+    if (!hybrid_present() || !hybrid_ckpt_save() || engine_wedged)
+        return -1;
+    int pos0 = n_pos, dbg0 = dbg_armed;
+    (void)forward(1, 1);
+    n_pos = pos0;
+    dbg_armed = dbg0;
+    hybrid_ckpt_restore();
+    // Reads at a bad tap offset corrupt the data a list computes on, not the lists: a list
+    // that failed on it (and turned the resident path off) is no fault of the path.
+    resident_reenable();
+    if (engine_wedged && engine_recover() == 0)
+        engine_wedged = 0;
+    return engine_wedged ? -1 : 0;
 }
 
 int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(int tok))

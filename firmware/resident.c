@@ -364,6 +364,12 @@ void resident_listcache_reset(void)
     RLS->chits = RLS->crecords = RLS->cevict = RLS->cmism = RLS->cfall = 0;
 }
 
+// The path back on after a list failed on corrupt data (the read eye scan's bad tap offsets).
+void resident_reenable(void)
+{
+    resident_state()->disabled = 0;
+}
+
 void resident_listcache_print(void)
 {
     const struct rl_state *L = RLS;
@@ -1519,6 +1525,7 @@ void resident_listprof_names(void) {}
 void resident_listcache_mode(int mode) { (void)mode; }
 void resident_listcache_print(void) {}
 void resident_listcache_reset(void) {}
+void resident_reenable(void) {}
 int  rl_begin_keyed(uint32_t a, uint32_t b, uint32_t c) { (void)a; (void)b; (void)c; return 0; }
 int  rl_replaying(void) { return 0; }
 

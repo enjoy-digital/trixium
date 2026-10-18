@@ -185,5 +185,6 @@ void resident_listprof_print(uint32_t forwards);   // `listprof` lines (stats)
 void resident_listprof_names(void);                // `TPL` lines (tprof dump)
 void resident_listcache_mode(int mode);            // 0 off, 1 on, 2 verify (every image rebuilt)
 void resident_listcache_print(void);               // `listcache` line (stats)
+void resident_reenable(void);                      // the path back on after a list failed on corrupt reads
 
 #endif /* RESIDENT_H */

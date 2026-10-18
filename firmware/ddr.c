@@ -53,6 +53,7 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 
 #include "engine.h"
 #include "bons.h"
+#include "infer.h"
 #include "ddr.h"
 
 // ECC-guided per-bit read tap centring (ddr_ecc_scan): a leveling the firmware owns, the
@@ -164,7 +165,12 @@ void ddr_tap_offset(int k, int off)
 // one earlier). Writes do not depend on the read taps. Destroys the first 32 MB of every
 // channel's weights: at boot (before any model), or reload the model after. Returns the number
 // of bits moved, -1 when controller k's taps are not the firmware's leveling (ddrinit k first).
-int ddr_ecc_scan(int k, int range, int passes)
+// The scan's loop: every bit's tap at its current tap + off for off in [-range, range], the
+// traffic callback `passes` times at each offset (0 = ran; nonzero stops the scan: the taps
+// go back and -1 comes back), the ECC per-bit counters marking the bits in error; then each
+// bit to the centre of its longest clean run of offsets (ties: toward the current tap).
+static int ddr_scan_eye(int k, int range, int passes, int (*traffic)(void *), void *arg,
+                        const char *what)
 {
     if (k != ckphase_ctrl) {
         printf("ddr: controller %d's taps are not the firmware's last leveling (ddrinit %d first)\n", k, k);
@@ -173,6 +179,93 @@ int ddr_ecc_scan(int k, int range, int passes)
     if (range < 1) range = 1;
     if (range > 8) range = 8;
     if (passes < 1) passes = 1;
+    sdram_csr_base = sdram_csr_base0 + (unsigned long)k*SDRAM_CSR_STRIDE;
+    uint32_t clean[CKPHASE_BITS];               // bit (off + range): no corrected error on DQ b
+    memset(clean, 0, sizeof clean);
+    int failed = 0;
+    for (int off = -range; off <= range && !failed; off++) {
+        for (int b = 0; b < CKPHASE_BITS; b++) {
+            int t = ckphase.bit[b].tap + off;
+            if (t < 0) t = 0;
+            if (t > SDRAM_PHY_DELAYS - 1) t = SDRAM_PHY_DELAYS - 1;
+            ckphase_set_tap(1u << (b/8), 1u << (b%8), t);
+        }
+        sdram_ecc_clear_write(1);
+        for (int p = 0; p < passes && !failed; p++) {
+            sdram_csr_base = sdram_csr_base0;   // the traffic may use any controller's CSRs
+            failed = traffic(arg);
+            sdram_csr_base = sdram_csr_base0 + (unsigned long)k*SDRAM_CSR_STRIDE;
+        }
+        for (int b = 0; b < CKPHASE_BITS; b++) {
+            sdram_ecc_bitsel_write(b);
+            (void)sdram_ecc_bitcnt_read();      // registered mux: settle
+            if (sdram_ecc_bitcnt_read() == 0)
+                clean[b] |= 1u << (off + range);
+        }
+    }
+    if (failed) {
+        for (int b = 0; b < CKPHASE_BITS; b++)
+            ckphase_set_tap(1u << (b/8), 1u << (b%8), ckphase.bit[b].tap);
+        sdram_ecc_clear_write(1);
+        sdram_csr_base = sdram_csr_base0;
+        printf("ddr: controller %d eye scan under %s stopped (the traffic failed) - taps unchanged\n",
+               k, what);
+        return -1;
+    }
+    int moved = 0;
+    printf("ddr: controller %d read eye under %s, offsets %+d..%+d from the leveling "
+           "(. error, # clean), each bit's tap moved by:\n", k, what, -range, range);
+    for (int l = 0; l < CKPHASE_LANES; l++) {
+        printf("ddr:  m%d:", l);
+        for (int i = 0; i < 8; i++) {
+            int b = 8*l + i, lo = 0, hi = -1, run_lo = 0;
+            // The longest clean run; on a tie the one holding the leveled tap wins.
+            for (int o = -range; o <= range + 1; o++) {
+                int c = o <= range && (clean[b] >> (o + range) & 1);
+                if (c && (o == -range || !(clean[b] >> (o - 1 + range) & 1)))
+                    run_lo = o;
+                if (!c && o > -range && (clean[b] >> (o - 1 + range) & 1)) {
+                    int run_hi = o - 1;
+                    if (run_hi - run_lo > hi - lo ||
+                        (run_hi - run_lo == hi - lo && run_lo <= 0 && run_hi >= 0)) {
+                        lo = run_lo; hi = run_hi;
+                    }
+                }
+            }
+            int c = hi < lo ? 0 : (lo + hi)/2;   // no clean offset: the leveled tap stays
+            int t = ckphase.bit[b].tap + c;
+            if (t < 0) t = 0;
+            if (t > SDRAM_PHY_DELAYS - 1) t = SDRAM_PHY_DELAYS - 1;
+            ckphase.bit[b].tap = (uint8_t)t;     // the next scan's (and ddrbit/ddrtap's) origin
+            ckphase_set_tap(1u << l, 1u << i, t);
+            if (c) moved++;
+            printf(" ");
+            for (int o = -range; o <= range; o++)
+                printf("%c", clean[b] >> (o + range) & 1 ? '#' : '.');
+            printf("%+d", c);
+        }
+        printf("\n");
+    }
+    sdram_ecc_clear_write(1);
+    sdram_csr_base = sdram_csr_base0;
+    printf("ddr: controller %d: %d of %d bits moved\n", k, moved, CKPHASE_BITS);
+    return moved;
+}
+
+// The synthetic traffic: a trit5 matvec with its result writes suppressed over a 32 MB
+// region of every channel window, written once by each controller's BIST generator.
+static int scan_matvec(void *arg)
+{
+    engine_run((struct engine_op *)arg);
+    return engine_wedged ? -1 : 0;
+}
+
+int ddr_ecc_scan(int k, int range, int passes)
+{
+    if (k != ckphase_ctrl) {
+        printf("ddr: controller %d's taps are not the firmware's last leveling (ddrinit %d first)\n", k, k);
+        return -1;
+    }
     // The engine op: trit5 rows of 2,048 columns, as many as fill 32 MB per channel.
     const uint32_t cols = 2048, group = 128, len = 32u << 20;
     uint32_t rb = bons_row_beats(cols, KIND_TERNARY5, group);   // memory beats per row
@@ -197,63 +290,24 @@ int ddr_ecc_scan(int k, int range, int passes)
             while (!sdram_generator_done_read());
         }
     }
-    sdram_csr_base = sdram_csr_base0 + (unsigned long)k*SDRAM_CSR_STRIDE;
-    uint32_t clean[CKPHASE_BITS];               // bit (off + range): no corrected error on DQ b
-    memset(clean, 0, sizeof clean);
-    for (int off = -range; off <= range; off++) {
-        for (int b = 0; b < CKPHASE_BITS; b++) {
-            int t = ckphase.bit[b].tap + off;
-            if (t < 0) t = 0;
-            if (t > SDRAM_PHY_DELAYS - 1) t = SDRAM_PHY_DELAYS - 1;
-            ckphase_set_tap(1u << (b/8), 1u << (b%8), t);
-        }
-        sdram_ecc_clear_write(1);
-        for (int p = 0; p < passes; p++)
-            engine_run(&op);
-        for (int b = 0; b < CKPHASE_BITS; b++) {
-            sdram_ecc_bitsel_write(b);
-            (void)sdram_ecc_bitcnt_read();      // registered mux: settle
-            if (sdram_ecc_bitcnt_read() == 0)
-                clean[b] |= 1u << (off + range);
-        }
-    }
-    int moved = 0;
-    printf("ddr: controller %d read eye under engine traffic, offsets %+d..%+d from the leveling "
-           "(. error, # clean), each bit's tap moved by:\n", k, -range, range);
-    for (int l = 0; l < CKPHASE_LANES; l++) {
-        printf("ddr:  m%d:", l);
-        for (int i = 0; i < 8; i++) {
-            int b = 8*l + i, lo = 0, hi = -1, run_lo = 0;
-            // The longest clean run; on a tie the one holding the leveled tap wins.
-            for (int o = -range; o <= range + 1; o++) {
-                int c = o <= range && (clean[b] >> (o + range) & 1);
-                if (c && (o == -range || !(clean[b] >> (o - 1 + range) & 1)))
-                    run_lo = o;
-                if (!c && o > -range && (clean[b] >> (o - 1 + range) & 1)) {
-                    int run_hi = o - 1;
-                    if (run_hi - run_lo > hi - lo ||
-                        (run_hi - run_lo == hi - lo && run_lo <= 0 && run_hi >= 0)) {
-                        lo = run_lo; hi = run_hi;
-                    }
-                }
-            }
-            int c = hi < lo ? 0 : (lo + hi)/2;   // no clean offset: the leveled tap stays
-            int t = ckphase.bit[b].tap + c;
-            if (t < 0) t = 0;
-            if (t > SDRAM_PHY_DELAYS - 1) t = SDRAM_PHY_DELAYS - 1;
-            ckphase_set_tap(1u << l, 1u << i, t);
-            if (c) moved++;
-            printf(" ");
-            for (int o = -range; o <= range; o++)
-                printf("%c", clean[b] >> (o + range) & 1 ? '#' : '.');
-            printf("%+d", c);
-        }
-        printf("\n");
-    }
-    sdram_ecc_clear_write(1);
     sdram_csr_base = sdram_csr_base0;
-    printf("ddr: controller %d: %d of %d bits moved\n", k, moved, CKPHASE_BITS);
-    return moved;
+    return ddr_scan_eye(k, range, passes, scan_matvec, &op, "engine traffic");
+}
+
+// The inference's own traffic: a forward of the loaded model per pass (infer_eye_forward: run
+// from the checkpoint and restored, as the ECC retry does), every weight stream, the DeltaNet
+// state's reads and writes and the KV rows included - the pattern the synthetic matvec does
+// not reproduce on every bitstream (ypcb_hyb7: its scan left three bits at 150-500 corrected
+// reads per 16 tokens). Run at the end of every hybrid model load (infer_init).
+static int scan_forward(void *arg)
+{
+    (void)arg;
+    return infer_eye_forward();
+}
+
+int ddr_eye_scan(int k, int range, int forwards)
+{
+    return ddr_scan_eye(k, range, forwards, scan_forward, 0, "inference traffic");
 }
 #endif
 

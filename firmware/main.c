@@ -973,11 +973,17 @@ static void console_service(void)
         int t = ddr_bit_offset((int)strtoul(kk, NULL, 0), (int)strtoul(d, NULL, 0), off);
         printf("DDRBIT ctrl %s dq %s off %+d -> tap %d\n", kk, d, off, t);
     }
-    else if (strcmp(token, "eccscan") == 0) { // eccscan [k] [range] [passes]: per-bit read eye under BIST traffic
+    else if (strcmp(token, "eccscan") == 0) { // eccscan [k] [range] [passes]: per-bit read eye under engine traffic
         char *kk = get_token(&str), *r = get_token(&str), *p = get_token(&str);
         int n = ddr_ecc_scan(*kk ? (int)strtoul(kk, NULL, 0) : 1, *r ? (int)strtoul(r, NULL, 0) : 3,
                              *p ? (int)strtoul(p, NULL, 0) : 2);
         printf("ECCSCAN %d\n", n);
+    }
+    else if (strcmp(token, "eyescan") == 0) { // eyescan [k] [range] [forwards]: per-bit read eye under the model's forwards
+        char *kk = get_token(&str), *r = get_token(&str), *p = get_token(&str);
+        int n = ddr_eye_scan(*kk ? (int)strtoul(kk, NULL, 0) : 1, *r ? (int)strtoul(r, NULL, 0) : 3,
+                             *p ? (int)strtoul(p, NULL, 0) : 2);
+        printf("EYESCAN %d\n", n);
     }
     else if (strcmp(token, "ddrtap") == 0) {
         char *kk = get_token(&str), *o = get_token(&str);
