@@ -44,6 +44,7 @@ from migen.fhdl.simplify import FullMemoryWE
 from litex.gen import LiteXModule
 
 from litex.soc.interconnect import csr_bus, wishbone, axi, stream
+from litex.soc.interconnect.csr import CSR, CSRStatus, CSRStorage
 from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter
 from litex.soc.integration.soc import SoCRegion, SoCCSRRegion
 
@@ -226,13 +227,90 @@ class _DDRCSRHolder(Module):
     """A plain Module: the SoC's CSR scan does not look inside it, the ddr-domain
     CSRBankArray does (its attributes sdram, ddrphy, sdram1, ... are the bank names)."""
 
+# DDR Statistics -----------------------------------------------------------------------------------
+
+class DFIStats(LiteXModule):
+    """Command statistics of one controller's DFI, in its clock: the cycles with a read, a
+    write, an activate, a precharge or a refresh on any phase, and the cycles with no command
+    at all. `snap` latches the counts for the CPU and restarts them, so two snaps bracket a
+    workload: the accounting of the cycles the engine's streams did not get a beat in (refresh,
+    row switches, nothing to issue)."""
+    def __init__(self, dfi):
+        self.snap   = CSR()
+        self.cycles = CSRStatus(32)
+        self.reads  = CSRStatus(32)
+        self.writes = CSRStatus(32)
+        self.acts   = CSRStatus(32)
+        self.pres   = CSRStatus(32)
+        self.refs   = CSRStatus(32)
+        self.idle   = CSRStatus(32)
+
+        # # #
+
+        def on_any_phase(ras_n, cas_n, we_n):
+            # Active-low pins: a rank selected and this command on the phase.
+            return reduce(or_, [(p.cs_n != 2**len(p.cs_n) - 1) & (p.ras_n == ras_n) &
+                                (p.cas_n == cas_n) & (p.we_n == we_n) for p in dfi.phases])
+        # Every increment a 1-bit Signal: an expression such as ~(a | b) widens to the adder's
+        # 32 bits in the emitted Verilog (the Migen width pitfall) and counts garbage.
+        rd, wr, act, pre, ref, none = [Signal() for _ in range(6)]
+        self.comb += [
+            rd.eq(on_any_phase(1, 0, 1)),
+            wr.eq(on_any_phase(1, 0, 0)),
+            act.eq(on_any_phase(0, 1, 1)),
+            pre.eq(on_any_phase(0, 1, 0)),
+            ref.eq(on_any_phase(0, 0, 1)),
+            none.eq(~(rd | wr | act | pre | ref)),
+        ]
+        for status, inc in ((self.cycles, 1), (self.reads, rd), (self.writes, wr), (self.acts, act),
+                            (self.pres, pre), (self.refs, ref), (self.idle, none)):
+            count = Signal(32)
+            self.sync += If(self.snap.re,
+                status.status.eq(count), count.eq(0),
+            ).Else(
+                count.eq(count + inc),
+            )
+
+class EnginePortStats(LiteXModule):
+    """Per engine channel, in the engine's clock: the read beats it received, the cycles its
+    read requests waited on the memory side, the cycles read data waited on the engine, the
+    write beats it sent. `sel` picks the channel the counts show; `snap` latches every
+    channel's and restarts them (two snaps bracket a workload)."""
+    def __init__(self, axis):
+        n = len(axis)
+        self.snap    = CSR()
+        self.sel     = CSRStorage(max(1, (n - 1).bit_length()))
+        self.cycles  = CSRStatus(32)
+        self.beats   = CSRStatus(32)   # Read beats delivered to the channel.
+        self.ar_wait = CSRStatus(32)   # Cycles a read request waited (memory side busy).
+        self.r_wait  = CSRStatus(32)   # Cycles read data waited (engine side busy).
+        self.wbeats  = CSRStatus(32)   # Write beats sent.
+
+        # # #
+
+        cycles = Signal(32)
+        self.sync += If(self.snap.re, self.cycles.status.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+        holds = {name: [] for name in ("beats", "ar_wait", "r_wait", "wbeats")}
+        for axi_if in axis:
+            for name, expr in (("beats",   axi_if.r.valid & axi_if.r.ready),
+                               ("ar_wait", axi_if.ar.valid & ~axi_if.ar.ready),
+                               ("r_wait",  axi_if.r.valid & ~axi_if.r.ready),
+                               ("wbeats",  axi_if.w.valid & axi_if.w.ready)):
+                inc, count, hold = Signal(), Signal(32), Signal(32)   # inc 1-bit: see DFIStats
+                self.comb += inc.eq(expr)
+                self.sync += If(self.snap.re, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
+                holds[name].append(hold)
+        for name, regs in holds.items():
+            self.comb += getattr(self, name).status.eq(Array(regs)[self.sel.storage])
+
 # DDR Domain Controllers ---------------------------------------------------------------------------
 
 def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_size,
                                csr_window, phy_renames={"sys": "ddr"}, controller_settings=None,
-                               with_bist=False, with_ecc=False):
+                               with_bist=False, with_ecc=False, with_stats=False):
     """Add one LiteDRAM controller per phy/module in the `ddr` domain (controller 0 carries
-    main_ram). Fills soc.sdrams; returns the per-controller memory sizes.
+    main_ram). Fills soc.sdrams and soc.ddr_csr_stride (controller k's CSR pages start at
+    controller 0's + k*stride); returns the per-controller memory sizes.
 
     controller_settings: a function returning the ControllerSettings of a controller (one
                          instance each), None for LiteDRAM's defaults.
@@ -242,6 +320,8 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
                          controller k's CSRs sit at controller 0's + k*4 pages.
     with_ecc:            LiteDRAM's DFI ECC (SECDED on each PHY's ECC byte lane, 72-bit beats;
                          the controllers see 64-bit beats, the calibration the raw 72).
+    with_stats:          DFI command statistics per controller (DFIStats, sdram_stats{k}: one
+                         more CSR page per controller), the console's `ddrstat`.
     """
     n            = len(phys)
     holder       = _DDRCSRHolder()
@@ -273,6 +353,12 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
             setattr(holder, f"sdram_checker{sfx}",   checker)
             soc.submodules += ClockDomainsRenamer("ddr")(generator)
             soc.submodules += ClockDomainsRenamer("ddr")(checker)
+    if with_stats:
+        for i, phy in enumerate(phys):
+            sfx = "" if i == 0 else str(i)
+            stats = DFIStats(phy.dfi)
+            setattr(holder, f"sdram_stats{sfx}", stats)
+            soc.submodules += ClockDomainsRenamer("ddr")(stats)
     soc.submodules += holder
     core0 = soc.sdrams[0]
     # The builder writes sdram_phy.h from soc.sdram.controller.settings; the CSR bridge's
@@ -316,16 +402,17 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
         soc.wishbone_bridge = LiteDRAMWishbone2Native(wishbone=soc.l2_cache.slave, port=port,
                                                       base_address=base)
 
-    # The ddr-domain CSR bus: sdram{k} on page 2k, ddrphy{k} on 2k + 1 (with the BIST: 4k,
-    # 4k + 1, then its generator and checker).
+    # The ddr-domain CSR bus: per controller, in order, sdram{k}, ddrphy{k}, with the BIST its
+    # generator and checker, with the statistics sdram_stats{k}; controller k's pages start at
+    # k*per (liblitedram's SDRAM_CSR_STRIDE = per pages).
+    names = (["sdram", "ddrphy"] + (["sdram_generator", "sdram_checker"] if with_bist else [])
+             + (["sdram_stats"] if with_stats else []))
+    per   = len(names)
     pages = {}
     for i in range(n):
         sfx = "" if i == 0 else str(i)
-        if with_bist:
-            pages[f"sdram{sfx}"], pages[f"ddrphy{sfx}"] = 4*i, 4*i + 1
-            pages[f"sdram_generator{sfx}"], pages[f"sdram_checker{sfx}"] = 4*i + 2, 4*i + 3
-        else:
-            pages[f"sdram{sfx}"], pages[f"ddrphy{sfx}"] = 2*i, 2*i + 1
+        for j, name in enumerate(names):
+            pages[f"{name}{sfx}"] = per*i + j
     bank = csr_bus.CSRBankArray(holder, lambda name, memory: pages[name],
         data_width=soc.csr.data_width, address_width=soc.csr.address_width,
         alignment=soc.csr.alignment, paging=soc.csr.paging, ordering=soc.csr.ordering)
@@ -333,7 +420,6 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
     assert not bank.srams
     by_page = {mapaddr: b for (_, _, mapaddr, b) in bank.banks}
     # (LiteDRAM's PHY model has no CSRs: its ddrphy page is then empty.)
-    per = 4 if with_bist else 2
     groups = [[by_page[p].bus for p in range(per*i, per*i + per) if p in by_page] for i in range(n)]
     bridge = PipelinedDDRCSR(wb, groups, soc.csr.address_width, soc.csr.data_width)
     soc.submodules += ClockDomainsRenamer("ddr")(bank)
@@ -347,4 +433,5 @@ def add_ddr_domain_controllers(soc, phys, modules, clk_freq, main_ram_size, l2_s
                                               busword=soc.csr.data_width, obj=csrs))
     for name, constant in bank.constants:
         soc.add_constant(name + "_" + constant.name, constant.value.value)
+    soc.ddr_csr_stride = soc.csr.paging*per
     return memory_sizes

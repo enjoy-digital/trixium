@@ -67,7 +67,7 @@ from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS, YPCB_HYBRID_UNIT_OPTIONS
 
 from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
-from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
+from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 from gateware.memory.ckphase_model import ckphase_model_settings, CKPhasePHYModel, NoDMPHYModel
 from model.bons import BONSReader
@@ -486,13 +486,14 @@ class TriXiumSimSoC(SoCCore):
             self.add_constant("TRIXIUM_CHAN_SKEW",        ddr3_skew(chan_mod))
             self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
             self.add_constant("TRIXIUM_N_MEMCTRL",        n_memctrl)
-            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   2*DDR4_SIM_CSR_STRIDE if ckphase_model else DDR4_SIM_CSR_STRIDE)
+            # Per controller: sdram, ddrphy, (generator, checker with the CK phase model,) stats.
+            self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   self.csr.paging*(5 if ckphase_model else 3))
             self.add_constant("SDRAM_TEST_DISABLE")
             if ckphase_model:
                 # The board's calibration (liblitedram's CK phase leveling, SDRAM_PHY_CKPHASE_STEPS
                 # from the model's settings) on the PHY model: `ddrinit 1` on the console. Scan
                 # stride and BIST sizes cut to simulation time.
-                self.add_constant("SDRAM_CSR_STRIDE",               2*DDR4_SIM_CSR_STRIDE)
+                self.add_constant("SDRAM_CSR_STRIDE",               self.csr.paging*5)
                 self.add_constant("SDRAM_CKPHASE_SCAN_STRIDE",      28)
                 self.add_constant("SDRAM_CKPHASE_BIST_STEP_BYTES",  0x10000)
                 self.add_constant("SDRAM_CKPHASE_BIST_FINAL_BYTES", 0x40000)
@@ -541,6 +542,7 @@ class TriXiumSimSoC(SoCCore):
                                                        rmw=YPCB_ENGINE_RMW)):
                     setattr(self, f"engport{c}_{jj}", m)
                 memory_ports.append(axi)
+        self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 
@@ -569,7 +571,7 @@ class TriXiumSimSoC(SoCCore):
             split_modules.append(module)
         add_ddr_domain_controllers(self, split_phys, split_modules, DDR3_SIM_FREQ, MAIN_RAM_SIZE,
             8192, DDR4_SIM_CSR_WINDOW, controller_settings=ddr_controller_settings(**ddr_settings),
-            with_bist=ckphase_model)
+            with_bist=ckphase_model, with_stats=True)
 
         # Engine ports: channel c -> controller c // chan_mod.
         for k in range(n_memctrl):
@@ -581,6 +583,7 @@ class TriXiumSimSoC(SoCCore):
                                                        rmw=YPCB_ENGINE_RMW)):
                     setattr(self, f"engport{c}_{jj}", m)
                 memory_ports.append(axi)
+        self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 

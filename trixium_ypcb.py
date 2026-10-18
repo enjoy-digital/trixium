@@ -53,7 +53,7 @@ from litepcie.software import generate_litepcie_software
 
 from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET, ddr_chan_stride
 from gateware.core.core import TriXiumConfig, TriXiumCore
-from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port
+from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
@@ -154,11 +154,12 @@ class _CRG(LiteXModule):
 
 # TriXiumYPCBSoC -----------------------------------------------------------------------------------
 
-# The (sdram, ddrphy, sdram_generator, sdram_checker) CSR pages of the two controllers: their
-# own CSR bus in the ddr domain, behind a wishbone crossing at DDR_CSR_WINDOW, controller k's
-# registers at controller 0's + k*DDR_CSR_STRIDE (liblitedram's SDRAM_CSR_STRIDE).
+# The (sdram, ddrphy, sdram_generator, sdram_checker, sdram_stats) CSR pages of the two
+# controllers: their own CSR bus in the ddr domain, behind a wishbone crossing at
+# DDR_CSR_WINDOW, controller k's registers at controller 0's + k*DDR_CSR_STRIDE (liblitedram's
+# SDRAM_CSR_STRIDE; five 0x800 pages since the DFI statistics).
 DDR_CSR_WINDOW = 0xF0020000
-DDR_CSR_STRIDE = 0x2000
+DDR_CSR_STRIDE = 0x2800
 
 # The MMCM of each DDR3 PHY in its channel's clock region (channel 0: banks 11-13, the MMCM of
 # bank 13's region; channel 1: banks 16-18, bank 17's, the command bank).
@@ -219,6 +220,7 @@ class TriXiumYPCBSoC(SoCCore):
                                                   rmw=ENGINE_RMW)):
                 setattr(self, f"engport{c}_{j}", m)
             memory_ports.append(axi)
+        self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
 
         # PCIe -------------------------------------------------------------------------------------
         self.pcie_phy = S7PCIEPHY(platform, platform.request("pcie_x8"),
@@ -348,7 +350,8 @@ class TriXiumYPCBSoC(SoCCore):
             modules.append(YPCBDDR3(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
             DDR_CSR_WINDOW, phy_renames={"sys": "ddr"}, controller_settings=controller_settings,
-            with_bist=True, with_ecc=ddr_ecc)
+            with_bist=True, with_ecc=ddr_ecc, with_stats=True)
+        assert self.ddr_csr_stride == DDR_CSR_STRIDE, self.ddr_csr_stride
         self.add_constant("SDRAM_CSR_STRIDE",  DDR_CSR_STRIDE)
         self.add_constant("SDRAM_CONTROLLERS", n)
 

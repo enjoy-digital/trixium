@@ -172,6 +172,7 @@ static void help(void)
     puts("  peek c addr       - dump one weight-memory beat of channel c via the engine (hex addr)");
     puts("  mvtest role [layer] - matvec one tensor with the test pattern, print checksum");
     puts("  mvbw role [layer] [reps] - engine streaming efficiency on one tensor");
+    puts("  ddrstat          - DFI command cycles per controller and the engine ports' waits since the previous ddrstat");
     puts("  mvdiff role [layer] [reps] - repeat one matvec, report the rows that change");
     puts("  fetchtest role [layer] [reps] - re-read a tensor's weights, compare chunk checksums");
 #ifdef TRIXIUM_N_MEMCTRL
@@ -494,6 +495,43 @@ static void fetchtest_cmd(char *str)
     printf("FETCHTEST role=%u layer=%u %lu beats/channel x %d passes: %d chunk mismatches\n",
            e->role, e->layer, (unsigned long)beats, reps, bad_total);
 }
+
+#if defined(CSR_SDRAM_STATS_SNAP_ADDR) && defined(TRIXIUM_DDR_CSR_STRIDE) && defined(TRIXIUM_N_MEMCTRL)
+#define STATS(k, reg) (CSR_SDRAM_STATS_##reg##_ADDR + (unsigned long)(k)*TRIXIUM_DDR_CSR_STRIDE)
+#define PCT10(x, n) (unsigned long)((uint64_t)(x)*1000u/(n)) / 10, (unsigned long)((uint64_t)(x)*1000u/(n)) % 10
+// `ddrstat`: the DFI command cycles of every controller (gateware DFIStats) and the engine
+// ports' waits (EnginePortStats) since the previous call - each call snaps and restarts the
+// counters, so call it before and after a workload (bench, mvbw) and read the second.
+static void ddrstat_cmd(void)
+{
+    for (int k = 0; k < TRIXIUM_N_MEMCTRL; k++) {
+        csr_write_simple(1, STATS(k, SNAP));
+        uint32_t cyc = csr_read_simple(STATS(k, CYCLES));
+        if (!cyc) cyc = 1;
+        uint32_t rd = csr_read_simple(STATS(k, READS)), wr = csr_read_simple(STATS(k, WRITES));
+        uint32_t act = csr_read_simple(STATS(k, ACTS)), pre = csr_read_simple(STATS(k, PRES));
+        uint32_t ref = csr_read_simple(STATS(k, REFS)), idle = csr_read_simple(STATS(k, IDLE));
+        printf("DDRSTAT ctrl %d: %lu ddr cycles: read %lu.%lu%% write %lu.%lu%% act %lu.%lu%% pre %lu.%lu%% "
+               "ref %lu.%lu%% no command %lu.%lu%%\n", k, (unsigned long)cyc, PCT10(rd, cyc), PCT10(wr, cyc),
+               PCT10(act, cyc), PCT10(pre, cyc), PCT10(ref, cyc), PCT10(idle, cyc));
+    }
+#ifdef CSR_ENGSTAT_BASE
+    engstat_snap_write(1);
+    uint32_t cyc = engstat_cycles_read();
+    if (!cyc) cyc = 1;
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        engstat_sel_write(c);
+        uint32_t beats = engstat_beats_read(), ar = engstat_ar_wait_read(), r = engstat_r_wait_read();
+        uint32_t wb = engstat_wbeats_read();
+        printf("  chan %d: %lu read beats (%lu.%02lu per clock), requests waited %lu.%lu%% of the cycles, "
+               "data waited on the engine %lu.%lu%%, %lu write beats\n", c, (unsigned long)beats,
+               (unsigned long)((uint64_t)beats*100u/cyc/100), (unsigned long)((uint64_t)beats*100u/cyc % 100),
+               PCT10(ar, cyc), PCT10(r, cyc), (unsigned long)wb);
+    }
+#endif
+}
+#endif
+
 
 #if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
 #define BIST(k, reg) (CSR_SDRAM_##reg##_ADDR + (unsigned long)(k)*SDRAM_CSR_STRIDE)
@@ -945,6 +983,10 @@ static void console_service(void)
         mvtest_cmd(str);
     else if (strcmp(token, "mvbw") == 0)
         mvbw_cmd(str);
+#if defined(CSR_SDRAM_STATS_SNAP_ADDR) && defined(TRIXIUM_DDR_CSR_STRIDE) && defined(TRIXIUM_N_MEMCTRL)
+    else if (strcmp(token, "ddrstat") == 0)   // ddrstat: DFI command cycles per controller + engine port waits since the previous call
+        ddrstat_cmd();
+#endif
 #if defined(CSR_SDRAM_GENERATOR_BASE_ADDR) && defined(SDRAM_CSR_STRIDE) && defined(SDRAM_CONTROLLERS)
     else if (strcmp(token, "ddrstress") == 0)
         ddrstress_cmd(str);
@@ -1220,6 +1262,11 @@ static void console_service(void)
         uint32_t rows = (uint32_t)strtoul(str, NULL, 0);
         hybrid_lm_chunk(rows);
         printf("LMCHUNK %lu (LM head list chunk cap in rows, 0 = automatic)\n", (unsigned long)rows);
+    } else if (strcmp(token, "softmaxdiv") == 0) { // softmaxdiv on|off: the softmax's divide per position (on) or one reciprocal per head (off, the default and the mirror's): a same-boot comparison
+        extern int hybrid_softmax_div;
+        if (strncmp(str, "on", 2) == 0)  hybrid_softmax_div = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_softmax_div = 0;
+        printf("SOFTMAXDIV %s\n", hybrid_softmax_div ? "on (a divide per position)" : "off (one reciprocal per head)");
     } else if (strcmp(token, "hwargmax") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);
