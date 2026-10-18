@@ -105,15 +105,15 @@ int main(int argc, char **argv) {{
 '''
 
 
-def build(lanes, rows, cols):
+def build(lanes, rows, cols, sublanes=1):
     """The compiled unit (cached by key: a hit neither constructs nor converts it)."""
-    top = f"dns_{lanes}_{rows}_{cols}"
-    return Simulator(lambda: _construct(lanes, rows, cols), name=top, key=file_key(__file__, top),
+    top = f"dns_{lanes}_{rows}_{cols}" + (f"_s{sublanes}" if sublanes > 1 else "")
+    return Simulator(lambda: _construct(lanes, rows, cols, sublanes), name=top, key=file_key(__file__, top),
                      driver=lambda built: _driver(top, lanes, built["dut"])).binary
 
 
-def _construct(lanes, rows, cols):
-    dut = DeltaNetStream(lanes=lanes, rows=rows, cols=cols)
+def _construct(lanes, rows, cols, sublanes=1):
+    dut = DeltaNetStream(lanes=lanes, rows=rows, cols=cols, sublanes=sublanes)
     sig = {n: getattr(dut, n) for n in ("start", "heads", "table", "zero", "busy", "done", "sp_rd_req",
            "sp_rd_adr", "sp_rd_dat", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat", "sp_wr_gnt")}
     for l in range(lanes):
@@ -202,6 +202,45 @@ def test_small_geometry(tmp_path_factory, pcts):
     check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
 
 
+@pytest.mark.parametrize("pcts", [(100, 100, 100), (40, 60, 50)])
+def test_small_geometry_two_sublanes(tmp_path_factory, pcts):
+    """Two sub-lanes per channel: the same streams and layout, each accumulator set on half
+    the rows (rows 32 so that 32/(2*2) = 8 rows per sub-lane cover the adder latency)."""
+    tmp = tmp_path_factory.mktemp("dns_small_s2")
+    lanes, rows, cols, heads = 2, 32, 16, 9
+    binary = build(lanes, rows, cols, sublanes=2)
+    mem, states, table, want_mem, want_states = scenario(np.random.default_rng(4), heads, rows, cols, 3)
+    got_mem, got_lanes, cycles = run(binary, tmp, mem, states, lanes, heads, table, pcts)
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+
+
+@pytest.fixture(scope="module")
+def binary_ypcb_s2():
+    return build(4, 128, 128, sublanes=2)
+
+
+def test_ypcb_geometry_two_sublanes_stream_a_head_per_2048_clocks(tmp_path, binary_ypcb_s2):
+    """The YPCB's 4 channels with 2 sub-lanes each: a 128x128 head per cols*R = 128*16 clocks."""
+    lanes, rows, cols = 4, 128, 128
+    cycles = {}
+    for heads in (6, 12):
+        mem, states, table, want_mem, want_states = scenario(np.random.default_rng(heads), heads, rows, cols, 2)
+        got_mem, got_lanes, cycles[heads] = run(binary_ypcb_s2, tmp_path, mem, states, lanes, heads, table,
+                                                (100, 100, 100))
+        check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+    per_head = (cycles[12] - cycles[6])/6
+    print("YPCB geometry, 2 sub-lanes:", cycles, "cycles;", per_head, "per head in steady state")
+    assert per_head < 2048*1.02, cycles
+    assert cycles[6] < 7*2048 + 800, cycles
+
+
+def test_ypcb_geometry_two_sublanes_under_backpressure(tmp_path, binary_ypcb_s2):
+    lanes, rows, cols, heads = 4, 128, 128, 5
+    mem, states, table, want_mem, want_states = scenario(np.random.default_rng(9), heads, rows, cols, 5)
+    got_mem, got_lanes, cycles = run(binary_ypcb_s2, tmp_path, mem, states, lanes, heads, table, (30, 50, 40))
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+
+
 @pytest.fixture(scope="module")
 def binary27():
     return build(16, 128, 128)
@@ -230,13 +269,13 @@ def test_27b_geometry_under_backpressure(tmp_path, binary27):
     check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
 
 
-@pytest.mark.parametrize("pcts", [(100, 100, 100), (40, 60, 50)])
-def test_zero_flag_ignores_the_incoming_state(tmp_path_factory, pcts):
+@pytest.mark.parametrize("pcts,sublanes", [((100, 100, 100), 1), ((40, 60, 50), 1), ((40, 60, 50), 2)])
+def test_zero_flag_ignores_the_incoming_state(tmp_path_factory, pcts, sublanes):
     """`zero`: the first token's state is +0.0 whatever the DDR holds (NaN, Inf included);
     the streams are still consumed; with the flag low the same netlist reads the state."""
     tmp = tmp_path_factory.mktemp("dns_zero")
-    lanes, rows, cols, heads = 2, 16, 16, 9
-    binary = build(lanes, rows, cols)
+    lanes, rows, cols, heads = 2, 16*sublanes, 16, 9
+    binary = build(lanes, rows, cols, sublanes)
     rng = np.random.default_rng(5)
     mem, states, table, want_mem, want_states = scenario(rng, heads, rows, cols, 3, zero=True)
     garbage = rng.integers(0, 1 << 32, states.size, dtype=np.uint64).astype(np.uint32).reshape(states.shape)
@@ -279,18 +318,20 @@ def int_reference(m, q, k, v, decay, beta, scale):
 
 # Compiled cluster; the plain placement also on Migen's simulator (~2 min).
 # woff: the write-back offset in beats (dstride, signed): the other state set.
-@pytest.mark.parametrize('placement,backend,woff', [
-    pytest.param(dict(), "verilator", 0, id="placement0-verilator"),
-    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", 0, id="placement1-verilator"),
-    pytest.param(dict(), "verilator", 0x200, id="placement0-woff-verilator"),
-    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", -0x100,
+@pytest.mark.parametrize('placement,backend,woff,sublanes', [
+    pytest.param(dict(), "verilator", 0, 1, id="placement0-verilator"),
+    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", 0, 1, id="placement1-verilator"),
+    pytest.param(dict(), "verilator", 0x200, 1, id="placement0-woff-verilator"),
+    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", -0x100, 1,
                  id="placement1-woff-neg-verilator"),
-    pytest.param(dict(), "migen", 0, marks=pytest.mark.slow, id="placement0-migen")])
-def test_dnstream_op_through_the_cluster(placement, backend, woff):
-    L, rows, cols, heads = 2, 16, 16, 5
+    pytest.param(dict(chan_stride=0x10000, chan_mod=2, chan_skew=0x1000), "verilator", 0x200, 2,
+                 id="placement1-woff-sublanes2-verilator"),
+    pytest.param(dict(), "migen", 0, 1, marks=pytest.mark.slow, id="placement0-migen")])
+def test_dnstream_op_through_the_cluster(placement, backend, woff, sublanes):
+    L, rows, cols, heads = 2, 16*sublanes, 16, 5    # 2 sub-lanes: 32 rows, 8 per sub-lane (IntAdd5)
     R, G = rows//L, cols//8
     config = TriXiumConfig(with_vecunit=True, scratchpad_size=16*1024, with_dnstream=True,
-        dnstream_options=(("rows", rows), ("cols", cols), ("add_factory", IntAdd5),
+        dnstream_options=(("rows", rows), ("cols", cols), ("sublanes", sublanes), ("add_factory", IntAdd5),
                           ("mul_factory", IntMul5), ("negate", lambda x: -x)),
         **placement)
     dut = SoC(config, n=L, backend=backend)

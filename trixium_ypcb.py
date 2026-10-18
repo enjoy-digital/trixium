@@ -73,8 +73,11 @@ ENGINE_RMW = True
 # hybrid models only), which pays for unit 12's RoPE stage (~20k: the attention layers' q/k
 # rotated on the unit, q/k/v staying in the scratchpad for the stream) at a lower density than
 # the 83% of the first hybrid builds.
-YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", True), ("hadamard_lanes", 8), ("silu_ways", 2),
-                            ("with_vecunit", False))
+YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", True), ("hadamard_lanes", 16), ("silu_ways", 2),
+                            ("with_vecunit", False), ("dnstream_options", (("sublanes", 2),)))
+# hyb8: the DeltaNet stream at two sub-lanes per channel (a 128x128 head in 2,048 clocks instead
+# of 4,096: the unit was compute-bound at 17% of a 2B token, 21% of the 4B's; ~+5k LUTs per
+# channel), and the Hadamard at 16 lanes (the rotated prepare lists' 2.2k -> ~1.1k clocks, +3.3k).
 # The attention stream: 4 lanes, 1 kv group (17k LUTs against 33k at 8/2): the 2B's 8/2 and the
 # 4B's 16/4 run as one command per kv head (TRIXIUM_ATTN_KV_SLICE), K/V streamed once per slice.
 YPCB_HYBRID_ATTN = (4, 1)

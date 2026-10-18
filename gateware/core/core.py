@@ -244,6 +244,7 @@ class TriXiumCore(LiteXModule):
         if config.with_dnstream:
             self.add_constant("TRIXIUM_HAS_DNSTREAM")
             self.add_constant("TRIXIUM_DNSTREAM_LANES", len(axis))
+            self.add_constant("TRIXIUM_DNSTREAM_SUBLANES", self.engine.dnstream.sublanes)
             self.add_constant("TRIXIUM_DNSTREAM_ZERO") # Op 5 bias bit 0: state taken as +0.0.
             self.add_constant("TRIXIUM_DNSTREAM_WOFF") # Op 5 writes back at wbase + dstride beats.
         self.engine_csr = EngineCSR(self.engine, seq=seq)

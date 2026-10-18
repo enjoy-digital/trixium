@@ -19,6 +19,12 @@ buffer (R >= adder latency + 1 covers the accumulator feedback). The layout exis
 in engine DDR and only this unit reads or writes it (``state_to_lanes`` /
 ``lanes_to_state`` convert).
 
+With ``sublanes`` S > 1 a channel's stream is shared by S sub-lanes in lockstep: beat b of a
+column group goes to sub-lane b % S, so sub-lane s of channel l owns rows r*(L*S) + s*L + l,
+R = rows/(L*S) of them, and the layout above is unchanged (it is the beat-wise interleave of
+the sub-lanes' own); a head costs ``cols*R`` clocks, R halving with each doubling of S, for S
+times the per-lane operators (the parameter reads, the delta and scale pipes stay shared).
+
 Per row the arithmetic is the firmware's loop, rounded after every operation::
 
     m = m*decay; d = d + m*k[i]            (P1, i in order, d from +0)
@@ -98,21 +104,23 @@ def reference(state, q, k, v, decay, beta, scale):
 class DeltaNetStream(LiteXModule):
     """Streaming DeltaNet recurrence, one command per layer, `lanes` row-striped state streams
     (see the module docstring for the layout and the arithmetic)."""
-    def __init__(self, lanes=16, rows=128, cols=128, slots=4, adr_bits=13,
+    def __init__(self, lanes=16, rows=128, cols=128, slots=4, adr_bits=13, sublanes=1,
                  add_factory=ExactFP32Add, mul_factory=ExactFP32Mul,
                  negate=lambda x: x ^ 0x80000000, fifo_depth=8):
-        L = lanes
+        L, S = lanes, sublanes
+        V = L*S                      # Virtual lanes: S per channel stream, in lockstep.
         pow2 = lambda x: x > 0 and (x & (x - 1)) == 0
-        assert pow2(L) and pow2(rows) and pow2(cols) and pow2(slots)
-        assert rows % L == 0 and cols >= 16 and rows >= 16
-        R, G, VB = rows//L, cols//8, rows//8
+        assert pow2(L) and pow2(S) and pow2(rows) and pow2(cols) and pow2(slots)
+        assert rows % V == 0 and cols >= 16 and rows >= 16
+        R, G, VB = rows//V, cols//8, rows//8   # R: rows per virtual lane.
         La, Lm = add_factory.latency, mul_factory.latency
-        assert R >= La + 1, "rows per lane must cover the accumulator feedback latency"
+        assert R >= La + 1, "rows per (sub)lane must cover the accumulator feedback latency"
         assert cols*R >= rows + La + Lm + 8, "delta must finish before the next snapshot"
         rb, gb, sb = (R - 1).bit_length(), (G - 1).bit_length(), max(1, (slots - 1).bit_length())
-        vbb = (VB - 1).bit_length()
-        self.lanes, self.rows, self.cols, self.rows_per_lane = L, rows, cols, R
-        self.beats_per_head = G*R   # Per lane.
+        vbb, ssb = (VB - 1).bit_length(), (S - 1).bit_length()
+        self.lanes, self.rows, self.cols, self.sublanes = L, rows, cols, S
+        self.rows_per_lane  = rows//L    # Per channel stream.
+        self.beats_per_head = G*rows//L  # Per channel stream.
 
         # Command / status.
         self.start = Signal()
@@ -270,40 +278,46 @@ class DeltaNetStream(LiteXModule):
             o = factory()
             setattr(self.submodules, name, o)
             return o
-        mul_dec = [op(mul_factory, f"mul_dec{l}") for l in range(L)]
-        mul_k   = [op(mul_factory, f"mul_k{l}")   for l in range(L)]
-        add_d   = [op(add_factory, f"add_d{l}")   for l in range(L)]
-        mul_dk  = [op(mul_factory, f"mul_dk{l}")  for l in range(L)]
-        add_m   = [op(add_factory, f"add_m{l}")   for l in range(L)]
-        mul_q   = [op(mul_factory, f"mul_q{l}")   for l in range(L)]
-        add_o   = [op(add_factory, f"add_o{l}")   for l in range(L)]
+        mul_dec = [op(mul_factory, f"mul_dec{v}") for v in range(V)]
+        mul_k   = [op(mul_factory, f"mul_k{v}")   for v in range(V)]
+        add_d   = [op(add_factory, f"add_d{v}")   for v in range(V)]
+        mul_dk  = [op(mul_factory, f"mul_dk{v}")  for v in range(V)]
+        add_m   = [op(add_factory, f"add_m{v}")   for v in range(V)]
+        mul_q   = [op(mul_factory, f"mul_q{v}")   for v in range(V)]
+        add_o   = [op(add_factory, f"add_o{v}")   for v in range(V)]
         add_v   = op(add_factory, "add_v")
         mul_b   = op(mul_factory, "mul_b")
         mul_s   = op(mul_factory, "mul_s")
 
-        # Input half-buffers (per lane, two column groups) -----------------------------------------
+        # Input half-buffers (per virtual lane, two column groups) ---------------------------------
+        # Beat b of a channel's column group is row b*L + l: sub-lane b % S takes it as its row
+        # b // S, so a channel's S sub-lanes share the fill counter and run in lockstep.
         p1_grp = Signal(2)       # Column groups consumed by P1 (mod 4, all lanes).
         fill_grp = []
-        inbufs = []
+        inbufs = [None]*V
         for l, sink in enumerate(self.sinks):
-            mem = Memory(256, 2*R, name=f"dns_in{l}")
-            wp = mem.get_port(write_capable=True)
-            rp = mem.get_port()
-            self.specials += mem, wp, rp
-            inbufs.append(rp)
-            fi = Signal(rb + 1, name=f"dns_fill{l}")
+            fi = Signal(rb + ssb + 1, name=f"dns_fill{l}")
             fg = Signal(2, name=f"dns_fillgrp{l}")
             fill_grp.append(fg)
-            self.comb += [
-                sink.ready.eq(run & ((fg - p1_grp)[:2] != 2)),
-                wp.adr.eq(fi), wp.dat_w.eq(sink.data), wp.we.eq(sink.valid & sink.ready),
-            ]
+            self.comb += sink.ready.eq(run & ((fg - p1_grp)[:2] != 2))
             self.sync += If(self.start,
                 fi.eq(0), fg.eq(0),
             ).Elif(sink.valid & sink.ready,
                 fi.eq(fi + 1),
-                If(fi[:rb] == R - 1, fg.eq(fg + 1)),
+                If(fi[:rb + ssb] == R*S - 1, fg.eq(fg + 1)),
             )
+            for s in range(S):
+                v = s*L + l
+                mem = Memory(256, 2*R, name=f"dns_in{v}")
+                wp = mem.get_port(write_capable=True)
+                rp = mem.get_port()
+                self.specials += mem, wp, rp
+                inbufs[v] = rp
+                mine = (fi[:ssb] == s) if S > 1 else 1
+                self.comb += [
+                    wp.adr.eq(Cat(fi[ssb:ssb + rb], fi[ssb + rb])), wp.dat_w.eq(sink.data),
+                    wp.we.eq(sink.valid & sink.ready & mine),
+                ]
         grp_ok = reduce(and_, [fg != p1_grp for fg in fill_grp])
 
         # P1: decay, k dot -------------------------------------------------------------------------
@@ -366,11 +380,11 @@ class DeltaNetStream(LiteXModule):
         # Per-lane accumulators and the snapshot the shared delta pipe drains.
         # Reset-less: the accumulators start from +0 on a head's first column (t3_first,
         # g4_first), the snapshots and delta registers are written before they are read.
-        dacc = [[Signal(32, name=f"dns_d{l}_{r}", reset_less=True) for r in range(R)]
-                for l in range(L)]
-        oacc = [[Signal(32, name=f"dns_o{l}_{r}", reset_less=True) for r in range(R)]
-                for l in range(L)]
-        dsnap = [Signal(32, name=f"dns_dsnap{i}", reset_less=True) # i = r*L + l
+        dacc = [[Signal(32, name=f"dns_d{v}_{r}", reset_less=True) for r in range(R)]
+                for v in range(V)]
+        oacc = [[Signal(32, name=f"dns_o{v}_{r}", reset_less=True) for r in range(R)]
+                for v in range(V)]
+        dsnap = [Signal(32, name=f"dns_dsnap{i}", reset_less=True) # i = r*V + v
                  for i in range(rows)]
         osnap = [[Signal(32, name=f"dns_osnap{b}_{i}", reset_less=True) for i in range(rows)]
                  for b in range(2)]
@@ -378,28 +392,28 @@ class DeltaNetStream(LiteXModule):
                  for b in range(2)]
 
         mdmems = []
-        for l in range(L):
-            md = Memory(32, 4*cols*R, name=f"dns_md{l}")
+        for v in range(V):
+            md = Memory(32, 4*cols*R, name=f"dns_md{v}")
             md_w = md.get_port(write_capable=True)
             md_r = md.get_port()
             self.specials += md, md_w, md_r
             mdmems.append(md_r)
-            da = Array(dacc[l])
-            u_m = Signal(32, name=f"dns_um{l}", reset_less=True)
-            self.sync += u_m.eq(Mux(zero_r, 0, fsel(inbufs[l].dat_r, s1_jj)))
+            da = Array(dacc[v])
+            u_m = Signal(32, name=f"dns_um{v}", reset_less=True)
+            self.sync += u_m.eq(Mux(zero_r, 0, fsel(inbufs[v].dat_r, s1_jj)))
             self.comb += [
-                mul_dec[l].a.eq(u_m),
-                mul_dec[l].b.eq(u_dec),
-                mul_dec[l].valid.eq(u_v),
-                md_w.adr.eq(t2_mda), md_w.dat_w.eq(mul_dec[l].result), md_w.we.eq(t2_v),
-                mul_k[l].a.eq(mul_dec[l].result),
-                mul_k[l].b.eq(t2_k),
-                mul_k[l].valid.eq(t2_v),
-                add_d[l].a.eq(Mux(t3_first, 0, da[t3_r])),
-                add_d[l].b.eq(mul_k[l].result),
-                add_d[l].valid.eq(t3_v),
+                mul_dec[v].a.eq(u_m),
+                mul_dec[v].b.eq(u_dec),
+                mul_dec[v].valid.eq(u_v),
+                md_w.adr.eq(t2_mda), md_w.dat_w.eq(mul_dec[v].result), md_w.we.eq(t2_v),
+                mul_k[v].a.eq(mul_dec[v].result),
+                mul_k[v].b.eq(t2_k),
+                mul_k[v].valid.eq(t2_v),
+                add_d[v].a.eq(Mux(t3_first, 0, da[t3_r])),
+                add_d[v].b.eq(mul_k[v].result),
+                add_d[v].valid.eq(t3_v),
             ]
-            self.sync += If(t4_v, da[t4_r].eq(add_d[l].result))
+            self.sync += If(t4_v, da[t4_r].eq(add_d[v].result))
 
         # Delta (shared): delta = (v - d)*beta over rows in natural order --------------------------
         dl_run = Signal()
@@ -410,8 +424,8 @@ class DeltaNetStream(LiteXModule):
         self.comb += dl_issue.eq(dl_run)
         snap_d = []
         for r in range(R):
-            for l in range(L):
-                snap_d.append(add_d[l].result if r == R - 1 else dacc[l][r])
+            for v in range(V):
+                snap_d.append(add_d[v].result if r == R - 1 else dacc[v][r])
         self.sync += If(p1_capture,
             *[dsnap[i].eq(snap_d[i]) for i in range(rows)],
         ).Elif(dl_issue,
@@ -529,51 +543,56 @@ class DeltaNetStream(LiteXModule):
         self.sync += [cap[b].eq(g5_ve & g5_laste & (g5_banke == b)) for b in range(2)]
 
         outbufs = []
-        for l in range(L):
-            ob = Memory(256, 2*R, name=f"dns_ob{l}")
+        for v in range(V):
+            ob = Memory(256, 2*R, name=f"dns_ob{v}")
             ob_w = ob.get_port(write_capable=True, we_granularity=32)
             ob_r = ob.get_port()
             self.specials += ob, ob_w, ob_r
             outbufs.append(ob_r)
-            f1_delta = Signal(32, name=f"dns_f1delta{l}", reset_less=True)
+            f1_delta = Signal(32, name=f"dns_f1delta{v}", reset_less=True)
             self.sync += f1_delta.eq(Mux(p2_head[0],
-                Array(dreg[1][r*L + l] for r in range(R))[p2_r],
-                Array(dreg[0][r*L + l] for r in range(R))[p2_r]))
-            md_d = dly(mdmems[l].dat_r, Lm, f"dns_mdd{l}")
-            oa = Array(oacc[l])
+                Array(dreg[1][r*V + v] for r in range(R))[p2_r],
+                Array(dreg[0][r*V + v] for r in range(R))[p2_r]))
+            md_d = dly(mdmems[v].dat_r, Lm, f"dns_mdd{v}")
+            oa = Array(oacc[v])
             self.comb += [
-                mul_dk[l].a.eq(f1_delta), mul_dk[l].b.eq(f1_k), mul_dk[l].valid.eq(f1_v),
-                add_m[l].a.eq(md_d), add_m[l].b.eq(mul_dk[l].result), add_m[l].valid.eq(g2_v),
+                mul_dk[v].a.eq(f1_delta), mul_dk[v].b.eq(f1_k), mul_dk[v].valid.eq(f1_v),
+                add_m[v].a.eq(md_d), add_m[v].b.eq(mul_dk[v].result), add_m[v].valid.eq(g2_v),
                 ob_w.adr.eq(Cat(g3_r, g3_half)),
-                ob_w.dat_w.eq(Replicate(add_m[l].result, 8)),
+                ob_w.dat_w.eq(Replicate(add_m[v].result, 8)),
                 ob_w.we.eq(Mux(g3_v, 1 << g3_jj, 0)),
-                mul_q[l].a.eq(add_m[l].result), mul_q[l].b.eq(g3_q), mul_q[l].valid.eq(g3_v),
-                add_o[l].a.eq(Mux(g4_first, 0, oa[g4_r])),
-                add_o[l].b.eq(mul_q[l].result),
-                add_o[l].valid.eq(g4_v),
+                mul_q[v].a.eq(add_m[v].result), mul_q[v].b.eq(g3_q), mul_q[v].valid.eq(g3_v),
+                add_o[v].a.eq(Mux(g4_first, 0, oa[g4_r])),
+                add_o[v].b.eq(mul_q[v].result),
+                add_o[v].valid.eq(g4_v),
             ]
-            self.sync += If(g5_v, oa[g5_r].eq(add_o[l].result))
+            self.sync += If(g5_v, oa[g5_r].eq(add_o[v].result))
         snap_o = []
         for r in range(R):
-            for l in range(L):
-                snap_o.append(add_o[l].result if r == R - 1 else oacc[l][r])
+            for v in range(V):
+                snap_o.append(add_o[v].result if r == R - 1 else oacc[v][r])
         self.sync += If(self.start,
             p2_done.eq(0),
         ).Elif(p2_capture,
             p2_done.eq(p2_done + 1),
         )
 
-        # Emission: completed output halves -> per-lane source FIFOs -------------------------------
-        em_run, em_half, em_i, em_push = Signal(), Signal(), Signal(rb), Signal()
+        # Emission: completed output halves -> per-channel source FIFOs ---------------------------
+        # Beat b of a channel's group comes from sub-lane b % S, row b // S of its buffer (the
+        # input layout); the buffers read a clock ahead of the push, the sub-lane select with them.
+        em_run, em_half, em_i, em_push = Signal(), Signal(), Signal(rb + ssb), Signal()
+        em_sub = dly(em_i[:ssb], 1, "emsub") if S > 1 else None
         fifos = []
         for l in range(L):
             f = stream.SyncFIFO([("data", 256)], fifo_depth)
             setattr(self.submodules, f"dns_src{l}", f)
             fifos.append(f)
+            obs = [outbufs[s*L + l] for s in range(S)]
             self.comb += [
-                f.sink.valid.eq(em_push), f.sink.data.eq(outbufs[l].dat_r),
+                f.sink.valid.eq(em_push),
+                f.sink.data.eq(Array([ob.dat_r for ob in obs])[em_sub] if S > 1 else obs[0].dat_r),
                 f.source.connect(self.sources[l]),
-                outbufs[l].adr.eq(Cat(em_i, em_half)),
+                *[ob.adr.eq(Cat(em_i[ssb:], em_half)) for ob in obs],
             ]
         room = reduce(and_, [f.level < fifo_depth - 2 for f in fifos])
         em_issue = Signal()
@@ -590,7 +609,7 @@ class DeltaNetStream(LiteXModule):
                     If(half_full[em_half], em_run.eq(1), em_i.eq(0)),
                 ).Elif(em_issue,
                     em_i.eq(em_i + 1),
-                    If(em_i == R - 1,
+                    If(em_i == R*S - 1,
                         em_run.eq(0),
                         half_full[em_half].eq(0),
                         half_busy[em_half].eq(0),
