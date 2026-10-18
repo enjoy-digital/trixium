@@ -78,9 +78,12 @@ YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", True), ("hadamard_lanes", 16), ("silu_
 # hyb8: the DeltaNet stream at two sub-lanes per channel (a 128x128 head in 2,048 clocks instead
 # of 4,096: the unit was compute-bound at 17% of a 2B token, 21% of the 4B's; ~+5k LUTs per
 # channel), and the Hadamard at 16 lanes (the rotated prepare lists' 2.2k -> ~1.1k clocks, +3.3k).
-# The attention stream: 4 lanes, 1 kv group (17k LUTs against 33k at 8/2): the 2B's 8/2 and the
-# 4B's 16/4 run as one command per kv head (TRIXIUM_ATTN_KV_SLICE), K/V streamed once per slice.
-YPCB_HYBRID_ATTN = (4, 1)
+# The attention stream: 8 lanes, 2 kv groups since hyb9 (32.6k LUTs out of context against 17.1k
+# at 4/1): the 2B's 8 heads in one command, the 4B's 16/4 in two (TRIXIUM_ATTN_KV_SLICE: one
+# command per kv-head slice, K/V streamed once per slice). At 4/1 the K and V passes cost 7.0k
+# cycles per position per 2B token (6 layers x 2 slices x 256 clocks x 2 passes): 7.1 tok/s at a
+# context of 1,024 against 13.3 at 64.
+YPCB_HYBRID_ATTN = (8, 2)
 
 # DDR3 ---------------------------------------------------------------------------------------------
 
@@ -180,6 +183,7 @@ class TriXiumYPCBSoC(SoCCore):
         vec_fused      = True,
         hybrid         = False,
         attn_geometry  = YPCB_HYBRID_ATTN + (256, 2048),
+        ddr_quiet_regions = False,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -221,6 +225,18 @@ class TriXiumYPCBSoC(SoCCore):
                 setattr(self, f"engport{c}_{j}", m)
             memory_ports.append(axi)
         self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
+        if ddr_quiet_regions:
+            # Experiment (hyb8q): the matvec engine kept out of controller 1's I/O clock regions
+            # (banks 16-18 = X0Y5..X0Y7). On ypcb_hyb8_d100 the read eye of controller 1 under
+            # the engine's 4-channel streams closed (lanes 0-2 without a clean tap, hyb7: 2-3)
+            # while every single-stream pattern stayed clean: is it the fabric's switching next
+            # to the DQ capture? A post-synthesis Pblock (the flattened cell names exist then).
+            platform.toolchain.pre_placement_commands.append(
+                "create_pblock engine_pb")
+            platform.toolchain.pre_placement_commands.append(
+                "resize_pblock [get_pblocks engine_pb] -add {{CLOCKREGION_X0Y0:CLOCKREGION_X0Y4 CLOCKREGION_X1Y0:CLOCKREGION_X1Y7}}")
+            platform.toolchain.pre_placement_commands.append(
+                "add_cells_to_pblock [get_pblocks engine_pb] [get_cells -hierarchical -filter {{NAME =~ main_matvecengine*}}]")
 
         # PCIe -------------------------------------------------------------------------------------
         self.pcie_phy = S7PCIEPHY(platform, platform.request("pcie_x8"),
@@ -386,6 +402,8 @@ def main():
     parser.add_target_argument("--ddr-ecc",            action=argparse.BooleanOptionalAction, default=True,  help="DDR3 ECC: SECDED on each channel's ninth byte lane (the default; corrects the rare read errors under full streaming).")
     parser.add_target_argument("--ddr-ibuf-low-power", action="store_true",                                   help="DQ/DQS input buffers in low-power mode (Vivado's default; not for sustained reads).")
     parser.add_target_argument("--hybrid",             action="store_true",                                   help="With the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B: DeltaNet/attention streams, FWHT, ...) and a CPU FPU.")
+    parser.add_target_argument("--attn-geometry",     default=None,                                          help="Attention stream lanes,groups,hd_max,t_max (default: YPCB_HYBRID_ATTN + 256,2048).")
+    parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="Experiment: the matvec engine kept out of controller 1's I/O clock regions (Pblock).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
@@ -418,6 +436,8 @@ def main():
         ddr_ibuf_hp        = not args.ddr_ibuf_low_power,
         ddr_ecc            = args.ddr_ecc,
         hybrid             = args.hybrid,
+        ddr_quiet_regions  = args.ddr_quiet_regions,
+        **({"attn_geometry": tuple(int(x) for x in args.attn_geometry.split(","))} if args.attn_geometry else {}),
         **parser.soc_argdict)
     add_zbb_constant(soc, args)
 

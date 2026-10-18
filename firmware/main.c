@@ -512,8 +512,10 @@ static void ddrstat_cmd(void)
         uint32_t act = csr_read_simple(STATS(k, ACTS)), pre = csr_read_simple(STATS(k, PRES));
         uint32_t ref = csr_read_simple(STATS(k, REFS)), idle = csr_read_simple(STATS(k, IDLE));
         printf("DDRSTAT ctrl %d: %lu ddr cycles: read %lu.%lu%% write %lu.%lu%% act %lu.%lu%% pre %lu.%lu%% "
-               "ref %lu.%lu%% no command %lu.%lu%%\n", k, (unsigned long)cyc, PCT10(rd, cyc), PCT10(wr, cyc),
-               PCT10(act, cyc), PCT10(pre, cyc), PCT10(ref, cyc), PCT10(idle, cyc));
+               "ref %lu.%lu%% no command %lu.%lu%% (counts %lu %lu %lu %lu %lu %lu)\n", k, (unsigned long)cyc,
+               PCT10(rd, cyc), PCT10(wr, cyc), PCT10(act, cyc), PCT10(pre, cyc), PCT10(ref, cyc), PCT10(idle, cyc),
+               (unsigned long)rd, (unsigned long)wr, (unsigned long)act, (unsigned long)pre, (unsigned long)ref,
+               (unsigned long)idle);
     }
 #ifdef CSR_ENGSTAT_BASE
     engstat_snap_write(1);
@@ -523,10 +525,10 @@ static void ddrstat_cmd(void)
         engstat_sel_write(c);
         uint32_t beats = engstat_beats_read(), ar = engstat_ar_wait_read(), r = engstat_r_wait_read();
         uint32_t wb = engstat_wbeats_read();
-        printf("  chan %d: %lu read beats (%lu.%02lu per clock), requests waited %lu.%lu%% of the cycles, "
-               "data waited on the engine %lu.%lu%%, %lu write beats\n", c, (unsigned long)beats,
+        printf("  chan %d: %lu read beats (%lu.%02lu per clock), requests waited %lu.%lu%% of the cycles (%lu), "
+               "data waited on the engine %lu.%lu%% (%lu), %lu write beats; %lu cycles\n", c, (unsigned long)beats,
                (unsigned long)((uint64_t)beats*100u/cyc/100), (unsigned long)((uint64_t)beats*100u/cyc % 100),
-               PCT10(ar, cyc), PCT10(r, cyc), (unsigned long)wb);
+               PCT10(ar, cyc), (unsigned long)ar, PCT10(r, cyc), (unsigned long)r, (unsigned long)wb, (unsigned long)cyc);
     }
 #endif
 }
