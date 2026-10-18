@@ -949,6 +949,7 @@ void hybrid_stats_print(void)
                    (unsigned long)(R->fallbacks/hyb_forwards_profiled),
                    resident_active() ? "on" : "off");
         resident_listprof_print(hyb_forwards_profiled);
+        resident_listcache_print();
         if (R->silu_lists)
             printf("siluprof: per fwd %lu ffn lists (%lu cycles), %lu fixups total\n",
                    (unsigned long)(R->silu_lists/hyb_forwards_profiled),
@@ -1279,7 +1280,8 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         rl_desc(&d);                                                                             \
     } while (0)
     perf_enter(OP_DN_PROJ);           // the token trace's phases (tprof): nested brackets
-    rl_begin();
+    rl_begin_keyed(0x04000000u | (uint32_t)l << 8 | (uint32_t)early | (uint32_t)z_stays << 1 |
+                   (uint32_t)rl_rsf_is(h) << 2, (uint32_t)(uintptr_t)h, 0);
     if (early) {
         rl_prepare(h, (uint32_t)n_embd, 0);                          // beta/alpha are not folded
         rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
@@ -1357,8 +1359,8 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // The q/k L2 list into the other bank while the conv runs.
     uint64_t tl = perf_now64();
     perf_enter(OP_DN_PREP);
-    rl_begin();
-    bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
+    if (!rl_begin_keyed(0x06000000u, 0, 0))
+        bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
     rl_desc(&d);
     perf_exit(OP_DN_PREP);
     uint64_t l2_dt = perf_now64() - tl;
@@ -1443,14 +1445,16 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // C: gated RMSNorm over the heads, x SiLU(z), into the grouped order at RS_F (og).
     t0 = perf_now64();
     perf_enter(OP_DN_GATE);
-    rl_begin();
+    int gate_replay = rl_begin_keyed(0x07000000u | (uint32_t)l << 8 | (uint32_t)z_stays, 0, 0);
     rl_fetch_raw(norm_ssm[l], dnr_align(4*(uint32_t)hv), NW);
     if (!z_stays)
         rl_fetch(zb, dnr_align(4*(uint32_t)nvh), Z2);
-    bns_seq_desc_norm(&d, 0, HO, HO, NW, (uint32_t)hv, (uint32_t)nv, eps);
+    if (!gate_replay)
+        bns_seq_desc_norm(&d, 0, HO, HO, NW, (uint32_t)hv, (uint32_t)nv, eps);
     rl_desc(&d);
-    bns_seq_desc_silu_ex(&d, Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, 0, (uint32_t)hv/8, (uint32_t)nk,
-                         (uint32_t)rep);
+    if (!gate_replay)
+        bns_seq_desc_silu_ex(&d, Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, 0, (uint32_t)hv/8,
+                             (uint32_t)nk, (uint32_t)rep);
     rl_desc(&d);
     if (rl_run("deltanet gated norm"))
         goto fatal;
@@ -1762,20 +1766,27 @@ static void attention_layer(int l, const float *h, float *out)
                 tab[rope_n/2 + i] = f32_bits(rope_s[i]);
             }
         }
-        rl_begin();
+        // q's norm (with the RoPE when the encoder takes it) is encoded first: its verdict is
+        // part of the list's name (the list image cache).
+        struct bns_seq_descriptor dq;
+        bns_seq_desc_norm_strided(&dq, 0, QS, QS, NQ, (uint32_t)head_dim, (uint32_t)n_head, eps,
+                                  gated ? 2*hb8 : hb8, gated ? 2*hb8 : hb8);
+        if (want_rope && bns_seq_desc_norm_rope(&dq, (uint32_t)rope_n, RT)) want_rope = 0;
+        int qkv_replay = rl_begin_keyed(0x08000000u | (uint32_t)l << 8 | (uint32_t)gated |
+                                        (uint32_t)want_rope << 1 | (uint32_t)rl_rsf_is(h) << 2,
+                                        (uint32_t)(uintptr_t)h, 0);
         rl_fetch_raw(norm_q[l], 4*(uint32_t)head_dim, NQ);
         rl_fetch_raw(norm_k[l], 4*(uint32_t)head_dim, NK);
         rl_prepare(h, (uint32_t)n_embd, 1);
         rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
         rl_matvec(model_entry(ROLE_ATTN_K, l), KS, KS);
         rl_matvec(model_entry(ROLE_ATTN_V, l), VS, VS);
-        bns_seq_desc_norm_strided(&d, 0, QS, QS, NQ, (uint32_t)head_dim, (uint32_t)n_head, eps,
-                                  gated ? 2*hb8 : hb8, gated ? 2*hb8 : hb8);
-        if (want_rope && bns_seq_desc_norm_rope(&d, (uint32_t)rope_n, RT)) want_rope = 0;
-        rl_desc(&d);
-        bns_seq_desc_norm(&d, 0, KS, KS, NK, (uint32_t)head_dim, (uint32_t)n_kv_head, eps);
-        if (want_rope)       // same n and table as q's, which the encoder accepted
-            (void)bns_seq_desc_norm_rope(&d, (uint32_t)rope_n, RT);
+        rl_desc(&dq);
+        if (!qkv_replay) {
+            bns_seq_desc_norm(&d, 0, KS, KS, NK, (uint32_t)head_dim, (uint32_t)n_kv_head, eps);
+            if (want_rope)       // same n and table as q's, which the encoder accepted
+                (void)bns_seq_desc_norm_rope(&d, (uint32_t)rope_n, RT);
+        }
         rl_desc(&d);
         if (!want_rope) {
             rl_store(gated ? qfull : qb, 4*qrows, QS);
@@ -1943,7 +1954,8 @@ static int lm_head_list(const struct bons_entry *head, float *dst)
     uint32_t nch = (uint32_t)n_ch, per = head->rows/nch;
     if (head->rows % unit || chunk/nch*4u > 8160u)
         return -1;
-    rl_begin();
+    rl_begin_keyed(0x0B000000u | (chunk/32u & 0x7FFu) << 1 | (uint32_t)rl_rsf_is(hb),
+                   (uint32_t)(uintptr_t)head, (uint32_t)(uintptr_t)dst);
     rl_prepare(hb, (uint32_t)n_embd, 1);
     for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
         uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
@@ -1991,7 +2003,9 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
     }
     for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
         uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
-        rl_begin();
+        // The list's name: the chunk (its index and size), whether hb is already in RS_F.
+        rl_begin_keyed(0x0A000000u | (r0/chunk & 0xFFFu) << 12 | (chunk/32u & 0x7FFu) << 1 |
+                       (uint32_t)rl_rsf_is(hb), (uint32_t)(uintptr_t)head, (uint32_t)(uintptr_t)dst);
         if (!r0)
             rl_prepare(hb, (uint32_t)n_embd, 1);
         rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);

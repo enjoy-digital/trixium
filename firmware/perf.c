@@ -310,7 +310,7 @@ static void overlap_print(const char *tag, const uint64_t acc[4])
     uint64_t tot = acc[0] ? acc[0] : 1;
     uint64_t active = acc[1] + acc[2] - acc[3];
     uint64_t neither = acc[0] >= active ? acc[0] - active : 0;
-    printf("%s: eng %lu%%  vec/dn %lu%%  both %lu%%  neither %lu%%  (of ", tag,
+    printf("%s: eng %lu%%  units %lu%%  both %lu%%  neither %lu%%  (of ", tag,
            (unsigned long)(acc[1]*100/tot), (unsigned long)(acc[2]*100/tot),
            (unsigned long)(acc[3]*100/tot), (unsigned long)(neither*100/tot));
     perf_print_u64(acc[0]);

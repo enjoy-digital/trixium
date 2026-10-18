@@ -82,6 +82,7 @@
 /*-------*/
 
 void resident_listprof_reset(void);
+void resident_listcache_reset(void);
 static uint8_t initialized;   // The window struct is not BSS: zero it once, here.
 
 _Static_assert(sizeof(struct resident_state) <= 256, "resident_state window is 256 bytes");
@@ -110,6 +111,7 @@ void resident_stats_reset(void)
     R->silu_cycles = 0;
     resident_listprof_reset();
     R->silu_lists = R->silu_fixups = 0;
+    resident_listcache_reset();
 }
 
 void resident_enable(int on) { resident_state()->enabled = on ? 1 : 0; }
@@ -193,6 +195,7 @@ struct list_prof {
     uint32_t calls, n;
     uint64_t cyc[RS_DESC_MAX];
     uint64_t build, post;
+    uint32_t waits;     // starts that found the previous list still running (build hidden)
 };
 #define LISTPROF_N 16
 #define LP ((struct list_prof *)TRIXIUM_LISTPROF_ADDR)
@@ -209,13 +212,23 @@ void resident_listprof_print(uint32_t forwards)
         if (!p->calls || !forwards) continue;
         uint64_t total = 0;
         for (uint32_t d = 0; d < p->n; d++) total += p->cyc[d];
-        printf("listprof %s: %lu calls/fwd, %lu cycles/call (build %lu, post %lu):", p->what,
-               (unsigned long)(p->calls/forwards), (unsigned long)(total/p->calls),
-               (unsigned long)(p->build/p->calls), (unsigned long)(p->post/p->calls));
+        // waited: the share of starts that found the previous list still running - the
+        // build (and the previous list's post) was hidden; the rest were on the critical path.
+        printf("listprof %s: %lu calls/fwd, %lu cycles/call (build %lu, post %lu, waited %lu%%):",
+               p->what, (unsigned long)(p->calls/forwards), (unsigned long)(total/p->calls),
+               (unsigned long)(p->build/p->calls), (unsigned long)(p->post/p->calls),
+               (unsigned long)(100u*p->waits/p->calls));
         for (uint32_t d = 0; d < p->n; d++)
             printf(" %lu", (unsigned long)(p->cyc[d]/p->calls));
         puts("");
     }
+}
+
+// The trace's list names: `TPL <slot> <name>` (software/lab/tprof.py).
+void resident_listprof_names(void)
+{
+    for (int i = 0; i < LISTPROF_N && LP[i].what; i++)
+        printf("TPL %d %s\n", i, LP[i].what);
 }
 
 static struct list_prof *listprof_slot(const char *what)
@@ -253,15 +266,121 @@ struct rl_state {
     uint32_t n, nbinv, bad;
     void *binv[16];
     uint32_t binv_bytes[16];
+    // The list image cache (below).
+    struct rl_image *images;        // RLC_SLOTS images in the heap (0: none yet)
+    struct rl_image *img;           // the list being built: its slot (0: not cached)
+    uint32_t replay;                // ... is a replay: desc_* write nothing
+    uint32_t key[3];
+    uint32_t cmode;                 // 0 off, 1 on, 2 verify (build anyway, compare)
+    uint32_t nslots;                // images allocated (RLC_SLOTS, or fewer in a small heap)
+    uint32_t chits, crecords, cevict, cmism, cfall;
 };
 #define RLS ((struct rl_state *)TRIXIUM_RL_STATE_ADDR)
 _Static_assert(sizeof(struct rl_state) <= 1024, "rl_state window is 1 KB");
+
+/* List Image Cache */
+/*------------------*/
+
+// A list whose descriptors do not change between two calls - the same layer, the same
+// buffers, the same scratchpad state - is built once; later calls replay its image: the
+// rl_*/desc_* calls run as before (cache maintenance, bookkeeping, the descriptor count) but
+// write no descriptor, and the bank's loader fetches the image from main RAM instead of the
+// staging area. Building is CPU time on the critical path when the previous list has ended
+// (listprof's `waited`): ~1.6k cycles for a prepare, ~5-8k for a layer's projections.
+// The caller names the list (cache_begin: everything its descriptors depend on - the layer,
+// the entries, which buffers are present, whether RS_F already holds the source). A key
+// that misses a dependency replays a wrong list: `listcache verify` builds every list anyway
+// and compares it with its image (the simulation gate runs with it), and a replay whose
+// descriptor count differs from the image's is dropped and the list declined (the caller's
+// fallback). Keys are direct-mapped by hash; a collision evicts (a rebuild, nothing more).
+#define RLC_DESCS 32                      // descriptors per image (the longest list is 27)
+#define RLC_SLOTS 1024                    // 2-way sets by key hash (~165 names on the 2B);
+                                          // a small heap (the simulation) gets 256 or 64
+struct rl_image {
+    uint32_t key[3];                      // all zero: empty
+    uint32_t count;                       // descriptors, the stop included
+    uint32_t pad[12];                     // the words on their own cache lines
+    uint32_t words[RLC_DESCS*16];         // the staged descriptors, clean in memory
+};
+_Static_assert(sizeof(struct rl_image) % 64 == 0, "list images are cache-line multiples");
+
+static uint32_t rlc_hash(const uint32_t *k)
+{
+    uint32_t h = k[0]*0x9E3779B1u ^ k[1]*0x85EBCA6Bu ^ k[2]*0xC2B2AE35u;
+    return (h ^ (h >> 16)) & (RLS->nslots - 1);
+}
+
+// Name the list being built (after build_begin/rl_begin): with the cache on and an image of
+// this name, the build becomes a replay.
+static void cache_begin(uint32_t a, uint32_t b, uint32_t c)
+{
+    struct rl_state *L = RLS;
+    L->img = 0;
+    L->replay = 0;
+    if (!L->cmode || !a)
+        return;
+    if (!L->images) {
+        uint8_t *p = 0;
+        for (L->nslots = RLC_SLOTS; L->nslots >= 64 && !p; L->nslots /= 4)
+            p = infer_halloc(sizeof(struct rl_image)*L->nslots + 64, 0);
+        if (!p) {
+            puts("resident: no heap for the list images - list cache off");
+            L->cmode = 0;
+            return;
+        }
+        L->nslots *= 4;                     // the loop's last division undone
+        L->images = (struct rl_image *)(((uintptr_t)p + 63) & ~(uintptr_t)63);
+        memset(L->images, 0, sizeof(struct rl_image)*L->nslots);
+    }
+    L->key[0] = a; L->key[1] = b; L->key[2] = c;
+    // The key's 2-way set: its image, or the way to fill (an empty one, else alternately).
+    struct rl_image *set = &L->images[rlc_hash(L->key) & ~1u], *img = 0;
+    for (int w = 0; w < 2; w++)
+        if (set[w].key[0] == a && set[w].key[1] == b && set[w].key[2] == c)
+            img = &set[w];
+    if (!img) {
+        if (!set[0].key[0])      img = &set[0];
+        else if (!set[1].key[0]) img = &set[1];
+        else { img = &set[set[0].pad[0] & 1u]; set[0].pad[0] ^= 1u; }
+    }
+    L->img = img;
+    if (L->cmode == 1 && img->key[0] == a && img->key[1] == b && img->key[2] == c) {
+        L->replay = 1;
+        L->chits++;
+    }
+}
+
+int rl_replaying(void) { return RLS->replay; }
+
+void resident_listcache_mode(int mode)
+{
+    RLS->cmode = (uint32_t)mode;
+    if (RLS->images && mode)               // every image rebuilt under the new mode
+        memset(RLS->images, 0, sizeof(struct rl_image)*RLS->nslots);
+}
+
+void resident_listcache_reset(void)
+{
+    RLS->chits = RLS->crecords = RLS->cevict = RLS->cmism = RLS->cfall = 0;
+}
+
+void resident_listcache_print(void)
+{
+    const struct rl_state *L = RLS;
+    printf("listcache: %s (%lu images), %lu replays, %lu records, %lu evictions, %lu mismatches, %lu dropped\n",
+           L->cmode == 2 ? "verify" : L->cmode ? "on" : "off", (unsigned long)(L->images ? L->nslots : 0),
+           (unsigned long)L->chits,
+           (unsigned long)L->crecords, (unsigned long)L->cevict, (unsigned long)L->cmism,
+           (unsigned long)L->cfall);
+}
 
 // Start building a list: the bank the list in flight does not use.
 static void build_begin(void)
 {
     RLS->bbase = (RLS->active && RLS->base == 0) ? RS_DESC_MAX : 0;
     RLS->t0 = perf_now64();
+    RLS->img = 0;
+    RLS->replay = 0;
 }
 
 // A list the CPU waits for at once (init, self-tests): nothing in flight first.
@@ -277,25 +396,31 @@ static volatile uint32_t *stage_w(uint32_t idx)
     return STAGE + (RLS->bbase + 1 + idx)*16;
 }
 
+// A replay (list image cache) counts the descriptors and writes none.
 static void desc_words(uint32_t idx, const struct bns_seq_descriptor *d)
 {
+    if (RLS->replay) return;
     volatile uint32_t *w = stage_w(idx);
     for (int i = 0; i < 16; i++) w[i] = d->word[i];
 }
 
 static void desc_engine(uint32_t idx, const struct engine_op *op)
 {
+    if (RLS->replay) return;
     seq_desc_engine_at(stage_w(idx), op);
 }
 
 static void desc_vec(uint32_t idx, uint16_t pc, const int32_t *args, int n)
 {
+    if (RLS->replay) return;
     seq_desc_vec_seed_at(stage_w(idx), pc, args, n, 0, 0);
 }
 
 static void desc_stop(uint32_t idx)
 {
-    seq_desc_stop_at(stage_w(idx));
+    if (RLS->replay) return;
+    volatile uint32_t *w = stage_w(idx);
+    for (int i = 0; i < 16; i++) w[i] = 0;   // all 16: the list's image is deterministic
 }
 
 // Bank `bbase`'s loader, in scratchpad slot bbase: fetches the staged slots bbase+1.. into
@@ -388,6 +513,8 @@ static int run_list_start(uint32_t count, const char *what)
     uint64_t now = perf_now64();
     if (prof && L->t0) prof->build += now - L->t0;
     L->t0 = 0;
+    int waited = L->active && (trixium_seq_status_read() & 1);
+    if (prof && waited) prof->waits++;
     if (run_list_wait())
         return -1;
     lp_post();
@@ -408,9 +535,48 @@ static int run_list_start(uint32_t count, const char *what)
         loader_write(RS_DESC_MAX);
         L->loaders = 1;
     }
-    // The staged descriptors to memory for the loader (slot bbase: its length), which is the
-    // list's descriptor 0 (listprof's and rl_wait_desc's counts include it).
-    clean_cpu_dcache_range((void *)(STAGE + (L->bbase + 1)*16), count*64);
+    // The staged descriptors to memory for the loader (slot bbase: its source and length),
+    // which is the list's descriptor 0 (listprof's and rl_wait_desc's counts include it) -
+    // or the list's image (the cache), recorded here from the staged build.
+    const volatile uint32_t *src = STAGE + (L->bbase + 1)*16;
+    struct rl_image *img = L->img;
+    L->img = 0;
+    if (L->replay) {
+        L->replay = 0;
+        if (img->count != count || count > RLC_DESCS) {
+            // The caller's inputs changed under a reused key: no list (the caller's fallback).
+            printf("resident: %s list image of %lu descriptors, %lu counted - dropped\n",
+                   what, (unsigned long)img->count, (unsigned long)count);
+            memset(img->key, 0, sizeof img->key);
+            L->cfall++;
+            return -1;
+        }
+        src = img->words;
+    } else {
+        clean_cpu_dcache_range((void *)src, count*64);
+        if (img && count <= RLC_DESCS) {
+            if (img->key[0] == L->key[0] && img->key[1] == L->key[1] && img->key[2] == L->key[2]) {
+                // Verify: the same name built again must give the same list.
+                uint32_t bad = img->count != count;
+                for (uint32_t i = 0; !bad && i < count*16; i++)
+                    bad |= img->words[i] != src[i];
+                if (bad) {
+                    L->cmism++;
+                    printf("resident: %s list differs from its image (key %08lx %08lx %08lx)\n",
+                           what, (unsigned long)L->key[0], (unsigned long)L->key[1],
+                           (unsigned long)L->key[2]);
+                }
+            } else if (img->key[0]) {
+                L->cevict++;
+            }
+            for (uint32_t i = 0; i < count*16; i++) img->words[i] = src[i];
+            img->count = count;
+            img->key[0] = L->key[0]; img->key[1] = L->key[1]; img->key[2] = L->key[2];
+            clean_cpu_dcache_range(img->words, count*64);
+            L->crecords++;
+        }
+    }
+    seq_patch(L->bbase, 4, eng_addr((const void *)src));
     seq_patch(L->bbase, 5, count*2);
     count++;
     L->prof = prof;
@@ -423,6 +589,9 @@ static int run_list_start(uint32_t count, const char *what)
     L->nbinv = 0;
     L->active = 1;
     L->last_t = perf_now64();
+    // The trace's list start: its listprof slot (the name, `tprof dump`'s TPL lines) and
+    // whether the start waited for the previous list (its build was hidden).
+    seq_list_tag = ((uint32_t)(prof ? prof - LP : LISTPROF_N - 1) << 17) | ((uint32_t)waited << 16);
     seq_list_start(L->base, count);
     return 0;
 }
@@ -463,6 +632,9 @@ int resident_init(void)
     R->n_ch = (uint8_t)H->n_channels;
     R->ready = R->disabled = 0;
     RLS->loaders = 0;                  // the slots may hold another model's lists
+    if (!initialized || !RLS->cmode) RLS->cmode = 1;
+    if (RLS->images)                   // another model's entries: every image is stale
+        memset(RLS->images, 0, sizeof(struct rl_image)*RLS->nslots);
     memset(R->sign_base, 0, sizeof R->sign_base);
     if (!resident_available())
         return -1;
@@ -539,9 +711,13 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     }
     uint64_t t0 = perf_now64();
     build_begin();
+    int fetch = src && src != R->rsf_src;
+    // The list's name: the source and whether it is fetched, the width and the rotation.
+    cache_begin(0x01000000u | (width/32u) << 8 | (uint32_t)rotate << 1 | (uint32_t)fetch,
+                (uint32_t)(uintptr_t)src, 0);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
-    if (src && src != R->rsf_src) {
+    if (fetch) {
         // The CPU wrote src through its write-back L1: make it visible to the engine's
         // FETCH. Clean, not flush: a clean line cannot clobber what the engine reads back.
         clean_cpu_dcache_range((void *)src, width*4);
@@ -550,7 +726,9 @@ int resident_prepare(const float *src, uint32_t width, int rotate)
     // src == rsf_src: the list that produced src left it in RS_F (resident_rsf_set).
     // src == NULL: the FP32 source is already in RS_F (resident_ffn_act) - consumed here.
     R->act_resident = 0;
-    if (rotate) {
+    if (RLS->replay) {
+        n += rotate ? 3u : 1u;
+    } else if (rotate) {
         // unit 4's `elements` is PER BLOCK (gateware: total = elements*blocks), so the
         // rotated form asks for width/B independent 1,024-element exponents, one per
         // Hadamard block. Passing the whole width here quantizes width*blocks elements
@@ -598,6 +776,10 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
     int nseg = (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
     if (nseg < 1 || nseg > 4)
         return -1;
+    if (RLS->replay) {                           // A replay: the image holds the descriptors.
+        *n += 2u*(uint32_t)nseg;
+        return 0;
+    }
     uint32_t ystride = ((rows*4 + 31) & ~31u);   // One int32 result stream per segment.
     if (ystage % 32 || ystage + (uint64_t)nseg*ystride > RS_F)   // The partials fit below RS_F,
         return -1;
@@ -658,6 +840,7 @@ int resident_matvec(const struct bons_entry *e, float *dst)
     int keep = R->keep_dst == dst;
     R->keep_dst = 0;
     build_begin();
+    cache_begin(0x02000000u | (uint32_t)keep, (uint32_t)(uintptr_t)e, (uint32_t)(uintptr_t)dst);
     if (!resident_active() || ((uintptr_t)dst & 31) || build_matvec(&n, e, RS_F)) {
         R->fallbacks++;
         resident_join();               // the caller's fallback may use the engine
@@ -698,6 +881,13 @@ void rl_begin(void)
     RLS->n = RLS->nbinv = RLS->bad = 0;
     resident_state()->rsf_list = resident_state()->rsf_src;
     build_begin();
+}
+
+int rl_begin_keyed(uint32_t a, uint32_t b, uint32_t c)
+{
+    rl_begin();
+    cache_begin(a, b, c);
+    return RLS->replay;
 }
 void resident_rsf_set(const void *src) { resident_state()->rsf_src = src; }
 int rl_rsf_is(const void *src) { return src && resident_state()->rsf_list == src; }
@@ -763,7 +953,7 @@ void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
 
 void rl_nowait(void)
 {
-    if (RLS->n)
+    if (RLS->n && !RLS->replay)
         stage_w(RLS->n - 1)[0] = 1u | (1u << 9);
 }
 
@@ -818,12 +1008,20 @@ static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t
         int wi = width_index(H, width);
         if (wi < 0 || width/B > 32) { RLS->bad = 1; return; }
         uint32_t blocks = width/B;
-        bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RLS->n++, &d);
-        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, had_flags(R)); desc_words(RLS->n++, &d);
-        bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks | req_flags(R)); desc_words(RLS->n++, &d);
+        if (RLS->replay) {
+            RLS->n += 3;
+        } else {
+            bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(RLS->n++, &d);
+            bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, had_flags(R)); desc_words(RLS->n++, &d);
+            bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks | req_flags(R)); desc_words(RLS->n++, &d);
+        }
         rl_rsf_lost();                    // the Hadamard wrote RS_F
     } else {
-        bns_seq_desc_quantize(&d, RS_F, xw, e8, width, 1);              desc_words(RLS->n++, &d);
+        if (RLS->replay) {
+            RLS->n++;
+        } else {
+            bns_seq_desc_quantize(&d, RS_F, xw, e8, width, 1);              desc_words(RLS->n++, &d);
+        }
         R->rsf_list = vec;                // a plain quantize leaves the source in RS_F
     }
 }
@@ -1220,13 +1418,20 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     uint64_t t0 = perf_now64();
     build_begin();
     R->keep_dst = 0;
+    // The list's name: the entries and which outputs go to main RAM (fixed buffers).
+    cache_begin(0x03000000u | (act != 0) | (gate_out != 0) << 1 | (up_out != 0) << 2,
+                (uint32_t)(uintptr_t)gate, (uint32_t)(uintptr_t)up);
     struct bns_seq_descriptor d;
     if (build_matvec(&n, gate, RS_F) || (gate_out && n > RS_DESC_MAX - 6u)) goto decline;
     if (gate_out) store_out(&n, gate_out, rows, RS_F);
     if (build_matvec(&n, up, RS_Y) || n + (up_out ? 4u : 3u) > RS_DESC_MAX) goto decline;
     if (up_out) store_out(&n, up_out, rows, RS_Y);
-    bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, rows);
-    desc_words(n++, &d);
+    if (RLS->replay) {
+        n++;
+    } else {
+        bns_seq_desc_silu(&d, RS_F, RS_Y, RS_F, RS_FIXMAP, rows);
+        desc_words(n++, &d);
+    }
     // act != NULL: the activation also goes to main RAM (the traces, and a caller that wants
     // the CPU fallback's input); fixup lanes are patched in both copies below. NULL: it
     // stays in RS_F only, saving the store (70 KB per 27B layer: cache flush, invalidate, DMA).
@@ -1306,6 +1511,12 @@ uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, f
 
 void resident_listprof_reset(void) {}
 void resident_listprof_print(uint32_t forwards) { (void)forwards; }
+void resident_listprof_names(void) {}
+void resident_listcache_mode(int mode) { (void)mode; }
+void resident_listcache_print(void) {}
+void resident_listcache_reset(void) {}
+int  rl_begin_keyed(uint32_t a, uint32_t b, uint32_t c) { (void)a; (void)b; (void)c; return 0; }
+int  rl_replaying(void) { return 0; }
 
 void rl_begin(void) {}
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp) { (void)src; (void)bytes; (void)sp; }

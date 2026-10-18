@@ -77,6 +77,13 @@ void resident_keep_rsf(const void *dst);
 #define RS_F_ADDR   0x1C800u
 struct bns_seq_descriptor;
 void rl_begin(void);
+// rl_begin naming the list (the list image cache, resident.c): a, b, c are everything its
+// descriptors depend on (a: a site code in bits 31:24 and the rest - never 0); returns 1 when
+// the list is a replay of an earlier build, so the caller may skip its own encoding work (the
+// rl_* calls must still be made, in the same order: they keep the count and the cache
+// maintenance).
+int  rl_begin_keyed(uint32_t a, uint32_t b, uint32_t c);
+int  rl_replaying(void);
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store(void *dst, uint32_t bytes, uint32_t sp);
 // No cache maintenance, for main-RAM spans the CPU holds no dirty line of (constants cleaned
@@ -175,5 +182,8 @@ struct resident_state {
 struct resident_state *resident_state(void);
 void resident_stats_reset(void);
 void resident_listprof_print(uint32_t forwards);   // `listprof` lines (stats)
+void resident_listprof_names(void);                // `TPL` lines (tprof dump)
+void resident_listcache_mode(int mode);            // 0 off, 1 on, 2 verify (every image rebuilt)
+void resident_listcache_print(void);               // `listcache` line (stats)
 
 #endif /* RESIDENT_H */

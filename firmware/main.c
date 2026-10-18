@@ -521,6 +521,54 @@ static void bist_report(int k)
            (unsigned long)bist_errs);
     bist_errs = bist_runs = 0;
 }
+
+// BIST traffic patterns for the ECC counters (`eccbits clear` / `eccbits` around it):
+// `bistpat <k> <mode> [runs]`. The generator writes the `ddrstress` region (32 MB above the
+// weights), then the checker reads it `runs` times; mode bit 0: at random addresses (the
+// LFSR's, so the checker's own count means nothing - the ECC's per-DQ counts do), bit 1: with
+// the generator writing the next 32 MB at the same time (read/write turnarounds). Which
+// generic pattern reproduces the read eye the engine's concurrent streams see (ddr_ecc_scan).
+static void bistpat_cmd(char *str)
+{
+    char *kk = get_token(&str), *m = get_token(&str), *n = get_token(&str);
+    int k = (int)strtoul(kk, NULL, 0), mode = *m ? (int)strtoul(m, NULL, 0) : 0;
+    int runs = *n ? (int)strtoul(n, NULL, 0) : 8;
+    if (k < 0 || k >= SDRAM_CONTROLLERS) { puts("bistpat: no such controller"); return; }
+    uint64_t t0 = perf_now64();
+    uint32_t errs = 0;
+    // Random addresses: the generator must visit the checker's LFSR sequence of addresses
+    // (a sequential write leaves most of a 32 MB region's random addresses unwritten).
+    csr_write_simple(1, BIST(k, GENERATOR_RESET));
+    csr_write_simple((mode & 1) ? 3 : 1, BIST(k, GENERATOR_RANDOM));
+    csr_write_simple(bist_base, BIST(k, GENERATOR_BASE));
+    csr_write_simple(bist_base + bist_len, BIST(k, GENERATOR_END));
+    csr_write_simple(bist_len, BIST(k, GENERATOR_LENGTH));
+    csr_write_simple(1, BIST(k, GENERATOR_START));
+    while (!csr_read_simple(BIST(k, GENERATOR_DONE)));
+    for (int i = 0; i < runs; i++) {
+        if (mode & 2) {
+            csr_write_simple(1, BIST(k, GENERATOR_RESET));
+            csr_write_simple(1, BIST(k, GENERATOR_RANDOM));
+            csr_write_simple(bist_base + bist_len, BIST(k, GENERATOR_BASE));
+            csr_write_simple(bist_base + 2*bist_len, BIST(k, GENERATOR_END));
+            csr_write_simple(bist_len, BIST(k, GENERATOR_LENGTH));
+            csr_write_simple(1, BIST(k, GENERATOR_START));
+        }
+        csr_write_simple(1, BIST(k, CHECKER_RESET));
+        csr_write_simple((mode & 1) ? 3 : 1, BIST(k, CHECKER_RANDOM));   // data | addr
+        csr_write_simple(bist_base, BIST(k, CHECKER_BASE));
+        csr_write_simple(bist_base + bist_len, BIST(k, CHECKER_END));
+        csr_write_simple(bist_len, BIST(k, CHECKER_LENGTH));
+        csr_write_simple(1, BIST(k, CHECKER_START));
+        while (!csr_read_simple(BIST(k, CHECKER_DONE)));
+        while (!csr_read_simple(BIST(k, GENERATOR_DONE)));
+        errs += csr_read_simple(BIST(k, CHECKER_ERRORS));
+    }
+    printf("BISTPAT ctrl %d mode %d: %d runs of %lu MB in %lu ms, %lu checker errors%s\n", k, mode,
+           runs, (unsigned long)(bist_len >> 20),
+           (unsigned long)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000)), (unsigned long)errs,
+           (mode & 1) ? " (random addresses: no data check)" : "");
+}
 #endif
 
 // Matvec repeatability: `mvdiff <role> <layer> [reps]` runs one matvec as the reference, then
@@ -862,6 +910,37 @@ static void console_service(void)
         sptest();
     else if (strcmp(token, "peek") == 0)
         peek_cmd(str);
+#ifdef CSR_TRIXIUM_ENGINE_CSR_CYC_VEC_ADDR
+    else if (strcmp(token, "spcost") == 0) { // spcost [n]: CPU scratchpad word accesses vs the busy counters
+        char *nn = get_token(&str);
+        uint32_t n = *nn ? (uint32_t)strtoul(nn, NULL, 0) : 1024, acc = 0;
+        volatile uint32_t *sp = (volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000);
+        uint32_t e0 = trixium_engine_csr_cyc_eng_read(), v0 = trixium_engine_csr_cyc_vec_read();
+        uint64_t t0 = perf_now64();
+        for (uint32_t i = 0; i < n; i++) acc += sp[i & 1023];
+        uint64_t t1 = perf_now64();
+        for (uint32_t i = 0; i < n; i++) sp[i & 1023] = i;
+        uint64_t t2 = perf_now64();
+        uint32_t e1 = trixium_engine_csr_cyc_eng_read(), v1 = trixium_engine_csr_cyc_vec_read();
+        printf("SPCOST %lu reads %lu cycles, %lu writes %lu cycles; busy deltas eng %lu vec %lu (acc %08lx)\n",
+               (unsigned long)n, (unsigned long)(t1 - t0), (unsigned long)n, (unsigned long)(t2 - t1),
+               (unsigned long)(e1 - e0), (unsigned long)(v1 - v0), (unsigned long)acc);
+    }
+#endif
+#ifdef TRIXIUM_CHAN_WEIGHT_BASE
+    else if (strcmp(token, "fetchload") == 0) { // fetchload <chan> [mb] [passes]: one channel's sequential FETCH stream (the read eye under a single stream: eccbits around it)
+        char *cc = get_token(&str), *mm = get_token(&str), *pp = get_token(&str);
+        uint32_t chan = (uint32_t)strtoul(cc, NULL, 0), mb = *mm ? (uint32_t)strtoul(mm, NULL, 0) : 32;
+        uint32_t passes = *pp ? (uint32_t)strtoul(pp, NULL, 0) : 4, beats = 1024;   // 32 KB into RS_Y (transient)
+        uint64_t t0 = perf_now64();
+        for (uint32_t p = 0; p < passes && !engine_wedged; p++)
+            for (uint32_t off = 0; off < (mb << 20) && !engine_wedged; off += beats*32)
+                engine_fetch((uint8_t)chan, TRIXIUM_CHAN_WEIGHT_BASE + off, beats, 0xC000);
+        printf("FETCHLOAD chan %lu: %lu x %lu MB in %lu ms%s\n", (unsigned long)chan, (unsigned long)passes,
+               (unsigned long)mb, (unsigned long)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000)),
+               engine_wedged ? " WEDGED" : "");
+    }
+#endif
     else if (strcmp(token, "mvtest") == 0)
         mvtest_cmd(str);
     else if (strcmp(token, "mvbw") == 0)
@@ -880,6 +959,8 @@ static void console_service(void)
         }
         bist_report(k);
     }
+    else if (strcmp(token, "bistpat") == 0) // bistpat <k> <mode> [runs]: BIST traffic patterns, for eccbits
+        bistpat_cmd(str);
 #endif
 #if defined(SDRAM_CSR_STRIDE)
     else if (strcmp(token, "ddrmr") == 0) { // ddrmr <k> <mr> <value>
@@ -1029,6 +1110,11 @@ static void console_service(void)
         if (strncmp(str, "off", 3) == 0) fprof_use = 0;
         if (strncmp(str, "print", 5) == 0) fprof_print();
         printf("FPROF %s\n", fprof_use ? "on" : "off");
+    } else if (strcmp(token, "listcache") == 0) { // listcache [off|on|verify]: the list image cache
+        if (strncmp(str, "off", 3) == 0)    resident_listcache_mode(0);
+        if (strncmp(str, "on", 2) == 0)     resident_listcache_mode(1);
+        if (strncmp(str, "verify", 6) == 0) resident_listcache_mode(2);
+        resident_listcache_print();
     } else if (strcmp(token, "tprof") == 0) {
         if (strncmp(str, "arm", 3) == 0) {
             const char *p = str + 3;
@@ -1038,7 +1124,7 @@ static void console_service(void)
             printf("TPROF armed: generated token #%d traces itself (gen or bench)\n",
                    tprof_armed);
         }
-        if (strncmp(str, "dump", 4) == 0) tprof_dump();
+        if (strncmp(str, "dump", 4) == 0) { tprof_dump(); resident_listprof_names(); }
         if (str[0] == 0)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");

@@ -84,6 +84,8 @@ void seq_desc_engine_at(volatile uint32_t *d, const struct engine_op *op)
     d[11] = op->rep;
     d[12] = op->dstride;
     d[13] = op->sstride;
+    d[14] = 0;                 // Every word written: a descriptor's image is deterministic
+    d[15] = 0;                 // (resident.c's list image cache compares them).
 }
 
 void seq_desc_stop(uint32_t idx)
@@ -167,12 +169,15 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
     return n;
 }
 
+uint32_t seq_list_tag;
+
 void seq_list_start(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged)
         return;
     if (tprof_active)
-        tprof_event((5u << 28) | ((idx0 & 0xFF) << 8) | (count & 0xFF));
+        tprof_event((5u << 28) | (seq_list_tag & 0x0FFF0000u) | ((idx0 & 0xFF) << 8) | (count & 0xFF));
+    seq_list_tag = 0;
     trixium_seq_base_write(SP_DESC + idx0*64);
     trixium_seq_count_write(count);
     trixium_seq_start_write(1);
