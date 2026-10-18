@@ -294,7 +294,7 @@ _Static_assert(sizeof(struct rl_state) <= 1024, "rl_state window is 1 KB");
 // descriptor count differs from the image's is dropped and the list declined (the caller's
 // fallback). Keys are direct-mapped by hash; a collision evicts (a rebuild, nothing more).
 #define RLC_DESCS 32                      // descriptors per image (the longest list is 27)
-#define RLC_SLOTS 1024                    // 2-way sets by key hash (~165 names on the 2B);
+#define RLC_SLOTS 1024                    // 4-way sets by key hash (~165 names on the 2B);
                                           // a small heap (the simulation) gets 256 or 64
 struct rl_image {
     uint32_t key[3];                      // all zero: empty
@@ -333,15 +333,18 @@ static void cache_begin(uint32_t a, uint32_t b, uint32_t c)
         memset(L->images, 0, sizeof(struct rl_image)*L->nslots);
     }
     L->key[0] = a; L->key[1] = b; L->key[2] = c;
-    // The key's 2-way set: its image, or the way to fill (an empty one, else alternately).
-    struct rl_image *set = &L->images[rlc_hash(L->key) & ~1u], *img = 0;
-    for (int w = 0; w < 2; w++)
+    // The key's 4-way set: its image, or the way to fill (an empty one, else round-robin;
+    // 2-way sets still evicted 3 names per forward on the 2B).
+    struct rl_image *set = &L->images[rlc_hash(L->key) & ~3u], *img = 0;
+    for (int w = 0; w < 4; w++)
         if (set[w].key[0] == a && set[w].key[1] == b && set[w].key[2] == c)
             img = &set[w];
+    for (int w = 0; w < 4 && !img; w++)
+        if (!set[w].key[0])
+            img = &set[w];
     if (!img) {
-        if (!set[0].key[0])      img = &set[0];
-        else if (!set[1].key[0]) img = &set[1];
-        else { img = &set[set[0].pad[0] & 1u]; set[0].pad[0] ^= 1u; }
+        img = &set[set[0].pad[0] & 3u];
+        set[0].pad[0] = (set[0].pad[0] + 1u) & 3u;
     }
     L->img = img;
     if (L->cmode == 1 && img->key[0] == a && img->key[1] == b && img->key[2] == c) {
