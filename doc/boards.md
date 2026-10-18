@@ -55,7 +55,14 @@ design and its simulation are exact; two boards' memory systems are not always:
   error, each bit then moved to the centre of its clean run. On the card (2B, 64 tokens):
   8 corrected, 0 uncorrectable, where the same boot's leveling alone gave 346 and 4 and a bad
   one 63,685 and 25,902. The ECC is upstream since 2026-10-17 (LiteDRAM #423, LiteX #2679,
-  LiteX-Boards #928); the per-bit scan under real traffic is the next LiteDRAM contribution.
+  LiteX-Boards #928). The per-bit re-centring is proposed for liblitedram's leveling with the
+  BIST as its oracle (LiteX #2681, 2026-10-18), with this caveat measured here: no single-port
+  pattern sees the narrow eye - a sequential BIST read, a random-address one, a read with
+  concurrent writes, or one engine channel's sequential stream alone (128-256 MB each, at tap
+  offsets where the two concurrent channel streams give 178k corrected reads per 3 tokens) all
+  read clean. Only two interleaved sequential read streams reproduce it, which is why the
+  firmware's own scan uses the engine; a two-stream mode of the LiteDRAM BIST would let the
+  leveling do the same.
   Behind it, the firmware re-runs a forward during which a controller flagged an uncorrectable
   read: the weights in DRAM are intact, the errors are transient. A Qwen3 forward is idempotent
   once its position is restored; a hybrid one (Bonsai 2) once its DeltaNet state is
