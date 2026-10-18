@@ -959,6 +959,32 @@ static void console_service(void)
         }
         bist_report(k);
     }
+    else if (strcmp(token, "fetchbist") == 0) { // fetchbist <k> <chan> [mb] [runs]: the checker's sequential stream on controller k while one engine channel streams: two ports (eccbits around it)
+        char *kk = get_token(&str), *cc = get_token(&str), *mm = get_token(&str), *nn = get_token(&str);
+        int k = (int)strtoul(kk, NULL, 0), runs = *nn ? (int)strtoul(nn, NULL, 0) : 8;
+        uint32_t chan = (uint32_t)strtoul(cc, NULL, 0), mb = *mm ? (uint32_t)strtoul(mm, NULL, 0) : 32, beats = 1024;
+        if (k < 0 || k >= SDRAM_CONTROLLERS) { puts("fetchbist: no such controller"); return; }
+        csr_write_simple(1, BIST(k, GENERATOR_RESET)); csr_write_simple(0, BIST(k, GENERATOR_RESET));
+        csr_write_simple(1, BIST(k, GENERATOR_RANDOM));
+        csr_write_simple(bist_base, BIST(k, GENERATOR_BASE));
+        csr_write_simple(bist_base + bist_len, BIST(k, GENERATOR_END));
+        csr_write_simple(bist_len, BIST(k, GENERATOR_LENGTH));
+        csr_write_simple(1, BIST(k, GENERATOR_START));
+        while (!csr_read_simple(BIST(k, GENERATOR_DONE)));
+        uint64_t t0 = perf_now64();
+        uint32_t passes = 0;
+        bist_kick(k);
+        while (bist_runs < (uint32_t)runs && !engine_wedged) {
+            for (uint32_t off = 0; off < (mb << 20) && !engine_wedged; off += beats*32)
+                engine_fetch((uint8_t)chan, TRIXIUM_CHAN_WEIGHT_BASE + off, beats, 0xC000);   // 32 KB into RS_Y (transient)
+            passes++;
+            bist_kick(k);
+        }
+        printf("FETCHBIST chan %lu: %lu x %lu MB in %lu ms%s; ", (unsigned long)chan, (unsigned long)passes,
+               (unsigned long)mb, (unsigned long)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000)),
+               engine_wedged ? " WEDGED" : "");
+        bist_report(k);
+    }
     else if (strcmp(token, "bistpat") == 0) // bistpat <k> <mode> [runs]: BIST traffic patterns, for eccbits
         bistpat_cmd(str);
 #endif
