@@ -379,7 +379,9 @@ unit or a scratchpad unit works on disjoint regions:
   FIFO always drains; `done` waits for it to empty. FETCH beats are back-pressured by the
   same mark.
 - Scratchpad units are mutually exclusive and share the vector unit's client slot
-  (`ScratchpadArbiter`); a unit runs under an engine op only with w0[9] (OVERLAP).
+  (`ScratchpadArbiter`, whose base client is the vector unit when the bitstream has one: the
+  hybrid-only builds leave it out, the arbiter then serves the units alone); a unit runs under
+  an engine op only with w0[9] (OVERLAP).
 - CPU sideband reads/writes take free cycles below all of them.
 
 Firmware rules (`engine_submit` / `engine_join` in `firmware/engine.c`, and NOWAIT lists):
