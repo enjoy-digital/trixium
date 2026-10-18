@@ -12,7 +12,7 @@ Builds need Vivado **2024.1** (the 2025.2 install lacks the VU33P).
 | memory | 4x DDR4 x64, 4 GB each (LiteDRAM, USPDDRPHY) | 8 GB HBM2, 16 of 32 pseudo-channels | 2x DDR3 x64 (the ninth, ECC lane used by the ECC build), 2 GB each (LiteDRAM, K7DDRPHY on HR banks, CK phase shift) |
 | clocks | sys 125 MHz, DDR4 controllers 187.5 MHz (DDR4-1500) | sys = HBM AXI 212.5 MHz, HBM 800 MHz | sys 125 MHz, DDR3 controllers 133.33 MHz (DDR3-1066) |
 | PCIe | Gen3 x4 (LitePCIe) | Gen3 x4 (LitePCIe) | Gen2 x8 (LitePCIe) |
-| units | every scratchpad unit, DeltaNet + attention streams | engine, sequencer, vector unit (no scratchpad units) | as the FK33; `--hybrid`: the hybrid models' units, trimmed to fit (4 channels, attention 4 lanes in kv-head slices, Hadamard 8 lanes, norm without RoPE) |
+| units | every scratchpad unit, DeltaNet + attention streams | engine, sequencer, vector unit (no scratchpad units) | as the FK33; `--hybrid`: the hybrid models' units, trimmed to fit (4 channels, attention 4 lanes in kv-head slices, Hadamard 8 lanes), the norm unit's RoPE stage on and no vector unit (the hybrid path never runs it; this bitstream runs the hybrid models only) |
 | models | Ternary-Bonsai-2 27B, Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B; `--hybrid`: Ternary-Bonsai-2 2B / 4B |
 | target | [`trixium_xcu1525.py`](../trixium_xcu1525.py) | [`trixium_fk33.py`](../trixium_fk33.py) | [`trixium_ypcb.py`](../trixium_ypcb.py) |
 | build | `./trixium_xcu1525.py --build` | `./trixium_fk33.py --build` | `./trixium_ypcb.py --build` |
@@ -62,7 +62,14 @@ design and its simulation are exact; two boards' memory systems are not always:
   offsets where the two concurrent channel streams give 178k corrected reads per 3 tokens) all
   read clean. Only two interleaved sequential read streams reproduce it, which is why the
   firmware's own scan uses the engine; a two-stream mode of the LiteDRAM BIST would let the
-  leveling do the same.
+  leveling do the same. Even the engine's synthetic streams are not the last word: on the
+  `ypcb_hyb7_d100` bitstream they saw bit 1 of lanes 4, 5 and 6 centred in a 5-tap eye while
+  the inference left them 150-500 corrected and a few uncorrectable reads per 16 tokens (one
+  tap earlier: 2 and 0; one tap later: 1.7 M and 225 k) - the forwards' own traffic (the
+  DeltaNet state's reads and writes among them) has a narrower, shifted eye. So every hybrid
+  model load ends with the same scan under the model's own forwards (`ddr_eye_scan`, console
+  `eyescan [k] [range] [forwards]`: a forward per offset from the checkpoint and back, as a
+  retry re-runs one; ~2 s), after which the bench runs with 0 corrected reads and no retry.
   Behind it, the firmware re-runs a forward during which a controller flagged an uncorrectable
   read: the weights in DRAM are intact, the errors are transient. A Qwen3 forward is idempotent
   once its position is restored; a hybrid one (Bonsai 2) once its DeltaNet state is

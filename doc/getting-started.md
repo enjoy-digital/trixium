@@ -140,7 +140,7 @@ trixium_smi                                                     Thu Oct 15 17:00
 │ Link        PCIe Gen2 x8              sys 125.0 MHz (measured)                       │
 │ State       CPU running               engine streaming          no errors            │
 ├─ Utilization over 1000 ms ───────────────────────────────────────────────────────────┤
-│ Engine  ████████░░  81%     Vector  ███░░░░░░░  27%     Overlap  15%                 │
+│ Engine  ████████░░  81%     Units   ███░░░░░░░  27%     Overlap  15%                 │
 │ 43455 engine ops/s · 3732 served from prefetch/s                                     │
 ├─ Memory · DDR3-1066 · 8 channels ────────────────────────────────────────────────────┤
 │ Read    ████████░░  13.94 GB/s of 17.1 GB/s DRAM peak   request wait   0%            │

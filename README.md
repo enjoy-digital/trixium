@@ -70,8 +70,8 @@ Batch-1 decode on the card, first tokens checked against the reference:
 | | | Ternary-Bonsai 1.7B | **106.3** |
 | Inspur **YPCB-00338** (XC7K480T) | 2x DDR3-1066 x64 | Ternary-Bonsai 8B | 8.11 |
 | | | Ternary-Bonsai 1.7B | **35.2** |
-| | 2x DDR3-933 x64 (hybrid build) | Ternary-Bonsai-2 4B | 5.86 |
-| | | Ternary-Bonsai-2 2B | 12.98 |
+| | 2x DDR3-933 x64 (hybrid build) | Ternary-Bonsai-2 4B | 5.98 |
+| | | Ternary-Bonsai-2 2B | 13.20 |
 
 Against CPUs and GPUs (PrismML's published Apple M4 Pro figures, our RTX 3080 run), per GB/s of
 memory bandwidth, and energy-per-token estimates: [`doc/results.md`](doc/results.md). The short
