@@ -353,6 +353,9 @@ per element.
 (range reduction to `[-ln2/2, ln2/2]`, degree-6 polynomial in FMAs, exact `2^n`) on
 [-80, 0], +0 below -80, a NaN argument returned. Arguments are `s - max`, so the maximum's
 term is exactly 1. The DeltaNet decay `exp(g)` uses the same function (`trixium_decay_exp`).
+The probabilities are the exps times one reciprocal of their sum per head (`1.0f/sum` once,
+then multiplies: ggml's order too; before 2026-10-18 a divide per position, the CPU's `fdiv`
+at every element of every head at every token - the long-context pole).
 The mirror's rv32f profile reproduces it (`softmax_exp_rv32`, qualified against the compiled
 firmware under QEMU in `test/model/test_rv32_math.py`).
 

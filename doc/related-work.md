@@ -78,8 +78,8 @@ device after a 512-token prompt; ours after a 3-token prompt):
 
 | | openTPU, 4-bit weights, int8 head | TriXium, ternary |
 | --- | --- | --- |
-| ~2B | Qwen3.5-2B 12.09, Gemma 4 E2B 12.14 (4-bit head), LFM2-2.6B 10.96 tok/s | Bonsai 1.7B **35.2 tok/s**; Bonsai-2 2B (ternary Qwen3.5-2B) 12.40 tok/s, hybrid build at DDR3-933 |
-| 3-4B | SmolLM3-3B 8.74, Phi-4-mini 6.56, Qwen3.5-4B 5.88 tok/s | Bonsai-2 4B (ternary Qwen3.5-4B) 5.71 tok/s, same build |
+| ~2B | Qwen3.5-2B 12.09, Gemma 4 E2B 12.14 (4-bit head), LFM2-2.6B 10.96 tok/s | Bonsai 1.7B **35.2 tok/s**; Bonsai-2 2B (ternary Qwen3.5-2B) **14.99 tok/s**, hybrid build at DDR3-933 |
+| 3-4B | SmolLM3-3B 8.74, Phi-4-mini 6.56, Qwen3.5-4B 5.88 tok/s | Bonsai-2 4B (ternary Qwen3.5-4B) **6.88 tok/s**, same build |
 | 8B | (its images stop at 4 GiB) | Bonsai 8B **8.11 tok/s** |
 | DRAM while decoding | 91-94 % of the 17.1 GB/s peak | 78 % (1.7B), 79 % (8B); ~89-91 % while the engine streams |
 | DRAM bytes read per token (~2B model) | ~1.3 GB (Qwen3.5-2B, 4-bit) | ~0.38 GB (Bonsai 1.7B): ~3.5x less |
@@ -87,12 +87,12 @@ device after a 512-token prompt; ours after a 3-token prompt):
 | memory controller | LiteDRAM, DDR3-1066 (133.33 MHz) | LiteDRAM, DDR3-1066 (133.33 MHz) |
 | clocks | one clock, 133.33 MHz | core 125 MHz, DDR controllers 133.33 MHz |
 
-The Bonsai-2 2B / 4B (2026-10-17) are ternary versions of the same Qwen3.5-2B / 4B openTPU runs at
-4 bits, and they decode at about the same rate with ~2.5x fewer bytes per token: the hybrid build
-uses only about a third of the DRAM bandwidth (the 2B: ~0.41 GB per token at 12.4 tok/s, at
-DDR3-933 on this card), the rest being per-token work (the DeltaNet recurrence unit, CPU softmax,
-list round trips) not yet overlapped with the weight streams. That is where the ternary format's
-advantage is still to be collected, not a speed win.
+The Bonsai-2 2B / 4B (2026-10-18) are ternary versions of the same Qwen3.5-2B / 4B openTPU runs at
+4 bits, and they decode faster (14.99 against 12.1, 6.88 against 5.9 tok/s) with ~2.5x fewer
+bytes per token: the hybrid build uses about 40% of the DRAM bandwidth (the 2B: ~0.41 GB per
+token at 15.0 tok/s, at DDR3-933 on this card), the rest being per-token work (the scratchpad
+units and the CPU on each layer's serial chain) not yet overlapped with the weight streams. That is where the ternary
+format's advantage is still to be collected: a small speed win so far, a large bandwidth one.
 
 Bytes per token come from each design's measured speed and DRAM use: 17.1 GB/s x DRAM busy /
 tok/s. Two small open projects, one person each (give or take an AI agent), opposite trade-offs.

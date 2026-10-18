@@ -65,6 +65,7 @@ trixium convert models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf    # -> models/bons/b
 trixium convert models/8b/Ternary-Bonsai-8B-PQ2_0.gguf        # -> models/bons/bonsai-8b-n16.img
 trixium convert --board ypcb models/1.7b/Ternary-Bonsai-1.7B-PQ2_0.gguf  # -> ...-n8-ypcb.img (5-trit codes)
 trixium convert --board ypcb --channels 4 models/2b/Ternary-Bonsai-2-2B-PTQ1_0.gguf  # -> bonsai2-2b-n4-ypcb.img (./trixium_ypcb.py --hybrid)
+trixium convert --board ypcb --channels 4 models/4b/Ternary-Bonsai-2-4B-PTQ1_0.gguf  # -> bonsai2-4b-n4-ypcb.img (same build; trixium deploy --board ypcb --model 2b|4b)
 trixium tokenizer models/1.7b/tokenizer.json                  # -> models/1.7b/tokenizer.bin
 trixium verify models/bons/bonsai-1p7b-n16.img
 ```

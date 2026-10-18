@@ -45,6 +45,7 @@ With a card and its host in `~/.config/trixium/boards.ini`
 
 ```sh
 trixium deploy --board ypcb --model 1p7b     # bitstream, firmware, weights, tokens, bench
+trixium deploy --board ypcb --model 2b       # the hybrid build: Ternary-Bonsai-2 2B (4b: the 4B)
 trixium chat                                 # on the card's host: talk to it
 trixium smi -l 1                             # and watch it work
 ```
@@ -70,8 +71,22 @@ Batch-1 decode on the card, first tokens checked against the reference:
 | | | Ternary-Bonsai 1.7B | **106.3** |
 | Inspur **YPCB-00338** (XC7K480T) | 2x DDR3-1066 x64 | Ternary-Bonsai 8B | 8.11 |
 | | | Ternary-Bonsai 1.7B | **35.2** |
-| | 2x DDR3-933 x64 (hybrid build) | Ternary-Bonsai-2 4B | 5.98 |
-| | | Ternary-Bonsai-2 2B | 13.20 |
+| | 2x DDR3-933 x64 (hybrid build) | Ternary-Bonsai-2 4B | 6.88 |
+| | | Ternary-Bonsai-2 2B | 14.99 |
+
+The models, all PrismML's, straight from their GGUF files (the converter copies the ternary codes
+and scales bit for bit):
+
+| model | architecture | weights streamed per token | runs on |
+| --- | --- | ---: | --- |
+| Ternary-Bonsai 1.7B | Qwen3 | 0.38 GB | FK33, XCU1525, YPCB-00338 |
+| Ternary-Bonsai 8B | Qwen3 | ~1.6 GB | FK33, XCU1525, YPCB-00338 |
+| Ternary-Bonsai-2 2B | Qwen3.5: DeltaNet + attention layers | 0.41 GB | YPCB-00338 (hybrid build) |
+| Ternary-Bonsai-2 4B | Qwen3.5 | 0.94 GB | YPCB-00338 (hybrid build) |
+| Ternary-Bonsai-2 27B | Qwen3.5 | ~5.4 GB | XCU1525 |
+
+Bytes with 5-trit codes (1.6 bits per weight plus the fp16 group scales); the 2-bit images the
+FK33 and XCU1525 use read about 25% more.
 
 Against CPUs and GPUs (PrismML's published Apple M4 Pro figures, our RTX 3080 run), per GB/s of
 memory bandwidth, and energy-per-token estimates: [`doc/results.md`](doc/results.md). The short
@@ -145,8 +160,13 @@ vector unit and fixed-function units added only where profiling showed they pay.
 are open, and both are, give or take an AI agent, one person's work. They make opposite
 trade-offs: openTPU runs any off-the-shelf model through an ISA and a compiler and keeps its DRAM
 busier; TriXium reads ~3.5x fewer bytes per token with natively ternary models, which comes out
-at 2.5-2.8x the decode rate per parameter (different models, so a speed comparison, not a
-quality one). The numbers, and the other FPGA LLM designs:
+at 2.5-2.8x the decode rate per parameter on the 1.7B and 8B (different models from openTPU's,
+so a speed comparison, not a quality one). Like for like: Ternary-Bonsai-2 2B and 4B are ternary
+versions of the Qwen3.5-2B and 4B that openTPU runs at 4 bits, and on the same card they decode
+at 14.99 against 12.1 and 6.88 against 5.9 tok/s (ours at DDR3-933, openTPU's at DDR3-1066)
+while reading ~2.5x fewer bytes per token: about a third of the DRAM bandwidth, the rest being
+per-token work still to overlap with the weight streams. The numbers, and the other FPGA LLM
+designs:
 [`doc/related-work.md`](doc/related-work.md#opentpu-on-the-same-card).
 
 **Specialised at build time, like a GPU kernel.** On an FPGA, flexibility is paid in logic: a

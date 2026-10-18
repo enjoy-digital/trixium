@@ -15,8 +15,8 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | FK33 | Ternary-Bonsai 1.7B | 106.3 | 2.00 M | sys 212.5 MHz |
 | YPCB-00338 (2x DDR3-1066) | Ternary-Bonsai 8B | 8.11 | 15.41 M | sys 125 MHz |
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
-| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 5.98 | 16.7 M | sys 100 MHz |
-| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 13.20 | 7.58 M | sys 100 MHz |
+| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 6.88 | 14.5 M | sys 100 MHz |
+| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 14.99 | 6.67 M | sys 100 MHz |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate
@@ -26,16 +26,19 @@ approved overclock), and the builds close timing to the project's empirical gate
 [`performance-next-steps.md`](performance-next-steps.md).
 
 The Bonsai 2 2B/4B on the YPCB-00338 are far from its memory limit: the 2B streams ~0.41 GB per
-token, so 13.2 tok/s uses about a third of the DDR3-933 bandwidth (7.35 M cycles per forward
-against a 3.2 M streaming floor). The token trace (`tprof`) puts the rest at: the DeltaNet
-recurrence unit, compute-bound at 4 lanes on this card (17%); the engine idle while the
-scratchpad units (12%: norms, quantize/rotate, convolution, activations, each one element per
-clock) and the CPU (13%: list round trips, the attention layers' RoPE and records) work on each
-layer's serial chain; the stream itself at 0.83 of the 512-bit port's rate, which at sys
-100 MHz is 86% of DDR3-933. Descriptor lists that do not change between tokens are built once
-and replayed from an image (the firmware's list cache: +3% on the 2B); the attention layers' RoPE runs on the norm unit since the hybrid bitstream dropped the vector unit it never used (+2%). openTPU's numbers on the same card (Qwen3.5-2B 12.1, 4B 5.9
-tok/s) are not a like-for-like comparison: the same architecture, but the original weights at 4
-bits (~2.5x the bytes per token) and DDR3-1066.
+token, so 15.0 tok/s uses about 40% of the DDR3-933 bandwidth (6.47 M cycles per forward
+against a 3.2 M streaming floor). The token trace (`tprof`) puts the rest at: the engine idle
+while the scratchpad units (13%: quantize/rotate, convolution, activations, norms) and the CPU
+(11%: list round trips, records, the attention softmax) work on each layer's serial chain; the
+DeltaNet recurrence unit, which was compute-bound at 17% of the token until it got two
+sub-lanes per channel (a 128x128 head in 2,048 clocks); the stream itself at 0.79-0.83 of the
+512-bit port's rate, which at sys 100 MHz is 86% of DDR3-933. Descriptor lists that do not change
+between tokens are built once and replayed from an image (the firmware's list cache: +3%); the
+attention layers' RoPE runs on the norm unit since the hybrid bitstream dropped the vector unit
+it never used (+2%); the attention stream at 8 lanes / 2 groups runs the 2B's heads in one pass
+(13.2 tok/s at a context of 256 tokens, 8.5 at 1,024; the 4B 5.9 at 256). openTPU's numbers on the
+same card (Qwen3.5-2B 12.1, 4B 5.9 tok/s) are not a like-for-like comparison: the same
+architecture, but the original weights at 4 bits (~2.5x the bytes per token) and DDR3-1066.
 
 ## Against CPUs and GPUs
 

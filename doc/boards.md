@@ -12,7 +12,7 @@ Builds need Vivado **2024.1** (the 2025.2 install lacks the VU33P).
 | memory | 4x DDR4 x64, 4 GB each (LiteDRAM, USPDDRPHY) | 8 GB HBM2, 16 of 32 pseudo-channels | 2x DDR3 x64 (the ninth, ECC lane used by the ECC build), 2 GB each (LiteDRAM, K7DDRPHY on HR banks, CK phase shift) |
 | clocks | sys 125 MHz, DDR4 controllers 187.5 MHz (DDR4-1500) | sys = HBM AXI 212.5 MHz, HBM 800 MHz | sys 125 MHz, DDR3 controllers 133.33 MHz (DDR3-1066) |
 | PCIe | Gen3 x4 (LitePCIe) | Gen3 x4 (LitePCIe) | Gen2 x8 (LitePCIe) |
-| units | every scratchpad unit, DeltaNet + attention streams | engine, sequencer, vector unit (no scratchpad units) | as the FK33; `--hybrid`: the hybrid models' units, trimmed to fit (4 channels, attention 4 lanes in kv-head slices, Hadamard 8 lanes), the norm unit's RoPE stage on and no vector unit (the hybrid path never runs it; this bitstream runs the hybrid models only) |
+| units | every scratchpad unit, DeltaNet + attention streams | engine, sequencer, vector unit (no scratchpad units) | as the FK33; `--hybrid`: the hybrid models' units sized for the part (4 channels; the attention stream at 8 lanes / 2 groups, one pass for the 2B's heads and two for the 4B's; the DeltaNet stream at two sub-lanes per channel, a 128x128 head in 2,048 clocks; Hadamard 16 lanes), the norm unit's RoPE stage on, DFI command statistics (`ddrstat`) and no vector unit (the hybrid path never runs it; this bitstream runs the hybrid models only): `ypcb_hyb9_d100`, 253k LUTs (85%) |
 | models | Ternary-Bonsai-2 27B, Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B | Ternary-Bonsai 8B / 1.7B; `--hybrid`: Ternary-Bonsai-2 2B / 4B |
 | target | [`trixium_xcu1525.py`](../trixium_xcu1525.py) | [`trixium_fk33.py`](../trixium_fk33.py) | [`trixium_ypcb.py`](../trixium_ypcb.py) |
 | build | `./trixium_xcu1525.py --build` | `./trixium_fk33.py --build` | `./trixium_ypcb.py --build` |
@@ -60,9 +60,15 @@ design and its simulation are exact; two boards' memory systems are not always:
   pattern sees the narrow eye - a sequential BIST read, a random-address one, a read with
   concurrent writes, or one engine channel's sequential stream alone (128-256 MB each, at tap
   offsets where the two concurrent channel streams give 178k corrected reads per 3 tokens) all
-  read clean. Only two interleaved sequential read streams reproduce it, which is why the
-  firmware's own scan uses the engine; a two-stream mode of the LiteDRAM BIST would let the
-  leveling do the same. Even the engine's synthetic streams are not the last word: on the
+  read clean - and so do (2026-10-18, `fetchbist`) a BIST read interleaved with one engine
+  stream on the same controller (two ports) and a stream loading the other controller. Only
+  the engine's matvec streaming (two channels per controller feeding the adder trees) and the
+  forwards see it: not a DRAM command pattern, the design's own activity. So the leveling's
+  BIST step cannot be the oracle; #2681 instead exports the scan with a traffic callback
+  (`sdram_ckphase_eye_refine`, the taps through `sdram_ckphase_bit_tap[_set]`), and the card
+  shows why in one boot: the BIST reads see 8-9 clean taps on every bit (2 of 72 moved), the
+  engine's scan right after sees 2-3 taps one tap lower (65 of 72 moved). Even the engine's
+  synthetic streams are not the last word: on the
   `ypcb_hyb7_d100` bitstream they saw bit 1 of lanes 4, 5 and 6 centred in a 5-tap eye while
   the inference left them 150-500 corrected and a few uncorrectable reads per 16 tokens (one
   tap earlier: 2 and 0; one tap later: 1.7 M and 225 k) - the forwards' own traffic (the
@@ -76,6 +82,17 @@ design and its simulation are exact; two boards' memory systems are not always:
   double-buffered (engine op 5 writes the other set). On the card (build `ypcb_hyb6_a`, WNS
   −0.360 ns, 2B 12.61 and 4B 5.76 tok/s): `eccforce 8` forces eight forwards to run twice and
   the generation stays golden (retries 8, unrecovered 0).
+- **The read eye under streaming is a placement lottery too** (2026-10-18). `ypcb_hyb8_d100`
+  (240k LUTs, 80%, WNS +0.029 ns) leveled normally (DFI windows of 10-14 taps, the 256 MB
+  single-stream BIST clean) and every single-stream or two-port pattern read clean, yet under the
+  engine's four streams controller 1's byte lanes 0-2 had no clean tap within ±8 and lanes 3-8 one
+  or two: `mvbw` alone 42k corrected / 15k uncorrectable per 8 reps, the bench on ECC retries,
+  a reloaded model wrong. The same streaming logic placed differently (`ypcb_hyb7_d100`: 2-3 clean
+  taps, `ypcb_hyb9_d100`: 3-4) reads clean. No per-region culprit showed in the routed
+  checkpoints (controller 1's lanes sit in clock regions X0Y5-X0Y7; hyb8 put more engine DSPs in
+  X0Y7 but fewer in X0Y5, whose lanes died anyway). So every new bitstream is qualified with
+  `mvbw 13 0 8` between `eccbits clear` and `eccbits`, or the `eyescan` table, before its speed
+  counts; a build whose eye fails is rebuilt (another placement), as hyb8 was superseded by hyb9.
 - **XCU1525: one DDR4 controller trains marginally on some boots.** The weights read back from
   that controller's four channels differ from the image (stably, so the writes are wrong), and
   its KV-cache writes make attention vary from run to run; about half the boots of 2026-10-15
