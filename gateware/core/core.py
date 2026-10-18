@@ -66,9 +66,8 @@ class TriXiumConfig:
     def __post_init__(self):
         if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore
                 or self.with_silu or self.with_norm or self.with_conv) and \
-                (not self.with_vecunit or self.scratchpad_size > 256*1024):
-            raise ValueError("Resident clients need the vector/sequencer arbiter and at most "
-                             "256 KiB scratchpad")
+                self.scratchpad_size > 256*1024:
+            raise ValueError("Resident clients need at most a 256 KiB scratchpad")
         if self.chan_mod < 0 or self.chan_mod & (self.chan_mod - 1):
             raise ValueError("chan_mod must be zero or a power of two")
         # Without chan_mod the STORE/upload paths shift the channel index by the stride; with it
@@ -124,19 +123,25 @@ class TriXiumCore(LiteXModule):
         axis = self.engrst.masters
         self.add_constant("TRIXIUM_HAS_ENGRESET")
 
-        # Vector unit / Sequencer.
-        vecunit = seq = None
+        # Sequencer (the descriptor lists of both paths) and the vector unit. A hybrid-only
+        # bitstream drops the vector unit (with_vecunit=False: 34k LUTs on the K7, which the
+        # hybrid path never runs - its lists hold no vector descriptor); the sequencer's vector
+        # ports then stay idle and the firmware declines K-segmented matvecs and non-hybrid
+        # models (TRIXIUM_HAS_VECUNIT absent).
+        vecunit = None
+        seq = self.seq = ClockDomainsRenamer("eng")(Sequencer(
+            with_hadamard            = config.with_hadamard,
+            with_activation_quantize = config.with_activation_quantize,
+            with_projection_restore  = config.with_projection_restore,
+            with_silu                = config.with_silu,
+            with_norm                = config.with_norm,
+            with_conv                = config.with_conv,
+            norm_rope                = config.norm_rope,
+            scratchpad_size          = config.scratchpad_size))
+        for name in ("TRIXIUM_HAS_SEQ", "TRIXIUM_SEQ_OVERLAP"):
+            self.add_constant(name)
         if config.with_vecunit:
             vecunit = self.vecunit = ClockDomainsRenamer("eng")(VectorUnit(fused=config.with_vec_fused))
-            seq = self.seq = ClockDomainsRenamer("eng")(Sequencer(
-                with_hadamard            = config.with_hadamard,
-                with_activation_quantize = config.with_activation_quantize,
-                with_projection_restore  = config.with_projection_restore,
-                with_silu                = config.with_silu,
-                with_norm                = config.with_norm,
-                with_conv                = config.with_conv,
-                norm_rope                = config.norm_rope,
-                scratchpad_size          = config.scratchpad_size))
             self.comb += [
                 vecunit.seq_en.eq(seq.busy),
                 vecunit.seq_start.eq(seq.vec_start),
@@ -148,7 +153,7 @@ class TriXiumCore(LiteXModule):
             ]
             self.comb += [vecunit.seq_args[i].eq(seq.vec_args[i]) for i in range(8)]
             for name in ("TRIXIUM_HAS_VECUNIT", "TRIXIUM_HAS_VECUNIT2", "TRIXIUM_VEC_LOOPS2",
-                         "TRIXIUM_SEQ_LUT", "TRIXIUM_HAS_SEQ", "TRIXIUM_SEQ_OVERLAP"):
+                         "TRIXIUM_SEQ_LUT"):
                 self.add_constant(name)
             self.add_constant("TRIXIUM_VEC_VREGS", vecunit.vregs)
             if config.with_vec_fused:
@@ -210,10 +215,7 @@ class TriXiumCore(LiteXModule):
                          chan_skew=config.chan_skew)
         sp_client = vecunit
         if sp_clients:
-            if vecunit is None:
-                raise ValueError("scratchpad units need the vector unit as the arbiter's base "
-                                 "client")
-            self.sparb = ScratchpadArbiter(vecunit, sp_clients)
+            self.sparb = ScratchpadArbiter(vecunit, sp_clients)   # base None without the unit
             sp_client = self.sparb
         self.engine = ClockDomainsRenamer("eng")(MatVecEngine(
             scratchpad = self.scratchpad,

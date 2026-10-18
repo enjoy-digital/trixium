@@ -776,6 +776,10 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
     int nseg = (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
     if (nseg < 1 || nseg > 4)
         return -1;
+#ifndef CSR_TRIXIUM_VECUNIT_PROG_ADDR
+    if (nseg > 1)                                // The segment sum is a vector program.
+        return -1;
+#endif
     if (RLS->replay) {                           // A replay: the image holds the descriptors.
         *n += 2u*(uint32_t)nseg;
         return 0;

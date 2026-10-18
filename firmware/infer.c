@@ -1315,7 +1315,11 @@ attn_heads_done: ;
                 int eg  = ex8 - (int)eg_t->bias + (int)eg_t->rshift + kg;
                 int eu  = ex8 - (int)eu_t->bias + (int)eu_t->rshift + ku;
                 int es8 = (eg + eu + 15)
+#ifdef CSR_TRIXIUM_VECUNIT_PROG_ADDR
                         + quant8_shift((uint32_t)trixium_vecunit_res6_read());
+#else
+                        + 0;   // Not reached: a bitstream without the unit runs hybrid models only.
+#endif
                 dbg_sum("ffn_g16", l, SP_G, 2*ffn_dim, eg);      // silu(gate)*up, int16
                 dbg_sum("silu_x8", l, SP_X, ffn_dim, es8);
                 // The residual tail and the next norm in one program - the last layer's
@@ -1600,6 +1604,10 @@ int infer_init(void)
     // The integer attention's per-head fold shifts by log2(n_rep); the hybrid CPU path takes
     // any ratio (the 27B: 24/4 = 6).
     if (!hybrid_present()) {
+#ifndef CSR_TRIXIUM_VECUNIT_PROG_ADDR
+        printf("infer: this bitstream has no vector unit - it runs the hybrid models only\n");
+        return -6;
+#endif
         int nrep = n_head/n_kv_head, sh = 0;
         while ((1 << sh) < nrep) sh++;
         if ((1 << sh) != nrep) {

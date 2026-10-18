@@ -84,7 +84,7 @@ static void info(void)
 /*--------*/
 
 /* The card's state, like nvidia-smi: identity and link, then the core's counters sampled twice
- * over an interval (engine/vector busy cycles, done ops, beats and request-wait cycles per memory
+ * over an interval (engine / scratchpad-units busy cycles, done ops, beats and request-wait cycles per memory
  * channel), then what the host tools recorded in TRIXIUM_STATE_DIR (weights, chat process). A
  * monitor: it only reads registers, plus perf_chan (the per-channel counter mux, which the
  * firmware only uses in its stall diagnostics). */
@@ -293,12 +293,15 @@ static void status(int devnum, double interval, int json)
     ident[255] = 0;
     pcie_link(devnum, addr, link, sizeof(link));
     uint32_t eng_status = litepcie_readl(fd, CSR_TRIXIUM_ENGINE_CSR_STATUS_ADDR);
-    uint32_t vec_status = litepcie_readl(fd, CSR_TRIXIUM_VECUNIT_STATUS_ADDR);
     uint32_t bus_errors = litepcie_readl(fd, CSR_CTRL_BUS_ERRORS_ADDR);
     int eng_error = (eng_status >> CSR_TRIXIUM_ENGINE_CSR_STATUS_ERROR_OFFSET) & 1;
     int eng_run   = (eng_status >> CSR_TRIXIUM_ENGINE_CSR_STATUS_RUN_OFFSET) & 1;
     int eng_busy  = (eng_status >> CSR_TRIXIUM_ENGINE_CSR_STATUS_BUSY_OFFSET) & 1;
-    int vec_bad   = (vec_status >> CSR_TRIXIUM_VECUNIT_STATUS_BAD_OP_OFFSET) & 1;
+    int vec_bad   = 0;   /* A hybrid-only bitstream has no vector unit. */
+#ifdef CSR_TRIXIUM_VECUNIT_STATUS_ADDR
+    uint32_t vec_status = litepcie_readl(fd, CSR_TRIXIUM_VECUNIT_STATUS_ADDR);
+    vec_bad = (vec_status >> CSR_TRIXIUM_VECUNIT_STATUS_BAD_OP_OFFSET) & 1;
+#endif
 #ifdef CSR_CPUMON_CPU_RESET_ADDR
     const char *cpu = (litepcie_readl(fd, CSR_CPUMON_CPU_RESET_ADDR) & 1) ? "in reset" : "running";
 #else
@@ -370,7 +373,7 @@ static void status(int devnum, double interval, int json)
                litepcie_device, addr, link, ident);
         printf(" \"clock_mhz\": %.3f, \"cpu\": \"%s\", \"bus_errors\": %u, \"engine_error\": %d, "
                "\"vector_bad_op\": %d,\n", clk/1e6, cpu, bus_errors, eng_error, vec_bad);
-        printf(" \"seconds\": %.3f, \"engine\": %.4f, \"vector\": %.4f, \"overlap\": %.4f, "
+        printf(" \"seconds\": %.3f, \"engine\": %.4f, \"units\": %.4f, \"overlap\": %.4f, "
                "\"ops_s\": %.1f, \"prefetch_s\": %.1f,\n", dt, u_eng, u_vec, u_both, ops_s, pf_s);
         printf(" \"memory\": \"%s\", \"channels\": %d, \"gbs\": %.3f, \"peak_gbs\": %.3f, "
                "\"request_wait\": %.4f, \"channel_util\": [", memory, TRIXIUM_N_CHANNELS, gbs,
@@ -410,7 +413,7 @@ static void status(int devnum, double interval, int json)
     char bar2[192];
     status_bar(bar, u_eng, 10);
     status_bar(bar2, u_vec, 10);
-    status_line("Engine  %s %3.0f%%     Vector  %s %3.0f%%     Overlap %3.0f%%",
+    status_line("Engine  %s %3.0f%%     Units   %s %3.0f%%     Overlap %3.0f%%",
                 bar, 100*u_eng, bar2, 100*u_vec, 100*u_both);
 #ifdef CSR_TRIXIUM_ENGINE_CSR_PF_HITS_ADDR
     status_line("%.0f engine ops/s · %.0f served from prefetch/s", ops_s, pf_s);

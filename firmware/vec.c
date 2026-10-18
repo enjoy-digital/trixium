@@ -21,7 +21,7 @@
 // The microcode encoding must be the bitstream's (model/asm.py). The Makefile
 // regenerates progs.h per build tree; this catches a stale header at build time.
 #ifndef TRIXIUM_VEC_VREGS
-#define TRIXIUM_VEC_VREGS 8
+#define TRIXIUM_VEC_VREGS 16           // No vector unit in the bitstream: the programs are not run.
 #endif
 #if TRIXIUM_PROGS_VREGS != TRIXIUM_VEC_VREGS
 #error "progs.h was emitted for a different vector register count than this bitstream"
@@ -29,6 +29,10 @@
 
 /* Programs */
 /*----------*/
+
+uint32_t vec_poll_spins, vec_poll_waits;   // The firmware's poll statistics (perf.c), unit or not.
+
+#ifdef CSR_TRIXIUM_VECUNIT_PROG_ADDR
 
 void vec_init(void)
 {
@@ -39,8 +43,6 @@ void vec_init(void)
 
 /* Run */
 /*-----*/
-
-uint32_t vec_poll_spins, vec_poll_waits;
 
 uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
 {
@@ -74,4 +76,19 @@ uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
     }
     return trixium_vecunit_res6_read();
 }
+
+#else // No vector unit in this bitstream (a hybrid-only build): nothing to upload; a program
+      // run is a firmware bug (infer_init refuses the models that need one).
+
+void vec_init(void) {}
+
+uint64_t vec_run(uint16_t pc, const int32_t *args, int n_args)
+{
+    (void)args; (void)n_args;
+    printf("VEC: program %u on a bitstream without a vector unit\n", pc);
+    engine_wedged = 1;
+    return 0;
+}
+
+#endif // CSR_TRIXIUM_VECUNIT_PROG_ADDR
 

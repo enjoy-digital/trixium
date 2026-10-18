@@ -64,11 +64,11 @@ LIBM_ABI  := $(patsubst -mabi=%,%,$(filter -mabi=%,$(CPUFLAGS)))
 all: trixium.bin
 
 # progs.h (the vector microcode) is regenerated on every build for the encoding of the build
-# tree's bitstream (TRIXIUM_VEC_VREGS in soc.h, 8 registers when absent). A mismatch is not a
+# tree's bitstream (TRIXIUM_VEC_VREGS in soc.h; 16 when absent: a bitstream without the unit). A mismatch is not a
 # build error (the unit rejects the words via bad_op, or decodes them as something else), so the
 # rule is forced rather than dependency-driven.
 VREGS := $(shell grep -oE 'define TRIXIUM_VEC_VREGS [0-9]+' $(BUILD_DIR)/software/include/generated/soc.h 2>/dev/null | grep -oE '[0-9]+$$')
-VREGS := $(if $(VREGS),$(VREGS),8)
+VREGS := $(if $(VREGS),$(VREGS),16)
 # Fused vector instructions when the bitstream has them (TRIXIUM_VEC_FUSED in soc.h).
 FUSED := $(if $(shell grep -s 'define TRIXIUM_VEC_FUSED' $(BUILD_DIR)/software/include/generated/soc.h),1,0)
 progs.h: FORCE

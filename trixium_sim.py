@@ -679,8 +679,8 @@ BOARDS = {
 # --hybrid (--board ypcb): the YPCB with the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B fit its
 # 4 GB): every scratchpad unit, the DeltaNet and attention streams, and an FPU for the CPU's share
 # of the hybrid forward (the XCU1525's set; the attention stream at the tiny models' geometry), sized
-# as trixium_ypcb.py's YPCB_HYBRID_UNIT_OPTIONS (the K7-480T's area: RoPE on the CPU, narrower
-# Hadamard and SiLU units).
+# as trixium_ypcb.py's YPCB_HYBRID_UNIT_OPTIONS (the K7-480T's area: narrower Hadamard and SiLU
+# units, no vector unit - the hybrid path never runs it - which pays for unit 12's RoPE stage).
 HYBRID_UNITS = dict(with_hadamard=True, with_activation_quantize=True, with_projection_restore=True,
     with_silu=True, with_norm=True, with_conv=True, with_dnstream=True,
     attn_geometry=YPCB_HYBRID_ATTN + (128, 256), unit_options=YPCB_HYBRID_UNIT_OPTIONS)

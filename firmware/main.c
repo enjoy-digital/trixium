@@ -1278,6 +1278,9 @@ int main(void)
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
     model_info();
     sptest();
+#ifndef CSR_TRIXIUM_VECUNIT_PROG_ADDR
+    puts("VECTEST skipped (no vector unit in this bitstream)");
+#else
     { // Vec unit smoke test: quant8 of a known ramp via the CSR dispatch path. Catches
       // emission-level datapath breaks that Migen-sim unit tests cannot see.
         volatile int16_t *pi = (volatile int16_t *)(SCRATCHPAD_BASE + 0x100);
@@ -1345,6 +1348,7 @@ int main(void)
             }
         }
     }
+#endif // CSR_TRIXIUM_VECUNIT_PROG_ADDR
     selftest();
     SIM_MARK("selftests");
     hwops_init();

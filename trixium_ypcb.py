@@ -64,13 +64,17 @@ from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
 # other half of its words (the first card run's ddrtest: half the words wrong).
 ENGINE_RMW = True
 
-# --hybrid unit sizing for the K7-480T (out-of-context LUTs, K7 -2): unit 12 without its RoPE stage
-# (the CPU rotates the attention layers' q/k; ~half of its 41k), unit 1 at 8 lanes (3.5k against
+# --hybrid unit sizing for the K7-480T (out-of-context LUTs, K7 -2): unit 1 at 8 lanes (3.5k against
 # 14.3k at 32, ~4x the clocks per block) and unit 11 at 2 ways (4.6k against 7.0k). With every unit
 # at the XCU1525's sizes the 4-channel SoC is 325k of 298.6k LUTs; with these and an 8/2 attention
 # stream 258k placed, but 55k sys endpoints failed (WNS -3.9 ns at 127 MHz: arbiter grant chains
-# across the scratchpad clients, and long routes in the full die).
-YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", False), ("hadamard_lanes", 8), ("silu_ways", 2))
+# across the scratchpad clients, and long routes in the full die). The hybrid build has no vector
+# unit (34.3k LUTs, 80 DSPs out of context; the hybrid path never runs it: this bitstream runs the
+# hybrid models only), which pays for unit 12's RoPE stage (~20k: the attention layers' q/k
+# rotated on the unit, q/k/v staying in the scratchpad for the stream) at a lower density than
+# the 83% of the first hybrid builds.
+YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", True), ("hadamard_lanes", 8), ("silu_ways", 2),
+                            ("with_vecunit", False))
 # The attention stream: 4 lanes, 1 kv group (17k LUTs against 33k at 8/2): the 2B's 8/2 and the
 # 4B's 16/4 run as one command per kv head (TRIXIUM_ATTN_KV_SLICE), K/V streamed once per slice.
 YPCB_HYBRID_ATTN = (4, 1)

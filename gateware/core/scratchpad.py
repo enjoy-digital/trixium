@@ -324,21 +324,23 @@ class _ScratchpadCSR(LiteXModule):
 class ScratchpadArbiter(LiteXModule):
     """Flat priority arbiter for the shared scratchpad client port.
 
-    `base` is the vector unit; among `clients` (in attach order) the last busy one wins, else
-    the base. Each client gets a one-hot select from a priority reduction over the busy bits
-    and the outputs are one AND-OR level, so the logic depth on the BRAM address/data/enable
-    pins grows with log2 of the client count (a serial mux chain failed timing).
+    `base` is the vector unit (None without one); among `clients` (in attach order) the last
+    busy one wins, else the base. Each client gets a one-hot select from a priority reduction
+    over the busy bits and the outputs are one AND-OR level, so the logic depth on the BRAM
+    address/data/enable pins grows with log2 of the client count (a serial mux chain failed
+    timing).
     """
     def __init__(self, base, clients):
         clients = list(clients)
+        ref = base if base is not None else clients[0]
         self.busy      = Signal()
         self.sp_rd_req = Signal()
-        self.sp_rd_adr = Signal.like(base.sp_rd_adr)
-        self.sp_rd_dat = Signal.like(base.sp_rd_dat)
+        self.sp_rd_adr = Signal.like(ref.sp_rd_adr)
+        self.sp_rd_dat = Signal.like(ref.sp_rd_dat)
         self.sp_wr_req = Signal()
-        self.sp_wr_adr = Signal.like(base.sp_wr_adr)
-        self.sp_wr_we  = Signal.like(base.sp_wr_we)
-        self.sp_wr_dat = Signal.like(base.sp_wr_dat)
+        self.sp_wr_adr = Signal.like(ref.sp_wr_adr)
+        self.sp_wr_we  = Signal.like(ref.sp_wr_we)
+        self.sp_wr_dat = Signal.like(ref.sp_wr_dat)
         self.sp_wr_gnt = Signal()
         # Write room, driven by the integrator (its grant without the request): a client's
         # grant is room & select & its own request - the same as sp_wr_gnt & select, as the
@@ -360,22 +362,23 @@ class ScratchpadArbiter(LiteXModule):
         any_aux = reduce(or_, [c.busy for c in clients], C(0, 1))
         self.comb += [
             self.aux_busy.eq(any_aux),
-            base_sel.eq(~any_aux),
-            self.busy.eq(base.busy | any_aux),
+            base_sel.eq(~any_aux if base is not None else 0),
+            self.busy.eq((base.busy if base is not None else 0) | any_aux),
         ]
 
         # One AND-OR level per output.
         def pick(field):
-            terms  = [Mux(base_sel, getattr(base, field), 0)]
+            terms  = [Mux(base_sel, getattr(base, field), 0)] if base is not None else []
             terms += [Mux(sel[i], getattr(clients[i], field), 0) for i in range(n)]
             return reduce(or_, terms)
 
         for field in ("sp_rd_req", "sp_rd_adr", "sp_wr_req", "sp_wr_adr", "sp_wr_we", "sp_wr_dat"):
             self.comb += getattr(self, field).eq(pick(field))
-        self.comb += [
-            base.sp_rd_dat.eq(self.sp_rd_dat),
-            base.sp_wr_gnt.eq(self.sp_wr_room & base_sel & base.sp_wr_req),
-        ]
+        if base is not None:
+            self.comb += [
+                base.sp_rd_dat.eq(self.sp_rd_dat),
+                base.sp_wr_gnt.eq(self.sp_wr_room & base_sel & base.sp_wr_req),
+            ]
         for i, c in enumerate(clients):
             self.comb += [c.sp_rd_dat.eq(self.sp_rd_dat),
                           c.sp_wr_gnt.eq(self.sp_wr_room & sel[i] & c.sp_wr_req)]
