@@ -642,8 +642,12 @@ int resident_init(void)
     R->ready = R->disabled = 0;
     RLS->loaders = 0;                  // the slots may hold another model's lists
     if (!initialized || !RLS->cmode) RLS->cmode = 1;
-    if (RLS->images)                   // another model's entries: every image is stale
-        memset(RLS->images, 0, sizeof(struct rl_image)*RLS->nslots);
+    // Another model's images sit in the previous load's heap, which infer_init reset and this
+    // load reuses for its own buffers: forget them (cache_begin allocates afresh), never write
+    // into them (a reload without a reboot once replayed and recorded images over live data:
+    // a unit error on the first list, the engine wedged).
+    RLS->images = 0;
+    RLS->nslots = 0;
     memset(R->sign_base, 0, sizeof R->sign_base);
     if (!resident_available())
         return -1;

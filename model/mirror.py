@@ -954,9 +954,10 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
             mx = sc.max()
             ex = softmax_exp((sc - mx).astype(f32))
             s = _fsum32(ex)
+            inv = f32(f32(1)/s)      # one divide per head, then multiplies (as ggml scales by 1/sum)
             o = np.zeros(hd, dtype=f32)
             for t in range(T):
-                p = f32(ex[t]/s)
+                p = f32(ex[t]*inv)
                 o = (o + p*vc[l][t][kvh]).astype(f32)
             if gated:
                 o = (o*sigmoid(gate[hh])).astype(f32)

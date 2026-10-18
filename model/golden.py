@@ -232,7 +232,7 @@ def silu(x):
 def softmax(x, axis=-1):
     m = x.max(axis=axis, keepdims=True)
     e = np.exp(x - m)
-    return e/e.sum(axis=axis, keepdims=True)
+    return e*(1/e.sum(axis=axis, keepdims=True))   # the reciprocal once, then multiplies (ggml's order)
 
 def sigmoid(x):
     return 1.0/(1.0 + np.exp(-x))

@@ -126,6 +126,7 @@ static int dn_hw_written;              // the span was cleared once since the bo
 // layer's op 5 takes it as +0.0 (TRIXIUM_DNSTREAM_ZERO) instead of hybrid_reset clearing the
 // 144 MiB in engine DDR at every generation's first token.
 static uint64_t dn_state_zero;
+int hybrid_softmax_div;                  // Console `softmaxdiv on`: the per-position divide (A/B).
 #ifdef TRIXIUM_SIM
 static int hybrid_inits, power_on_reset; // Simulation: hybrid_init's first reset (below).
 #endif
@@ -1660,7 +1661,14 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
         float *sc = at_buf + hh*Tp, mx = -1e30f, sum = 0;
         for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
         for (int t = 0; t < T; t++) { sc[t] = trixium_softmax_exp(sc[t] - mx); sum += sc[t]; }
-        for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
+        // One divide per head, then multiplies (ggml scales by 1/sum too; the mirror's order).
+        // `softmaxdiv on` keeps the old divide per position, for a same-boot comparison only.
+        if (hybrid_softmax_div) {
+            for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
+        } else {
+            float inv = 1.0f/sum;
+            for (int t = 0; t < T; t++) sc[t] = sc[t]*inv;
+        }
     }
     clean_cpu_dcache_range(at_buf, nq*Tp*4u);
     perf_exit(OP_SOFTMAX);
@@ -1899,10 +1907,11 @@ static void attention_layer(int l, const float *h, float *out)
             }
             float sum = 0;
             for (int t = 0; t < T; t++) { scores[t] = trixium_softmax_exp(scores[t] - mx); sum += scores[t]; }
+            float inv = 1.0f/sum;      // one divide per head (the stream path's and the mirror's order)
             for (int i = 0; i < head_dim; i++) oh[i] = 0;
             for (int t = 0; t < T; t++) {
                 const float *vt = V + (uint64_t)t*kv_dim + kvh*head_dim;
-                float p = scores[t]/sum;
+                float p = hybrid_softmax_div ? scores[t]/sum : scores[t]*inv;
                 int i = 0;
                 for (; i + 3 < head_dim; i += 4) {
                     oh[i + 0] += p*vt[i + 0]; oh[i + 1] += p*vt[i + 1];

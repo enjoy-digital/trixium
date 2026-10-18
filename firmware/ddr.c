@@ -72,7 +72,7 @@ unsigned long ddr_csr_base;             // The controller being talked to.
 
 // The controller whose per-bit read taps the `ckphase` table holds: the last one the FIRMWARE
 // leveled (-1: only the BIOS has, and its table is not ours - ddrtap/ddrbit refuse).
-static int ckphase_ctrl = -1;
+static int ckphase_ctrl __attribute__((unused)) = -1;   // unused where nothing levels (the simulation)
 
 int ddr_init(int k)
 {
