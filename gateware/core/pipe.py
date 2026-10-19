@@ -79,7 +79,10 @@ class ChannelPipe(LiteXModule):
 
     axpy: the weighted-V accumulate (kind 2: per-lane shifters, 4 x 32 int32 accumulators, the
     wide drain) - the Qwen3 path's attention; a hybrid build never issues it and leaves it out."""
-    def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1, axpy=True):
+    def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1, axpy=True,
+                 xw_cd="sys"):
+        # xw_cd: the x-buffer write port's clock domain (PipeIsland: the engine's, the rest of
+        # the pipe in its own).
         self.axpy = axpy
         # Op parameters (quasi-static while busy; registered by the engine every cycle, reset-less:
         # an op only reads them from `start` on).
@@ -118,7 +121,7 @@ class ChannelPipe(LiteXModule):
         # x-buffer: 1024-bit words, one per ternary group (4 q8 groups) ----------------------------
         xbuf   = Memory(1024, xbuf_groups)
         self.specials += xbuf
-        xbuf_w = xbuf.get_port(write_capable=True, we_granularity=256)
+        xbuf_w = xbuf.get_port(write_capable=True, we_granularity=256, clock_domain=xw_cd)
         xbuf_r = xbuf.get_port()
         self.specials += xbuf_w, xbuf_r
         self.comb += [

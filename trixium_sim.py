@@ -362,7 +362,7 @@ class ReaderStats(LiteXModule):
 
 class TriXiumSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
-                 cpu_type="vexriscv", icache_kb=0, vexii_extra="", reader_bursts=8,
+                 cpu_type="vexriscv", icache_kb=0, vexii_extra="", reader_bursts=8, pipe_clk_freq=0,
                  mem="hbm", n_memctrl=4, update_repo="no",
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
@@ -443,6 +443,12 @@ class TriXiumSimSoC(SoCCore):
             self.cd_ddr = ClockDomain()
             self.comb += self.cd_ddr.clk.eq(platform.request("ddr_clk"))
             self.specials += AsyncResetSynchronizer(self.cd_ddr, ResetSignal("sys"))
+        if pipe_clk_freq:
+            # The channel pipes' clock (PipeIsland) on a third sim clock.
+            platform.add_extension([("pipeclk", 0, Pins(1))])
+            self.cd_pipeclk = ClockDomain("pipeclk")
+            self.comb += self.cd_pipeclk.clk.eq(platform.request("pipeclk"))
+            self.specials += AsyncResetSynchronizer(self.cd_pipeclk, ResetSignal("sys"))
 
         # TriXium Memory Ports ---------------------------------------------------------------------
         memory_ports = []
@@ -486,6 +492,7 @@ class TriXiumSimSoC(SoCCore):
             with_conv                = with_conv,
             with_dnstream            = bool(with_dnstream),
             with_axpy                = not with_dnstream,  # the hybrid path never issues the weighted-V op
+            pipe_clk                 = "pipeclk" if pipe_clk_freq else "",
             with_attnstream          = attn_geometry is not None,
             with_prefetch            = bool(prefetch),
             with_vec_fused           = vec_fused,
@@ -792,6 +799,10 @@ def build_sim(args, board, out_dir):
         sys_hz, ddr_hz = ddr3_sim_clocks(args.sys_clk_freq)
         sim_config = SimConfig(default_clk="sys_clk", default_clk_freq=sys_hz)
         sim_config.add_clocker("ddr_clk", ddr_hz)
+        if args.pipe_clk_freq:
+            # The pipes' clock at the board's pipe:sys ratio on a 0.1 ns period grid.
+            pclk_period = 100*round(1e12/sys_hz*args.sys_clk_freq/args.pipe_clk_freq/100)
+            sim_config.add_clocker("pipeclk", int(1e12//pclk_period))
     else:
         sim_config = SimConfig(default_clk="sys_clk")
     sim_config.add_module("serial2console", "serial")
@@ -803,6 +814,8 @@ def build_sim(args, board, out_dir):
         soc_kwargs["prefetch"] = args.prefetch
     if args.reader_bursts:
         soc_kwargs["reader_bursts"] = args.reader_bursts
+    if args.pipe_clk_freq:
+        soc_kwargs["pipe_clk_freq"] = args.pipe_clk_freq
     if args.vec_fused:
         soc_kwargs["vec_fused"] = True
     if args.ddr_settings:
@@ -865,6 +878,7 @@ def main():
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
+    parser.add_argument("--pipe-clk-freq",  default=0, type=float,                                 help="--board ypcb: the channel pipes' own clock (PipeIsland), 0: the sys clock.")
     parser.add_argument("--reader-bursts",  default=0, type=int, metavar="N",                     help="16-beat bursts a channel reader keeps outstanding (0: the core's default, 8).")
     parser.add_argument("--vec-fused",      action="store_true",                                   help="Vector unit with the fused clamp/round instructions (TRIXIUM_VEC_FUSED).")
     parser.add_argument("--ckphase-model",  action="store_true",                                   help="--board ypcb: the PHY models behind the K7DDRPHY's CK phase CSRs (calibration test: ddrinit 1).")

@@ -137,12 +137,14 @@ class _CRG(LiteXModule):
     (the K7DDRPHY in CK phase mode: one MMCM per channel). The memory ports cross sys <-> ddr at
     the AXI level (memory/ddr.py), the controllers' CSRs behind a wishbone crossing.
     """
-    def __init__(self, platform, sys_clk_freq, ddr_clk_freq):
+    def __init__(self, platform, sys_clk_freq, ddr_clk_freq, pipe_clk_freq=0):
         assert ddr_clk_freq != sys_clk_freq
         self.rst       = Signal()
         self.cd_sys    = ClockDomain()
         self.cd_ddr    = ClockDomain()
         self.cd_idelay = ClockDomain()
+        if pipe_clk_freq:
+            self.cd_pipeclk = ClockDomain("pipeclk")   # The channel pipes' clock (gateware/core/island.py).
 
         # # #
 
@@ -158,6 +160,14 @@ class _CRG(LiteXModule):
         pll.create_clkout(self.cd_idelay, 200e6,        margin=1e-4)
         platform.add_false_path_constraints(self.cd_sys.clk, pll.clkin) # Ignore sys_clk to pll.clkin path created by SoC's rst.
         platform.add_false_path_constraints(self.cd_sys.clk, self.cd_ddr.clk)
+        if pipe_clk_freq:
+            # Its own PLL (any rate): the pipes cross to sys through async FIFOs, a pulse
+            # synchronizer and quasi-static parameters (false paths, like sys <-> ddr).
+            self.pipe_pll = ppll = S7PLL(speedgrade=-2)
+            self.comb += ppll.reset.eq(self.rst)
+            ppll.register_clkin(clk50, 50e6)
+            ppll.create_clkout(self.cd_pipeclk, pipe_clk_freq, margin=1e-3)
+            platform.add_false_path_constraints(self.cd_sys.clk, self.cd_pipeclk.clk)
 
         # IDELAYCTRL (replicated by Vivado in every bank with IDELAYs).
         self.idelayctrl = S7IDELAYCTRL(self.cd_idelay)
@@ -192,6 +202,7 @@ class TriXiumYPCBSoC(SoCCore):
         attn_geometry  = YPCB_HYBRID_ATTN + (256, 2048),
         ddr_quiet_regions = False,
         reader_bursts  = 8,
+        pipe_clk_freq  = 0,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -201,7 +212,7 @@ class TriXiumYPCBSoC(SoCCore):
         platform = ypcb_00338_1p1.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.crg = _CRG(platform, sys_clk_freq, ddr_clk_freq=ddr_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq, ddr_clk_freq=ddr_clk_freq, pipe_clk_freq=pipe_clk_freq)
 
         # SoCCore ----------------------------------------------------------------------------------
         if kwargs.get("uart_name", "serial") == "serial":
@@ -331,9 +342,12 @@ class TriXiumYPCBSoC(SoCCore):
             with_prefetch     = bool(prefetch),
             reader_fifo_depth = prefetch or 512,
             reader_max_bursts = reader_bursts,
+            pipe_clk          = "pipeclk" if pipe_clk_freq else "",   # TRIXIUM_PIPE_CLK_FREQ below ("pclk" is the PCIe PHY's)
             # Fused vector instructions (the clamp/round after an ALU op in one instruction).
             with_vec_fused    = vec_fused)
         self.trixium = TriXiumCore(memory_ports, config)
+        if pipe_clk_freq:
+            self.add_constant("TRIXIUM_PIPE_CLK_FREQ", int(pipe_clk_freq))
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
         add_cluster_constraints(platform)
@@ -423,6 +437,7 @@ def main():
     parser.add_target_argument("--ddr-ibuf-low-power", action="store_true",                                   help="DQ/DQS input buffers in low-power mode (Vivado's default; not for sustained reads).")
     parser.add_target_argument("--hybrid",             action="store_true",                                   help="With the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B: DeltaNet/attention streams, FWHT, ...) and a CPU FPU.")
     parser.add_target_argument("--attn-geometry",     default=None,                                          help="Attention stream lanes,groups,hd_max,t_max (default: YPCB_HYBRID_ATTN + 256,2048).")
+    parser.add_target_argument("--pipe-clk-freq",    default=0,        type=float,                          help="The channel pipes' own clock (Hz, a PLL): one 128-trit beat per pipe clock; 0: the sys clock.")
     parser.add_target_argument("--reader-bursts",     default=8,        type=int,                            help="16-beat bursts a channel reader keeps outstanding (8: the core's default).")
     parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
@@ -459,6 +474,7 @@ def main():
         hybrid             = args.hybrid,
         ddr_quiet_regions  = args.ddr_quiet_regions,
         reader_bursts      = args.reader_bursts,
+        pipe_clk_freq      = args.pipe_clk_freq,
         **({"attn_geometry": tuple(int(x) for x in args.attn_geometry.split(","))} if args.attn_geometry else {}),
         **parser.soc_argdict)
     add_zbb_constant(soc, args)

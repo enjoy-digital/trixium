@@ -61,6 +61,7 @@ class TriXiumConfig:
     with_prefetch: bool            = False # Engine op 7: a matvec's weight reads issued ahead.
     reader_fifo_depth: int         = 512   # Beats buffered per channel reader (the prefetch's reach).
     reader_max_bursts: int         = 8     # 16-beat bursts a channel reader keeps outstanding.
+    pipe_clk: str                  = ""    # The channel pipes' own clock domain (PipeIsland), "": the engine's.
     with_axpy: bool                = True  # Engine op 4 (weighted-V accumulate, the Qwen3 attention): the
                                            # pipes' shifters, accumulators and drain; off in hybrid builds.
     with_vec_fused: bool           = False # Vector unit: fused clamp/round instructions (asm.fuse).
@@ -122,7 +123,7 @@ class TriXiumCore(LiteXModule):
         if config.with_sp_csr:
             sp_csr = self.scratchpad.add_csr_port()
             self.sp_csr = sp_csr
-        self.engrst = EngineResetDomain(ports)
+        self.engrst = EngineResetDomain(ports, pipe_clk=config.pipe_clk or None)
         axis = self.engrst.masters
         self.add_constant("TRIXIUM_HAS_ENGRESET")
 
@@ -232,6 +233,7 @@ class TriXiumCore(LiteXModule):
             reader_fifo_depth = config.reader_fifo_depth,
             reader_max_bursts = config.reader_max_bursts,
             axpy       = config.with_axpy,
+            pipe_cd    = "peng" if config.pipe_clk else None,
             **placement))
         if config.with_trit5:
             self.add_constant("TRIXIUM_HAS_TRIT5")

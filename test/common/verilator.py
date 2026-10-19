@@ -459,12 +459,13 @@ def _parse(stdout, tmp):
 
 # Migen Backend ------------------------------------------------------------------------------------
 
-def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None):
+def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None, clocks=None):
     """Run a Script on the Migen model of the DUT (same results as Simulator.run).
 
     signals : {name: Signal} (the same names as the Verilator ios).
     memories: {name: Memory} for reads (the AXI models' memories by their prefix, too).
     axi_log : {prefix: AXIInterface} whose AR/AW handshakes are logged.
+    clocks  : run_simulation's {domain: period} (default: sys at 10); the script's cycles are sys's.
     """
     r = Result()
     memories = memories or {}
@@ -588,7 +589,7 @@ def run_migen(dut, signals, script, memories=None, axi_log=None, vcd_name=None):
     gens = [gen()] + [probe(p, a) for p, a in (axi_log or {}).items()]
     if vcd_name is None and tracing():
         vcd_name = str(trace_path("migen", "vcd"))
-    run_simulation(dut, gens, vcd_name=vcd_name)
+    run_simulation(dut, gens, vcd_name=vcd_name, **({} if clocks is None else dict(clocks=clocks)))
     return r
 
 # Compiled Co-Simulation ---------------------------------------------------------------------------

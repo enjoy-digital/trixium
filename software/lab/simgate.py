@@ -102,6 +102,11 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
             # middle of an op (stall reporter, soft reset, self-test).
             print(f"pre: {cmd}", flush=True)
             done, ok = {"gen":      (r"GEN (DONE|ERR)",                "GEN DONE"),
+                        # bench answers the prompt before its tokens too; BENCH_PHASE is its
+                        # last line (without this marker the driver moved on to `dbg` while
+                        # the bench ran, timed out 60 s later and killed the simulator: a
+                        # "hang" that was only the driver's).
+                        "bench":    (r"BENCH_PHASE[^\r\n]*",            "BENCH:"),
                         "engreset": (r"ENGRESET (ok|:)",               "ENGRESET ok"),
                         "wedge":    (r"WEDGE: (recovered|the op|.*?reconfigure)",
                                      "WEDGE: recovered")}.get(cmd.split()[0], (None, None))

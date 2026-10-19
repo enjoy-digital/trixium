@@ -47,9 +47,14 @@ class EngineDUT(Module):
     def __init__(self, n_channels, xbuf_groups=32, chan_stride=0, chan_mod=0, chan_skew=0,
                  loader=False, loader_width=128, vecunit=False, seq=False, seed7=True,
                  front=False, overlap=False, sp_size=64*1024, hbm=None, sp_init=None, trit5=False,
-                 prefetch=False, reader_fifo_depth=512, axpy=True):
+                 prefetch=False, reader_fifo_depth=512, axpy=True, pipe_cd=None):
         self.axis = axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                             for _ in range(n_channels)]
+        if pipe_cd:
+            # The pipes' own clock domain (PipeIsland); the simulator drives its clock (Migen
+            # backend: run(..., clocks={"sys": 10, pipe_cd: period})). Reset-less like the
+            # simulators' sys: registers start at their reset values.
+            self.clock_domains += ClockDomain(pipe_cd, reset_less=True)
         init = words_from_bytes(sp_init) if sp_init is not None else None
         self.submodules.scratchpad = Scratchpad(size=sp_size, init=init)
         if vecunit:
@@ -61,7 +66,7 @@ class EngineDUT(Module):
         self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=xbuf_groups,
             chan_stride=chan_stride, chan_mod=chan_mod, chan_skew=chan_skew,
             vecunit=self.vu if vecunit else None, seq=self.seq if seq else None, trit5=trit5,
-            prefetch=prefetch, reader_fifo_depth=reader_fifo_depth, axpy=axpy)
+            prefetch=prefetch, reader_fifo_depth=reader_fifo_depth, axpy=axpy, pipe_cd=pipe_cd)
         if front:
             from gateware.core.csr import EngineCSR
             self.submodules.front = EngineCSR(self.engine, seq=self.seq if seq else None)
@@ -170,9 +175,10 @@ class EngineBench:
         return _simulators[key]
 
     def run(self, backend, script, sp=b"", payloads=None, latency=8, stall_rate=0, reorder_ids=0,
-            model_size=64*1024, axi_log=()):
+            model_size=64*1024, axi_log=(), clocks=None):
         """Run `script` after a reset. payloads: per-channel memory images; latency/stall_rate:
-        a value or a per-channel list (stall_rate in sixteenths, as HBMChannelModel)."""
+        a value or a per-channel list (stall_rate in sixteenths, as HBMChannelModel); clocks:
+        the Migen backend's {domain: period} (a DUT with a pipe clock domain)."""
         n   = self.n_channels
         lat = latency    if isinstance(latency,    (list, tuple)) else [latency]*n
         stl = stall_rate if isinstance(stall_rate, (list, tuple)) else [stall_rate]*n
@@ -189,7 +195,7 @@ class EngineBench:
             mems = {"sp": dut.scratchpad.mem}
             mems.update({f"axi{i}": m.mem for i, m in enumerate(dut.models)})
             return run_migen(dut, dut.signals, full, memories=mems,
-                             axi_log={f"axi{i}": dut.axis[i] for i in axi_log})
+                             axi_log={f"axi{i}": dut.axis[i] for i in axi_log}, clocks=clocks)
         assert backend == "verilator", backend
         axi = {}
         for i in range(n):

@@ -129,6 +129,73 @@ def test_matvec_trit5_no_axpy(backend):
     _case_ternary(backend, n_channels=2, rows_per_chan=6, cols=2048, latency=8, stall_rate=2, seed=23,
                   kind=T5, trit5=True, axpy=False)
 
+# Pipe island: the pipes (and unpackers) in their own clock domain ---------------------------------
+
+def _trit5_case(n_channels, rows_per_chan, cols, seed):
+    """One trit5 matvec: per-channel shards, x8, the command's fields and its exact result."""
+    rng    = np.random.default_rng(seed)
+    M      = n_channels*rows_per_chan
+    G      = cols//layout.GROUP_TERNARY
+    scales = rng.uniform(0.01, 0.08, (M, G)).astype(np.float16)
+    codes  = rng.integers(0, 3, (M, cols), dtype=np.uint8)
+    x8     = rng.integers(-127, 128, cols, dtype=np.int8)
+    _, e16 = bx.fp16_decompose(scales)
+    B = bx.choose_scale_bias(e16)
+    R = bx.choose_result_shift(scales, B)
+    expected = bx.matvec_ternary(scales, codes, x8, B, R)
+    spec = TensorSpec("w", layout.ROLE_ATTN_Q, 0, layout.KIND_TERNARY, M, cols,
+                      scales=scales, values=codes)
+    spec.kind = T5
+    shards = [encode_rows(spec, *layout.shard_rows(M, n_channels, c)).tobytes()
+              for c in range(n_channels)]
+    cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
+               wlen=rows_per_chan*layout.row_beats(cols, T5),
+               sbeats=layout.scale_beats(cols, T5), cbeats=layout.code_beats(cols, T5),
+               bias=B, rshift=R, pk=1)
+    return shards, x8, cmd, expected
+
+@pytest.mark.parametrize("phase", [0] + [pytest.param(p, marks=pytest.mark.slow) for p in range(1, 5)])
+def test_matvec_trit5_island(phase):
+    """PipeIsland (gateware/core/island.py): the pipes and unpackers in their own clock domain,
+    on the Migen backend with sys at 10 ns and the pipe clock at 8 ns (the YPCB's 100/125 MHz
+    ratio: the alignments repeat every 4 sys cycles, `phase` walks them). Two trit5 tensors
+    back to back, a FETCH between (it pulses the pipes' start as well), the first tensor again:
+    every result exact, no sticky error."""
+    n = 2
+    a = _trit5_case(n, 6, 2048, 31)
+    b = _trit5_case(n, 4, 1024, 32)
+    # Memory: tensor A at 0, tensor B behind it on a beat boundary, in every channel.
+    off_b = (max(len(sh) for sh in a[0]) + 31)//32*32
+    payloads = [sa.ljust(off_b, b"\0") + sb for sa, sb in zip(a[0], b[0])]
+    # Scratchpad: x8 of A at 0, of B at 0x1000; results at 0x4000/0x5000/0x6000, the fetch at 0x7000.
+    sp    = a[1].tobytes().ljust(0x1000, b"\0") + b[1].tobytes()
+    cmd_a = dict(a[2], xsrc=0, dst=0x4000)
+    cmd_b = dict(b[2], wbase=off_b, xsrc=0x1000, dst=0x5000)
+    s = Script()
+    s.step(phase)
+    submit(s, cmd_a)
+    s.wait("done", cap=50000, tag="a")
+    submit(s, cmd_b)                                       # Back to back.
+    s.wait("done", cap=50000, tag="b")
+    submit(s, dict(kind=2, chan=1, wbase=0, wlen=4, dst=0x7000), fields=CMD_FIELDS)
+    s.wait("done", cap=5000, tag="fetch")
+    s.step(phase)
+    submit(s, dict(cmd_a, dst=0x6000))
+    s.wait("done", cap=50000, tag="a2")
+    s.step(2)
+    s.peek("error")
+    s.read("sp", 0x4000, 4*len(a[3]), "ra")
+    s.read("sp", 0x5000, 4*len(b[3]), "rb")
+    s.read("sp", 0x6000, 4*len(a[3]), "ra2")
+    s.read("sp", 0x7000, 128, "fetched")
+    bench = EngineBench(n, xbuf_groups=32, trit5=True, axpy=False, pipe_cd="peng")
+    r = bench.run("migen", s, sp=sp, payloads=payloads, clocks={"sys": 10, "peng": 8})
+    assert r.peeks["error"] == 0
+    assert np.array_equal(_i32(r.reads["ra"]),  a[3]), "tensor A"
+    assert np.array_equal(_i32(r.reads["rb"]),  b[3]), "tensor B after A"
+    assert np.array_equal(_i32(r.reads["ra2"]), a[3]), "tensor A after the fetch"
+    assert r.reads["fetched"] == payloads[1][:128]
+
 @COMPILED
 def test_matvec_trit5_padded_stalls(backend):
     # K = 384: 3 groups in 78 bytes, each row padded to a whole beat; stalls desynchronize the

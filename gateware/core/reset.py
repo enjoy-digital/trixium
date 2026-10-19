@@ -22,6 +22,7 @@ from operator import or_
 from functools import reduce
 
 from migen import *
+from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
 
@@ -30,7 +31,9 @@ from gateware.memory.axi import AXIResetShim
 # Engine Reset Domain ------------------------------------------------------------------------------
 
 class EngineResetDomain(LiteXModule):
-    def __init__(self, axis, hold_cycles=64, stuck_cycles=1 << 20):
+    def __init__(self, axis, hold_cycles=64, stuck_cycles=1 << 20, pipe_clk=None):
+        # pipe_clk: a clock domain of the SoC the channel pipes run in (PipeIsland); the engine
+        # domain `peng` is that clock with this module's reset (the soft reset holds the pipes).
         self.cd_eng = ClockDomain("eng")
         # The reset register implements its own reset equation below: Migen's sys reset
         # insertion would append eng_rst <= 0 and override eng_rst <= sys_rst | holding.
@@ -64,6 +67,12 @@ class EngineResetDomain(LiteXModule):
             # Registered: one clean high-fanout net, the sys reset ORed in.
             self.cd_eng.rst.eq(ResetSignal("sys", allow_reset_less=True) | self.holding),
         ]
+        if pipe_clk:
+            self.cd_peng = ClockDomain("peng")
+            self.cd_peng.rst.reset_less = True
+            self.comb += self.cd_peng.clk.eq(ClockSignal(pipe_clk))
+            self.specials += AsyncResetSynchronizer(self.cd_peng,
+                ResetSignal(pipe_clk, allow_reset_less=True) | self.holding)
         if shims:
             self.comb += [
                 self.busy.eq(reduce(or_, [s.busy for s in shims]) | self.holding),

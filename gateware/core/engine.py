@@ -32,6 +32,7 @@ from litex.soc.interconnect import stream
 
 from gateware.memory.axi import AXIReader
 from gateware.core.pipe import ChannelPipe
+from gateware.core.island import PipeIsland
 from gateware.core.trit5 import Trit5Unpacker
 from gateware.units.deltanet_stream import DeltaNetStream
 from gateware.units.attention_stream import AttentionStream
@@ -159,7 +160,7 @@ class MatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
                  trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8,
-                 axpy=True):
+                 axpy=True, pipe_cd=None):
         # chan_stride: byte distance between consecutive channels' weight regions. With the
         # HBM AXI switch enabled the address (not the port) selects the pseudo-channel, so
         # each channel needs its own window; 0 when every channel has its own address space.
@@ -325,13 +326,21 @@ class MatVecEngine(LiteXModule):
             # per round trip); round-robin ARIDs let it pipeline.
             reader = AXIReader(axi, n_ids=4, fifo_depth=reader_fifo_depth,
                                max_bursts=reader_max_bursts)
-            pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n, axpy=axpy)
+            # pipe_cd: the pipes in their own, faster clock domain (gateware/core/island.py).
+            if pipe_cd:
+                # The island holds the unpacker too (its output rate is the island's input).
+                pipe = PipeIsland(pipe_cd, trit5=trit5, xbuf_groups=xbuf_groups, chan_id=i,
+                                  n_channels=n, axpy=axpy)
+            else:
+                pipe = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n, axpy=axpy)
             setattr(self, f"reader{i}", reader)
             setattr(self, f"pipe{i}",   pipe)
             # trit5: the compute beats go through the unpacker (a pass-through unless the op's
             # codes are packed), the pipe sees 2-bit code beats either way.
             psink = pipe.sink
-            if trit5:
+            if trit5 and pipe_cd:
+                self.unpackers.append(pipe.unp)
+            elif trit5:
                 unp = Trit5Unpacker()
                 setattr(self, f"unpack{i}", unp)
                 self.comb += unp.source.connect(pipe.sink)
