@@ -47,18 +47,29 @@ BOARD_SUFFIX = {"fk33": "", "xcu1525": "-xcu1525", "ypcb": "-ypcb"}
 
 # Engine channels of each board's bitstream (convert's default --channels), and the boards whose
 # bitstream unpacks 5-trit codes (convert's default --trit5).
-BOARD_CHANNELS = {"fk33": 16, "xcu1525": 16, "ypcb": 8}
-BOARD_TRIT5    = {"fk33": False, "xcu1525": False, "ypcb": True}
+# The boards' memory systems: (controllers, bytes per controller, default engine channels, trit5
+# weights). A board with one controller (the small boards: one DRAM) puts every channel on it.
+BOARDS = {
+    "fk33":    dict(memctrl=0, ctrl_size=0,       channels=16, trit5=False),   # HBM: no windows.
+    "xcu1525": dict(memctrl=4, ctrl_size=4 << 30, channels=16, trit5=False),
+    "ypcb":    dict(memctrl=2, ctrl_size=2 << 30, channels=8,  trit5=True),
+}
+BOARD_CHANNELS = {name: b["channels"] for name, b in BOARDS.items()}
+BOARD_TRIT5    = {name: b["trit5"]    for name, b in BOARDS.items()}
 
 
-def board_windows(board, channels):
-    """(chan_stride, window, window_reserve) of `board`'s images at `channels` engine channels."""
+def board_windows(board, channels, memctrl=None):
+    """(chan_stride, window, window_reserve) of `board`'s images at `channels` engine channels
+    over `memctrl` controllers (the board's by default; the YPCB also builds with one)."""
     if board == "xcu1525":
         return 0x4000_0000, None, 0x18000
     if board == "ypcb":
         from model.layout import ddr_chan_stride
-        chan_mod = channels//2
-        stride   = ddr_chan_stride(2 << 30, chan_mod)
+        memctrl  = memctrl or BOARDS[board]["memctrl"]
+        if channels % memctrl:
+            raise SystemExit(f"{channels} channels do not shard over {memctrl} controllers")
+        chan_mod = channels//memctrl
+        stride   = ddr_chan_stride(BOARDS[board]["ctrl_size"], chan_mod)
         return stride, stride, (chan_mod - 1)*(0x10000//chan_mod)
     return None, None, 0
 
@@ -79,7 +90,7 @@ def cmd_convert(args):
         args.channels = BOARD_CHANNELS[args.board]
     if args.trit5 is None:
         args.trit5 = BOARD_TRIT5[args.board]
-    chan_stride, window, window_reserve = board_windows(args.board, args.channels)
+    chan_stride, window, window_reserve = board_windows(args.board, args.channels, getattr(args, "memctrl", None))
     suffix = BOARD_SUFFIX[args.board]
     out = args.out
     if out is None:
@@ -126,9 +137,12 @@ MODELS = {
 DEFAULT_MODELS = ["1.7b", "8b"]
 MODELS_FREE_GB = 8 # Disk guard.
 
-# The tiny random models the tests and the simulation use (seconds): (channels, config).
+# The tiny random models the tests and the simulation use (seconds): (channels, config); a
+# "-t5" config is the same model with 5-trits-per-byte weights (the YPCB's images), at the
+# channel counts the YPCB simulations run: 4 (the board), 2 and 1 (the small-board profiles).
 TINY_MODELS = [(2, "tiny"), (4, "tiny"), (8, "tiny"), (16, "tiny"),
-               (2, "hybrid"), (8, "hybrid"), (8, "hybrid-1k"), (4, "bonsai2"), (4, "bonsai2-512")]
+               (2, "hybrid"), (8, "hybrid"), (8, "hybrid-1k"), (4, "bonsai2"), (4, "bonsai2-512"),
+               (4, "hybrid-1k-t5"), (2, "hybrid-1k-t5"), (1, "hybrid-1k-t5")]
 
 
 def cmd_models(args):
@@ -139,7 +153,9 @@ def cmd_models(args):
                    "hybrid-1k": tinygen.BONSAI_TINY_HYBRID_1K, "bonsai2": tinygen.BONSAI2_TINY,
                    "bonsai2-512": tinygen.BONSAI2_TINY_512}
         for channels, name in TINY_MODELS:
-            img, _, _ = tinygen.generate(out, channels, cfg=configs[name])
+            trit5 = name.endswith("-t5")
+            img, _, _ = tinygen.generate(out, channels, cfg=configs[name[:-3] if trit5 else name],
+                                         trit5=trit5)
             print(img)
         return
     import shutil
@@ -238,6 +254,7 @@ def main(argv=None):
     p = subparsers.add_parser("convert", help="GGUF -> BONS image (streams; ~13 s, ~2 GB for the 1.7B).")
     p.add_argument("gguf",                              help="Source GGUF.")
     p.add_argument("--channels",  default=None, type=int, help="Engine channels of the bitstream (default: the board's, 16; ypcb: 8).")
+    p.add_argument("--memctrl", type=int, default=None, help="Controllers the image's windows shard over (default: the board's; the YPCB also builds with 1).")
     p.add_argument("--board",     default="fk33",       choices=sorted(BOARD_SUFFIX), help="Target board's weight windows (default: fk33).")
     p.add_argument("--out",                             help="Image (default: models/bons/bonsai-<model>-n<channels>[-<board>].img).")
     p.add_argument("--tokenizer",                       help="tokenizer.json hashed into the image (default: next to the GGUF).")

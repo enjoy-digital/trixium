@@ -44,6 +44,7 @@ import subprocess
 import numpy as np
 
 from migen import *
+from migen.genlib.cdc import PulseSynchronizer
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
@@ -65,6 +66,7 @@ from litedram.phy.model import SDRAMPHYModel
 
 from trixium_ypcb import YPCBDDR3, DDR3_CL, DDR3_CWL, ddr_controller_settings
 from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS, YPCB_HYBRID_UNIT_OPTIONS, YPCB_HYBRID_ATTN
+from trixium_ypcb import YPCB_LITE_UNIT_OPTIONS, YPCB_LITE_ATTN
 
 from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
@@ -253,7 +255,11 @@ def ddr3_stride(img):
         h    = img.header
         n    = h["n_channels"]
         kv   = h["n_layer"]*h["n_kv_head"]*2*((h["max_ctx"] + n - 1)//n)*(1 + h["head_dim"]//32)*32
-        need = max(len(img.channel_payload(c)) for c in range(n)) + kv + 512*1024
+        # The DeltaNet recurrent state (hybrid.c: heads x 128x128 fp32 over the channels, two sets
+        # when the window allows): at 1-2 channels it outgrows the 4-channel sizing.
+        n_dn = sum(1 for t in h.get("layer_types", ()) if t == "deltanet")
+        dn   = 2*((n_dn*h.get("dn_num_v_heads", 0) + n - 1)//n)*128*128*4
+        need = max(len(img.channel_payload(c)) for c in range(n)) + kv + dn + 512*1024
         while stride < need + DDR3_SIM_BANK_CYCLE:
             stride *= 2
     return stride
@@ -335,8 +341,9 @@ class ReaderStats(LiteXModule):
     """Per channel reader, at its output to the channel pipe (the sim's instrumentation): the
     beats delivered, the cycles a beat waited on the pipe (valid, not ready), the cycles
     without a beat to offer (the reader's FIFO empty). `snap` latches and restarts, `sel`
-    picks the channel (as EnginePortStats)."""
-    def __init__(self, readers):
+    picks the channel (as EnginePortStats). cd: the readers' clock domain when they run in the
+    memory's (ReaderIsland: its `stat` endpoint, the output after the prefetch gate)."""
+    def __init__(self, readers, cd="sys"):
         n = len(readers)
         self.snap    = CSR()
         self.sel     = CSRStorage(max(1, (n - 1).bit_length()))
@@ -344,16 +351,29 @@ class ReaderStats(LiteXModule):
         self.beats   = CSRStatus(32)
         self.stalled = CSRStatus(32)
         self.starved = CSRStatus(32)
+        snap = self.snap.re
+        if cd != "sys":
+            ps = PulseSynchronizer("sys", cd)
+            self.submodules += ps
+            self.comb += ps.i.eq(self.snap.re)
+            snap = ps.o
+        sync = self.sync if cd == "sys" else getattr(self.sync, cd)
         cycles = Signal(32)
-        self.sync += If(self.snap.re, self.cycles.status.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+        if cd == "sys":
+            sync += If(snap, self.cycles.status.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+        else:
+            cyc_hold = Signal(32)
+            sync += If(snap, cyc_hold.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+            self.comb += self.cycles.status.eq(cyc_hold)
         holds = {name: [] for name in ("beats", "stalled", "starved")}
         for r in readers:
-            for name, expr in (("beats",   r.source.valid & r.source.ready),
-                               ("stalled", r.source.valid & ~r.source.ready),
-                               ("starved", ~r.source.valid)):
+            src = r.stat if cd != "sys" else r.source
+            for name, expr in (("beats",   src.valid & src.ready),
+                               ("stalled", src.valid & ~src.ready),
+                               ("starved", ~src.valid)):
                 inc, count, hold = Signal(), Signal(32), Signal(32)
                 self.comb += inc.eq(expr)
-                self.sync += If(self.snap.re, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
+                sync += If(snap, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
                 holds[name].append(hold)
         for name, regs in holds.items():
             self.comb += getattr(self, name).status.eq(Array(regs)[self.sel.storage])
@@ -368,7 +388,7 @@ class TriXiumSimSoC(SoCCore):
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
                  with_softmax=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
-                 ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False,
+                 ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
                  unit_options=()):
         assert mem in ("hbm", "ddr4", "ddr3")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
@@ -476,8 +496,9 @@ class TriXiumSimSoC(SoCCore):
                                      contents)
         else:
             stride   = ddr3_stride(img)
+            read_ports = [] if ddr_readers else None   # --ddr-readers: the readers in the ddr domain.
             chan_mod = self.add_ddr3(n_channels, n_memctrl, ram, img, memory_ports, stride,
-                ddr_settings or {}, ckphase_model)
+                ddr_settings or {}, ckphase_model, read_ports=read_ports)
 
         # TriXium ----------------------------------------------------------------------------------
         # Same integration as both hardware targets; only memory/physical policy differs.
@@ -495,6 +516,7 @@ class TriXiumSimSoC(SoCCore):
             with_dnstream            = bool(with_dnstream),
             with_axpy                = not with_dnstream,  # the hybrid path never issues the weighted-V op
             pipe_clk                 = "pipeclk" if pipe_clk_freq else "",
+            readers_cd               = "ddr" if ddr_readers else "",
             with_attnstream          = attn_geometry is not None,
             with_prefetch            = bool(prefetch),
             with_vec_fused           = vec_fused,
@@ -507,8 +529,9 @@ class TriXiumSimSoC(SoCCore):
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
                 if attn_geometry else (),
             **dict(unit_options)) # Unit sizing (TriXiumConfig fields), as the board target's.
-        self.trixium = TriXiumCore(memory_ports, config)
-        self.rdstat  = ReaderStats(self.trixium.engine.readers)   # console `ddrstat`: the readers' output
+        self.trixium = TriXiumCore(memory_ports, config, read_ports=read_ports if ddr_readers else None)
+        self.rdstat  = ReaderStats(self.trixium.engine.readers,   # console `ddrstat`: the readers' output
+                                   cd="ddr" if ddr_readers else "sys")
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
 
@@ -527,6 +550,9 @@ class TriXiumSimSoC(SoCCore):
             # The YPCB's constants, with the sim's windows.
             self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", DDR3_SIM_WEIGHT_BASE)
             self.add_constant("TRIXIUM_CHAN_STRIDE",      stride)
+            # The window a channel may use (the firmware's chan_limit): a whole stride from the
+            # weight base - the base is not stride-aligned at 1-2 channels (12 MB vs 8/16 MB).
+            self.add_constant("TRIXIUM_CHAN_WINDOW",      stride)
             self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
             self.add_constant("TRIXIUM_CHAN_SKEW",        ddr3_skew(chan_mod))
             self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
@@ -592,8 +618,12 @@ class TriXiumSimSoC(SoCCore):
         return chan_mod
 
     def add_ddr3(self, n_channels, n_memctrl, ram, img, memory_ports, stride, ddr_settings,
-                 ckphase_model=False):
+                 ckphase_model=False, read_ports=None):
         """The YPCB's memory system on LiteDRAM's PHY model; returns chan_mod.
+
+        read_ports: a list to receive a read-only 256-bit AXI per channel in the `ddr` domain
+        (the readers there: TriXiumConfig readers_cd, gateware/core/reader_island.py); the
+        memory_ports then carry the writes only.
 
         ckphase_model: the PHY models behind the K7DDRPHY's CSRs in CK phase mode (CKPhasePHYModel),
         with a LiteDRAM BIST per controller: controller 0 (main_ram, the firmware) without channel effects,
@@ -628,14 +658,22 @@ class TriXiumSimSoC(SoCCore):
             for j in range(chan_mod):
                 c = k*chan_mod + j
                 axi = AXIInterface(data_width=256, address_width=32, id_width=6)
+                axi_r = None
+                if read_ports is not None:
+                    axi_r = AXIInterface(data_width=256, address_width=32, id_width=6)
+                    axi_r.clock_domain = "ddr"
+                    read_ports.append(axi_r)
                 for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port",
                                                        rmw=YPCB_ENGINE_RMW, taps=taps,
-                                                       native_taps=native_taps)):
+                                                       native_taps=native_taps, read_axi=axi_r)):
                     setattr(self, f"engport{c}_{jj}", m)
                 memory_ports.append(axi)
-        self.engstat  = EnginePortStats(memory_ports)  # console `ddrstat`: the ports' waits
-        self.widestat = EnginePortStats(taps)          # ... the 512-bit words the crossing delivers
-        self.natstat  = NativePortStats(native_taps)   # ... and the native ports' commands
+        split = read_ports is not None
+        # Console `ddrstat`: the ports' waits (the read ports' in their domain when the readers
+        # run there), the 512-bit words the merge delivers, the native ports' commands.
+        self.engstat  = EnginePortStats(read_ports, cd="ddr") if split else EnginePortStats(memory_ports)
+        self.widestat = EnginePortStats(taps, cd="ddr" if split else "sys")
+        self.natstat  = NativePortStats(native_taps)
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 
@@ -741,6 +779,11 @@ BOARDS = {
 HYBRID_UNITS = dict(with_hadamard=True, with_activation_quantize=True, with_projection_restore=True,
     with_silu=True, with_norm=True, with_conv=True, with_softmax=True, with_dnstream=True,
     attn_geometry=YPCB_HYBRID_ATTN + (128, 256), unit_options=YPCB_HYBRID_UNIT_OPTIONS)
+# --profile lite: the small boards' sizing (trixium_ypcb.py YPCB_LITE_UNIT_OPTIONS: RoPE on the CPU,
+# the Hadamard at 8 lanes, one SiLU way, no softmax unit, the DeltaNet stream's lanes x sub-lanes
+# kept at 8 over fewer channels, the attention stream at 4 lanes / 1 group).
+LITE_UNITS = dict(HYBRID_UNITS, with_softmax=False, attn_geometry=YPCB_LITE_ATTN + (128, 256),
+    unit_options=YPCB_LITE_UNIT_OPTIONS)
 
 # The image each board's simulation bakes in by default (--image).
 DEFAULT_IMAGES = {
@@ -812,6 +855,9 @@ def build_sim(args, board, out_dir):
         hbm_latency=args.hbm_latency, hbm_stall_rate=args.hbm_stall_rate)
     if args.ckphase_model:
         soc_kwargs["ckphase_model"] = True
+    if args.ddr_readers:
+        assert args.board == "ypcb" and args.pipe_clk_freq, "--ddr-readers: --board ypcb with --pipe-clk-freq"
+        soc_kwargs["ddr_readers"] = True
     if args.prefetch:
         soc_kwargs["prefetch"] = args.prefetch
     if args.reader_bursts:
@@ -885,6 +931,9 @@ def main():
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
+    parser.add_argument("--memctrl",        default=0, type=int, choices=[0, 1, 2],                 help="--board ypcb: DDR3 controllers (default: the board's two; 1 = every channel and main_ram on one, the small boards' topology).")
+    parser.add_argument("--profile",        default="full", choices=["full", "lite"],               help="--hybrid: the units' sizing (lite: the small boards' profile).")
+    parser.add_argument("--ddr-readers",    action="store_true",                                   help="--board ypcb: the channel readers in the controllers' ddr domain (reader islands), with --pipe-clk-freq.")
     parser.add_argument("--pipe-clk-freq",  default=0, type=float,                                 help="--board ypcb: the channel pipes' own clock (PipeIsland), 0: the sys clock.")
     parser.add_argument("--dn-sublanes",    default=0, type=int,                                   help="--hybrid: DeltaNet stream sub-lanes per channel (0: the board's default).")
     parser.add_argument("--reader-bursts",  default=0, type=int, metavar="N",                     help="16-beat bursts a channel reader keeps outstanding (0: the core's default, 8).")
@@ -923,7 +972,11 @@ def main():
     if args.hybrid:
         if args.board != "ypcb":
             parser.error("--hybrid is the YPCB's (the XCU1525 has every unit already).")
-        board.update(HYBRID_UNITS, vexii_extra=board["vexii_extra"] + " --with-rvf")
+        board.update(LITE_UNITS if args.profile == "lite" else HYBRID_UNITS,
+                     vexii_extra=board["vexii_extra"] + " --with-rvf")
+    if args.memctrl:
+        assert args.board == "ypcb", "--memctrl: --board ypcb"
+        board["n_memctrl"] = args.memctrl
         out_dir      = args.out_dir or out_dir + "_hybrid"
         gateware_dir = os.path.join(out_dir, "gateware")
     if args.attn_geometry is not None:

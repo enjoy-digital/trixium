@@ -43,3 +43,6 @@ software/user/.build_config
 *.vcd
 *.fst
 *.fst.hier
+# Vivado droppings when a build runs from the repository root.
+/clockInfo.txt
+/tight_setup_hold_pins.txt

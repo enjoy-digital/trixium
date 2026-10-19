@@ -136,3 +136,30 @@ def test_sim_ypcb_calibration():
         assert wls[l] == ((base + 2) & 7 if ck >= cross else base), (ck, l, wls)
     for c in range(4):
         assert re.search(rf"DDRTEST chan +{c} \(controller {c//2}\) OK", out), out[-1500:]
+
+
+# The hybrid path (Ternary-Bonsai-2: the DeltaNet and attention streams, the scratchpad units, the
+# resident firmware) on the YPCB simulation, through the gate of software/lab/simgate.py: the
+# pre-generation's tokens against the mirror, the traced generation's checkpoints against it, the
+# list image cache verified. Parametrised over the board's profile (4 channels, 2 controllers, the
+# shipping units) and the small boards' lite profile at 2 and 1 channels on one controller.
+HYBRID_CASES = [
+    pytest.param("models/tiny/bonsai-tiny-hybrid-1k-t5-n4.img", 2, "full", id="n4-full"),
+    pytest.param("models/tiny/bonsai-tiny-hybrid-1k-t5-n2.img", 1, "lite", id="n2-lite-1ctrl"),
+    pytest.param("models/tiny/bonsai-tiny-hybrid-1k-t5-n1.img", 1, "lite", id="n1-lite-1ctrl"),
+]
+
+@pytest.mark.slow
+@pytest.mark.parametrize("image,memctrl,profile", HYBRID_CASES)
+def test_sim_ypcb_hybrid_gate(image, memctrl, profile):
+    assert os.path.exists(image), image
+    stem = os.path.splitext(os.path.basename(image))[0]
+    out_dir = os.path.join("build", f"sim_ypcb_{stem}_{profile}_m{memctrl}")
+    common = [sys.executable, "trixium_sim.py", "--board", "ypcb", "--hybrid", "--image", image,
+              "--sys-clk-freq", "100e6", "--prefetch", "512", "--pipe-clk-freq", "125e6",
+              "--memctrl", str(memctrl), "--profile", profile, "--out-dir", out_dir]
+    if not os.path.exists(os.path.join(out_dir, "gateware", "obj_dir", "Vsim")):
+        subprocess.run(common + ["--build"], check=True)
+    r = subprocess.run(common + ["--gate", "--gate-pre", "listcache verify;gen 4 1 2 3;stats"],
+                       capture_output=True, text=True, timeout=60*60)
+    assert r.returncode == 0 and "GATE PASS" in r.stdout, r.stdout[-3000:] + r.stderr[-1500:]

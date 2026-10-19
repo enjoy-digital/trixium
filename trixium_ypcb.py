@@ -84,6 +84,15 @@ YPCB_HYBRID_UNIT_OPTIONS = (("norm_rope", True), ("hadamard_lanes", 16), ("silu_
 # cycles per position per 2B token (6 layers x 2 slices x 256 clocks x 2 passes): 7.1 tok/s at a
 # context of 1,024 against 13.3 at 64.
 YPCB_HYBRID_ATTN = (8, 2)
+# The lite profile (--profile lite): the small boards' sizing, proven on the YPCB at 2 channels /
+# one controller first - RoPE on the CPU (norm_rope off: unit 12 without its RoPE stage), the
+# Hadamard at 8 lanes, one SiLU way, no softmax unit (the CPU's softmax: ~3% of a 2B token at 64),
+# the DeltaNet stream's lanes x sub-lanes kept at 8 (4 sub-lanes at 2 channels: a head per 1,024
+# clocks either way), the attention stream at 4 lanes / 1 kv group (the 2B's 8 heads in two
+# commands). About 100-130k LUTs with the core at 2 channels.
+YPCB_LITE_UNIT_OPTIONS = (("norm_rope", False), ("hadamard_lanes", 8), ("silu_ways", 1),
+                          ("with_vecunit", False), ("dnstream_options", (("sublanes", 4),)))
+YPCB_LITE_ATTN = (4, 1)
 
 # DDR3 ---------------------------------------------------------------------------------------------
 
@@ -168,6 +177,7 @@ class _CRG(LiteXModule):
             ppll.register_clkin(clk50, 50e6)
             ppll.create_clkout(self.cd_pipeclk, pipe_clk_freq, margin=1e-3)
             platform.add_false_path_constraints(self.cd_sys.clk, self.cd_pipeclk.clk)
+            platform.add_false_path_constraints(self.cd_ddr.clk, self.cd_pipeclk.clk) # --ddr-readers: the island FIFOs' write side.
 
         # IDELAYCTRL (replicated by Vivado in every bank with IDELAYs).
         self.idelayctrl = S7IDELAYCTRL(self.cd_idelay)
@@ -204,8 +214,14 @@ class TriXiumYPCBSoC(SoCCore):
         reader_bursts  = 8,
         pipe_clk_freq  = 0,
         dn_sublanes    = 0,
+        ddr_readers    = False,
+        engine_memctrl = 2,
+        profile        = "full",
         **kwargs):
-        ddram_channels = 2
+        # engine_memctrl: the DDR3 controllers built (2: the board's; 1: every channel and main_ram
+        # on controller 0, the single-DRAM topology of the small boards, proven here first).
+        ddram_channels = engine_memctrl
+        assert ddram_channels in (1, 2)
         assert engine_channels % ddram_channels == 0, \
             "engine channels shard evenly over the controllers"
         chan_mod = engine_channels//ddram_channels
@@ -238,17 +254,28 @@ class TriXiumYPCBSoC(SoCCore):
         # TriXium Memory Ports ---------------------------------------------------------------------
         # Engine channel c -> controller c // chan_mod: a 512-bit crossbar port behind an AXI
         # bridge, crossed into sys at the AXI level (memory/ddr.py).
-        memory_ports, taps, native_taps = [], [], []
+        # --ddr-readers: the channel readers in the controllers' ddr domain (reader islands,
+        # gateware/core/reader_island.py): a read-only AXI per channel there, merged straight
+        # into the bridge; the sys-side port then carries the writes only.
+        assert not ddr_readers or pipe_clk_freq, "--ddr-readers needs the pipe clock island"
+        memory_ports, read_ports, taps, native_taps = [], [], [], []
         for c in range(engine_channels):
             axi = AXIInterface(data_width=256, address_width=32, id_width=6)
+            axi_r = None
+            if ddr_readers:
+                axi_r = AXIInterface(data_width=256, address_width=32, id_width=6)
+                axi_r.clock_domain = "ddr"
+                read_ports.append(axi_r)
             for j, m in enumerate(engine_ddr_port(self.sdrams[c//chan_mod], axi, clock_domain="sys_port",
-                                                  rmw=ENGINE_RMW, taps=taps, native_taps=native_taps)):
+                                                  rmw=ENGINE_RMW, taps=taps, native_taps=native_taps,
+                                                  read_axi=axi_r)):
                 setattr(self, f"engport{c}_{j}", m)
             memory_ports.append(axi)
-        # Console `ddrstat`: the engine ports' beats and waits, the 512-bit words the crossing
-        # delivers to the merge, the native ports' commands in the controller's clock.
-        self.engstat  = EnginePortStats(memory_ports)
-        self.widestat = EnginePortStats(taps)
+        # Console `ddrstat`: the engine ports' beats and waits (the read ports' in their domain
+        # with --ddr-readers), the 512-bit words the crossing/merge delivers, the native ports'
+        # commands in the controller's clock.
+        self.engstat  = EnginePortStats(read_ports, cd="ddr") if ddr_readers else EnginePortStats(memory_ports)
+        self.widestat = EnginePortStats(taps, cd="ddr" if ddr_readers else "sys")
         self.natstat  = NativePortStats(native_taps)
         if ddr_quiet_regions:
             # The matvec engine's streaming datapath (channel pipes, trit decoders, readers,
@@ -334,6 +361,11 @@ class TriXiumYPCBSoC(SoCCore):
                     (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3]))))
         if hybrid:
             units.update(YPCB_HYBRID_UNIT_OPTIONS)
+            if profile == "lite":
+                units.update(YPCB_LITE_UNIT_OPTIONS, with_softmax=False)
+                if attn_geometry[:2] == YPCB_HYBRID_ATTN:
+                    units["attnstream_options"] = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
+                        (YPCB_LITE_ATTN[0], YPCB_LITE_ATTN[1], attn_geometry[2]//8, attn_geometry[3])))
             if dn_sublanes:    # The DeltaNet stream's sub-lanes per channel (2: the default above).
                 units["dnstream_options"] = (("sublanes", dn_sublanes),)
         config = TriXiumConfig(scratchpad_xpm=True, **units,
@@ -347,9 +379,10 @@ class TriXiumYPCBSoC(SoCCore):
             reader_fifo_depth = prefetch or 512,
             reader_max_bursts = reader_bursts,
             pipe_clk          = "pipeclk" if pipe_clk_freq else "",   # TRIXIUM_PIPE_CLK_FREQ below ("pclk" is the PCIe PHY's)
+            readers_cd        = "ddr" if ddr_readers else "",
             # Fused vector instructions (the clamp/round after an ALU op in one instruction).
             with_vec_fused    = vec_fused)
-        self.trixium = TriXiumCore(memory_ports, config)
+        self.trixium = TriXiumCore(memory_ports, config, read_ports=read_ports if ddr_readers else None)
         if pipe_clk_freq:
             self.add_constant("TRIXIUM_PIPE_CLK_FREQ", int(pipe_clk_freq))
         for name, value in self.trixium.constants.items():
@@ -443,6 +476,9 @@ def main():
     parser.add_target_argument("--attn-geometry",     default=None,                                          help="Attention stream lanes,groups,hd_max,t_max (default: YPCB_HYBRID_ATTN + 256,2048).")
     parser.add_target_argument("--pipe-clk-freq",    default=0,        type=float,                          help="The channel pipes' own clock (Hz, a PLL): one 128-trit beat per pipe clock; 0: the sys clock.")
     parser.add_target_argument("--dn-sublanes",      default=0,        type=int,                            help="--hybrid: DeltaNet stream sub-lanes per channel (1, 2, 4; 0: the default, 2).")
+    parser.add_target_argument("--ddr-readers",      action="store_true",                                    help="The channel readers in the controllers' ddr clock domain (reader islands: the weight stream past the sys-clock port cap), with --pipe-clk-freq.")
+    parser.add_target_argument("--engine-memctrl",   default=2,        type=int, choices=[1, 2],          help="DDR3 controllers built (1: every channel and main_ram on controller 0, the small boards' topology).")
+    parser.add_target_argument("--profile",          default="full",   choices=["full", "lite"],            help="--hybrid: the units' sizing (lite: the small boards' profile).")
     parser.add_target_argument("--reader-bursts",     default=8,        type=int,                            help="16-beat bursts a channel reader keeps outstanding (8: the core's default).")
     parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
@@ -481,6 +517,9 @@ def main():
         reader_bursts      = args.reader_bursts,
         pipe_clk_freq      = args.pipe_clk_freq,
         dn_sublanes        = args.dn_sublanes,
+        ddr_readers        = args.ddr_readers,
+        engine_memctrl     = args.engine_memctrl,
+        profile            = args.profile,
         **({"attn_geometry": tuple(int(x) for x in args.attn_geometry.split(","))} if args.attn_geometry else {}),
         **parser.soc_argdict)
     add_zbb_constant(soc, args)

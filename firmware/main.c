@@ -40,10 +40,11 @@
 /* Checks */
 /*--------*/
 
-#ifdef TRIXIUM_N_MEMCTRL
+#if defined(TRIXIUM_N_MEMCTRL) && TRIXIUM_N_MEMCTRL > 1
 // ddr.c reaches controller k's registers as controller 0's shifted by k*STRIDE: the target
 // pins the (sdram, ddrphy) CSR pairs to consecutive pages, and this is where that is checked.
-// (The PHY model of the Verilator sim has no CSRs, hence the ddrphy guards.)
+// (The PHY model of the Verilator sim has no CSRs, hence the ddrphy guards. One controller - the
+// small boards' topology, every channel on main_ram's controller - has no page to check.)
 _Static_assert(CSR_SDRAM1_BASE - CSR_SDRAM_BASE == TRIXIUM_DDR_CSR_STRIDE, "sdram1 CSR page");
 #ifdef CSR_DDRPHY_BASE
 _Static_assert(CSR_DDRPHY1_BASE - CSR_DDRPHY_BASE == TRIXIUM_DDR_CSR_STRIDE, "ddrphy1 CSR page");

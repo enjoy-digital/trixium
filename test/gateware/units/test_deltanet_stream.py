@@ -269,6 +269,28 @@ def test_ypcb_geometry_four_sublanes_under_backpressure(tmp_path, binary_ypcb_s4
     check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
 
 
+@pytest.mark.parametrize("lanes,sublanes", [(1, 4), (2, 4), (2, 2)])
+def test_small_board_geometries_stream_a_head(tmp_path, lanes, sublanes):
+    """The lite profile's lanes (= channels) at 1 and 2: 128x128 heads over 1 or 2 lanes at 4 (or
+    2) sub-lanes - the state traffic per lane doubles/quadruples against the YPCB's 4 lanes, the
+    head cost is cols x rows / (lanes x sublanes) clocks: 4,096 at 1x4 and 2x2, 2,048 at 2x4.
+    Exact against the model, with and without back-pressure."""
+    rows, cols = 128, 128
+    binary = build(lanes, rows, cols, sublanes=sublanes)
+    cycles = {}
+    for heads in (3, 6):
+        mem, states, table, want_mem, want_states = scenario(np.random.default_rng(heads + 10*lanes), heads, rows, cols, 2)
+        got_mem, got_lanes, cycles[heads] = run(binary, tmp_path, mem, states, lanes, heads, table, (100, 100, 100))
+        check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+    per_head = (cycles[6] - cycles[3])/3
+    expect = rows*cols//(lanes*sublanes)
+    print(f"{lanes} lanes x {sublanes} sub-lanes:", cycles, "cycles;", per_head, "per head in steady state")
+    assert per_head < expect*1.02 + 64, (cycles, expect)
+    mem, states, table, want_mem, want_states = scenario(np.random.default_rng(7*lanes + sublanes), 4, rows, cols, 5)
+    got_mem, got_lanes, _ = run(binary, tmp_path, mem, states, lanes, 4, table, (30, 50, 40))
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+
+
 @pytest.fixture(scope="module")
 def binary27():
     return build(16, 128, 128)
