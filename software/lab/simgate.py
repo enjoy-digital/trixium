@@ -120,12 +120,17 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
             answer += child.before
             if ok and ok not in answer:
                 raise SystemExit(f"{cmd} failed: {answer[-300:]!r}")
+            if "unknown command" in answer:
+                raise SystemExit(f"{cmd}: the firmware does not know it (a gate without --firmware "
+                                 f"runs the firmware baked at --build)")
             # A pre-generation (`gen N ids...`, the untraced path with the posted lists and the
             # list cache replaying) must give the mirror's tokens too.
             words = cmd.split()
             if words[0] == "gen" and len(words) > 2 and all(w.lstrip("-").isdigit() for w in words[1:]):
                 n_new, pids = int(words[1]), [int(w) for w in words[2:]]
-                got = re.search(r"GEN:((?:[ \t]+-?\d+)+)", answer)
+                # The tokens are the line before GEN DONE (the firmware may print messages
+                # between the GEN: prompt and them).
+                got = re.search(r"(-?\d+(?:[ \t]+-?\d+)*)\s*GEN DONE", answer)
                 got = [int(t) for t in got.group(1).split()] if got else []
                 want = mirror_tokens(image, pids, n_new)
                 print(f"pre-gen tokens: {got} mirror: {want}", flush=True)
