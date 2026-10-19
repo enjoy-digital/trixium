@@ -61,6 +61,8 @@ class TriXiumConfig:
     with_prefetch: bool            = False # Engine op 7: a matvec's weight reads issued ahead.
     reader_fifo_depth: int         = 512   # Beats buffered per channel reader (the prefetch's reach).
     reader_max_bursts: int         = 8     # 16-beat bursts a channel reader keeps outstanding.
+    with_axpy: bool                = True  # Engine op 4 (weighted-V accumulate, the Qwen3 attention): the
+                                           # pipes' shifters, accumulators and drain; off in hybrid builds.
     with_vec_fused: bool           = False # Vector unit: fused clamp/round instructions (asm.fuse).
     attnstream_options: tuple      = ()    # (name, value) overrides of the unit's arguments.
 
@@ -229,9 +231,12 @@ class TriXiumCore(LiteXModule):
             prefetch   = config.with_prefetch,
             reader_fifo_depth = config.reader_fifo_depth,
             reader_max_bursts = config.reader_max_bursts,
+            axpy       = config.with_axpy,
             **placement))
         if config.with_trit5:
             self.add_constant("TRIXIUM_HAS_TRIT5")
+        if config.with_axpy:
+            self.add_constant("TRIXIUM_HAS_AXPY")
         if config.with_prefetch:
             self.add_constant("TRIXIUM_HAS_PREFETCH")
             self.add_constant("TRIXIUM_READER_FIFO_DEPTH", config.reader_fifo_depth)

@@ -75,8 +75,12 @@ def _adder_tree(module, lanes, reg_every=2):
 # Channel Pipe -------------------------------------------------------------------------------------
 
 class ChannelPipe(LiteXModule):
-    """One memory channel's compute pipeline: weight beats in, one int32 result per row out."""
-    def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1):
+    """One memory channel's compute pipeline: weight beats in, one int32 result per row out.
+
+    axpy: the weighted-V accumulate (kind 2: per-lane shifters, 4 x 32 int32 accumulators, the
+    wide drain) - the Qwen3 path's attention; a hybrid build never issues it and leaves it out."""
+    def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1, axpy=True):
+        self.axpy = axpy
         # Op parameters (quasi-static while busy; registered by the engine every cycle, reset-less:
         # an op only reads them from `start` on).
         self.kind        = Signal(2,  reset_less=True)
@@ -181,7 +185,7 @@ class ChannelPipe(LiteXModule):
             t0_fire.eq(accept & is_code),
             pidx.eq(row_cnt*n_channels + chan_id),
             pidx_d.eq(Cat(pidx[0:5], C(0, 1), pidx[5:15])),
-            xbuf_r.adr.eq(Mux(self.kind == KIND_OP_AXPY,
+            xbuf_r.adr.eq(Mux((self.kind == KIND_OP_AXPY) if axpy else 0,
                               Mux(self.qn, pidx_d[7:], pidx[7:]),
                           Mux(self.kind == KIND_OP_Q8,
                               Mux(self.qn, g_cnt[1:], g_cnt[2:]),
@@ -266,7 +270,10 @@ class ChannelPipe(LiteXModule):
         # START+5 or later, so a flop copy is exact and keeps the kind compare (and the
         # engine-side flop it would otherwise reach) out of the 32-lane operand mux.
         is_axpy = Signal(reset_less=True)
-        self.sync += is_axpy.eq(self.kind == KIND_OP_AXPY)
+        if axpy:
+            self.sync += is_axpy.eq(self.kind == KIND_OP_AXPY)
+        else:
+            self.comb += is_axpy.eq(0)
         q8_lanes = []
         # The 32 signed 8x8 products go to DSPs (saves ~2.6k LUT per channel; Vivado folds
         # the first Q8 tree levels into the DSP ALUs). Operands are registered at T1 (the
@@ -283,7 +290,7 @@ class ChannelPipe(LiteXModule):
             p.attr.add(("use_dsp", "yes"))
             self.comb += [
                 w_j.eq(codes_r[8*j:8*j+8]),
-                x_j.eq(Mux(is_axpy, p8_ax, xslice[8*j:8*j+8])),
+                x_j.eq(Mux(is_axpy, p8_ax, xslice[8*j:8*j+8]) if axpy else xslice[8*j:8*j+8]),
                 p.eq(w_r*x_r),
             ]
             self.sync += If(v1_q8[j // 16], w_r.eq(w_j), x_r.eq(x_j))
@@ -311,124 +318,129 @@ class ChannelPipe(LiteXModule):
         # is added at T1 from the RAM read data, and the resulting direction/amount bits are
         # registered (replicated per 8 lanes, dont_touch): T2 is register -> shifter ->
         # register.
-        ax_c31n  = Signal((9, True), reset=-31)
-        ax_bias  = Signal((8, True))
-        ax_rpre  = Signal((8, True))
-        ax_bmr   = Signal((9, True), reset_less=True) # B - Rpre - 15, registered (op-stable).
-        ax_exp   = Signal(5)
-        ax_exp_s = Signal((7, True))
-        ax_sh    = Signal((9, True)) # T1: exponent + (B - Rpre - 15), same range as before.
-        self.comb += [
-            ax_bias.eq(self.bias),
-            ax_rpre.eq(self.rshift),
-            ax_exp.eq(scale_f16_t1[10:15]),
-            ax_exp_s.eq(ax_exp),          # Zero-extend into a signed signal.
-            ax_sh.eq(ax_exp_s + ax_bmr),
-        ]
-        self.sync += ax_bmr.eq(ax_bias - ax_rpre - 15)
-        def amount_regs(sh, tag):
-            """(neg, shl, shr) for `sh`: registered at T1 (valid T2), then one more stage
-            so they meet the products at T3; one dont_touch copy per 8 lanes."""
-            copies = []
-            for k in range(4):
-                neg1 = Signal(name=f"axneg1_{tag}{k}", reset_less=True)
-                shl1 = Signal(4, name=f"axshl1_{tag}{k}", reset_less=True)
-                shr1 = Signal(5, name=f"axshr1_{tag}{k}", reset_less=True)
-                self.sync += If(v1_scale,
-                    neg1.eq(sh < 0),
-                    shl1.eq(Mux(sh >= 0, Mux(sh > 15, 15, sh[:4]), 0)),
-                    shr1.eq(Mux(sh < 0, Mux(sh < ax_c31n, 31, (-sh)[:5]), 0)),
-                )
-                neg = Signal(name=f"axneg_{tag}{k}", reset_less=True)
-                shl = Signal(4, name=f"axshl_{tag}{k}", reset_less=True)
-                shr = Signal(5, name=f"axshr_{tag}{k}", reset_less=True)
-                for c in (neg, shl, shr):
-                    c.attr.add(("dont_touch", "true"))
-                self.sync += [neg.eq(neg1), shl.eq(shl1), shr.eq(shr1)]
-                copies.append((neg, shl, shr))
-            return copies
-        ax_amt = amount_regs(ax_sh, "a")
-        v2a = _delay(self, v1, 2) # Lane products valid (T3).
-        ax_shifted = []
-        for j in range(32):
-            neg, shl, shr = ax_amt[j // 8]
-            sh_full = Signal((32, True))
-            r       = Signal((32, True), reset_less=True)
-            self.comb += sh_full.eq(Mux(neg, q8_lanes[j] >> shr, q8_lanes[j] << shl))
-            self.sync += If(v2a, r.eq(sh_full))
-            ax_shifted.append(r)
-
-        AX_GROUPS = 4 # head_dim <= 128 for AXPY ops (kvpack contract).
-        # Accumulators: cleared by `start`, reset-less.
-        acc_ax = [[Signal((32, True), name=f"axacc{g}_{j}", reset_less=True) for j in range(32)]
-                  for g in range(AX_GROUPS)]
-        acc_flat = Array([acc_ax[g][j] for g in range(AX_GROUPS) for j in range(32)])
-
-        # Final-beat tag: last code beat of the last row, aligned to the accumulate stage.
-        fin_t0 = Signal()
-        self.comb += fin_t0.eq(t0_fire & row_last & (row_cnt == self.rows - 1))
-        fin_acc = _delay(self, fin_t0, 4) # Accumulate of the final beat done (T5).
-
-        d_cnt   = Signal(8)
-        d_total = Signal(8)
-        # Wide drain: 8 accumulators (one scratchpad beat) per FIFO entry, so the gather
-        # stage retires 8 partials/cycle instead of 1. d_cnt counts 8-lane groups.
-        self.comb += d_total.eq(Cat(C(0, 2), self.code_beats[:3])) # code_beats * 4 = cols/8.
-        self.ax_fsm = ax_fsm = FSM(reset_state="AX_IDLE")
         drain_val = Signal()
-        ax_fsm.act("AX_IDLE",
-            If(self.start & (self.kind == KIND_OP_AXPY),
-                NextValue(d_cnt, 0),
-                If(self.rows == 0,
-                    NextState("AX_DRAIN"), # No rows on this channel: emit zero partials.
-                ).Else(
-                    NextState("AX_ACC"),
-                )
-            )
-        )
-        ax_fsm.act("AX_ACC",
-            If(fin_acc,
-                NextState("AX_DRAIN"),
-            )
-        )
-        ax_fsm.act("AX_DRAIN",
-            drain_val.eq(1),
-            If(out_fifo_rdy_ax,
-                NextValue(d_cnt, d_cnt + 1),
-                If(d_cnt == d_total - 1,
-                    NextState("AX_IDLE"),
-                )
-            )
-        )
-
-        # Accumulate: one adder per lane, shared by the four groups. The beat's bank is
-        # selected (4:1 per lane, select replicated per 8 lanes), added once, and written
-        # back under a registered per-bank enable. Exact: the group sequence is cyclic within
-        # a row and rows are separated by at least one scale beat, so the same bank is never
-        # updated on consecutive beats and the single-cycle read-modify-write sees its own
-        # previous write. `start` keeps priority over the enables.
-        g_ax1 = _delay(self, g_ax_r, 2, reset_less=True) # Beat group at T3 (decode below -> T4).
-        ax_we = [Signal(name=f"ax_we{g}") for g in range(AX_GROUPS)]
-        self.sync += [ax_we[g].eq(v2a & is_axpy & (g_ax1[:2] == g)) for g in range(AX_GROUPS)]
-        g_sel = []
-        for k in range(4):
-            c = Signal(2, name=f"ax_gsel{k}", reset_less=True)
-            c.attr.add(("dont_touch", "true"))
-            self.sync += c.eq(g_ax1[:2]) # The beat's group at T3, one copy per 8 lanes.
-            g_sel.append(c)
-        for j in range(32):
-            acc_sel = Signal((32, True))
-            acc_sum = Signal((32, True))
+        d_cnt     = Signal(8)
+        acc_flat  = None
+        if not axpy:
+            self.comb += drain_val.eq(0)
+        if axpy:
+            ax_c31n  = Signal((9, True), reset=-31)
+            ax_bias  = Signal((8, True))
+            ax_rpre  = Signal((8, True))
+            ax_bmr   = Signal((9, True), reset_less=True) # B - Rpre - 15, registered (op-stable).
+            ax_exp   = Signal(5)
+            ax_exp_s = Signal((7, True))
+            ax_sh    = Signal((9, True)) # T1: exponent + (B - Rpre - 15), same range as before.
             self.comb += [
-                Case(g_sel[j // 8], {g: acc_sel.eq(acc_ax[g][j]) for g in range(AX_GROUPS)}),
-                acc_sum.eq(acc_sel + ax_shifted[j]),
+                ax_bias.eq(self.bias),
+                ax_rpre.eq(self.rshift),
+                ax_exp.eq(scale_f16_t1[10:15]),
+                ax_exp_s.eq(ax_exp),          # Zero-extend into a signed signal.
+                ax_sh.eq(ax_exp_s + ax_bmr),
             ]
-            for g in range(AX_GROUPS):
-                self.sync += If(self.start,
-                    acc_ax[g][j].eq(0),
-                ).Elif(ax_we[g],
-                    acc_ax[g][j].eq(acc_sum),
+            self.sync += ax_bmr.eq(ax_bias - ax_rpre - 15)
+            def amount_regs(sh, tag):
+                """(neg, shl, shr) for `sh`: registered at T1 (valid T2), then one more stage
+                so they meet the products at T3; one dont_touch copy per 8 lanes."""
+                copies = []
+                for k in range(4):
+                    neg1 = Signal(name=f"axneg1_{tag}{k}", reset_less=True)
+                    shl1 = Signal(4, name=f"axshl1_{tag}{k}", reset_less=True)
+                    shr1 = Signal(5, name=f"axshr1_{tag}{k}", reset_less=True)
+                    self.sync += If(v1_scale,
+                        neg1.eq(sh < 0),
+                        shl1.eq(Mux(sh >= 0, Mux(sh > 15, 15, sh[:4]), 0)),
+                        shr1.eq(Mux(sh < 0, Mux(sh < ax_c31n, 31, (-sh)[:5]), 0)),
+                    )
+                    neg = Signal(name=f"axneg_{tag}{k}", reset_less=True)
+                    shl = Signal(4, name=f"axshl_{tag}{k}", reset_less=True)
+                    shr = Signal(5, name=f"axshr_{tag}{k}", reset_less=True)
+                    for c in (neg, shl, shr):
+                        c.attr.add(("dont_touch", "true"))
+                    self.sync += [neg.eq(neg1), shl.eq(shl1), shr.eq(shr1)]
+                    copies.append((neg, shl, shr))
+                return copies
+            ax_amt = amount_regs(ax_sh, "a")
+            v2a = _delay(self, v1, 2) # Lane products valid (T3).
+            ax_shifted = []
+            for j in range(32):
+                neg, shl, shr = ax_amt[j // 8]
+                sh_full = Signal((32, True))
+                r       = Signal((32, True), reset_less=True)
+                self.comb += sh_full.eq(Mux(neg, q8_lanes[j] >> shr, q8_lanes[j] << shl))
+                self.sync += If(v2a, r.eq(sh_full))
+                ax_shifted.append(r)
+
+            AX_GROUPS = 4 # head_dim <= 128 for AXPY ops (kvpack contract).
+            # Accumulators: cleared by `start`, reset-less.
+            acc_ax = [[Signal((32, True), name=f"axacc{g}_{j}", reset_less=True) for j in range(32)]
+                      for g in range(AX_GROUPS)]
+            acc_flat = Array([acc_ax[g][j] for g in range(AX_GROUPS) for j in range(32)])
+
+            # Final-beat tag: last code beat of the last row, aligned to the accumulate stage.
+            fin_t0 = Signal()
+            self.comb += fin_t0.eq(t0_fire & row_last & (row_cnt == self.rows - 1))
+            fin_acc = _delay(self, fin_t0, 4) # Accumulate of the final beat done (T5).
+
+            d_total = Signal(8)
+            # Wide drain: 8 accumulators (one scratchpad beat) per FIFO entry, so the gather
+            # stage retires 8 partials/cycle instead of 1. d_cnt counts 8-lane groups.
+            self.comb += d_total.eq(Cat(C(0, 2), self.code_beats[:3])) # code_beats * 4 = cols/8.
+            self.ax_fsm = ax_fsm = FSM(reset_state="AX_IDLE")
+            ax_fsm.act("AX_IDLE",
+                If(self.start & (self.kind == KIND_OP_AXPY),
+                    NextValue(d_cnt, 0),
+                    If(self.rows == 0,
+                        NextState("AX_DRAIN"), # No rows on this channel: emit zero partials.
+                    ).Else(
+                        NextState("AX_ACC"),
+                    )
                 )
+            )
+            ax_fsm.act("AX_ACC",
+                If(fin_acc,
+                    NextState("AX_DRAIN"),
+                )
+            )
+            ax_fsm.act("AX_DRAIN",
+                drain_val.eq(1),
+                If(out_fifo_rdy_ax,
+                    NextValue(d_cnt, d_cnt + 1),
+                    If(d_cnt == d_total - 1,
+                        NextState("AX_IDLE"),
+                    )
+                )
+            )
+
+            # Accumulate: one adder per lane, shared by the four groups. The beat's bank is
+            # selected (4:1 per lane, select replicated per 8 lanes), added once, and written
+            # back under a registered per-bank enable. Exact: the group sequence is cyclic within
+            # a row and rows are separated by at least one scale beat, so the same bank is never
+            # updated on consecutive beats and the single-cycle read-modify-write sees its own
+            # previous write. `start` keeps priority over the enables.
+            g_ax1 = _delay(self, g_ax_r, 2, reset_less=True) # Beat group at T3 (decode below -> T4).
+            ax_we = [Signal(name=f"ax_we{g}") for g in range(AX_GROUPS)]
+            self.sync += [ax_we[g].eq(v2a & is_axpy & (g_ax1[:2] == g)) for g in range(AX_GROUPS)]
+            g_sel = []
+            for k in range(4):
+                c = Signal(2, name=f"ax_gsel{k}", reset_less=True)
+                c.attr.add(("dont_touch", "true"))
+                self.sync += c.eq(g_ax1[:2]) # The beat's group at T3, one copy per 8 lanes.
+                g_sel.append(c)
+            for j in range(32):
+                acc_sel = Signal((32, True))
+                acc_sum = Signal((32, True))
+                self.comb += [
+                    Case(g_sel[j // 8], {g: acc_sel.eq(acc_ax[g][j]) for g in range(AX_GROUPS)}),
+                    acc_sum.eq(acc_sel + ax_shifted[j]),
+                ]
+                for g in range(AX_GROUPS):
+                    self.sync += If(self.start,
+                        acc_ax[g][j].eq(0),
+                    ).Elif(ax_we[g],
+                        acc_ax[g][j].eq(acc_sum),
+                    )
+        # (end of the AXPY datapath)
 
         # T2..: adder trees (both built; result muxed by kind) -------------------------------------
         tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
@@ -518,8 +530,11 @@ class ChannelPipe(LiteXModule):
         # AXPY wide-drain FIFO: 8 accumulators per entry (one full beat). Matvec and AXPY
         # entries never interleave (drain runs only in AXPY mode, row-last pushes only in
         # matvec kinds), so the source muxes by kind.
-        axw_fifo = stream.SyncFIFO([("row", 16), ("data", 256), ("head", 1)], 4)
-        self.submodules += out_fifo, axw_fifo
+        self.submodules += out_fifo
+        axw_fifo = None
+        if axpy:
+            axw_fifo = stream.SyncFIFO([("row", 16), ("data", 256), ("head", 1)], 4)
+            self.submodules += axw_fifo
 
         self.sync += [
             If(self.start,
@@ -529,42 +544,47 @@ class ChannelPipe(LiteXModule):
             ),
             If(self.start,
                 self.overflow.eq(0),
-            ).Elif(out_fifo.sink.valid & ~out_fifo.sink.ready & (self.kind != KIND_OP_AXPY),
+            ).Elif(out_fifo.sink.valid & ~out_fifo.sink.ready & ((self.kind != KIND_OP_AXPY) if axpy else 1),
                 # Matvec pushes don't wait: valid & !ready here is a dropped result. The
                 # AXPY drain FSM holds valid until accepted - backpressure, not a drop.
                 self.overflow.eq(1),
             ),
         ]
-        self.comb += [
-            If(self.kind == KIND_OP_AXPY,
-                axw_fifo.sink.valid.eq(drain_val),
-                axw_fifo.sink.row.eq(Cat(C(0, 3), d_cnt)), # First lane index = d_cnt*8.
-                axw_fifo.sink.data.eq(Cat(*[acc_flat[(d_cnt << 3) + i][0:32]
-                    for i in range(8)])),
-            ).Else(
-                out_fifo.sink.valid.eq(v4 & rlast4),
-                out_fifo.sink.row.eq(row4),
-                out_fifo.sink.data.eq(result[:32]),
-            ),
-            out_fifo_rdy_ax.eq(axw_fifo.sink.ready),
-            # 9 slots of slack cover in-flight results (<= 4 row-lasts in the T+0..T+4
-            # stages with the Q8 operand register, x2 margin).
-            out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 9)),
-            If(self.kind == KIND_OP_AXPY,
-                self.source.valid.eq(axw_fifo.source.valid),
-                self.source.row.eq(axw_fifo.source.row),
-                self.source.data.eq(axw_fifo.source.data),
-                self.source.head.eq(axw_fifo.source.head),
-                self.source.wide.eq(1),
-                axw_fifo.source.ready.eq(self.source.ready),
-            ).Else(
-                self.source.valid.eq(out_fifo.source.valid),
-                self.source.row.eq(out_fifo.source.row),
-                # The 32-bit result in every lane: the engine's result packer keeps a
-                # per-lane register and enables only the lane this result belongs to, so
-                # replicating here (pure fanout) lets the packer carry no data mux.
-                self.source.data.eq(Replicate(out_fifo.source.data, 8)),
-                self.source.head.eq(out_fifo.source.head),
-                out_fifo.source.ready.eq(self.source.ready),
-            ),
+        matvec_sink = [
+            out_fifo.sink.valid.eq(v4 & rlast4),
+            out_fifo.sink.row.eq(row4),
+            out_fifo.sink.data.eq(result[:32]),
         ]
+        matvec_source = [
+            self.source.valid.eq(out_fifo.source.valid),
+            self.source.row.eq(out_fifo.source.row),
+            # The 32-bit result in every lane: the engine's result packer keeps a
+            # per-lane register and enables only the lane this result belongs to, so
+            # replicating here (pure fanout) lets the packer carry no data mux.
+            self.source.data.eq(Replicate(out_fifo.source.data, 8)),
+            self.source.head.eq(out_fifo.source.head),
+            out_fifo.source.ready.eq(self.source.ready),
+        ]
+        # 9 slots of slack cover in-flight results (<= 4 row-lasts in the T+0..T+4
+        # stages with the Q8 operand register, x2 margin).
+        self.comb += out_fifo_room.eq(out_fifo.level < (out_fifo_depth - 9))
+        if axpy:
+            self.comb += [
+                If(self.kind == KIND_OP_AXPY,
+                    axw_fifo.sink.valid.eq(drain_val),
+                    axw_fifo.sink.row.eq(Cat(C(0, 3), d_cnt)), # First lane index = d_cnt*8.
+                    axw_fifo.sink.data.eq(Cat(*[acc_flat[(d_cnt << 3) + i][0:32]
+                        for i in range(8)])),
+                ).Else(*matvec_sink),
+                out_fifo_rdy_ax.eq(axw_fifo.sink.ready),
+                If(self.kind == KIND_OP_AXPY,
+                    self.source.valid.eq(axw_fifo.source.valid),
+                    self.source.row.eq(axw_fifo.source.row),
+                    self.source.data.eq(axw_fifo.source.data),
+                    self.source.head.eq(axw_fifo.source.head),
+                    self.source.wide.eq(1),
+                    axw_fifo.source.ready.eq(self.source.ready),
+                ).Else(*matvec_source),
+            ]
+        else:
+            self.comb += matvec_sink + matvec_source + [out_fifo_rdy_ax.eq(0)]

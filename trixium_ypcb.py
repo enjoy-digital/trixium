@@ -186,7 +186,7 @@ class TriXiumYPCBSoC(SoCCore):
         write_time     = 128,
         refresh_postponing = 1,
         trit5          = True,
-        prefetch       = 2048,
+        prefetch       = 512,
         vec_fused      = True,
         hybrid         = False,
         attn_geometry  = YPCB_HYBRID_ATTN + (256, 2048),
@@ -308,6 +308,7 @@ class TriXiumYPCBSoC(SoCCore):
         units = {}
         if hybrid:
             units = dict(
+                with_axpy                = False,  # the hybrid path never issues the weighted-V op
                 with_hadamard            = True,
                 with_activation_quantize = True,
                 with_projection_restore  = True,
@@ -416,7 +417,7 @@ def main():
     parser.add_target_argument("--refresh-postponing", default=1,        type=int,                            help="LiteDRAM refresh postponing (1-8).")
     parser.add_target_argument("--chan-stride",        default=None,     type=lambda x: int(x, 0),            help="Engine window stride (default: each controller above the weight base split evenly).")
     parser.add_target_argument("--trit5",              action=argparse.BooleanOptionalAction, default=True,  help="Unpackers for 5-trits-per-byte weights (the default; --no-trit5: 2-bit images, convert --board ypcb --no-trit5).")
-    parser.add_target_argument("--prefetch",           default=2048,     type=int,                            help="Weight prefetch: reader FIFO beats per channel (0: no prefetch).")
+    parser.add_target_argument("--prefetch",           default=512,     type=int,                            help="Weight prefetch: reader FIFO beats per channel (0: no prefetch).")
     parser.add_target_argument("--vec-fused",          action=argparse.BooleanOptionalAction, default=True,  help="Vector unit with the fused clamp/round instructions.")
     parser.add_target_argument("--ddr-ecc",            action=argparse.BooleanOptionalAction, default=True,  help="DDR3 ECC: SECDED on each channel's ninth byte lane (the default; corrects the rare read errors under full streaming).")
     parser.add_target_argument("--ddr-ibuf-low-power", action="store_true",                                   help="DQ/DQS input buffers in low-power mode (Vivado's default; not for sustained reads).")

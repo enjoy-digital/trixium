@@ -485,6 +485,7 @@ class TriXiumSimSoC(SoCCore):
             with_norm                = with_norm,
             with_conv                = with_conv,
             with_dnstream            = bool(with_dnstream),
+            with_axpy                = not with_dnstream,  # the hybrid path never issues the weighted-V op
             with_attnstream          = attn_geometry is not None,
             with_prefetch            = bool(prefetch),
             with_vec_fused           = vec_fused,

@@ -158,7 +158,8 @@ class MatVecEngine(LiteXModule):
     """N-channel matvec engine: one AXIReader + ChannelPipe per memory channel (see module doc)."""
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
-                 trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8):
+                 trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8,
+                 axpy=True):
         # chan_stride: byte distance between consecutive channels' weight regions. With the
         # HBM AXI switch enabled the address (not the port) selects the pseudo-channel, so
         # each channel needs its own window; 0 when every channel has its own address space.
@@ -324,7 +325,7 @@ class MatVecEngine(LiteXModule):
             # per round trip); round-robin ARIDs let it pipeline.
             reader = AXIReader(axi, n_ids=4, fifo_depth=reader_fifo_depth,
                                max_bursts=reader_max_bursts)
-            pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
+            pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n, axpy=axpy)
             setattr(self, f"reader{i}", reader)
             setattr(self, f"pipe{i}",   pipe)
             # trit5: the compute beats go through the unpacker (a pass-through unless the op's
@@ -413,7 +414,7 @@ class MatVecEngine(LiteXModule):
             pf_mode.eq(cmd_r["kind"] == 7 if prefetch else 0),
             fetch_mode.eq(cmd_r["kind"] == 2),
             store_mode.eq(cmd_r["kind"] == 3),
-            axpy_mode.eq(cmd_r["kind"] == 4),
+            axpy_mode.eq((cmd_r["kind"] == 4) if axpy else 0), # No AXPY datapath: never set.
             dn_mode.eq(cmd_r["kind"] == 5 if dnstream else 0),
             at_mode.eq(cmd_r["kind"] == 6 if attnstream else 0),
             fetch_chan.eq(cmd_r["chan"]),
@@ -1166,8 +1167,11 @@ class MatVecEngine(LiteXModule):
         read_cmd_fields = [
             *[c.addr.eq(cmd_r["wbase"] + _chan_off(i))
               for i, c in enumerate(read_cmds)],
+            # A striped extra row (rem) is sbeats + cbeats memory beats, or with trit5 codes
+            # (pk) sbeats + the packed code bytes' beats: 26 of every 32 (bons_row_beats).
             *[c.len.eq(cmd_r["wlen"]
-                + Mux(i < cmd_r["rem"], cmd_r["sbeats"] + cmd_r["cbeats"], 0))
+                + Mux(i < cmd_r["rem"],
+                      cmd_r["sbeats"] + Mux(cmd_r["pk"], (cmd_r["cbeats"]*26 + 31) >> 5, cmd_r["cbeats"]), 0))
               for i, c in enumerate(read_cmds)],
         ]
         # Prefetch bookkeeping: a kind-7 op leaves its reads pending for the next matvec, whose
@@ -1175,6 +1179,7 @@ class MatVecEngine(LiteXModule):
         # goes straight to RUN.
         pf_pending  = Signal()
         pf_wbase    = Signal(32, reset_less=True)
+        pf_wlen     = Signal(24, reset_less=True)
         self.pf_hits     = Signal(32) # Matvecs served from a prefetch.
         self.pf_mismatch = Signal()   # Sticky: a matvec (or another op) followed a prefetch
                                       # of a different span.
@@ -1211,10 +1216,13 @@ class MatVecEngine(LiteXModule):
                 If(fsm.ongoing("PF_ISSUE") & read_cmds[0].ready,
                     pf_pending.eq(cmd_r["wlen"] != 0), # wlen 0: a no-op (a list's unused slot).
                     pf_wbase.eq(cmd_r["wbase"]),
+                    pf_wlen.eq(cmd_r["wlen"]),
                 ).Elif(fsm.ongoing("ISSUE") & pf_pending,
                     pf_pending.eq(0),
                     self.pf_hits.eq(self.pf_hits + 1),
-                    If((cmd_r["wbase"] != pf_wbase) | fetch_mode | at_mode | dn_mode,
+                    # The matvec must read the prefetched span: address and length (a shorter
+                    # one leaves beats in the FIFOs, a longer one waits forever).
+                    If((cmd_r["wbase"] != pf_wbase) | (cmd_r["wlen"] != pf_wlen) | fetch_mode | at_mode | dn_mode,
                         self.pf_mismatch.eq(1)),
                 ),
             ]

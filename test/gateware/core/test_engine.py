@@ -42,7 +42,7 @@ def _i32(data):
     return np.frombuffer(data, dtype="<i4").astype(np.int64)
 
 def _run_engine(backend, n_channels, payloads, sp, cmd, n_results, dst, latency=8, stall_rate=0,
-                xbuf_groups=32, reorder_ids=0, absmax=False, trit5=False):
+                xbuf_groups=32, reorder_ids=0, absmax=False, trit5=False, axpy=True):
     """Results array, or (results, engine.absmax) when absmax=True."""
     s = Script()
     submit(s, cmd)
@@ -51,7 +51,8 @@ def _run_engine(backend, n_channels, payloads, sp, cmd, n_results, dst, latency=
     s.peek("error")
     s.peek("absmax")
     s.read("sp", dst, 4*n_results, "res")
-    bench = EngineBench(n_channels, xbuf_groups=xbuf_groups, **({"trit5": True} if trit5 else {}))
+    bench = EngineBench(n_channels, xbuf_groups=xbuf_groups, **({"trit5": True} if trit5 else {}),
+                        **({"axpy": False} if not axpy else {}))
     r = bench.run(backend, s, sp=sp, payloads=payloads,
         latency=latency, stall_rate=stall_rate, reorder_ids=reorder_ids)
     assert r.peeks["error"] == 0
@@ -59,7 +60,7 @@ def _run_engine(backend, n_channels, payloads, sp, cmd, n_results, dst, latency=
     return (arr, r.peeks["absmax"]) if absmax else arr
 
 def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate, seed,
-                  kind=layout.KIND_TERNARY, trit5=False, xbuf_groups=32):
+                  kind=layout.KIND_TERNARY, trit5=False, xbuf_groups=32, axpy=True):
     rng    = np.random.default_rng(seed)
     M      = n_channels*rows_per_chan
     G      = cols//layout.GROUP_TERNARY
@@ -89,7 +90,7 @@ def _case_ternary(backend, n_channels, rows_per_chan, cols, latency, stall_rate,
     if trit5:
         cmd["pk"] = int(kind == layout.KIND_TERNARY5)
     got = _run_engine(backend, n_channels, payloads, x8.tobytes(), cmd, M, dst, latency, stall_rate,
-                      xbuf_groups=xbuf_groups, trit5=trit5)
+                      xbuf_groups=xbuf_groups, trit5=trit5, axpy=axpy)
     assert np.array_equal(got, expected), f"N={n_channels} rows={rows_per_chan} cols={cols}"
 
 @COMPILED
@@ -120,6 +121,13 @@ def test_matvec_trit5_aligned(backend):
     # K = 2048: 16 groups in 13 memory beats, no row padding (the Qwen3 widths).
     _case_ternary(backend, n_channels=2, rows_per_chan=6, cols=2048, latency=8, stall_rate=0, seed=21,
                   kind=T5, trit5=True)
+
+@COMPILED
+def test_matvec_trit5_no_axpy(backend):
+    # The hybrid builds' pipe: no AXPY datapath (ChannelPipe axpy=False), the ternary and
+    # trit5 matvecs unchanged bit for bit.
+    _case_ternary(backend, n_channels=2, rows_per_chan=6, cols=2048, latency=8, stall_rate=2, seed=23,
+                  kind=T5, trit5=True, axpy=False)
 
 @COMPILED
 def test_matvec_trit5_padded_stalls(backend):
