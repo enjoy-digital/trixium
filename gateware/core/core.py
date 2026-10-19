@@ -31,6 +31,7 @@ from gateware.units.activation import ActivationScratchpad
 from gateware.units.restore import ProjectionRestoreScratchpad
 from gateware.units.silu import SiluScratchpad
 from gateware.units.norm import NormScratchpad
+from gateware.units.softmax import SoftmaxScratchpad
 from gateware.units.conv import ConvScratchpad
 
 # TriXium Config -----------------------------------------------------------------------------------
@@ -50,6 +51,7 @@ class TriXiumConfig:
     with_silu: bool                = False
     with_norm: bool                = False
     with_conv: bool                = False
+    with_softmax: bool             = False # Unit 14: the attention softmax (exact exp) over the scores.
     norm_rope: bool                = True  # Unit 12's RoPE stage (off: CPU RoPE, norm ABI 1.1).
     hadamard_lanes: int            = 32    # Unit 1 butterflies per clock (8, 16, 32).
     silu_ways: int                 = 4     # Unit 11 kernels in lockstep (elements per clock/2).
@@ -140,6 +142,7 @@ class TriXiumCore(LiteXModule):
             with_silu                = config.with_silu,
             with_norm                = config.with_norm,
             with_conv                = config.with_conv,
+            with_softmax             = config.with_softmax,
             norm_rope                = config.norm_rope,
             scratchpad_size          = config.scratchpad_size))
         for name in ("TRIXIUM_HAS_SEQ", "TRIXIUM_SEQ_OVERLAP"):
@@ -213,6 +216,11 @@ class TriXiumCore(LiteXModule):
             sp_clients.append(self.conv)
             extensions.append(("conv", self.conv))
             self.add_constant("TRIXIUM_HAS_CONV")
+        if config.with_softmax:
+            self.softmax = ClockDomainsRenamer("eng")(SoftmaxScratchpad(config.scratchpad_size))
+            sp_clients.append(self.softmax)
+            extensions.append(("softmax", self.softmax))
+            self.add_constant("TRIXIUM_HAS_SOFTMAX")
 
         # Matvec engine.
         placement = dict(chan_stride=config.chan_stride, chan_mod=config.chan_mod,

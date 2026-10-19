@@ -327,6 +327,7 @@ class TriXiumYPCBSoC(SoCCore):
                 with_silu                = True,
                 with_norm                = True,
                 with_conv                = True,
+                with_softmax             = True,
                 with_dnstream            = True,
                 with_attnstream          = True,
                 attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),

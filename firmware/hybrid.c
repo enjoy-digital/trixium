@@ -127,6 +127,7 @@ static int dn_hw_written;              // the span was cleared once since the bo
 // 144 MiB in engine DDR at every generation's first token.
 static uint64_t dn_state_zero;
 int hybrid_softmax_div;                  // Console `softmaxdiv on`: the per-position divide (A/B).
+int hybrid_softmax_unit = 1;             // Console `softmaxunit off`: the CPU softmax instead of unit 14.
 #ifdef TRIXIUM_SIM
 static int hybrid_inits, power_on_reset; // Simulation: hybrid_init's first reset (below).
 #endif
@@ -1579,6 +1580,56 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 // the gates behind each head). 0: attnb holds the ungated outputs; 1: the gated outputs;
 // -1: the CPU loop runs on main RAM's copy (a long context, or a list failure, which also
 // turns the stream off until the next reset).
+// The attention softmax over `rows` score rows of T positions (Tp floats apart), in place,
+// exactly as the per-head loop: mx = max (NaN never wins), e = softmax_exp(s - mx), one
+// sequential sum per row from +0, one reciprocal per row, then multiplies. Four rows per pass:
+// the exp is a dependent chain of ~12 FPU operations and the per-row sum another, so one row
+// at a time left the FPU idle most cycles (~40 cycles per element on the card); four
+// independent rows interleave in the same basic block. Every row's result is bit-for-bit the
+// one-row loop's (elements are independent, each row's sum keeps its order).
+static void softmax_rows(float *buf, uint32_t rows, uint32_t stride, int T)
+{
+    uint32_t hh = 0;
+    for (; hh + 4 <= rows; hh += 4) {
+        float *s0 = buf + hh*stride, *s1 = s0 + stride, *s2 = s1 + stride, *s3 = s2 + stride;
+        float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f, m3 = -1e30f;
+        for (int t = 0; t < T; t++) {
+            float a = s0[t], b = s1[t], c = s2[t], d = s3[t];
+            if (a > m0) m0 = a;
+            if (b > m1) m1 = b;
+            if (c > m2) m2 = c;
+            if (d > m3) m3 = d;
+        }
+        float sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+        for (int t = 0; t < T; t++) {
+            float e0 = trixium_softmax_exp(s0[t] - m0);
+            float e1 = trixium_softmax_exp(s1[t] - m1);
+            float e2 = trixium_softmax_exp(s2[t] - m2);
+            float e3 = trixium_softmax_exp(s3[t] - m3);
+            s0[t] = e0; s1[t] = e1; s2[t] = e2; s3[t] = e3;
+            sum0 += e0; sum1 += e1; sum2 += e2; sum3 += e3;
+        }
+        if (hybrid_softmax_div) {   // `softmaxdiv on`: the old divide per position, comparisons only
+            for (int t = 0; t < T; t++) { s0[t] = s0[t]/sum0; s1[t] = s1[t]/sum1; s2[t] = s2[t]/sum2; s3[t] = s3[t]/sum3; }
+        } else {
+            float i0 = 1.0f/sum0, i1 = 1.0f/sum1, i2 = 1.0f/sum2, i3 = 1.0f/sum3;
+            for (int t = 0; t < T; t++) { s0[t] = s0[t]*i0; s1[t] = s1[t]*i1; s2[t] = s2[t]*i2; s3[t] = s3[t]*i3; }
+        }
+    }
+    for (; hh < rows; hh++) {
+        float *sc = buf + hh*stride, mx = -1e30f, sum = 0;
+        for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
+        for (int t = 0; t < T; t++) { sc[t] = trixium_softmax_exp(sc[t] - mx); sum += sc[t]; }
+        // One divide per head, then multiplies (ggml scales by 1/sum too; the mirror's order).
+        if (hybrid_softmax_div) {
+            for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
+        } else {
+            float inv = 1.0f/sum;
+            for (int t = 0; t < T; t++) sc[t] = sc[t]*inv;
+        }
+    }
+}
+
 static int attn_stream(int a, int T, float scale, int gated, const float *q, uint32_t qstride,
                        uint32_t qsp, uint32_t ksp, uint32_t vsp)
 {
@@ -1598,6 +1649,13 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     struct engine_op o;
     uint64_t ts = perf_now64(), tn;
 #define AT_SUB(i) do { tn = perf_now64(); HP->at_sub[i] += tn - ts; ts = tn; } while (0)
+    // The softmax on unit 14 (its ABI 1 present, the geometry within its bounds, the console
+    // toggle on): the scores, the softmax and the values run as one list.
+    int usm = 0;
+#ifdef CSR_TRIXIUM_SEQ_SOFTMAX_ABI_ADDR
+    usm = hybrid_softmax_unit && (trixium_seq_softmax_abi_read() >> 16) == 1 &&
+          T <= 4096 && nq <= 256u;
+#endif
     rl_begin();
     if (!ksp) {
         rl_fetch(kb, (uint32_t)kv_dim*4u, AT_KST);
@@ -1629,17 +1687,20 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
             o.xsrc = AT_REC + 32u*sl;
             rl_engine(&o);
         }
-        rl_store(at_buf, nq*Tp*4u, AT_SP);
+        if (!usm)
+            rl_store(at_buf, nq*Tp*4u, AT_SP);
     }
     AT_SUB(1);
-    // Posted: the values list is built while the scores run (it fetches the probabilities
-    // only after the softmax below has cleaned them to main RAM).
-    if (rl_post("attention scores")) {
-        HP->attnstream_active = 0;
-        return -1;
+    if (!usm) {
+        // Posted: the values list is built while the scores run (it fetches the probabilities
+        // only after the softmax below has cleaned them to main RAM).
+        if (rl_post("attention scores")) {
+            HP->attnstream_active = 0;
+            return -1;
+        }
     }
     if (!fits) {
-        if (resident_join())
+        if (usm ? rl_run("attention kv") : resident_join())
             HP->attnstream_active = 0;
         return -1;
     }
@@ -1647,8 +1708,21 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     // (disjoint: the outputs in AT_O and the gates stay for the fixups).
     int unit_gate = gated && qstride == 2u*hd && resident_gate_active() && hd <= 256u &&
                     nq*hd*4u <= AT_FX - AT_D && nq*32u <= AT_IMG - AT_FX;
-    rl_begin();
-    rl_fetch_raw(at_buf, nq*Tp*4u, AT_SP);   // cleaned after the softmax
+    if (usm) {
+#ifdef CSR_TRIXIUM_SEQ_SOFTMAX_ABI_ADDR
+        // The softmax on unit 14 over the scores in AT_SP, in the same list as the scores and
+        // the values: no main-RAM round trip, no CPU between them.
+        struct bns_seq_descriptor d;
+        if (bns_seq_desc_softmax(&d, AT_SP, (uint32_t)T, nq, Tp/8u)) {
+            HP->attnstream_active = 0;
+            return -1;
+        }
+        rl_desc(&d);
+#endif
+    } else {
+        rl_begin();
+        rl_fetch_raw(at_buf, nq*Tp*4u, AT_SP);   // cleaned after the softmax
+    }
     o.wbase = vspan;
     for (uint32_t sl = 0; sl < nsl; sl++) {
         o.xsrc = vrec + 32u*sl;
@@ -1665,30 +1739,20 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
         rl_store(attnb, nq*hd*4u, AT_O);
     }
     AT_SUB(4);
-    if (resident_join()) {
-        HP->attnstream_active = 0;
-        return -1;
-    }
-    AT_SUB(2);
-    // The softmax exactly as the CPU loop computes it.
-    perf_enter(OP_SOFTMAX);
-    for (uint32_t hh = 0; hh < nq; hh++) {
-        float *sc = at_buf + hh*Tp, mx = -1e30f, sum = 0;
-        for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
-        for (int t = 0; t < T; t++) { sc[t] = trixium_softmax_exp(sc[t] - mx); sum += sc[t]; }
-        // One divide per head, then multiplies (ggml scales by 1/sum too; the mirror's order).
-        // `softmaxdiv on` keeps the old divide per position, for a same-boot comparison only.
-        if (hybrid_softmax_div) {
-            for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
-        } else {
-            float inv = 1.0f/sum;
-            for (int t = 0; t < T; t++) sc[t] = sc[t]*inv;
+    if (!usm) {
+        if (resident_join()) {
+            HP->attnstream_active = 0;
+            return -1;
         }
+        AT_SUB(2);
+        // The softmax exactly as the CPU loop computes it, four heads per pass (below).
+        perf_enter(OP_SOFTMAX);
+        softmax_rows(at_buf, nq, Tp, T);
+        clean_cpu_dcache_range(at_buf, nq*Tp*4u);
+        perf_exit(OP_SOFTMAX);
+        AT_SUB(3);
     }
-    clean_cpu_dcache_range(at_buf, nq*Tp*4u);
-    perf_exit(OP_SOFTMAX);
-    AT_SUB(3);
-    if (rl_run(unit_gate ? "attention values+gate" : "attention values")) {
+    if (rl_run(usm ? "attention" : unit_gate ? "attention values+gate" : "attention values")) {
         HP->attnstream_active = 0;
         if (unit_gate)
             resident_silu_restore();

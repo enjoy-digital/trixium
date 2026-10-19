@@ -1333,6 +1333,16 @@ static void console_service(void)
         if (strncmp(str, "on", 2) == 0)  hybrid_softmax_div = 1;
         if (strncmp(str, "off", 3) == 0) hybrid_softmax_div = 0;
         printf("SOFTMAXDIV %s\n", hybrid_softmax_div ? "on (a divide per position)" : "off (one reciprocal per head)");
+    } else if (strcmp(token, "softmaxunit") == 0) { // softmaxunit on|off: the attention softmax on unit 14 (on, the default where the unit exists) or on the CPU
+        extern int hybrid_softmax_unit;
+        if (strncmp(str, "on", 2) == 0)  hybrid_softmax_unit = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_softmax_unit = 0;
+#ifdef CSR_TRIXIUM_SEQ_SOFTMAX_ABI_ADDR
+        printf("SOFTMAXUNIT %s (unit 14 ABI %lu.%lu)\n", hybrid_softmax_unit ? "on" : "off",
+               (unsigned long)(trixium_seq_softmax_abi_read() >> 16), (unsigned long)(trixium_seq_softmax_abi_read() & 0xFFFF));
+#else
+        printf("SOFTMAXUNIT %s (no unit 14 in this bitstream: the CPU softmax)\n", hybrid_softmax_unit ? "on" : "off");
+#endif
     } else if (strcmp(token, "hwargmax") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);

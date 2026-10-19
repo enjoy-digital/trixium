@@ -135,6 +135,15 @@ int bns_seq_desc_conv(struct bns_seq_descriptor *out, uint32_t x0, uint32_t x1, 
 int bns_seq_desc_add(struct bns_seq_descriptor *out, uint32_t a, uint32_t b, uint32_t dst,
                      uint32_t n);
 
+/* Softmax (unit 14) */
+/*-------------------*/
+
+/* ABI 1: the attention softmax, in place, over `rows` rows of `n` FP32 scores at src, rows
+ * `stride` beats apart (0 = ceil(n/8)): max, the canonical exp, a sequential sum, one
+ * reciprocal per row, multiplies - hybrid.c's loop bit for bit. */
+int bns_seq_desc_softmax(struct bns_seq_descriptor *out, uint32_t src, uint32_t n,
+                         uint32_t rows, uint32_t stride);
+
 /* Serialization */
 /*---------------*/
 

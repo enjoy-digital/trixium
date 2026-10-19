@@ -366,6 +366,7 @@ class TriXiumSimSoC(SoCCore):
                  mem="hbm", n_memctrl=4, update_repo="no",
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
+                 with_softmax=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False,
                  unit_options=()):
@@ -490,6 +491,7 @@ class TriXiumSimSoC(SoCCore):
             with_silu                = with_silu,
             with_norm                = with_norm,
             with_conv                = with_conv,
+            with_softmax             = with_softmax,
             with_dnstream            = bool(with_dnstream),
             with_axpy                = not with_dnstream,  # the hybrid path never issues the weighted-V op
             pipe_clk                 = "pipeclk" if pipe_clk_freq else "",
@@ -737,7 +739,7 @@ BOARDS = {
 # as trixium_ypcb.py's YPCB_HYBRID_UNIT_OPTIONS (the K7-480T's area: narrower Hadamard and SiLU
 # units, no vector unit - the hybrid path never runs it - which pays for unit 12's RoPE stage).
 HYBRID_UNITS = dict(with_hadamard=True, with_activation_quantize=True, with_projection_restore=True,
-    with_silu=True, with_norm=True, with_conv=True, with_dnstream=True,
+    with_silu=True, with_norm=True, with_conv=True, with_softmax=True, with_dnstream=True,
     attn_geometry=YPCB_HYBRID_ATTN + (128, 256), unit_options=YPCB_HYBRID_UNIT_OPTIONS)
 
 # The image each board's simulation bakes in by default (--image).

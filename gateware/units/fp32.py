@@ -306,6 +306,152 @@ class FP32Add(LiteXModule):
             Mux(s4_special, s4_sval, Mux(s4_zero, Cat(C(0, 31), s4_zsign), pack.word))))
         reset_less_registers(self)
 
+# FP32 FMA -----------------------------------------------------------------------------------------
+
+class FP32Fma(LiteXModule):
+    """r = RNE(a*b + c), one rounding (C's fmaf, RV32F's fmadd.s): the exact 48-bit product and
+    the addend aligned on one grid with a sticky bit, added, normalised, rounded once. Register
+    stages advance on `ce`; results are LATENCY enabled clocks behind their operands. No reset:
+    the caller tracks validity. Specials as IEEE with the canonical NaN: NaN for a NaN operand,
+    inf*0 or inf - inf; infinity from an infinite product or addend; an exact zero sum is +0
+    unless every operand's zero carries a minus sign (-0 + -0 = -0)."""
+    LATENCY = 8
+
+    def __init__(self):
+        self.a, self.b, self.c, self.r = Signal(32), Signal(32), Signal(32), Signal(32)
+        self.ce = Signal(reset=1)
+
+        # # #
+
+        ua, ub, uc = _Unpack(self.a), _Unpack(self.b), _Unpack(self.c)
+        self.submodules += ua, ub, uc
+        # S1: unpack, specials, the product's sign and exponent sum.
+        s1_sp, s1_sc, s1_ma, s1_mb, s1_mc = Signal(), Signal(), Signal(24), Signal(24), Signal(24)
+        s1_esum, s1_ec = Signal(10), Signal(8)
+        s1_special, s1_sval = Signal(), Signal(32)
+        s1_pzero, s1_czero = Signal(), Signal()
+        sp = Signal()
+        pinf = Signal()
+        self.comb += [
+            sp.eq(ua.sign ^ ub.sign),
+            pinf.eq(ua.is_inf | ub.is_inf),
+        ]
+        self.sync += If(self.ce,
+            s1_sp.eq(sp), s1_sc.eq(uc.sign), s1_ma.eq(ua.man), s1_mb.eq(ub.man), s1_mc.eq(uc.man),
+            s1_esum.eq(ua.eff + ub.eff), s1_ec.eq(uc.eff),
+            s1_pzero.eq(ua.is_zero | ub.is_zero), s1_czero.eq(uc.is_zero),
+            s1_special.eq(ua.is_nan | ub.is_nan | uc.is_nan | pinf | uc.is_inf),
+            If(ua.is_nan | ub.is_nan | uc.is_nan | (ua.is_inf & ub.is_zero) | (ua.is_zero & ub.is_inf)
+               | (pinf & uc.is_inf & (sp != uc.sign)),
+                s1_sval.eq(CANONICAL_NAN),
+            ).Elif(pinf,
+                s1_sval.eq(Cat(C(0, 23), C(0xFF, 8), sp)),
+            ).Else(
+                s1_sval.eq(self.c),                       # c infinite
+            ),
+        )
+        # S2: the exact product; the addend's leading zeros (subnormals).
+        s2_p = Signal(48)
+        s2_mc, s2_lzc = Signal(24), Signal(5)
+        s2_sp, s2_sc, s2_special, s2_sval, s2_pzero, s2_czero = (Signal(), Signal(), Signal(),
+                                                                 Signal(32), Signal(), Signal())
+        s2_wp, s2_wc = Signal((11, True)), Signal((11, True))   # lsb weights (exponents)
+        lzc_c, lzc_c_stmts = _lzc(s1_mc, 24)
+        self.comb += lzc_c_stmts
+        self.sync += If(self.ce,
+            s2_p.eq(s1_ma*s1_mb), s2_mc.eq(s1_mc), s2_lzc.eq(lzc_c),
+            s2_wp.eq(s1_esum - 300), s2_wc.eq(s1_ec - 150),
+            s2_sp.eq(s1_sp), s2_sc.eq(s1_sc), s2_special.eq(s1_special), s2_sval.eq(s1_sval),
+            s2_pzero.eq(s1_pzero), s2_czero.eq(s1_czero))
+        # S3: both as 48-bit containers with the leading one at bit 47 (zero stays zero).
+        lzc_p, lzc_p_stmts = _lzc(s2_p, 48)
+        self.comb += lzc_p_stmts
+        pn, pn_stmts = _shift_left(s2_p, lzc_p, 47, 48)
+        cn, cn_stmts = _shift_left(Cat(C(0, 24), s2_mc), s2_lzc, 23, 48)
+        self.comb += pn_stmts + cn_stmts
+        s3_pn, s3_cn = Signal(48), Signal(48)
+        s3_wpn, s3_wcn = Signal((11, True)), Signal((11, True))
+        s3_sp, s3_sc, s3_special, s3_sval, s3_pzero, s3_czero = (Signal(), Signal(), Signal(),
+                                                                 Signal(32), Signal(), Signal())
+        self.sync += If(self.ce,
+            s3_pn.eq(pn), s3_cn.eq(cn),
+            s3_wpn.eq(s2_wp - lzc_p), s3_wcn.eq(s2_wc - s2_lzc - 24),
+            s3_sp.eq(s2_sp), s3_sc.eq(s2_sc), s3_special.eq(s2_special), s3_sval.eq(s2_sval),
+            s3_pzero.eq(s2_pzero), s3_czero.eq(s2_czero))
+        # S4: the larger magnitude is the anchor; the other shifts right onto its grid (3 guard
+        # bits below, sticky). Equal weights compare the containers.
+        c_big = Signal()
+        d = Signal((12, True))
+        dist = Signal(7)
+        big, small = Signal(48), Signal(48)
+        wbig = Signal((11, True))
+        self.comb += [
+            c_big.eq(~s3_czero & (s3_pzero | (s3_wcn > s3_wpn) | ((s3_wcn == s3_wpn) & (s3_cn > s3_pn)))),
+            If(c_big,
+                big.eq(s3_cn), small.eq(s3_pn), wbig.eq(s3_wcn), d.eq(s3_wcn - s3_wpn),
+            ).Else(
+                big.eq(s3_pn), small.eq(s3_cn), wbig.eq(s3_wpn), d.eq(s3_wpn - s3_wcn),
+            ),
+            dist.eq(Mux(d > 60, 60, d[:7])),
+        ]
+        sq, sst, sstmts = _shift_right_sticky(Cat(C(0, 3), small), 51, dist, 60, 51)
+        self.comb += sstmts
+        s4_big, s4_small, s4_st = Signal(51), Signal(51), Signal()
+        s4_wbig = Signal((11, True))
+        s4_sub, s4_sign, s4_special, s4_sval, s4_zsign = Signal(), Signal(), Signal(), Signal(32), Signal()
+        self.sync += If(self.ce,
+            s4_big.eq(Cat(C(0, 3), big)), s4_small.eq(sq), s4_st.eq(sst), s4_wbig.eq(wbig),
+            s4_sub.eq(s3_sp ^ s3_sc), s4_sign.eq(Mux(c_big, s3_sc, s3_sp)),
+            s4_special.eq(s3_special), s4_sval.eq(s3_sval),
+            s4_zsign.eq(s3_pzero & s3_czero & s3_sp & s3_sc))
+        # S5: add or subtract (|big| >= |small|).
+        s5_sum = Signal(52)
+        s5_st, s5_sign, s5_special, s5_sval, s5_zsign = Signal(), Signal(), Signal(), Signal(32), Signal()
+        s5_wbig = Signal((11, True))
+        self.sync += If(self.ce,
+            s5_sum.eq(Mux(s4_sub, s4_big - s4_small, s4_big + s4_small)),
+            s5_st.eq(s4_st), s5_sign.eq(s4_sign), s5_special.eq(s4_special), s5_sval.eq(s4_sval),
+            s5_zsign.eq(s4_zsign), s5_wbig.eq(s4_wbig))
+        # S6: the shift to 24 bits: s = max(msb - 23, the subnormal floor), negative = left.
+        # Bit k of the sum weighs 2**(wbig - 3 + k); q's lsb must weigh at least 2**-149.
+        lz, lz_stmts = _lzc(s5_sum, 52)
+        self.comb += lz_stmts
+        s_norm, s_sub, s_sel = Signal((12, True)), Signal((12, True)), Signal((12, True))
+        self.comb += [
+            s_norm.eq(C(28, 12) - lz),                       # (51 - lz) - 23
+            s_sub.eq(C(-146, 12) - s5_wbig),
+            s_sel.eq(Mux(s_norm > s_sub, s_norm, s_sub)),
+        ]
+        s6_sum, s6_s = Signal(52), Signal((12, True))
+        s6_st, s6_sign, s6_special, s6_sval, s6_zero, s6_zsign = (Signal(), Signal(), Signal(),
+                                                                  Signal(32), Signal(), Signal())
+        s6_wbig = Signal((11, True))
+        self.sync += If(self.ce,
+            s6_sum.eq(s5_sum), s6_s.eq(s_sel), s6_st.eq(s5_st), s6_sign.eq(s5_sign),
+            s6_special.eq(s5_special), s6_sval.eq(s5_sval), s6_zero.eq(s5_sum == 0),
+            s6_zsign.eq(s5_zsign), s6_wbig.eq(s5_wbig))
+        # S7: shift to 24 bits + guard + sticky (right), or exactly left.
+        rs = Signal(6)
+        self.comb += rs.eq(Mux(s6_s < 0, 0, Mux(s6_s > 54, 54, s6_s[:6])))
+        sh_q, sh_sticky, sh_case = _shift_right_sticky(Cat(C(0, 1), s6_sum), 53, rs, 54, 25)
+        ls = Signal(5)
+        self.comb += ls.eq(Mux(s6_s < 0, -s6_s, 0))
+        left, left_case = _shift_left(s6_sum, ls, 24, 25)
+        self.comb += [sh_case, left_case]
+        s7_q, s7_g, s7_st, s7_s = Signal(25), Signal(), Signal(), Signal((12, True))
+        s7_sign, s7_special, s7_sval, s7_zero, s7_zsign = Signal(), Signal(), Signal(32), Signal(), Signal()
+        s7_wbig = Signal((11, True))
+        self.sync += If(self.ce,
+            If(s6_s < 0, s7_q.eq(left), s7_g.eq(0), s7_st.eq(0),
+            ).Else(s7_q.eq(sh_q[1:]), s7_g.eq(sh_q[0]), s7_st.eq(sh_sticky | s6_st)),
+            s7_s.eq(s6_s), s7_sign.eq(s6_sign), s7_special.eq(s6_special), s7_sval.eq(s6_sval),
+            s7_zero.eq(s6_zero), s7_zsign.eq(s6_zsign), s7_wbig.eq(s6_wbig))
+        # S8: round, pack. q's lsb weighs 2**(wbig - 3 + s) = 2**(e - 150): e = wbig + s + 147.
+        self.pack = pack = _RoundPack(s7_sign, s7_q[:24], s7_g, s7_st, s7_wbig, s7_s, bias=147)
+        self.sync += If(self.ce, self.r.eq(
+            Mux(s7_special, s7_sval, Mux(s7_zero, Cat(C(0, 31), s7_zsign), pack.word))))
+        reset_less_registers(self)
+
 # FP32 Div/Sqrt ------------------------------------------------------------------------------------
 
 class FP32DivSqrt(LiteXModule):

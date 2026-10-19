@@ -287,6 +287,25 @@ int bns_seq_desc_add(struct bns_seq_descriptor *out, uint32_t a, uint32_t b, uin
     return BNS_SEQ_DESC_OK;
 }
 
+/* Softmax (unit 14) */
+/*-------------------*/
+
+int bns_seq_desc_softmax(struct bns_seq_descriptor *out, uint32_t src, uint32_t n,
+                         uint32_t rows, uint32_t stride)
+{
+    struct bns_seq_descriptor d = {{0}};
+    uint32_t nbeats = (n + 7)/8;
+    if (!out || !sp_address(src, 32) || n == 0 || n > 4096 || rows == 0 || rows > 256
+        || (stride && (stride < nbeats || stride > 0xFFFF)))
+        return BNS_SEQ_DESC_INVALID;
+    d.word[0] = 14;
+    d.word[1] = src;
+    d.word[2] = n | rows << 16;
+    d.word[3] = stride;
+    *out = d;
+    return BNS_SEQ_DESC_OK;
+}
+
 /* Serialization */
 /*---------------*/
 

@@ -140,6 +140,21 @@ def scratchpad_add_descriptor(*, a, b, dst, n):
         raise ValueError("n must be a multiple of 8 in [8, 65528]")
     return [13, a, 0, 0, b, 0, dst, n | 1 << 16] + [0]*8
 
+# Softmax (unit 14) --------------------------------------------------------------------------------
+
+def scratchpad_softmax_descriptor(*, src, n, rows, stride=0):
+    """Unit 14: the attention softmax in place over `rows` rows of `n` FP32 scores at src, rows
+    `stride` beats apart (0 = ceil(n/8)); check seq.softmax_abi major 1 first."""
+    _sp_address("src", src)
+    if not isinstance(n, int) or not 1 <= n <= 4096:
+        raise ValueError("n must be in [1, 4096]")
+    if not isinstance(rows, int) or not 1 <= rows <= 256:
+        raise ValueError("rows must be in [1, 256]")
+    nbeats = (n + 7)//8
+    if not isinstance(stride, int) or stride < 0 or stride > 0xFFFF or (stride and stride < nbeats):
+        raise ValueError("stride must be 0 or at least the row's beats, below 65536")
+    return [14, src, n | rows << 16, stride] + [0]*12
+
 # Projection Restore (unit 8) ----------------------------------------------------------------------
 
 def scratchpad_restore_descriptor(*, src, dst, exponents, elements, adjustment=0):

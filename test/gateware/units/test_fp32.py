@@ -13,7 +13,8 @@ import pytest
 
 from migen import Module, Signal, run_simulation
 
-from gateware.units.fp32 import CANONICAL_NAN, FP32Add, FP32DivSqrt, FP32Mul, FP32ArgmaxTracker
+from gateware.units.fp32 import CANONICAL_NAN, FP32Add, FP32DivSqrt, FP32Fma, FP32Mul, FP32ArgmaxTracker
+from model.rv32_math import fma32
 
 from common import RTL
 from common.verilator import Simulator
@@ -67,11 +68,13 @@ def compiled():
     top.submodules.mul = mul = FP32Mul()
     top.submodules.add = add = FP32Add()
     top.submodules.ds = ds = FP32DivSqrt()
+    top.submodules.fma = fma = FP32Fma()
     ports = {"mul_a": mul.a, "mul_b": mul.b, "mul_r": mul.r, "mul_ce": mul.ce,
              "add_a": add.a, "add_b": add.b, "add_r": add.r, "add_ce": add.ce,
+             "fma_a": fma.a, "fma_b": fma.b, "fma_c": fma.c, "fma_r": fma.r, "fma_ce": fma.ce,
              "ds_a": ds.a, "ds_b": ds.b, "ds_op": ds.op, "ds_start": ds.start, "ds_done": ds.done,
              "ds_r": ds.r}
-    lat = {"mul_latency": FP32Mul.LATENCY, "add_latency": FP32Add.LATENCY}
+    lat = {"mul_latency": FP32Mul.LATENCY, "add_latency": FP32Add.LATENCY, "fma_latency": FP32Fma.LATENCY}
     for name, sig in ports.items():
         sig.name_override = name
     consts = {}
@@ -93,6 +96,40 @@ def test_compiled_operator_equals_ieee(tmp_path, compiled, op, n):
     vec = tmp_path / f"{op}.bin"
     np.stack([a, b, want], axis=1).astype("<u4").tofile(vec)
     run = subprocess.run([str(compiled), op, str(vec)], capture_output=True, text=True, timeout=900)
+    print(run.stdout, run.stderr[-3000:])
+    assert run.returncode == 0, run.stdout + run.stderr[-3000:]
+
+
+def test_compiled_fma_equals_fmaf(tmp_path, compiled):
+    """FP32Fma against the host libm's fmaf (one rounding): random operands of every class with
+    the exp polynomial's shape mixed in (|r| < 0.35, p near 1, the constants), cancellations
+    (c = -(a*b) nearly), tiny products under a normal addend and the reverse."""
+    rng = np.random.default_rng(5)
+    n = 200000
+    a, b = operands(5, n)
+    m = len(a)
+    c = rng.integers(0, 1 << 32, m, dtype=np.uint64).astype(np.uint32)
+    k = n//5
+    fa, fb = a.view(f32), b.view(f32)
+    with np.errstate(all="ignore"):
+        # The polynomial's operands: p in [0.5, 1.5], r in [-0.35, 0.35], c a small constant.
+        a[:k] = rng.uniform(0.5, 1.5, k).astype(f32).view(np.uint32)
+        b[:k] = rng.uniform(-0.35, 0.35, k).astype(f32).view(np.uint32)
+        c[:k] = rng.choice(np.array([1/720, 1/120, 1/24, 1/6, 0.5, 1.0], dtype=f32), k).view(np.uint32)
+        # Near-cancellation: c close to -(a*b).
+        prod = (a[k:2*k].view(f32).astype(np.float64)*b[k:2*k].view(f32).astype(np.float64)).astype(f32)
+        c[k:2*k] = (-prod).view(np.uint32) ^ rng.integers(0, 4, k, dtype=np.uint32)
+        # A product far below the addend, and far above it.
+        c[2*k:3*k] = (a[2*k:3*k].view(f32)*f32(2.0**40)).astype(f32).view(np.uint32)
+        c[3*k:4*k] = (b[3*k:4*k].view(f32)*f32(2.0**-40)).astype(f32).view(np.uint32)
+    want = np.empty(m, dtype=np.uint32)
+    fa, fb, fc = a.view(f32), b.view(f32), c.view(f32)
+    with np.errstate(all="ignore"):
+        for i in range(m):
+            want[i] = canon(fma32(fa[i], fb[i], fc[i]))
+    vec = tmp_path / "fma.bin"
+    np.stack([a, b, c, want], axis=1).astype("<u4").tofile(vec)
+    run = subprocess.run([str(compiled), "fma", str(vec)], capture_output=True, text=True, timeout=900)
     print(run.stdout, run.stderr[-3000:])
     assert run.returncode == 0, run.stdout + run.stderr[-3000:]
 

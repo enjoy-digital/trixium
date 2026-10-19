@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from model.activation import (
+    scratchpad_softmax_descriptor,
     scratchpad_quantize_descriptor, scratchpad_requantize_descriptor, scratchpad_restore_descriptor,
     scratchpad_silu_descriptor, scratchpad_norm_descriptor, scratchpad_conv_descriptor,
     scratchpad_add_descriptor,
@@ -241,3 +242,21 @@ def test_norm_rope_encoder(encoder):
     # rope_n past the segment
     assert encoder.bns_seq_desc_norm(ct.byref(out), 0, 32, 64, 96, 128, 1, 0x358637bd) == 0
     assert encoder.bns_seq_desc_norm_rope(ct.byref(out), 256, 32) == -1
+
+
+def test_softmax_encoder(encoder):
+    """Unit 14: the C encoder and the Python schema agree; invalid arguments leave the output."""
+    encoder.bns_seq_desc_softmax.argtypes = [ct.POINTER(Descriptor)] + [ct.c_uint32]*4
+    out = Descriptor()
+    for src, n, rows, stride in ((0x30000, 37, 16, 0), (0x30000, 256, 16, 32), (32, 1, 1, 0),
+                                 (0x3FFE0, 4096, 256, 512), (0, 8, 4, 4)):
+        assert encoder.bns_seq_desc_softmax(ct.byref(out), src, n, rows, stride) == 0
+        assert list(out.word) == scratchpad_softmax_descriptor(src=src, n=n, rows=rows, stride=stride)
+    for src, n, rows, stride in ((0x30004, 37, 16, 0), (0x30000, 0, 16, 0), (0x30000, 4097, 1, 0),
+                                 (0x30000, 37, 0, 0), (0x30000, 37, 257, 0), (0x30000, 37, 16, 4)):
+        assert encoder.bns_seq_desc_softmax(ct.byref(out), 0x30000, 37, 16, 0) == 0
+        saved = bytes(out)
+        assert encoder.bns_seq_desc_softmax(ct.byref(out), src, n, rows, stride) == -1
+        assert bytes(out) == saved
+        with pytest.raises(ValueError):
+            scratchpad_softmax_descriptor(src=src, n=n, rows=rows, stride=stride)

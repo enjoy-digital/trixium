@@ -81,6 +81,9 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
   conv:   Optional unit 13, serialized; w0 exactly 13, w1..w3 window slots x0..x2, w4 new
           input x3, w5 taps, w6 dst, w7 channels | op << 16 (op 1: dst = x0 + x3, the
           residual add), w8..w15 zero. gateware/units/conv.py.
+  softmax: Optional unit 14, serialized; w0 exactly 14, w1 FP32 src (rows of scores, in
+          place), w2 n | rows << 16, w3 row stride in beats (0 = ceil(n/8)), w4..w15 zero.
+          gateware/units/softmax.py.
 
 Unit 3 returns raw integer rotations; it does not replace a dense rotation or its
 quantization boundary.
@@ -105,6 +108,7 @@ from gateware.units.restore import RESTORE_COMMAND
 from gateware.units.silu import SILU_COMMAND
 from gateware.units.norm import NORM_COMMAND
 from gateware.units.conv import CONV_COMMAND
+from gateware.units.softmax import SOFTMAX_COMMAND
 
 # Sequencer ----------------------------------------------------------------------------------------
 
@@ -112,9 +116,9 @@ class Sequencer(LiteXModule):
     """Descriptor-list executor (see the module doc for the descriptor format)."""
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False,
-                 with_conv=False, norm_rope=True, scratchpad_size=256*1024):
+                 with_conv=False, with_softmax=False, norm_rope=True, scratchpad_size=256*1024):
         extended = (with_hadamard or with_activation_quantize or with_projection_restore or
-                    with_silu or with_norm or with_conv)
+                    with_silu or with_norm or with_conv or with_softmax)
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024
                          or scratchpad_size % 32):
             raise ValueError("Resident sequencer needs an aligned scratchpad within its 13-bit "
@@ -198,6 +202,15 @@ class Sequencer(LiteXModule):
                 "descriptor, bits8..15 conv-client error (bit14 protects the full descriptor "
                 "list).")
             extension_errors.append(self.conv_error)
+        if with_softmax:
+            self.softmax_cmd   = stream.Endpoint(SOFTMAX_COMMAND)
+            self.softmax_done, self.softmax_failed = Signal(), Signal(8)
+            self.softmax_abi   = CSRStatus(32, reset=0x00010000, description="ABI version (16.16).")
+            self.softmax_error = CSRStatus(32, description=
+                "Sticky until cluster reset: bit0 list bounds/alignment, bit1 malformed "
+                "descriptor, bits8..15 softmax-client error (bit14 protects the full descriptor "
+                "list).")
+            extension_errors.append(self.softmax_error)
 
         if with_projection_restore:
             # Appended last: every earlier register keeps its address.
@@ -298,7 +311,7 @@ class Sequencer(LiteXModule):
 
         # Resident unit descriptor checks and command fields.
         had_dispatch, quant_dispatch, restore_dispatch, bad_list = [], [], [], []
-        silu_dispatch, norm_dispatch, conv_dispatch = [], [], []
+        silu_dispatch, norm_dispatch, conv_dispatch, softmax_dispatch = [], [], [], []
         unknown_unit = [NextState("IDLE")]
         if extended:
             list_base = Signal(24, reset_less=True) # Latched at start.
@@ -442,6 +455,20 @@ class Sequencer(LiteXModule):
             conv_dispatch = [If(malformed,
                 NextValue(self.conv_error.status, 2), NextState("EXT_FAILED"),
             ).Else(NextState("DISPATCH_CONV"))]
+        if with_softmax:
+            malformed = Signal()
+            command   = self.softmax_cmd
+            self.comb += [
+                malformed.eq((w0u != 14) | (w(0, 1)[24:] != 0) | (w(0, 3)[16:] != 0) |
+                    reduce(or_, [w(0, i) != 0 for i in range(4, 8)]) | (d1 != 0)),
+                command.src.eq(w(0, 1)[:24]),
+                command.n.eq(w(0, 2)[:16]), command.rows.eq(w(0, 2)[16:32]),
+                command.stride.eq(w(0, 3)[:16]),
+                command.protect_start.eq(list_base), command.protect_end.eq(list_end),
+            ]
+            softmax_dispatch = [If(malformed,
+                NextValue(self.softmax_error.status, 2), NextState("EXT_FAILED"),
+            ).Else(NextState("DISPATCH_SOFTMAX"))]
 
         # Common descriptor fields.
         unit   = Signal(4)
@@ -770,6 +797,7 @@ class Sequencer(LiteXModule):
             ).Elif(unit == 11, *(silu_dispatch if with_silu else unknown_unit)
             ).Elif(unit == 12, *(norm_dispatch if with_norm else unknown_unit)
             ).Elif(unit == 13, *(conv_dispatch if with_conv else unknown_unit)
+            ).Elif(unit == 14, *(softmax_dispatch if with_softmax else unknown_unit)
             ).Else(*unknown_unit)
         )
         if with_hadamard:
@@ -849,7 +877,7 @@ class Sequencer(LiteXModule):
                     NextState("NEXT"),
                 ),
             )
-        for name, enabled in (("norm", with_norm), ("conv", with_conv)):
+        for name, enabled in (("norm", with_norm), ("conv", with_conv), ("softmax", with_softmax)):
             if not enabled:
                 continue
             cmd    = getattr(self, name + "_cmd")
