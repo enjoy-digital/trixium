@@ -158,7 +158,7 @@ class MatVecEngine(LiteXModule):
     """N-channel matvec engine: one AXIReader + ChannelPipe per memory channel (see module doc)."""
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
-                 trit5=False, prefetch=False, reader_fifo_depth=512):
+                 trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8):
         # chan_stride: byte distance between consecutive channels' weight regions. With the
         # HBM AXI switch enabled the address (not the port) selects the pseudo-channel, so
         # each channel needs its own window; 0 when every channel has its own address space.
@@ -322,7 +322,8 @@ class MatVecEngine(LiteXModule):
         for i, axi in enumerate(hbm_axis):
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
             # per round trip); round-robin ARIDs let it pipeline.
-            reader = AXIReader(axi, n_ids=4, fifo_depth=reader_fifo_depth)
+            reader = AXIReader(axi, n_ids=4, fifo_depth=reader_fifo_depth,
+                               max_bursts=reader_max_bursts)
             pipe   = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n)
             setattr(self, f"reader{i}", reader)
             setattr(self, f"pipe{i}",   pipe)

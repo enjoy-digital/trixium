@@ -67,7 +67,7 @@ from trixium_ypcb import VEXII_ARGS as YPCB_VEXII_ARGS, YPCB_HYBRID_UNIT_OPTIONS
 
 from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
-from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats
+from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats, NativePortStats
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 from gateware.memory.ckphase_model import ckphase_model_settings, CKPhasePHYModel, NoDMPHYModel
 from model.bons import BONSReader
@@ -278,7 +278,8 @@ def ddr3_content(k, ram, img, chan_mod, stride, size):
 
 def ddr3_phy(content, size, mapping="ROW_BANK_COL"):
     """The YPCB sim's DDR3 PHY model holding `content`, its banks filled as the controller's
-    address mapping places the words (LiteDRAM's model knows ROW_BANK_COL and ROW_COL_BANK)."""
+    address mapping places the words (a model filled in another mapping than the controller's
+    boots garbage: the firmware sits where the other mapping puts it)."""
     module   = sim_ddr3(size)(DDR3_SIM_FREQ, "1:4")
     settings = ckphase_model_settings(DDR3_SIM_FREQ, 64, DDR3_CL, DDR3_CWL)
     phy      = SDRAMPHYModel(module=module, settings=settings, clk_freq=DDR3_SIM_FREQ,
@@ -293,17 +294,13 @@ def words(content):
 
 def bank_words(content, module, mapping="ROW_BANK_COL"):
     """The init words of each bank of a DDR4/DDR3 PHY model holding `content`: 512-bit words
-    (4 phases x 2 x 64 bits, little-endian) placed as the controller's address mapping does.
-    ROW_BANK_COL: a bank's row (ncols x 8 bytes) at a time; ROW_COL_BANK: consecutive words rotate
-    over the banks (LiteDRAM's ROW_COL_BANK at its one-word bank alignment)."""
+    (4 phases x 2 x 64 bits, little-endian) placed as the controller's address mapping does
+    (ROW_BANK_COL: a bank's row, ncols x 8 bytes, at a time)."""
+    assert mapping == "ROW_BANK_COL", f"{mapping}: the model's init layout is ROW_BANK_COL's"
     g      = module.geom_settings
     nbanks = 2**g.bankbits
     span   = (2**g.colbits)*8
     data   = bytes(content) + bytes(-len(content) % (nbanks*span))
-    if mapping == "ROW_COL_BANK":
-        w = np.frombuffer(data, dtype=np.uint8).reshape(-1, nbanks, 64)
-        return [[int.from_bytes(v.tobytes(), "little") for v in w[:, b, :]] for b in range(nbanks)]
-    assert mapping == "ROW_BANK_COL", mapping
     rows   = np.frombuffer(data, dtype=np.uint8).reshape(-1, nbanks, span)
     inits  = []
     for b in range(nbanks):
@@ -337,7 +334,7 @@ def ddr4_phy(content, dmap=SIM_DDR4_MAP):
 
 class TriXiumSimSoC(SoCCore):
     def __init__(self, image=None, firmware=None, hbm_latency=16, hbm_stall_rate=0,
-                 cpu_type="vexriscv", icache_kb=0, vexii_extra="",
+                 cpu_type="vexriscv", icache_kb=0, vexii_extra="", reader_bursts=8,
                  mem="hbm", n_memctrl=4, update_repo="no",
                  with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False, with_conv=False,
@@ -464,6 +461,7 @@ class TriXiumSimSoC(SoCCore):
             with_prefetch            = bool(prefetch),
             with_vec_fused           = vec_fused,
             reader_fifo_depth        = prefetch or 512,
+            reader_max_bursts        = reader_bursts,
             # An image with 5-trits-per-byte weights needs the unpacker in front of the pipes.
             with_trit5               = img is not None and any(
                 e["kind"] == KIND_TERNARY5 for e in img.entries),
@@ -585,16 +583,20 @@ class TriXiumSimSoC(SoCCore):
             with_bist=ckphase_model, with_stats=True)
 
         # Engine ports: channel c -> controller c // chan_mod.
+        taps, native_taps = [], []
         for k in range(n_memctrl):
             core = self.sdrams[k]
             for j in range(chan_mod):
                 c = k*chan_mod + j
                 axi = AXIInterface(data_width=256, address_width=32, id_width=6)
                 for jj, m in enumerate(engine_ddr_port(core, axi, clock_domain="sys_port",
-                                                       rmw=YPCB_ENGINE_RMW)):
+                                                       rmw=YPCB_ENGINE_RMW, taps=taps,
+                                                       native_taps=native_taps)):
                     setattr(self, f"engport{c}_{jj}", m)
                 memory_ports.append(axi)
-        self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
+        self.engstat  = EnginePortStats(memory_ports)  # console `ddrstat`: the ports' waits
+        self.widestat = EnginePortStats(taps)          # ... the 512-bit words the crossing delivers
+        self.natstat  = NativePortStats(native_taps)   # ... and the native ports' commands
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 
@@ -622,10 +624,7 @@ def ddr3_bank_inits(content, size, mapping="ROW_BANK_COL"):
     n      = -(-len(content)//256)*4
     inits  = []
     for b, words in enumerate(bank_words(content, module, mapping)):
-        if mapping == "ROW_COL_BANK":
-            keep = max(0, -(-(n - b)//nbanks)) # The bank's words below n: b, b + nbanks, ...
-        else:
-            keep = sum(max(0, min(col, n - (r*nbanks + b)*col)) for r in range(len(words)//col))
+        keep = sum(max(0, min(col, n - (r*nbanks + b)*col)) for r in range(len(words)//col))
         inits.append([f"{v:0128x}" for v in words[:keep]])
     return inits
 
@@ -772,6 +771,8 @@ def build_sim(args, board, out_dir):
         soc_kwargs["ckphase_model"] = True
     if args.prefetch:
         soc_kwargs["prefetch"] = args.prefetch
+    if args.reader_bursts:
+        soc_kwargs["reader_bursts"] = args.reader_bursts
     if args.vec_fused:
         soc_kwargs["vec_fused"] = True
     if args.ddr_settings:
@@ -834,6 +835,7 @@ def main():
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
+    parser.add_argument("--reader-bursts",  default=0, type=int, metavar="N",                     help="16-beat bursts a channel reader keeps outstanding (0: the core's default, 8).")
     parser.add_argument("--vec-fused",      action="store_true",                                   help="Vector unit with the fused clamp/round instructions (TRIXIUM_VEC_FUSED).")
     parser.add_argument("--ckphase-model",  action="store_true",                                   help="--board ypcb: the PHY models behind the K7DDRPHY's CK phase CSRs (calibration test: ddrinit 1).")
     parser.add_argument("--ddr-settings",   default=None,                                          help="--board ypcb: controller settings, e.g. read_time=32,write_time=16,refresh_postponing=1 (default: the board's).")

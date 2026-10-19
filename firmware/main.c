@@ -531,6 +531,37 @@ static void ddrstat_cmd(void)
                PCT10(ar, cyc), (unsigned long)ar, PCT10(r, cyc), (unsigned long)r, (unsigned long)wb, (unsigned long)cyc);
     }
 #endif
+#ifdef CSR_WIDESTAT_BASE
+    // The 512-bit side of each engine port, before the clock crossing (the sim): words the
+    // crossing delivered, requests that waited on it, words that waited on the merge.
+    widestat_snap_write(1);
+    uint32_t wcyc = widestat_cycles_read();
+    if (!wcyc) wcyc = 1;
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        widestat_sel_write(c);
+        uint32_t words = widestat_beats_read(), ar = widestat_ar_wait_read(), r = widestat_r_wait_read();
+        printf("  wide %d: %lu words (%lu.%02lu per clock), requests waited %lu.%lu%% (%lu), "
+               "words waited on the merge %lu.%lu%% (%lu); %lu cycles\n", c, (unsigned long)words,
+               (unsigned long)((uint64_t)words*100u/wcyc/100), (unsigned long)((uint64_t)words*100u/wcyc % 100),
+               PCT10(ar, wcyc), (unsigned long)ar, PCT10(r, wcyc), (unsigned long)r, (unsigned long)wcyc);
+    }
+#endif
+#ifdef CSR_NATSTAT_BASE
+    // Each engine channel's native port, in the controller's clock: commands issued, cycles a
+    // command waited on the controller, cycles with nothing to issue, read words returned.
+    natstat_snap_write(1);
+    uint32_t ncyc = natstat_cycles_read();
+    if (!ncyc) ncyc = 1;
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        natstat_sel_write(c);
+        uint32_t iss = natstat_issued_read(), wt = natstat_waited_read(), st = natstat_starved_read();
+        uint32_t rw = natstat_rwords_read();
+        printf("  native %d: %lu read commands (%lu.%lu%% of the cycles), waited on the controller %lu.%lu%% (%lu), "
+               "nothing to issue %lu.%lu%% (%lu), %lu words back; %lu ddr cycles\n", c, (unsigned long)iss,
+               PCT10(iss, ncyc), PCT10(wt, ncyc), (unsigned long)wt, PCT10(st, ncyc), (unsigned long)st,
+               (unsigned long)rw, (unsigned long)ncyc);
+    }
+#endif
 }
 #endif
 

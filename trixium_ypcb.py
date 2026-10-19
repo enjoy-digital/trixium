@@ -53,7 +53,7 @@ from litepcie.software import generate_litepcie_software
 
 from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET, ddr_chan_stride
 from gateware.core.core import TriXiumConfig, TriXiumCore
-from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats
+from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats, NativePortStats
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
@@ -109,25 +109,24 @@ class YPCBDDR3(MT41K256M8):
     speedgrade_timings["default"] = speedgrade_timings["1600"]
 
 
-def ddr_controller_settings(read_time=256, write_time=128, refresh_postponing=1,
-                            address_mapping="ROW_BANK_COL"):
+def ddr_controller_settings(read_time=256, write_time=128, refresh_postponing=1):
     """The controller settings (trixium_sim.py --board ypcb --ddr-settings). Measured on the
     truncated 1.7B (one layer + LM head, decode token): every setting within 0.25 %, the weight
     streams are reads and a token's KV writes are a few beats. Postponing refreshes costs (2:
     +0.1 %, 8: +0.25 %: a burst of refreshes stalls both streams at once); the read/write times
     are neutral here (32/16 to 256/128 within 0.02 %) and 256/128 keeps the writes of longer
     contexts grouped (-0.6 % on a Qwen3.5 decode in openTPU's co-simulation of this card).
-    address_mapping: LiteDRAM's "ROW_BANK_COL" keeps a sequential stream in one bank for a row
-    (8 KB), so an engine channel's stream keeps one bank machine busy and a bank machine issues
-    a read every ~3 DDR cycles: one channel streams at 0.71 beats per clock, two per controller
-    at 0.79 (68% of the controller's cycles carry a read, `ddrstat`, 2026-10-18). "ROW_COL_BANK"
-    (LiteDRAM PR) rotates consecutive words over the banks: every bank machine busy for one
-    stream (--ddr-bank-interleave)."""
+    The address mapping stays LiteDRAM's ROW_BANK_COL: an engine channel's stream keeps one bank
+    machine busy (0.82 beats per clock per channel, two per controller: 68% of the controller's
+    cycles carry a read, `ddrstat` 2026-10-18), and no mapping changes that - the crossbar locks a
+    port to the bank machine holding its queued commands (in-order read data), so a port never
+    has two bank machines working for it; bank bits at the bottom of the address (ROW_COL_BANK,
+    LiteDRAM PR #427, closed) measured 0.27 for one stream and 0.14 for two (every read an
+    activate) in the simulation. The per-port limit is one bank machine's command cadence."""
     return lambda: ControllerSettings(
         read_time          = read_time,
         write_time         = write_time,
-        refresh_postponing = refresh_postponing,
-        address_mapping    = address_mapping)
+        refresh_postponing = refresh_postponing)
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -192,7 +191,7 @@ class TriXiumYPCBSoC(SoCCore):
         hybrid         = False,
         attn_geometry  = YPCB_HYBRID_ATTN + (256, 2048),
         ddr_quiet_regions = False,
-        ddr_bank_interleave = False,
+        reader_bursts  = 8,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -220,22 +219,25 @@ class TriXiumYPCBSoC(SoCCore):
         self.sdrams = []
         self.add_ddr_controllers(platform, ddram_channels, ddr_clk_freq, main_ram_size,
             kwargs.get("l2_size", 8192),
-            ddr_controller_settings(read_time, write_time, refresh_postponing,
-                                    "ROW_COL_BANK" if ddr_bank_interleave else "ROW_BANK_COL"),
+            ddr_controller_settings(read_time, write_time, refresh_postponing),
             ddr_ibuf_hp, ddr_ecc)
         set_main_ram_executable(self)
 
         # TriXium Memory Ports ---------------------------------------------------------------------
         # Engine channel c -> controller c // chan_mod: a 512-bit crossbar port behind an AXI
         # bridge, crossed into sys at the AXI level (memory/ddr.py).
-        memory_ports = []
+        memory_ports, taps, native_taps = [], [], []
         for c in range(engine_channels):
             axi = AXIInterface(data_width=256, address_width=32, id_width=6)
             for j, m in enumerate(engine_ddr_port(self.sdrams[c//chan_mod], axi, clock_domain="sys_port",
-                                                  rmw=ENGINE_RMW)):
+                                                  rmw=ENGINE_RMW, taps=taps, native_taps=native_taps)):
                 setattr(self, f"engport{c}_{j}", m)
             memory_ports.append(axi)
-        self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
+        # Console `ddrstat`: the engine ports' beats and waits, the 512-bit words the crossing
+        # delivers to the merge, the native ports' commands in the controller's clock.
+        self.engstat  = EnginePortStats(memory_ports)
+        self.widestat = EnginePortStats(taps)
+        self.natstat  = NativePortStats(native_taps)
         if ddr_quiet_regions:
             # The matvec engine's streaming datapath (channel pipes, trit decoders, readers,
             # packers) kept out of controller 1's I/O clock regions (banks 16-18 = X0Y5..X0Y7).
@@ -327,6 +329,7 @@ class TriXiumYPCBSoC(SoCCore):
             # before it, into 64 KB reader FIFOs per channel (block RAM).
             with_prefetch     = bool(prefetch),
             reader_fifo_depth = prefetch or 512,
+            reader_max_bursts = reader_bursts,
             # Fused vector instructions (the clamp/round after an ALU op in one instruction).
             with_vec_fused    = vec_fused)
         self.trixium = TriXiumCore(memory_ports, config)
@@ -419,8 +422,8 @@ def main():
     parser.add_target_argument("--ddr-ibuf-low-power", action="store_true",                                   help="DQ/DQS input buffers in low-power mode (Vivado's default; not for sustained reads).")
     parser.add_target_argument("--hybrid",             action="store_true",                                   help="With the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B: DeltaNet/attention streams, FWHT, ...) and a CPU FPU.")
     parser.add_target_argument("--attn-geometry",     default=None,                                          help="Attention stream lanes,groups,hd_max,t_max (default: YPCB_HYBRID_ATTN + 256,2048).")
+    parser.add_target_argument("--reader-bursts",     default=8,        type=int,                            help="16-beat bursts a channel reader keeps outstanding (8: the core's default).")
     parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
-    parser.add_target_argument("--ddr-bank-interleave", action="store_true",                                 help="LiteDRAM ROW_COL_BANK address mapping: consecutive words over the banks (a sequential stream keeps every bank machine busy).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
@@ -454,7 +457,7 @@ def main():
         ddr_ecc            = args.ddr_ecc,
         hybrid             = args.hybrid,
         ddr_quiet_regions  = args.ddr_quiet_regions,
-        ddr_bank_interleave = args.ddr_bank_interleave,
+        reader_bursts      = args.reader_bursts,
         **({"attn_geometry": tuple(int(x) for x in args.attn_geometry.split(","))} if args.attn_geometry else {}),
         **parser.soc_argdict)
     add_zbb_constant(soc, args)

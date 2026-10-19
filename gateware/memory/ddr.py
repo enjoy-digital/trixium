@@ -44,6 +44,7 @@ from migen.fhdl.simplify import FullMemoryWE
 from litex.gen import LiteXModule
 
 from litex.soc.interconnect import csr_bus, wishbone, axi, stream
+from migen.genlib.cdc import PulseSynchronizer
 from litex.soc.interconnect.csr import CSR, CSRStatus, CSRStorage
 from litex.soc.interconnect.axi import AXIInterface, AXIUpConverter
 from litex.soc.integration.soc import SoCRegion, SoCCSRRegion
@@ -97,7 +98,8 @@ class AXICrossing(LiteXModule):
 # Engine DDR Port ----------------------------------------------------------------------------------
 
 def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
-                    r_buffer_depth=256, clock_domain="sys", rmw=False):
+                    r_buffer_depth=256, clock_domain="sys", rmw=False, taps=None,
+                    native_taps=None):
     """Return the modules (to register as submodules) that connect `axi` (the engine channel's
     256-bit AXI) to a `port_width`-bit crossbar port of `core`.
 
@@ -108,6 +110,9 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
     rmw:          read-modify-write the partially-strobed words (a memory without DM pins, the
                   YPCB's DDR3: the 256-bit beats reach the 512-bit word with half strobes, and
                   KV rows of an odd number of beats share words).
+    taps:         a list to receive the wide (port-width) AXI on the engine's side of the
+                  crossing, for statistics (EnginePortStats) on the words the crossing delivers.
+    native_taps:  a list to receive the crossbar port (NativePortStats).
     """
     split = clock_domain != "sys"
     # Split: a native port on the controller's own side (the core renames its sys to ddr),
@@ -122,6 +127,10 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
             mods.append(AXIWide(axi, wide))
         else:
             mods.append(AXIUpConverter(axi, wide))
+    if taps is not None:
+        taps.append(wide)
+    if native_taps is not None:
+        native_taps.append(port)
     if split:
         far = AXIInterface(data_width=port_width, address_width=axi.address_width,
                            id_width=axi.id_width, version=wide.version)
@@ -299,6 +308,45 @@ class EnginePortStats(LiteXModule):
                 inc, count, hold = Signal(), Signal(32), Signal(32)   # inc 1-bit: see DFIStats
                 self.comb += inc.eq(expr)
                 self.sync += If(self.snap.re, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
+                holds[name].append(hold)
+        for name, regs in holds.items():
+            self.comb += getattr(self, name).status.eq(Array(regs)[self.sel.storage])
+
+class NativePortStats(LiteXModule):
+    """Per engine channel, at its LiteDRAM native port (the controller's clock): the read
+    commands issued, the cycles a command waited on the controller (valid, not ready), the
+    cycles the port had no command to offer (the AXI side starving it), the read words returned.
+    The counters run in the controller's domain; `snap` (a sys pulse, synchronised) latches them
+    into hold registers that the sys-domain CSRs read; `sel` picks the channel."""
+    def __init__(self, ports, cd="ddr"):
+        n = len(ports)
+        self.snap    = CSR()
+        self.sel     = CSRStorage(max(1, (n - 1).bit_length()))
+        self.cycles  = CSRStatus(32)
+        self.issued  = CSRStatus(32)   # Read commands accepted by the controller.
+        self.waited  = CSRStatus(32)   # Cycles a command waited (valid & ~ready).
+        self.starved = CSRStatus(32)   # Cycles with no command offered (~valid).
+        self.rwords  = CSRStatus(32)   # Read words returned.
+
+        # # #
+
+        ps = PulseSynchronizer("sys", cd)
+        self.submodules += ps
+        self.comb += ps.i.eq(self.snap.re)
+        snap = ps.o
+        sync = getattr(self.sync, cd)
+        cycles, cyc_hold = Signal(32), Signal(32)
+        sync += If(snap, cyc_hold.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+        self.comb += self.cycles.status.eq(cyc_hold)
+        holds = {name: [] for name in ("issued", "waited", "starved", "rwords")}
+        for port in ports:
+            for name, expr in (("issued",  port.cmd.valid & port.cmd.ready & ~port.cmd.we),
+                               ("waited",  port.cmd.valid & ~port.cmd.ready),
+                               ("starved", ~port.cmd.valid),
+                               ("rwords",  port.rdata.valid)):
+                inc, count, hold = Signal(), Signal(32), Signal(32)
+                self.comb += inc.eq(expr)
+                sync += If(snap, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
                 holds[name].append(hold)
         for name, regs in holds.items():
             self.comb += getattr(self, name).status.eq(Array(regs)[self.sel.storage])
