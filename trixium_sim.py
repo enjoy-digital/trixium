@@ -276,11 +276,13 @@ def ddr3_content(k, ram, img, chan_mod, stride, size):
     return content
 
 
-def ddr3_phy(content, size):
+def ddr3_phy(content, size, mapping="ROW_BANK_COL"):
+    """The YPCB sim's DDR3 PHY model holding `content`, its banks filled as the controller's
+    address mapping places the words (LiteDRAM's model knows ROW_BANK_COL and ROW_COL_BANK)."""
     module   = sim_ddr3(size)(DDR3_SIM_FREQ, "1:4")
     settings = ckphase_model_settings(DDR3_SIM_FREQ, 64, DDR3_CL, DDR3_CWL)
     phy      = SDRAMPHYModel(module=module, settings=settings, clk_freq=DDR3_SIM_FREQ,
-                             init=words(content))
+                             init=words(content), address_mapping=mapping)
     return phy, module
 
 
@@ -289,13 +291,19 @@ def words(content):
     return np.frombuffer(content, dtype="<u4").tolist()
 
 
-def bank_words(content, module):
-    """The init words of each bank of a DDR4 PHY model holding `content` (ROW_BANK_COL: a bank's
-    row is ncols x 8 bytes, its words 4 phases x 2 x 64 bits, little-endian)."""
+def bank_words(content, module, mapping="ROW_BANK_COL"):
+    """The init words of each bank of a DDR4/DDR3 PHY model holding `content`: 512-bit words
+    (4 phases x 2 x 64 bits, little-endian) placed as the controller's address mapping does.
+    ROW_BANK_COL: a bank's row (ncols x 8 bytes) at a time; ROW_COL_BANK: consecutive words rotate
+    over the banks (LiteDRAM's ROW_COL_BANK at its one-word bank alignment)."""
     g      = module.geom_settings
     nbanks = 2**g.bankbits
     span   = (2**g.colbits)*8
     data   = bytes(content) + bytes(-len(content) % (nbanks*span))
+    if mapping == "ROW_COL_BANK":
+        w = np.frombuffer(data, dtype=np.uint8).reshape(-1, nbanks, 64)
+        return [[int.from_bytes(v.tobytes(), "little") for v in w[:, b, :]] for b in range(nbanks)]
+    assert mapping == "ROW_BANK_COL", mapping
     rows   = np.frombuffer(data, dtype=np.uint8).reshape(-1, nbanks, span)
     inits  = []
     for b in range(nbanks):
@@ -557,11 +565,14 @@ class TriXiumSimSoC(SoCCore):
         chan_mod = n_channels//n_memctrl
         assert chan_mod & (chan_mod - 1) == 0
 
-        # Controllers (the board's controller settings unless ddr_settings overrides them).
+        # Controllers (the board's controller settings unless ddr_settings overrides them; the
+        # memory models are filled in the controllers' address mapping).
+        controller_settings = ddr_controller_settings(**ddr_settings) # A factory (one per core).
+        mapping = controller_settings().address_mapping
         self.sdrams, split_phys, split_modules = [], [], []
         for k in range(n_memctrl):
             size = ddr3_size(chan_mod, stride)
-            phy, module = ddr3_phy(ddr3_content(k, ram, img, chan_mod, stride, size), size)
+            phy, module = ddr3_phy(ddr3_content(k, ram, img, chan_mod, stride, size), size, mapping)
             # The board has no DM pins: neither model lets a write mask reach the memory.
             if ckphase_model:
                 phy = CKPhasePHYModel(phy, ideal=(k == 0), **CKPHASE_CHANNEL)
@@ -570,7 +581,7 @@ class TriXiumSimSoC(SoCCore):
             split_phys.append(phy)
             split_modules.append(module)
         add_ddr_domain_controllers(self, split_phys, split_modules, DDR3_SIM_FREQ, MAIN_RAM_SIZE,
-            8192, DDR4_SIM_CSR_WINDOW, controller_settings=ddr_controller_settings(**ddr_settings),
+            8192, DDR4_SIM_CSR_WINDOW, controller_settings=controller_settings,
             with_bist=ckphase_model, with_stats=True)
 
         # Engine ports: channel c -> controller c // chan_mod.
@@ -600,9 +611,9 @@ def bank_inits(content, dmap=SIM_DDR4_MAP):
     return inits
 
 
-def ddr3_bank_inits(content, size):
+def ddr3_bank_inits(content, size, mapping="ROW_BANK_COL"):
     """The init lines of each bank Memory of the YPCB sim's DDR3 PHY model holding `content`
-    (LiteDRAM's ROW_BANK_COL layout of 512-bit words, as bank_words)."""
+    (the controller's address mapping's layout of 512-bit words, as bank_words)."""
     module = sim_ddr3(size)(DDR3_SIM_FREQ, "1:4")
     nbanks = 2**module.geom_settings.bankbits
     col    = 2**module.geom_settings.colbits*8//64 # 512-bit words per bank row.
@@ -610,13 +621,17 @@ def ddr3_bank_inits(content, size):
     # of data_width_bytes 32-bit words (64 words = 256 bytes = four 512-bit words here).
     n      = -(-len(content)//256)*4
     inits  = []
-    for b, words in enumerate(bank_words(content, module)):
-        keep = sum(max(0, min(col, n - (r*nbanks + b)*col)) for r in range(len(words)//col))
+    for b, words in enumerate(bank_words(content, module, mapping)):
+        if mapping == "ROW_COL_BANK":
+            keep = max(0, -(-(n - b)//nbanks)) # The bank's words below n: b, b + nbanks, ...
+        else:
+            keep = sum(max(0, min(col, n - (r*nbanks + b)*col)) for r in range(len(words)//col))
         inits.append([f"{v:0128x}" for v in words[:keep]])
     return inits
 
 
-def rebake_firmware(gateware_dir, image, firmware, n_memctrl, dmap=SIM_DDR4_MAP, mem="ddr4"):
+def rebake_firmware(gateware_dir, image, firmware, n_memctrl, dmap=SIM_DDR4_MAP, mem="ddr4",
+                    mapping="ROW_BANK_COL"):
     """Rewrite the bank init files holding the firmware in a built DDR4/DDR3 simulation (seconds).
 
     The firmware lives in controller 0's memory model: one sim_mem_N.init per bank, read at
@@ -631,7 +646,8 @@ def rebake_firmware(gateware_dir, image, firmware, n_memctrl, dmap=SIM_DDR4_MAP,
         if mem == "ddr3":
             stride = ddr3_stride(img)
             size   = ddr3_size(chan_mod, stride)
-            return ddr3_bank_inits(ddr3_content(0, ram, img, chan_mod, stride, size), size)
+            return ddr3_bank_inits(ddr3_content(0, ram, img, chan_mod, stride, size), size,
+                                   mapping)
         return bank_inits(ddr4_content(0, ram, img, chan_mod, dmap), dmap)
     new   = inits(fw)
     blank = inits(None)
@@ -724,6 +740,14 @@ def build_firmware(out_dir):
         check=True)
 
 
+def ddr_settings_of(arg):
+    """--ddr-settings k=v,...: the controller settings overrides (integers where they parse)."""
+    if not arg:
+        return {}
+    return {k: (int(v) if v.lstrip("-").isdigit() else v) for k, v in
+            (kv.split("=") for kv in arg.split(","))}
+
+
 def build_sim(args, board, out_dir):
     board = dict(board)
     board.pop("engine_channels", None)
@@ -751,8 +775,7 @@ def build_sim(args, board, out_dir):
     if args.vec_fused:
         soc_kwargs["vec_fused"] = True
     if args.ddr_settings:
-        soc_kwargs["ddr_settings"] = {k: int(v) for k, v in
-            (kv.split("=") for kv in args.ddr_settings.split(","))}
+        soc_kwargs["ddr_settings"] = ddr_settings_of(args.ddr_settings)
     csr_csv = os.path.join(out_dir, "csr.csv")
 
     # Headers + LiteX libraries (to build the firmware against; the ROM is the boot stub, no BIOS;
@@ -866,7 +889,9 @@ def main():
             raise SystemExit("--firmware re-bakes the DDR4/DDR3 model memories (--board xcu1525/ypcb): use --build.")
         build_firmware(out_dir)
         rebake_firmware(gateware_dir, args.image, FIRMWARE, board["n_memctrl"],
-            BOARD_DDR4_MAP if args.board_timing else SIM_DDR4_MAP, mem=board["mem"])
+            BOARD_DDR4_MAP if args.board_timing else SIM_DDR4_MAP, mem=board["mem"],
+            mapping=ddr_controller_settings(**ddr_settings_of(args.ddr_settings))().address_mapping
+                    if board["mem"] == "ddr3" else "ROW_BANK_COL")
 
     # Run.
     if args.run:

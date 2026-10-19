@@ -109,17 +109,25 @@ class YPCBDDR3(MT41K256M8):
     speedgrade_timings["default"] = speedgrade_timings["1600"]
 
 
-def ddr_controller_settings(read_time=256, write_time=128, refresh_postponing=1):
+def ddr_controller_settings(read_time=256, write_time=128, refresh_postponing=1,
+                            address_mapping="ROW_BANK_COL"):
     """The controller settings (trixium_sim.py --board ypcb --ddr-settings). Measured on the
     truncated 1.7B (one layer + LM head, decode token): every setting within 0.25 %, the weight
     streams are reads and a token's KV writes are a few beats. Postponing refreshes costs (2:
     +0.1 %, 8: +0.25 %: a burst of refreshes stalls both streams at once); the read/write times
     are neutral here (32/16 to 256/128 within 0.02 %) and 256/128 keeps the writes of longer
-    contexts grouped (-0.6 % on a Qwen3.5 decode in openTPU's co-simulation of this card)."""
+    contexts grouped (-0.6 % on a Qwen3.5 decode in openTPU's co-simulation of this card).
+    address_mapping: LiteDRAM's "ROW_BANK_COL" keeps a sequential stream in one bank for a row
+    (8 KB), so an engine channel's stream keeps one bank machine busy and a bank machine issues
+    a read every ~3 DDR cycles: one channel streams at 0.71 beats per clock, two per controller
+    at 0.79 (68% of the controller's cycles carry a read, `ddrstat`, 2026-10-18). "ROW_COL_BANK"
+    (LiteDRAM PR) rotates consecutive words over the banks: every bank machine busy for one
+    stream (--ddr-bank-interleave)."""
     return lambda: ControllerSettings(
         read_time          = read_time,
         write_time         = write_time,
-        refresh_postponing = refresh_postponing)
+        refresh_postponing = refresh_postponing,
+        address_mapping    = address_mapping)
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -184,6 +192,7 @@ class TriXiumYPCBSoC(SoCCore):
         hybrid         = False,
         attn_geometry  = YPCB_HYBRID_ATTN + (256, 2048),
         ddr_quiet_regions = False,
+        ddr_bank_interleave = False,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -211,7 +220,9 @@ class TriXiumYPCBSoC(SoCCore):
         self.sdrams = []
         self.add_ddr_controllers(platform, ddram_channels, ddr_clk_freq, main_ram_size,
             kwargs.get("l2_size", 8192),
-            ddr_controller_settings(read_time, write_time, refresh_postponing), ddr_ibuf_hp, ddr_ecc)
+            ddr_controller_settings(read_time, write_time, refresh_postponing,
+                                    "ROW_COL_BANK" if ddr_bank_interleave else "ROW_BANK_COL"),
+            ddr_ibuf_hp, ddr_ecc)
         set_main_ram_executable(self)
 
         # TriXium Memory Ports ---------------------------------------------------------------------
@@ -226,17 +237,22 @@ class TriXiumYPCBSoC(SoCCore):
             memory_ports.append(axi)
         self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
         if ddr_quiet_regions:
-            # Experiment (hyb8q): the matvec engine kept out of controller 1's I/O clock regions
-            # (banks 16-18 = X0Y5..X0Y7). On ypcb_hyb8_d100 the read eye of controller 1 under
-            # the engine's 4-channel streams closed (lanes 0-2 without a clean tap, hyb7: 2-3)
-            # while every single-stream pattern stayed clean: is it the fabric's switching next
-            # to the DQ capture? A post-synthesis Pblock (the flattened cell names exist then).
+            # The matvec engine's streaming datapath (channel pipes, trit decoders, readers,
+            # packers) kept out of controller 1's I/O clock regions (banks 16-18 = X0Y5..X0Y7).
+            # On ypcb_hyb8_d100 the read eye of controller 1 under the engine's 4-channel streams
+            # closed (lanes 0-2 without a clean tap, hyb7: 2-3) while every single-stream pattern
+            # stayed clean; the same netlist with the engine Pblocked (hyb8q) had a healthy eye:
+            # the fabric's switching next to the DQ capture. A post-synthesis Pblock (the
+            # flattened cell names exist then). The DeltaNet and attention stream units stay
+            # free: with them inside (hyb10, 85% LUT) the router left 212 nets unrouted.
             platform.toolchain.pre_placement_commands.append(
                 "create_pblock engine_pb")
             platform.toolchain.pre_placement_commands.append(
                 "resize_pblock [get_pblocks engine_pb] -add {{CLOCKREGION_X0Y0:CLOCKREGION_X0Y4 CLOCKREGION_X1Y0:CLOCKREGION_X1Y7}}")
             platform.toolchain.pre_placement_commands.append(
-                "add_cells_to_pblock [get_pblocks engine_pb] [get_cells -hierarchical -filter {{NAME =~ main_matvecengine*}}]")
+                "add_cells_to_pblock [get_pblocks engine_pb] [get_cells -hierarchical -filter "
+                "{{NAME =~ main_matvecengine* && NAME !~ main_matvecengine_deltanetstream* && "
+                "NAME !~ main_matvecengine_attentionstream*}}]")
 
         # PCIe -------------------------------------------------------------------------------------
         self.pcie_phy = S7PCIEPHY(platform, platform.request("pcie_x8"),
@@ -403,7 +419,8 @@ def main():
     parser.add_target_argument("--ddr-ibuf-low-power", action="store_true",                                   help="DQ/DQS input buffers in low-power mode (Vivado's default; not for sustained reads).")
     parser.add_target_argument("--hybrid",             action="store_true",                                   help="With the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B: DeltaNet/attention streams, FWHT, ...) and a CPU FPU.")
     parser.add_target_argument("--attn-geometry",     default=None,                                          help="Attention stream lanes,groups,hd_max,t_max (default: YPCB_HYBRID_ATTN + 256,2048).")
-    parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="Experiment: the matvec engine kept out of controller 1's I/O clock regions (Pblock).")
+    parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
+    parser.add_target_argument("--ddr-bank-interleave", action="store_true",                                 help="LiteDRAM ROW_COL_BANK address mapping: consecutive words over the banks (a sequential stream keeps every bank machine busy).")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
@@ -437,6 +454,7 @@ def main():
         ddr_ecc            = args.ddr_ecc,
         hybrid             = args.hybrid,
         ddr_quiet_regions  = args.ddr_quiet_regions,
+        ddr_bank_interleave = args.ddr_bank_interleave,
         **({"attn_geometry": tuple(int(x) for x in args.attn_geometry.split(","))} if args.attn_geometry else {}),
         **parser.soc_argdict)
     add_zbb_constant(soc, args)
