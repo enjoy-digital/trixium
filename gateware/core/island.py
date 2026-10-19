@@ -48,7 +48,9 @@ class _UnpackerPorts:
                                       # starts its unpacker from the pipe's synchronized pulse.
 
 class PipeIsland(LiteXModule):
-    def __init__(self, cd, trit5=False, in_depth=32, out_depth=16, **pipe_kwargs):
+    def __init__(self, cd, trit5=False, in_depth=32, out_depth=16, in_cd="sys", **pipe_kwargs):
+        # in_cd: the domain the memory beats arrive in (`sink`): the engine's, or the readers'
+        # when they run in the memory's clock (ReaderIsland).
         pipe = ChannelPipe(xw_cd="xw", **pipe_kwargs)
         # The engine's view (its own clock domain): the same signals as ChannelPipe's.
         self.kind        = Signal.like(pipe.kind)
@@ -98,7 +100,7 @@ class PipeIsland(LiteXModule):
             pipe.start.eq(ps.o),
         ]
         # Beats in (memory beats), through the unpacker when the build has it, results out.
-        self.fifo_in  = fi = ClockDomainsRenamer({"write": "sys", "read": cd})(
+        self.fifo_in  = fi = ClockDomainsRenamer({"write": in_cd, "read": cd})(
             stream.AsyncFIFO(pipe.sink.description, in_depth))
         self.fifo_out = fo = ClockDomainsRenamer({"write": cd, "read": "sys"})(
             stream.AsyncFIFO(pipe.source.description, out_depth))

@@ -54,9 +54,11 @@ from litedram.frontend.axi import LiteDRAMAXI2Native
 from litedram.frontend.wishbone import LiteDRAMWishbone2Native
 from litedram.frontend.bist import LiteDRAMBISTGenerator, LiteDRAMBISTChecker
 
-from gateware.memory.axi import AXIWide
+from gateware.memory.axi import AXIWide, AXIReadMerge, AXIWriteMerge
 
 # AXI Crossing -------------------------------------------------------------------------------------
+
+AXI_CHANNELS = ("aw", "w", "b", "ar", "r")
 
 class AXICrossing(LiteXModule):
     """An AXI interface from cd_from to cd_to: LiteX's AXIClockDomainCrossing (one buffered async
@@ -73,33 +75,47 @@ class AXICrossing(LiteXModule):
     clock-to-out, and its ready computes the RAM's next read address. Without them, a bridge
     with read-modify-write runs a W FIFO's strobes through its partial-write detect, the RMW
     request and the command into the AW FIFO's read address in one ddr cycle."""
-    def __init__(self, master, slave, cd_from, cd_to, depth=16, register=False):
+    def __init__(self, master, slave, cd_from, cd_to, depth=16, register=False,
+                 channels=AXI_CHANNELS):
+        # channels: the AXI channels crossed (the others are left to the caller: a write-only
+        # crossing when the reads reach the memory in its own domain, engine_ddr_port read_axi).
         # # #
 
         mid = slave
         if register:
             mid = AXIInterface(data_width=slave.data_width, address_width=slave.address_width,
                                id_width=slave.id_width, version=slave.version)
-        self.cdc = axi.AXIClockDomainCrossing(master, mid, cd_from, cd_to, depth=depth,
-                                              buffered=True)
+        if set(channels) == set(AXI_CHANNELS):
+            self.cdc = axi.AXIClockDomainCrossing(master, mid, cd_from, cd_to, depth=depth,
+                                                  buffered=True)
+        else:
+            # LiteX's crossing, channel by channel (the same FIFOs).
+            for ch in channels:
+                fwd = ch in ("aw", "w", "ar")
+                m_ep, s_ep = getattr(master, ch), getattr(mid, ch)
+                cdc = stream.ClockDomainCrossing(m_ep.description, cd_from if fwd else cd_to,
+                                                 cd_to if fwd else cd_from, depth=depth, buffered=True)
+                self.add_module(f"{ch}_cdc", cdc)
+                self.comb += ([m_ep.connect(cdc.sink), cdc.source.connect(s_ep)] if fwd else
+                              [s_ep.connect(cdc.sink), cdc.source.connect(m_ep)])
         if register:
             for ch in ("aw", "w", "ar"):
+                if ch not in channels:
+                    continue
                 buf = stream.Buffer(getattr(mid, ch).description, pipe_valid=True, pipe_ready=True)
                 self.add_module(f"{ch}_slice", ClockDomainsRenamer(cd_to)(buf))
                 self.comb += [
                     getattr(mid, ch).connect(buf.sink),
                     buf.source.connect(getattr(slave, ch)),
                 ]
-            self.comb += [
-                slave.b.connect(mid.b),
-                slave.r.connect(mid.r),
-            ]
+            self.comb += [getattr(slave, ch).connect(getattr(mid, ch))
+                          for ch in ("b", "r") if ch in channels]
 
 # Engine DDR Port ----------------------------------------------------------------------------------
 
 def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
                     r_buffer_depth=256, clock_domain="sys", rmw=False, taps=None,
-                    native_taps=None):
+                    native_taps=None, read_axi=None):
     """Return the modules (to register as submodules) that connect `axi` (the engine channel's
     256-bit AXI) to a `port_width`-bit crossbar port of `core`.
 
@@ -113,8 +129,14 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
     taps:         a list to receive the wide (port-width) AXI on the engine's side of the
                   crossing, for statistics (EnginePortStats) on the words the crossing delivers.
     native_taps:  a list to receive the crossbar port (NativePortStats).
+    read_axi:     split only: the channel's read-only 256-bit AXI in the controller's `ddr`
+                  domain (EngineResetDomain read_masters); its reads are merged in that domain
+                  straight into the bridge, only the writes of `axi` cross (AXICrossing on
+                  aw/w/b). `taps` then receive the ddr-side wide AXI (EnginePortStats cd="ddr").
     """
     split = clock_domain != "sys"
+    assert read_axi is None or (split and merge and port_width != len(axi.r.data)), \
+        "read_axi needs the split domain and the merged wide port"
     # Split: a native port on the controller's own side (the core renames its sys to ddr),
     # the bridge there too, and the AXI crossing into it (AXICrossing).
     port = core.crossbar.get_port(data_width=port_width)
@@ -123,18 +145,26 @@ def engine_ddr_port(core, axi, port_width=512, merge=True, w_buffer_depth=64,
     if port_width != len(axi.r.data):
         wide = AXIInterface(data_width=port_width, address_width=axi.address_width,
                             id_width=axi.id_width)
-        if merge:
+        if read_axi is not None:
+            mods.append(AXIWriteMerge(axi, wide))     # The writes only: the reads merge in ddr.
+        elif merge:
             mods.append(AXIWide(axi, wide))
         else:
             mods.append(AXIUpConverter(axi, wide))
-    if taps is not None:
+    if taps is not None and read_axi is None:
         taps.append(wide)
     if native_taps is not None:
         native_taps.append(port)
     if split:
         far = AXIInterface(data_width=port_width, address_width=axi.address_width,
                            id_width=axi.id_width, version=wide.version)
-        mods.append(AXICrossing(wide, far, "sys", "ddr", register=True))
+        if read_axi is None:
+            mods.append(AXICrossing(wide, far, "sys", "ddr", register=True))
+        else:
+            mods.append(AXICrossing(wide, far, "sys", "ddr", register=True, channels=("aw", "w", "b")))
+            mods.append(ClockDomainsRenamer("ddr")(AXIReadMerge(read_axi, far)))
+            if taps is not None:
+                taps.append(far)
         wide = far
     bridge = LiteDRAMAXI2Native(wide, port, w_buffer_depth=w_buffer_depth,
                                 r_buffer_depth=r_buffer_depth, with_read_modify_write=rmw)
@@ -285,7 +315,9 @@ class EnginePortStats(LiteXModule):
     read requests waited on the memory side, the cycles read data waited on the engine, the
     write beats it sent. `sel` picks the channel the counts show; `snap` latches every
     channel's and restarts them (two snaps bracket a workload)."""
-    def __init__(self, axis):
+    def __init__(self, axis, cd="sys"):
+        # cd: the interfaces' clock domain when not sys (the counters run there, `snap` crosses
+        # as NativePortStats'; the holds are read at rest).
         n = len(axis)
         self.snap    = CSR()
         self.sel     = CSRStorage(max(1, (n - 1).bit_length()))
@@ -297,8 +329,20 @@ class EnginePortStats(LiteXModule):
 
         # # #
 
+        snap = self.snap.re
+        if cd != "sys":
+            ps = PulseSynchronizer("sys", cd)
+            self.submodules += ps
+            self.comb += ps.i.eq(self.snap.re)
+            snap = ps.o
+        sync = self.sync if cd == "sys" else getattr(self.sync, cd)
         cycles = Signal(32)
-        self.sync += If(self.snap.re, self.cycles.status.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+        if cd == "sys":
+            sync += If(snap, self.cycles.status.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+        else:
+            cyc_hold = Signal(32)
+            sync += If(snap, cyc_hold.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+            self.comb += self.cycles.status.eq(cyc_hold)
         holds = {name: [] for name in ("beats", "ar_wait", "r_wait", "wbeats")}
         for axi_if in axis:
             for name, expr in (("beats",   axi_if.r.valid & axi_if.r.ready),
@@ -307,7 +351,7 @@ class EnginePortStats(LiteXModule):
                                ("wbeats",  axi_if.w.valid & axi_if.w.ready)):
                 inc, count, hold = Signal(), Signal(32), Signal(32)   # inc 1-bit: see DFIStats
                 self.comb += inc.eq(expr)
-                self.sync += If(self.snap.re, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
+                sync += If(snap, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
                 holds[name].append(hold)
         for name, regs in holds.items():
             self.comb += getattr(self, name).status.eq(Array(regs)[self.sel.storage])

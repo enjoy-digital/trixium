@@ -64,6 +64,8 @@ class TriXiumConfig:
     reader_fifo_depth: int         = 512   # Beats buffered per channel reader (the prefetch's reach).
     reader_max_bursts: int         = 8     # 16-beat bursts a channel reader keeps outstanding.
     pipe_clk: str                  = ""    # The channel pipes' own clock domain (PipeIsland), "": the engine's.
+    readers_cd: str                = ""    # The memory's clock domain the channel readers run in (ReaderIsland, on
+                                           # the core's read_ports), "": the engine's. Requires pipe_clk.
     with_axpy: bool                = True  # Engine op 4 (weighted-V accumulate, the Qwen3 attention): the
                                            # pipes' shifters, accumulators and drain; off in hybrid builds.
     with_vec_fused: bool           = False # Vector unit: fused clamp/round instructions (asm.fuse).
@@ -88,6 +90,8 @@ class TriXiumConfig:
             raise ValueError("scratchpad must contain a whole number of 32-byte beats")
         if self.loader_data_width not in (32, 64, 128, 256):
             raise ValueError("upload stream width must divide 256 bits")
+        if self.readers_cd and not self.pipe_clk:
+            raise ValueError("readers in the memory's domain need the pipe clock island (pipe_clk)")
 
 # TriXium Core -------------------------------------------------------------------------------------
 
@@ -97,6 +101,9 @@ class TriXiumCore(LiteXModule):
     Standard interfaces, the whole contract with a target:
     - ``memory_ports``: one 256-bit AXI master per engine channel, in sys (the target does
       any clock-domain crossing and maps each port onto its memory: DDR4, HBM, a model).
+    - ``read_ports`` (config.readers_cd): one read-only 256-bit AXI master per channel in the
+      memory's own clock domain (``clock_domain`` attribute = readers_cd), the channel readers'
+      path (gateware/core/reader_island.py); ``memory_ports`` then carry the writes only.
     - ``bus``: a 32-bit wishbone slave onto the scratchpad (the CPU's window).
     - ``upload``: a 128-bit stream sink for weight uploads (the host's PCIe DMA).
     - ``constants``: the firmware-visible feature constants, for ``soc.add_constant``.
@@ -104,7 +111,7 @@ class TriXiumCore(LiteXModule):
     The CSRs (engine, sequencer, vector unit, loader, scratchpad peek) are this module's.
     Commands and upload/store use the stride/mod/skew channel placement.
     """
-    def __init__(self, memory_ports, config=TriXiumConfig()):
+    def __init__(self, memory_ports, config=TriXiumConfig(), read_ports=None):
         self.constants = {}
         ports = list(memory_ports)
         if not 1 <= len(ports) <= 31:
@@ -116,6 +123,18 @@ class TriXiumCore(LiteXModule):
                 raise ValueError("cluster memory ports require 256-bit AXI, >=32-bit addresses")
             if getattr(port, "clock_domain", "sys") != "sys":
                 raise ValueError("memory ports need target-side CDC into sys")
+        rports = None
+        if config.readers_cd:
+            rports = list(read_ports or [])
+            if len(rports) != len(ports):
+                raise ValueError("readers_cd needs one read port per memory port")
+            for port in rports:
+                if port.data_width != 256 or port.address_width < 32:
+                    raise ValueError("read ports require 256-bit AXI, >=32-bit addresses")
+                if getattr(port, "clock_domain", "sys") != config.readers_cd:
+                    raise ValueError(f"read ports must be in the readers' domain ({config.readers_cd})")
+        elif read_ports:
+            raise ValueError("read ports need config.readers_cd")
 
         # # #
 
@@ -125,9 +144,12 @@ class TriXiumCore(LiteXModule):
         if config.with_sp_csr:
             sp_csr = self.scratchpad.add_csr_port()
             self.sp_csr = sp_csr
-        self.engrst = EngineResetDomain(ports, pipe_clk=config.pipe_clk or None)
+        self.engrst = EngineResetDomain(ports, pipe_clk=config.pipe_clk or None,
+                                        read_axis=rports, read_clk=config.readers_cd or None)
         axis = self.engrst.masters
         self.add_constant("TRIXIUM_HAS_ENGRESET")
+        if config.readers_cd:
+            self.add_constant("TRIXIUM_READERS_CD")
 
         # Sequencer (the descriptor lists of both paths) and the vector unit. A hybrid-only
         # bitstream drops the vector unit (with_vecunit=False: 34k LUTs on the K7, which the
@@ -242,6 +264,8 @@ class TriXiumCore(LiteXModule):
             reader_max_bursts = config.reader_max_bursts,
             axpy       = config.with_axpy,
             pipe_cd    = "peng" if config.pipe_clk else None,
+            readers_cd = "reng" if config.readers_cd else None,
+            read_axis  = self.engrst.read_masters if config.readers_cd else None,
             **placement))
         if config.with_trit5:
             self.add_constant("TRIXIUM_HAS_TRIT5")

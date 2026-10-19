@@ -196,6 +196,71 @@ def test_matvec_trit5_island(phase):
     assert np.array_equal(_i32(r.reads["ra2"]), a[3]), "tensor A after the fetch"
     assert r.reads["fetched"] == payloads[1][:128]
 
+@pytest.mark.parametrize("phase", [0] + [pytest.param(p, marks=pytest.mark.slow) for p in range(1, 12)])
+def test_matvec_trit5_reader_island(phase):
+    """ReaderIsland (gateware/core/reader_island.py) under PipeIsland: the readers in the memory's
+    clock domain (`ddr`, the models there too), the pipes in theirs, the engine in sys; Migen
+    backend at periods 70 / 60 / 56 (100 : 116.7 : 125 MHz; the alignments repeat every
+    12 sys cycles, `phase` walks them). Two trit5 tensors back to back, a FETCH between (one
+    channel's command FIFO fuller than the others': a duplicate command would wedge or corrupt),
+    a prefetch then its matvec, two back-to-back FETCHes on different channels (the steering
+    level's race), the first tensor again: every result exact, no sticky error, no prefetch
+    mismatch."""
+    n = 2
+    a = _trit5_case(n, 6, 2048, 31)
+    b = _trit5_case(n, 4, 1024, 32)
+    off_b = (max(len(sh) for sh in a[0]) + 31)//32*32
+    payloads = [sa.ljust(off_b, b"\0") + sb for sa, sb in zip(a[0], b[0])]
+    sp    = a[1].tobytes().ljust(0x1000, b"\0") + b[1].tobytes()
+    cmd_a = dict(a[2], xsrc=0, dst=0x4000)
+    cmd_b = dict(b[2], wbase=off_b, xsrc=0x1000, dst=0x5000)
+    s = Script()
+    s.step(phase)
+    submit(s, cmd_a)
+    s.wait("done", cap=50000, tag="a")
+    submit(s, cmd_b)                                       # Back to back.
+    s.wait("done", cap=50000, tag="b")
+    submit(s, dict(kind=2, chan=1, wbase=0, wlen=4, dst=0x7000), fields=CMD_FIELDS)
+    s.wait("done", cap=5000, tag="fetch")
+    # A prefetch (kind 7) of tensor B, then B itself (served from the prefetched beats).
+    submit(s, dict(cmd_b, kind=7, dst=0x5000))
+    s.wait("done", cap=5000, tag="pf")
+    s.step(phase + 40)
+    submit(s, dict(cmd_b, dst=0x8000))
+    s.wait("done", cap=50000, tag="b2")
+    # Two FETCHes back to back on different channels.
+    submit(s, dict(kind=2, chan=0, wbase=off_b, wlen=4, dst=0x9000), fields=CMD_FIELDS)
+    s.wait("done", cap=5000, tag="fetch0")
+    submit(s, dict(kind=2, chan=1, wbase=off_b, wlen=4, dst=0x9800), fields=CMD_FIELDS)
+    s.wait("done", cap=5000, tag="fetch1")
+    s.step(phase)
+    submit(s, dict(cmd_a, dst=0x6000))
+    s.wait("done", cap=50000, tag="a2")
+    s.step(4)
+    s.peek("error")
+    s.peek("pf_mismatch")
+    s.peek("pf_hits")
+    s.read("sp", 0x4000, 4*len(a[3]), "ra")
+    s.read("sp", 0x5000, 4*len(b[3]), "rb")
+    s.read("sp", 0x8000, 4*len(b[3]), "rb2")
+    s.read("sp", 0x6000, 4*len(a[3]), "ra2")
+    s.read("sp", 0x7000, 128, "fetched")
+    s.read("sp", 0x9000, 128, "fetched0")
+    s.read("sp", 0x9800, 128, "fetched1")
+    bench = EngineBench(n, xbuf_groups=32, trit5=True, axpy=False, pipe_cd="peng", readers_cd="ddr",
+                        prefetch=True)
+    r = bench.run("migen", s, sp=sp, payloads=payloads, clocks={"sys": 70, "ddr": 60, "peng": 56})
+    assert r.peeks["error"] == 0
+    assert r.peeks["pf_mismatch"] == 0
+    assert r.peeks["pf_hits"] == 1
+    assert np.array_equal(_i32(r.reads["ra"]),  a[3]), "tensor A"
+    assert np.array_equal(_i32(r.reads["rb"]),  b[3]), "tensor B after A"
+    assert np.array_equal(_i32(r.reads["rb2"]), b[3]), "tensor B from the prefetch"
+    assert np.array_equal(_i32(r.reads["ra2"]), a[3]), "tensor A after the fetches"
+    assert r.reads["fetched"]  == payloads[1][:128]
+    assert r.reads["fetched0"] == payloads[0][off_b:off_b + 128]
+    assert r.reads["fetched1"] == payloads[1][off_b:off_b + 128]
+
 @COMPILED
 def test_matvec_trit5_padded_stalls(backend):
     # K = 384: 3 groups in 78 bytes, each row padded to a whole beat; stalls desynchronize the

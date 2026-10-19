@@ -53,14 +53,32 @@ def test_compiled_system_reset_reaches_registered_engine_domain():
 
 class _DUT(LiteXModule):
     """Scratchpad + engine + loader in the reset domain, on HBMChannelModels (backend "migen")
-    or C++ AXI slaves (common.verilator.ChannelModel)."""
-    def __init__(self, n_channels, chan_payloads, sp_init, backend="migen"):
+    or C++ AXI slaves (common.verilator.ChannelModel).
+
+    split: the readers in the memory's own clock domain (`ddr`, reset-less here: the simulator
+    clocks it) on read-only ports the models serve from that domain, the pipes in theirs
+    (`pipeclk`), the loader's writes on the sys-side ports (EngineResetDomain read_axis /
+    read_clk, ReaderIsland, PipeIsland); the models' AXI then carries reads only (the loader
+    is not exercised): Migen backend."""
+    def __init__(self, n_channels, chan_payloads, sp_init, backend="migen", split=False):
         axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                 for _ in range(n_channels)]
         self.scratchpad = Scratchpad(size=64*1024, init=sp_init)
-        self.engrst = EngineResetDomain(axis, hold_cycles=16, stuck_cycles=4000)
-        self.engine = ClockDomainsRenamer("eng")(
-            MatVecEngine(self.scratchpad, self.engrst.masters))
+        if split:
+            assert backend == "migen"
+            self.clock_domains += [ClockDomain("ddr", reset_less=True),
+                                   ClockDomain("pipeclk", reset_less=True)]
+            raxis = [AXIInterface(data_width=256, address_width=33, id_width=6)
+                     for _ in range(n_channels)]
+            self.engrst = EngineResetDomain(axis, hold_cycles=16, stuck_cycles=4000,
+                                            pipe_clk="pipeclk", read_axis=raxis, read_clk="ddr")
+            self.engine = ClockDomainsRenamer("eng")(
+                MatVecEngine(self.scratchpad, self.engrst.masters, pipe_cd="peng",
+                             readers_cd="reng", read_axis=self.engrst.read_masters))
+        else:
+            self.engrst = EngineResetDomain(axis, hold_cycles=16, stuck_cycles=4000)
+            self.engine = ClockDomainsRenamer("eng")(
+                MatVecEngine(self.scratchpad, self.engrst.masters))
         self.loader = ClockDomainsRenamer("eng")(Loader(self.engrst.masters))
         self.comb += [
             self.engine.store_cmd.connect(self.loader.store_cmd),
@@ -68,17 +86,25 @@ class _DUT(LiteXModule):
             self.engine.store_busy.eq(self.loader.store_busy),
         ]
         self.backend = backend
+        self.split   = split
         self.models  = []
-        for i, axi in enumerate(axis):
+        for i, axi in enumerate(raxis if split else axis):
             model = HBMChannelModel if backend == "migen" else ChannelModel
             m = model(axi, size=64*1024, init=words_from_bytes(chan_payloads[i]), latency=6)
+            if split:
+                m = ClockDomainsRenamer("ddr")(m)
             if backend == "migen":
                 setattr(self, f"model{i}", m)
             self.models.append(m)
 
 
 def _run(dut, generator):
-    run(dut, generator, dut.backend, clocks={"sys": 10, "eng": 10}, channels=dut.models)
+    clocks = {"sys": 10, "eng": 10}
+    if dut.split:   # 100 : 116.7 : 125 MHz on integer half periods (the YPCB's ratios). Migen's
+        # simulator ticks the listed domains only: the derived ones (eng = sys, reng = ddr, peng =
+        # pipeclk, their clocks wired by comb) need their period here.
+        clocks = {"sys": 70, "eng": 70, "ddr": 60, "reng": 60, "pipeclk": 56, "peng": 56}
+    run(dut, generator, dut.backend, clocks=clocks, channels=dut.models)
 
 
 def _submit(dut, cmd):
@@ -108,8 +134,12 @@ def _results(dut, dst, n):
     return np.array(out, dtype=np.int64)
 
 
-@pytest.mark.parametrize("backend", ["verilator", pytest.param("migen", marks=pytest.mark.slow)])
-def test_engreset_recovers_a_wedged_matvec(backend):
+@pytest.mark.parametrize("backend,split", [("verilator", False),
+                                           pytest.param("migen", False, marks=pytest.mark.slow),
+                                           ("migen", True)])
+def test_engreset_recovers_a_wedged_matvec(backend, split):
+    """split: the readers in the memory's domain (ReaderIsland): the wedge, the drain across
+    the domains (the read shims in `ddr`, hold and busy crossed), the bit-exact re-run."""
     n_channels, rows_per_chan, cols = 2, 8, 256
     rng    = np.random.default_rng(7)
     M      = n_channels*rows_per_chan
@@ -128,13 +158,14 @@ def test_engreset_recovers_a_wedged_matvec(backend):
         row0, nrows = layout.shard_rows(M, n_channels, c)
         payloads.append(encode_rows(spec, row0, nrows).tobytes())
     dst = 0x4000
-    dut = _DUT(n_channels, payloads, words_from_bytes(x8.tobytes()), backend)
+    dut = _DUT(n_channels, payloads, words_from_bytes(x8.tobytes()), backend, split=split)
     cmd = dict(kind=0, rows=rows_per_chan, cols=cols, wbase=0,
                wlen=rows_per_chan*layout.row_beats(cols, layout.KIND_TERNARY),
                sbeats=layout.scale_beats(cols, layout.KIND_TERNARY),
                cbeats=layout.code_beats(cols, layout.KIND_TERNARY),
                bias=B, rshift=R, xsrc=0, dst=dst)
     out = {}
+    busy_dips = []   # split: busy must not dip between the trigger and the drain's end.
 
     def gen():
         # 1. A clean run.
@@ -170,6 +201,26 @@ def test_engreset_recovers_a_wedged_matvec(backend):
             yield
         out["drained"] = not (yield dut.engrst.busy)
         out["stuck"] = (yield dut.engrst.stuck)
+        if split:
+            # Monotone busy: trigger again (nothing in flight), watch busy from the trigger to
+            # the end of the drain: no dip while reng is still in reset.
+            yield dut.engrst.trigger.eq(1)
+            yield
+            yield dut.engrst.trigger.eq(0)
+            seen_busy = False
+            for _ in range(400):
+                b = (yield dut.engrst.busy)
+                if b:
+                    seen_busy = True
+                elif seen_busy:
+                    busy_dips.append(1)   # busy went down...
+                    for _ in range(40):
+                        if (yield dut.engrst.busy):
+                            busy_dips.append(2)   # ...and up again: a dip.
+                            break
+                        yield
+                    break
+                yield
         # 4. The same op again is bit-exact: no stale beat reached the pipes.
         yield from _submit(dut, cmd)
         assert (yield from _wait_done(dut))
@@ -184,6 +235,7 @@ def test_engreset_recovers_a_wedged_matvec(backend):
     assert out["drained"] and not out["stuck"]
     assert out["error"] == 0
     assert np.array_equal(out["second"], expected), "stale beats after the reset"
+    assert busy_dips != [1, 2], "busy dipped before the drain ended (reng still in reset)"
 
 
 def test_engreset_reports_a_port_that_never_answers():

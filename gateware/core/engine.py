@@ -33,6 +33,7 @@ from litex.soc.interconnect import stream
 from gateware.memory.axi import AXIReader
 from gateware.core.pipe import ChannelPipe
 from gateware.core.island import PipeIsland
+from gateware.core.reader_island import ReaderIsland
 from gateware.core.trit5 import Trit5Unpacker
 from gateware.units.deltanet_stream import DeltaNetStream
 from gateware.units.attention_stream import AttentionStream
@@ -160,7 +161,11 @@ class MatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
                  trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8,
-                 axpy=True, pipe_cd=None):
+                 axpy=True, pipe_cd=None, readers_cd=None, read_axis=None):
+        # readers_cd/read_axis: the channels' readers in the memory's clock domain on these
+        # read-only AXI ports (gateware/core/reader_island.py; requires pipe_cd: the weight
+        # beats go from that domain into the pipe island's FIFO). hbm_axis then only counts the
+        # channels (the loader writes through them).
         # chan_stride: byte distance between consecutive channels' weight regions. With the
         # HBM AXI switch enabled the address (not the port) selects the pseudo-channel, so
         # each channel needs its own window; 0 when every channel has its own address space.
@@ -321,7 +326,55 @@ class MatVecEngine(LiteXModule):
         at_chan = Signal(max=max(2, len(hbm_axis))) # The merge's current channel.
         at_take = Signal() # The merged beat is accepted this cycle.
         rsrc_valids, rsrc_datas = [], []
+        if readers_cd:
+            assert pipe_cd and read_axis is not None and len(read_axis) == n
         for i, axi in enumerate(hbm_axis):
+            if readers_cd:
+                # The reader in the memory's domain, the pipe island fed from there; the engine
+                # sees the FETCH / DeltaNet / attention beats (`source`) and steers by two levels.
+                reader = ReaderIsland(readers_cd, read_axis[i], n_ids=4, fifo_depth=reader_fifo_depth,
+                                      max_bursts=reader_max_bursts)
+                pipe = PipeIsland(pipe_cd, in_cd=readers_cd, trit5=trit5, xbuf_groups=xbuf_groups,
+                                  chan_id=i, n_channels=n, axpy=axpy)
+                setattr(self, f"reader{i}", reader)
+                setattr(self, f"pipe{i}",   pipe)
+                self.comb += reader.wsource.connect(pipe.sink)
+                if trit5:
+                    self.unpackers.append(pipe.unp)
+                read_cmds.append(reader.sink)
+                rsrc = reader.source
+                is_fetch = Signal(name=f"is_fetch{i}")
+                self.sync += is_fetch.eq(fetch_mode & (fetch_chan == i))
+                is_dn = C(0, 1)
+                if dnstream:
+                    is_dn = Signal(name=f"is_dn{i}")
+                    self.sync += is_dn.eq(dn_mode)
+                    self.comb += [
+                        dn.sinks[i].valid.eq(rsrc.valid & is_dn),
+                        dn.sinks[i].data.eq(rsrc.data),
+                    ]
+                is_at = C(0, 1)
+                if attnstream:
+                    is_at = Signal(name=f"is_at{i}")
+                    self.sync += is_at.eq(at_mode)
+                consume = C(1, 1)
+                if prefetch:
+                    consume = Signal(name=f"consume{i}")
+                    self.sync += consume.eq(run_state)
+                self.comb += [
+                    reader.misc.eq(is_fetch | is_dn | is_at),
+                    reader.consume.eq(consume),
+                    rsrc.ready.eq((is_fetch & fetch_rdy)
+                                  | (is_dn & (dn.sinks[i].ready if dnstream else 0))
+                                  | (is_at & at_take & (at_chan == i))),
+                ]
+                rsrc_valids.append(rsrc.valid)
+                rsrc_datas.append(rsrc.data)
+                fetch_valids.append(rsrc.valid & is_fetch)
+                fetch_datas.append(rsrc.data)
+                self.readers.append(reader)
+                self.pipes.append(pipe)
+                continue
             # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
             # per round trip); round-robin ARIDs let it pipeline.
             reader = AXIReader(axi, n_ids=4, fifo_depth=reader_fifo_depth,
@@ -1195,18 +1248,29 @@ class MatVecEngine(LiteXModule):
         pf_skip = Signal()
         if prefetch:
             self.comb += pf_skip.eq(pf_pending)
+        if readers_cd:
+            # Command FIFOs (ReaderIsland): `ready` is room, not an idle reader, so every
+            # channel's valid is gated by all-ready and the state advances with it - exactly
+            # one command per channel.
+            cmds_ready = Signal()
+            self.comb += cmds_ready.eq(reduce(and_, [c.ready for c in read_cmds]))
+            cmd_gate = cmds_ready
+        else:
+            cmds_ready = read_cmds[0].ready
+            cmd_gate = C(1, 1)
         fsm.act("ISSUE",
             self.busy.eq(1),
             If(pf_skip,
                 NextState("RUN"),
             ).Else(
-                *[c.valid.eq(~fetch_mode | (fetch_chan == i))
+                *[c.valid.eq((~fetch_mode | (fetch_chan == i)) & cmd_gate if readers_cd else
+                             ~fetch_mode | (fetch_chan == i))
                   for i, c in enumerate(read_cmds)],
                 *read_cmd_fields,
                 # Waits on readers[0] alone. A reader only accepts while idle, so a reader
                 # still draining could in principle miss its command; not observed on
                 # hardware, and a per-reader wait costs timing.
-                If(read_cmds[0].ready,
+                If(cmds_ready,
                     NextState("RUN"),
                 )
             )
@@ -1214,15 +1278,15 @@ class MatVecEngine(LiteXModule):
         if prefetch:
             fsm.act("PF_ISSUE",
                 self.busy.eq(1),
-                *[c.valid.eq(1) for c in read_cmds],
+                *[c.valid.eq(cmd_gate) for c in read_cmds],
                 *read_cmd_fields,
-                If(read_cmds[0].ready,
+                If(cmds_ready,
                     self.done.eq(1),
                     NextState("IDLE"),
                 )
             )
             self.sync += [
-                If(fsm.ongoing("PF_ISSUE") & read_cmds[0].ready,
+                If(fsm.ongoing("PF_ISSUE") & cmds_ready,
                     pf_pending.eq(cmd_r["wlen"] != 0), # wlen 0: a no-op (a list's unused slot).
                     pf_wbase.eq(cmd_r["wbase"]),
                     pf_wlen.eq(cmd_r["wlen"]),
