@@ -453,11 +453,17 @@ static void mvbw_cmd(char *str)
         model_matvec(e, 0, 0x8000);
     uint64_t dt = (perf_now64() - t0)/(uint64_t)(reps > 0 ? reps : 1);
     uint64_t beats = e->chan_len_beats;
+    // The pipe's beats: one 128-trit (or 32-byte Q8) beat per clock per channel, scale beats
+    // included; a trit5 row's memory beats are 26/32 of its code beats (bons_row_beats), so the
+    // pipe at 100% reads 0.81-0.85 memory beats per clock: compare the two rates.
+    uint64_t pipe = (e->flags & FLAG_KSEG) ? 0 : (uint64_t)(e->rows/TRIXIUM_N_CHANNELS)*
+                    (bons_scale_beats(e->cols, e->group) + bons_code_beats(e->cols, e->kind));
     printf("MVBW role=%u layer=%u rows=%lu cols=%lu kind=%u: %lu cycles/matvec, %lu beats/channel, "
-           "%lu.%02lu beats/channel/clock (%lu%% of 1.0)\n", e->role, e->layer,
+           "%lu.%02lu beats/channel/clock (%lu%% of 1.0); pipe beats %lu, %lu.%02lu per clock\n", e->role, e->layer,
            (unsigned long)e->rows, (unsigned long)e->cols, e->kind, (unsigned long)dt,
            (unsigned long)beats, (unsigned long)(beats/dt), (unsigned long)(beats*100/dt % 100),
-           (unsigned long)(beats*100/dt));
+           (unsigned long)(beats*100/dt), (unsigned long)pipe, (unsigned long)(pipe/dt),
+           (unsigned long)(pipe*100/dt % 100));
 }
 
 // Weight read consistency: `fetchtest <role> <layer> [reps]` fetches a tensor's beats on

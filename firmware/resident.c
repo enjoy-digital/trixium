@@ -52,6 +52,10 @@
 #define RESIDENT_BUILT 0
 #endif
 
+// The hybrid lists' prefetch descriptors (desc_prefetch), off by default: console `prefetch
+// hybrid on|off`. Defined in every build (the console refers to it).
+int hybrid_pf_use = 0;
+
 #define RS_Q8B   0x00000u  // Per-block Q8, [4] out / [3] in (transient, <= 17,408 B).
 #define RS_Y     0x04800u  // int32 engine results, 96 KB: one chunk of <= 24,576 rows.
 #define RS_F     0x1C800u  // FP32 src, then raw int32 rotation, then FP32 result (68 KB).
@@ -806,12 +810,12 @@ static void matvec_seg_op(struct engine_op *op, const struct bons_entry *seg, ui
 // its prefetch is never issued. Nothing is emitted for an entry the matvec builder would
 // refuse, without the hardware, or with the prefetch off (engine_pf_use: part of the list's
 // name, so `prefetch on|off` images differ).
-// The hybrid lists' prefetch is opt-in (`prefetch hybrid on`): measured on the YPCB's 2B
-// (hyb9, 2026-10-19) it cost 0.3% - the engine is datapath-bound there (one 128-trit pipe beat
-// per clock; a trit5 memory beat carries 32/26 of one, so memory runs at 0.81 beats per clock
-// with slack), and beats buffered ahead do not shorten a matvec. It pays once the pipe outruns
-// the memory (a wider pipe, or a faster engine clock).
-int hybrid_pf_use = 0;
+// The hybrid lists' prefetch is opt-in (`prefetch hybrid on`, hybrid_pf_use below the build
+// guards: the console names it in every build): measured on the YPCB's 2B (hyb9, 2026-10-19) it
+// cost 0.3% - the engine is datapath-bound there (one 128-trit pipe beat per clock; a trit5
+// memory beat carries 32/26 of one, so memory runs at 0.81 beats per clock with slack), and
+// beats buffered ahead do not shorten a matvec. It pays once the pipe outruns the memory (a
+// wider pipe, or a faster engine clock).
 static inline int pf_on(void) { return engine_pf_use && hybrid_pf_use; }
 static void desc_prefetch(uint32_t *n, const struct bons_entry *e, uint32_t row0, uint32_t rows)
 {
@@ -942,8 +946,10 @@ int resident_prepare_matvec(const float *src, uint32_t width, int rotate, const 
     const struct bons_header *H = model_header();
     int keep = R->keep_dst == dst;
     R->keep_dst = 0;
-    if (!resident_active() || !e || width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)src & 31) ||
-        (!src && !R->act_resident) || ((uintptr_t)dst & 31)) {
+    // width is e's K (the matvec consumes the whole prepared vector): the list's name carries
+    // e, not the width.
+    if (!resident_active() || !e || width != infer_matvec_cols(e) || width > RS_WIDTH_MAX || width % 32 ||
+        ((uintptr_t)src & 31) || (!src && !R->act_resident) || ((uintptr_t)dst & 31)) {
         R->fallbacks++;
         resident_join();               // the caller's fallback may use the engine
         return -1;
@@ -961,11 +967,12 @@ int resident_prepare_matvec(const float *src, uint32_t width, int rotate, const 
     uint64_t t0 = perf_now64();
     build_begin();
     int fetch = src && src != R->rsf_src;
-    // The list's name: the entry and the destination, whether the source is fetched (its
-    // address, a fixed buffer per site, hashed), the width, the rotation, the prefetch.
-    cache_begin(0x0C000000u | (((uint32_t)(uintptr_t)src >> 5) & 0x3Fu) << 18 | (width/32u & 0x3FFu) << 8 |
-                (uint32_t)keep << 3 | (uint32_t)pf_on() << 2 | (uint32_t)rotate << 1 | (uint32_t)fetch,
-                (uint32_t)(uintptr_t)e, (uint32_t)(uintptr_t)dst);
+    // The list's name: the source's address (main RAM, 32-byte units: 24 bits cover it), the
+    // entry (its two low bits free: keep, prefetch) and the destination (32-byte aligned: the
+    // fetch and rotation bits) - every input of the descriptors.
+    cache_begin(0x0C000000u | (src ? (uint32_t)(((uintptr_t)src - MAIN_RAM_BASE) >> 5) & 0xFFFFFFu : 0u),
+                (uint32_t)(uintptr_t)e | (uint32_t)keep | (uint32_t)pf_on() << 1,
+                (uint32_t)(uintptr_t)dst | (uint32_t)fetch | (uint32_t)rotate << 1);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
     if (fetch) {
@@ -1032,7 +1039,15 @@ int rl_begin_keyed(uint32_t a, uint32_t b, uint32_t c)
     return RLS->replay;
 }
 void resident_rsf_set(const void *src) { resident_state()->rsf_src = src; }
-int rl_rsf_is(const void *src) { return src && resident_state()->rsf_list == src; }
+// Whether `src` is the vector RS_F holds: during a build the list's view (rsf_list, lost once a
+// descriptor may write RS_F), between lists the last list's result (rsf_src: what rl_begin will
+// copy into rsf_list) - a list's name computed before its rl_begin_keyed sees the same answer
+// as the build.
+int rl_rsf_is(const void *src)
+{
+    const struct resident_state *R = resident_state();
+    return src && (RLS->t0 ? R->rsf_list : R->rsf_src) == src;
+}
 // A descriptor that may write RS_F: the list no longer holds rsf_src there.
 static void rl_rsf_lost(void) { resident_state()->rsf_list = 0; }
 
@@ -1572,7 +1587,8 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     if (!resident_silu_active() || !gate || !up || gate->rows != up->rows ||
         gate->rows > RS_WIDTH_MAX || ((uintptr_t)act & 31) ||
         ((uintptr_t)gate_out & 31) || ((uintptr_t)up_out & 31) ||
-        (x && (width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)x & 31) || wi < 0 || width/B > 32))) {
+        (x && (width != infer_matvec_cols(gate) || width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)x & 31) ||
+               wi < 0 || width/B > 32))) {
         R->fallbacks++;
         resident_join();
         return -1;
@@ -1582,10 +1598,13 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     build_begin();
     R->keep_dst = 0;
     int fetch = x && x != R->rsf_src;
-    // The list's name: the entries, which outputs go to main RAM (fixed buffers), the in-list
-    // prepare (its source fetched or RS_F's, the width), the prefetch.
+    // The list's name: the entries, which outputs go to main RAM (act, gate_out, up_out are
+    // the caller's fixed buffers: their presence, not their addresses), the in-list prepare
+    // (its source's address in 32-byte units, 16 bits: fetched or RS_F's; the width is gate's K),
+    // the prefetch.
     cache_begin(0x03000000u | (act != 0) | (gate_out != 0) << 1 | (up_out != 0) << 2 | (x != 0) << 3 |
-                (uint32_t)fetch << 4 | (uint32_t)pf_on() << 5 | (x ? (width/32u & 0x3FFu) : 0u) << 8,
+                (uint32_t)fetch << 4 | (uint32_t)pf_on() << 5 |
+                (x ? (uint32_t)(((uintptr_t)x - MAIN_RAM_BASE) >> 5) & 0xFFFFu : 0u) << 8,
                 (uint32_t)(uintptr_t)gate, (uint32_t)(uintptr_t)up);
     struct bns_seq_descriptor d;
     if (x) {
