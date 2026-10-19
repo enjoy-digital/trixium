@@ -1580,47 +1580,18 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 // the gates behind each head). 0: attnb holds the ungated outputs; 1: the gated outputs;
 // -1: the CPU loop runs on main RAM's copy (a long context, or a list failure, which also
 // turns the stream off until the next reset).
-// The attention softmax over `rows` score rows of T positions (Tp floats apart), in place,
-// exactly as the per-head loop: mx = max (NaN never wins), e = softmax_exp(s - mx), one
-// sequential sum per row from +0, one reciprocal per row, then multiplies. Four rows per pass:
-// the exp is a dependent chain of ~12 FPU operations and the per-row sum another, so one row
-// at a time left the FPU idle most cycles (~40 cycles per element on the card); four
-// independent rows interleave in the same basic block. Every row's result is bit-for-bit the
-// one-row loop's (elements are independent, each row's sum keeps its order).
+// The attention softmax over `rows` score rows of T positions (Tp floats apart), in place: mx =
+// max (a NaN never wins), e = softmax_exp(s - mx), one sequential sum per row from +0, one
+// reciprocal per row, then multiplies (ggml scales by 1/sum too; the mirror's order). Unit 14
+// does the same in the scratchpad when the bitstream has it (softmaxunit). Four rows per pass
+// gained 2% on the card (the exp's branches keep the chains serial): one row at a time.
 static void softmax_rows(float *buf, uint32_t rows, uint32_t stride, int T)
 {
-    uint32_t hh = 0;
-    for (; hh + 4 <= rows; hh += 4) {
-        float *s0 = buf + hh*stride, *s1 = s0 + stride, *s2 = s1 + stride, *s3 = s2 + stride;
-        float m0 = -1e30f, m1 = -1e30f, m2 = -1e30f, m3 = -1e30f;
-        for (int t = 0; t < T; t++) {
-            float a = s0[t], b = s1[t], c = s2[t], d = s3[t];
-            if (a > m0) m0 = a;
-            if (b > m1) m1 = b;
-            if (c > m2) m2 = c;
-            if (d > m3) m3 = d;
-        }
-        float sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
-        for (int t = 0; t < T; t++) {
-            float e0 = trixium_softmax_exp(s0[t] - m0);
-            float e1 = trixium_softmax_exp(s1[t] - m1);
-            float e2 = trixium_softmax_exp(s2[t] - m2);
-            float e3 = trixium_softmax_exp(s3[t] - m3);
-            s0[t] = e0; s1[t] = e1; s2[t] = e2; s3[t] = e3;
-            sum0 += e0; sum1 += e1; sum2 += e2; sum3 += e3;
-        }
-        if (hybrid_softmax_div) {   // `softmaxdiv on`: the old divide per position, comparisons only
-            for (int t = 0; t < T; t++) { s0[t] = s0[t]/sum0; s1[t] = s1[t]/sum1; s2[t] = s2[t]/sum2; s3[t] = s3[t]/sum3; }
-        } else {
-            float i0 = 1.0f/sum0, i1 = 1.0f/sum1, i2 = 1.0f/sum2, i3 = 1.0f/sum3;
-            for (int t = 0; t < T; t++) { s0[t] = s0[t]*i0; s1[t] = s1[t]*i1; s2[t] = s2[t]*i2; s3[t] = s3[t]*i3; }
-        }
-    }
-    for (; hh < rows; hh++) {
+    for (uint32_t hh = 0; hh < rows; hh++) {
         float *sc = buf + hh*stride, mx = -1e30f, sum = 0;
         for (int t = 0; t < T; t++) if (sc[t] > mx) mx = sc[t];
         for (int t = 0; t < T; t++) { sc[t] = trixium_softmax_exp(sc[t] - mx); sum += sc[t]; }
-        // One divide per head, then multiplies (ggml scales by 1/sum too; the mirror's order).
+        // `softmaxdiv on` keeps the old divide per position, for a same-boot comparison only.
         if (hybrid_softmax_div) {
             for (int t = 0; t < T; t++) sc[t] = sc[t]/sum;
         } else {
@@ -1745,7 +1716,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
             return -1;
         }
         AT_SUB(2);
-        // The softmax exactly as the CPU loop computes it, four heads per pass (below).
+        // The softmax exactly as the CPU loop computes it (softmax_rows above).
         perf_enter(OP_SOFTMAX);
         softmax_rows(at_buf, nq, Tp, T);
         clean_cpu_dcache_range(at_buf, nq*Tp*4u);
