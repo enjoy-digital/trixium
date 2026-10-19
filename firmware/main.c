@@ -1250,11 +1250,15 @@ static void console_service(void)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
     } else if (strcmp(token, "prefetch") == 0) {
+        // prefetch [on|off|hybrid on|hybrid off]: the engine's weight prefetch (the Qwen3 path's
+        // calls), and the hybrid lists' prefetch descriptors (resident.c, default off).
         if (strncmp(str, "on", 2) == 0)  engine_pf_use = 1;
         if (strncmp(str, "off", 3) == 0) engine_pf_use = 0;
+        if (strncmp(str, "hybrid on", 9) == 0)   hybrid_pf_use = 1;
+        if (strncmp(str, "hybrid off", 10) == 0) hybrid_pf_use = 0;
 #ifdef TRIXIUM_HAS_PREFETCH
-        printf("PREFETCH %s (hits %lu, mismatch %lu, reader FIFO %d beats)\n",
-               engine_pf_use ? "on" : "off",
+        printf("PREFETCH %s, hybrid lists %s (hits %lu, mismatch %lu, reader FIFO %d beats)\n",
+               engine_pf_use ? "on" : "off", hybrid_pf_use ? "on" : "off",
                (unsigned long)trixium_engine_csr_pf_hits_read(),
                (unsigned long)trixium_engine_csr_pf_mismatch_read(), TRIXIUM_READER_FIFO_DEPTH);
 #else

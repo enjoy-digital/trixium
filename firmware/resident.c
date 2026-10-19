@@ -806,11 +806,18 @@ static void matvec_seg_op(struct engine_op *op, const struct bons_entry *seg, ui
 // its prefetch is never issued. Nothing is emitted for an entry the matvec builder would
 // refuse, without the hardware, or with the prefetch off (engine_pf_use: part of the list's
 // name, so `prefetch on|off` images differ).
+// The hybrid lists' prefetch is opt-in (`prefetch hybrid on`): measured on the YPCB's 2B
+// (hyb9, 2026-10-19) it cost 0.3% - the engine is datapath-bound there (one 128-trit pipe beat
+// per clock; a trit5 memory beat carries 32/26 of one, so memory runs at 0.81 beats per clock
+// with slack), and beats buffered ahead do not shorten a matvec. It pays once the pipe outruns
+// the memory (a wider pipe, or a faster engine clock).
+int hybrid_pf_use = 0;
+static inline int pf_on(void) { return engine_pf_use && hybrid_pf_use; }
 static void desc_prefetch(uint32_t *n, const struct bons_entry *e, uint32_t row0, uint32_t rows)
 {
 #ifdef TRIXIUM_HAS_PREFETCH
     struct resident_state *R = resident_state();
-    if (!engine_pf_use || !e || !rows || rows % (uint32_t)R->n_ch || row0 % (uint32_t)R->n_ch ||
+    if (!pf_on() || !e || !rows || rows % (uint32_t)R->n_ch || row0 % (uint32_t)R->n_ch ||
         row0 + rows > e->rows ||
         (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5 && e->kind != KIND_Q8))
         return;
@@ -957,7 +964,7 @@ int resident_prepare_matvec(const float *src, uint32_t width, int rotate, const 
     // The list's name: the entry and the destination, whether the source is fetched (its
     // address, a fixed buffer per site, hashed), the width, the rotation, the prefetch.
     cache_begin(0x0C000000u | (((uint32_t)(uintptr_t)src >> 5) & 0x3Fu) << 18 | (width/32u & 0x3FFu) << 8 |
-                (uint32_t)keep << 3 | (uint32_t)(engine_pf_use != 0) << 2 | (uint32_t)rotate << 1 | (uint32_t)fetch,
+                (uint32_t)keep << 3 | (uint32_t)pf_on() << 2 | (uint32_t)rotate << 1 | (uint32_t)fetch,
                 (uint32_t)(uintptr_t)e, (uint32_t)(uintptr_t)dst);
     struct bns_seq_descriptor d;
     uint32_t n = 0;
@@ -1578,7 +1585,7 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     // The list's name: the entries, which outputs go to main RAM (fixed buffers), the in-list
     // prepare (its source fetched or RS_F's, the width), the prefetch.
     cache_begin(0x03000000u | (act != 0) | (gate_out != 0) << 1 | (up_out != 0) << 2 | (x != 0) << 3 |
-                (uint32_t)fetch << 4 | (uint32_t)(engine_pf_use != 0) << 5 | (x ? (width/32u & 0x3FFu) : 0u) << 8,
+                (uint32_t)fetch << 4 | (uint32_t)pf_on() << 5 | (x ? (width/32u & 0x3FFu) : 0u) << 8,
                 (uint32_t)(uintptr_t)gate, (uint32_t)(uintptr_t)up);
     struct bns_seq_descriptor d;
     if (x) {

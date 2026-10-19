@@ -121,6 +121,7 @@ void rl_prepare(const float *src, uint32_t width, int rotate);   // src NULL: al
 void rl_prepare_pf(const float *src, uint32_t width, int rotate, const struct bons_entry *pf,
                    uint32_t pf_row0, uint32_t pf_rows);
 void rl_prefetch(const struct bons_entry *e, uint32_t row0, uint32_t rows);   // the descriptor alone
+extern int hybrid_pf_use;   // the hybrid lists' prefetch descriptors (default off: `prefetch hybrid on`)
 void rl_desc(const struct bns_seq_descriptor *d);
 struct engine_op;
 void rl_engine(const struct engine_op *op);                       // any engine op, in order

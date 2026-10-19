@@ -417,7 +417,7 @@ static void rl_prepare_for(const float *src, uint32_t width, int rotate, const s
 }
 // A list image holding prefetch descriptors is named apart from one without (`prefetch off`):
 // the bit goes into an aligned pointer of the list's name.
-static inline uint32_t pf_key(void) { return (uint32_t)(engine_pf_use != 0); }
+static inline uint32_t pf_key(void) { return (uint32_t)(engine_pf_use && hybrid_pf_use); }
 
 static int prepare_f(const float *src, int width, int rotate)
 {
