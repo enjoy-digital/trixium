@@ -347,6 +347,28 @@ Op 0: `y[c] = (((+0 + w[4c]*x0[c]) + w[4c+1]*x1[c]) + w[4c+2]*x2[c]) + w[4c+3]*x
 Op 1 (residual add, `bns_seq_desc_add`): `y[c] = x0[c] + x3[c]`, dst == x0 or x3. The SiLU
 after the conv is unit 11 with `unit_m`.
 
+## Unit 14: attention softmax
+
+[`gateware/units/softmax.py`](../gateware/units/softmax.py), exact binary32, no fixups.
+
+| word | field |
+| --- | --- |
+| w1 | src: the first row of scores (32-byte aligned; in place) |
+| w2 | n [15:0] positions per row (1..4096) \| rows [31:16] (1..256) |
+| w3 | row stride in beats (0 = ceil(n/8)) |
+
+For every row, hybrid.c's `softmax_rows` bit for bit: `mx = max(s[t])` from -1e30 (a NaN
+never wins), `e[t] = softmax_exp(s[t] - mx)` (the canonical exp below), `sum = (((+0 + e[0])
++ e[1]) + ...)`, `inv = 1/sum`, `p[t] = e[t]*inv`. Lanes past n in a row's last beat are not
+written. Three passes: the maximum 8 lanes per clock; the exp one element per clock through a
+pipeline of exact operators (`FP32Add`, `FP32Mul`, the fused `FP32Fma` for the six polynomial
+stages), eight rows interleaved so each row's sequential sum gets one addition every 8 clocks
+(past the adder's latency) and stays in the CPU's order; one reciprocal per row on the
+sequential divider, then the scale 8 lanes per clock. 16 heads at T = 256: ~6,200 clocks
+(the CPU loop: ~166,000). With the unit the attention's scores, softmax and weighted-V
+passes are one list (`hybrid.c`, `usm`): no main-RAM round trip, no CPU between them; the
+console `softmaxunit off` keeps the CPU path for a same-boot comparison.
+
 ## Canonical reductions
 
 Every FP32 reduction the firmware, the Python mirror (`model/mirror.py`) and the
