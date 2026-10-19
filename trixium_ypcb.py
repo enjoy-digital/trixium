@@ -279,7 +279,10 @@ class TriXiumYPCBSoC(SoCCore):
         self.natstat  = NativePortStats(native_taps)
         if ddr_quiet_regions:
             # The matvec engine's streaming datapath (channel pipes, trit decoders, readers,
-            # packers) kept out of controller 1's I/O clock regions (banks 16-18 = X0Y5..X0Y7).
+            # packers) kept out of controller 1's I/O clock regions (banks 16-18 = X0Y5..X0Y7),
+            # and with "both" out of controller 0's as well (banks 11-13 = X0Y0..X0Y2; the
+            # BIOS-levelled controller the firmware's eye scan does not cover: on hyb18 its DQ6 /
+            # DQ11 logged corrected and a few uncorrectable reads under the 133 MHz pipes).
             # On ypcb_hyb8_d100 the read eye of controller 1 under the engine's 4-channel streams
             # closed (lanes 0-2 without a clean tap, hyb7: 2-3) while every single-stream pattern
             # stayed clean; the same netlist with the engine Pblocked (hyb8q) had a healthy eye:
@@ -288,8 +291,11 @@ class TriXiumYPCBSoC(SoCCore):
             # free: with them inside (hyb10, 85% LUT) the router left 212 nets unrouted.
             platform.toolchain.pre_placement_commands.append(
                 "create_pblock engine_pb")
+            regions = ("CLOCKREGION_X0Y3:CLOCKREGION_X0Y4 CLOCKREGION_X1Y0:CLOCKREGION_X1Y7"
+                       if ddr_quiet_regions == "both" else
+                       "CLOCKREGION_X0Y0:CLOCKREGION_X0Y4 CLOCKREGION_X1Y0:CLOCKREGION_X1Y7")
             platform.toolchain.pre_placement_commands.append(
-                "resize_pblock [get_pblocks engine_pb] -add {{CLOCKREGION_X0Y0:CLOCKREGION_X0Y4 CLOCKREGION_X1Y0:CLOCKREGION_X1Y7}}")
+                f"resize_pblock [get_pblocks engine_pb] -add {{{{{regions}}}}}")
             platform.toolchain.pre_placement_commands.append(
                 "add_cells_to_pblock [get_pblocks engine_pb] [get_cells -hierarchical -filter "
                 "{{NAME =~ main_matvecengine* && NAME !~ main_matvecengine_deltanetstream* && "
@@ -480,7 +486,7 @@ def main():
     parser.add_target_argument("--engine-memctrl",   default=2,        type=int, choices=[1, 2],          help="DDR3 controllers built (1: every channel and main_ram on controller 0, the small boards' topology).")
     parser.add_target_argument("--profile",          default="full",   choices=["full", "lite"],            help="--hybrid: the units' sizing (lite: the small boards' profile).")
     parser.add_target_argument("--reader-bursts",     default=8,        type=int,                            help="16-beat bursts a channel reader keeps outstanding (8: the core's default).")
-    parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
+    parser.add_target_argument("--ddr-quiet-regions", nargs="?", const="ctrl1", default=False, choices=["ctrl1", "both"],                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings",    default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     # The shipping recipe (overridable from the command line).
