@@ -775,6 +775,61 @@ static int build_matvec(uint32_t *n, const struct bons_entry *e, uint32_t dst_sp
     return build_matvec_at(n, e, RS_Y, dst_sp);
 }
 
+// The engine op of K-segment `seg` of a matvec's rows [row0, row0 + rows) (rpc per channel,
+// x at RS_XW + xoff, results at dst): the matvec's, or its weight reads alone with the kind
+// set to ENGINE_KIND_PREFETCH (desc_prefetch).
+static void matvec_seg_op(struct engine_op *op, const struct bons_entry *seg, uint32_t row0,
+                          uint32_t rpc, uint32_t xoff, uint32_t dst)
+{
+    struct resident_state *R = resident_state();
+    uint32_t rb = bons_row_beats(seg->cols, seg->kind, seg->group);
+    *op = (struct engine_op){0};
+    op->kind   = (seg->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
+    op->rows   = rpc;
+    op->cols   = seg->cols;
+    op->wbase  = TRIXIUM_CHAN_WEIGHT_BASE + (seg->chan_base_beats + (row0/(uint32_t)R->n_ch)*rb)*32;
+    op->wlen   = rpc*rb;
+    op->sbeats = bons_scale_beats(seg->cols, seg->group);
+    op->cbeats = bons_code_beats(seg->cols, seg->kind);
+    op->pk     = (seg->kind == KIND_TERNARY5);
+    op->bias   = seg->bias;
+    op->rshift = seg->rshift;
+    op->xsrc   = RS_XW + xoff;
+    op->dst    = dst;
+}
+// The weight reads of e's first K-segment (rows [row0, row0 + rows)) issued now (engine op 7,
+// TRIXIUM_HAS_PREFETCH): the beats wait in the readers' FIFOs (TRIXIUM_READER_FIFO_DEPTH per
+// channel) while the list's units work, and the matvec that follows starts on buffered beats.
+// That matvec must be the list's next engine read op (unit descriptors and STOREs may sit in
+// between, never a FETCH: the engine's pf_mismatch); as every list begins with the loader's
+// FETCH, a prefetch and its matvec always share a list. A list that declines never runs, so
+// its prefetch is never issued. Nothing is emitted for an entry the matvec builder would
+// refuse, without the hardware, or with the prefetch off (engine_pf_use: part of the list's
+// name, so `prefetch on|off` images differ).
+static void desc_prefetch(uint32_t *n, const struct bons_entry *e, uint32_t row0, uint32_t rows)
+{
+#ifdef TRIXIUM_HAS_PREFETCH
+    struct resident_state *R = resident_state();
+    if (!engine_pf_use || !e || !rows || rows % (uint32_t)R->n_ch || row0 % (uint32_t)R->n_ch ||
+        row0 + rows > e->rows ||
+        (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5 && e->kind != KIND_Q8))
+        return;
+    int nseg = (e->flags & FLAG_KSEG) ? model_entry_nkseg(e) : 1;
+    if (nseg < 1 || nseg > 4)
+        return;
+    if (RLS->replay) {
+        (*n)++;
+        return;
+    }
+    const struct bons_entry *seg = nseg > 1 ? model_entry_kseg(e, 0) : e;
+    struct engine_op op;
+    matvec_seg_op(&op, seg, row0, rows/(uint32_t)R->n_ch, 0, RS_Y);
+    op.kind = ENGINE_KIND_PREFETCH;
+    desc_engine((*n)++, &op);
+#else
+    (void)n; (void)e; (void)row0; (void)rows;
+#endif
+}
 // Local rows [row0/n_ch, (row0 + rows)/n_ch) of every channel's block of e (the image shards
 // rows in blocks - layout.shard_rows - so the result is channel-major, see resident.h).
 // ystage: where the int32 segment partials go (RS_Y, or another region the caller keeps
@@ -808,20 +863,8 @@ static int build_matvec_rows(uint32_t *n, const struct bons_entry *e, uint32_t r
     uint32_t xoff = 0;
     for (int k = 0; k < nseg; k++) {
         const struct bons_entry *seg = nseg > 1 ? model_entry_kseg(e, k) : e;
-        uint32_t rb = bons_row_beats(seg->cols, seg->kind, seg->group);
-        struct engine_op op = {0};
-        op.kind   = (seg->kind == KIND_Q8) ? ENGINE_KIND_Q8 : ENGINE_KIND_TERNARY;
-        op.rows   = rpc;
-        op.cols   = seg->cols;
-        op.wbase  = TRIXIUM_CHAN_WEIGHT_BASE + (seg->chan_base_beats + (row0/(uint32_t)R->n_ch)*rb)*32;
-        op.wlen   = rpc*rb;
-        op.sbeats = bons_scale_beats(seg->cols, seg->group);
-        op.cbeats = bons_code_beats(seg->cols, seg->kind);
-        op.pk     = (seg->kind == KIND_TERNARY5);
-        op.bias   = seg->bias;
-        op.rshift = seg->rshift;
-        op.xsrc   = RS_XW + xoff;
-        op.dst    = ystage + (uint32_t)k*ystride;
+        struct engine_op op;
+        matvec_seg_op(&op, seg, row0, rpc, xoff, ystage + (uint32_t)k*ystride);
         desc_engine((*n)++, &op);
         if (k) {
             // Wrapping int32 sum of the segment partials, as the fused path's reduce_acc.
@@ -882,6 +925,81 @@ int resident_matvec(const struct bons_entry *e, float *dst)
         }
     }
     R->matvec_cycles += perf_now64() - t0;
+    R->matvecs++;
+    return rc;
+}
+
+int resident_prepare_matvec(const float *src, uint32_t width, int rotate, const struct bons_entry *e, float *dst)
+{
+    struct resident_state *R = resident_state();
+    const struct bons_header *H = model_header();
+    int keep = R->keep_dst == dst;
+    R->keep_dst = 0;
+    if (!resident_active() || !e || width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)src & 31) ||
+        (!src && !R->act_resident) || ((uintptr_t)dst & 31)) {
+        R->fallbacks++;
+        resident_join();               // the caller's fallback may use the engine
+        return -1;
+    }
+    int wi = -1;
+    uint32_t B = (uint32_t)H->hadamard_block;
+    if (rotate) {
+        wi = width_index(H, width);
+        if (wi < 0 || width/B > 32) {
+            R->fallbacks++;
+            resident_join();
+            return -1;
+        }
+    }
+    uint64_t t0 = perf_now64();
+    build_begin();
+    int fetch = src && src != R->rsf_src;
+    // The list's name: the entry and the destination, whether the source is fetched (its
+    // address, a fixed buffer per site, hashed), the width, the rotation, the prefetch.
+    cache_begin(0x0C000000u | (((uint32_t)(uintptr_t)src >> 5) & 0x3Fu) << 18 | (width/32u & 0x3FFu) << 8 |
+                (uint32_t)keep << 3 | (uint32_t)(engine_pf_use != 0) << 2 | (uint32_t)rotate << 1 | (uint32_t)fetch,
+                (uint32_t)(uintptr_t)e, (uint32_t)(uintptr_t)dst);
+    struct bns_seq_descriptor d;
+    uint32_t n = 0;
+    if (fetch) {
+        clean_cpu_dcache_range((void *)src, width*4);
+        desc_fetch(n++, eng_addr(src), width*4/32, RS_F);
+    }
+    desc_prefetch(&n, e, 0, e->rows);
+    R->act_resident = 0;
+    if (RLS->replay) {
+        n += rotate ? 3u : 1u;
+    } else if (rotate) {
+        uint32_t blocks = width/B;
+        bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(n++, &d);
+        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, had_flags(R)); desc_words(n++, &d);
+        bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks | req_flags(R)); desc_words(n++, &d);
+    } else {
+        bns_seq_desc_quantize(&d, RS_F, RS_XW, RS_E8, width, 1);              desc_words(n++, &d);
+    }
+    if (build_matvec(&n, e, RS_F)) {
+        R->fallbacks++;
+        resident_join();
+        return -1;
+    }
+    int rc;
+    if (keep) {
+        desc_stop(n++);
+        rc = run_list_start(n, "prepare+matvec");
+        if (!rc)
+            R->rsf_src = dst;
+    } else {
+        store_out(&n, dst, e->rows, RS_F);
+        desc_stop(n++);
+        rc = run_list(n, "prepare+matvec");
+        if (!rc) {
+            invd_cpu_dcache_range(dst, e->rows*4);
+            R->rsf_src = dst;
+            lp_post();
+        }
+    }
+    R->matvec_cycles += perf_now64() - t0;
+    R->prepares++;
     R->matvecs++;
     return rc;
 }
@@ -1002,25 +1120,40 @@ void rl_engine(const struct engine_op *op)
     rl_rsf_lost();
 }
 
-static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t xw, uint32_t e8);
+static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t xw, uint32_t e8,
+                          const struct bons_entry *pf, uint32_t pf_row0, uint32_t pf_rows);
 void rl_prepare(const float *src, uint32_t width, int rotate)
 {
-    rl_prepare_to(src, width, rotate, RS_XW, RS_E8);
+    rl_prepare_to(src, width, rotate, RS_XW, RS_E8, 0, 0, 0);
+}
+void rl_prepare_pf(const float *src, uint32_t width, int rotate, const struct bons_entry *pf,
+                   uint32_t pf_row0, uint32_t pf_rows)
+{
+    rl_prepare_to(src, width, rotate, RS_XW, RS_E8, pf, pf_row0, pf_rows);
+}
+void rl_prefetch(const struct bons_entry *e, uint32_t row0, uint32_t rows)
+{
+    if (!rl_room(1)) { RLS->bad = 1; return; }
+    desc_prefetch(&RLS->n, e, row0, rows);
 }
 
-// rl_prepare with the Q8 vector at xw and its exponent beat at e8 (a batched op's slot b).
-static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t xw, uint32_t e8)
+// rl_prepare with the Q8 vector at xw and its exponent beat at e8 (a batched op's slot b); pf:
+// the matvec consuming the vector, its weights prefetched after the source's FETCH.
+static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t xw, uint32_t e8,
+                          const struct bons_entry *pf, uint32_t pf_row0, uint32_t pf_rows)
 {
     struct resident_state *R = resident_state();
     const struct bons_header *H = model_header();
     uint32_t B = (uint32_t)H->hadamard_block;
     struct bns_seq_descriptor d;
-    if (!rl_room(4) || width > RS_WIDTH_MAX || width % 32) { RLS->bad = 1; return; }
+    if (!rl_room(5) || width > RS_WIDTH_MAX || width % 32) { RLS->bad = 1; return; }
     const float *vec = src ? src : (const float *)R->rsf_list;
     if (src && src == R->rsf_list)
         src = 0;                          // already in RS_F: resident_rsf_set, nothing since
     if (src)
         rl_fetch(src, width*4, RS_F);
+    if (pf)
+        desc_prefetch(&RLS->n, pf, pf_row0, pf_rows);
     if (rotate) {
         int wi = width_index(H, width);
         if (wi < 0 || width/B > 32) { RLS->bad = 1; return; }
@@ -1420,13 +1553,19 @@ uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, f
 /*----------------*/
 
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
-                     float *act, float *gate_out, float *up_out)
+                     const float *x, uint32_t width, float *act, float *gate_out, float *up_out)
 {
     struct resident_state *R = resident_state();
+    const struct bons_header *H = model_header();
     uint32_t n = 0;
+    // x: the FP32 input prepared (rotated and quantized) at the head of the list itself, the
+    // gate's weights prefetched under that work; NULL: the caller prepared it (RS_XW).
+    uint32_t B = (uint32_t)H->hadamard_block;
+    int wi = x ? width_index(H, width) : -1;
     if (!resident_silu_active() || !gate || !up || gate->rows != up->rows ||
         gate->rows > RS_WIDTH_MAX || ((uintptr_t)act & 31) ||
-        ((uintptr_t)gate_out & 31) || ((uintptr_t)up_out & 31)) {
+        ((uintptr_t)gate_out & 31) || ((uintptr_t)up_out & 31) ||
+        (x && (width > RS_WIDTH_MAX || width % 32 || ((uintptr_t)x & 31) || wi < 0 || width/B > 32))) {
         R->fallbacks++;
         resident_join();
         return -1;
@@ -1435,10 +1574,29 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     uint64_t t0 = perf_now64();
     build_begin();
     R->keep_dst = 0;
-    // The list's name: the entries and which outputs go to main RAM (fixed buffers).
-    cache_begin(0x03000000u | (act != 0) | (gate_out != 0) << 1 | (up_out != 0) << 2,
+    int fetch = x && x != R->rsf_src;
+    // The list's name: the entries, which outputs go to main RAM (fixed buffers), the in-list
+    // prepare (its source fetched or RS_F's, the width), the prefetch.
+    cache_begin(0x03000000u | (act != 0) | (gate_out != 0) << 1 | (up_out != 0) << 2 | (x != 0) << 3 |
+                (uint32_t)fetch << 4 | (uint32_t)(engine_pf_use != 0) << 5 | (x ? (width/32u & 0x3FFu) : 0u) << 8,
                 (uint32_t)(uintptr_t)gate, (uint32_t)(uintptr_t)up);
     struct bns_seq_descriptor d;
+    if (x) {
+        if (fetch) {
+            clean_cpu_dcache_range((void *)x, width*4);
+            desc_fetch(n++, eng_addr(x), width*4/32, RS_F);
+        }
+        desc_prefetch(&n, gate, 0, gate->rows);
+        R->act_resident = 0;
+        if (RLS->replay) {
+            n += 3;
+        } else {
+            uint32_t blocks = width/B;
+            bns_seq_desc_quantize(&d, RS_F, RS_Q8B, RS_EXP, B, blocks);          desc_words(n++, &d);
+            bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, had_flags(R)); desc_words(n++, &d);
+            bns_seq_desc_requantize(&d, RS_F, RS_XW, RS_EXP, RS_MAX, RS_E8, blocks | req_flags(R)); desc_words(n++, &d);
+        }
+    }
     if (build_matvec(&n, gate, RS_F) || (gate_out && n > RS_DESC_MAX - 6u)) goto decline;
     if (gate_out) store_out(&n, gate_out, rows, RS_F);
     if (build_matvec(&n, up, RS_Y) || n + (up_out ? 4u : 3u) > RS_DESC_MAX) goto decline;
@@ -1495,9 +1653,9 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
     return 0;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
-                     float *act, float *gate_out, float *up_out)
+                     const float *x, uint32_t width, float *act, float *gate_out, float *up_out)
 {
-    (void)gate; (void)up; (void)act; (void)gate_out; (void)up_out;
+    (void)gate; (void)up; (void)x; (void)width; (void)act; (void)gate_out; (void)up_out;
     resident_state()->fallbacks++;
     return -1;
 }
@@ -1545,6 +1703,14 @@ void rl_desc_overlap(const struct bns_seq_descriptor *d) { (void)d; }
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage, uint32_t dst_sp)
 { (void)e; (void)row0; (void)rows; (void)ystage; (void)dst_sp; }
 void rl_prepare(const float *src, uint32_t width, int rotate) { (void)src; (void)width; (void)rotate; }
+void rl_prepare_pf(const float *src, uint32_t width, int rotate, const struct bons_entry *pf,
+                   uint32_t pf_row0, uint32_t pf_rows)
+{ (void)src; (void)width; (void)rotate; (void)pf; (void)pf_row0; (void)pf_rows; }
+void rl_prefetch(const struct bons_entry *e, uint32_t row0, uint32_t rows) { (void)e; (void)row0; (void)rows; }
+int resident_prepare_matvec(const float *src, uint32_t width, int rotate, const struct bons_entry *e, float *dst)
+{
+    (void)src; (void)width; (void)rotate; (void)e; (void)dst; resident_state()->fallbacks++; return -1;
+}
 void rl_desc(const struct bns_seq_descriptor *d) { (void)d; }
 void rl_engine(const struct engine_op *op) { (void)op; }
 void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp) { (void)src; (void)bytes; (void)sp; }
@@ -1586,9 +1752,9 @@ uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint
     return 0;
 }
 int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
-                     float *act, float *gate_out, float *up_out)
+                     const float *x, uint32_t width, float *act, float *gate_out, float *up_out)
 {
-    (void)gate; (void)up; (void)act; (void)gate_out; (void)up_out;
+    (void)gate; (void)up; (void)x; (void)width; (void)act; (void)gate_out; (void)up_out;
     resident_state()->fallbacks++;
     return -1;
 }

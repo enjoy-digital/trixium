@@ -562,6 +562,20 @@ static void ddrstat_cmd(void)
                (unsigned long)rw, (unsigned long)ncyc);
     }
 #endif
+#ifdef CSR_RDSTAT_BASE
+    // Each channel reader's output to its pipe: beats, cycles a beat waited on the pipe,
+    // cycles the reader had no beat (its FIFO empty).
+    rdstat_snap_write(1);
+    uint32_t rcyc = rdstat_cycles_read();
+    if (!rcyc) rcyc = 1;
+    for (int c = 0; c < TRIXIUM_N_CHANNELS; c++) {
+        rdstat_sel_write(c);
+        uint32_t b = rdstat_beats_read(), st = rdstat_stalled_read(), sv = rdstat_starved_read();
+        printf("  reader %d: %lu beats (%lu.%lu%% of the cycles), waited on the pipe %lu.%lu%% (%lu), "
+               "no beat %lu.%lu%% (%lu); %lu cycles\n", c, (unsigned long)b, PCT10(b, rcyc),
+               PCT10(st, rcyc), (unsigned long)st, PCT10(sv, rcyc), (unsigned long)sv, (unsigned long)rcyc);
+    }
+#endif
 }
 #endif
 

@@ -409,6 +409,16 @@ static int rotate_quantize_legacy(const float *src, int width)
 // declines (LM head rows, a failed list) can requantize and take the CPU path.
 #define E8_RESIDENT 0x40000001
 
+// The list builder's prepare naming the matvec that consumes the vector: its weights are
+// prefetched under the prepare's units (rl_prepare_pf; nothing for a NULL entry).
+static void rl_prepare_for(const float *src, uint32_t width, int rotate, const struct bons_entry *e)
+{
+    rl_prepare_pf(src, width, rotate, e, 0, e ? e->rows : 0);
+}
+// A list image holding prefetch descriptors is named apart from one without (`prefetch off`):
+// the bit goes into an aligned pointer of the list's name.
+static inline uint32_t pf_key(void) { return (uint32_t)(engine_pf_use != 0); }
+
 static int prepare_f(const float *src, int width, int rotate)
 {
     struct resident_state *R = resident_state();
@@ -450,6 +460,12 @@ static void proj_f(const struct bons_entry *e, const float *src, float *dst)
 {
     if (H->hadamard_block) {
         uint32_t width = infer_matvec_cols(e);      // The whole width, K-segments included.
+        // The prepare and the matvec in one list, the weights prefetched under the prepare;
+        // declined (nothing run): the two-list path below.
+        struct resident_state *R = resident_state();
+        R->prep_src = src; R->prep_width = (int)width; R->prep_rotate = 1;
+        if (resident_prepare_matvec(src, width, 1, e, dst) == 0)
+            return;
         int e8 = prepare_f(src, (int)width, 1);
         if (e8 == E8_RESIDENT) {
             matvec_q(e, e8, dst);
@@ -1282,13 +1298,13 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     } while (0)
     perf_enter(OP_DN_PROJ);           // the token trace's phases (tprof): nested brackets
     rl_begin_keyed(0x04000000u | (uint32_t)l << 8 | (uint32_t)early | (uint32_t)z_stays << 1 |
-                   (uint32_t)rl_rsf_is(h) << 2, (uint32_t)(uintptr_t)h, 0);
+                   (uint32_t)rl_rsf_is(h) << 2, (uint32_t)(uintptr_t)h | pf_key(), 0);
     if (early) {
-        rl_prepare(h, (uint32_t)n_embd, 0);                          // beta/alpha are not folded
+        rl_prepare_for(h, (uint32_t)n_embd, 0, model_entry(ROLE_SSM_BETA, l)); // beta/alpha are not folded
         rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
         rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
         uint32_t k_ba = rl_count();
-        rl_prepare(h, (uint32_t)n_embd, 1);
+        rl_prepare_for(h, (uint32_t)n_embd, 1, e_qkv);
         rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
         rl_matvec(e_z, Z, Z);
         if (rl_start("deltanet projections"))
@@ -1315,10 +1331,10 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         if (rl_wait())
             return -1;                 // nothing of the layer's state has moved yet
     } else {
-        rl_prepare(h, (uint32_t)n_embd, 1);
+        rl_prepare_for(h, (uint32_t)n_embd, 1, e_qkv);
         rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
         rl_matvec(e_z, Z, Z);
-        rl_prepare(h, (uint32_t)n_embd, 0);                          // beta/alpha are not folded
+        rl_prepare_for(h, (uint32_t)n_embd, 0, model_entry(ROLE_SSM_BETA, l)); // beta/alpha are not folded
         rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
         rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
         rl_store(betab, dnr_align(4*(uint32_t)nv), BA);
@@ -1471,11 +1487,10 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     struct resident_state *R = resident_state();
     R->prep_src = og; R->prep_width = nvh; R->prep_rotate = 1;
     resident_mark_act();
-    if (resident_prepare(NULL, (uint32_t)nvh, 1) != 0)
-        goto fatal;
     if (HP->keep_out)
         resident_keep_rsf(out);
-    if (resident_matvec(model_entry(ROLE_SSM_OUT, l), out))
+    // The prepare and the out projection in one list, its weights prefetched under the prepare.
+    if (resident_prepare_matvec(NULL, (uint32_t)nvh, 1, model_entry(ROLE_SSM_OUT, l), out))
         goto fatal;
     dn_cyc_outproj += perf_now64() - t0;
     perf_exit(OP_DN_OUT);
@@ -1782,10 +1797,10 @@ static void attention_layer(int l, const float *h, float *out)
         if (want_rope && bns_seq_desc_norm_rope(&dq, (uint32_t)rope_n, RT)) want_rope = 0;
         int qkv_replay = rl_begin_keyed(0x08000000u | (uint32_t)l << 8 | (uint32_t)gated |
                                         (uint32_t)want_rope << 1 | (uint32_t)rl_rsf_is(h) << 2,
-                                        (uint32_t)(uintptr_t)h, 0);
+                                        (uint32_t)(uintptr_t)h | pf_key(), 0);
         rl_fetch_raw(norm_q[l], 4*(uint32_t)head_dim, NQ);
         rl_fetch_raw(norm_k[l], 4*(uint32_t)head_dim, NK);
-        rl_prepare(h, (uint32_t)n_embd, 1);
+        rl_prepare_for(h, (uint32_t)n_embd, 1, model_entry(ROLE_ATTN_Q, l));
         rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
         rl_matvec(model_entry(ROLE_ATTN_K, l), KS, KS);
         rl_matvec(model_entry(ROLE_ATTN_V, l), VS, VS);
@@ -1964,8 +1979,8 @@ static int lm_head_list(const struct bons_entry *head, float *dst)
     if (head->rows % unit || chunk/nch*4u > 8160u)
         return -1;
     rl_begin_keyed(0x0B000000u | (chunk/32u & 0x7FFu) << 1 | (uint32_t)rl_rsf_is(hb),
-                   (uint32_t)(uintptr_t)head, (uint32_t)(uintptr_t)dst);
-    rl_prepare(hb, (uint32_t)n_embd, 1);
+                   (uint32_t)(uintptr_t)head | pf_key(), (uint32_t)(uintptr_t)dst);
+    rl_prepare_pf(hb, (uint32_t)n_embd, 1, head, 0, head->rows < chunk ? head->rows : chunk);
     for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
         uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
         rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
@@ -2014,9 +2029,9 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
         uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
         // The list's name: the chunk (its index and size), whether hb is already in RS_F.
         rl_begin_keyed(0x0A000000u | (r0/chunk & 0xFFFu) << 12 | (chunk/32u & 0x7FFu) << 1 |
-                       (uint32_t)rl_rsf_is(hb), (uint32_t)(uintptr_t)head, (uint32_t)(uintptr_t)dst);
+                       (uint32_t)rl_rsf_is(hb), (uint32_t)(uintptr_t)head | pf_key(), (uint32_t)(uintptr_t)dst);
         if (!r0)
-            rl_prepare(hb, (uint32_t)n_embd, 1);
+            rl_prepare_pf(hb, (uint32_t)n_embd, 1, head, 0, rows);
         rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
         rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u, NULL, 0);
         if (rl_run("lm head"))
@@ -2105,27 +2120,41 @@ static int head_argmax(uint64_t t0)
 // The FFN of hb (ffn-normed, the token's residual in xb) into tmp_h; t0: the fprep start.
 static void ffn_tok(int l, uint64_t t0)
 {
-    int e8;
-    perf_enter(OP_QUANT8);
-    if (H->hadamard_block)
-        e8 = rotate_quantize_f(hb, n_embd);
-    else
-        e8 = quantize_f(hb, n_embd);
-    hyb_cyc_fprep += perf_now64() - t0;
-    perf_exit(OP_QUANT8);
-    t0 = perf_now64();
-    perf_enter(OP_FFN_PROJ);
+    int e8 = E8_RESIDENT, fused = 0, pre = 0;
     const struct bons_entry *down = model_entry(ROLE_FFN_DOWN, l);
     // Resident FFN: gate, up and act = up*silu(gate) in one scratchpad list, the act
     // then prepared for the down projection where it already is (no FETCH). The gate
     // and up projections reach main RAM only when traced. The activation stays in RS_F
     // (never stored to main RAM): the trace reads it there, and a failed down projection
-    // recomputes it on the CPU path.
-    int fused = 0;
-    if (e8 == E8_RESIDENT && H->hadamard_block && resident_silu_active() &&
+    // recomputes it on the CPU path. The input's prepare sits at the head of that list,
+    // the gate's weights prefetched under it (pre); declined (nothing run), the separate
+    // prepare and the list without it follow.
+    if (H->hadamard_block && resident_silu_active() && infer_matvec_cols(down) == (uint32_t)ffn_dim) {
+        struct resident_state *R = resident_state();
+        R->prep_src = hb; R->prep_width = n_embd; R->prep_rotate = 1;
+        int traced = infer_dbg_armed();
+        perf_enter(OP_FFN_PROJ);
+        pre = resident_ffn_act(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l), hb,
+                               (uint32_t)n_embd, NULL, traced ? gateb : NULL, traced ? upb : NULL) == 0;
+        perf_exit(OP_FFN_PROJ);
+    }
+    if (!pre) {
+        perf_enter(OP_QUANT8);
+        if (H->hadamard_block)
+            e8 = rotate_quantize_f(hb, n_embd);
+        else
+            e8 = quantize_f(hb, n_embd);
+        hyb_cyc_fprep += perf_now64() - t0;
+        perf_exit(OP_QUANT8);
+        t0 = perf_now64();
+    }
+    perf_enter(OP_FFN_PROJ);
+    if (pre) {
+        fused = 1;
+    } else if (e8 == E8_RESIDENT && H->hadamard_block && resident_silu_active() &&
         infer_matvec_cols(down) == (uint32_t)ffn_dim) {
         int traced = infer_dbg_armed();
-        fused = resident_ffn_act(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l),
+        fused = resident_ffn_act(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l), NULL, 0,
                                  NULL, traced ? gateb : NULL, traced ? upb : NULL) == 0;
     }
     if (fused) {
@@ -2140,14 +2169,12 @@ static void ffn_tok(int l, uint64_t t0)
         R->prep_src = actb; R->prep_width = ffn_dim; R->prep_rotate = 1;
         int down_done = 0;
         uint64_t tf = perf_now64();
-        if (resident_prepare(NULL, (uint32_t)ffn_dim, 1) == 0) {
-            uint64_t tm = perf_now64();
-            HP->fd_prep += tm - tf;
-            if (HP->keep_out)
-                resident_keep_rsf(tmp_h);
-            down_done = resident_matvec(down, tmp_h) == 0;
-            HP->fd_mv += perf_now64() - tm;
-        }
+        // The prepare and the down projection in one list, its weights prefetched under the
+        // prepare (fd_prep stays 0: no separate prepare).
+        if (HP->keep_out)
+            resident_keep_rsf(tmp_h);
+        down_done = resident_prepare_matvec(NULL, (uint32_t)ffn_dim, 1, down, tmp_h) == 0;
+        HP->fd_mv += perf_now64() - tf;
         if (!down_done) {
             int e8c = rotate_quantize_legacy(hb, n_embd);
             matvec_q(model_entry(ROLE_FFN_GATE, l), e8c, gateb);

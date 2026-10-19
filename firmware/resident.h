@@ -43,6 +43,9 @@ int  resident_prepare(const float *src, uint32_t width, int rotate);
 // Multiply the resident Q8 vector by tensor e (K-segments summed in int32), restore FP32 and
 // DMA the rows into dst (main RAM, 32-byte aligned, rows*4 bytes). 0 = ok, -1 = unsupported.
 int  resident_matvec(const struct bons_entry *e, float *dst);
+// resident_prepare and resident_matvec as ONE list (no round trip between them), e's weights
+// prefetched under the prepare's units; -1 declines with nothing run, as either would.
+int  resident_prepare_matvec(const float *src, uint32_t width, int rotate, const struct bons_entry *e, float *dst);
 
 /* SiLU Unit */
 /*-----------*/
@@ -59,7 +62,7 @@ void resident_silu_enable(int on);   // Console A/B.
 // receives a copy in main RAM (the fallback source); gate_out/up_out, when not NULL,
 // receive the projections for traces. All 32-byte aligned. 0 = ok, -1 = declined/failed.
 int  resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
-                      float *act, float *gate_out, float *up_out);
+                      const float *x, uint32_t width, float *act, float *gate_out, float *up_out);
 void resident_mark_act(void);      // RS_F holds the next prepare's FP32 source (a list left it)
 // The next resident_matvec into dst leaves its result in RS_F only - no STORE, no cache
 // maintenance - for a caller whose next list reads it there (rl_rsf_is): dst's main-RAM copy
@@ -110,6 +113,14 @@ void rl_desc_overlap(const struct bns_seq_descriptor *d);
 void rl_store_packets(void *dst, uint32_t packet_bytes, uint32_t packets, uint32_t dst_stride,
                       uint32_t sp, uint32_t sp_stride, void *inv, uint32_t inv_bytes);
 void rl_prepare(const float *src, uint32_t width, int rotate);   // src NULL: already in RS_F
+// rl_prepare naming the matvec that consumes the vector (rows [pf_row0, pf_row0 + pf_rows) of
+// pf): its weight reads are issued right after the source's FETCH (engine op 7, a bitstream
+// with the prefetch) and wait in the readers' FIFOs while the prepare's units work. The matvec
+// must be the list's next engine read op (unit descriptors and STOREs may sit in between, never
+// a FETCH); every list starts with the loader's FETCH, so a prefetch and its matvec share a list.
+void rl_prepare_pf(const float *src, uint32_t width, int rotate, const struct bons_entry *pf,
+                   uint32_t pf_row0, uint32_t pf_rows);
+void rl_prefetch(const struct bons_entry *e, uint32_t row0, uint32_t rows);   // the descriptor alone
 void rl_desc(const struct bns_seq_descriptor *d);
 struct engine_op;
 void rl_engine(const struct engine_op *op);                       // any engine op, in order

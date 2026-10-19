@@ -57,6 +57,7 @@ from litex.soc.cores.cpu.vexiiriscv.core import VexiiRiscv
 from litex.soc.integration.soc_core import SoCCore
 from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.builder import Builder
+from litex.soc.interconnect.csr import CSR, CSRStatus, CSRStorage
 from litex.soc.interconnect.axi import AXIInterface
 
 from litedram.modules import MT40A512M8
@@ -330,6 +331,33 @@ def ddr4_phy(content, dmap=SIM_DDR4_MAP):
             m.init = init
     return phy, module
 
+class ReaderStats(LiteXModule):
+    """Per channel reader, at its output to the channel pipe (the sim's instrumentation): the
+    beats delivered, the cycles a beat waited on the pipe (valid, not ready), the cycles
+    without a beat to offer (the reader's FIFO empty). `snap` latches and restarts, `sel`
+    picks the channel (as EnginePortStats)."""
+    def __init__(self, readers):
+        n = len(readers)
+        self.snap    = CSR()
+        self.sel     = CSRStorage(max(1, (n - 1).bit_length()))
+        self.cycles  = CSRStatus(32)
+        self.beats   = CSRStatus(32)
+        self.stalled = CSRStatus(32)
+        self.starved = CSRStatus(32)
+        cycles = Signal(32)
+        self.sync += If(self.snap.re, self.cycles.status.eq(cycles), cycles.eq(0)).Else(cycles.eq(cycles + 1))
+        holds = {name: [] for name in ("beats", "stalled", "starved")}
+        for r in readers:
+            for name, expr in (("beats",   r.source.valid & r.source.ready),
+                               ("stalled", r.source.valid & ~r.source.ready),
+                               ("starved", ~r.source.valid)):
+                inc, count, hold = Signal(), Signal(32), Signal(32)
+                self.comb += inc.eq(expr)
+                self.sync += If(self.snap.re, hold.eq(count), count.eq(0)).Else(count.eq(count + inc))
+                holds[name].append(hold)
+        for name, regs in holds.items():
+            self.comb += getattr(self, name).status.eq(Array(regs)[self.sel.storage])
+
 # TriXiumSimSoC ------------------------------------------------------------------------------------
 
 class TriXiumSimSoC(SoCCore):
@@ -470,6 +498,7 @@ class TriXiumSimSoC(SoCCore):
                 if attn_geometry else (),
             **dict(unit_options)) # Unit sizing (TriXiumConfig fields), as the board target's.
         self.trixium = TriXiumCore(memory_ports, config)
+        self.rdstat  = ReaderStats(self.trixium.engine.readers)   # console `ddrstat`: the readers' output
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
 
