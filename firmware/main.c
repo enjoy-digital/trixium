@@ -1249,6 +1249,15 @@ static void console_service(void)
         if (str[0] == 0)
             printf("TPROF %s (arm | dump)\n",
                    tprof_armed ? "armed" : tprof_active ? "tracing" : "idle");
+    } else if (strcmp(token, "listlat") == 0) {
+        // listlat [n]: the round trip of an empty resident list (its loader FETCH and stop), n
+        // times: the fixed cost of every list start.
+        int n = *str ? (int)strtoul(str, NULL, 0) : 64, bad = 0;
+        uint64_t t0 = perf_now64();
+        for (int i = 0; i < n && !bad; i++) { rl_begin(); bad = rl_run("empty list"); }
+        uint64_t dt = perf_now64() - t0;
+        printf("LISTLAT %d empty lists: %lu cycles each%s\n", n, (unsigned long)(dt/(uint32_t)(n > 0 ? n : 1)),
+               bad ? " (FAILED)" : "");
     } else if (strcmp(token, "prefetch") == 0) {
         // prefetch [on|off|hybrid on|hybrid off]: the engine's weight prefetch (the Qwen3 path's
         // calls), and the hybrid lists' prefetch descriptors (resident.c, default off).
