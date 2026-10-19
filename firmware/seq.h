@@ -55,6 +55,7 @@ static inline void seq_patch(uint32_t idx, int word, uint32_t value)
 void     seq_run(uint32_t idx0, uint32_t count);            // Run + wait (gives up if wedged).
 extern uint32_t seq_list_tag;  // Bits 16-27 of the next list start's trace event (resident.c).
 void     seq_list_start(uint32_t idx0, uint32_t count);     // Start only; overlap CPU work...
+void     seq_csr_forget(void);                               // After another writer of the base/count CSRs.
 int      seq_run_trace(uint32_t idx0, uint32_t count,
                        uint32_t *ts, int max);              // Per-dcount timestamps.
 void     seq_join(void);                                    // ...then wait (same wedge guard).

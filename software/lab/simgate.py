@@ -27,7 +27,7 @@ import time
 
 import pexpect
 
-from software.lab.mirror import mirror, compare
+from software.lab.mirror import mirror, mirror_tokens, compare
 
 # Constants ----------------------------------------------------------------------------------------
 
@@ -93,6 +93,7 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
     mirror(image, [int(i) for i in ids], mirror_trace)
 
     # Simulation.
+    pre_ok = True
     child = spawn(gateware_dir, out_dir)
     try:
         boot_text = boot(child)
@@ -119,6 +120,16 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
             answer += child.before
             if ok and ok not in answer:
                 raise SystemExit(f"{cmd} failed: {answer[-300:]!r}")
+            # A pre-generation (`gen N ids...`, the untraced path with the posted lists and the
+            # list cache replaying) must give the mirror's tokens too.
+            words = cmd.split()
+            if words[0] == "gen" and len(words) > 2 and all(w.lstrip("-").isdigit() for w in words[1:]):
+                n_new, pids = int(words[1]), [int(w) for w in words[2:]]
+                got = re.search(r"GEN:((?:[ \t]+-?\d+)+)", answer)
+                got = [int(t) for t in got.group(1).split()] if got else []
+                want = mirror_tokens(image, pids, n_new)
+                print(f"pre-gen tokens: {got} mirror: {want}", flush=True)
+                pre_ok &= got == want
             print(f"pre: {cmd}: ok", flush=True)
         child.sendline(f"dbg {dbg}")
         child.expect(r"DBG armed for \d+ forwards", timeout=60)
@@ -152,6 +163,13 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
     for line in stats.splitlines():
         if line.strip().startswith("hybprof:"):
             print(line.strip())
+    # The list image cache: a replayed image that differs from a fresh build (verify mode) or a
+    # dropped replay is a wrong key somewhere.
+    lc = re.search(r"listcache: .*?(\d+) mismatches, (\d+) dropped", stats)
+    if lc:
+        print("listcache:", lc.group(0).split("listcache: ", 1)[1])
+        ok &= lc.group(1) == "0" and lc.group(2) == "0"
+    ok &= pre_ok
     ok &= compare(mirror_trace, sim_trace) == 0
     print("GATE", "PASS" if ok else "FAIL")
     return 0 if ok else 1

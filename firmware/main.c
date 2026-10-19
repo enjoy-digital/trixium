@@ -1289,6 +1289,7 @@ static void console_service(void)
         for (uint32_t i = 0; i < n; i++) acc += trixium_seq_status_read();
         uint32_t t1 = perf_now();
         for (uint32_t i = 0; i < n; i++) trixium_seq_count_write(i & 1);
+        seq_csr_forget();
         uint32_t t2 = perf_now();
         for (uint32_t i = 0; i < n; i++) acc += sp[i & 15];
         uint32_t t3 = perf_now();
@@ -1343,6 +1344,11 @@ static void console_service(void)
 #else
         printf("SOFTMAXUNIT %s (no unit 14 in this bitstream: the CPU softmax)\n", hybrid_softmax_unit ? "on" : "off");
 #endif
+    } else if (strcmp(token, "hbstore") == 0) { // hbstore on|off: the residual list stores the normed hidden state to main RAM every call (off: in RS_F only, materialized for CPU readers)
+        extern int hybrid_hb_store;
+        if (strncmp(str, "on", 2) == 0)  hybrid_hb_store = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_hb_store = 0;
+        printf("HBSTORE %s\n", hybrid_hb_store ? "on (hb stored every residual list)" : "off (hb stays in RS_F; CPU readers restore it)");
     } else if (strcmp(token, "hwargmax") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);

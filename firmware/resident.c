@@ -450,6 +450,10 @@ static void loader_write(uint32_t bbase)
 // Report the resident units' failures at once instead of after the sequencer's stall
 // timeout: a failed unit parks the list busy until the engine reset. Waits for the list in
 // flight (none: 0), then invalidates its stores.
+// Whether run_list_wait's first poll found the list still running (the start that follows
+// "waited": its build was hidden behind the list, listprof's `waits`).
+static int rl_wait_busy;
+
 static int run_list_wait(void)
 {
     struct rl_state *L = RLS;
@@ -464,6 +468,8 @@ static int run_list_wait(void)
     uint32_t spins = 0;
     for (;;) {
         uint32_t st = trixium_seq_status_read();
+        if (spins == 0)
+            rl_wait_busy = st & 1;
         if (prof) {
             uint32_t dc = st >> 8;
             if (dc != last_d && dc < RS_DESC_MAX) {
@@ -481,6 +487,11 @@ static int run_list_wait(void)
             }
             break;
         }
+        // One status read per spin; the units' error CSRs (six reads, ~70 cycles each) every 32
+        // spins: a failed unit parks the list busy, so its error is still there a round later,
+        // and a completed list is seen within one read instead of up to seven.
+        if (++spins & 31u)
+            continue;
         uint32_t eq = trixium_seq_activation_quantize_error_read(), eh = trixium_seq_hadamard_error_read(),
                  er = trixium_seq_projection_restore_error_read(), es = 0;
 #if SILU_BUILT
@@ -492,7 +503,7 @@ static int run_list_wait(void)
 #ifdef CSR_TRIXIUM_SEQ_CONV_ERROR_ADDR
         es |= trixium_seq_conv_error_read();
 #endif
-        if ((eq | eh | er | es) || ++spins > 4000000u) {
+        if ((eq | eh | er | es) || spins > 4000000u) {
             printf("resident: %s list failed at dcount %lu (quantize %08lx hadamard %08lx "
                    "restore %08lx silu/norm/conv %08lx eng %02lx)%s - engine soft reset, resident path off\n",
                    what, (unsigned long)(st >> 8), (unsigned long)eq, (unsigned long)eh,
@@ -526,10 +537,11 @@ static int run_list_start(uint32_t count, const char *what)
     uint64_t now = perf_now64();
     if (prof && L->t0) prof->build += now - L->t0;
     L->t0 = 0;
-    int waited = L->active && (trixium_seq_status_read() & 1);
-    if (prof && waited) prof->waits++;
+    int waited = L->active;            // ... and still running at run_list_wait's first poll
     if (run_list_wait())
         return -1;
+    waited = waited && rl_wait_busy;
+    if (prof && waited) prof->waits++;
     lp_post();
     if (seq_wedged) {
         R->disabled = 1;

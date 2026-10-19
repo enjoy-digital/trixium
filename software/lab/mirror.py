@@ -122,6 +122,20 @@ def mirror(image, ids, out, hybrid_silu="rv32f"):
     print(f"{out}: {len(lines)} checksums, mirror token {tokens}")
 
 
+def mirror_tokens(image, ids, n_new, hybrid_silu="rv32f"):
+    """The mirror's `n_new` greedy tokens after the prompt `ids` (no trace): what the card's or the
+    simulation's `gen n_new ids...` must print."""
+    from model.bons import BONSReader
+    from model.mirror import hybrid_generate, hybrid27_generate
+    img = BONSReader(image)
+    h = img.header
+    is_hybrid = h["version"] >= 3 and ("deltanet" in h["layer_types"] or h["hadamard_block"])
+    if is_hybrid:
+        return [int(t) for t in hybrid27_generate(img, ids, n_new, silu_mode=hybrid_silu)]
+    modes = {"silu_mul": "hw", "rmsnorm": "hw", "kv_hbm": "hw"}
+    return [int(t) for t in hybrid_generate(img, ids, n_new, modes=modes)]
+
+
 def cmd_mirror(a):
     mirror(a.image, prompt_ids(a), a.out, a.hybrid_silu)
 

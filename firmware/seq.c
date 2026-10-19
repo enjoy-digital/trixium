@@ -99,6 +99,7 @@ void seq_desc_stop(uint32_t idx)
 int seq_wedged; // Sticky: a list never finished, so the engine state is not trustworthy.
 
 uint32_t seq_poll_spins, seq_poll_waits;
+static void seq_program(uint32_t idx0, uint32_t count);
 
 // Split form (per-cycle sideband slot): seq_list_start() starts a list and returns; the CPU
 // may then patch other lists' descriptors or do main_ram work while it runs, and seq_join()
@@ -144,8 +145,7 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
     uint32_t last = 0xFFFFFFFF, spins = 0;
     if (n < max)
         ts[n++] = perf_now();
-    trixium_seq_base_write(SP_DESC + idx0*64);
-    trixium_seq_count_write(count);
+    seq_program(idx0, count);
     trixium_seq_start_write(1);
     for (;;) {
         uint32_t st = trixium_seq_status_read();
@@ -171,6 +171,29 @@ int seq_run_trace(uint32_t idx0, uint32_t count, uint32_t *ts, int max)
 
 uint32_t seq_list_tag;
 
+// The list's base and count CSRs are written only when they change (the two descriptor banks
+// alternate, lists of one count repeat): a CSR write is ~70 cycles on the critical path of
+// every list start. seq_csr_forget() after any other writer of these CSRs.
+static uint32_t seq_base_shadow = 0xFFFFFFFFu, seq_count_shadow = 0xFFFFFFFFu;
+
+void seq_csr_forget(void)
+{
+    seq_base_shadow = seq_count_shadow = 0xFFFFFFFFu;
+}
+
+static void seq_program(uint32_t idx0, uint32_t count)
+{
+    uint32_t base = SP_DESC + idx0*64;
+    if (base != seq_base_shadow) {
+        trixium_seq_base_write(base);
+        seq_base_shadow = base;
+    }
+    if (count != seq_count_shadow) {
+        trixium_seq_count_write(count);
+        seq_count_shadow = count;
+    }
+}
+
 void seq_list_start(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged)
@@ -178,8 +201,7 @@ void seq_list_start(uint32_t idx0, uint32_t count)
     if (tprof_active)
         tprof_event((5u << 28) | (seq_list_tag & 0x0FFF0000u) | ((idx0 & 0xFF) << 8) | (count & 0xFF));
     seq_list_tag = 0;
-    trixium_seq_base_write(SP_DESC + idx0*64);
-    trixium_seq_count_write(count);
+    seq_program(idx0, count);
     trixium_seq_start_write(1);
 }
 
@@ -187,8 +209,7 @@ void seq_run(uint32_t idx0, uint32_t count)
 {
     if (seq_wedged) // Nothing will complete until the FPGA is reconfigured.
         return;
-    trixium_seq_base_write(SP_DESC + idx0*64);
-    trixium_seq_count_write(count);
+    seq_program(idx0, count);
     trixium_seq_start_write(1);
     // Spin-capped poll: a wedged list names the stuck descriptor instead of hanging, and
     // gives up: a stalled list keeps `busy` and the scratchpad grant (status bit 9), so the
