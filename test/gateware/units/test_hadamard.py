@@ -474,8 +474,7 @@ def test_rotation_descriptor_encoding_and_configuration():
         args.update(changed)
         with pytest.raises(ValueError):
             scratchpad_rotation_descriptor(**args)
-    with pytest.raises(ValueError):
-        TriXiumConfig(with_hadamard=True, with_vecunit=False)
+    TriXiumConfig(with_hadamard=True, with_vecunit=False)   # supported since the YPCB's hyb7
     with pytest.raises(ValueError):
         TriXiumConfig(with_hadamard=True, scratchpad_size=512*1024)
     for size in (0, 31, 33, 256*1024 + 32):
