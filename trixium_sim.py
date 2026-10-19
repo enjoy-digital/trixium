@@ -816,6 +816,11 @@ def build_sim(args, board, out_dir):
         soc_kwargs["reader_bursts"] = args.reader_bursts
     if args.pipe_clk_freq:
         soc_kwargs["pipe_clk_freq"] = args.pipe_clk_freq
+    if args.dn_sublanes and "unit_options" in soc_kwargs:
+        # The DeltaNet stream's sub-lanes per channel, over the board's default.
+        soc_kwargs["unit_options"] = tuple((k, v) for k, v in soc_kwargs["unit_options"]
+                                           if k != "dnstream_options") \
+                                     + (("dnstream_options", (("sublanes", args.dn_sublanes),)),)
     if args.vec_fused:
         soc_kwargs["vec_fused"] = True
     if args.ddr_settings:
@@ -879,6 +884,7 @@ def main():
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
     parser.add_argument("--pipe-clk-freq",  default=0, type=float,                                 help="--board ypcb: the channel pipes' own clock (PipeIsland), 0: the sys clock.")
+    parser.add_argument("--dn-sublanes",    default=0, type=int,                                   help="--hybrid: DeltaNet stream sub-lanes per channel (0: the board's default).")
     parser.add_argument("--reader-bursts",  default=0, type=int, metavar="N",                     help="16-beat bursts a channel reader keeps outstanding (0: the core's default, 8).")
     parser.add_argument("--vec-fused",      action="store_true",                                   help="Vector unit with the fused clamp/round instructions (TRIXIUM_VEC_FUSED).")
     parser.add_argument("--ckphase-model",  action="store_true",                                   help="--board ypcb: the PHY models behind the K7DDRPHY's CK phase CSRs (calibration test: ddrinit 1).")

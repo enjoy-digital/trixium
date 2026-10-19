@@ -203,6 +203,7 @@ class TriXiumYPCBSoC(SoCCore):
         ddr_quiet_regions = False,
         reader_bursts  = 8,
         pipe_clk_freq  = 0,
+        dn_sublanes    = 0,
         **kwargs):
         ddram_channels = 2
         assert engine_channels % ddram_channels == 0, \
@@ -332,6 +333,8 @@ class TriXiumYPCBSoC(SoCCore):
                     (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3]))))
         if hybrid:
             units.update(YPCB_HYBRID_UNIT_OPTIONS)
+            if dn_sublanes:    # The DeltaNet stream's sub-lanes per channel (2: the default above).
+                units["dnstream_options"] = (("sublanes", dn_sublanes),)
         config = TriXiumConfig(scratchpad_xpm=True, **units,
             chan_stride = chan_stride,
             chan_mod    = chan_mod,
@@ -438,6 +441,7 @@ def main():
     parser.add_target_argument("--hybrid",             action="store_true",                                   help="With the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B: DeltaNet/attention streams, FWHT, ...) and a CPU FPU.")
     parser.add_target_argument("--attn-geometry",     default=None,                                          help="Attention stream lanes,groups,hd_max,t_max (default: YPCB_HYBRID_ATTN + 256,2048).")
     parser.add_target_argument("--pipe-clk-freq",    default=0,        type=float,                          help="The channel pipes' own clock (Hz, a PLL): one 128-trit beat per pipe clock; 0: the sys clock.")
+    parser.add_target_argument("--dn-sublanes",      default=0,        type=int,                            help="--hybrid: DeltaNet stream sub-lanes per channel (1, 2, 4; 0: the default, 2).")
     parser.add_target_argument("--reader-bursts",     default=8,        type=int,                            help="16-beat bursts a channel reader keeps outstanding (8: the core's default).")
     parser.add_target_argument("--ddr-quiet-regions", action="store_true",                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
@@ -475,6 +479,7 @@ def main():
         ddr_quiet_regions  = args.ddr_quiet_regions,
         reader_bursts      = args.reader_bursts,
         pipe_clk_freq      = args.pipe_clk_freq,
+        dn_sublanes        = args.dn_sublanes,
         **({"attn_geometry": tuple(int(x) for x in args.attn_geometry.split(","))} if args.attn_geometry else {}),
         **parser.soc_argdict)
     add_zbb_constant(soc, args)

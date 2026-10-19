@@ -242,6 +242,34 @@ def test_ypcb_geometry_two_sublanes_under_backpressure(tmp_path, binary_ypcb_s2)
 
 
 @pytest.fixture(scope="module")
+def binary_ypcb_s4():
+    return build(4, 128, 128, sublanes=4)
+
+
+def test_ypcb_geometry_four_sublanes_stream_a_head_per_1024_clocks(tmp_path, binary_ypcb_s4):
+    """4 channels x 4 sub-lanes (R = 8 rows per virtual lane, above the adder's feedback latency):
+    a 128x128 head per cols*R = 128*8 clocks, the 27B geometry's rate on the YPCB."""
+    lanes, rows, cols = 4, 128, 128
+    cycles = {}
+    for heads in (6, 12):
+        mem, states, table, want_mem, want_states = scenario(np.random.default_rng(heads), heads, rows, cols, 2)
+        got_mem, got_lanes, cycles[heads] = run(binary_ypcb_s4, tmp_path, mem, states, lanes, heads, table,
+                                                (100, 100, 100))
+        check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+    per_head = (cycles[12] - cycles[6])/6
+    print("YPCB geometry, 4 sub-lanes:", cycles, "cycles;", per_head, "per head in steady state")
+    assert per_head < 1024*1.02, cycles
+    assert cycles[6] < 7*1024 + 800, cycles
+
+
+def test_ypcb_geometry_four_sublanes_under_backpressure(tmp_path, binary_ypcb_s4):
+    lanes, rows, cols, heads = 4, 128, 128, 5
+    mem, states, table, want_mem, want_states = scenario(np.random.default_rng(11), heads, rows, cols, 5)
+    got_mem, got_lanes, cycles = run(binary_ypcb_s4, tmp_path, mem, states, lanes, heads, table, (30, 50, 40))
+    check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
+
+
+@pytest.fixture(scope="module")
 def binary27():
     return build(16, 128, 128)
 
@@ -269,7 +297,7 @@ def test_27b_geometry_under_backpressure(tmp_path, binary27):
     check(got_mem, got_lanes, want_mem, want_states, lanes, rows, cols)
 
 
-@pytest.mark.parametrize("pcts,sublanes", [((100, 100, 100), 1), ((40, 60, 50), 1), ((40, 60, 50), 2)])
+@pytest.mark.parametrize("pcts,sublanes", [((100, 100, 100), 1), ((40, 60, 50), 1), ((40, 60, 50), 2), ((40, 60, 50), 4)])
 def test_zero_flag_ignores_the_incoming_state(tmp_path_factory, pcts, sublanes):
     """`zero`: the first token's state is +0.0 whatever the DDR holds (NaN, Inf included);
     the streams are still consumed; with the flag low the same netlist reads the state."""
