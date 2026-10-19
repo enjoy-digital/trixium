@@ -1586,8 +1586,11 @@ uint32_t resident_gate_patch(uint32_t fixmap_sp, uint32_t g_sp, uint32_t m_sp, f
 /* FFN Activation */
 /*----------------*/
 
-int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
-                     const float *x, uint32_t width, float *act, float *gate_out, float *up_out)
+// The posted activation list's leftovers for resident_ffn_act_finish().
+static struct { uint32_t rows; float *act, *gate_out, *up_out; uint64_t t0; int pending; } ffn_post;
+
+int resident_ffn_act_post(const struct bons_entry *gate, const struct bons_entry *up,
+                          const float *x, uint32_t width, float *act, float *gate_out, float *up_out)
 {
     struct resident_state *R = resident_state();
     const struct bons_header *H = model_header();
@@ -1651,27 +1654,52 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     if (act)
         store_out(&n, act, rows, RS_F);
     desc_stop(n++);
-    int rc = run_list(n, "ffn activation");
+    // Posted: the caller builds the list that follows (the down projection) while it runs,
+    // then resident_ffn_act_finish() joins it and patches the fixups.
+    int rc = run_list_start(n, "ffn activation");
     if (!rc) {
-        if (act) invd_cpu_dcache_range(act, rows*4);
-        if (gate_out) invd_cpu_dcache_range(gate_out, rows*4);
-        if (up_out) invd_cpu_dcache_range(up_out, rows*4);
+        ffn_post.rows = rows; ffn_post.act = act; ffn_post.gate_out = gate_out;
+        ffn_post.up_out = up_out; ffn_post.t0 = t0; ffn_post.pending = 1;
+    } else {
+        R->silu_cycles += perf_now64() - t0;
+    }
+    return rc;
+decline:
+    R->fallbacks++;
+    resident_join();
+    return -1;
+}
+
+int resident_ffn_act_finish(void)
+{
+    struct resident_state *R = resident_state();
+    if (!ffn_post.pending)
+        return 0;
+    ffn_post.pending = 0;
+    int rc = resident_join();
+    if (!rc) {
+        uint32_t rows = ffn_post.rows;
+        if (ffn_post.act) invd_cpu_dcache_range(ffn_post.act, rows*4);
+        if (ffn_post.gate_out) invd_cpu_dcache_range(ffn_post.gate_out, rows*4);
+        if (ffn_post.up_out) invd_cpu_dcache_range(ffn_post.up_out, rows*4);
         // Elements outside the unit's exact range (|gate| tails, specials, non-normal
         // products) kept g in RS_F; recompute them with the firmware's own function.
         uint32_t fixups = trixium_seq_silu_fixups_read();
         R->silu_fixups += fixups;
         if (fixups)
-            silu_patch(rows, act);
+            silu_patch(rows, ffn_post.act);
         R->act_resident = 1;
-        lp_post();
     }
-    R->silu_cycles += perf_now64() - t0;
+    R->silu_cycles += perf_now64() - ffn_post.t0;
     R->silu_lists++;
     return rc;
-decline:
-    R->fallbacks++;
-    resident_join();                   // the caller's fallback may use the engine
-    return -1;
+}
+
+int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
+                     const float *x, uint32_t width, float *act, float *gate_out, float *up_out)
+{
+    int rc = resident_ffn_act_post(gate, up, x, width, act, gate_out, up_out);
+    return rc ? rc : resident_ffn_act_finish();
 }
 
 #else  // !SILU_BUILT
@@ -1796,6 +1824,10 @@ int resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
     resident_state()->fallbacks++;
     return -1;
 }
+int resident_ffn_act_post(const struct bons_entry *gate, const struct bons_entry *up, const float *x,
+                          uint32_t width, float *act, float *gate_out, float *up_out)
+{ (void)gate; (void)up; (void)x; (void)width; (void)act; (void)gate_out; (void)up_out; return -1; }
+int resident_ffn_act_finish(void) { return 0; }
 int resident_gate_init(const float *sig_lut, uint32_t *image)
 {
     (void)sig_lut; (void)image; resident_state()->gate_ready = 0; return -1;

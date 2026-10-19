@@ -1344,6 +1344,21 @@ static void console_service(void)
 #else
         printf("SOFTMAXUNIT %s (no unit 14 in this bitstream: the CPU softmax)\n", hybrid_softmax_unit ? "on" : "off");
 #endif
+    } else if (strcmp(token, "fuseout") == 0) { // fuseout on|off: a mixer's or the FFN's output projection, the residual add and the next norm as one list (on) or as separate lists (off)
+        extern int hybrid_fuse_out;
+        if (strncmp(str, "on", 2) == 0)  hybrid_fuse_out = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_fuse_out = 0;
+        printf("FUSEOUT %s\n", hybrid_fuse_out ? "on (out projection + residual + norm in one list)" : "off (separate lists)");
+    } else if (strcmp(token, "lmstore") == 0) { // lmstore on|off: the LM head's logits stored to main RAM when the hardware argmax decides (off: the tracker alone; traced runs always store)
+        extern int hybrid_lm_store;
+        if (strncmp(str, "on", 2) == 0)  hybrid_lm_store = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_lm_store = 0;
+        printf("LMSTORE %s\n", hybrid_lm_store ? "on (logits stored every chunk)" : "off (the argmax tracker alone)");
+    } else if (strcmp(token, "dnlist") == 0) { // dnlist on|off: the DeltaNet q/k norm, heads op and gated norm as one list (on) or the heads op through the CSRs (off)
+        extern int hybrid_dn_list;
+        if (strncmp(str, "on", 2) == 0)  hybrid_dn_list = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_dn_list = 0;
+        printf("DNLIST %s\n", hybrid_dn_list ? "on (one list: l2 norm, heads, gated norm)" : "off (the heads op through the CSRs)");
     } else if (strcmp(token, "hbstore") == 0) { // hbstore on|off: the residual list stores the normed hidden state to main RAM every call (off: in RS_F only, materialized for CPU readers)
         extern int hybrid_hb_store;
         if (strncmp(str, "on", 2) == 0)  hybrid_hb_store = 1;

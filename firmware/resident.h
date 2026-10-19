@@ -63,6 +63,10 @@ void resident_silu_enable(int on);   // Console A/B.
 // receive the projections for traces. All 32-byte aligned. 0 = ok, -1 = declined/failed.
 int  resident_ffn_act(const struct bons_entry *gate, const struct bons_entry *up,
                       const float *x, uint32_t width, float *act, float *gate_out, float *up_out);
+// The same list posted (the caller builds the next list meanwhile) and finished (join, fixups).
+int  resident_ffn_act_post(const struct bons_entry *gate, const struct bons_entry *up, const float *x,
+                           uint32_t width, float *act, float *gate_out, float *up_out);
+int  resident_ffn_act_finish(void);
 void resident_mark_act(void);      // RS_F holds the next prepare's FP32 source (a list left it)
 // The next resident_matvec into dst leaves its result in RS_F only - no STORE, no cache
 // maintenance - for a caller whose next list reads it there (rl_rsf_is): dst's main-RAM copy

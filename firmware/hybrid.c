@@ -128,6 +128,17 @@ static int dn_hw_written;              // the span was cleared once since the bo
 static uint64_t dn_state_zero;
 int hybrid_softmax_div;                  // Console `softmaxdiv on`: the per-position divide (A/B).
 int hybrid_softmax_unit = 1;             // Console `softmaxunit off`: the CPU softmax instead of unit 14.
+int hybrid_dn_list = 1;                  // Console `dnlist off`: the DeltaNet heads op through the CSRs
+                                         // (its ENGSTALL diagnostics) instead of the merged core list.
+int hybrid_fuse_out = 1;                 // Console `fuseout off`: the output projection, the residual add
+                                         // and the next norm as separate lists (the A/B of out_resid_*).
+int hybrid_lm_store = 0;                 // Console `lmstore on`: the LM head chunk lists store the logits
+                                         // to main RAM even when the hardware argmax decides (the
+                                         // untraced default stores nothing: the tracker reads RS_F).
+int hybrid_hb_store = 0;                 // Console `hbstore on`: the residual list stores hb to main RAM
+                                         // every call (the untraced default leaves it in RS_F only).
+static int hb_stale;                     // hb's main-RAM copy lags the scratchpad (see hb_materialize)
+static const float *hb_w;                // ... the norm weight that produced it
 #ifdef TRIXIUM_SIM
 static int hybrid_inits, power_on_reset; // Simulation: hybrid_init's first reset (below).
 #endif
@@ -171,6 +182,7 @@ struct hyb_prof {
     uint8_t logits_clean;            // the CPU holds no dirty line of `logits` (lm_head_argmax)
     uint64_t fd_prep, fd_mv;         // inside hyb_cyc_fdown: the down prepare, the down matvec
     uint8_t keep_out;                // the mixer/FFN outputs stay in RS_F for the residual add
+    uint8_t xres_on;                 // the resident residual stream runs this forward (out_resid_*)
 };
 #define HP ((struct hyb_prof *)TRIXIUM_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -329,6 +341,45 @@ static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
     for (; i < n; i++) dst[i] = src[i]*r*w[i];
 }
 
+#define XRES_SP   0x36600u        // the resident residual stream (above the persistent map)
+// hb's main-RAM copy for the CPU paths. Untraced, the residual list leaves hb in RS_F and stores
+// nothing (a STORE descriptor, 8 KB flushed and 8 KB invalidated at every list, 49 times a
+// token); the resident consumers take it from RS_F (rl_rsf_is). A CPU reader of hb (a declined
+// or failed list's fallback, the LM head's CPU loop) calls this first: one list stores x from
+// XRES_SP (xb) and hb from RS_F while it is still there, else hb is renormed on the CPU (the
+// same canonical sum as unit 12). If the list itself fails, the words are read from the
+// scratchpad directly (slow, correct).
+static int hb_materialize(void)
+{
+    if (!hb_stale)
+        return 0;
+    uint32_t n = (uint32_t)n_embd, bytes = 4u*n;
+    int from_rsf = rl_rsf_is(hb);
+    rl_begin();
+    rl_store(xb, bytes, XRES_SP);
+    if (from_rsf)
+        rl_store(hb, bytes, RS_F_ADDR);
+    if (rl_run("hb restore")) {
+        const volatile uint32_t *x = (const volatile uint32_t *)(SCRATCHPAD_BASE + XRES_SP);
+        const volatile uint32_t *f = (const volatile uint32_t *)(SCRATCHPAD_BASE + RS_F_ADDR);
+        for (uint32_t i = 0; i < n; i++) ((uint32_t *)xb)[i] = x[i];
+        if (from_rsf)
+            for (uint32_t i = 0; i < n; i++) ((uint32_t *)hb)[i] = f[i];
+    }
+    if (!from_rsf)
+        rmsnorm_fv(hb, xb, hb_w, n_embd);
+    hb_stale = 0;
+    return 0;
+}
+
+// Before a list that may FETCH hb from main RAM (its prepare, when RS_F no longer holds hb).
+static void hb_ready(void)
+{
+    if (hb_stale && !rl_rsf_is(hb))
+        hb_materialize();
+}
+
+
 static void l2norm_fv(float *v, int n)   // ggml_l2_norm: v / max(|v|, eps)
 {
     float ss = sumsq64(v, n);
@@ -399,6 +450,7 @@ static void rotate_f_legacy(const float *src, float *dst, int width)
 
 static int rotate_quantize_legacy(const float *src, int width)
 {
+    if (src == hb) hb_materialize();
     int e8 = infer_rotate_quantize_f(src, (uint32_t)width);
     if (e8 != INFER_ROTATE_UNSUPPORTED) return e8;
     rotate_f_legacy(src, rot, width);
@@ -420,12 +472,91 @@ static void rl_prepare_for(const float *src, uint32_t width, int rotate, const s
 // the bit goes into an aligned pointer of the list's name.
 static inline uint32_t pf_key(void) { return (uint32_t)(engine_pf_use && hybrid_pf_use); }
 
+static uint32_t f32_bits(float x);
+
+/* Output Projection + Residual */
+/*------------------------------*/
+
+// A mixer's or the FFN's output projection, the residual add into the stream (XRES_SP) and the
+// next norm as ONE list: staged (out_resid_build) under the list before it, started
+// (out_resid_start) after that list's SiLU fixup patch, so neither its build nor the residual
+// list's round trip is exposed. src: the projection's input in main RAM (fetched; the attention
+// output), NULL: in RS_F (the gated SiLU's og, the FFN activation); e: the projection; w_next:
+// the next norm's weight (NULL: no norm); sync: xb brought up to date (the trace, the last
+// layer). Traced, the projection's output is stored to tmp_h and hb to main RAM for the trace's
+// taps, so the list has one structure in both modes. out_resid_start: 0 done (RS_F holds hb when
+// w_next), -1 declined (nothing ran: the caller's two-list path), -2 the list failed.
+enum { OUT_SITE_DN, OUT_SITE_ATTN, OUT_SITE_FFN };
+static struct { const float *w_next; int sync, traced, built; } out_resid;
+
+static int out_resid_build(const float *src, uint32_t width, const struct bons_entry *e,
+                           const float *w_next, int sync, int site, int l)
+{
+    struct bns_seq_descriptor d;
+    uint32_t n = (uint32_t)n_embd, bytes = 4u*n, wsp = RS_Y_ADDR + ((bytes + 31u) & ~31u);
+    out_resid.built = 0;
+    if (!hybrid_fuse_out || !HP->xres_on || !e || !resident_active() || width % 32 ||
+        width != infer_matvec_cols(e) || ((uintptr_t)src & 31))
+        return -1;                                 // (rl_prepare_pf bounds the width itself)
+    int traced = infer_dbg_armed() != 0;           // a count of forwards: one key bit
+    // The name: the layer and site, the source's presence and whether RS_F holds it, sync, the
+    // trace; the entry (its low bit the prefetch); the next norm's weight.
+    int hb_store = traced || hybrid_hb_store;      // the hb store descriptor's presence (the key)
+    rl_begin_keyed(0x0E000000u | (uint32_t)l << 8 | (uint32_t)hb_store << 7 | (uint32_t)site << 4 |
+                   (uint32_t)(src != NULL) << 3 | (uint32_t)(src && rl_rsf_is(src)) << 2 |
+                   (uint32_t)sync << 1 | (uint32_t)traced,
+                   (uint32_t)(uintptr_t)e | pf_key(), (uint32_t)(uintptr_t)w_next);
+    rl_prepare_pf(src, width, 1, e, 0, e->rows);
+    rl_matvec(e, RS_Y_ADDR, RS_F_ADDR);
+    if (traced)
+        rl_store(tmp_h, bytes, RS_F_ADDR);         // the trace's dn_out / attn_out / ffn_down
+    bns_seq_desc_add(&d, XRES_SP, RS_F_ADDR, XRES_SP, n);
+    rl_desc(&d);
+    if (sync)
+        rl_store(xb, bytes, XRES_SP);
+    if (w_next) {
+        rl_fetch_raw(w_next, bytes, wsp);          // a norm weight: cleaned at load
+        bns_seq_desc_norm(&d, 0, XRES_SP, RS_F_ADDR, wsp, n, 1, f32_bits(rms_eps));
+        rl_desc(&d);
+        if (hb_store)
+            rl_store(hb, bytes, RS_F_ADDR);
+    }
+    out_resid.w_next = w_next; out_resid.sync = sync; out_resid.traced = traced;
+    out_resid.built = 1;
+    return 0;
+}
+
+static int out_resid_start(void)
+{
+    if (!out_resid.built)
+        return -1;
+    out_resid.built = 0;
+    int post = !out_resid.sync && HP->keep_out;
+    if (rl_start("out+residual"))
+        return -1;                                 // declined: nothing ran
+    if (out_resid.w_next) {
+        resident_rsf_set(hb);                      // the next list's prepare of hb reads RS_F
+        if (out_resid.traced || hybrid_hb_store) {
+            hb_stale = 0;
+        } else {
+            hb_stale = 1;
+            hb_w = out_resid.w_next;
+        }
+    }
+    if (!post && rl_wait())
+        return -2;
+    return 0;
+}
+
+
 static int prepare_f(const float *src, int width, int rotate)
 {
     struct resident_state *R = resident_state();
     R->prep_src = src; R->prep_width = width; R->prep_rotate = rotate;
+    if (src == hb) hb_ready();
     if (resident_prepare(src, (uint32_t)width, rotate) == 0)
         return E8_RESIDENT;
+    if (src == hb) hb_materialize();
     return rotate ? rotate_quantize_legacy(src, width) : infer_quantize_f(src, (uint32_t)width);
 }
 
@@ -446,6 +577,7 @@ static void matvec_q(const struct bons_entry *e, int e8, float *dst)
             return;
         // Declined or failed: the CPU path needs its own Q8 in SP_X.
         const struct resident_state *R = resident_state();
+        if (R->prep_src == hb) hb_materialize();
         e8 = R->prep_rotate ? rotate_quantize_legacy(R->prep_src, R->prep_width)
                             : infer_quantize_f(R->prep_src, (uint32_t)R->prep_width);
         if (e8 == E8_RESIDENT) return;   // Cannot happen: the legacy path never returns it.
@@ -1029,6 +1161,7 @@ static inline void deltanet_rows4(float *M, int stride, const float *kk, const f
 static void deltanet_layer(int l, const float *h, float *out)
 {
     resident_join();                   // h from a posted residual-stream list
+    if (h == hb) hb_materialize();     // ... which left it in the scratchpad
     int   s = dn_slot[l];
     int   C = 2*nq + nvh;
     float *S    = dn_hw ? NULL : dn_state + (uint64_t)s*nv*hv*hk;
@@ -1187,7 +1320,6 @@ static uint32_t f32_bits(float x)
 // only the per-head scalars and the rare SiLU fixups. Bit-exact with deltanet_layer (the
 // sim gate compares them checkpoint by checkpoint). Scratchpad map for this layer:
 #define DNR_QKV   0x04800u        // qkv, then conv+SiLU output, q/k L2-normed in place (4C)
-#define XRES_SP   0x36600u        // the resident residual stream (above the persistent map)
 static uint32_t dnr_align(uint32_t x) { return (x + 31u) & ~31u; }
 
 #ifdef TRIXIUM_HAS_DNSTREAM
@@ -1213,6 +1345,7 @@ static void dn_stream_records(uint32_t slot0, uint32_t ho, float scale, int rep)
 
 static int deltanet_layer_resident(int l, const float *h, float *out)
 {
+    hb_ready();                        // a prepare of hb may FETCH it from main RAM
     int s = dn_slot[l];
     uint32_t C = (uint32_t)(2*nq + nvh);
     // z is restored at Z and parked in main RAM (zb) for the heads, whose outputs take its
@@ -1374,12 +1507,53 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     perf_exit(OP_DN_ACT);
     act_dt = perf_now64() - ta;
     dn_cyc_act += act_dt;
-    // The q/k L2 list into the other bank while the conv runs.
+    // The q/k L2 norm, the heads and the gated norm as one keyed list, built into the other
+    // bank while the conv runs (dnlist on, the stream op in the list as an engine descriptor:
+    // the same fields as the CSR path's; its key carries the state set and the zero flag, which
+    // change wbase/dstride/bias): no list round trip for the L2, no CSR dispatch and poll for
+    // the heads, the gated norm's build hidden. The CSR path stays (dnlist off) for its
+    // ENGSTALL diagnostics and the CPU recurrence.
+    int dn_list = 0, core_posted = 0;
+#ifdef TRIXIUM_HAS_DNSTREAM
+    dn_list = hybrid_dn_list && dn_hw && HP->dnstream_active;
+#endif
     uint64_t tl = perf_now64();
     perf_enter(OP_DN_PREP);
-    if (!rl_begin_keyed(0x06000000u, 0, 0))
-        bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
-    rl_desc(&d);
+    int core_replay = 0;
+    if (dn_list) {
+        uint32_t zero = (uint32_t)(dn_state_zero >> s & 1u);
+        core_replay = rl_begin_keyed(0x0D000000u | (uint32_t)l << 8 | (uint32_t)z_stays |
+                                     (uint32_t)dn_par << 1 | zero << 2, 0, 0);
+        if (!core_replay)
+            bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
+        rl_desc(&d);
+        rl_fetch_raw(norm_ssm[l], dnr_align(4*(uint32_t)hv), NW);
+        if (!z_stays)
+            rl_fetch(zb, dnr_align(4*(uint32_t)nvh), Z2);
+#ifdef TRIXIUM_HAS_DNSTREAM
+        struct engine_op o = {0};
+        o.kind  = ENGINE_KIND_DNSTREAM;
+        o.rows  = (uint16_t)nv;
+        o.wbase = dn_hbm_base + (uint32_t)dn_par*dn_set_bytes + (uint32_t)s*(uint32_t)nv*DN_STREAM_BEATS*32u;
+        o.dstride = (dn_par ? -(int32_t)(dn_set_bytes/32u) : (int32_t)(dn_set_bytes/32u)) & 0xFFFFFF;
+        o.wlen  = (uint32_t)nv*DN_STREAM_BEATS;
+        o.xsrc  = SLOT0;
+        o.bias  = (uint8_t)zero;
+        rl_engine(&o);
+#endif
+        if (!core_replay)
+            bns_seq_desc_norm(&d, 0, HO, HO, NW, (uint32_t)hv, (uint32_t)nv, eps);
+        rl_desc(&d);
+        if (!core_replay)
+            bns_seq_desc_silu_ex(&d, Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, 0, (uint32_t)hv/8,
+                                 (uint32_t)nk, (uint32_t)rep);
+        rl_desc(&d);
+    } else {
+        // The q/k L2 list alone into the other bank while the conv runs.
+        if (!rl_begin_keyed(0x06000000u, 0, 0))
+            bns_seq_desc_norm(&d, 1, DNR_QKV, DNR_QKV, 0, (uint32_t)hk, 2u*(uint32_t)nk, eps);
+        rl_desc(&d);
+    }
     perf_exit(OP_DN_PREP);
     uint64_t l2_dt = perf_now64() - tl;
     if (resident_join())
@@ -1389,13 +1563,23 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         resident_silu_patch(DNR_QKV, 0, DNR_QKV, FIX, C, 0, 0, 0);
     dn_cyc_conv += perf_now64() - t0 - act_dt - l2_dt;
     perf_exit(OP_DN_CONV);
+    if (dn_list) {
+        // The records at SLOT0 were posted writes during the conv list: the read-back fences
+        // them (the sequencer drains posted writes before a list too).
+        volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + SLOT0);
+        (void)rec[8*(nv - 1) + 7];
+        t0 = perf_now64() - l2_dt;
+        perf_enter(OP_DN_HEADS);
+        if (rl_start("deltanet core"))             // posted: the out list is staged under it
+            goto fatal;
+        core_posted = 1;
+    } else {
     perf_enter(OP_DN_PREP);
     t0 = perf_now64() - l2_dt;
     if (rl_run("deltanet q/k l2"))
         goto fatal;
     dn_cyc_prep += perf_now64() - t0;
     perf_exit(OP_DN_PREP);
-
     // Heads: outputs in natural head order at HO.
     t0 = perf_now64();
     perf_enter(OP_DN_HEADS);
@@ -1482,12 +1666,43 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // past this point invalidates the token anyway - the layer's window and state have moved.
     dn_cyc_gate += perf_now64() - t0;
     perf_exit(OP_DN_GATE);
+    }
 
-    t0 = perf_now64();
-    perf_enter(OP_DN_OUT);
+    // The out projection, the residual add and the FFN norm as one list (out_resid_build):
+    // staged while the posted core list runs, started after the gated SiLU's fixup patch.
+    uint64_t to = perf_now64();
     struct resident_state *R = resident_state();
     R->prep_src = og; R->prep_width = nvh; R->prep_rotate = 1;
     resident_mark_act();
+    int fused = out_resid_build(NULL, (uint32_t)nvh, model_entry(ROLE_SSM_OUT, l), norm_ffn[l],
+                                infer_dbg_armed() != 0, OUT_SITE_DN, l) == 0;
+    uint64_t tb = perf_now64() - to;
+    if (core_posted) {
+        if (resident_join())
+            goto fatal;
+        dn_state_zero &= ~(1ull << s);
+        dn_cyc_heads += perf_now64() - t0 - tb;
+        perf_exit(OP_DN_HEADS);
+        t0 = perf_now64();
+        perf_enter(OP_DN_GATE);
+        if (trixium_seq_silu_fixups_read())
+            resident_silu_patch(Z2, HO, RS_F_ADDR, FIX, (uint32_t)nvh, (uint32_t)hv, (uint32_t)nk, (uint32_t)rep);
+        dn_cyc_gate += perf_now64() - t0;
+        perf_exit(OP_DN_GATE);
+    }
+    t0 = perf_now64() - tb;
+    perf_enter(OP_DN_OUT);
+    if (fused) {
+        int rc = out_resid_start();
+        if (rc == -2)
+            goto fatal;
+        if (rc == 0) {
+            dn_cyc_outproj += perf_now64() - t0;
+            perf_exit(OP_DN_OUT);
+            return 1;                              // the residual add and the FFN norm are done
+        }
+        resident_mark_act();                       // declined: the two-list path below
+    }
     if (HP->keep_out)
         resident_keep_rsf(out);
     // The prepare and the out projection in one list, its weights prefetched under the prepare.
@@ -1523,6 +1738,7 @@ static int xres_list(const float *y, const float *w, int load, int sync)
 {
     struct bns_seq_descriptor d;
     uint32_t n = (uint32_t)n_embd, bytes = 4*n;
+    int traced_now = infer_dbg_armed() != 0;
     uint32_t wsp = RS_Y_ADDR + ((bytes + 31u) & ~31u);
     rl_begin();
     if (load)
@@ -1543,7 +1759,15 @@ static int xres_list(const float *y, const float *w, int load, int sync)
         rl_fetch_raw(w, bytes, wsp);                  // a norm weight: cleaned at load
         bns_seq_desc_norm(&d, 0, XRES_SP, RS_F_ADDR, wsp, n, 1, f32_bits(rms_eps));
         rl_desc(&d);
-        rl_store(hb, bytes, RS_F_ADDR);
+        // hb to main RAM only for the trace (or `hbstore on`): the next lists read it in RS_F,
+        // a CPU reader calls hb_materialize() first.
+        if (traced_now || hybrid_hb_store) {
+            rl_store(hb, bytes, RS_F_ADDR);
+            hb_stale = 0;
+        } else {
+            hb_stale = 1;
+            hb_w = w;
+        }
     }
     // Untraced and not syncing xb, nothing reads this list's outputs but the next list:
     // posted, so the CPU builds that one while this runs.
@@ -1787,8 +2011,9 @@ static int attn_kv_main(int a, int T, float *K, float *V)
     return 0;
 }
 
-static void attention_layer(int l, const float *h, float *out)
+static int attention_layer(int l, const float *h, float *out)
 {
+    hb_ready();                        // a prepare of hb may FETCH it from main RAM
     int a = attn_slot[l];
     float *K = kc + (uint64_t)a*ctx_cap*kv_dim, *V = vc + (uint64_t)a*ctx_cap*kv_dim;
     int gated = H->attn_gated;
@@ -1905,7 +2130,7 @@ static void attention_layer(int l, const float *h, float *out)
     if (!stream_on && attn_kv_main(a, T, K, V)) {
         puts("hybrid: attention K/V rows could not be restored");
         engine_wedged = 1;
-        return;
+        return 0;
     }
     HP->at_sub[0] += perf_now64() - t0;
     float scale = 1.0f/sqrtf((float)head_dim);
@@ -1925,13 +2150,13 @@ static void attention_layer(int l, const float *h, float *out)
         if (rl_run("attention q/k/v store")) {
             puts("hybrid: attention q/k/v could not be stored for the CPU loop");
             engine_wedged = 1;
-            return;
+            return 0;
         }
     }
     if (!streamed && stream_on && attn_kv_main(a, T, K, V)) {   // the CPU loop after all
         puts("hybrid: attention K/V rows could not be restored");
         engine_wedged = 1;
-        return;
+        return 0;
     }
     if (!streamed && q_in_place)           // the CPU loop after all: its contiguous q
         for (int hh = 0; hh < n_head; hh++)
@@ -1981,10 +2206,20 @@ static void attention_layer(int l, const float *h, float *out)
         }
     }
     t1 = perf_now64(); HP->at_core += t1 - t0; t0 = t1;
+    // The out projection (attnb fetched), the residual add and the FFN norm as one list.
+    if (out_resid_build(attnb, (uint32_t)n_embd, model_entry(ROLE_ATTN_OUT, l), norm_ffn[l],
+                        infer_dbg_armed() != 0, OUT_SITE_ATTN, l) == 0) {
+        int rc = out_resid_start();
+        if (rc != -1) {
+            HP->at_out += perf_now64() - t0;
+            return rc == 0 ? 1 : -2;
+        }
+    }
     if (HP->keep_out)
         resident_keep_rsf(out);
     proj_f(model_entry(ROLE_ATTN_OUT, l), attnb, out);
     HP->at_out += perf_now64() - t0;
+    return 0;
 }
 
 /* LM Head */
@@ -2011,19 +2246,27 @@ static int lm_head_list(const struct bons_entry *head, float *dst)
         return -1;
     uint32_t unit = 8u*(uint32_t)n_ch, chunk = lm_chunk_rows();
     uint32_t nch = (uint32_t)n_ch, per = head->rows/nch;
-    if (head->rows % unit || chunk/nch*4u > 8160u)
+    if (head->rows % unit || !chunk)
         return -1;
     rl_begin_keyed(0x0B000000u | (chunk/32u & 0x7FFu) << 1 | (uint32_t)rl_rsf_is(hb),
                    (uint32_t)(uintptr_t)head | pf_key(), (uint32_t)(uintptr_t)dst);
     rl_prepare_pf(hb, (uint32_t)n_embd, 1, head, 0, head->rows < chunk ? head->rows : chunk);
+    if (!HP->logits_clean) {                  // CPU-written lines must not land over the stores
+        flush_cpu_dcache_range(dst, (size_t)head->rows*4u);
+        HP->logits_clean = 1;
+    }
     for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
         uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
         rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
-        // Channel-major result: channel c's rpc rows are model rows c*per + r0/nch + j.
-        rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u,
-                         r0 ? NULL : dst, head->rows*4u);
+        // Channel-major result: channel c's rpc rows are model rows c*per + r0/nch + j, one
+        // store per channel (a packet store's source stride is 8 bits of beats: 8,160 bytes).
+        for (uint32_t c = 0; c < nch; c++)
+            rl_store_raw(dst + c*per + r0/nch, rpc*4u, RS_F_ADDR + c*rpc*4u);
     }
-    return rl_run("lm head");
+    int rc = rl_run("lm head");
+    if (!rc)
+        invd_cpu_dcache_range(dst, (size_t)head->rows*4u);
+    return rc;
 }
 
 #ifdef CSR_TRIXIUM_SEQ_RESTORE_ARGMAX_IDX_ADDR
@@ -2042,13 +2285,12 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
         return -1;
     uint32_t unit = 8u*(uint32_t)n_ch, chunk = lm_chunk_rows();
     uint32_t nch = (uint32_t)n_ch, per = head->rows/nch, vocab = (uint32_t)H->vocab;
-    // At most 8160 bytes of logits per channel and chunk: with few channels (the YPCB's 4)
-    // the default chunk is smaller here, not a fallback to the CPU's pass over the vocabulary.
-    uint32_t cap = 8160u/4u*nch/unit*unit;
-    if (chunk > cap)
-        chunk = cap;
     if (head->rows % unit || !chunk)
         return -1;
+    // The logits reach main RAM only for the trace (or `lmstore on`): the tracker reads the
+    // restore's output in RS_F. A chunk the tracker cannot answer for is re-run with its stores
+    // before the CPU scans it.
+    int store = infer_dbg_armed() || hybrid_lm_store;
     int have = 0, frozen = 0;
     float bv = 0.0f;
     uint32_t brow = 0;
@@ -2062,18 +2304,26 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
     }
     for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
         uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
-        // The list's name: the chunk (its index and size), whether hb is already in RS_F.
+        int st = store, reran = 0;
+        uint32_t idx, row;
+        union { uint32_t u; float f; } v;
+    rerun:
+        // The list's name: the chunk (its index and size), whether hb is already in RS_F, the
+        // stores (bit 1 of the aligned entry pointer).
         rl_begin_keyed(0x0A000000u | (r0/chunk & 0xFFFu) << 12 | (chunk/32u & 0x7FFu) << 1 |
-                       (uint32_t)rl_rsf_is(hb), (uint32_t)(uintptr_t)head | pf_key(), (uint32_t)(uintptr_t)dst);
-        if (!r0)
+                       (uint32_t)rl_rsf_is(hb), (uint32_t)(uintptr_t)head | pf_key() | (uint32_t)st << 1,
+                       (uint32_t)(uintptr_t)dst);
+        if (!r0 && !reran)
             rl_prepare_pf(hb, (uint32_t)n_embd, 1, head, 0, rows);
         rl_matvec_rows(head, r0, rows, RS_Y_ADDR, RS_F_ADDR);
-        rl_store_packets(dst + r0/nch, rpc*4u, nch, per*4u, RS_F_ADDR, rpc*4u, NULL, 0);
+        if (st)
+            for (uint32_t c = 0; c < nch; c++)    // channel c's rpc rows: model rows c*per + r0/nch + j
+                rl_store_raw(dst + c*per + r0/nch, rpc*4u, RS_F_ADDR + c*rpc*4u);
         if (rl_run("lm head"))
             return -1;
-        uint32_t idx = trixium_seq_restore_argmax_idx_read();
-        union { uint32_t u; float f; } v = { trixium_seq_restore_argmax_val_read() };
-        uint32_t row = idx < rows ? (idx/rpc)*per + r0/nch + idx % rpc : 0xFFFFFFFFu;
+        idx = trixium_seq_restore_argmax_idx_read();
+        v.u = trixium_seq_restore_argmax_val_read();
+        row = idx < rows ? (idx/rpc)*per + r0/nch + idx % rpc : 0xFFFFFFFFu;
         if (frozen)
             continue;
         if (!r0 && row == 0 && v.f != v.f) {       // the model's first logit is NaN
@@ -2082,6 +2332,10 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
         }
         float cv = v.f;
         if (row >= vocab || cv != cv) {
+            if (!st) {                             // the scan needs the chunk's logits in main RAM
+                st = 1; reran = 1;
+                goto rerun;
+            }
             // Scan this chunk's rows (< vocab) in model order: NaN never wins.
             for (uint32_t c = 0; c < nch; c++)
                 invd_cpu_dcache_range(dst + c*per + r0/nch, rpc*4u);
@@ -2105,6 +2359,7 @@ static int lm_head_argmax(const struct bons_entry *head, float *dst)
 // The LM head on hb (the normed hidden state) and its argmax. t0: the logits phase's start.
 static int head_argmax(uint64_t t0)
 {
+    hb_ready();                        // a prepare of hb may FETCH it from main RAM
     const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
     if (!head) head = model_entry(ROLE_TOK_EMB, 0);
     int best = -1;
@@ -2128,6 +2383,7 @@ static int head_argmax(uint64_t t0)
     int one_chunk = head && head->rows <= lm_chunk_rows();
 #endif
     if (!head_done) {
+        hb_materialize();
         proj_f(head, hb, logits);
         HP->logits_clean = 0;            // CPU-written: lm_head_argmax flushes it first
     }
@@ -2153,9 +2409,12 @@ static int head_argmax(uint64_t t0)
 /*-----*/
 
 // The FFN of hb (ffn-normed, the token's residual in xb) into tmp_h; t0: the fprep start.
-static void ffn_tok(int l, uint64_t t0)
+// w_next / sync: the residual list that would follow (the next norm's weight, xb synced); with
+// the fused down list (out_resid_*) it is this function's. 1 = residual done, -2 = failed.
+static int ffn_tok(int l, uint64_t t0, const float *w_next, int sync)
 {
-    int e8 = E8_RESIDENT, fused = 0, pre = 0;
+    hb_ready();                        // a prepare of hb may FETCH it from main RAM
+    int e8 = E8_RESIDENT, fused = 0, pre = 0, fused_down = 0;
     const struct bons_entry *down = model_entry(ROLE_FFN_DOWN, l);
     // Resident FFN: gate, up and act = up*silu(gate) in one scratchpad list, the act
     // then prepared for the down projection where it already is (no FETCH). The gate
@@ -2169,8 +2428,17 @@ static void ffn_tok(int l, uint64_t t0)
         R->prep_src = hb; R->prep_width = n_embd; R->prep_rotate = 1;
         int traced = infer_dbg_armed();
         perf_enter(OP_FFN_PROJ);
-        pre = resident_ffn_act(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l), hb,
-                               (uint32_t)n_embd, NULL, traced ? gateb : NULL, traced ? upb : NULL) == 0;
+        pre = resident_ffn_act_post(model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l), hb,
+                                    (uint32_t)n_embd, NULL, traced ? gateb : NULL, traced ? upb : NULL) == 0;
+        if (pre) {
+            // The down projection, the residual add and the next norm staged under the
+            // activation list; started after its fixup patch (below).
+            fused_down = out_resid_build(NULL, (uint32_t)ffn_dim, down, w_next, sync, OUT_SITE_FFN, l) == 0;
+            if (resident_ffn_act_finish()) {
+                pre = 0;                           // the activation list failed: the CPU path
+                fused_down = 0;
+            }
+        }
         perf_exit(OP_FFN_PROJ);
     }
     if (!pre) {
@@ -2204,6 +2472,18 @@ static void ffn_tok(int l, uint64_t t0)
         R->prep_src = actb; R->prep_width = ffn_dim; R->prep_rotate = 1;
         int down_done = 0;
         uint64_t tf = perf_now64();
+        if (fused_down) {
+            int rc = out_resid_start();
+            if (rc == -2)
+                return -2;
+            if (rc == 0) {
+                HP->fd_mv += perf_now64() - tf;
+                hyb_cyc_fdown += perf_now64() - t0;
+                perf_exit(OP_FFN_DOWN);
+                return 1;                          // the residual add and the next norm are done
+            }
+            resident_mark_act();                   // declined: the two-list path below
+        }
         // The prepare and the down projection in one list, its weights prefetched under the
         // prepare (fd_prep stays 0: no separate prepare).
         if (HP->keep_out)
@@ -2238,6 +2518,7 @@ static void ffn_tok(int l, uint64_t t0)
         hyb_cyc_fdown += perf_now64() - t0;
         perf_exit(OP_FFN_DOWN);
     }
+    return 0;
 }
 
 /* Forward */
@@ -2301,6 +2582,7 @@ int hybrid_forward(int token, int want_logits)
     // matvec left them (RS_F, never stored to main RAM), and the residual add closing layer l
     // runs layer l+1's attention norm in the same list.
     HP->keep_out = xres && !traced;
+    HP->xres_on = (uint8_t)xres;
     int normed = 0;                       // hb already holds layer l's attention norm
     int out_normed = 0;                   // ... and after the loop the LM head's norm
     (void)normed;
@@ -2315,23 +2597,28 @@ int hybrid_forward(int token, int want_logits)
 #endif
         } else {
             rmsnorm_fv(hb, xb, norm_attn[l], n_embd);
+            hb_stale = 0;
         }
         hyb_cyc_anorm += perf_now64() - t0;
         perf_exit(OP_RMSNORM);
         infer_dbg_f32("attn_norm", l, hb, n_embd);
         t0 = perf_now64();
+        int resid_done = 0;                   // the mixer's list did the residual add + FFN norm
         if (dn_slot[l] >= 0) {
             int rc = -1;
 #ifdef DNRES_BUILT
             rc = deltanet_layer_resident(l, hb, tmp_h);
             if (rc == -2) return -1;
+            if (rc == 1) { resid_done = 1; rc = 0; }
 #endif
             if (rc)
                 deltanet_layer(l, hb, tmp_h);
             hyb_cyc_dn += perf_now64() - t0;
         } else {
             perf_enter(OP_ATTN);
-            attention_layer(l, hb, tmp_h);
+            int rc = attention_layer(l, hb, tmp_h);
+            if (rc == -2) return -1;
+            resid_done = rc == 1;
             hyb_cyc_attn += perf_now64() - t0;
             perf_exit(OP_ATTN);
         }
@@ -2340,8 +2627,9 @@ int hybrid_forward(int token, int want_logits)
         perf_enter(OP_RESID_ADD);
         if (xres) {
 #ifdef DNRES_BUILT
-            // Residual add, the FFN norm, and xb for the trace when traced.
-            if (xres_list(tmp_h, norm_ffn[l], 0, traced)) return -1;
+            // Residual add, the FFN norm, and xb for the trace when traced (unless the mixer's
+            // own list did them).
+            if (!resid_done && xres_list(tmp_h, norm_ffn[l], 0, traced)) return -1;
 #endif
             hyb_cyc_resid += perf_now64() - t0;
             perf_exit(OP_RESID_ADD);
@@ -2354,22 +2642,29 @@ int hybrid_forward(int token, int want_logits)
             infer_dbg_f32("attn_res", l, xb, n_embd);
             t0 = perf_now64();
             rmsnorm_fv(hb, xb, norm_ffn[l], n_embd);
+            hb_stale = 0;
         }
         infer_dbg_f32("ffn_norm", l, hb, n_embd);
-        ffn_tok(l, t0);
+        // The residual list after the FFN: the last layer's runs the LM head's norm (hb in RS_F
+        // for its prepare; the CPU's rmsnorm_fv below was the forward's largest engine-idle gap,
+        // ~90k cycles); traced, or without the resident outputs, it brings xb up to date for the
+        // CPU. The FFN's own list does it when it can (fdone).
+        int last = l + 1 == n_layer, fdone = 0, fsync = 0;
+        const float *w_next = NULL;
+        if (xres) {
+            normed = HP->keep_out && !last;
+            out_normed = HP->keep_out && last && want_logits;
+            w_next = normed ? norm_attn[l + 1] : out_normed ? out_norm : NULL;
+            fsync = traced || (last && !out_normed);
+        }
+        fdone = ffn_tok(l, t0, w_next, fsync);
+        if (fdone == -2) return -1;
         infer_dbg_f32("ffn_down", l, tmp_h, n_embd);
         t0 = perf_now64();
         perf_enter(OP_RESID_ADD);
         if (xres) {
 #ifdef DNRES_BUILT
-            // The last layer's list runs the LM head's norm (hb in RS_F for its prepare; the
-            // CPU's rmsnorm_fv below was the forward's largest engine-idle gap, ~90k cycles);
-            // traced, or without the resident outputs, it brings xb up to date for the CPU.
-            int last = l + 1 == n_layer;
-            normed = HP->keep_out && !last;
-            out_normed = HP->keep_out && last && want_logits;
-            if (xres_list(tmp_h, normed ? norm_attn[l + 1] : out_normed ? out_norm : NULL, 0,
-                          traced || (last && !out_normed)))
+            if (fdone != 1 && xres_list(tmp_h, w_next, 0, fsync))
                 return -1;
 #endif
         } else {
@@ -2388,8 +2683,10 @@ int hybrid_forward(int token, int want_logits)
     if (!out_norm)                        // model_entry_kind scans the table: once
         out_norm = fetch_f32(model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32));
     perf_enter(OP_LMHEAD);
-    if (!out_normed)
+    if (!out_normed) {
         rmsnorm_fv(hb, xb, out_norm, n_embd);
+        hb_stale = 0;
+    }
     infer_dbg_f32("out_norm", -1, hb, n_embd);
     int r = head_argmax(t0);
     perf_exit(OP_LMHEAD);
