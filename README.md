@@ -71,8 +71,8 @@ Batch-1 decode on the card, first tokens checked against the reference:
 | | | Ternary-Bonsai 1.7B | **106.3** |
 | Inspur **YPCB-00338** (XC7K480T) | 2x DDR3-1066 x64 | Ternary-Bonsai 8B | 8.11 |
 | | | Ternary-Bonsai 1.7B | **35.2** |
-| | 2x DDR3-933 x64 (hybrid build) | Ternary-Bonsai-2 4B | 6.88 |
-| | | Ternary-Bonsai-2 2B | 14.99 |
+| | 2x DDR3-933 x64 (hybrid build) | Ternary-Bonsai-2 4B | 7.60 |
+| | | Ternary-Bonsai-2 2B | 16.78 |
 
 The models, all PrismML's, straight from their GGUF files (the converter copies the ternary codes
 and scales bit for bit):
@@ -163,7 +163,7 @@ busier; TriXium reads ~3.5x fewer bytes per token with natively ternary models, 
 at 2.5-2.8x the decode rate per parameter on the 1.7B and 8B (different models from openTPU's,
 so a speed comparison, not a quality one). Like for like: Ternary-Bonsai-2 2B and 4B are ternary
 versions of the Qwen3.5-2B and 4B that openTPU runs at 4 bits, and on the same card they decode
-at 14.99 against 12.1 and 6.88 against 5.9 tok/s (ours at DDR3-933, openTPU's at DDR3-1066)
+at 16.78 against 12.1 and 7.60 against 5.9 tok/s (ours at DDR3-933, openTPU's at DDR3-1066)
 while reading ~2.5x fewer bytes per token: about a third of the DRAM bandwidth, the rest being
 per-token work still to overlap with the weight streams. The numbers, and the other FPGA LLM
 designs:

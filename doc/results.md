@@ -15,8 +15,8 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | FK33 | Ternary-Bonsai 1.7B | 106.3 | 2.00 M | sys 212.5 MHz |
 | YPCB-00338 (2x DDR3-1066) | Ternary-Bonsai 8B | 8.11 | 15.41 M | sys 125 MHz |
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
-| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 6.88 | 14.5 M | sys 100 MHz |
-| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 14.99 | 6.67 M | sys 100 MHz |
+| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 7.60 | 13.2 M | sys 100 MHz, pipes 125 MHz |
+| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 16.78 | 5.96 M | sys 100 MHz, pipes 125 MHz |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate

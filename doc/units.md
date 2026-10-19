@@ -148,6 +148,23 @@ fits int32, so neither saturates by construction. The semantic scale of a result
 `2^(ex - B + R)`. The engine also tracks the absmax of the gathered results (for `k`) and a
 greedy argmax (value, global row; ties to the smallest index).
 
+**Rate.** A pipe takes one 128-trit beat per clock, scale beats included; trit5 weights
+(`TRIXIUM_HAS_TRIT5`: 128 trits in 26 of a 32-byte memory beat, `Trit5Unpacker` in front of
+the pipe) therefore need only 26/32 of a memory beat per clock, and with `mvbw` reporting the
+pipe at 0.96 beats per clock on the YPCB the stream is bound by the pipes, not the memory.
+`TriXiumCoreConfig.with_axpy = False` leaves the AXPY datapath (kind 4) out of a build whose
+firmware never issues it (the hybrid models): a pipe shrinks from 17.1k to 9.0k LUTs.
+
+**Pipe clock island** (`pipe_clk`, [`gateware/core/island.py`](../gateware/core/island.py)):
+the unpacker and the pipe of every channel run in their own clock domain, derived by the SoC
+from a PLL (`--pipe-clk-freq`) and reset with the engine (`peng`). Memory beats enter and
+results leave through async FIFOs, `start` crosses in a pulse synchronizer, the op parameters
+are quasi-static (written at the op's accept, read from `start` on), and the x-buffer's write
+port stays in the engine's domain (a dual-clock memory, filled before the first beat). At
+1.25x the engine clock a trit5 stream asks the memory for 1.02 beats per engine clock, the
+port's rate: the limit moves back to the memory. The unpacker must be inside: in the engine's
+domain it emits one pipe beat per engine clock and caps the island at the old rate.
+
 ### Op 5: DeltaNet stream
 
 One op runs every head of a 27B DeltaNet layer

@@ -88,11 +88,14 @@ design and its simulation are exact; two boards' memory systems are not always:
   engine's four streams controller 1's byte lanes 0-2 had no clean tap within ±8 and lanes 3-8 one
   or two: `mvbw` alone 42k corrected / 15k uncorrectable per 8 reps, the bench on ECC retries,
   a reloaded model wrong. The same streaming logic placed differently (`ypcb_hyb7_d100`: 2-3 clean
-  taps, `ypcb_hyb9_d100`: 3-4) reads clean. No per-region culprit showed in the routed
-  checkpoints (controller 1's lanes sit in clock regions X0Y5-X0Y7; hyb8 put more engine DSPs in
-  X0Y7 but fewer in X0Y5, whose lanes died anyway). So every new bitstream is qualified with
+  taps, `ypcb_hyb9_d100`: 3-4) reads clean. The cause is the fabric's switching next to the DQ
+  capture: controller 1's byte lanes sit in clock regions X0Y5-X0Y7 (banks 16-18), and the same
+  hyb8 netlist rebuilt with the matvec engine kept out of those three regions (`ypcb_hyb8q_d100`,
+  `--ddr-quiet-regions`: a post-synthesis Pblock on the engine's cells) has a healthy eye again
+  (2-3 clean taps on every bit, `mvbw` clean, 14.73 tok/s golden). So the hybrid build keeps the
+  engine out of controller 1's regions, and every new bitstream is still qualified with
   `mvbw 13 0 8` between `eccbits clear` and `eccbits`, or the `eyescan` table, before its speed
-  counts; a build whose eye fails is rebuilt (another placement), as hyb8 was superseded by hyb9.
+  counts.
 - **XCU1525: one DDR4 controller trains marginally on some boots.** The weights read back from
   that controller's four channels differ from the image (stably, so the writes are wrong), and
   its KV-cache writes make attention vary from run to run; about half the boots of 2026-10-15
