@@ -527,9 +527,9 @@ def test_descriptor_encoding_and_configuration():
     image, reference_image = silu_table_image(lut, dlut), [int(w) for w in table_image()]
     assert len(image) == 8*1025 and image[4097:4104] == [0]*7    # padding lanes are ignored
     assert image[:4097] == reference_image[:4097] and image[4104:] == reference_image[4104:]
-    for options in ({'with_vecunit': False}, {'scratchpad_size': 512*1024}):
-        with pytest.raises(ValueError):
-            TriXiumConfig(with_silu=True, **options)
+    TriXiumConfig(with_silu=True, with_vecunit=False)   # supported since the YPCB's hyb7
+    with pytest.raises(ValueError):
+        TriXiumConfig(with_silu=True, scratchpad_size=512*1024)
 
 
 def fixture(descriptors):

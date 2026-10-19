@@ -463,9 +463,9 @@ def test_restoration_descriptor_and_configuration():
         with pytest.raises(ValueError):
             descriptor(**changes)
     assert descriptor(adjustment=-(1 << 31))[5] == 0x80000000
-    for options in ({'with_vecunit': False}, {'scratchpad_size': 512*1024}):
-        with pytest.raises(ValueError):
-            TriXiumConfig(with_projection_restore=True, **options)
+    TriXiumConfig(with_projection_restore=True, with_vecunit=False)   # supported since the YPCB's hyb7
+    with pytest.raises(ValueError):
+        TriXiumConfig(with_projection_restore=True, scratchpad_size=512*1024)
     for size in (0, 31, 33, 256*1024 + 32):
         with pytest.raises(ValueError):
             Sequencer(with_projection_restore=True, scratchpad_size=size)
