@@ -71,7 +71,7 @@ class TriXiumConfig:
 
     def __post_init__(self):
         if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore
-                or self.with_silu or self.with_norm or self.with_conv) and \
+                or self.with_silu or self.with_norm or self.with_conv or self.with_softmax) and \
                 self.scratchpad_size > 256*1024:
             raise ValueError("Resident clients need at most a 256 KiB scratchpad")
         if self.chan_mod < 0 or self.chan_mod & (self.chan_mod - 1):

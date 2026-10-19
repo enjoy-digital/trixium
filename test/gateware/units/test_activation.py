@@ -624,9 +624,11 @@ def test_activation_descriptor_and_configuration():
         args.update(changes)
         with pytest.raises(ValueError):
             scratchpad_quantize_descriptor(**args)
-    for options in ({'with_vecunit': False}, {'scratchpad_size': 512*1024}):
-        with pytest.raises(ValueError):
-            TriXiumConfig(with_activation_quantize=True, **options)
+    # Resident units without the vector unit are a supported build since the YPCB's hyb7 (the
+    # hybrid path never runs it); the scratchpad stays within the clients' 13-bit beat addresses.
+    TriXiumConfig(with_activation_quantize=True, with_vecunit=False)
+    with pytest.raises(ValueError):
+        TriXiumConfig(with_activation_quantize=True, scratchpad_size=512*1024)
     assert scratchpad_requantize_descriptor(src=32, dst=64, exponents=96, maxima=128,
         result_exponent=160, blocks=17) == [5, 32, 64, 96, 128, 160, 17] + [0]*9
     for changes in ({'src': 1}, {'dst': -32}, {'exponents': 1 << 24}, {'maxima': 127},
