@@ -286,3 +286,41 @@ def test_write_data_of_one_master_waiting_on_another_does_not_deadlock():
                          bresp(a), bresp(b), watch()])
     assert state["b_done"] and state["a_done"], f"deadlock: {state}"
     assert state["mem"] == [0x100 + k for k in range(BEATS)] + [0x200 + k for k in range(BEATS)]
+
+
+def test_id_squash_restores_the_ids():
+    """AXIIDSquash: reads and writes under several IDs go out under ID 0 and come back with their
+    own IDs, in request order."""
+    from gateware.memory.axi_shared import AXIIDSquash
+    m = AXIInterface(data_width=256, address_width=33, id_width=8)
+    s = AXIInterface(data_width=256, address_width=33, id_width=1)
+    rng = np.random.default_rng(4)
+    data = rng.integers(0, 256, MEM_SIZE, dtype=np.uint8).tobytes()
+    dut = Module()
+    dut.submodules.sq = AXIIDSquash(m, s)
+    dut.submodules.model = HBMChannelModel(s, size=MEM_SIZE, init=words_from_bytes(data), latency=6)
+    ids = [0x5a, 0x03, 0xff, 0x10]
+    got = []
+
+    def ar():
+        for k, i in enumerate(ids):
+            yield m.ar.addr.eq(32*4*k); yield m.ar.len.eq(1); yield m.ar.id.eq(i); yield m.ar.valid.eq(1)
+            yield
+            while not (yield m.ar.ready):
+                yield
+        yield m.ar.valid.eq(0)
+
+    def r():
+        yield m.r.ready.eq(1)
+        for _ in range(400):
+            if (yield m.r.valid):
+                got.append(((yield m.r.id), (yield m.r.data), (yield m.r.last)))
+            yield
+
+    run_simulation(dut, [ar(), r()])
+    want = []
+    for k, i in enumerate(ids):
+        for b in range(2):
+            a = 32*(4*k + b)
+            want.append((i, int.from_bytes(data[a:a + 32], "little"), b == 1))
+    assert got == want
