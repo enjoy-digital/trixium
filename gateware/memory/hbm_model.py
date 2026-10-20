@@ -63,10 +63,16 @@ class HBMChannelModel(LiteXModule):
                                 data before the address - the HBM IP behaves like this).
     """
     def __init__(self, axi=None, size=64*1024, init=None, latency=16, stall_rate=0,
-                 reorder_ids=0, write_order="aw_first"):
+                 reorder_ids=0, write_order="aw_first", data_width=256, axi3=True):
+        # data_width: the port's (256: HBM; 512: the Efinix hard DDR controller's AXI4 port);
+        # axi3: the HBM ports' 4-bit AxLEN (an AXI4 port takes 8-bit lengths).
         assert write_order in ("aw_first", "w_first", "aw_after_w")
         if axi is None:
-            axi = AXIInterface(data_width=256, address_width=33, id_width=6)
+            axi = AXIInterface(data_width=data_width, address_width=33, id_width=6)
+        data_width = axi.data_width
+        assert reorder_ids == 0 or data_width == 256
+        self.beat_bytes = data_width//8
+        self.axi3       = axi3
         self.axi = axi
         # Test control: while `freeze` is up the read server delivers nothing (a port that
         # stops answering - the wedge the engine soft reset exists for); released later, the
@@ -79,8 +85,8 @@ class HBMChannelModel(LiteXModule):
         # # #
 
         # Memory.
-        depth = size//BEAT_BYTES
-        mem   = Memory(256, depth, init=init)
+        depth = size//self.beat_bytes
+        mem   = Memory(data_width, depth, init=init)
         self.specials += mem
         wr_port = mem.get_port(write_capable=True, we_granularity=8)
         rd_port = mem.get_port(async_read=True)
@@ -98,10 +104,11 @@ class HBMChannelModel(LiteXModule):
         # happily serves 64-beat bursts that hardware never will (a stall on the first fetch).
         # `axlen_overflow` latches the mistake so a test can name it instead of timing out.
         self.axlen_overflow = axlen_overflow = Signal()
-        self.sync += If((axi.ar.valid & (axi.ar.len[4:] != 0)) |
-                        (axi.aw.valid & (axi.aw.len[4:] != 0)),
-            axlen_overflow.eq(1),
-        )
+        if axi3:
+            self.sync += If((axi.ar.valid & (axi.ar.len[4:] != 0)) |
+                            (axi.aw.valid & (axi.aw.len[4:] != 0)),
+                axlen_overflow.eq(1),
+            )
 
         if reorder_ids:
             self._reorder_read_path(axi, rd_port, latency, stall, reorder_ids)
@@ -112,19 +119,19 @@ class HBMChannelModel(LiteXModule):
 
     def _inorder_read_path(self, axi, rd_port, latency, stall):
         # Read path --------------------------------------------------------------------------------
-        ar_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
+        ar_fifo = stream.SyncFIFO([("addr", axi.address_width), ("len", 8), ("id", axi.id_width)], 8)
         self += ar_fifo
         self.comb += [
             ar_fifo.sink.valid.eq(axi.ar.valid),
             axi.ar.ready.eq(ar_fifo.sink.ready),
             ar_fifo.sink.addr.eq(axi.ar.addr),
-            ar_fifo.sink.len.eq(axi.ar.len[:4]),
+            ar_fifo.sink.len.eq(axi.ar.len[:4] if self.axi3 else axi.ar.len),
             ar_fifo.sink.id.eq(axi.ar.id),
         ]
 
         r_beat  = Signal(30) # Current beat index.
         r_left  = Signal(9)  # Beats left in burst (len+1 counted down).
-        r_id    = Signal(6)
+        r_id    = Signal(axi.id_width)
         lat_cnt = Signal(16)
 
         self.comb += [
@@ -139,7 +146,7 @@ class HBMChannelModel(LiteXModule):
         fsm.act("IDLE",
             ar_fifo.source.ready.eq(1),
             If(ar_fifo.source.valid,
-                NextValue(r_beat, ar_fifo.source.addr[log2_int(BEAT_BYTES):]),
+                NextValue(r_beat, ar_fifo.source.addr[log2_int(self.beat_bytes):]),
                 NextValue(r_left,  ar_fifo.source.len + 1),
                 NextValue(r_id,    ar_fifo.source.id),
                 NextValue(lat_cnt, latency),
@@ -162,7 +169,7 @@ class HBMChannelModel(LiteXModule):
                     # outstanding bursts; latency only applies from an idle queue).
                     If(ar_fifo.source.valid,
                         ar_fifo.source.ready.eq(1),
-                        NextValue(r_beat, ar_fifo.source.addr[log2_int(BEAT_BYTES):]),
+                        NextValue(r_beat, ar_fifo.source.addr[log2_int(self.beat_bytes):]),
                         NextValue(r_left, ar_fifo.source.len + 1),
                         NextValue(r_id,   ar_fifo.source.id),
                     ).Else(
@@ -175,7 +182,7 @@ class HBMChannelModel(LiteXModule):
     def _reorder_read_path(self, axi, rd_port, latency, stall, nq):
         # Per-ID request queues (ID low bits select the queue).
         qbits = log2_int(nq)
-        ar_qs = [stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 4) for _ in range(nq)]
+        ar_qs = [stream.SyncFIFO([("addr", axi.address_width), ("len", 8), ("id", axi.id_width)], 4) for _ in range(nq)]
         self.submodules += ar_qs
         for i, q in enumerate(ar_qs):
             self.comb += [
@@ -195,14 +202,14 @@ class HBMChannelModel(LiteXModule):
         st_valid = [Signal(    name=f"st_valid{i}") for i in range(nq)]
         st_addr  = [Signal(33, name=f"st_addr{i}")  for i in range(nq)]
         st_len   = [Signal(8,  name=f"st_len{i}")   for i in range(nq)]
-        st_id    = [Signal(6,  name=f"st_id{i}")    for i in range(nq)]
+        st_id    = [Signal(axi.id_width, name=f"st_id{i}") for i in range(nq)]
         st_lat   = [Signal(16, name=f"st_lat{i}")   for i in range(nq)]
         cooldown = [Signal(16, name=f"cooldown{i}") for i in range(nq)]
 
         cur_valid = Signal()
         cur_beat  = Signal(30)
         cur_left  = Signal(9)
-        cur_id    = Signal(6)
+        cur_id    = Signal(axi.id_width)
 
         rr_fire  = Signal()
         cur_done = Signal()
@@ -279,11 +286,11 @@ class HBMChannelModel(LiteXModule):
 
     def _write_path(self, axi, wr_port):
         # Write path -------------------------------------------------------------------------------
-        aw_fifo = stream.SyncFIFO([("addr", 33), ("len", 8), ("id", 6)], 8)
+        aw_fifo = stream.SyncFIFO([("addr", axi.address_width), ("len", 8), ("id", axi.id_width)], 8)
         self += aw_fifo
         self.comb += [
             aw_fifo.sink.addr.eq(axi.aw.addr),
-            aw_fifo.sink.len.eq(axi.aw.len[:4]),
+            aw_fifo.sink.len.eq(axi.aw.len[:4] if self.axi3 else axi.aw.len),
             aw_fifo.sink.id.eq(axi.aw.id),
         ]
         if self.write_order == "aw_after_w":
@@ -299,9 +306,10 @@ class HBMChannelModel(LiteXModule):
             ]
 
         # The data source of the write server: the bus, or a FIFO fed ahead of the AW.
-        w = stream.Endpoint([("data", 256), ("strb", 32)]) # `last` is the stream's own.
+        dw = axi.data_width
+        w = stream.Endpoint([("data", dw), ("strb", dw//8)]) # `last` is the stream's own.
         if self.write_order == "w_first":
-            w_fifo = stream.SyncFIFO([("data", 256), ("strb", 32)], 64)
+            w_fifo = stream.SyncFIFO([("data", dw), ("strb", dw//8)], 64)
             self += w_fifo
             self.comb += [
                 w_fifo.sink.valid.eq(axi.w.valid),
@@ -321,7 +329,7 @@ class HBMChannelModel(LiteXModule):
             ]
 
         w_beat = Signal(30)
-        w_id   = Signal(6)
+        w_id   = Signal(axi.id_width)
 
         self.comb += [
             wr_port.adr.eq(w_beat),
@@ -332,7 +340,7 @@ class HBMChannelModel(LiteXModule):
         fsm.act("IDLE",
             aw_fifo.source.ready.eq(1),
             If(aw_fifo.source.valid,
-                NextValue(w_beat, aw_fifo.source.addr[log2_int(BEAT_BYTES):]),
+                NextValue(w_beat, aw_fifo.source.addr[log2_int(self.beat_bytes):]),
                 NextValue(w_id,   aw_fifo.source.id),
                 NextState("STREAM"),
             )
