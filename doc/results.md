@@ -15,8 +15,8 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | FK33 | Ternary-Bonsai 1.7B | 106.3 | 2.00 M | sys 212.5 MHz |
 | YPCB-00338 (2x DDR3-1066) | Ternary-Bonsai 8B | 8.11 | 15.41 M | sys 125 MHz |
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
-| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 7.92 | 12.6 M | sys 100 MHz, pipes 125 MHz |
-| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 17.49 | 5.72 M | sys 100 MHz, pipes 125 MHz; 16.90 tok/s at 256 tokens, 14.06 at 1,024 (the softmax unit) |
+| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 8.63 | 11.6 M | sys 100 MHz, pipes 133 MHz, readers in the DDR clock; 8.22 tok/s at 256 tokens |
+| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 19.47 | 5.14 M | sys 100 MHz, pipes 133 MHz, readers in the DDR clock; 18.71 tok/s at 256 tokens, 15.30 at 1,024 |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate
@@ -25,18 +25,26 @@ approved overclock), and the builds close timing to the project's empirical gate
 (reset-less datapath, fused residual tail). Where the remaining time goes:
 [`performance-next-steps.md`](performance-next-steps.md).
 
-The Bonsai 2 2B/4B on the YPCB-00338 are far from its memory limit: the 2B streams ~0.41 GB per
-token, so 15.0 tok/s uses about 40% of the DDR3-933 bandwidth (6.47 M cycles per forward
-against a 3.2 M streaming floor). The token trace (`tprof`) puts the rest at: the engine idle
-while the scratchpad units (13%: quantize/rotate, convolution, activations, norms) and the CPU
-(11%: list round trips, records, the attention softmax) work on each layer's serial chain; the
-DeltaNet recurrence unit, which was compute-bound at 17% of the token until it got two
-sub-lanes per channel (a 128x128 head in 2,048 clocks); the stream itself at 0.79-0.83 of the
-512-bit port's rate, which at sys 100 MHz is 86% of DDR3-933. Descriptor lists that do not change
-between tokens are built once and replayed from an image (the firmware's list cache: +3%); the
-attention layers' RoPE runs on the norm unit since the hybrid bitstream dropped the vector unit
-it never used (+2%); the attention stream at 8 lanes / 2 groups runs the 2B's heads in one pass
-(13.2 tok/s at a context of 256 tokens, 8.5 at 1,024; the 4B 5.9 at 256). openTPU's numbers on the
+The Bonsai 2 2B/4B on the YPCB-00338 are still some way from its memory limit: the 2B streams
+~0.41 GB per token, so 19.5 tok/s uses about half of the DDR3-933 bandwidth (5.0 M cycles per
+forward against a 3.2 M streaming floor). The weight streams run at 1.04 memory beats per clock,
+the memory side's own limit (refresh and row switches off DDR3-933's 1.17): each channel's
+unpacker and pipe sit in their own 133 MHz clock domain (the trit5 pipe consumes one 128-trit
+beat per clock; at the engine's 100 MHz it was the limit, and at 143 MHz nothing more comes) and
+each channel's reader in the DDR controller's clock (the 256-bit port at the engine clock was the
+cap in between, 0.95). The engine's streaming datapath is kept out of both controllers' I/O clock
+regions: next to them its switching narrows the read eye (corrected and the odd uncorrectable
+read on controller 0, which the firmware's eye scan does not cover). The token trace (`tprof`) puts the rest at: the engine idle while the scratchpad units
+(13%: quantize/rotate, convolution, activations, norms) and the CPU (~8%: list round trips and
+records; the descriptor lists are fused across each sub-block - the projection, the residual
+add and the next norm run as one list, built while the list before it runs) work on each
+layer's serial chain, and the DeltaNet recurrence unit (a 128x128 head in
+2,048 clocks at two sub-lanes per channel; at four it sits on its state traffic). Descriptor
+lists that do not change between tokens are built once and replayed from an image (the
+firmware's list cache); the attention layers' RoPE runs on the norm unit; the attention stream
+at 8 lanes / 2 groups runs the 2B's heads in one pass; the attention softmax runs on a
+scratchpad unit (exact binary32, the firmware's own exp), so the context costs only the
+scores and weighted-V passes: 18.7 tok/s at 256 tokens, 15.3 at 1,024. openTPU's numbers on the
 same card (Qwen3.5-2B 12.1, 4B 5.9 tok/s) are not a like-for-like comparison: the same
 architecture, but the original weights at 4 bits (~2.5x the bytes per token) and DDR3-1066.
 

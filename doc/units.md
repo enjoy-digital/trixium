@@ -165,6 +165,24 @@ port stays in the engine's domain (a dual-clock memory, filled before the first 
 port's rate: the limit moves back to the memory. The unpacker must be inside: in the engine's
 domain it emits one pipe beat per engine clock and caps the island at the old rate.
 
+**Readers in the memory's domain** (`readers_cd`,
+[`gateware/core/reader_island.py`](../gateware/core/reader_island.py), `--ddr-readers` on the
+YPCB target and the simulator): with the pipes in their island the next cap is the channel's
+256-bit AXI at the engine clock (3.2 GB/s at 100 MHz against a DDR3-1066 controller's ~3.7 GB/s
+share per channel; the stream measured 0.95 memory beats per engine clock). The reader then
+runs in the controller's own clock (`reng`: the `ddr` clock with the engine's reset) on a
+read-only AXI port that reaches the bridge in that domain with no crossing (the write half of
+the port, the loader's, keeps its sys-side path: `AXIResetShim(reads=, writes=)`,
+`AXICrossing(channels=)`, `engine_ddr_port(read_axi=)`). The engine commands it through a small
+async FIFO (every channel ready, then one command each: a FIFO's `ready` is room, not an idle
+reader), the weight beats go straight into the pipe island's input FIFO (`PipeIsland(in_cd=)`),
+and only the FETCH / DeltaNet / attention beats cross back to the engine through an async FIFO,
+steered by two quasi-static levels (the op's kind, the prefetch gate) crossed by MultiReg. The
+soft reset holds `reng` with the engine; the read shims' hold and busy cross by MultiReg and
+`busy` covers the readers' reset release. The trit5 pipe then caps the stream at ~1.03 memory
+beats per engine clock at a 125 MHz pipe (26 trits of 32 per beat): the pipe clock is the lever
+left.
+
 ### Op 5: DeltaNet stream
 
 One op runs every head of a 27B DeltaNet layer
