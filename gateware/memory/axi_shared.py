@@ -16,9 +16,13 @@ through every switch. Here:
   upper ARID bits, R beats are routed back by those bits - each master keeps its own bursts in
   flight and the slave serves them in whatever order its IDs allow (in order per ID, as AXI
   requires);
-- writes: AW is arbitrated per burst; the granted masters' indices queue in AW order and W
-  beats are taken from the queue head's master until WLAST (AXI4 has no WID: W follows AW
-  order); B is routed back by the upper BID bits.
+- writes: each master's AW is taken at once into a small queue of its own and its W beats into
+  a buffer (`w_buffer` beats, at least its longest burst); an AW goes to the slave only once its
+  whole burst is buffered (masters that wait for AWREADY before WVALID keep working): W at the slave must
+  follow AW order (AXI4 has no WID), and a master whose data waits on another master's progress
+  (the DeltaNet stream feeds every channel's writer in lockstep) would otherwise block the port
+  for good. The granted masters' indices queue in AW order, W is drained from the head master's
+  buffer until WLAST; B is routed back by the upper BID bits.
 
 The slave's ID width must hold the masters' IDs and the index: `id_width(masters)`.
 """
@@ -58,7 +62,7 @@ def _rr_next(current, requests, n):
 # AXISharedPort ------------------------------------------------------------------------------------
 
 class AXISharedPort(LiteXModule):
-    def __init__(self, masters, slave, w_queue_depth=8):
+    def __init__(self, masters, slave, w_queue_depth=8, w_buffer=32):
         n = len(masters)
         ib = index_bits(n)
         mid = max(m.id_width for m in masters)
@@ -104,10 +108,39 @@ class AXISharedPort(LiteXModule):
             ]
         self.comb += slave.r.ready.eq(Array([m.r.ready for m in masters])[r_idx])
 
-        # Write address: per-burst round robin, the grants queued in AW order for W.
+        # Write data: buffered per master; `ready[i]` counts its complete bursts not yet granted.
+        dw = slave.data_width
+        wbufs, wready = [], []
+        for i, m in enumerate(masters):
+            fifo = stream.SyncFIFO([("data", dw), ("strb", dw//8)], w_buffer, buffered=True)
+            setattr(self, f"wbuf{i}", fifo)
+            self.comb += [
+                fifo.sink.valid.eq(m.w.valid),
+                fifo.sink.data.eq(m.w.data),
+                fifo.sink.strb.eq(m.w.strb),
+                fifo.sink.last.eq(m.w.last),
+                m.w.ready.eq(fifo.sink.ready),
+            ]
+            wbufs.append(fifo)
+            wready.append(Signal(max=w_buffer + 1, name=f"wbursts{i}"))
+
+        # Write address: per-burst round robin among masters with a whole burst buffered, the
+        # grants queued in AW order for W.
         self.wq = wq = stream.SyncFIFO([("idx", ib)], w_queue_depth)
         aw_sel = Signal(max=max(2, n))
-        aw_req = [m.aw.valid for m in masters]
+        awqs = []
+        for i, m in enumerate(masters):
+            q = stream.SyncFIFO([("addr", m.address_width), ("len", 8), ("size", 3), ("burst", 2),
+                                 ("id", m.id_width)], 4)
+            setattr(self, f"awq{i}", q)
+            self.comb += [
+                q.sink.valid.eq(m.aw.valid),
+                q.sink.addr.eq(m.aw.addr), q.sink.len.eq(m.aw.len), q.sink.size.eq(m.aw.size),
+                q.sink.burst.eq(m.aw.burst), q.sink.id.eq(m.aw.id),
+                m.aw.ready.eq(q.sink.ready),
+            ]
+            awqs.append(q)
+        aw_req = [awqs[i].source.valid & (wready[i] != 0) for i in range(n)]
         aw_pick, aw_case = _rr_next(aw_sel, aw_req, n)
         aw_cur  = Signal(max=max(2, n))
         aw_hold = Signal()
@@ -115,14 +148,15 @@ class AXISharedPort(LiteXModule):
         self.comb += If(aw_hold, aw_cur.eq(aw_sel)).Else(aw_cur.eq(aw_pick))
         aw_valid = Signal()
         for i, m in enumerate(masters):
+            q = awqs[i].source
             self.comb += If(aw_cur == i,
-                aw_valid.eq(m.aw.valid),
-                slave.aw.addr.eq(m.aw.addr),
-                slave.aw.len.eq(m.aw.len),
-                slave.aw.size.eq(m.aw.size),
-                slave.aw.burst.eq(m.aw.burst),
-                slave.aw.id.eq(_tag(m.aw.id, mid, i, ib)),
-                m.aw.ready.eq(slave.aw.ready & wq.sink.ready),
+                aw_valid.eq(q.valid & (wready[i] != 0)),
+                slave.aw.addr.eq(q.addr),
+                slave.aw.len.eq(q.len),
+                slave.aw.size.eq(q.size),
+                slave.aw.burst.eq(q.burst),
+                slave.aw.id.eq(_tag(q.id, mid, i, ib)),
+                q.ready.eq(slave.aw.ready & wq.sink.ready & (wready[i] != 0)),
             )
         self.comb += [
             slave.aw.valid.eq(aw_valid & wq.sink.ready),
@@ -133,15 +167,26 @@ class AXISharedPort(LiteXModule):
             aw_sel.eq(aw_cur),
             aw_hold.eq(slave.aw.valid & ~slave.aw.ready),
         ]
-        # Write data: from the queue head's master until WLAST.
+        # Burst counts: +1 when a master's WLAST enters its buffer, -1 when its AW is granted.
+        aw_fire = Signal()
+        self.comb += aw_fire.eq(slave.aw.valid & slave.aw.ready)
+        for i, m in enumerate(masters):
+            inc = Signal(name=f"winc{i}")
+            dec = Signal(name=f"wdec{i}")
+            self.comb += [
+                inc.eq(wbufs[i].sink.valid & wbufs[i].sink.ready & wbufs[i].sink.last),
+                dec.eq(aw_fire & (aw_cur == i)),
+            ]
+            self.sync += wready[i].eq(wready[i] + inc - dec)
+        # Write data: from the queue head's master's buffer until WLAST.
         w_idx = wq.source.idx
         for i, m in enumerate(masters):
             self.comb += If(wq.source.valid & (w_idx == i),
-                slave.w.valid.eq(m.w.valid),
-                slave.w.data.eq(m.w.data),
-                slave.w.strb.eq(m.w.strb),
-                slave.w.last.eq(m.w.last),
-                m.w.ready.eq(slave.w.ready),
+                slave.w.valid.eq(wbufs[i].source.valid),
+                slave.w.data.eq(wbufs[i].source.data),
+                slave.w.strb.eq(wbufs[i].source.strb),
+                slave.w.last.eq(wbufs[i].source.last),
+                wbufs[i].source.ready.eq(slave.w.ready),
             )
         self.comb += wq.source.ready.eq(slave.w.valid & slave.w.ready & slave.w.last)
         # Write responses: back by the index bits.
