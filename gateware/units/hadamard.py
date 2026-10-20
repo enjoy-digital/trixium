@@ -53,9 +53,10 @@ class IntegerHadamard(LiteXModule):
     any prefix from a cancelled command.
     """
     def __init__(self, block_size=1024, lanes=8, input_width=8, re_covers_we=False):
-        # re_covers_we: each bank port's read enable also high while it writes (Efinity maps a
-        # dual-port RAM only when RE controls WE; NO_CHANGE ports hold their output on a write,
-        # so nothing reads differently).
+        # re_covers_we: the Efinix port form - no read enable (Efinity maps a true dual-port RAM
+        # only with the write nested in the read enable, which Migen does not emit), a plain
+        # synchronous read every cycle at an address held while the read enable is low: the
+        # output holds exactly where it held, since no bank is written while it is read.
         if (not isinstance(block_size, int) or block_size < 4 or
                 block_size & (block_size - 1)):
             raise ValueError("block_size must be a power of two >= 4")
@@ -113,7 +114,8 @@ class IntegerHadamard(LiteXModule):
         # Migen's default WRITE_FIRST emits registered addresses + asynchronous
         # data reads, which Vivado rejects for this two-writer memory template.
         # No algorithm phase observes a port's output during its write cycle.
-        ports = [[memory.get_port(write_capable=True, has_re=True, mode=NO_CHANGE)
+        ports = [[memory.get_port(write_capable=True, has_re=not re_covers_we,
+                                  mode=READ_FIRST if re_covers_we else NO_CHANGE)
                   for _ in range(2)] for memory in memories]
         signs = Memory(lanes, words, name="hadamard_signs")
         sign_write = signs.get_port(write_capable=True)
@@ -192,10 +194,13 @@ class IntegerHadamard(LiteXModule):
         for which in range(2):
             for port in range(2):
                 ram = ports[which][port]
-                rd = Signal(name=f"hadamard_rd{which}{port}") if re_covers_we else None
-                if rd is not None:
-                    self.comb += ram.re.eq(rd | ram.we)
-                    ram = SimpleNamespace(adr=ram.adr, re=rd, we=ram.we, dat_w=ram.dat_w)
+                if re_covers_we:
+                    rd   = Signal(name=f"hadamard_rd{which}{port}")
+                    adr  = Signal(len(ram.adr), name=f"hadamard_adr{which}{port}")
+                    held = Signal(len(ram.adr), name=f"hadamard_held{which}{port}")
+                    self.comb += ram.adr.eq(Mux(rd | ram.we, adr, held))
+                    self.sync += held.eq(ram.adr)
+                    ram = SimpleNamespace(adr=adr, re=rd, we=ram.we, dat_w=ram.dat_w)
                 self.comb += [ram.adr.eq(0), ram.re.eq(0), ram.we.eq(0), ram.dat_w.eq(0)]
                 self.comb += If(~self.cancel,
                     If(state == LOAD,
