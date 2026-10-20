@@ -354,14 +354,15 @@ def boot_ypcb(tok, firmware):
     kill_consoles()
     cpu_reset()
     # The BIOS levels controller 0 (liblitedram's CK phase leveling, a BIST per step), runs its
-    # memtest, then levels controller 1 (SDRAM_CONTROLLERS); only the text after the NEW banner
-    # counts.
+    # memtest, then the other controllers the build has (SDRAM_CONTROLLERS: the board's second,
+    # none on an --engine-memctrl 1 build); only the text after the NEW banner counts, and every
+    # controller the BIOS reports must have leveled.
     acc = new = ""
     for i in range(1, 31):
         acc += "\n" + con([], wait=10, quiet_after=3)
         new = acc[acc.rfind("BIOS built on"):] if "BIOS built on" in acc else ""
         if new and re.search(r"Memtest (OK|KO)", new) and re.search(r"litex.*> ?$", new, re.M) \
-                and ckphase_results(new).keys() >= {0, 1}:
+                and 0 in ckphase_results(new):
             say(f"BIOS prompt after ~{i*10} s")
             break
     if not new:
@@ -376,9 +377,11 @@ def boot_ypcb(tok, firmware):
     if not results.get(0) or not re.search(r"Memtest OK", new):
         say("STOP: controller 0 did not level (CK phase) or main_ram fails the memtest")
         return 1
-    if not results.get(1):
-        say("STOP: controller 1 did not level (CK phase)")
-        return 1
+    say(f"controllers leveled by the BIOS: {sorted(results)}")
+    for k in sorted(results):
+        if k and not results[k]:
+            say(f"STOP: controller {k} did not level (CK phase)")
+            return 1
 
     # No model at boot (a staged header from a previous session points at stale weights); the
     # firmware boots without a CPU reset and runs the round trip.
