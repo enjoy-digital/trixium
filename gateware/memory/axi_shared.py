@@ -15,7 +15,10 @@ through every switch. Here:
 - reads: AR is arbitrated per request (round robin, no lock), the master's index rides in the
   upper ARID bits, R beats are routed back by those bits - each master keeps its own bursts in
   flight and the slave serves them in whatever order its IDs allow (in order per ID, as AXI
-  requires);
+  requires); with `r_buffer` each master's beats land in a FIFO of their own first, so a master
+  that drains slowly (a 256-bit port behind a 2:1 split takes a 512-bit word every other clock)
+  does not stall the slave for the others - size it to the beats a master can have in flight,
+  so it never fills (no head-of-line blocking between masters);
 - writes: each master's AW is taken at once into a small queue of its own and its W beats into
   a buffer (`w_buffer` beats, at least its longest burst); an AW goes to the slave only once its
   whole burst is buffered (masters that wait for AWREADY before WVALID keep working): W at the slave must
@@ -62,7 +65,7 @@ def _rr_next(current, requests, n):
 # AXISharedPort ------------------------------------------------------------------------------------
 
 class AXISharedPort(LiteXModule):
-    def __init__(self, masters, slave, w_queue_depth=8, w_buffer=32):
+    def __init__(self, masters, slave, w_queue_depth=8, w_buffer=32, r_buffer=0):
         n = len(masters)
         ib = index_bits(n)
         mid = max(m.id_width for m in masters)
@@ -98,15 +101,36 @@ class AXISharedPort(LiteXModule):
         # Read data: back by the index bits.
         r_idx = Signal(ib)
         self.comb += r_idx.eq(slave.r.id[mid:mid + ib])
+        r_readys = []
         for i, m in enumerate(masters):
-            self.comb += [
-                m.r.valid.eq(slave.r.valid & (r_idx == i)),
-                m.r.data.eq(slave.r.data),
-                m.r.resp.eq(slave.r.resp),
-                m.r.last.eq(slave.r.last),
-                m.r.id.eq(slave.r.id[:m.id_width]),
-            ]
-        self.comb += slave.r.ready.eq(Array([m.r.ready for m in masters])[r_idx])
+            if r_buffer:
+                f = stream.SyncFIFO([("data", slave.data_width), ("resp", 2), ("id", m.id_width)],
+                                    r_buffer, buffered=True)
+                setattr(self, f"rbuf{i}", f)
+                self.comb += [
+                    f.sink.valid.eq(slave.r.valid & (r_idx == i)),
+                    f.sink.data.eq(slave.r.data),
+                    f.sink.resp.eq(slave.r.resp),
+                    f.sink.last.eq(slave.r.last),
+                    f.sink.id.eq(slave.r.id[:m.id_width]),
+                    m.r.valid.eq(f.source.valid),
+                    m.r.data.eq(f.source.data),
+                    m.r.resp.eq(f.source.resp),
+                    m.r.last.eq(f.source.last),
+                    m.r.id.eq(f.source.id),
+                    f.source.ready.eq(m.r.ready),
+                ]
+                r_readys.append(f.sink.ready)
+            else:
+                self.comb += [
+                    m.r.valid.eq(slave.r.valid & (r_idx == i)),
+                    m.r.data.eq(slave.r.data),
+                    m.r.resp.eq(slave.r.resp),
+                    m.r.last.eq(slave.r.last),
+                    m.r.id.eq(slave.r.id[:m.id_width]),
+                ]
+                r_readys.append(m.r.ready)
+        self.comb += slave.r.ready.eq(Array(r_readys)[r_idx])
 
         # Write data: buffered per master; `ready[i]` counts its complete bursts not yet granted.
         dw = slave.data_width

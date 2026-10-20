@@ -59,7 +59,8 @@ from litex.soc.integration.soc_core import SoCCore
 from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.builder import Builder
 from litex.soc.interconnect.csr import CSR, CSRStatus, CSRStorage
-from litex.soc.interconnect.axi import AXIInterface
+from litex.soc.interconnect.axi import AXIInterface, Wishbone2AXI, AXIConverter
+from litex.soc.interconnect import wishbone
 
 from litedram.modules import MT40A512M8
 from litedram.phy.model import SDRAMPHYModel
@@ -72,6 +73,8 @@ from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats, NativePortStats
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
+from gateware.memory.axi_shared import AXISharedPort, slave_id_width
+from gateware.memory.axi import AXIWide
 from gateware.memory.ckphase_model import ckphase_model_settings, CKPhasePHYModel, NoDMPHYModel
 from model.bons import BONSReader
 from gateware.common import set_main_ram_executable
@@ -178,6 +181,12 @@ BOARD_DDR4_MAP = DDR4Map(BoardDDR4, 187.5e6,
     reserve       = 4 << 20)
 
 
+def words512(data):
+    """bytes -> 512-bit little-endian words (the Ti375 model's memory)."""
+    data = bytes(data) + bytes(-len(data) % 64)
+    return [int.from_bytes(data[i:i + 64], "little") for i in range(0, len(data), 64)]
+
+
 def main_ram_content(img, firmware=None, size=MAIN_RAM_SIZE):
     """main_ram: the firmware binary at 0, the BONS header+table at HDR_OFFSET."""
     ram = bytearray(size)
@@ -265,16 +274,17 @@ def ddr3_stride(img):
     return stride
 
 
-def ddr3_content(k, ram, img, chan_mod, stride, size):
+def ddr3_content(k, ram, img, chan_mod, stride, size, skew=None):
     """DDR3 controller k: main_ram at 0 for controller 0 and, for all, its channels' payloads at
     their windows (the content ends with the last payload: the model's banks start zeroed)."""
     content = bytearray(ram) if k == 0 else bytearray()
+    skew = ddr3_skew(chan_mod) if skew is None else skew
     if img is not None:
         for j in range(chan_mod):
             c = k*chan_mod + j
             payload = bytes(img.channel_payload(c))
-            base = DDR3_SIM_WEIGHT_BASE + j*stride + j*ddr3_skew(chan_mod)
-            assert base + stride - j*ddr3_skew(chan_mod) <= size, \
+            base = DDR3_SIM_WEIGHT_BASE + j*stride + j*skew
+            assert base + stride - j*skew <= size, \
                 f"channel {c}: a {stride >> 20} MB window does not fit the sim's DDR3"
             if len(content) < base + len(payload):
                 content.extend(bytes(base + len(payload) - len(content)))
@@ -389,8 +399,9 @@ class TriXiumSimSoC(SoCCore):
                  with_softmax=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
+                 axi1_latency=24,
                  unit_options=()):
-        assert mem in ("hbm", "ddr4", "ddr3")
+        assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
         dmap      = BOARD_DDR4_MAP if board_timing else SIM_DDR4_MAP
@@ -445,12 +456,12 @@ class TriXiumSimSoC(SoCCore):
         # only keep the ddr:sys ratio.
         SoCCore.__init__(self, platform,
             clk_freq                 = int(BOARD_SYS_CLK_FREQ) if board_timing else int(1e6),
-            ident                    = "TriXium Sim" + {"hbm": "", "ddr4": " DDR4", "ddr3": " DDR3"}[mem],
+            ident                    = "TriXium Sim" + {"hbm": "", "ddr4": " DDR4", "ddr3": " DDR3", "axi1": " AXI"}[mem],
             cpu_type                 = cpu_type,
             integrated_rom_size      = 0x20000,
             integrated_rom_init      = ROM_BOOT_STUB,
             # The YPCB's 16 KB (trixium_ypcb.py): liblitedram's CK phase leveling state in .bss.
-            integrated_sram_size     = 0x4000 if mem == "ddr3" else 0x2000,
+            integrated_sram_size     = 0x4000 if mem in ("ddr3", "axi1") else 0x2000,
             integrated_main_ram_size = MAIN_RAM_SIZE if mem == "hbm" else 0,
             integrated_main_ram_init = words(ram) if mem == "hbm" else [],
             uart_name                = "sim")
@@ -494,6 +505,9 @@ class TriXiumSimSoC(SoCCore):
         elif mem == "ddr4":
             chan_mod = self.add_ddr4(n_channels, n_memctrl, ram, img, memory_ports, dmap,
                                      contents)
+        elif mem == "axi1":
+            stride   = ddr3_stride(img)
+            chan_mod = self.add_axi1(n_channels, ram, img, memory_ports, stride, axi1_latency)
         else:
             stride   = ddr3_stride(img)
             read_ports = [] if ddr_readers else None   # --ddr-readers: the readers in the ddr domain.
@@ -503,7 +517,7 @@ class TriXiumSimSoC(SoCCore):
         # TriXium ----------------------------------------------------------------------------------
         # Same integration as both hardware targets; only memory/physical policy differs.
         config = TriXiumConfig(with_sp_csr=False,
-            chan_stride              = stride if mem == "ddr3" else dmap.chan_stride if mem == "ddr4" else 0,
+            chan_stride              = stride if mem in ("ddr3", "axi1") else dmap.chan_stride if mem == "ddr4" else 0,
             chan_mod                 = chan_mod,
             chan_skew                = ddr3_skew(chan_mod) if mem == "ddr3" else dmap.chan_skew if mem == "ddr4" else 0,
             with_hadamard            = with_hadamard,
@@ -546,6 +560,15 @@ class TriXiumSimSoC(SoCCore):
             # Stride 0: every channel has its own HBM model, hence a private address space. On
             # hardware the AXI switch makes the address select the pseudo-channel.
             self.add_constant("TRIXIUM_CHAN_STRIDE",      0)
+        elif mem == "axi1":
+            # One memory for the CPU and every channel (chan_mod = channels: all on main_ram's
+            # memory), no LiteDRAM (TRIXIUM_N_MEMCTRL absent: firmware/ddr.c compiles out).
+            self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", DDR3_SIM_WEIGHT_BASE)
+            self.add_constant("TRIXIUM_CHAN_STRIDE",      stride)
+            self.add_constant("TRIXIUM_CHAN_WINDOW",      stride)
+            self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
+            self.add_constant("TRIXIUM_CHAN_SKEW",        0)
+            self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
         elif mem == "ddr3":
             # The YPCB's constants, with the sim's windows.
             self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", DDR3_SIM_WEIGHT_BASE)
@@ -615,6 +638,56 @@ class TriXiumSimSoC(SoCCore):
                 memory_ports.append(axi)
         self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
         set_main_ram_executable(self, MAIN_RAM_BASE)
+        return chan_mod
+
+    def add_axi1(self, n_channels, ram, img, memory_ports, stride, latency):
+        """The Ti375's memory system: one 512-bit AXI4 memory (the hard DDR controller's port,
+        modelled with a fixed latency) behind AXISharedPort, carrying main_ram at 0 and every
+        engine channel's window; returns chan_mod (= the channels: all on one memory)."""
+        chan_mod = n_channels
+        content  = ddr3_content(0, ram, img, chan_mod, stride, 1 << 62, skew=0)
+        size     = 1 << (max(len(content), DDR3_SIM_WEIGHT_BASE + chan_mod*stride) - 1).bit_length()
+        self.axi1_size = size
+        masters = []
+        # Engine channels: 256-bit ports merged two beats per 512-bit word (reads and writes).
+        for c in range(n_channels):
+            axi  = AXIInterface(data_width=256, address_width=32, id_width=6)
+            wide = AXIInterface(data_width=512, address_width=32, id_width=6)
+            self.add_module(f"engwide{c}", AXIWide(axi, wide))
+            memory_ports.append(axi)
+            masters.append(wide)
+        # main_ram: the CPU's memory buses at 512 bits (and the wishbone path for the other
+        # bus masters, as add_sdram), the region's base taken off the address.
+        base = self.mem_map["main_ram"]
+        self.bus.add_region("main_ram", SoCRegion(origin=base, size=MAIN_RAM_SIZE, mode="rwx"))
+        def rebased(m):
+            far = AXIInterface(data_width=m.data_width, address_width=32, id_width=m.id_width)
+            for ch in ("aw", "w", "ar"):
+                self.comb += getattr(m, ch).connect(getattr(far, ch), omit={"addr"})
+            for ch in ("b", "r"):
+                self.comb += getattr(far, ch).connect(getattr(m, ch))
+            self.comb += [far.ar.addr.eq(m.ar.addr - base), far.aw.addr.eq(m.aw.addr - base)]
+            return far
+        if hasattr(self.cpu, "add_memory_buses"):
+            self.cpu.add_memory_buses(address_width=32, data_width=512)
+        for mem_bus in self.cpu.memory_buses:
+            assert isinstance(mem_bus, AXIInterface) and mem_bus.data_width == 512
+            masters.append(rebased(mem_bus))
+        if (not len(self.cpu.memory_buses)) or not hasattr(self.cpu, "dma_bus"):
+            wb = wishbone.Interface(data_width=self.bus.data_width, address_width=32, addressing="byte")
+            self.bus.add_slave(name="main_ram", slave=wb)
+            a32  = AXIInterface(data_width=self.bus.data_width, address_width=32, id_width=1)
+            a512 = AXIInterface(data_width=512, address_width=32, id_width=1)
+            self.submodules += Wishbone2AXI(wb, a32, base_address=base)
+            self.submodules += AXIConverter(a32, a512)
+            masters.append(a512)
+        self.axi1_slave = slave = AXIInterface(data_width=512, address_width=32,
+                                               id_width=slave_id_width(masters))
+        # r_buffer: a channel reader's 8 bursts of 16 beats are <= 72 words in flight.
+        self.axi1_port  = AXISharedPort(masters, slave, r_buffer=96)
+        self.axi1_mem   = HBMChannelModel(slave, size=size, init=words512(content), latency=latency,
+                                          data_width=512, axi3=False)
+        self.engstat = EnginePortStats(memory_ports)   # console `ddrstat`: the ports' waits
         return chan_mod
 
     def add_ddr3(self, n_channels, n_memctrl, ram, img, memory_ports, stride, ddr_settings,
@@ -719,6 +792,10 @@ def rebake_firmware(gateware_dir, image, firmware, n_memctrl, dmap=SIM_DDR4_MAP,
         fw = f.read()
     def inits(fw):
         ram = main_ram_content(img, fw, size=dmap.main_ram_size)
+        if mem == "axi1":                # One memory, one init file (SoC.add_axi1).
+            stride = ddr3_stride(img)
+            return [[f"{v:0128x}" for v in words512(ddr3_content(0, ram, img, img.header["n_channels"],
+                                                                 stride, 1 << 62, skew=0))]]
         if mem == "ddr3":
             stride = ddr3_stride(img)
             size   = ddr3_size(chan_mod, stride)
@@ -769,6 +846,11 @@ BOARDS = {
     # (caches, branch prediction, Zbb: the per-op CPU work between the lists is board-true).
     "ypcb": dict(mem="ddr3", n_memctrl=2,
         cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS),
+    # The Efinix Ti375 C529 (small boards, milestone M4): one hard DDR controller with ONE AXI4
+    # port (512 bits) for every engine channel and the CPU's memory, no LiteDRAM - modelled as
+    # one 512-bit AXI memory behind AXISharedPort. Run with --hybrid (lite profile by default).
+    "ti375": dict(mem="axi1", n_memctrl=1,
+        cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS),
 }
 
 # --hybrid (--board ypcb): the YPCB with the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B fit its
@@ -790,6 +872,7 @@ DEFAULT_IMAGES = {
     "xcu1525": "models/tiny/bonsai-tiny-hybrid-1k-n8.img",
     "fk33":    "models/tiny/bonsai-tiny-hybrid-1k-n8.img",
     "ypcb":    "models/tiny/bonsai-tiny-n4.img", # Four engine channels, the Qwen3 path.
+    "ti375":   "models/tiny/bonsai-tiny-hybrid-1k-t5-n4.img",
 }
 
 BOARD_SYS_CLK_FREQ = 125e6
@@ -970,8 +1053,8 @@ def main():
                          f"channels, the image {n_channels}.")
     gateware_dir = os.path.join(out_dir, "gateware")
     if args.hybrid:
-        if args.board != "ypcb":
-            parser.error("--hybrid is the YPCB's (the XCU1525 has every unit already).")
+        if args.board not in ("ypcb", "ti375"):
+            parser.error("--hybrid is the YPCB's and the Ti375's (the XCU1525 has every unit already).")
         board.update(LITE_UNITS if args.profile == "lite" else HYBRID_UNITS,
                      vexii_extra=board["vexii_extra"] + " --with-rvf")
     if args.memctrl:
@@ -992,8 +1075,8 @@ def main():
 
     # Firmware.
     if args.firmware:
-        if board["mem"] not in ("ddr4", "ddr3"):
-            raise SystemExit("--firmware re-bakes the DDR4/DDR3 model memories (--board xcu1525/ypcb): use --build.")
+        if board["mem"] not in ("ddr4", "ddr3", "axi1"):
+            raise SystemExit("--firmware re-bakes the DDR4/DDR3/AXI model memories (--board xcu1525/ypcb/ti375): use --build.")
         build_firmware(out_dir)
         rebake_firmware(gateware_dir, args.image, FIRMWARE, board["n_memctrl"],
             BOARD_DDR4_MAP if args.board_timing else SIM_DDR4_MAP, mem=board["mem"],

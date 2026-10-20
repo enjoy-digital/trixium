@@ -154,7 +154,7 @@ class _WideDUT(Module):
             setattr(self.submodules, f"wide{i}", AXIWide(a, w))
             wides.append(w)
         self.slave = AXIInterface(data_width=512, address_width=32, id_width=slave_id_width(wides))
-        self.submodules.port  = AXISharedPort(wides, self.slave)
+        self.submodules.port  = AXISharedPort(wides, self.slave, r_buffer=96)
         words = [int.from_bytes(init[i:i + 64], "little") for i in range(0, len(init), 64)]
         self.submodules.model = HBMChannelModel(self.slave, size=MEM_SIZE, init=words, latency=latency,
                                                 data_width=512, axi3=False)
