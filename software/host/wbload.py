@@ -13,8 +13,12 @@ payload to its window, through the gateware loader's CSR poke path (gateware/mem
 `src_sel = 1`, eight 32-bit pokes per 256-bit beat, nothing dropped or reordered, the FIFO's
 `poke_full` polled every 256 words, `done` awaited per transfer, 128 MB per armed transfer: the
 loader counts beats in 24 bits). Bring-up grade: one CSR write per word (an Etherbone packet
-each), so tens of KB/s over JTAG and a few hundred over UDP - the tiny models in seconds, the 2B
-in hours; the LiteEth weight port is the fast path.
+each; litex_server writes every record as an incrementing burst, so pokes to one address cannot
+be batched): measured over JTAGBone on the YPCB-00338, ~1,900 writes/s, 10 KB/s - a tiny model
+in ~16 minutes, then `hdrload` and `gen` exact; the LiteEth weight port is the fast path.
+litex_server --jtag needs an OpenOCD config that sets `_CHIPNAME` (it names the TAP
+`$_CHIPNAME.tap`), and the JTAG cable to itself: stop the server and its OpenOCD (by PID) before
+programming the card.
 
   litex_server --udp --udp-ip <board-host>      # or --jtag --jtag-config openocd_xxx.cfg
   python3 -m software.host.wbload --csr-csv build/<name>/csr.csv models/tiny/bonsai-tiny-n2.img
