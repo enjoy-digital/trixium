@@ -129,6 +129,7 @@ static uint64_t dn_state_zero;
 int hybrid_softmax_div;                  // Console `softmaxdiv on`: the per-position divide (A/B).
 int hybrid_softmax_unit = 1;             // Console `softmaxunit off`: the CPU softmax instead of unit 14.
 int hybrid_dn_list = 1;                  // Console `dnlist off`: the DeltaNet heads op through the CSRs
+int hybrid_dn_zbeside = 0;               // Console `dnzbeside on`: z beside the conv's SiLU, not in the projection list (A/B pending on the card)
                                          // (its ENGSTALL diagnostics) instead of the merged core list.
 int hybrid_fuse_out = 1;                 // Console `fuseout off`: the output projection, the residual add
                                          // and the next norm as separate lists (the A/B of out_resid_*).
@@ -1396,6 +1397,11 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     early = dn_hw && HP->dnstream_active && z_stays && e_qkv && e_z &&
             !(e_qkv->flags & FLAG_KSEG) && !(e_z->flags & FLAG_KSEG);
 #endif
+    // z beside the conv's SiLU (early only): its matvec streams while unit 11 works, instead
+    // of lengthening the projection list. It reads the prepared input at RS_XW (the conv
+    // buffers end below it) and writes Z; the SiLU touches DNR_QKV and FIX; z is used by the
+    // gated norm in the core list.
+    int zbeside = early && hybrid_dn_zbeside;
     float scale = 1.0f/sqrtf((float)hk);
     int rep = nv/nk;
     uint64_t t0 = perf_now64(), act_dt = 0, conv_dt = 0;
@@ -1428,11 +1434,15 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
             }                                                                                    \
         }                                                                                        \
         bns_seq_desc_silu_ex(&d, DNR_QKV, DNR_QKV, DNR_QKV, FIX, C, 1, 0, 0, 0);                 \
-        rl_desc(&d);                                                                             \
+        if (zbeside)                                                                             \
+            rl_matvec_beside(e_z, Z, Z, &d);                                                     \
+        else                                                                                     \
+            rl_desc(&d);                                                                         \
     } while (0)
     perf_enter(OP_DN_PROJ);           // the token trace's phases (tprof): nested brackets
     rl_begin_keyed(0x04000000u | (uint32_t)l << 8 | (uint32_t)early | (uint32_t)z_stays << 1 |
-                   (uint32_t)rl_rsf_is(h) << 2, (uint32_t)(uintptr_t)h | pf_key(), 0);
+                   (uint32_t)rl_rsf_is(h) << 2 | (uint32_t)zbeside << 3,
+                   (uint32_t)(uintptr_t)h | pf_key(), 0);
     if (early) {
         rl_prepare_for(h, (uint32_t)n_embd, 0, model_entry(ROLE_SSM_BETA, l)); // beta/alpha are not folded
         rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
@@ -1440,7 +1450,8 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         uint32_t k_ba = rl_count();
         rl_prepare_for(h, (uint32_t)n_embd, 1, e_qkv);
         rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
-        rl_matvec(e_z, Z, Z);
+        if (!zbeside)
+            rl_matvec(e_z, Z, Z);
         if (rl_start("deltanet projections"))
             return -1;
         if (rl_wait_desc(k_ba) == 0) {

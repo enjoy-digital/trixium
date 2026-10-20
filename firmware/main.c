@@ -1355,6 +1355,11 @@ static void console_service(void)
         if (strncmp(str, "on", 2) == 0)  hybrid_lm_store = 1;
         if (strncmp(str, "off", 3) == 0) hybrid_lm_store = 0;
         printf("LMSTORE %s\n", hybrid_lm_store ? "on (logits stored every chunk)" : "off (the argmax tracker alone)");
+    } else if (strcmp(token, "dnzbeside") == 0) { // dnzbeside on|off: the DeltaNet z projection beside the conv's SiLU (on) or in the projection list
+        extern int hybrid_dn_zbeside;
+        if (strncmp(str, "on", 2) == 0)  hybrid_dn_zbeside = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_dn_zbeside = 0;
+        printf("DNZBESIDE %s\n", hybrid_dn_zbeside ? "on (z streams beside the conv's SiLU)" : "off (z in the projection list)");
     } else if (strcmp(token, "dnlist") == 0) { // dnlist on|off: the DeltaNet q/k norm, heads op and gated norm as one list (on) or the heads op through the CSRs (off)
         extern int hybrid_dn_list;
         if (strncmp(str, "on", 2) == 0)  hybrid_dn_list = 1;

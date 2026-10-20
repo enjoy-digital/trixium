@@ -1120,6 +1120,33 @@ void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp)
     if (dst_sp == RS_F) rl_rsf_lost();   // partials stay below RS_F (build_matvec_rows)
 }
 
+void rl_matvec_beside(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp,
+                      const struct bns_seq_descriptor *unit)
+{
+    if (!e || ((e->flags & FLAG_KSEG) && model_entry_nkseg(e) > 1)) {
+        rl_matvec(e, ystage, dst_sp);
+        rl_desc(unit);
+        return;
+    }
+    // [engine, restore] as build_matvec_rows emits them for one segment; the unit goes between.
+    uint32_t k = RLS->n;
+    rl_matvec(e, ystage, dst_sp);
+    if (RLS->bad || RLS->n != k + 2u)
+        return;
+    if (RLS->replay) {                   // the image holds the three descriptors
+        RLS->n++;
+        return;
+    }
+    uint32_t restore[16];
+    for (int i = 0; i < 16; i++) restore[i] = stage_w(k + 1u)[i];
+    stage_w(k)[0] |= 1u << 9;            // the engine op NOWAIT
+    RLS->n = k + 1u;
+    rl_desc_overlap(unit);               // the unit beside it (OVERLAP)
+    if (!rl_room(1)) return;
+    for (int i = 0; i < 16; i++) stage_w(RLS->n)[i] = restore[i];   // the restore waits for the op
+    RLS->n++;
+}
+
 void rl_nowait(void)
 {
     if (RLS->n && !RLS->replay)
@@ -1764,6 +1791,7 @@ void rl_begin(void) {}
 void rl_fetch(const void *src, uint32_t bytes, uint32_t sp) { (void)src; (void)bytes; (void)sp; }
 void rl_store(void *dst, uint32_t bytes, uint32_t sp) { (void)dst; (void)bytes; (void)sp; }
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp) { (void)e; (void)ystage; (void)dst_sp; }
+void rl_matvec_beside(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp, const struct bns_seq_descriptor *unit) { (void)e; (void)ystage; (void)dst_sp; (void)unit; }
 void rl_nowait(void) {}
 void rl_desc_overlap(const struct bns_seq_descriptor *d) { (void)d; }
 void rl_matvec_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t ystage, uint32_t dst_sp)

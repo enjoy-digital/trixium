@@ -100,6 +100,11 @@ void rl_store(void *dst, uint32_t bytes, uint32_t sp);
 void rl_fetch_raw(const void *src, uint32_t bytes, uint32_t sp);
 void rl_store_raw(void *dst, uint32_t bytes, uint32_t sp);
 void rl_matvec(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp);
+// e's matvec with `unit` (a unit 3/4/5/8/11/12/13 descriptor touching nothing the matvec reads
+// or writes) running beside it: the engine op NOWAIT, the unit with OVERLAP, then the restore.
+// A K-segmented entry: the plain matvec, then the unit.
+void rl_matvec_beside(const struct bons_entry *e, uint32_t ystage, uint32_t dst_sp,
+                      const struct bns_seq_descriptor *unit);
 // Rows [row0, row0 + rows) of each channel's block of e, row0 and rows multiples of 8*n_ch:
 // the image shards rows in blocks (channel c holds model rows [c*R/n_ch, (c+1)*R/n_ch)), so
 // channel c computes its local rows row0/n_ch .. and the result is channel-major - model
