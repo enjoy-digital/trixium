@@ -34,6 +34,34 @@ from software.lab.mirror import mirror, mirror_tokens, compare
 READY   = r"TRIXIUM-READY[ \t]*\r?\n"
 PROMPT  = r"trixium> "
 TIMEOUT = 3*3600 # Boot / generation timeout (s).
+# Hang detection: no console output for this long while waiting (s; TRIXIUM_SIM_STALL to change).
+# A tiny-model forward prints within minutes; the slowest board-timing slices within ~20.
+STALL   = int(os.environ.get("TRIXIUM_SIM_STALL", 1800))
+
+
+class SimHang(SystemExit):
+    pass
+
+
+def expect_alive(child, pattern, timeout=TIMEOUT, what=""):
+    """child.expect(pattern) that fails fast on a hang: the console silent for STALL seconds
+    raises SimHang (the simulation keeps burning CPU when the SoC is stuck, so silence is the
+    signal), the overall timeout as before."""
+    start = last = time.time()
+    seen  = len(child.buffer)
+    while True:
+        try:
+            return child.expect(pattern, timeout=min(60, timeout))
+        except pexpect.TIMEOUT:
+            now = time.time()
+            if len(child.buffer) != seen:
+                seen, last = len(child.buffer), now
+            if now - last > STALL:
+                tail = child.buffer[-400:]
+                raise SimHang(f"HANG: no console output for {now - last:.0f} s waiting for "
+                              f"{what or pattern!r} (simulation stopped); last output: {tail!r}")
+            if now - start > timeout:
+                raise
 
 # Console ------------------------------------------------------------------------------------------
 
@@ -54,11 +82,11 @@ def boot(child):
     The skip key is only sent once the firmware offers it: earlier, it reaches the LiteX BIOS,
     where Q aborts the boot. A firmware without the offer goes straight to READY."""
     start = time.time()
-    index = child.expect([r"BOOT-LEGS \(q to skip\)", READY])
+    index = expect_alive(child, [r"BOOT-LEGS \(q to skip\)", READY], what="boot")
     text  = child.before + child.after
     if index == 0:
         child.send("q")
-        child.expect(READY)
+        expect_alive(child, READY, what="boot")
         text += child.before + child.after
     print(f"console ready after {time.time() - start:.0f} s", flush=True)
     return text
@@ -67,7 +95,7 @@ def boot(child):
 def command(child, cmd, timeout=300):
     """Run one console command and return its output, consuming exactly its own prompt."""
     child.sendline(cmd)
-    child.expect(PROMPT, timeout=timeout)
+    expect_alive(child, PROMPT, timeout=timeout, what=cmd)
     return child.before
 
 # Gate ---------------------------------------------------------------------------------------------
@@ -114,9 +142,9 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
             child.sendline(cmd)
             answer = ""
             if done:
-                child.expect(done, timeout=2*TIMEOUT)
+                expect_alive(child, done, timeout=2*TIMEOUT, what=cmd)
                 answer = child.before + child.after
-            child.expect(PROMPT, timeout=2*TIMEOUT)
+            expect_alive(child, PROMPT, timeout=2*TIMEOUT, what=cmd)
             answer += child.before
             if ok and ok not in answer:
                 raise SystemExit(f"{cmd} failed: {answer[-300:]!r}")
@@ -141,9 +169,9 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
         # `gen` takes the token COUNT first, then the prompt ids: "gen 1 1 2 3" is one token from
         # [1, 2, 3] (sending "gen 1 2 3" traces one forward fewer than the mirror).
         child.sendline("gen 1 " + " ".join(ids))
-        child.expect(r"GEN (DONE|ERR)")
+        expect_alive(child, r"GEN (DONE|ERR)", what="traced gen")
         trace = child.before + child.after
-        child.expect(PROMPT)
+        expect_alive(child, PROMPT, what="traced gen")
         stats = command(child, "stats")
     finally:
         child.sendline("")
@@ -194,7 +222,7 @@ def bench(gateware_dir, out_dir, toggle="resident", tokens=2, image=None, board=
     modes   = ("as-built",) if toggle == "none" else ("off", "on")
     try:
         boot(child)
-        child.expect(PROMPT)
+        expect_alive(child, PROMPT, what="boot prompt")
         for mode in modes:
             if toggle != "none":
                 answer = command(child, f"{toggle} {mode}")
@@ -237,7 +265,7 @@ def tprof(gateware_dir, out_dir, token=2, tokens=3):
     child = spawn(gateware_dir, out_dir)
     try:
         boot(child)
-        child.expect(PROMPT)
+        expect_alive(child, PROMPT, what="boot prompt")
         command(child, f"tprof arm {token}")
         command(child, f"bench {tokens}", timeout=2*TIMEOUT)
         text = command(child, "tprof dump", timeout=900)
