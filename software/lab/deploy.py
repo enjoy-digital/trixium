@@ -301,7 +301,11 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
     if board == "xcu1525":
         image = f"{stem}-n16.img" if model == "1p7b" else f"{stem}-n16-xcu1525.img"
     elif board == "ypcb":
-        image = f"{stem}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '8')}-ypcb.img"
+        # A build on fewer controllers than the board's two (--engine-memctrl 1) has its own
+        # windows: `trixium convert --memctrl 1` names its image -m1 (software/cli.py).
+        memctrl = soc_constant(soc_h, "TRIXIUM_N_MEMCTRL", "2")
+        msuffix = "" if str(memctrl) == "2" else f"-m{memctrl}"
+        image = f"{stem}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '8')}{msuffix}-ypcb.img"
         if model in ("2b", "4b") and soc_constant(soc_h, "TRIXIUM_DNSTREAM_LANES") is None:
             raise DeployError(f"{name} has no hybrid-model units (build trixium_ypcb.py --hybrid)")
     else:

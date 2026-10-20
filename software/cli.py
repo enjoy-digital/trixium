@@ -92,6 +92,9 @@ def cmd_convert(args):
         args.trit5 = BOARD_TRIT5[args.board]
     chan_stride, window, window_reserve = board_windows(args.board, args.channels, getattr(args, "memctrl", None))
     suffix = BOARD_SUFFIX[args.board]
+    memctrl = getattr(args, "memctrl", None)
+    if memctrl and args.board in BOARDS and memctrl != BOARDS[args.board]["memctrl"]:
+        suffix = f"-m{memctrl}{suffix}"      # Windows over fewer controllers than the board's: its own image.
     out = args.out
     if out is None:
         name = os.path.basename(args.gguf)
