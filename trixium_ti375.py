@@ -68,7 +68,11 @@ class _CRG(LiteXModule):
         self.comb += pll.reset.eq(~rst_n | self.rst_pulse)
         pll.register_clkin(clk100, platform.default_clk_freq)
         pll.create_clkout(self.cd_sys, sys_clk_freq, with_reset=True)
-        pll.create_clkout(None, 800e6)   # The LPDDR4x controller's clock (clkin_sel in ddr_config).
+        # The LPDDR4x controller takes its PHY clock from PLL0's output 3 (the platform's
+        # ddr_config clkin_sel): outputs 1 and 2 are placeholders, as in LiteX-Boards' target.
+        pll.create_clkout(None, 100e6)
+        pll.create_clkout(None, 60e6, margin=0)
+        pll.create_clkout(None, 800e6)
 
 # TriXium SoC --------------------------------------------------------------------------------------
 
@@ -152,7 +156,7 @@ class TriXiumTi375SoC(SoCCore):
         units.update(YPCB_HYBRID_UNIT_OPTIONS)
         if profile == "lite":
             units.update(YPCB_LITE_UNIT_OPTIONS, with_softmax=False)
-        config = TriXiumConfig(scratchpad_xpm=False, **units,
+        config = TriXiumConfig(scratchpad_xpm=False, efinix_ram=True, **units,
             chan_stride       = chan_stride,
             chan_mod          = chan_mod,
             chan_skew         = 0,
@@ -188,12 +192,11 @@ def main():
     parser.add_target_argument("--profile",         default="lite", choices=["full", "lite"], help="The units' sizing.")
     parser.add_target_argument("--prefetch",        default=512,   type=int,   help="Reader FIFO beats (0: no prefetch).")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
-    parser.set_defaults(cpu_type="vexiiriscv", cpu_variant="standard", update_repo="no")   # never touch the shared VexiiRiscv checkout
+    # LiteX applies the CPU arguments inside parse_args (with the variant's own: mul/div, which the
+    # FPU needs); never touch the shared VexiiRiscv checkout.
+    parser.set_defaults(cpu_type="vexiiriscv", update_repo="no", vexii_args=VEXII_ARGS + " --with-rvf")
     args = parser.parse_args()
     os.environ.setdefault("LITEX_ENV_EFINITY", "/opt/efinix/efinity/2025.1")
-    if args.cpu_type == "vexiiriscv":
-        from litex.soc.cores.cpu.vexiiriscv import VexiiRiscv
-        VexiiRiscv.vexii_args = VEXII_ARGS + " --with-rvf"
     soc = TriXiumTi375SoC(sys_clk_freq=args.sys_clk_freq, engine_channels=args.engine_channels,
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
                           **parser.soc_argdict)

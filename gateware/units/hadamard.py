@@ -19,6 +19,8 @@ int8 blocks into raw signed int32 vectors and writes one raw absmax per block. I
 from functools import reduce
 from operator import or_
 
+from types import SimpleNamespace
+
 from migen import *
 
 from litex.gen import LiteXModule
@@ -50,7 +52,10 @@ class IntegerHadamard(LiteXModule):
     block before any result can be emitted. An external consumer must discard
     any prefix from a cancelled command.
     """
-    def __init__(self, block_size=1024, lanes=8, input_width=8):
+    def __init__(self, block_size=1024, lanes=8, input_width=8, re_covers_we=False):
+        # re_covers_we: each bank port's read enable also high while it writes (Efinity maps a
+        # dual-port RAM only when RE controls WE; NO_CHANGE ports hold their output on a write,
+        # so nothing reads differently).
         if (not isinstance(block_size, int) or block_size < 4 or
                 block_size & (block_size - 1)):
             raise ValueError("block_size must be a power of two >= 4")
@@ -187,6 +192,10 @@ class IntegerHadamard(LiteXModule):
         for which in range(2):
             for port in range(2):
                 ram = ports[which][port]
+                rd = Signal(name=f"hadamard_rd{which}{port}") if re_covers_we else None
+                if rd is not None:
+                    self.comb += ram.re.eq(rd | ram.we)
+                    ram = SimpleNamespace(adr=ram.adr, re=rd, we=ram.we, dat_w=ram.dat_w)
                 self.comb += [ram.adr.eq(0), ram.re.eq(0), ram.we.eq(0), ram.dat_w.eq(0)]
                 self.comb += If(~self.cancel,
                     If(state == LOAD,
@@ -302,7 +311,7 @@ class HadamardScratchpad(LiteXModule):
     before accepting a command. Failure/cancel invalidates the entire output,
     including already-written prefixes. Only done publishes successful results.
     """
-    def __init__(self, scratchpad_size=256*1024, block_size=1024, lanes=32):
+    def __init__(self, scratchpad_size=256*1024, block_size=1024, lanes=32, re_covers_we=False):
         if scratchpad_size < 32 or scratchpad_size > 256*1024 or scratchpad_size % 32:
             raise ValueError("scratchpad_size must be 32-byte aligned and within the 13-bit "
                              "client address space")
@@ -337,7 +346,7 @@ class HadamardScratchpad(LiteXModule):
         # # #
 
         # Kernel.
-        self.core = core = IntegerHadamard(block_size=block_size, lanes=lanes)
+        self.core = core = IntegerHadamard(block_size=block_size, lanes=lanes, re_covers_we=re_covers_we)
         L = lanes
         half_ok = block_size >= 512 and block_size//L >= 4 # Else half=1 is a config error.
         wpb, wps = 32//L, 256//L      # core words per data beat, per sign beat

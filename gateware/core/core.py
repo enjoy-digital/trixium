@@ -56,6 +56,7 @@ class TriXiumConfig:
     hadamard_lanes: int            = 32    # Unit 1 butterflies per clock (8, 16, 32).
     silu_ways: int                 = 4     # Unit 11 kernels in lockstep (elements per clock/2).
     scratchpad_xpm: bool           = False # Xilinx: the scratchpad as an explicit XPM block RAM.
+    efinix_ram: bool               = False # Efinix: RAM port forms Efinity maps (read enables covering writes).
     with_dnstream: bool            = False # Engine op 5: the DeltaNet stream unit on every channel.
     dnstream_options: tuple        = ()    # (name, value) overrides of the unit's arguments.
     with_attnstream: bool          = False # Engine op 6: the attention passes (scores, weighted V).
@@ -197,7 +198,8 @@ class TriXiumCore(LiteXModule):
         extensions = []
         if config.with_hadamard:
             self.hadamard = ClockDomainsRenamer("eng")(
-                HadamardScratchpad(config.scratchpad_size, lanes=config.hadamard_lanes))
+                HadamardScratchpad(config.scratchpad_size, lanes=config.hadamard_lanes,
+                                   re_covers_we=config.efinix_ram))
             sp_clients.append(self.hadamard)
             extensions.append(("hadamard", self.hadamard))
             self.add_constant("TRIXIUM_HAS_HADAMARD")

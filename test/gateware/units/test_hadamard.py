@@ -126,6 +126,18 @@ def test_integer_hadamard_dense_equivalence(size, lanes, width, inverse):
     run_tb(dut, command(dut, values, signs, inverse))
 
 
+@pytest.mark.parametrize("size,lanes", [(16, 2), (128, 4), (1024, 8)])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_integer_hadamard_efinix_ram_ports(size, lanes, inverse):
+    """re_covers_we (the Efinix RAM port form: read enables high on writes too) is the same
+    transform."""
+    rng = random.Random(size)
+    values = [rng.randrange(-128, 128) for _ in range(size)]
+    signs = [rng.choice([-1, 1]) for _ in range(size)]
+    dut = IntegerHadamard(size, lanes, 8, re_covers_we=True)
+    run_tb(dut, command(dut, values, signs, inverse))
+
+
 @pytest.mark.parametrize("size,lanes", [(16, 2), (64, 4), (1024, 8), (1024, 32)])
 @pytest.mark.parametrize("inverse", [False, True])
 def test_integer_hadamard_half_block_then_full_block(size, lanes, inverse):
