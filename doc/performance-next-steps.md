@@ -186,6 +186,40 @@ port and the prepare units are the cheapest.
   whole rotated prepare (with unit 5's pass) at ~0.3 clock/element against ~0.6 now: ~0.7 M
   per 27B token more.
 
+## Hybrid path on the YPCB-00338 (Bonsai-2 2B / 4B), 2026-10-20
+
+Where a 2B forward goes on `ypcb_hyb20_d100` (`hybprof`, `dnprof`, 64-token bench, 4.95 M cycles
+per forward at sys 100 MHz, 19.47 tok/s):
+
+| part | M cycles | of which |
+| --- | ---: | --- |
+| DeltaNet layers (18) | 2.12 | in-projections 0.61 (weight streams), heads 0.74, conv 0.41, activation 0.28, out 0.06 |
+| FFN projections (24) | 1.38 | weight streams; the down projection fused behind the activation |
+| LM head | 0.85 | weight stream, the hardware argmax deciding |
+| attention layers (6) | 0.51 | grows with the context: 0.82 at 256 tokens |
+| embedding, norms, residuals | 0.07 | |
+
+The weight streams run at 1.04 memory beats per channel per clock, the DDR3-933 controllers' own
+rate: 393 MB per forward is a 3.1 M floor at that rate, 1.6x under the forward. What is left above
+it is the serial work of the DeltaNet layers (heads, conv, activation: ~1.4 M) and of the
+attention, during which the memory idles. The levers, roughly in order of gain per effort:
+
+- **The DRAM rate (done, `ypcb_hyb21_d100`).** DDR3-1066 with the pipes at 143 MHz: the streams
+  at 1.11 beats per clock, 2B 19.47 -> 20.33 tok/s (+4.4%), 4B 8.63 -> 9.23 (+7%); the read eye
+  holds with the odd uncorrectable read the forward retry repeats.
+- **Overlap the DeltaNet conv and activation with the projections that do not depend on them**:
+  tried for the z projection beside the conv's SiLU (`dnzbeside on`): 2.7% slower on the card
+  (the projection list no longer ends on z's stream, the conv list then waits for it); off.
+  The weight prefetch for the hybrid lists (`prefetch hybrid on`) is still a loss (-0.8%).
+- **The DeltaNet heads at four sub-lanes per channel** (0.74 M -> ~0.37 M, ~7%) cost ~27k LUTs:
+  with both controllers' I/O regions kept free the K7-480T does not route it (global congestion
+  level 6); it needs area back elsewhere first.
+- **Long context:** the attention's weighted-V pass grows with the position (0.15 M at 64 tokens,
+  0.45 M at 256); 16 attention lanes or 8-bit K/V halve it.
+- **Two activation rows per weight beat** (a second adder tree per channel), which makes
+  speculative decoding pay on a stream-bound engine: the largest lever left, and the largest piece
+  of work.
+
 ## Denser ternary codes (5 trits per byte): the YPCB's default since 2026-10-15
 
 Adopted for the YPCB-00338 (eight channels, `--trit5` by default: 32.1 / 7.83 tok/s on the card

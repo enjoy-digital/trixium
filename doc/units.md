@@ -180,8 +180,10 @@ and only the FETCH / DeltaNet / attention beats cross back to the engine through
 steered by two quasi-static levels (the op's kind, the prefetch gate) crossed by MultiReg. The
 soft reset holds `reng` with the engine; the read shims' hold and busy cross by MultiReg and
 `busy` covers the readers' reset release. The trit5 pipe then caps the stream at ~1.03 memory
-beats per engine clock at a 125 MHz pipe (26 trits of 32 per beat): the pipe clock is the lever
-left.
+beats per engine clock at a 125 MHz pipe (26 trits of 32 per beat). At 133 MHz the stream reaches
+1.04 beats per engine clock on the YPCB-00338, the DDR3-933 controller's own rate after refresh
+and row switches; a 143 MHz pipe adds nothing there. At DDR3-1066 with the pipes at 143 MHz the
+stream reaches 1.11.
 
 ### Op 5: DeltaNet stream
 

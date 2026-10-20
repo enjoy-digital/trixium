@@ -71,8 +71,8 @@ Batch-1 decode on the card, first tokens checked against the reference:
 | | | Ternary-Bonsai 1.7B | **106.3** |
 | Inspur **YPCB-00338** (XC7K480T) | 2x DDR3-1066 x64 | Ternary-Bonsai 8B | 8.11 |
 | | | Ternary-Bonsai 1.7B | **35.2** |
-| | 2x DDR3-933 x64 (hybrid build) | Ternary-Bonsai-2 4B | 8.63 |
-| | | Ternary-Bonsai-2 2B | 19.47 |
+| | 2x DDR3-1066 x64 (hybrid build) | Ternary-Bonsai-2 4B | 9.23 |
+| | | Ternary-Bonsai-2 2B | 20.33 |
 
 The models, all PrismML's, straight from their GGUF files (the converter copies the ternary codes
 and scales bit for bit):
@@ -163,8 +163,8 @@ busier; TriXium reads ~3.5x fewer bytes per token with natively ternary models, 
 at 2.5-2.8x the decode rate per parameter on the 1.7B and 8B (different models from openTPU's,
 so a speed comparison, not a quality one). Like for like: Ternary-Bonsai-2 2B and 4B are ternary
 versions of the Qwen3.5-2B and 4B that openTPU runs at 4 bits, and on the same card they decode
-at 19.47 against 12.1 and 8.63 against 5.9 tok/s (ours at DDR3-933, openTPU's at DDR3-1066)
-while reading ~2.5x fewer bytes per token: about a third of the DRAM bandwidth, the rest being
+at 20.33 against 12.1 and 9.23 against 5.9 tok/s (both at DDR3-1066)
+while reading ~2.5x fewer bytes per token: about half of the DRAM bandwidth, the rest being
 per-token work still to overlap with the weight streams. The numbers, and the other FPGA LLM
 designs:
 [`doc/related-work.md`](doc/related-work.md#opentpu-on-the-same-card).
@@ -222,9 +222,14 @@ the YPCB-00338's measured ratio). Projections, labelled as such, with assumed bo
 | --- | --- | --- | --- | ---: | ---: | ---: |
 | FK33 | VU33P | 2x HBM2, 8 GB | 1.7B | 106.3 (measured) | 27 W FPGA (Vivado) | 0.07 (est.) |
 | XCU1525 | VU9P | 4x DDR4 | 27B | 4.03 (measured) | 20 W FPGA (Vivado) | 1.4 (est.) |
+| YPCB-00338, small-board setup | K7-480T, 155k LUTs used | 1x DDR3-933 x64, 2 channels | Bonsai-2 2B | 10.3 (measured) | | |
 | Efinix Ti375 C529 | Titanium Ti375 | LPDDR4x x32, 1 GB | 1.7B | ~15-25 (projected) | 3-5 W | ~0.03-0.09 |
 | Acorn CLE-215+ | Artix-7 200T | 1x DDR3, 1 GB | 1.7B | ~2.5-4 (projected) | 3-5 W | ~0.2-0.6 |
 | Titanium SiP | Ti60 / Ti125 | 32-64 MiB HyperRAM in the package | tiny (15M+) | ~10-30 (projected) | 0.3-1 W | ~0.003-0.03 |
+
+The small-board setup is the YPCB-00338 built the way a small board would be: one DDR3 controller
+for the CPU and two engine channels, the lighter unit set (`--engine-memctrl 1 --profile lite`),
+the same firmware and a two-channel image. It is the rehearsal for the Ti375 and the Artix-7.
 
 The last line is the one we find most exciting: logic and memory in one package, a small model
 and its state inside, a few hundred milliwatts. Not a chat assistant, but a block of

@@ -78,8 +78,8 @@ device after a 512-token prompt; ours after a 3-token prompt):
 
 | | openTPU, 4-bit weights, int8 head | TriXium, ternary |
 | --- | --- | --- |
-| ~2B | Qwen3.5-2B 12.09, Gemma 4 E2B 12.14 (4-bit head), LFM2-2.6B 10.96 tok/s | Bonsai 1.7B **35.2 tok/s**; Bonsai-2 2B (ternary Qwen3.5-2B) **19.47 tok/s**, hybrid build at DDR3-933 |
-| 3-4B | SmolLM3-3B 8.74, Phi-4-mini 6.56, Qwen3.5-4B 5.88 tok/s | Bonsai-2 4B (ternary Qwen3.5-4B) **8.63 tok/s**, same build |
+| ~2B | Qwen3.5-2B 12.09, Gemma 4 E2B 12.14 (4-bit head), LFM2-2.6B 10.96 tok/s | Bonsai 1.7B **35.2 tok/s**; Bonsai-2 2B (ternary Qwen3.5-2B) **20.33 tok/s**, hybrid build |
+| 3-4B | SmolLM3-3B 8.74, Phi-4-mini 6.56, Qwen3.5-4B 5.88 tok/s | Bonsai-2 4B (ternary Qwen3.5-4B) **9.23 tok/s**, same build |
 | 8B | (its images stop at 4 GiB) | Bonsai 8B **8.11 tok/s** |
 | DRAM while decoding | 91-94 % of the 17.1 GB/s peak | 78 % (1.7B), 79 % (8B); ~89-91 % while the engine streams |
 | DRAM bytes read per token (~2B model) | ~1.3 GB (Qwen3.5-2B, 4-bit) | ~0.38 GB (Bonsai 1.7B): ~3.5x less |
@@ -88,9 +88,9 @@ device after a 512-token prompt; ours after a 3-token prompt):
 | clocks | one clock, 133.33 MHz | core 125 MHz, DDR controllers 133.33 MHz |
 
 The Bonsai-2 2B / 4B (2026-10-19) are ternary versions of the same Qwen3.5-2B / 4B openTPU runs at
-4 bits, and they decode faster (19.47 against 12.1, 8.63 against 5.9 tok/s) with ~2.5x fewer
-bytes per token: the hybrid build uses about 48% of the DRAM bandwidth (the 2B: ~0.41 GB per
-token at 17.5 tok/s, at DDR3-933 on this card), the rest being per-token work (the scratchpad
+4 bits, and they decode faster (20.33 against 12.1, 9.23 against 5.9 tok/s) with ~2.5x fewer
+bytes per token: the hybrid build uses about 54% of the DRAM bandwidth (the 2B: ~0.41 GB per
+token at 20.3 tok/s, at DDR3-1066 on this card), the rest being per-token work (the scratchpad
 units and the CPU on each layer's serial chain) not yet overlapped with the weight streams. That is where the ternary
 format's advantage is still to be collected: a small speed win so far, a large bandwidth one.
 

@@ -115,6 +115,22 @@ in ~112 s.
 | 2026-10-14/15 | `ypcb_t5n8c` | eight channels, 5-trit codes | 32.1 | 7.83 |
 | 2026-10-15 | `ypcb_pff2` | weight prefetch, fused vector instructions | 35.2 | 8.11 |
 
+**YPCB-00338, hybrid build** (Ternary-Bonsai-2, sys 100 MHz, DDR3-933, ECC with forward retry):
+
+| date | build | change | 2B tok/s | 4B tok/s |
+| --- | --- | --- | ---: | ---: |
+| 2026-10-17 | `ypcb_hyb7` | first golden tokens; RoPE on the norm unit, list image cache | 13.20 | 5.98 |
+| 2026-10-19 | `ypcb_hyb12` | DeltaNet stream at 2 sub-lanes, wider Hadamard | 15.01 | |
+| 2026-10-19 | `ypcb_hyb13` | channel pipes in their own 125 MHz clock | 16.78 | |
+| 2026-10-19 | `ypcb_hyb15` | softmax unit | 17.49 | 7.92 |
+| 2026-10-19 | `ypcb_hyb15` | firmware: fused lists, DeltaNet heads in a list, LM head without logits stores | 18.45 | 8.15 |
+| 2026-10-19 | `ypcb_hyb17` | channel readers in the DDR controllers' clock | 18.79 | 8.50 |
+| 2026-10-20 | `ypcb_hyb20` | pipes at 133 MHz, engine datapath out of both controllers' I/O regions | 19.47 | 8.63 |
+| 2026-10-20 | `ypcb_hyb21` | DDR3-1066, pipes at 143 MHz | 20.33 | 9.23 |
+
+The same day, the small-board configuration on the same card: two engine channels on one DDR3
+controller with the lighter unit set (`ypcb_m1b_lite_n2m1`, 155k LUTs): 2B 10.32 tok/s.
+
 Long context on the FK33 1.7B (v14b, 2026-09-15): 89.8 tok/s at 78 tokens of context, 78.7 at
 354, 70.0 at 684, 57.4 at 1,344; attention grows by ~0.9k cycles per position per token, and
 the vector unit's softmax, not the K/V streams, is the pole.

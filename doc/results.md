@@ -15,8 +15,8 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | FK33 | Ternary-Bonsai 1.7B | 106.3 | 2.00 M | sys 212.5 MHz |
 | YPCB-00338 (2x DDR3-1066) | Ternary-Bonsai 8B | 8.11 | 15.41 M | sys 125 MHz |
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
-| YPCB-00338 (hybrid build, 2x DDR3-933, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 8.63 | 11.6 M | sys 100 MHz, pipes 133 MHz, readers in the DDR clock; 8.22 tok/s at 256 tokens |
-| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 19.47 | 5.14 M | sys 100 MHz, pipes 133 MHz, readers in the DDR clock; 18.71 tok/s at 256 tokens, 15.30 at 1,024 |
+| YPCB-00338 (hybrid build, 2x DDR3-1066, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 9.23 | 10.8 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock |
+| YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 20.33 | 4.92 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock; 19.49 tok/s at 256 tokens, 15.81 at 1,024 |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate
@@ -26,11 +26,11 @@ approved overclock), and the builds close timing to the project's empirical gate
 [`performance-next-steps.md`](performance-next-steps.md).
 
 The Bonsai 2 2B/4B on the YPCB-00338 are still some way from its memory limit: the 2B streams
-~0.41 GB per token, so 19.5 tok/s uses about half of the DDR3-933 bandwidth (5.0 M cycles per
-forward against a 3.2 M streaming floor). The weight streams run at 1.04 memory beats per clock,
-the memory side's own limit (refresh and row switches off DDR3-933's 1.17): each channel's
-unpacker and pipe sit in their own 133 MHz clock domain (the trit5 pipe consumes one 128-trit
-beat per clock; at the engine's 100 MHz it was the limit, and at 143 MHz nothing more comes) and
+~0.41 GB per token, so 20.3 tok/s uses about half of the DDR3-1066 bandwidth (4.8 M cycles per
+forward against a 3.2 M streaming floor). The weight streams run at 1.11 memory beats per clock
+at DDR3-1066 (1.04 at DDR3-933: the memory side's own limit after refresh and row switches): each channel's
+unpacker and pipe sit in their own 143 MHz clock domain (the trit5 pipe consumes one 128-trit
+beat per clock; at the engine's 100 MHz it was the limit) and
 each channel's reader in the DDR controller's clock (the 256-bit port at the engine clock was the
 cap in between, 0.95). The engine's streaming datapath is kept out of both controllers' I/O clock
 regions: next to them its switching narrows the read eye (corrected and the odd uncorrectable
@@ -44,7 +44,9 @@ lists that do not change between tokens are built once and replayed from an imag
 firmware's list cache); the attention layers' RoPE runs on the norm unit; the attention stream
 at 8 lanes / 2 groups runs the 2B's heads in one pass; the attention softmax runs on a
 scratchpad unit (exact binary32, the firmware's own exp), so the context costs only the
-scores and weighted-V passes: 18.7 tok/s at 256 tokens, 15.3 at 1,024. openTPU's numbers on the
+scores and weighted-V passes: 19.5 tok/s at 256 tokens, 15.8 at 1,024. At DDR3-1066 the ECC
+logs the odd corrected read and, rarely, an uncorrectable one that the forward retry repeats
+(2 in ~5,500 benched tokens, output exact). openTPU's numbers on the
 same card (Qwen3.5-2B 12.1, 4B 5.9 tok/s) are not a like-for-like comparison: the same
 architecture, but the original weights at 4 bits (~2.5x the bytes per token) and DDR3-1066.
 

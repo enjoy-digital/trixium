@@ -47,9 +47,9 @@ the board's timings and clock ratio, four channels, the tiny 4-channel model).
 ./trixium_fk33.py --load          # OpenOCD (openFPGALoader does not configure the FK33)
 ./trixium_ypcb.py --build         # -> build/ypcb/
 ./trixium_ypcb.py --load          # openFPGALoader (Digilent HS2 cable)
-./trixium_ypcb.py --hybrid --engine-channels 4 --ddr-clk-freq 116.6667e6 --sys-clk-freq 100e6 \
-    --ddr-quiet-regions both --pipe-clk-freq 133.333e6 --ddr-readers \
-    --build --output-dir build/ypcb_hybrid    # the Bonsai 2 2B / 4B build (pipes at 133 MHz, readers in the DDR clock)
+./trixium_ypcb.py --hybrid --engine-channels 4 --ddr-clk-freq 133.333e6 --sys-clk-freq 100e6 \
+    --ddr-quiet-regions both --pipe-clk-freq 142.857e6 --ddr-readers \
+    --build --output-dir build/ypcb_hybrid    # the Bonsai 2 2B / 4B build (DDR3-1066, pipes at 143 MHz, readers in the DDR clock)
 ```
 
 The defaults are the configurations of the results above; `--help` lists the few knobs
