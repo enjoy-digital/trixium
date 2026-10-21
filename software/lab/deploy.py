@@ -516,9 +516,16 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
         shutil.copy(bit, os.path.join(archive, f"{name}.bit"))
         ti375.load(bit)
         time.sleep(8)                   # The BIOS: memtest, then it gives up booting on its own.
-    say("serial boot")
-    boot = ti375.boot(firmware, tty)
-    print("\n".join(l for l in boot.splitlines() if l.startswith(("TriXium", "BONS", "SPTEST", "hybrid: emb"))))
+    if reconfigure:
+        say("serial boot")
+        boot = ti375.boot(firmware, tty)
+        print("\n".join(l for l in boot.splitlines() if l.startswith(("TriXium", "BONS", "SPTEST", "hybrid: emb"))))
+    else:
+        # --no-reconfigure: the firmware already running (the BIOS's serial boot needs its prompt:
+        # a new firmware means a new load).
+        out_txt = console_run([""], tty, wait=5, baud=ti375.BAUD)
+        if "trixium>" not in out_txt:
+            raise DeployError("no TriXium firmware answers on the console - deploy without --no-reconfigure")
     if not ti375.ping(ip, iface):
         raise DeployError(f"the board does not answer at {ip}")
     say("weights over UDP")
