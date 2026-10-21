@@ -21,6 +21,8 @@
 #include <irq.h>
 #include <libbase/uart.h>
 #include <libbase/console.h>
+#include <libbase/crc.h>
+#include <system.h>
 
 #include "bons.h"
 #include "ddr.h"
@@ -321,6 +323,13 @@ static void emit_token(int tok)
 // that followed the upload of a DIFFERENT model would run the boot demo with the previous
 // model's tables (its KV addresses point into the new model's weights, and the demo tokens
 // overwrite them), so the boot refreshes main_ram from the staged header when they differ.
+// The table as the converter wrote it (header table_crc32, zlib's CRC over the entries).
+static int hdr_table_ok(const struct bons_header *h)
+{
+    return crc32((const unsigned char *)h + h->table_offset,
+                 h->n_tensors*sizeof(struct bons_entry)) == h->table_crc32;
+}
+
 static int hdrload_staged(int quiet)
 {
     // First fetch just the header to learn the table size.
@@ -350,7 +359,8 @@ static int hdrload_staged(int quiet)
     const struct bons_header *mh = model_header();
     if (quiet && mh->magic == BONS_MAGIC && mh->version == sh->version
         && mh->n_tensors == sh->n_tensors && mh->payload_beats == sh->payload_beats
-        && mh->n_layer == sh->n_layer && mh->table_crc32 == sh->table_crc32)
+        && mh->n_layer == sh->n_layer && mh->table_crc32 == sh->table_crc32
+        && hdr_table_ok(mh))
         return 0;                              // main_ram already holds this image's header
     uint32_t bytes = sh->payload_offset;
     uint8_t *dst   = (uint8_t *)TRIXIUM_HDR_ADDR;
@@ -363,7 +373,20 @@ static int hdrload_staged(int quiet)
             ((uint32_t *)(dst + off))[i] = src[i];
         off += chunk;
     }
+#ifdef HAS_CLEAN_CPU_DCACHE_RANGE
+    clean_cpu_dcache_range(dst, bytes);   // main_ram holds the table now, not just the cache.
+#endif
     model_cache_reset(); // Header changed: rebuild the (role, layer) lookup cache.
+    if (!hdr_table_ok((const struct bons_header *)dst)) {
+        // The staged copy itself (the upload) or the copy into main_ram is damaged: a table
+        // entry read wrong is a NULL tensor in the forward, an engine op on garbage.
+        printf("hdrload: table CRC mismatch (%08lx, header says %08lx) - re-upload the image\n",
+               (unsigned long)crc32((const unsigned char *)dst + ((struct bons_header *)dst)->table_offset,
+                                    ((struct bons_header *)dst)->n_tensors*sizeof(struct bons_entry)),
+               (unsigned long)((struct bons_header *)dst)->table_crc32);
+        ((struct bons_header *)dst)->magic = 0;
+        return -1;
+    }
     printf("hdrload: %lu KB copied%s\n", (unsigned long)(bytes/1024),
            quiet ? " (staged header differed from main_ram's)" : "");
     return 1;

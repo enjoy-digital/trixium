@@ -684,10 +684,12 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
     int n = e->cols;
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
     uint32_t rpc = e->rows/n_ch;
+    // Staged in the destination itself (the row is read whole before any result is written):
+    // SP_FET lies inside the resident path's RS_F, whose conv buffers reach it at the 2B's size.
     engine_fetch(row/rpc,
                  TRIXIUM_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)(row % rpc)*rb)*32,
-                 rb, SP_FET);
-    volatile uint8_t *pb = (volatile uint8_t *)(SCRATCHPAD_BASE + SP_FET);
+                 rb, sp_dst);
+    volatile uint8_t *pb = (volatile uint8_t *)(SCRATCHPAD_BASE + sp_dst);
     const volatile uint16_t *scales = (const volatile uint16_t *)pb;
     const volatile uint32_t *cw = (const volatile uint32_t *)(pb + bons_scale_beats(e->cols, e->group)*32);
     int G = n/128;
