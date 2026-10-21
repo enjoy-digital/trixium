@@ -173,6 +173,7 @@ static void help(void)
     puts("  selftest          - engine self-tests (matvec + fetch checksums)");
     puts("  sptest            - scratchpad bus read/write test");
     puts("  peek c addr       - dump one weight-memory beat of channel c via the engine (hex addr)");
+    puts("  imgcheck [i [n]]  - read every tensor back through the engine, check its table CRC");
     puts("  mvtest role [layer] - matvec one tensor with the test pattern, print checksum");
     puts("  mvbw role [layer] [reps] - engine streaming efficiency on one tensor");
     puts("  ddrstat          - DFI command cycles per controller and the engine ports' waits since the previous ddrstat");
@@ -403,6 +404,69 @@ static void hdrload(void)
 
 /* Diagnostics */
 /*-------------*/
+
+// zlib's CRC-32, chainable (the converter chains each tensor's channels): a nibble table, so
+// no 1 KB table in the SRAM.
+static uint32_t crc32_update(uint32_t crc, const volatile uint32_t *p, uint32_t n)
+{
+    static const uint32_t t[16] = {
+        0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC, 0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
+        0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C, 0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C,
+    };
+    crc = ~crc;
+    for (uint32_t i = 0; i < n/4; i++) {   // Little-endian words: bytes in address order.
+        uint32_t w = p[i];                 // One uncached scratchpad read per 4 bytes.
+        for (int k = 0; k < 4; k++, w >>= 8) {
+            crc ^= w & 0xff;
+            crc = (crc >> 4) ^ t[crc & 15];
+            crc = (crc >> 4) ^ t[crc & 15];
+        }
+    }
+    return ~crc;
+}
+
+// Every tensor's payload read back through the engine and checked against its table CRC
+// (the converter's: each channel's share, channel-major): proves the upload landed whole, and
+// names the tensor when it did not.
+//   imgcheck [first [count [chunk]]]   (chunk: beats per engine fetch, default 2048)
+static void imgcheck_cmd(char *str)
+{
+    const struct bons_header *h = model_header();
+    if (h->magic != BONS_MAGIC) {
+        puts("imgcheck: no model (hdrload)");
+        return;
+    }
+    char *f_s = get_token(&str);
+    char *n_s = get_token(&str);
+    char *k_s = get_token(&str);
+    uint32_t chunk = *k_s ? (uint32_t)strtoul(k_s, NULL, 0) : 2048;
+    if (chunk == 0 || chunk > 2048) chunk = 2048;
+    uint32_t first = *f_s ? (uint32_t)strtoul(f_s, NULL, 0) : 0;
+    uint32_t count = *n_s ? (uint32_t)strtoul(n_s, NULL, 0) : h->n_tensors;
+    const struct bons_entry *t = (const struct bons_entry *)(TRIXIUM_HDR_ADDR + h->table_offset);
+    uint32_t bad = 0, done = 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = first; i < h->n_tensors && i < first + count; i++, done++) {
+        const struct bons_entry *e = &t[i];
+        uint32_t crc = 0;
+        for (uint32_t c = 0; c < h->n_channels; c++) {
+            for (uint64_t b = 0; b < e->chan_len_beats; ) {
+                uint32_t n = e->chan_len_beats - b > chunk ? chunk : (uint32_t)(e->chan_len_beats - b);
+                engine_fetch((uint8_t)c, TRIXIUM_CHAN_WEIGHT_BASE + (uint32_t)((e->chan_base_beats + b)*32), n, 0xC000);
+                crc = crc32_update(crc, (const volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000), n*32);
+                b += n;
+            }
+        }
+        bytes += (uint64_t)e->chan_len_beats*32*h->n_channels;
+        if (crc != e->crc32) {
+            bad++;
+            printf("imgcheck: [%lu] %.24s crc %08lx, table %08lx\n", (unsigned long)i, e->name,
+                   (unsigned long)crc, (unsigned long)e->crc32);
+        }
+    }
+    printf("imgcheck: %lu tensors, %lu MB, %lu bad\n", (unsigned long)done,
+           (unsigned long)(bytes >> 20), (unsigned long)bad);
+}
 
 // Fetch one beat from (channel, HBM byte address) through the engine and dump it. Ground
 // truth for "did the host's upload land where the engine looks for it?" - the two sides
@@ -1025,6 +1089,8 @@ static void console_service(void)
         sptest();
     else if (strcmp(token, "peek") == 0)
         peek_cmd(str);
+    else if (strcmp(token, "imgcheck") == 0)
+        imgcheck_cmd(str);
 #ifdef CSR_TRIXIUM_ENGINE_CSR_CYC_VEC_ADDR
     else if (strcmp(token, "spcost") == 0) { // spcost [n]: CPU scratchpad word accesses vs the busy counters
         char *nn = get_token(&str);
