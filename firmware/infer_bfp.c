@@ -704,31 +704,59 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
         e16[g]   = (ex > 0) ? (ex - 25) : -24;
         if (e16[g] < e16min) e16min = e16[g];
     }
-    // v, exact: |m11| < 2^11 aligned by at most 30 bits, sums of a block below 2^50.
-    int64_t *v = er_acc;
+    // v, exact: |m11| < 2^11 aligned by the row's exponent spread, a block's sums log2(block)
+    // bits wider. Most rows' scales span a few binades: int32 then (the transform ~3x faster
+    // on RV32); otherwise int64 (spread up to 30: sums below 2^50). Same values either way.
+    int spread = 0, lg = 0;
+    for (int g = 0; g < G; g++) if (e16[g] - e16min > spread) spread = e16[g] - e16min;
+    while ((1 << lg) < er_block) lg++;
+    int narrow = 11 + spread + lg + 1 <= 31;
+    int64_t *v   = er_acc;
+    int32_t *v32 = (int32_t *)er_acc;
     for (int g = 0; g < G; g++) {
         int64_t mg = m[g] << (e16[g] - e16min);
         for (int w = 0; w < 8; w++) {
             uint32_t c = cw[g*8 + w];
             for (int i = 0; i < 16; i++) {
                 uint32_t q = (c >> (2*i)) & 3;
-                v[g*128 + w*16 + i] = (q == 2) ? mg : (q == 0) ? -mg : 0;
+                int64_t  x = (q == 2) ? mg : (q == 0) ? -mg : 0;
+                if (narrow) v32[g*128 + w*16 + i] = (int32_t)x;
+                else        v[g*128 + w*16 + i]   = x;
             }
         }
     }
     // Walsh-Hadamard per block (h below the block: the strides never cross one).
-    for (int h = 1; h < er_block; h <<= 1)
-        for (int i = 0; i < n; i += 2*h)
-            for (int j = i; j < i + h; j++) {
-                int64_t a = v[j], b = v[j + h];
-                v[j]     = a + b;
-                v[j + h] = a - b;
-            }
     uint64_t amax = 0;
-    for (int j = 0; j < n; j++) {
-        if (er_signs[j] < 0) v[j] = -v[j];
-        uint64_t a = (uint64_t)((v[j] < 0) ? -v[j] : v[j]);
-        if (a > amax) amax = a;
+    if (narrow) {
+        for (int h = 1; h < er_block; h <<= 1)
+            for (int i = 0; i < n; i += 2*h)
+                for (int j = i; j < i + h; j++) {
+                    int32_t a = v32[j], b = v32[j + h];
+                    v32[j]     = a + b;
+                    v32[j + h] = a - b;
+                }
+        uint32_t am = 0;
+        for (int j = 0; j < n; j++) {
+            if (er_signs[j] < 0) v32[j] = -v32[j];
+            uint32_t a = (uint32_t)((v32[j] < 0) ? -v32[j] : v32[j]);
+            if (a > am) am = a;
+        }
+        amax = am;
+        for (int j = n - 1; j >= 0; j--)   // Widened in place (back to front) for the rounding.
+            v[j] = v32[j];
+    } else {
+        for (int h = 1; h < er_block; h <<= 1)
+            for (int i = 0; i < n; i += 2*h)
+                for (int j = i; j < i + h; j++) {
+                    int64_t a = v[j], b = v[j + h];
+                    v[j]     = a + b;
+                    v[j + h] = a - b;
+                }
+        for (int j = 0; j < n; j++) {
+            if (er_signs[j] < 0) v[j] = -v[j];
+            uint64_t a = (uint64_t)((v[j] < 0) ? -v[j] : v[j]);
+            if (a > amax) amax = a;
+        }
     }
     volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + sp_dst);
     if (amax == 0) {
