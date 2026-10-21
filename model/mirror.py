@@ -730,9 +730,24 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     out_norm = f32_rows(layout.ROLE_OUT_NORM, 0).reshape(-1)
     emb16  = entry(layout.ROLE_TOK_EMB16, 0)
     emb16x = entry(layout.ROLE_TOK_EMB16_EXP, 0)
-    _, mant = img.tensor(emb16["name"])
-    _, exps = img.tensor(emb16x["name"])
-    exps = np.asarray(exps).reshape(-1)
+    if emb16 is not None:
+        _, mant = img.tensor(emb16["name"])
+        _, exps = img.tensor(emb16x["name"])
+        exps = np.asarray(exps).reshape(-1)
+        def embed_row(tok):
+            return mant[tok], int(exps[tok])
+    else:
+        # No int16 table (a 1 GB board): the firmware restores the rotated row in integers
+        # (embed_row_restore), the signs from row 0 of the width's rotation tensors.
+        from model.bons import restored_row_exact
+        assert h["hadamard_block"], "a hybrid image without the int16 embedding table"
+        emb_s, emb_c = img.tensor(entry(layout.ROLE_TOK_EMB, 0)["name"])
+        wi = list(h["hadamard_widths"]).index(n_embd)
+        emb_signs = np.concatenate([np.asarray(img.tensor(entry(layout.ROLE_HADAMARD,
+            layout.hadamard_layer(wi, b))["name"])[1])[0].astype(np.int64) - 1
+            for b in range(n_embd//B)])
+        def embed_row(tok):
+            return restored_row_exact(np.asarray(emb_s)[tok], np.asarray(emb_c)[tok], emb_signs, B)
     rope_freq = np.array([f32(np.float32(h["rope_theta"])**f32(-2.0*i/rope_n)) for i in range(rope_n//2)], dtype=f32)
 
     # State.
@@ -969,7 +984,8 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
             trace(pos, layer, tag, dtype, np.asarray(values).copy())
 
     def forward(tok, pos, want_logits=True):
-        x = (mant[tok].astype(f32)*f32(np.exp2(f32(exps[tok])))).astype(f32)
+        row, e = embed_row(tok)
+        x = (row.astype(f32)*f32(np.exp2(f32(e)))).astype(f32)
         checkpoint(pos, -1, "emb", x)
         for l in range(n_layer):
             hn = rmsnorm(x, norm_attn[l])

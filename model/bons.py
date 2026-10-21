@@ -27,7 +27,7 @@ from model.layout import (
     FLAG_REPLICATED, ceil_div, scale_beats, code_beats, row_beats, shard_rows,
 )
 from model import bitexact as bx
-from model.golden import hadamard_restore, hadamard_image_gain, rope_tables
+from model.golden import hadamard_restore, hadamard_image_gain, hadamard_image_scales, rope_tables
 
 # TensorSpec ---------------------------------------------------------------------------------------
 
@@ -258,6 +258,41 @@ def restored_bfp_rows(scales, codes, signs, hblock):
     # exactly (one LSB of 2^15 = 3e-5 relative), which the int16 cannot hold: clip.
     mant = np.clip(np.round(e*2.0**(-exps[:, None])), -32767, 32767)
     return mant.astype(np.int16), exps.astype(np.int32)
+
+def restored_row_exact(scales, codes, signs, hblock):
+    """One rotated embedding row restored to the plain basis in integers, the firmware's
+    embed_row_restore (images without the int16 table): v = (q-1)*m11 aligned to the row's
+    smallest fp16 scale exponent (exact, int64), y = s * (H v) per block with H the +-1
+    Sylvester matrix (a fast Walsh-Hadamard transform), and the transform's normalization
+    times the image's gain is the power of two hadamard_image_scales(hblock)[0]. Normalized
+    like restored_bfp_rows (absmax mantissa in [2^14, 2^15), rounded half to even, clipped)
+    but from the exact value: the float32 restore can differ by one LSB. -> (int16 row, exp)."""
+    m11, e16 = bx.fp16_decompose(np.asarray(scales).reshape(-1))
+    e16min = int(e16.min())
+    q  = codes.astype(np.int64).reshape(len(m11), -1) - 1
+    v  = (q*(m11.astype(np.int64) << (e16 - e16min).astype(np.int64))[:, None]).reshape(-1, hblock)
+    h = 1
+    while h < hblock:
+        v = v.reshape(v.shape[0], -1, 2, h)
+        v = np.stack([v[:, :, 0] + v[:, :, 1], v[:, :, 0] - v[:, :, 1]], axis=2)
+        h *= 2
+    y = v.reshape(-1)*np.asarray(signs).astype(np.int64)
+    fexp = -((hblock.bit_length() - 1)//2)
+    assert hadamard_image_scales(hblock)[0] == 2.0**fexp
+    amax = int(np.abs(y).max())
+    if amax == 0:
+        return np.zeros(len(y), dtype=np.int16), 0
+    r = amax.bit_length() - 15
+    if r > 0:
+        half = np.int64(1) << (r - 1)
+        mag  = np.abs(y)
+        quo  = mag >> r
+        rem  = mag & ((np.int64(1) << r) - 1)
+        quo  = quo + ((rem > half) | ((rem == half) & (quo & 1 == 1)))
+        mant = np.where(y < 0, -quo, quo)
+    else:
+        mant = y << -r
+    return np.clip(mant, -32767, 32767).astype(np.int16), e16min + fexp + r
 
 def _emb16_specs(emb, block=8192, restore=None):
     """The token embedding pre-dequantized to int16 BFP rows (ROLE_TOK_EMB16) plus the per-row

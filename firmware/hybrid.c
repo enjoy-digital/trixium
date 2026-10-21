@@ -653,9 +653,16 @@ int hybrid_init(void)
         printf("hybrid: rotated basis but the emb16 rows are not restored - reconvert\n");
         return -1;
     }
+    embed_restore_off();
     if (H->hadamard_block && !model_entry_kind(ROLE_TOK_EMB16, 0, KIND_NORM16)) {
-        printf("hybrid: rotated basis needs the emb16 rows in the image (window too small?)\n");
-        return -1;
+        // A 1 GB board's image: each embedding row is restored on the CPU (embed_row_restore).
+        int wi = -1;
+        for (int i = 0; i < 4; i++) if ((int)H->hadamard_widths[i] == n_embd) wi = i;
+        if (wi < 0 || embed_restore_setup(H->hadamard_block, n_embd, wi)) {
+            printf("hybrid: rotated basis, no emb16 rows and no rotation tensors to restore them\n");
+            return -1;
+        }
+        printf("hybrid: embedding rows restored on the CPU (no emb16 table)\n");
     }
     n_dn = n_attn = 0;
     int n_lay = n_layer;

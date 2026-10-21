@@ -131,9 +131,11 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
 
 # Generate -----------------------------------------------------------------------------------------
 
-def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None, trit5=False):
+def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None, trit5=False,
+             emb16=True):
     """kseg_max: split matvecs wider than this into K-segments (the 27B's FFN down projection
-    path, exercised on the tiny model with e.g. 256); the image is named `-kseg`."""
+    path, exercised on the tiny model with e.g. 256); the image is named `-kseg`. emb16=False
+    leaves out the int16 embedding table (a 1 GB board's image), named `-noemb16`."""
     os.makedirs(out_dir, exist_ok=True)
     suffix = ""
     if cfg.layer_types:
@@ -145,10 +147,12 @@ def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None, t
         suffix += "-kseg"
     if trit5:
         suffix += "-t5"
+    if not emb16:
+        suffix += "-noemb16"
     img_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.img")
     man_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.json")
     manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path,
-                           trit5=trit5)
+                           trit5=trit5, emb16=emb16)
     return img_path, man_path, manifest
 
 def generate_slice(out_dir, name, n_channels=16, seed=1234, trit5=False):
@@ -166,7 +170,7 @@ def generate_slice(out_dir, name, n_channels=16, seed=1234, trit5=False):
     img_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.img")
     man_path = os.path.join(out_dir, f"{cfg.name}{suffix}-n{n_channels}.json")
     manifest = write_image(cfg, tensors, n_channels, img_path, manifest_path=man_path,
-                           trit5=trit5)
+                           trit5=trit5, emb16=emb16)
     return img_path, man_path, manifest
 
 # Run ----------------------------------------------------------------------------------------------

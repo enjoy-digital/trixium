@@ -560,8 +560,13 @@ int embed_row_fetch(const struct bons_entry *e, int row, uint32_t sp_dst)
 // Integer embedding: fetch the ternary row, dequantize with exact fp16 decomposition
 // ((q-1)*m11 aligned to the smallest group exponent), then normalize to int16 BFP.
 // Pure integer (~6 ops/element vs ~50 soft-float ones); exponent returned.
+static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_dst);
+static int er_block;
+
 COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_dst)
 {
+    if (er_block)
+        return embed_row_restore(e, row, sp_dst);
     if (e->kind == KIND_TERNARY5) { // Packed rows only come with the int16 table (bons.py).
         printf("embed: 5-trit token embedding without the int16 table\n");
         return 0;
@@ -624,6 +629,130 @@ COLD static int embed_row_bfp(const struct bons_entry *e, int row, uint32_t sp_d
         }
     }
     return e16min + k2;
+}
+
+/* Rotated Embedding Without The Int16 Table */
+/*-------------------------------------------*/
+
+// A 1 GB board's image leaves out the int16 table (ROLE_TOK_EMB16: ~1 GB for the 2B), and a
+// rotated basis cannot be decoded group by group: the row is restored here in integers,
+// bit-exact with bons.py restored_row_exact. v = (q-1)*m11 aligned to the row's smallest fp16
+// exponent (exact in int64), y = s * (H v) per block with H the +-1 Sylvester matrix (a fast
+// Walsh-Hadamard transform), the transform's normalization times the image's gain being the
+// power of two 2^-floor(log2(block)/2); then int16 BFP: absmax mantissa in [2^14, 2^15),
+// rounded half to even, clipped to +-32767. ~20k int64 butterflies per row at 2048.
+static int8_t  *er_signs;  // s, from row 0 of the width's rotation tensors (codes s_j + 1).
+static int64_t *er_acc;
+static int      er_fexp;
+
+void embed_restore_off(void)
+{
+    er_block = 0;
+}
+
+int embed_restore_setup(int block, int width, int wi)
+{
+    er_block = 0;
+    if (block <= 0 || width % block) return -1;
+    er_signs = infer_halloc((uint64_t)width, 0);
+    er_acc   = infer_halloc((uint64_t)width*sizeof(int64_t), 0);
+    if (!er_signs || !er_acc) return -1;
+    for (int b = 0; b < width/block; b++) {
+        const struct bons_entry *e = model_entry(ROLE_HADAMARD, HADAMARD_LAYER(wi, b));
+        if (!e || e->kind != KIND_TERNARY || (int)e->cols != block) return -1;
+        // Row 0 is channel 0's first row.
+        engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE + (uint64_t)e->chan_base_beats*32,
+                     bons_row_beats(e->cols, e->kind, e->group), SP_FET);
+        const volatile uint32_t *cw = (const volatile uint32_t *)(SCRATCHPAD_BASE + SP_FET
+            + bons_scale_beats(e->cols, e->group)*32);
+        for (int j = 0; j < block; j++)
+            er_signs[b*block + j] = (int8_t)((int)((cw[j/16] >> (2*(j % 16))) & 3) - 1);
+    }
+    int lg = 0;
+    while ((1 << lg) < block) lg++;
+    er_fexp  = -(lg/2);
+    er_block = block;
+    return 0;
+}
+
+static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_dst)
+{
+    if (e->kind != KIND_TERNARY || e->cols % er_block) {
+        printf("embed: no restore for this embedding table\n");
+        return 0;
+    }
+    int n = e->cols;
+    uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
+    uint32_t rpc = e->rows/n_ch;
+    engine_fetch(row/rpc,
+                 TRIXIUM_CHAN_WEIGHT_BASE + (e->chan_base_beats + (uint64_t)(row % rpc)*rb)*32,
+                 rb, SP_FET);
+    volatile uint8_t *pb = (volatile uint8_t *)(SCRATCHPAD_BASE + SP_FET);
+    const volatile uint16_t *scales = (const volatile uint16_t *)pb;
+    const volatile uint32_t *cw = (const volatile uint32_t *)(pb + bons_scale_beats(e->cols, e->group)*32);
+    int G = n/128;
+    int64_t m[64];
+    int     e16[64], e16min = 1000;
+    for (int g = 0; g < G; g++) {
+        uint16_t b2 = scales[g];
+        int ex   = (b2 >> 10) & 0x1F;
+        int frac = b2 & 0x3FF;
+        int mm   = (ex > 0) ? (1024 + frac) : frac;
+        m[g]     = (b2 & 0x8000) ? -mm : mm;
+        e16[g]   = (ex > 0) ? (ex - 25) : -24;
+        if (e16[g] < e16min) e16min = e16[g];
+    }
+    // v, exact: |m11| < 2^11 aligned by at most 30 bits, sums of a block below 2^50.
+    int64_t *v = er_acc;
+    for (int g = 0; g < G; g++) {
+        int64_t mg = m[g] << (e16[g] - e16min);
+        for (int w = 0; w < 8; w++) {
+            uint32_t c = cw[g*8 + w];
+            for (int i = 0; i < 16; i++) {
+                uint32_t q = (c >> (2*i)) & 3;
+                v[g*128 + w*16 + i] = (q == 2) ? mg : (q == 0) ? -mg : 0;
+            }
+        }
+    }
+    // Walsh-Hadamard per block (h below the block: the strides never cross one).
+    for (int h = 1; h < er_block; h <<= 1)
+        for (int i = 0; i < n; i += 2*h)
+            for (int j = i; j < i + h; j++) {
+                int64_t a = v[j], b = v[j + h];
+                v[j]     = a + b;
+                v[j + h] = a - b;
+            }
+    uint64_t amax = 0;
+    for (int j = 0; j < n; j++) {
+        if (er_signs[j] < 0) v[j] = -v[j];
+        uint64_t a = (uint64_t)((v[j] < 0) ? -v[j] : v[j]);
+        if (a > amax) amax = a;
+    }
+    volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + sp_dst);
+    if (amax == 0) {
+        for (int j = 0; j < n/2; j++) pw[j] = 0;
+        return 0;
+    }
+    int bl = (amax >> 32) ? 32 + bitlen32((uint32_t)(amax >> 32)) : bitlen32((uint32_t)amax);
+    int r  = bl - 15;
+    for (int j = 0; j < n; j += 2) {
+        int32_t o[2];
+        for (int k = 0; k < 2; k++) {
+            int64_t y = v[j + k];
+            int64_t mag = (y < 0) ? -y : y, qv;
+            if (r > 0) {
+                int64_t rem  = mag & ((1ll << r) - 1), half = 1ll << (r - 1);
+                qv = mag >> r;
+                if (rem > half || (rem == half && (qv & 1))) qv++;
+            } else {
+                qv = mag << -r;
+            }
+            if (qv > 32767) qv = 32767;
+            o[k] = (int32_t)((y < 0) ? -qv : qv);
+        }
+        pw[j/2] = (uint32_t)(uint16_t)o[0] | ((uint32_t)(uint16_t)o[1] << 16);
+    }
+    return e16min + er_fexp + r;
 }
 
 int infer_embed_f(int token, float *dst)
