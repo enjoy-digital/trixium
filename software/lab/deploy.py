@@ -11,6 +11,7 @@
   trixium deploy --board ypcb    --model 1p7b                 # build/ypcb on the YPCB-00338 host
   trixium deploy --board xcu1525 --model 8b --no-reconfigure  # next model, board already deployed
   trixium deploy --board xcu1525 --model 27b --dry-run        # print every command, run nothing
+  trixium deploy --board ti375   --model 2b                   # build/ti375 on the kit plugged in here
 
 The board hosts come from ~/.config/trixium/boards.ini (doc/boards.ini.example), one section per
 board, overridable with TRIXIUM_<BOARD>_<KEY> environment variables (TRIXIUM_XCU1525_HOST=...).
@@ -88,6 +89,16 @@ PLATFORMS = {
     "xcu1525" : "sqrl_xcu1525",
     "fk33"    : "sqrl_fk33",
     "ypcb"    : "ypcb_00338_1p1",
+    "ti375"   : "efinix_ti375_c529_dev_kit",
+}
+
+# A board whose image computes a model differently has its own reference: the Ti375's 2B image
+# has no int16 embedding table (1 GB of memory), so the firmware restores each embedding row from
+# the rotated ternary row exactly (model/bons.py restored_row_exact), 1 LSB away from the
+# converter's float32 table at most - which flips the 2B's third token. The mirror of that image
+# (model/mirror.py) gives this sequence; the card ran it bit-exact.
+BOARD_GOLDEN = {
+    ("ti375", "2b"): "11751 13 561 6511 314 17163 369 23327",
 }
 
 # Board Hosts --------------------------------------------------------------------------------------
@@ -452,6 +463,90 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
           "  ~4-5%. References: doc/boards.md.")
     return 0
 
+# Ti375 --------------------------------------------------------------------------------------------
+
+class Local(Remote):
+    """The Ti375 kit hangs off this workstation (USB JTAG + UART, the wired NIC): local commands
+    only (the firmware build is shared with the board-host flow)."""
+    def __init__(self, dry_run=False):
+        Remote.__init__(self, {"target": "local", "dir": REPO}, dry_run)
+
+
+def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None):
+    """The kit's sequence: firmware, the bitstream archived and loaded volatile over JTAG, the
+    serial boot, the weights over UDP (software/host/udpload.py), hdrload + imgcheck, tokens
+    before numbers, bench. ~/.config/trixium/boards.ini [ti375] (or TRIXIUM_TI375_<KEY>): tty
+    (/dev/ttyUSB2), ip (<board-host>), iface (the NIC that reaches the board, when another one
+    routes its subnet)."""
+    from software.host import ti375
+    from software.host.console import run as console_run
+    if model not in ("2b",):
+        raise DeployError("the Ti375's 1 GB holds the 2B (bonsai2-2b-n4-ti375.img); the 4B does not fit")
+    cfg = configparser.ConfigParser()
+    cfg.read(BOARDS_INI)
+    sec  = cfg["ti375"] if cfg.has_section("ti375") else {}
+    get  = lambda k, d=None: os.environ.get(f"TRIXIUM_TI375_{k.upper()}", sec.get(k, d))
+    tty, ip, iface = get("tty", ti375.TTY), get("ip", ti375.BOARD_IP), get("iface")
+    tok, prompt, want, bench_n, timeout = MODELS[model]
+    want    = BOARD_GOLDEN.get(("ti375", model), want)
+    bench_n = bench_n if bench is None else bench
+    local   = Local(dry_run)
+    out     = os.path.join(REPO, "build", build)
+    name    = os.path.basename(out)
+    bit     = os.path.join(out, "gateware", f"{PLATFORMS['ti375']}.bit")
+    soc_h   = os.path.join(out, "software", "include", "generated", "soc.h")
+    image   = os.path.join(REPO, "models", "bons",
+                           f"bonsai2-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '4')}-ti375.img")
+    print(f"deploy {os.path.relpath(out, REPO)} -> ti375 (tty {tty}, {ip}{' via ' + iface if iface else ''}), "
+          f"model {model} ({os.path.relpath(image, REPO)})")
+    if dry_run:
+        for step in ["firmware", "archive + JTAG load (volatile)", "serial boot", "litex_server",
+                     "udpload", "hdrload + imgcheck", f"gen {prompt} (want {want})", f"bench {bench_n}"]:
+            print(f"# {step}")
+        return 0
+
+    say("firmware")
+    firmware = build_firmware(local, out)
+    if reconfigure:
+        say("bitstream: archive + JTAG load (volatile, the flash untouched)")
+        archive = os.path.join(REPO, "build", "archive")
+        os.makedirs(archive, exist_ok=True)
+        shutil.copy(bit, os.path.join(archive, f"{name}.bit"))
+        ti375.load(bit)
+        time.sleep(8)                   # The BIOS: memtest, then it gives up booting on its own.
+    say("serial boot")
+    boot = ti375.boot(firmware, tty)
+    print("\n".join(l for l in boot.splitlines() if l.startswith(("TriXium", "BONS", "SPTEST", "hybrid: emb"))))
+    if not ti375.ping(ip, iface):
+        raise DeployError(f"the board does not answer at {ip}")
+    say("weights over UDP")
+    srv = ti375.start_server(ip, iface)
+    try:
+        from litex.tools.litex_client import RemoteClient
+        from software.host.udpload import UDPLink, upload
+        bus = RemoteClient(csr_csv=os.path.join(out, "csr.csv"))
+        bus.open()
+        t0 = time.time()
+        n, resent = upload(bus, UDPLink(ip, iface=iface), image)
+        print(f"{n/1e6:.1f} MB in {time.time() - t0:.1f} s, {resent} datagrams resent")
+        bus.close()
+    finally:
+        srv.kill()
+    out_txt = console_run(["hdrload", "imgcheck"], tty, wait=300, until="imgcheck: ", baud=ti375.BAUD)
+    print("\n".join(l for l in out_txt.splitlines() if l.startswith(("hdrload", "imgcheck"))))
+    if "inference ready" not in out_txt or " 0 bad" not in out_txt:
+        raise DeployError("header or weights wrong on the board - refusing to go on")
+    say(f"tokens first - want: {want} ...")
+    out_txt = console_run([f"gen 8 {prompt}"], tty, wait=timeout, until="GEN DONE", baud=ti375.BAUD)
+    got = next((l[4:].strip() for l in out_txt.splitlines() if l.startswith("GEN:")), "")
+    print(f"got:  {got}")
+    if got != want:
+        raise DeployError("TOKENS differ - refusing to benchmark")
+    say(f"measure (bench {bench_n})")
+    out_txt = console_run([f"bench {bench_n}"], tty, wait=3600, until="BENCH_PHASE", baud=ti375.BAUD)
+    print("\n".join(l for l in out_txt.splitlines() if l.startswith("BENCH")))
+    return 0
+
 # Run ----------------------------------------------------------------------------------------------
 
 def add_arguments(parser):
@@ -468,6 +563,9 @@ def add_arguments(parser):
 
 def run(args):
     try:
+        if args.board == "ti375":
+            return deploy_ti375(args.build or args.board, args.model, not args.no_reconfigure,
+                                args.dry_run, args.bench)
         return deploy(args.build or args.board, args.board, args.model,
             reconfigure         = not args.no_reconfigure,
             boot                = args.boot,

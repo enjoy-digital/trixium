@@ -28,7 +28,9 @@ class ConsoleBusy(OSError):
 
 class Console:
     """The firmware console on a liteuart tty, raw and non-blocking, locked for one session."""
-    def __init__(self, tty="/dev/ttyLXU0"):
+    def __init__(self, tty="/dev/ttyLXU0", baud=None):
+        # baud: a serial UART's rate (the Ti375 kit's FTDI port, 115200); None for the PCIe
+        # liteuart tty, which has none.
         self.tty = tty
         self.fd  = os.open(tty, os.O_RDWR | os.O_NOCTTY)
         # One console session at a time: the firmware reads one byte stream, and two readers
@@ -43,6 +45,8 @@ class Console:
         a = termios.tcgetattr(self.fd)
         a[0] = a[1] = a[3] = 0                                   # raw: no in/out/local processing
         a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
+        if baud is not None:
+            a[4] = a[5] = getattr(termios, f"B{baud}")
         a[6][termios.VMIN]  = 0
         a[6][termios.VTIME] = 0
         termios.tcsetattr(self.fd, termios.TCSANOW, a)
@@ -91,9 +95,9 @@ class Console:
         return out.decode(errors="replace")
 
 
-def run(cmds, tty="/dev/ttyLXU0", wait=20.0, quiet_after=2.0, until=None, echo=False):
+def run(cmds, tty="/dev/ttyLXU0", wait=20.0, quiet_after=2.0, until=None, echo=False, baud=None):
     """One console session: open, send `cmds`, close. Returns the transcript (\\r removed)."""
-    with Console(tty) as console:
+    with Console(tty, baud) as console:
         return console.run(cmds, wait, quiet_after, until, echo).replace("\r", "")
 
 # Run ----------------------------------------------------------------------------------------------
