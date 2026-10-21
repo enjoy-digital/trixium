@@ -401,7 +401,7 @@ class TriXiumSimSoC(SoCCore):
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
                  axi1_latency=24,
-                 unit_options=()):
+                 unit_options=(), efinix_ram=False, attn_sync_operand=False):
         assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
@@ -544,7 +544,10 @@ class TriXiumSimSoC(SoCCore):
                 e["kind"] == KIND_TERNARY5 for e in img.entries),
             attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
+                + ((("sync_operand", True),) if attn_sync_operand else ())
                 if attn_geometry else (),
+            # The Efinix memory forms (trixium_ti375.py): what the board runs, in the gate too.
+            efinix_ram               = efinix_ram,
             **dict(unit_options)) # Unit sizing (TriXiumConfig fields), as the board target's.
         self.trixium = TriXiumCore(memory_ports, config, read_ports=read_ports if ddr_readers else None)
         self.rdstat  = ReaderStats(self.trixium.engine.readers,   # console `ddrstat`: the readers' output
@@ -878,7 +881,8 @@ BOARDS = {
     # port (512 bits) for every engine channel and the CPU's memory, no LiteDRAM - modelled as
     # one 512-bit AXI memory behind AXISharedPort. Run with --hybrid (lite profile by default).
     "ti375": dict(mem="axi1", n_memctrl=1,
-        cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS),
+        cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS,
+        efinix_ram=True, attn_sync_operand=True),
 }
 
 # --hybrid (--board ypcb): the YPCB with the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B fit its

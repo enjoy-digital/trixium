@@ -48,7 +48,6 @@ from litex.soc.interconnect.csr import CSRStatus
 from trixium_ypcb import YPCB_HYBRID_UNIT_OPTIONS, YPCB_LITE_UNIT_OPTIONS, YPCB_LITE_ATTN, VEXII_ARGS
 
 UPLOAD_PORT = 2345   # software/host/udpload.py
-DDR_ID_PINS = 6      # The hard LPDDR4x controller's AXI ID width on the Ti375 (Efinity's interface).
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -108,24 +107,17 @@ class TriXiumTi375SoC(SoCCore):
                                       pads=platform.request("eth"), with_hw_init_reset=False)
         platform.add_false_path_constraints(self.crg.cd_sys.clk,
             self.ethphy.crg.cd_eth_rx.clk, self.ethphy.crg.cd_eth_tx.clk)
-        # The UDP/IP core at 32 bits in sys (LiteX's add_etherbone at 8 bits renames the whole core
-        # into the PHY's RX clock - user ports included, so a "sys" port is not in sys - and at
-        # 32 bits expects the PHY's domains named eth_rx/eth_tx; this PHY names them eth0_*).
-        from liteeth.core import LiteEthUDPIPCore
-        from liteeth.frontend.etherbone import LiteEthEtherbone
-        ethcore = LiteEthUDPIPCore(phy=self.ethphy, mac_address=0x10e2d5000000,
-            ip_address=eth_ip, clk_freq=sys_clk_freq, dw=32, with_sys_datapath=True)
-        self.ethcore_etherbone = ClockDomainsRenamer({
-            "eth_tx": self.ethphy.crg.cd_eth_tx.name,
-            "eth_rx": self.ethphy.crg.cd_eth_rx.name,
-        })(ethcore)
-        self.etherbone = LiteEthEtherbone(ethcore.udp, 1234, buffer_depth=16, cd="sys")
-        self.bus.add_master(name="etherbone", master=self.etherbone.wishbone.bus)
-        udp_port = ethcore.udp.crossbar.get_port(UPLOAD_PORT, dw=32, cd="sys")
+        # The UDP/IP core at 32 bits in sys (an 8-bit one at 100 MHz is slower than the 1 Gb/s line);
+        # the upload port in the SoC's sys clock domain (cd="etherbone").
+        self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, data_width=32, with_timing_constraints=False)
+        udp_port = self.ethcore_etherbone.udp.crossbar.get_port(UPLOAD_PORT, dw=32, cd="etherbone")
         self.udpload = UDPUpload(udp_port, max_beats=32, out_dw=128)
 
         # Memory: the hard controller's port, shared --------------------------------------------
-        self.ddr = ddr = EfinixDDR(platform=platform, clock_domain="sys", **platform.ddr_config)
+        # EfinixDDR's own AXI ID width (the controller's 6 bits): litex-boards' ddr_config pins 8
+        # until litex-boards#931.
+        ddr_config = {k: v for k, v in platform.ddr_config.items() if k != "id_width"}
+        self.ddr = ddr = EfinixDDR(platform=platform, clock_domain="sys", **ddr_config)
         ctrl_size  = platform.ddr_size
         chan_mod   = engine_channels or 4
         chan_stride = ddr_chan_stride(ctrl_size, chan_mod)
@@ -162,9 +154,8 @@ class TriXiumTi375SoC(SoCCore):
             self.comb += [far.ar.addr.eq(mem_bus.ar.addr - base), far.aw.addr.eq(mem_bus.aw.addr - base)]
             masters.append(far)
         idw = slave_id_width(masters)
-        # The controller's AXI has 6 ID pins (Efinity's interface: ARID/AWID/RID/BID[5:0]), although
-        # EfinixDDR declares 8: an ID wider than 6 bits loses its top bits on the way back.
-        assert idw <= DDR_ID_PINS, f"{idw} ID bits for the port, the controller has {DDR_ID_PINS}"
+        # The controller's AXI IDs are 6 bits (ARID/AWID/RID/BID[5:0]): the masters' index must fit.
+        assert idw <= len(ddr.bus.ar.id), f"{idw} ID bits for the port, the controller has {len(ddr.bus.ar.id)}"
         shared = AXIInterface(data_width=512, address_width=32, id_width=idw)
         self.port = AXISharedPort(masters, shared, r_buffer=96)
         for ch in ("aw", "w", "ar"):
