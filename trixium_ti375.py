@@ -108,8 +108,20 @@ class TriXiumTi375SoC(SoCCore):
                                       pads=platform.request("eth"), with_hw_init_reset=False)
         platform.add_false_path_constraints(self.crg.cd_sys.clk,
             self.ethphy.crg.cd_eth_rx.clk, self.ethphy.crg.cd_eth_tx.clk)
-        self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, with_timing_constraints=False)
-        udp_port = self.ethcore_etherbone.udp.crossbar.get_port(UPLOAD_PORT, dw=32, cd="sys")
+        # The UDP/IP core at 32 bits in sys (LiteX's add_etherbone at 8 bits renames the whole core
+        # into the PHY's RX clock - user ports included, so a "sys" port is not in sys - and at
+        # 32 bits expects the PHY's domains named eth_rx/eth_tx; this PHY names them eth0_*).
+        from liteeth.core import LiteEthUDPIPCore
+        from liteeth.frontend.etherbone import LiteEthEtherbone
+        ethcore = LiteEthUDPIPCore(phy=self.ethphy, mac_address=0x10e2d5000000,
+            ip_address=eth_ip, clk_freq=sys_clk_freq, dw=32, with_sys_datapath=True)
+        self.ethcore_etherbone = ClockDomainsRenamer({
+            "eth_tx": self.ethphy.crg.cd_eth_tx.name,
+            "eth_rx": self.ethphy.crg.cd_eth_rx.name,
+        })(ethcore)
+        self.etherbone = LiteEthEtherbone(ethcore.udp, 1234, buffer_depth=16, cd="sys")
+        self.bus.add_master(name="etherbone", master=self.etherbone.wishbone.bus)
+        udp_port = ethcore.udp.crossbar.get_port(UPLOAD_PORT, dw=32, cd="sys")
         self.udpload = UDPUpload(udp_port, max_beats=32, out_dw=128)
 
         # Memory: the hard controller's port, shared --------------------------------------------

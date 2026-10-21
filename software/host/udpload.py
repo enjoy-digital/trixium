@@ -40,7 +40,17 @@ class UDPLink:
         self.sock.sendto(struct.pack("<I", seq) + payload, self.addr)
 
 
-def transfer(bus, link, chan, base, data, beats_per_datagram=32, window=64, verbose=False):
+def port_status(regs):
+    """The port's counters, and its last datagram when the build has the debug CSRs."""
+    st = {k: getattr(regs, "udpload_" + k).read() for k in ("expected", "accepted", "dropped")}
+    if hasattr(regs, "udpload_last_flags"):
+        flags = regs.udpload_last_flags.read()
+        st["last"] = dict(seq=regs.udpload_last_seq.read(), words=regs.udpload_last_words.read(),
+            seq_ok=flags & 1, whole_beats=(flags >> 1) & 1, lost=(flags >> 2) & 1, no_slot=(flags >> 3) & 1)
+    return st
+
+
+def transfer(bus, link, chan, base, data, beats_per_datagram=32, window=64, verbose=False, stall_s=5.0):
     """One channel's bytes to `base`, in 128 MB armed transfers; returns the datagrams resent."""
     regs   = bus.regs
     data   = bytes(data) + bytes(-len(data) % BEAT_BYTES)
@@ -60,10 +70,16 @@ def transfer(bus, link, chan, base, data, beats_per_datagram=32, window=64, verb
         regs.udpload_restart.write(0)
         regs.trixium_loader_start.write(1)
         sent, last = 0, -1
+        progress = time.time()
         while True:
             expected = regs.udpload_expected.read()
             if expected >= count:
                 break
+            if expected != last:
+                progress = time.time()
+            elif time.time() - progress > stall_s:
+                raise RuntimeError(f"chan {chan}: no datagram accepted for {stall_s:.0f} s at "
+                    f"{expected}/{count}: {port_status(regs)}")
             if expected == last and sent > expected:   # No progress: the rest was lost.
                 resent += sent - expected
                 sent = expected

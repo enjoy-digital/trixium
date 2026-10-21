@@ -18,6 +18,10 @@ expected number (to 0 for a new transfer).
 
 The datagram is staged whole in a FIFO before it is released (its sequence number and size are
 only known as complete at its end), so the FIFO holds one maximal datagram: `max_beats` beats.
+The port never back-pressures the UDP RX path (it is LiteEth's, shared with Etherbone: a stall
+there stops the CSR link too): a datagram that does not fit, while the loader drains earlier ones,
+is dropped and resent like a lost one. `last_seq`/`last_words`/`last_flags` describe the last
+datagram received (bring-up: why datagrams are refused).
 """
 
 from migen import *
@@ -44,32 +48,50 @@ class UDPUpload(LiteXModule):
 
         rx = udp_port.source
         words_per_beat = 8
+        max_words      = max_beats*words_per_beat
+
+        # Debug: the last datagram's sequence word, payload words and verdict flags.
+        self.last_seq   = CSRStatus(32, description="The last datagram's sequence word.")
+        self.last_words = CSRStatus(16, description="The last datagram's payload words.")
+        self.last_flags = CSRStatus(4,  description="The last datagram: [0] sequence matched, "
+            "[1] whole beats, [2] a word lost (staging full or past max_beats), [3] no verdict slot.")
 
         # Stage the payload words; mark each datagram's end with its verdict in a side FIFO.
-        self.fifo = fifo = stream.SyncFIFO([("data", 32)], max_beats*words_per_beat + 8, buffered=True)
+        # The UDP RX path is shared (Etherbone): the port never back-pressures it. A datagram
+        # that cannot be staged whole is dropped instead.
+        self.fifo = fifo = stream.SyncFIFO([("data", 32)], max_words + 8, buffered=True)
         self.verdicts = verdicts = stream.SyncFIFO([("ok", 1)], 4)
-        counts_ready = Signal()
+        self.counts   = counts   = stream.SyncFIFO([("n", 16)], 4)
         expected = Signal(32)
         self.comb += self.expected.status.eq(expected)
 
         first  = Signal(reset=1)  # The next word is a datagram's first (its sequence number).
         good   = Signal()         # The datagram's sequence number matched.
         nwords = Signal(16)       # Payload words of the datagram so far.
-        over   = Signal()         # More payload than the FIFO holds.
+        lost   = Signal()         # A payload word of the datagram was not staged.
+        skip   = Signal()         # No verdict slot when the datagram began: nothing staged.
         seq_ok = Signal()
-        self.comb += seq_ok.eq(rx.data == expected)
-
-        word_in = Signal()
+        room   = Signal()
         self.comb += [
-            word_in.eq(rx.valid & rx.ready),
-            # Payload words go to the staging FIFO; the sequence word does not.
-            fifo.sink.valid.eq(rx.valid & ~first & ~over),
-            fifo.sink.data.eq(rx.data),
-            rx.ready.eq((fifo.sink.ready | first | over) & verdicts.sink.ready & counts_ready),
+            seq_ok.eq(rx.data == expected),
+            room.eq(verdicts.sink.ready & counts.sink.ready),
+            rx.ready.eq(1),
         ]
-        pushed = Signal()
+
+        word_in  = Signal()
+        pushed   = Signal()
+        skip_now = Signal()       # This datagram has no verdict slot (decided at its first word).
+        lost_now = Signal()       # This datagram lost a word, this one included.
+        self.comb += [
+            word_in.eq(rx.valid),
+            skip_now.eq(Mux(first, ~room, skip)),
+            # Payload words go to the staging FIFO; the sequence word does not.
+            fifo.sink.valid.eq(rx.valid & ~first & ~skip & ~lost & (nwords < max_words)),
+            fifo.sink.data.eq(rx.data),
+            pushed.eq(fifo.sink.valid & fifo.sink.ready),
+            lost_now.eq(lost | (~first & ~pushed)),
+        ]
         staged = Signal(16)       # Words of this datagram in the staging FIFO.
-        self.comb += pushed.eq(fifo.sink.valid & fifo.sink.ready)
         self.sync += If(word_in,
             If(first, staged.eq(0)).Else(staged.eq(staged + pushed)),
         )
@@ -83,40 +105,43 @@ class UDPUpload(LiteXModule):
                 If(first,
                     good.eq(seq_ok),
                     nwords.eq(0),
-                    over.eq(0),
+                    lost.eq(0),
+                    skip.eq(~room),
                     first.eq(rx.last),        # A datagram of one word: no payload.
                 ).Else(
                     nwords.eq(nwords + 1),
-                    If(nwords == max_beats*words_per_beat - 1, over.eq(1)),
+                    lost.eq(lost_now),
                     first.eq(rx.last),
                 ),
             ),
         ]
         # The verdict at the datagram's last word (one with no payload is refused).
         verdict = Signal()
+        side    = Signal()
         self.comb += [
-            verdict.eq(good & ~first & size_ok & ~over),
-            verdicts.sink.valid.eq(word_in & rx.last),
-            verdicts.sink.ok.eq(Mux(first, 0, verdict)),
+            verdict.eq(good & ~first & size_ok & ~lost_now & ~skip_now),
+            side.eq(word_in & rx.last & ~skip_now),
+            verdicts.sink.valid.eq(side),
+            verdicts.sink.ok.eq(verdict),
+            counts.sink.valid.eq(side),
+            counts.sink.n.eq(Mux(first, 0, staged + pushed)),   # Every staged word drains once.
         ]
         self.sync += If(word_in & rx.last,
-            If(~first & verdict,
+            If(verdict,
                 expected.eq(expected + 1),
                 self.accepted.status.eq(self.accepted.status + 1),
             ).Else(
                 self.dropped.status.eq(self.dropped.status + 1),
-            )
+            ),
+            self.last_words.status.eq(Mux(first, 0, nwords + 1)),
+            self.last_flags.status.eq(Cat(Mux(first, seq_ok, good), size_ok & ~first,
+                lost_now & ~first, skip_now)),
         )
+        self.sync += If(word_in & first, self.last_seq.status.eq(rx.data))
 
         # Release: with a verdict at the head, drain the staged words (to the loader, or away).
         # The staged words of one datagram are exactly those before its verdict was pushed: the
-        # FIFO's words are counted per datagram in a third FIFO.
-        self.counts = counts = stream.SyncFIFO([("n", 16)], 4)
-        self.comb += [
-            counts_ready.eq(counts.sink.ready),
-            counts.sink.valid.eq(word_in & rx.last),
-            counts.sink.n.eq(Mux(first, 0, staged + pushed)),   # Every staged word drains once.
-        ]
+        # FIFO's words are counted per datagram in the counts FIFO.
         left  = Signal(16)
         busy  = Signal()
         keep  = Signal()

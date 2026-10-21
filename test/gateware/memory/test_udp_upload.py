@@ -69,3 +69,55 @@ def test_only_the_expected_datagram_passes():
     run_simulation(dut, [sender(), receiver()])
     assert got == want, f"{len(got)} words out, {len(want)} wanted"
     assert state == {"expected": 3, "dropped": 5, "accepted": 3}, state
+
+
+def test_never_backpressures_the_udp_rx():
+    # The UDP RX path is shared with Etherbone: with the loader stalled, datagrams arriving back
+    # to back are dropped (never stalled), and the host's resend from `expected` still delivers
+    # every payload once, in order. The debug CSRs describe the last datagram.
+    port = SimpleNamespace(source=stream.Endpoint(eth_udp_user_description(32)))
+    dut  = UDPUpload(port, max_beats=4, out_dw=128)
+    rng  = random.Random(5)
+    payloads = [[rng.getrandbits(32) for _ in range(8*rng.choice([1, 2, 4]))] for _ in range(12)]
+    want  = [w for p in payloads for w in p]
+    got   = []
+    state = {"stalled_rx": 0, "sent": 0}
+
+    def sender():
+        while True:
+            expected = (yield dut.expected.status)
+            if expected == len(payloads):
+                break
+            for seq in range(expected, min(len(payloads), expected + 6)):
+                words = [seq] + payloads[seq]
+                for k, w in enumerate(words):
+                    yield port.source.data.eq(w)
+                    yield port.source.last.eq(k == len(words) - 1)
+                    yield port.source.valid.eq(1)
+                    yield
+                    if not (yield port.source.ready):
+                        state["stalled_rx"] += 1
+                state["sent"] += 1
+            yield port.source.valid.eq(0)
+            for _ in range(40):
+                yield
+        state["last"] = ((yield dut.last_seq.status), (yield dut.last_words.status),
+                         (yield dut.last_flags.status))
+
+    def receiver():
+        prng = random.Random(2)
+        for cycle in range(40000):
+            yield dut.source.ready.eq(cycle > 600 and prng.randrange(4) != 0)
+            yield
+            if (yield dut.source.valid) and (yield dut.source.ready):
+                v = (yield dut.source.data)
+                got.extend((v >> (32*i)) & 0xFFFFFFFF for i in range(4))
+        state["accepted"] = (yield dut.accepted.status)
+        state["dropped"]  = (yield dut.dropped.status)
+
+    run_simulation(dut, [sender(), receiver()])
+    assert state["stalled_rx"] == 0
+    assert got == want, f"{len(got)} words out, {len(want)} wanted"
+    assert state["accepted"] == len(payloads)
+    assert state["dropped"] == state["sent"] - len(payloads) > 0
+    assert state["last"] == (11, len(payloads[11]), 0b0011), state["last"]
