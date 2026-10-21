@@ -67,14 +67,16 @@ def boot(firmware, tty=TTY, timeout=240):
 # Etherbone ----------------------------------------------------------------------------------------
 
 def bind_sockets(iface):
-    """Bind every socket this process creates to `iface` (SO_BINDTODEVICE)."""
+    """Bind every UDP socket this process creates to `iface` (SO_BINDTODEVICE): the server's
+    link to the board, not its TCP listener (its clients connect over loopback)."""
     orig = socket.socket.__init__
     def init(self, *a, **kw):
         orig(self, *a, **kw)
-        try:
-            self.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode() + b"\0")
-        except OSError:
-            pass
+        if self.type == socket.SOCK_DGRAM:
+            try:
+                self.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode() + b"\0")
+            except OSError:
+                pass
     socket.socket.__init__ = init
 
 def server(ip=BOARD_IP, iface=None):

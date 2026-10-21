@@ -472,7 +472,7 @@ class Local(Remote):
         Remote.__init__(self, {"target": "local", "dir": REPO}, dry_run)
 
 
-def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None):
+def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firmware=None):
     """The kit's sequence: firmware, the bitstream archived and loaded volatile over JTAG, the
     serial boot, the weights over UDP (software/host/udpload.py), hdrload + imgcheck, tokens
     before numbers, bench. ~/.config/trixium/boards.ini [ti375] (or TRIXIUM_TI375_<KEY>): tty
@@ -506,7 +506,9 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None):
         return 0
 
     say("firmware")
-    firmware = build_firmware(local, out)
+    # --firmware: a binary built elsewhere (a private tree while a simulation compiles in the
+    # shared firmware/), for this build's CSR map.
+    firmware = firmware or build_firmware(local, out)
     if reconfigure:
         say("bitstream: archive + JTAG load (volatile, the flash untouched)")
         archive = os.path.join(REPO, "build", "archive")
@@ -559,13 +561,14 @@ def add_arguments(parser):
     parser.add_argument("--serializer-baseline", default="v8",                                   help="XCU1525 timing gate serializer baseline.")
     parser.add_argument("--bench",               type=int,                                       help="bench n (default: per model).")
     parser.add_argument("--dry-run",             action="store_true",                            help="Print every command, run nothing.")
+    parser.add_argument("--firmware",            default=None,                                   help="Ti375: ship this firmware binary (built for the build's CSR map) instead of building one.")
 
 
 def run(args):
     try:
         if args.board == "ti375":
             return deploy_ti375(args.build or args.board, args.model, not args.no_reconfigure,
-                                args.dry_run, args.bench)
+                                args.dry_run, args.bench, args.firmware)
         return deploy(args.build or args.board, args.board, args.model,
             reconfigure         = not args.no_reconfigure,
             boot                = args.boot,
