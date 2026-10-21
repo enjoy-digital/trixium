@@ -48,6 +48,7 @@ from litex.soc.interconnect.csr import CSRStatus
 from trixium_ypcb import YPCB_HYBRID_UNIT_OPTIONS, YPCB_LITE_UNIT_OPTIONS, YPCB_LITE_ATTN, VEXII_ARGS
 
 UPLOAD_PORT = 2345   # software/host/udpload.py
+DDR_ID_PINS = 6      # The hard LPDDR4x controller's AXI ID width on the Ti375 (Efinity's interface).
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -84,8 +85,11 @@ class TriXiumTi375SoC(SoCCore):
                  no_core=False, **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
         # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
+        idle_channels = 0
         if no_core:
-            engine_channels = 0
+            # The engine's ports kept as idle masters: the shared port's IDs and arbitration as in
+            # the full design.
+            idle_channels, engine_channels = engine_channels, 0
         platform = efinix_ti375_c529_dev_kit.Platform()
 
         # CRG --------------------------------------------------------------------------------------
@@ -119,11 +123,15 @@ class TriXiumTi375SoC(SoCCore):
 
         masters, memory_ports = [], []
         for c in range(engine_channels):
-            axi  = AXIInterface(data_width=256, address_width=32, id_width=4)
-            wide = AXIInterface(data_width=512, address_width=32, id_width=4)
+            # 3 ID bits (the readers round-robin 4 IDs): with the master index, the port's IDs fit
+            # the controller's 6 ID pins.
+            axi  = AXIInterface(data_width=256, address_width=32, id_width=3)
+            wide = AXIInterface(data_width=512, address_width=32, id_width=3)
             self.add_module(f"engwide{c}", AXIWide(axi, wide))
             memory_ports.append(axi)
             masters.append(wide)
+        for c in range(idle_channels):
+            masters.append(AXIInterface(data_width=512, address_width=32, id_width=3))
         base = self.mem_map["main_ram"]
         self.bus.add_region("main_ram", SoCRegion(origin=base, size=main_ram_size, mode="rwx"))
         if hasattr(self.cpu, "add_memory_buses"):
@@ -142,7 +150,9 @@ class TriXiumTi375SoC(SoCCore):
             self.comb += [far.ar.addr.eq(mem_bus.ar.addr - base), far.aw.addr.eq(mem_bus.aw.addr - base)]
             masters.append(far)
         idw = slave_id_width(masters)
-        assert idw <= ddr.bus.id_width, f"{idw} ID bits for the port, the controller has {ddr.bus.id_width}"
+        # The controller's AXI has 6 ID pins (Efinity's interface: ARID/AWID/RID/BID[5:0]), although
+        # EfinixDDR declares 8: an ID wider than 6 bits loses its top bits on the way back.
+        assert idw <= DDR_ID_PINS, f"{idw} ID bits for the port, the controller has {DDR_ID_PINS}"
         shared = AXIInterface(data_width=512, address_width=32, id_width=idw)
         self.port = AXISharedPort(masters, shared, r_buffer=96)
         for ch in ("aw", "w", "ar"):

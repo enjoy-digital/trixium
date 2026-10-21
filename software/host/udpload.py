@@ -31,8 +31,10 @@ UPLOAD_PORT = 2345
 
 class UDPLink:
     """The datagram side: send(seq, payload bytes)."""
-    def __init__(self, ip, port=UPLOAD_PORT):
+    def __init__(self, ip, port=UPLOAD_PORT, iface=None):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if iface:   # A host with several interfaces on the board's subnet: send through this one.
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode() + b"\0")
         self.addr = (ip, port)
     def send(self, seq, payload):
         self.sock.sendto(struct.pack("<I", seq) + payload, self.addr)
@@ -104,13 +106,14 @@ def main():
     parser.add_argument("--port",     default=1234, type=int)
     parser.add_argument("--board-ip", required=True,       help="The board's IP (the upload datagrams).")
     parser.add_argument("--upload-port", default=UPLOAD_PORT, type=int)
+    parser.add_argument("--iface",    default=None,         help="Send the datagrams through this interface (SO_BINDTODEVICE).")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     from litex.tools.litex_client import RemoteClient
     bus = RemoteClient(host=args.host, port=args.port, csr_csv=args.csr_csv)
     bus.open()
     t0 = time.time()
-    n, resent = upload(bus, UDPLink(args.board_ip, args.upload_port), args.image, args.verbose)
+    n, resent = upload(bus, UDPLink(args.board_ip, args.upload_port, args.iface), args.image, args.verbose)
     dt = time.time() - t0
     print(f"done: {n/1e6:.1f} MB in {dt:.1f} s ({n/1e6/dt:.1f} MB/s), {resent} datagrams resent")
     bus.close()
