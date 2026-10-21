@@ -151,6 +151,7 @@ class AXISharedPort(LiteXModule):
         # Write address: per-burst round robin among masters with a whole burst buffered, the
         # grants queued in AW order for W.
         self.wq = wq = stream.SyncFIFO([("idx", ib)], w_queue_depth)
+        w_done_early = Signal()
         aw_sel = Signal(max=max(2, n))
         awqs = []
         for i, m in enumerate(masters):
@@ -184,7 +185,7 @@ class AXISharedPort(LiteXModule):
             )
         self.comb += [
             slave.aw.valid.eq(aw_valid & wq.sink.ready),
-            wq.sink.valid.eq(slave.aw.valid & slave.aw.ready),
+            wq.sink.valid.eq(slave.aw.valid & slave.aw.ready & ~w_done_early),
             wq.sink.idx.eq(aw_cur),
         ]
         self.sync += [
@@ -202,17 +203,36 @@ class AXISharedPort(LiteXModule):
                 dec.eq(aw_fire & (aw_cur == i)),
             ]
             self.sync += wready[i].eq(wready[i] + inc - dec)
-        # Write data: from the queue head's master's buffer until WLAST.
-        w_idx = wq.source.idx
+        # Write data: from the queue head's master's buffer until WLAST - or, with the queue empty,
+        # from the buffer of the master whose AW is being presented: a slave may wait for WVALID
+        # before it takes the AW (the Efinix hard DDR controller does; AXI allows it). Its burst is
+        # whole in the buffer, so it can go ahead; once its last beat is out before the AW fired
+        # (`ahead`), nothing more is sent until it fires, and that AW is not queued.
+        ahead = Signal()
+        from_pending = Signal()
+        self.comb += from_pending.eq(~wq.source.valid & slave.aw.valid & ~ahead)
+        w_idx = Signal(ib)
+        self.comb += w_idx.eq(Mux(wq.source.valid, wq.source.idx, aw_cur))
         for i, m in enumerate(masters):
-            self.comb += If(wq.source.valid & (w_idx == i),
+            self.comb += If((wq.source.valid | from_pending) & (w_idx == i),
                 slave.w.valid.eq(wbufs[i].source.valid),
                 slave.w.data.eq(wbufs[i].source.data),
                 slave.w.strb.eq(wbufs[i].source.strb),
                 slave.w.last.eq(wbufs[i].source.last),
                 wbufs[i].source.ready.eq(slave.w.ready),
             )
-        self.comb += wq.source.ready.eq(slave.w.valid & slave.w.ready & slave.w.last)
+        w_last_fire = Signal()
+        self.comb += [
+            w_last_fire.eq(slave.w.valid & slave.w.ready & slave.w.last),
+            wq.source.ready.eq(wq.source.valid & w_last_fire),
+            # The pending AW's burst completed: in this cycle or before.
+            w_done_early.eq(ahead | (from_pending & w_last_fire)),
+        ]
+        self.sync += If(aw_fire,
+            ahead.eq(0),
+        ).Elif(from_pending & w_last_fire,
+            ahead.eq(1),
+        )
         # Write responses: back by the index bits.
         b_idx = Signal(ib)
         self.comb += b_idx.eq(slave.b.id[mid:mid + ib])

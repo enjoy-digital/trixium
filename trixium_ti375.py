@@ -42,6 +42,8 @@ from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.axi import AXIWide
 from gateware.memory.axi_shared import AXISharedPort, AXIIDSquash, slave_id_width
 from gateware.memory.udp_upload import UDPUpload
+from gateware.common import CPUBusMonitor
+from litex.soc.interconnect.csr import CSRStatus
 
 from trixium_ypcb import YPCB_HYBRID_UNIT_OPTIONS, YPCB_LITE_UNIT_OPTIONS, YPCB_LITE_ATTN, VEXII_ARGS
 
@@ -79,7 +81,11 @@ class _CRG(LiteXModule):
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
                  eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 1024), dn_sublanes=0,
-                 **kwargs):
+                 no_core=False, **kwargs):
+        # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
+        # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
+        if no_core:
+            engine_channels = 0
         platform = efinix_ti375_c529_dev_kit.Platform()
 
         # CRG --------------------------------------------------------------------------------------
@@ -105,7 +111,7 @@ class TriXiumTi375SoC(SoCCore):
         # Memory: the hard controller's port, shared --------------------------------------------
         self.ddr = ddr = EfinixDDR(platform=platform, clock_domain="sys", **platform.ddr_config)
         ctrl_size  = platform.ddr_size
-        chan_mod   = engine_channels
+        chan_mod   = engine_channels or 4
         chan_stride = ddr_chan_stride(ctrl_size, chan_mod)
         main_ram_size = 0x1000_0000
         assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000
@@ -148,6 +154,21 @@ class TriXiumTi375SoC(SoCCore):
             self.comb += getattr(shared, ch).id.eq(getattr(ddr.bus, ch).id[:idw])
         self.comb += ddr.awallstrb.eq(0)
 
+        # Bring-up visibility over Etherbone (the CPU has no debug port here): where the CPU is
+        # (bus handshake counts and last addresses, software/host/cpumon.py's CSRs) and the hard
+        # controller's initialisation and port state.
+        self.cpumon = CPUBusMonitor(self.cpu)
+        self.ddrstat = LiteXModule()
+        self.ddrstat.init_done = CSRStatus(1, description="The LPDDR4x controller finished its initialisation.")
+        self.ddrstat.port = CSRStatus(10, description="The controller AXI handshakes: ar/r/aw/w/b valid and ready.")
+        self.comb += [
+            self.ddrstat.init_done.status.eq(ddr.init_done),
+            self.ddrstat.port.status.eq(Cat(ddr.bus.ar.valid, ddr.bus.ar.ready, ddr.bus.r.valid, ddr.bus.r.ready,
+                ddr.bus.aw.valid, ddr.bus.aw.ready, ddr.bus.w.valid, ddr.bus.w.ready, ddr.bus.b.valid, ddr.bus.b.ready)),
+        ]
+
+        if no_core:
+            return
         # TriXium ----------------------------------------------------------------------------------
         units = dict(with_axpy=False, with_hadamard=True, with_activation_quantize=True,
                      with_projection_restore=True, with_silu=True, with_norm=True, with_conv=True,
@@ -198,6 +219,7 @@ def main():
     parser.add_target_argument("--profile",         default="lite", choices=["full", "lite"], help="The units' sizing.")
     parser.add_target_argument("--prefetch",        default=256,   type=int,   help="Reader FIFO beats (0: no prefetch).")
     parser.add_target_argument("--dn-sublanes",     default=1,     type=int,   help="DeltaNet stream sub-lanes per channel (1 at 4 channels: width 4).")
+    parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--attn-t-max",      default=1024,  type=int,   help="Attention stream context positions.")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
     # LiteX applies the CPU arguments inside parse_args (with the variant's own: mul/div, which the
@@ -208,6 +230,7 @@ def main():
     soc = TriXiumTi375SoC(sys_clk_freq=args.sys_clk_freq, engine_channels=args.engine_channels,
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
                           dn_sublanes=args.dn_sublanes, attn_geometry=YPCB_LITE_ATTN + (256, args.attn_t_max),
+                          no_core=args.no_core,
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:

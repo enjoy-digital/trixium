@@ -324,3 +324,55 @@ def test_id_squash_restores_the_ids():
             a = 32*(4*k + b)
             want.append((i, int.from_bytes(data[a:a + 32], "little"), b == 1))
     assert got == want
+
+
+@pytest.mark.parametrize("write_order", ["aw_first", "w_first", "aw_after_w"])
+def test_writes_with_every_slave_write_order(write_order):
+    """A slave may take W before AW, or wait for WVALID before AWREADY (the Efinix hard DDR
+    controller: its first write deadlocked the port, which sent W only after the AW): two writers'
+    bursts land, in order, whatever the slave's discipline."""
+    a = AXIInterface(data_width=256, address_width=33, id_width=6)
+    b = AXIInterface(data_width=256, address_width=33, id_width=6)
+    slave = AXIInterface(data_width=256, address_width=33, id_width=slave_id_width([a, b]))
+    dut = Module()
+    dut.submodules.wa = AXIWriter(a, burst_beats=16)
+    dut.submodules.wb = AXIWriter(b, burst_beats=16)
+    dut.submodules.port = AXISharedPort([a, b], slave)
+    dut.submodules.model = HBMChannelModel(slave, size=MEM_SIZE, latency=4, write_order=write_order)
+    rng = np.random.default_rng(len(write_order))
+    beats = 40
+    data = {w: [int.from_bytes(rng.integers(0, 256, 32, dtype=np.uint8).tobytes(), "little") for _ in range(beats)]
+            for w in ("a", "b")}
+    bases = {"a": 0, "b": 32*1024}
+    state = {}
+
+    def writer(w, base, words):
+        yield w.sink_cmd.addr.eq(base); yield w.sink_cmd.len.eq(beats); yield w.sink_cmd.valid.eq(1)
+        yield
+        while not (yield w.sink_cmd.ready):
+            yield
+        yield w.sink_cmd.valid.eq(0)
+        for d in words:
+            yield w.sink_data.data.eq(d); yield w.sink_data.valid.eq(1)
+            yield
+            for _ in range(3000):
+                if (yield w.sink_data.ready):
+                    break
+                yield
+            else:
+                state["stall"] = True
+                return
+        yield w.sink_data.valid.eq(0)
+
+    def check():
+        for _ in range(4000):
+            yield
+        for k, base in bases.items():
+            got = []
+            for i in range(beats):
+                got.append((yield dut.model.mem[base//32 + i]))
+            state[k] = got
+
+    run_simulation(dut, [writer(dut.wa, 0, data["a"]), writer(dut.wb, bases["b"], data["b"]), check()])
+    assert "stall" not in state, "a writer stalled: the port deadlocked"
+    assert state["a"] == data["a"] and state["b"] == data["b"]
