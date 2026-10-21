@@ -201,6 +201,23 @@ def test_small_geometry(tmp_path, small, mode, nq, n_rep, nkv, hd, T, pcts):
     check(got, expect, care)
 
 
+@pytest.fixture(scope="module")
+def small_sync():
+    return build(**SMALL, sync_operand=True)
+
+
+@pytest.mark.parametrize("mode", [MODE_SCORES, MODE_VALUES])
+@pytest.mark.parametrize("nq,n_rep,nkv,hd,T,pcts", [
+    (4, 2, 2, 32, 13, (100, 100)),
+    (3, 3, 1, 8, 64, (30, 60)),
+])
+def test_small_geometry_sync_operand(tmp_path, small_sync, mode, nq, n_rep, nkv, hd, T, pcts):
+    """sync_operand (the operand memories in block RAM: Efinix) - the same results."""
+    mem, rows, rec, expect, care = layout(np.random.default_rng(T*7 + hd), nq, n_rep, nkv, hd, T, mode)
+    got, cycles = run(small_sync, tmp_path, mem, rows, rec, pcts)
+    check(got, expect, care)
+
+
 def test_bad_geometry_is_an_error(tmp_path, small):
     mem, rows, rec, expect, care = layout(np.random.default_rng(1), 4, 2, 2, 32, 13, MODE_SCORES)
     mem[rec*8 + 2] = 48                                     # hd not a power of two

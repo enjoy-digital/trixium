@@ -84,7 +84,10 @@ class AttentionStream(LiteXModule):
     """Streaming attention passes (scores, values) over `lanes` query heads; see the module
     docstring for the record layout and the arithmetic."""
     def __init__(self, lanes=24, groups=4, hb_max=32, t_max=2048, adr_bits=13,
-                 add_factory=ExactFP32Add, mul_factory=ExactFP32Mul):
+                 add_factory=ExactFP32Add, mul_factory=ExactFP32Mul, sync_operand=False):
+        # sync_operand: the per-lane operand memories read synchronously (block RAM on a part
+        # without distributed RAM - Efinix maps an asynchronous read to flip-flops); the same
+        # timing, the read data being registered in the next cycle either way.
         L, P = lanes, 8
         pow2 = lambda x: x > 0 and (x & (x - 1)) == 0
         assert pow2(hb_max) and pow2(t_max) and t_max % 8 == 0
@@ -364,19 +367,24 @@ class AttentionStream(LiteXModule):
         for l in range(L):
             om = Memory(256, 1 << pw, name=f"attn_op{l}")
             ow = om.get_port(write_capable=True)
-            orp = om.get_port(async_read=True)
+            orp = om.get_port(async_read=not sync_operand, mode=READ_FIRST if sync_operand else WRITE_FIRST)
             self.specials += om, ow, orp
             self.comb += [
                 ow.adr.eq(op_word), ow.dat_w.eq(op_dat),
                 ow.we.eq(op_v & (op_lane == l)),
                 orp.adr.eq(Mux(mode, is_unit[3:3 + pw], is_i[3:3 + pw])),
             ]
-            opnd = Signal(32, name=f"attn_opnd{l}", reset_less=True)
             opnd2 = Signal(32, name=f"attn_opnd2_{l}", reset_less=True)
-            self.sync += [
-                opnd.eq(fsel(orp.dat_r, Mux(mode, is_unit[:3], is_i[:3]))),
-                opnd2.eq(opnd),
-            ]
+            if sync_operand:
+                # The memory registers the word; the 32-bit select is registered alongside.
+                osel = Signal(3, name=f"attn_osel{l}", reset_less=True)
+                opnd = Signal(32, name=f"attn_opnd{l}")
+                self.sync += osel.eq(Mux(mode, is_unit[:3], is_i[:3]))
+                self.comb += opnd.eq(fsel(orp.dat_r, osel))
+            else:
+                opnd = Signal(32, name=f"attn_opnd{l}", reset_less=True)
+                self.sync += opnd.eq(fsel(orp.dat_r, Mux(mode, is_unit[:3], is_i[:3])))
+            self.sync += opnd2.eq(opnd)
             row = Signal(32, name=f"attn_rowv{l}", reset_less=True)
             self.sync += row.eq(fsel(Array([r.dat_r for r in rowrd])[kv_of[l]], s1_sub))
             am = Memory(256, hb_max, name=f"attn_acc{l}")

@@ -78,7 +78,8 @@ class _CRG(LiteXModule):
 
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
-                 eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 2048), **kwargs):
+                 eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 1024), dn_sublanes=0,
+                 **kwargs):
         platform = efinix_ti375_c529_dev_kit.Platform()
 
         # CRG --------------------------------------------------------------------------------------
@@ -156,6 +157,11 @@ class TriXiumTi375SoC(SoCCore):
         units.update(YPCB_HYBRID_UNIT_OPTIONS)
         if profile == "lite":
             units.update(YPCB_LITE_UNIT_OPTIONS, with_softmax=False)
+        # The attention stream's operand memories in block RAM (Efinix has no distributed RAM: an
+        # asynchronous read became 131k flip-flops).
+        units["attnstream_options"] = units["attnstream_options"] + (("sync_operand", True),)
+        if dn_sublanes:   # lanes (= channels) x sub-lanes: the DeltaNet stream's width.
+            units["dnstream_options"] = (("sublanes", dn_sublanes),)
         config = TriXiumConfig(scratchpad_xpm=False, efinix_ram=True, **units,
             chan_stride       = chan_stride,
             chan_mod          = chan_mod,
@@ -190,7 +196,9 @@ def main():
     parser.add_target_argument("--sys-clk-freq",    default=100e6, type=float, help="System clock frequency.")
     parser.add_target_argument("--engine-channels", default=4,     type=int,   help="Engine channels on the shared port.")
     parser.add_target_argument("--profile",         default="lite", choices=["full", "lite"], help="The units' sizing.")
-    parser.add_target_argument("--prefetch",        default=512,   type=int,   help="Reader FIFO beats (0: no prefetch).")
+    parser.add_target_argument("--prefetch",        default=256,   type=int,   help="Reader FIFO beats (0: no prefetch).")
+    parser.add_target_argument("--dn-sublanes",     default=1,     type=int,   help="DeltaNet stream sub-lanes per channel (1 at 4 channels: width 4).")
+    parser.add_target_argument("--attn-t-max",      default=1024,  type=int,   help="Attention stream context positions.")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
     # LiteX applies the CPU arguments inside parse_args (with the variant's own: mul/div, which the
     # FPU needs); never touch the shared VexiiRiscv checkout.
@@ -199,6 +207,7 @@ def main():
     os.environ.setdefault("LITEX_ENV_EFINITY", "/opt/efinix/efinity/2025.1")
     soc = TriXiumTi375SoC(sys_clk_freq=args.sys_clk_freq, engine_channels=args.engine_channels,
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
+                          dn_sublanes=args.dn_sublanes, attn_geometry=YPCB_LITE_ATTN + (256, args.attn_t_max),
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:
