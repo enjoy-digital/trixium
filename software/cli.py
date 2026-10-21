@@ -43,7 +43,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # at a 1 GB stride, the last one 96 KB short (the bank-group skew); the YPCB-00338 splits each
 # 2 GB DDR3 controller above the weight base evenly between its windows (trixium_ypcb.py: 864 MB
 # at 4 channels, 432 MB at 8), the last one short of its bank skew (64 KB / windows each).
-BOARD_SUFFIX = {"fk33": "", "xcu1525": "-xcu1525", "ypcb": "-ypcb"}
+BOARD_SUFFIX = {"fk33": "", "xcu1525": "-xcu1525", "ypcb": "-ypcb", "ti375": "-ti375"}
 
 # Engine channels of each board's bitstream (convert's default --channels), and the boards whose
 # bitstream unpacks 5-trit codes (convert's default --trit5).
@@ -53,6 +53,8 @@ BOARDS = {
     "fk33":    dict(memctrl=0, ctrl_size=0,       channels=16, trit5=False),   # HBM: no windows.
     "xcu1525": dict(memctrl=4, ctrl_size=4 << 30, channels=16, trit5=False),
     "ypcb":    dict(memctrl=2, ctrl_size=2 << 30, channels=8,  trit5=True),
+    # The Efinix Ti375 C529 kit: one 1 GB LPDDR4x controller, four channels on it (trixium_ti375.py).
+    "ti375":   dict(memctrl=1, ctrl_size=1 << 30, channels=4,  trit5=True, no_emb16=True),
 }
 BOARD_CHANNELS = {name: b["channels"] for name, b in BOARDS.items()}
 BOARD_TRIT5    = {name: b["trit5"]    for name, b in BOARDS.items()}
@@ -71,6 +73,11 @@ def board_windows(board, channels, memctrl=None):
         chan_mod = channels//memctrl
         stride   = ddr_chan_stride(BOARDS[board]["ctrl_size"], chan_mod)
         return stride, stride, (chan_mod - 1)*(0x10000//chan_mod)
+    if board == "ti375":
+        # The target's windows: channel c at HBM_WEIGHT_BASE + c*stride, no bank skew.
+        from model.layout import ddr_chan_stride
+        stride = ddr_chan_stride(BOARDS[board]["ctrl_size"], channels)
+        return stride, stride, 0
     return None, None, 0
 
 
@@ -107,7 +114,8 @@ def cmd_convert(args):
         tokenizer = candidate if os.path.exists(candidate) else None
     manifest = out.rsplit(".", 1)[0] + ".json"
     convert(args.gguf, args.channels, out, manifest, tokenizer, args.layers, args.check,
-            emb16=not args.no_emb16, chan_stride=chan_stride, window=window,
+            emb16=not (args.no_emb16 or BOARDS.get(args.board, {}).get("no_emb16")),
+            chan_stride=chan_stride, window=window,
             window_reserve=window_reserve, trit5=args.trit5)
     print(f"{out}\n{manifest}")
 
