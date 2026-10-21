@@ -216,20 +216,23 @@ with a new workload: **can an FPGA SoC think?** TriXium is a start, not a destin
 
 **Same blocks, smaller homes.** Batch-1 decode is set by the memory, so a smaller home is easy
 to project: tok/s ~ bandwidth x ~78 % / bytes per token (0.38 GB for the 1.7B with 5-trit codes,
-the YPCB-00338's measured ratio). Projections, labelled as such, with assumed board powers:
+the YPCB-00338's measured ratio). Measured where we have the board, projections labelled as
+such, with assumed board powers:
 
 | home | FPGA | memory | model | tok/s | power (assumed) | mWh/token |
 | --- | --- | --- | --- | ---: | ---: | ---: |
 | FK33 | VU33P | 2x HBM2, 8 GB | 1.7B | 106.3 (measured) | 27 W FPGA (Vivado) | 0.07 (est.) |
 | XCU1525 | VU9P | 4x DDR4 | 27B | 4.03 (measured) | 20 W FPGA (Vivado) | 1.4 (est.) |
 | YPCB-00338, small-board setup | K7-480T, 155k LUTs used | 1x DDR3-933 x64, 2 channels | Bonsai-2 2B | 10.3 (measured) | | |
-| Efinix Ti375 C529 | Titanium Ti375 | LPDDR4x x32, 1 GB | 1.7B | ~15-25 (projected) | 3-5 W | ~0.03-0.09 |
+| Efinix Ti375 C529 | Titanium Ti375, everything at 100 MHz | LPDDR4x x32, 1 GB, one AXI port | Bonsai-2 2B | 8.86 (measured) | 3-5 W | ~0.09-0.16 |
 | Acorn CLE-215+ | Artix-7 200T | 1x DDR3, 1 GB | 1.7B | ~2.5-4 (projected) | 3-5 W | ~0.2-0.6 |
 | Titanium SiP | Ti60 / Ti125 | 32-64 MiB HyperRAM in the package | tiny (15M+) | ~10-30 (projected) | 0.3-1 W | ~0.003-0.03 |
 
 The small-board setup is the YPCB-00338 built the way a small board would be: one DDR3 controller
 for the CPU and two engine channels, the lighter unit set (`--engine-memctrl 1 --profile lite`),
-the same firmware and a two-channel image. It is the rehearsal for the Ti375 and the Artix-7.
+the same firmware and a two-channel image. It was the rehearsal for the Ti375, which now runs the
+2B on its kit (`trixium deploy --board ti375`: the weights over UDP, 8.86 tok/s at 64 tokens, 8.05
+at 256, 5.41 at 1,024; [doc/boards.md](doc/boards.md#efinix-ti375-c529)).
 
 The last line is the one we find most exciting: logic and memory in one package, a small model
 and its state inside, a few hundred milliwatts. Not a chat assistant, but a block of

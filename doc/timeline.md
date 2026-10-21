@@ -131,6 +131,12 @@ in ~112 s.
 The same day, the small-board configuration on the same card: two engine channels on one DDR3
 controller with the lighter unit set (`ypcb_m1b_lite_n2m1`, 155k LUTs): 2B 10.32 tok/s.
 
+**Efinix Ti375 C529** (Ternary-Bonsai-2 2B, everything at 100 MHz, LPDDR4x x32 on one AXI port):
+
+| date | build | change | 2B tok/s |
+| --- | --- | --- | ---: |
+| 2026-10-21 | `ti375_v7` | first golden tokens on the kit: four channels, lite units, the weights over UDP | 8.86 |
+
 Long context on the FK33 1.7B (v14b, 2026-09-15): 89.8 tok/s at 78 tokens of context, 78.7 at
 354, 70.0 at 684, 57.4 at 1,344; attention grows by ~0.9k cycles per position per token, and
 the vector unit's softmax, not the K/V streams, is the pole.

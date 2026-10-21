@@ -7,6 +7,14 @@
 # The deploy runs on the workstation and drives the host over ssh in BatchMode: install an ssh
 # key on the host first (ssh-copy-id user@host).
 
+# The Efinix Ti375 C529 kit plugs into the workstation itself (USB for JTAG and the console, the
+# RJ45 on the LAN): no host, user or sudo - software/host/ti375.py, `trixium deploy --board ti375`.
+# iface: the NIC that reaches the board when another interface also routes its subnet.
+[ti375]
+tty           = /dev/ttyUSB2
+ip            = 192.0.2.50
+# iface       = eth1
+
 [xcu1525]
 # Board host (name or address) and ssh user (default: ssh's own).
 host          = 192.0.2.10

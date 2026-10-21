@@ -17,6 +17,7 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
 | YPCB-00338 (hybrid build, 2x DDR3-1066, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 9.23 | 10.8 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock |
 | YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 20.33 | 4.92 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock; 19.49 tok/s at 256 tokens, 15.81 at 1,024 |
+| Efinix Ti375 C529 (LPDDR4x x32, one AXI port, 4 channels, lite units) | Ternary-Bonsai-2 2B | 8.86 | 11.28 M | everything at 100 MHz; 8.05 tok/s at 256 tokens, 5.41 at 1,024 |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate
@@ -24,6 +25,18 @@ approved overclock), and the builds close timing to the project's empirical gate
 1.7B climb ends at its peak build (101.9 tok/s at 212.5 MHz); the shipping build reaches 106.3
 (reset-less datapath, fused residual tail). Where the remaining time goes:
 [`performance-next-steps.md`](performance-next-steps.md).
+
+The Ti375 kit is the first small board: one LPDDR4x x32 behind the hard controller's single
+512-bit AXI port at 100 MHz (6.4 GB/s at the port), shared by the CPU and four engine channels,
+the lighter unit set (no softmax unit, RoPE on the CPU, the DeltaNet stream at width 4), the
+weights uploaded over UDP. A forward is 10.4 M cycles (`hybprof`): the DeltaNet layers 3.9 M (their
+in-projections 1.6 M, the recurrence heads 1.4 M, the convolution and activation 0.9 M), the FFNs
+2.9 M, the LM head 2.1 M, the attention layers 1.0 M, and 0.43 M for the embedding row the CPU
+restores (the image has no int16 table: it would fill the 1 GB); the engine is busy 81% of the
+time, its weight streams at ~0.46 beats per channel per clock on a large matvec - the shared
+port, not the pipes, is this board's limit. The board's
+reference tokens are its image's own (that restore is exact, one LSB away from the converter's
+table), checked against the mirror and deterministic run to run ([`boards.md`](boards.md#efinix-ti375-c529)).
 
 The Bonsai 2 2B/4B on the YPCB-00338 are still some way from its memory limit: the 2B streams
 ~0.41 GB per token, so 20.3 tok/s uses about half of the DDR3-1066 bandwidth (4.8 M cycles per
