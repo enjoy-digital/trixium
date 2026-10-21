@@ -160,7 +160,7 @@ class MatVecEngine(LiteXModule):
     """N-channel matvec engine: one AXIReader + ChannelPipe per memory channel (see module doc)."""
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
-                 trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8,
+                 trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8, reader_n_ids=4,
                  axpy=True, pipe_cd=None, readers_cd=None, read_axis=None):
         # readers_cd/read_axis: the channels' readers in the memory's clock domain on these
         # read-only AXI ports (gateware/core/reader_island.py; requires pipe_cd: the weight
@@ -332,7 +332,7 @@ class MatVecEngine(LiteXModule):
             if readers_cd:
                 # The reader in the memory's domain, the pipe island fed from there; the engine
                 # sees the FETCH / DeltaNet / attention beats (`source`) and steers by two levels.
-                reader = ReaderIsland(readers_cd, read_axis[i], n_ids=4, fifo_depth=reader_fifo_depth,
+                reader = ReaderIsland(readers_cd, read_axis[i], n_ids=reader_n_ids, fifo_depth=reader_fifo_depth,
                                       max_bursts=reader_max_bursts)
                 pipe = PipeIsland(pipe_cd, in_cd=readers_cd, trit5=trit5, xbuf_groups=xbuf_groups,
                                   chan_id=i, n_channels=n, axpy=axpy)
@@ -375,9 +375,10 @@ class MatVecEngine(LiteXModule):
                 self.readers.append(reader)
                 self.pipes.append(pipe)
                 continue
-            # n_ids=4: the HBM controller serializes same-ARID reads (one 16-beat burst
-            # per round trip); round-robin ARIDs let it pipeline.
-            reader = AXIReader(axi, n_ids=4, fifo_depth=reader_fifo_depth,
+            # n_ids=4 (default): the HBM controller serializes same-ARID reads (one 16-beat
+            # burst per round trip); round-robin ARIDs let it pipeline. 1 where responses must
+            # come back in AR order (reader_n_ids, TriXiumConfig).
+            reader = AXIReader(axi, n_ids=reader_n_ids, fifo_depth=reader_fifo_depth,
                                max_bursts=reader_max_bursts)
             # pipe_cd: the pipes in their own, faster clock domain (gateware/core/island.py).
             if pipe_cd:

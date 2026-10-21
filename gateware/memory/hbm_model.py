@@ -70,7 +70,6 @@ class HBMChannelModel(LiteXModule):
         if axi is None:
             axi = AXIInterface(data_width=data_width, address_width=33, id_width=6)
         data_width = axi.data_width
-        assert reorder_ids == 0 or data_width == 256
         self.beat_bytes = data_width//8
         self.axi3       = axi3
         self.axi = axi
@@ -188,7 +187,7 @@ class HBMChannelModel(LiteXModule):
             self.comb += [
                 q.sink.valid.eq(axi.ar.valid & (axi.ar.id[:qbits] == i)),
                 q.sink.addr.eq(axi.ar.addr),
-                q.sink.len.eq(axi.ar.len[:4]),
+                q.sink.len.eq(axi.ar.len[:4] if self.axi3 else axi.ar.len),
                 q.sink.id.eq(axi.ar.id),
             ]
         self.comb += axi.ar.ready.eq(Array([q.sink.ready for q in ar_qs])[axi.ar.id[:qbits]])
@@ -247,7 +246,7 @@ class HBMChannelModel(LiteXModule):
             qp.eq(qp + 1),
             If(promote,
                 cur_valid.eq(1),
-                cur_beat.eq(Array(st_addr)[pick_q][log2_int(BEAT_BYTES):]),
+                cur_beat.eq(Array(st_addr)[pick_q][log2_int(self.beat_bytes):]),
                 cur_left.eq(Array(st_len)[pick_q] + 1),
                 cur_id.eq(Array(st_id)[pick_q]),
             ).Elif(cur_done,

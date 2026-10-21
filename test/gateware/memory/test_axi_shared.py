@@ -376,3 +376,60 @@ def test_writes_with_every_slave_write_order(write_order):
     run_simulation(dut, [writer(dut.wa, 0, data["a"]), writer(dut.wb, bases["b"], data["b"]), check()])
     assert "stall" not in state, "a writer stalled: the port deadlocked"
     assert state["a"] == data["a"] and state["b"] == data["b"]
+
+
+# The read merge needs the AR order back (Ti375) ---------------------------------------------------
+#
+# AXIWide's read merge (AXIReadMerge) keeps each narrow burst's half/length in AR order and
+# applies them to the R bursts as they come: right only if the slave answers in AR order. The
+# Efinix hard controller may serve different IDs out of order, so a reader rotating 4 ARIDs got
+# other bursts' halves - wrong weights, intermittently (the 2B's tokens changed run to run on the
+# kit). With one ARID per reader (TriXiumConfig reader_n_ids=1, the Ti375's) AXI keeps the order.
+
+def _merge_reorder_case(n_ids, seed=7):
+    import random
+    from gateware.memory.axi import AXIReader, AXIWide
+    from gateware.memory.hbm_model import HBMChannelModel
+    rng  = random.Random(seed)
+    size = 64*1024
+    data = bytes(rng.getrandbits(8) for _ in range(size))
+    narrow = AXIInterface(data_width=256, address_width=32, id_width=3)
+    wide   = AXIInterface(data_width=512, address_width=32, id_width=3)
+    dut = Module()
+    dut.submodules.reader = reader = AXIReader(narrow, burst_beats=16, fifo_depth=128, n_ids=n_ids)
+    dut.submodules.wide   = AXIWide(narrow, wide)
+    words = [int.from_bytes(data[i:i+64], "little") for i in range(0, size, 64)]
+    dut.submodules.model  = HBMChannelModel(wide, size=size, init=words, latency=12,
+                                            data_width=512, axi3=False, reorder_ids=4)
+    cmds = [(32*rng.randrange(0, size//32 - 80), rng.randrange(17, 80)) for _ in range(5)]
+    got  = []
+
+    def driver():
+        for addr, nbeats in cmds:
+            yield reader.sink.addr.eq(addr)
+            yield reader.sink.len.eq(nbeats)
+            yield reader.sink.valid.eq(1)
+            yield
+            while not (yield reader.sink.ready):
+                yield
+            yield reader.sink.valid.eq(0)
+            yield reader.source.ready.eq(1)
+            n, t = 0, 0
+            while n < nbeats and t < 20000:
+                yield
+                t += 1
+                if (yield reader.source.valid):
+                    got.append((yield reader.source.data))
+                    n += 1
+            yield reader.source.ready.eq(0)
+
+    run_simulation(dut, [driver()])
+    want = [int.from_bytes(data[a + 32*i:a + 32*i + 32], "little") for a, n in cmds for i in range(n)]
+    return got == want
+
+def test_read_merge_single_id_exact_under_reorder():
+    assert _merge_reorder_case(n_ids=1)
+
+def test_read_merge_multi_id_breaks_under_reorder():
+    # Pins the reason for reader_n_ids=1 on the Ti375: drop this test if the merge learns IDs.
+    assert not _merge_reorder_case(n_ids=4)

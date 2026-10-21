@@ -400,7 +400,7 @@ class TriXiumSimSoC(SoCCore):
                  with_softmax=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
-                 axi1_latency=24,
+                 axi1_latency=24, axi1_reorder=0, reader_n_ids=4,
                  unit_options=(), efinix_ram=False, attn_sync_operand=False):
         assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
@@ -509,6 +509,7 @@ class TriXiumSimSoC(SoCCore):
         elif mem == "axi1":
             stride   = ddr3_stride(img)
             read_ports = [] if ddr_readers else None   # --ddr-readers: the port in its own clock.
+            self.axi1_reorder = axi1_reorder
             chan_mod = self.add_axi1(n_channels, ram, img, memory_ports, stride, axi1_latency,
                                      read_ports=read_ports)
         else:
@@ -539,6 +540,7 @@ class TriXiumSimSoC(SoCCore):
             with_vec_fused           = vec_fused,
             reader_fifo_depth        = prefetch or 512,
             reader_max_bursts        = reader_bursts,
+            reader_n_ids             = reader_n_ids,
             # An image with 5-trits-per-byte weights needs the unpacker in front of the pipes.
             with_trit5               = img is not None and any(
                 e["kind"] == KIND_TERNARY5 for e in img.entries),
@@ -715,8 +717,10 @@ class TriXiumSimSoC(SoCCore):
                                                id_width=slave_id_width(masters))
         # r_buffer: a channel reader's 8 bursts of 16 beats are <= 72 words in flight.
         self.axi1_port  = ClockDomainsRenamer(cd)(AXISharedPort(masters, slave, r_buffer=96))
+        # axi1_reorder: bursts on different IDs served out of order (as the hard controller may).
         self.axi1_mem   = ClockDomainsRenamer(cd)(HBMChannelModel(slave, size=size, init=words512(content),
-                                          latency=latency, data_width=512, axi3=False))
+                                          latency=latency, data_width=512, axi3=False,
+                                          reorder_ids=self.axi1_reorder))
         # console `ddrstat`: the ports' waits (the read ports' in their domain with the readers there)
         self.engstat = EnginePortStats(read_ports, cd="ddr") if split else EnginePortStats(memory_ports)
         return chan_mod
@@ -882,7 +886,7 @@ BOARDS = {
     # one 512-bit AXI memory behind AXISharedPort. Run with --hybrid (lite profile by default).
     "ti375": dict(mem="axi1", n_memctrl=1,
         cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS,
-        efinix_ram=True, attn_sync_operand=True),
+        efinix_ram=True, attn_sync_operand=True, reader_n_ids=1),
 }
 
 # --hybrid (--board ypcb): the YPCB with the hybrid models' units (Ternary-Bonsai-2 2B/4B/9B fit its
@@ -986,6 +990,11 @@ def build_sim(args, board, out_dir):
         soc_kwargs["prefetch"] = args.prefetch
     if args.reader_bursts:
         soc_kwargs["reader_bursts"] = args.reader_bursts
+    if args.reader_ids:
+        soc_kwargs["reader_n_ids"] = args.reader_ids
+    if args.axi1_reorder:
+        assert args.board == "ti375", "--axi1-reorder: --board ti375"
+        soc_kwargs["axi1_reorder"] = args.axi1_reorder
     if args.pipe_clk_freq:
         soc_kwargs["pipe_clk_freq"] = args.pipe_clk_freq
     if args.dn_sublanes and "unit_options" in soc_kwargs:
@@ -1054,6 +1063,8 @@ def main():
     parser.add_argument("--hbm-stall-rate", default=0,  type=int,                                  help="--board fk33: HBM model stall rate.")
     parser.add_argument("--threads",        default=4,  type=int,                                  help="Verilator threads.")
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
+    parser.add_argument("--reader-ids",     default=0, type=int, choices=[0, 1, 2, 4, 8],           help="ARIDs each channel reader rotates (0: the board's; the Ti375 uses 1).")
+    parser.add_argument("--axi1-reorder",   default=0, type=int, choices=[0, 2, 4, 8],              help="--board ti375: the memory model serves bursts out of order across N ID queues (as the hard controller may).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
     parser.add_argument("--memctrl",        default=0, type=int, choices=[0, 1, 2],                 help="--board ypcb: DDR3 controllers (default: the board's two; 1 = every channel and main_ram on one, the small boards' topology).")
     parser.add_argument("--profile",        default="full", choices=["full", "lite"],               help="--hybrid: the units' sizing (lite: the small boards' profile).")

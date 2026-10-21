@@ -64,6 +64,9 @@ class TriXiumConfig:
     with_prefetch: bool            = False # Engine op 7: a matvec's weight reads issued ahead.
     reader_fifo_depth: int         = 512   # Beats buffered per channel reader (the prefetch's reach).
     reader_max_bursts: int         = 8     # 16-beat bursts a channel reader keeps outstanding.
+    reader_n_ids: int              = 4     # ARIDs a reader rotates (HBM pipelines across IDs); 1 where the
+                                           # path to the memory needs the AR order back (AXIReadMerge in front
+                                           # of a controller that may reorder across IDs: the Efinix one).
     pipe_clk: str                  = ""    # The channel pipes' own clock domain (PipeIsland), "": the engine's.
     readers_cd: str                = ""    # The memory's clock domain the channel readers run in (ReaderIsland, on
                                            # the core's read_ports), "": the engine's. Requires pipe_clk.
@@ -264,6 +267,7 @@ class TriXiumCore(LiteXModule):
             prefetch   = config.with_prefetch,
             reader_fifo_depth = config.reader_fifo_depth,
             reader_max_bursts = config.reader_max_bursts,
+            reader_n_ids      = config.reader_n_ids,
             axpy       = config.with_axpy,
             pipe_cd    = "peng" if config.pipe_clk else None,
             readers_cd = "reng" if config.readers_cd else None,

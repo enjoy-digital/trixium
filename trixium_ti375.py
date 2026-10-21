@@ -202,7 +202,10 @@ class TriXiumTi375SoC(SoCCore):
             chan_skew         = 0,
             with_trit5        = True,
             with_prefetch     = bool(prefetch),
-            reader_fifo_depth = prefetch or 512)
+            reader_fifo_depth = prefetch or 512,
+            # One ARID per reader: AXIWide's read merge needs the R order to be the AR order, and
+            # the hard controller may reorder (or interleave) bursts across IDs.
+            reader_n_ids      = 1)
         self.trixium = TriXiumCore(memory_ports, config)
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
