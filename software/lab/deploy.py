@@ -537,7 +537,7 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
         bus.close()
     finally:
         srv.kill()
-    out_txt = console_run(["hdrload", "imgcheck"], tty, wait=300, until="imgcheck: ", baud=ti375.BAUD)
+    out_txt = console_run(["hdrload", "imgcheck"], tty, wait=300, until=" bad", baud=ti375.BAUD)   # the summary line's end: "imgcheck: ... N bad"
     print("\n".join(l for l in out_txt.splitlines() if l.startswith(("hdrload", "imgcheck"))))
     if "inference ready" not in out_txt or " 0 bad" not in out_txt:
         raise DeployError("header or weights wrong on the board - refusing to go on")

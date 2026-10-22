@@ -34,6 +34,7 @@
 #include "seq.h"
 #include "progs.h"
 #include "infer_internal.h"
+#include "resident.h"
 
 /* Resident BFP Ops */
 /*------------------*/
@@ -645,6 +646,31 @@ static int8_t  *er_signs;  // s, from row 0 of the width's rotation tensors (cod
 static int64_t *er_acc;
 static int      er_fexp;
 
+// The transform on unit 3 (resident_embed_rotate): v is split exactly into 7-bit chunks,
+// v = sum_k 2^(7k) (sign(m)*q') * ((|m| << sh) >> 7k & 127), each an int8 vector (|value| <=
+// 127): the unit rotates them in exact int32 (s*(H chunk), inverse mode) and the CPU
+// recombines them, the same integers as the CPU transform. 11 + spread bits: two chunks for
+// the usual spread of a few binades, at most six. Console `embres unit|cpu` (default unit).
+#define ER_CHUNKS 6
+static int8_t  *er_chunks; // [ER_CHUNKS][width], main RAM, 64-byte aligned
+static int32_t *er_rot;    // [ER_CHUNKS][width]
+static int      er_width;
+static uint32_t *er_out;   // The int16 row, cached, then one engine fetch into sp_dst (1,024
+                           // uncached scratchpad writes cost more than the transform).
+int embed_restore_unit = 1;
+static uint64_t er_cyc[4]; // Console `embres`: fetch + split, transform, recombine, round.
+static uint32_t er_calls;
+
+void embed_restore_print(void)
+{
+    uint32_t c = er_calls ? er_calls : 1;
+    printf("embres: %lu rows, avg cycles fetch+split %lu transform %lu recombine %lu round+store %lu\n",
+           (unsigned long)er_calls, (unsigned long)(er_cyc[0]/c), (unsigned long)(er_cyc[1]/c),
+           (unsigned long)(er_cyc[2]/c), (unsigned long)(er_cyc[3]/c));
+    er_calls = 0;
+    er_cyc[0] = er_cyc[1] = er_cyc[2] = er_cyc[3] = 0;
+}
+
 void embed_restore_off(void)
 {
     er_block = 0;
@@ -654,8 +680,12 @@ int embed_restore_setup(int block, int width, int wi)
 {
     er_block = 0;
     if (block <= 0 || width % block) return -1;
-    er_signs = infer_halloc((uint64_t)width, 0);
-    er_acc   = infer_halloc((uint64_t)width*sizeof(int64_t), 0);
+    er_signs  = infer_halloc((uint64_t)width, 0);
+    er_acc    = infer_halloc((uint64_t)width*sizeof(int64_t), 0);
+    er_chunks = infer_halloc((uint64_t)ER_CHUNKS*width, 0);
+    er_rot    = infer_halloc((uint64_t)ER_CHUNKS*width*sizeof(int32_t), 0);
+    er_out    = infer_halloc((uint64_t)width*2u, 0);
+    er_width  = width;
     if (!er_signs || !er_acc) return -1;
     for (int b = 0; b < width/block; b++) {
         const struct bons_entry *e = model_entry(ROLE_HADAMARD, HADAMARD_LAYER(wi, b));
@@ -682,6 +712,7 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
         return 0;
     }
     int n = e->cols;
+    uint64_t t0 = perf_now64(), t1, t2;
     uint32_t rb  = bons_row_beats(e->cols, e->kind, e->group);
     uint32_t rpc = e->rows/n_ch;
     // Staged in the destination itself (the row is read whole before any result is written):
@@ -713,6 +744,75 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
     int narrow = 11 + spread + lg + 1 <= 31;
     int64_t *v   = er_acc;
     int32_t *v32 = (int32_t *)er_acc;
+    uint64_t amax = 0;
+    int is32 = 0;                  // The transformed row is in v32 (narrow), else in v.
+    int nck = (11 + spread + 6)/7;
+    if (embed_restore_unit && er_chunks && er_rot && n == er_width && nck <= ER_CHUNKS) {
+        // Four codes (one byte) at a time: lanes 0xFF where the code is +1 (pos) / -1 (neg),
+        // a chunk's word then (pos & b) | (neg & -b) with b in every byte.
+        static uint32_t pos_tab[256], neg_tab[256];
+        if (!neg_tab[0]) {
+            for (int x = 0; x < 256; x++)
+                for (int l = 0; l < 4; l++) {
+                    uint32_t q = (x >> (2*l)) & 3;
+                    if (q == 2) pos_tab[x] |= 0xFFu << (8*l);
+                    if (q == 0) neg_tab[x] |= 0xFFu << (8*l);
+                }
+        }
+        uint32_t *cwd = (uint32_t *)er_chunks;
+        for (int g = 0; g < G; g++) {
+            int64_t  ma = (m[g] < 0 ? -m[g] : m[g]) << (e16[g] - e16min);
+            uint32_t bp[ER_CHUNKS], bn[ER_CHUNKS];
+            for (int k = 0; k < nck; k++) {
+                uint32_t b = (uint32_t)((ma >> (7*k)) & 127);
+                bp[k] = b*0x01010101u;
+                bn[k] = ((256u - b) & 0xFFu)*0x01010101u;
+            }
+            int neg = m[g] < 0;
+            for (int w = 0; w < 8; w++) {
+                uint32_t c = cw[g*8 + w];
+                for (int t = 0; t < 4; t++) {
+                    uint32_t x = (c >> (8*t)) & 0xFFu;
+                    uint32_t p = neg ? neg_tab[x] : pos_tab[x];
+                    uint32_t q = neg ? pos_tab[x] : neg_tab[x];
+                    uint32_t *d = cwd + g*32 + w*4 + t;
+                    for (int k = 0; k < nck; k++)
+                        d[k*n/4] = (p & bp[k]) | (q & bn[k]);
+                }
+            }
+        }
+        t1 = perf_now64();
+        if (!resident_embed_rotate(er_chunks, (uint32_t)nck, (uint32_t)n, er_rot)) {
+            t2 = perf_now64();
+            er_cyc[0] += t1 - t0;
+            er_cyc[1] += t2 - t1;
+            if (narrow) {
+                uint32_t am = 0;
+                for (int j = 0; j < n; j++) {
+                    int32_t y = er_rot[(nck - 1)*n + j];
+                    for (int k = nck - 2; k >= 0; k--)
+                        y = y*128 + er_rot[k*n + j];
+                    v32[j] = y;
+                    uint32_t a = (uint32_t)((y < 0) ? -y : y);
+                    if (a > am) am = a;
+                }
+                amax = am;
+                is32 = 1;
+            } else {
+                for (int j = 0; j < n; j++) {
+                    int64_t y = er_rot[(nck - 1)*n + j];
+                    for (int k = nck - 2; k >= 0; k--)
+                        y = y*128 + er_rot[k*n + j];
+                    v[j] = y;
+                    uint64_t a = (uint64_t)((y < 0) ? -y : y);
+                    if (a > amax) amax = a;
+                }
+            }
+            goto quantize;
+        }
+    }
+    t1 = t2 = perf_now64();
+    er_cyc[0] += t1 - t0;
     for (int g = 0; g < G; g++) {
         int64_t mg = m[g] << (e16[g] - e16min);
         for (int w = 0; w < 8; w++) {
@@ -726,7 +826,6 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
         }
     }
     // Walsh-Hadamard per block (h below the block: the strides never cross one).
-    uint64_t amax = 0;
     if (narrow) {
         for (int h = 1; h < er_block; h <<= 1)
             for (int i = 0; i < n; i += 2*h)
@@ -742,8 +841,7 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
             if (a > am) am = a;
         }
         amax = am;
-        for (int j = n - 1; j >= 0; j--)   // Widened in place (back to front) for the rounding.
-            v[j] = v32[j];
+        is32 = 1;
     } else {
         for (int h = 1; h < er_block; h <<= 1)
             for (int i = 0; i < n; i += 2*h)
@@ -758,6 +856,9 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
             if (a > amax) amax = a;
         }
     }
+quantize:;
+    uint64_t t3 = perf_now64();
+    er_cyc[2] += t3 - t2;
     volatile uint32_t *pw = (volatile uint32_t *)(SCRATCHPAD_BASE + sp_dst);
     if (amax == 0) {
         for (int j = 0; j < n/2; j++) pw[j] = 0;
@@ -765,23 +866,62 @@ static int embed_row_restore(const struct bons_entry *e, int row, uint32_t sp_ds
     }
     int bl = (amax >> 32) ? 32 + bitlen32((uint32_t)(amax >> 32)) : bitlen32((uint32_t)amax);
     int r  = bl - 15;
+    uint32_t *ow = (er_out && n == er_width && n % 16 == 0) ? er_out : NULL;
+    if (is32 && ow) {                    // The usual row: all in 32 bits (|y| < 2^31, r <= 16).
+        uint32_t rmask = r > 0 ? (1u << r) - 1 : 0, half = r > 0 ? 1u << (r - 1) : 0;
+        for (int j = 0; j < n; j += 2) {
+            uint32_t w = 0;
+            for (int k = 0; k < 2; k++) {
+                int32_t  y   = v32[j + k];
+                uint32_t mag = (uint32_t)((y < 0) ? -y : y);
+                if (r > 0) {
+                    uint32_t rem = mag & rmask;
+                    mag >>= r;
+                    if (rem > half || (rem == half && (mag & 1))) mag++;
+                } else {
+                    mag <<= -r;
+                }
+                if (mag > 32767) mag = 32767;
+                w |= (uint32_t)(uint16_t)(y < 0 ? -(int32_t)mag : (int32_t)mag) << (16*k);
+            }
+            ow[j/2] = w;
+        }
+    } else
     for (int j = 0; j < n; j += 2) {
         int32_t o[2];
         for (int k = 0; k < 2; k++) {
-            int64_t y = v[j + k];
-            int64_t mag = (y < 0) ? -y : y, qv;
-            if (r > 0) {
-                int64_t rem  = mag & ((1ll << r) - 1), half = 1ll << (r - 1);
-                qv = mag >> r;
-                if (rem > half || (rem == half && (qv & 1))) qv++;
+            int64_t y = is32 ? (int64_t)v32[j + k] : v[j + k];
+            int32_t qv;
+            if (bl <= 31) {             // The usual row: the same rounding in 32 bits.
+                uint32_t mag = (uint32_t)((y < 0) ? -y : y);
+                if (r > 0) {
+                    uint32_t rem = mag & ((1u << r) - 1), half = 1u << (r - 1);
+                    mag >>= r;
+                    if (rem > half || (rem == half && (mag & 1))) mag++;
+                } else {
+                    mag <<= -r;
+                }
+                qv = (int32_t)(mag > 32767 ? 32767 : mag);
             } else {
-                qv = mag << -r;
+                int64_t mag = (y < 0) ? -y : y, q;
+                int64_t rem  = mag & ((1ll << r) - 1), half = 1ll << (r - 1);
+                q = mag >> r;
+                if (rem > half || (rem == half && (q & 1))) q++;
+                qv = (int32_t)(q > 32767 ? 32767 : q);
             }
-            if (qv > 32767) qv = 32767;
-            o[k] = (int32_t)((y < 0) ? -qv : qv);
+            o[k] = (y < 0) ? -qv : qv;
         }
-        pw[j/2] = (uint32_t)(uint16_t)o[0] | ((uint32_t)(uint16_t)o[1] << 16);
+        uint32_t w = (uint32_t)(uint16_t)o[0] | ((uint32_t)(uint16_t)o[1] << 16);
+        if (ow) ow[j/2] = w;
+        else    pw[j/2] = w;
     }
+    if (ow) {
+        flush_cpu_dcache_range(ow, (uint32_t)n*2u);
+        engine_fetch(0, (uint32_t)((uintptr_t)ow - MAIN_RAM_BASE + TRIXIUM_MEM_CPU_OFFSET),
+                     (uint32_t)n*2u/32u, sp_dst);
+    }
+    er_cyc[3] += perf_now64() - t3;
+    er_calls++;
     return e16min + er_fexp + r;
 }
 

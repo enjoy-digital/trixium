@@ -163,6 +163,7 @@ static void help(void)
     puts("  hwops [op cpu|hw] - show/set per-op CPU/HW dispatch (op name or 'all')");
     puts("  seq resident silu dnres dnstream attnstream hwargmax [on|off]");
     puts("                    - unit or list path vs its CPU reference (prints the state)");
+    puts("  embres unit|cpu   - embedding rows without the int16 table: transform on unit 3 or the CPU");
     puts("  lmchunk rows      - LM head list chunk cap in rows (0 = automatic)");
     puts("  attnchunk n       - cap the heads per attention list");
     puts("Diagnostics:");
@@ -1459,6 +1460,12 @@ static void console_service(void)
         if (strncmp(str, "on", 2) == 0)  hybrid_hb_store = 1;
         if (strncmp(str, "off", 3) == 0) hybrid_hb_store = 0;
         printf("HBSTORE %s\n", hybrid_hb_store ? "on (hb stored every residual list)" : "off (hb stays in RS_F; CPU readers restore it)");
+    } else if (strcmp(token, "embres") == 0) { // embres unit|cpu: a rotated image's embedding rows without the int16 table, transformed on unit 3 or on the CPU
+        extern int embed_restore_unit;
+        if (strncmp(str, "unit", 4) == 0) embed_restore_unit = 1;
+        if (strncmp(str, "cpu", 3) == 0)  embed_restore_unit = 0;
+        printf("EMBRES %s\n", embed_restore_unit ? "unit (the rows' Hadamard transform on unit 3)" : "cpu (the transform on the CPU)");
+        embed_restore_print();
     } else if (strcmp(token, "hwargmax") == 0) {
         if (strncmp(str, "on", 2) == 0)  hybrid_hwargmax_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_hwargmax_enable(0);

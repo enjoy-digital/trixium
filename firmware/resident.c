@@ -650,6 +650,38 @@ static int width_index(const struct bons_header *H, uint32_t width)
     return -1;
 }
 
+/* Embedding Rotation */
+/*--------------------*/
+
+// The rotated embedding rows of an image without the int16 table (infer_bfp.c
+// embed_row_restore): out[k] = s*(H chunks[k]) per Hadamard block for nchunks int8 vectors of
+// `width` - unit 3 in inverse mode, exact int32, the sign bits of the width's rotation already
+// resident (resident_init). The caller splits a row into the chunks and recombines them
+// exactly. chunks and out are 32-byte aligned main RAM buffers, out is valid on return.
+// -1: no resident path or it failed (the caller restores on the CPU).
+int resident_embed_rotate(const int8_t *chunks, uint32_t nchunks, uint32_t width, int32_t *out)
+{
+    struct resident_state *R = resident_state();
+    const struct bons_header *H = model_header();
+    int wi = resident_active() ? width_index(H, width) : -1;
+    uint32_t B = H->hadamard_block;
+    if (wi < 0 || !nchunks || width % B || nchunks*width > RS_F - RS_Q8B ||
+        nchunks*width*4u > RS_F - RS_Y)
+        return -1;
+    uint32_t blocks = width/B;
+    rl_begin_keyed(0x0E000000u | nchunks << 16 | width/32u, (uint32_t)(uintptr_t)chunks,
+                   (uint32_t)(uintptr_t)out);
+    rl_fetch(chunks, nchunks*width, RS_Q8B);
+    for (uint32_t k = 0; k < nchunks; k++) {   // (the per-block absmax is not used: RS_MAX each time)
+        struct bns_seq_descriptor d;
+        bns_seq_desc_hadamard(&d, RS_Q8B + k*width, R->sign_base[wi], RS_Y + k*width*4u,
+                              RS_MAX, blocks, 1u | had_flags(R));
+        rl_desc(&d);
+    }
+    rl_store(out, nchunks*width*4u, RS_Y);
+    return rl_run("embedding rotate");
+}
+
 int resident_init(void)
 {
     struct resident_state *R = resident_state();
@@ -1826,6 +1858,8 @@ void resident_rsf_set(const void *src) { (void)src; }
 int  rl_rsf_is(const void *src) { (void)src; return 0; }
 
 int resident_init(void) { resident_state()->ready = 0; return -1; }
+int resident_embed_rotate(const int8_t *chunks, uint32_t nchunks, uint32_t width, int32_t *out)
+{ (void)chunks; (void)nchunks; (void)width; (void)out; return -1; }
 int resident_prepare(const float *src, uint32_t width, int rotate)
 {
     (void)src; (void)width; (void)rotate; resident_state()->fallbacks++; return -1;

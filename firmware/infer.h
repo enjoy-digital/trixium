@@ -91,6 +91,7 @@ void     infer_matvec_f_rotated_quantized(const struct bons_entry *e, int e8, fl
 void    *infer_halloc(uint64_t n, int big);
 // Rotated embedding rows restored on the CPU (images without the int16 table).
 void    embed_restore_off(void);
+void    embed_restore_print(void);
 int     embed_restore_setup(int block, int width, int wi);
 uint64_t infer_heap_room(int big);
 void     infer_fetch_f32(uint32_t addr, uint32_t beats, float *dst, int n);

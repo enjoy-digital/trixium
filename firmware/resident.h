@@ -35,6 +35,9 @@ int  resident_available(void);   // The bitstream carries units 3/4/5/8 with the
 int  resident_init(void);        // Extract the rotation sign bits from the image. 0 = ready.
 void resident_enable(int on);    // Console A/B: default on when available.
 int  resident_active(void);      // available && enabled && not disabled by a failure.
+// A rotated embedding row's int8 chunks through unit 3 (out[k] = s*(H chunks[k]), exact int32):
+// infer_bfp.c embed_row_restore without the int16 table. -1: restore on the CPU.
+int  resident_embed_rotate(const int8_t *chunks, uint32_t nchunks, uint32_t width, int32_t *out);
 
 // Quantize src[width] (FP32, main RAM; NULL = the activation resident_ffn_act left in the
 // scratchpad) into the resident Q8 vector, rotating it first when `rotate` (width must be a
