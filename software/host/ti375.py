@@ -6,14 +6,20 @@
 
 """The Efinix Ti375 C529 kit from the workstation it is plugged into: no board host, no PCIe.
 
-The kit's FT4232H gives JTAG (the bitstream, loaded volatile: the SPI flash is never written) and
+The kit's FT4232H gives JTAG (the bitstream, volatile, or into the SPI flash with `flash`) and
 the SoC's UART (the console, 115200); its RJ45 gives Etherbone (the CSRs) and the UDP weight port
-(software/host/udpload.py). Used by `trixium deploy --board ti375` (software/lab/deploy.py).
+(software/host/udpload.py). Used by `trixium deploy --board ti375` (software/lab/deploy.py) and
+`trixium chat --board ti375` (ensure_model: the weights uploaded only when not already there).
 
   python3 -m software.host.ti375 load build/ti375_v7/gateware/efinix_ti375_c529_dev_kit.bit
   python3 -m software.host.ti375 boot build/ti375_v7/trixium.bin
+  python3 -m software.host.ti375 flash build/ti375_v10 firmware/trixium.bin   # power-up boot
+  python3 -m software.host.ti375 model models/bons/bonsai2-2b-n4-ti375.img    # upload unless there
   python3 -m software.host.ti375 server --iface enp5s0      # litex_server on that interface
   python3 -m software.host.ti375 smi [-w 1]                 # trixium smi over Etherbone
+
+A build with `--with-spi-flash` boots the firmware from the flash at power-up (LiteX's
+flashboot, after the BIOS's serial boot: a host answering that one still boots its own).
 
 A workstation with several interfaces on the board's subnet must reach it through the wired
 one: `--iface` binds the Etherbone server's and the uploader's sockets to it (SO_BINDTODEVICE,
@@ -32,6 +38,9 @@ TTY     = "/dev/ttyUSB2"   # The FT4232H's third port: the SoC's UART.
 BAUD    = 115200
 BOARD_IP = "<board-host>"
 MAIN_RAM = 0x4000_0000     # Where the BIOS serial-boots the firmware.
+JTAG_HZ  = 30_000_000      # The FT4232H's JTAG clock for loads (Efinity's default: 6 MHz).
+DEVICE_ID = 0x006A0A79     # The Ti375's JTAG ID (the flash bridge image's name).
+FIRMWARE_FLASH_OFFSET = 0x0200_0000   # trixium_ti375.py's (the BIOS's FLASH_BOOT_ADDRESS).
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -46,27 +55,65 @@ def config():
 
 # JTAG ---------------------------------------------------------------------------------------------
 
-def load(bit):
-    """The bitstream into the FPGA's configuration memory (volatile; the flash is untouched)."""
+def _programmer():
     from litex.build.efinix.programmer import EfinixProgrammer
-    EfinixProgrammer(family="Titanium").load_bitstream(bit)
+    return EfinixProgrammer(family="Titanium")
+
+def load(bit, hz=JTAG_HZ):
+    """The bitstream into the FPGA's configuration memory (volatile), at `hz` (6 MHz retried)."""
+    prog = _programmer()
+    cmd  = prog._load_bitstream_command(bit)
+    for f in ([hz, 6_000_000] if hz != 6_000_000 else [hz]):
+        if subprocess.call(cmd + ["--jtag_clock_freq", str(int(f))], env=prog.env) == 0:
+            return
+    raise OSError(f"JTAG load of {bit} failed")
+
+def _hex_bytes(data, path):
+    """Efinity's flash .hex: one byte per line, upper-case hex."""
+    with open(path, "w") as f:
+        f.write("".join(f"{b:02X}\n" for b in data))
+
+def flash(build, firmware):
+    """Bitstream + firmware into the kit's configuration flash (through Efinity's JTAG bridge
+    image): at power-up the FPGA configures itself and the BIOS boots the firmware (flashboot,
+    LiteX's FBI: length + CRC-32 + the binary). The FPGA runs the bridge image afterwards:
+    reload the bitstream (`load`) or power-cycle."""
+    import tempfile
+    from litex.soc.software.crcfbigen import insert_crc
+    hexf = os.path.join(build, "gateware", "efinix_ti375_c529_dev_kit.hex")
+    if not os.path.exists(hexf):
+        raise SystemExit(f"{hexf} missing (the build's flash image)")
+    prog = _programmer()
+    with tempfile.TemporaryDirectory() as d:
+        fbi = os.path.join(d, "firmware.fbi")
+        insert_crc(firmware, fbi_mode=True, o_filename=fbi, little_endian=True)
+        fw_hex = os.path.join(d, "firmware.hex")
+        with open(fbi, "rb") as f:
+            _hex_bytes(f.read(), fw_hex)
+        prog.flash(0, hexf, device_id=DEVICE_ID)
+        prog.flash(FIRMWARE_FLASH_OFFSET, fw_hex)
 
 # Serial Boot --------------------------------------------------------------------------------------
 
-def boot(firmware, tty=TTY, timeout=240):
-    """The firmware through the BIOS's serial boot (litex_term in a pty, as it wants a terminal):
-    from the BIOS prompt (after `load`, once the BIOS has given up booting on its own). Returns
-    the boot transcript; raises when the firmware does not come up."""
+def boot(firmware, tty=TTY, timeout=240, bit=None):
+    """The firmware through the BIOS's serial boot (litex_term in a pty, as it wants a terminal).
+    With `bit`: litex_term is attached first, then the bitstream loaded, so it answers the BIOS's
+    serial boot as soon as the BIOS starts (no wait, and a firmware in the flash cannot boot
+    instead); without, from the BIOS prompt. Returns the boot transcript; raises when the
+    firmware does not come up."""
     import pexpect
     c = pexpect.spawn(f"{sys.executable} -m litex.tools.litex_term {tty} --speed {BAUD} "
                       f"--kernel {firmware} --kernel-adr {MAIN_RAM:#x}",
                       encoding="utf-8", codec_errors="replace", timeout=timeout)
     log = []
     try:
-        time.sleep(2)
-        c.send("\r")
-        time.sleep(0.5)
-        c.send("serialboot\r")
+        time.sleep(1)
+        if bit:
+            load(bit)
+        else:
+            c.send("\r")
+            time.sleep(0.5)
+            c.send("serialboot\r")
         i = c.expect([r"TRIXIUM-READY", pexpect.TIMEOUT, pexpect.EOF], timeout=timeout)
         log.append(c.before or "")
         if i != 0:
@@ -118,6 +165,61 @@ def ping(ip=BOARD_IP, iface=None):
     cmd = ["ping", "-c", "2", "-W", "1"] + (["-I", iface] if iface else []) + [ip]
     return subprocess.run(cmd, capture_output=True).returncode == 0
 
+# Model --------------------------------------------------------------------------------------------
+
+# ctrl_scratch (LiteX's SoC scratch register) resets with the SoC (power-up, a bitstream load, the
+# reset button): an upload leaves a random tag in it and in its host record, and a later start
+# finds the weights still in the DRAM when both still agree (the same image, file unchanged).
+SCRATCH_RESET = 0x12345678
+
+def image_id(image):
+    st = os.stat(image)
+    return dict(image=os.path.realpath(image), bytes=st.st_size, mtime=int(st.st_mtime))
+
+def ensure_model(image, csr_csv=None, force=False, verbose=False):
+    """The weights of `image` on the kit: uploaded over UDP (each transfer CRC-checked on the
+    builds with the port's CRC) unless the kit still holds them, then `hdrload`. Returns
+    (uploaded, seconds)."""
+    from litex.tools.litex_client import RemoteClient
+    from software.host.ebsmi import state_read, state_write
+    from software.host.udpload import UDPLink, upload
+    from software.host.console import run as console_run
+    import random
+    tty, ip, iface = config()
+    csr_csv = csr_csv or loaded_csr_csv()
+    server  = None
+    try:
+        socket.create_connection(("localhost", 1234), timeout=0.5).close()
+    except OSError:
+        server = start_server(ip, iface)
+    t0 = time.time()
+    uploaded = False
+    try:
+        bus = RemoteClient(csr_csv=csr_csv)
+        bus.open()
+        rec = state_read("load") or {}
+        same = (not force and rec.get("board") == "ti375" and rec.get("tag")
+                and bus.regs.ctrl_scratch.read() == rec["tag"]
+                and {k: rec.get(k) for k in ("image", "bytes", "mtime")} == image_id(image))
+        if not same:
+            bus.regs.ctrl_scratch.write(SCRATCH_RESET)     # Invalid while the weights change.
+            n, resent = upload(bus, UDPLink(ip, iface=iface), image, verbose=verbose)
+            tag = random.randrange(1, 1 << 32)
+            while tag == SCRATCH_RESET:
+                tag = random.randrange(1, 1 << 32)
+            bus.regs.ctrl_scratch.write(tag)
+            state_write("load", board="ti375", tag=tag, csr_csv=csr_csv, time=int(time.time()),
+                        **image_id(image), build=os.path.basename(os.path.dirname(csr_csv)))
+            uploaded = True
+        bus.close()
+    finally:
+        if server:
+            server.kill()
+    out = console_run(["hdrload"], tty, wait=20, until="inference ready", baud=BAUD)
+    if "inference ready" not in out:
+        raise RuntimeError("hdrload failed:\n" + out[-800:])
+    return uploaded, time.time() - t0
+
 # Status -------------------------------------------------------------------------------------------
 
 def loaded_csr_csv():
@@ -164,6 +266,10 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("load");   p.add_argument("bit")
     p = sub.add_parser("boot");   p.add_argument("firmware"); p.add_argument("--tty", default=TTY)
+    p.add_argument("--bit", default=None, help="Load this bitstream first (litex_term already attached).")
+    p = sub.add_parser("flash");  p.add_argument("build"); p.add_argument("firmware")
+    p = sub.add_parser("model");  p.add_argument("image"); p.add_argument("--csr-csv", default=None)
+    p.add_argument("--force", action="store_true", help="Upload even when the kit holds the image.")
     p = sub.add_parser("server"); p.add_argument("--ip", default=BOARD_IP); p.add_argument("--iface", default=None)
     p = sub.add_parser("smi");    p.add_argument("--csr-csv", default=None); p.add_argument("-i", default=0.25, type=float, dest="interval")
     p.add_argument("-w", default=0.0, type=float, dest="watch"); p.add_argument("--json", action="store_true")
@@ -171,7 +277,12 @@ def main(argv=None):
     if args.cmd == "load":
         load(args.bit)
     elif args.cmd == "boot":
-        print(boot(args.firmware, args.tty))
+        print(boot(args.firmware, args.tty, bit=args.bit))
+    elif args.cmd == "flash":
+        flash(args.build, args.firmware)
+    elif args.cmd == "model":
+        uploaded, dt = ensure_model(args.image, args.csr_csv, args.force, verbose=True)
+        print(f"{'uploaded' if uploaded else 'already on the kit'}, ready in {dt:.1f} s")
     elif args.cmd == "smi":
         smi(args.csr_csv, args.interval, args.watch, args.json)
     else:

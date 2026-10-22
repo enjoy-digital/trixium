@@ -11,6 +11,7 @@ memory ends up holding the image at wbload's placement, and losses are resent.""
 import os
 import random
 import types
+import zlib
 
 import pytest
 
@@ -21,8 +22,9 @@ IMAGE = "models/tiny/bonsai-tiny-hybrid-1k-t5-n2.img"
 
 
 class Board:
-    def __init__(self, consts, drop=0.0, reorder=0.0, seed=1):
+    def __init__(self, consts, drop=0.0, reorder=0.0, seed=1, crc=False, corrupt_once=False):
         self.constants = types.SimpleNamespace(d=consts)
+        self.corrupt_once = corrupt_once
         self.rng, self.drop, self.reorder = random.Random(seed), drop, reorder
         self.mem, self.expected, self.armed, self.held = {}, 0, None, []
         board = self
@@ -38,6 +40,8 @@ class Board:
             def read(self):
                 if self.name == "udpload_expected":
                     return board.expected
+                if self.name == "udpload_crc":          # The forwarded bytes since the restart.
+                    return zlib.crc32(board.armed["data"]) if board.armed else 0
                 if self.name == "trixium_loader_status":
                     a = board.armed
                     return 1 if a and len(a["data"]) >= 32*a["length"] else 0
@@ -46,6 +50,8 @@ class Board:
         self.regs = types.SimpleNamespace(**{f"trixium_loader_{n}": Reg(f"trixium_loader_{n}") for n in names},
                                           udpload_restart=Reg("udpload_restart"),
                                           udpload_expected=Reg("udpload_expected"))
+        if crc:
+            self.regs.udpload_crc = Reg("udpload_crc")
 
     def send(self, seq, payload):                # The link, then the port.
         if self.rng.random() < self.drop:
@@ -55,6 +61,9 @@ class Board:
             return
         for s, p in [(seq, payload)] + [self.held.pop(0)] if self.held and self.rng.random() < 0.5 else [(seq, payload)]:
             if s == self.expected and len(p) % 32 == 0 and p:
+                if self.corrupt_once:                   # One payload byte flipped on the way in.
+                    p = bytes([p[0] ^ 1]) + p[1:]
+                    self.corrupt_once = False
                 a = self.armed
                 a["data"] += p
                 self.expected += 1
@@ -75,3 +84,16 @@ def test_upload_over_a_lossy_link(drop, reorder):
     for c in range(h["n_channels"]):
         assert board.mem[(c, 0x00C0_0000)] == bytes(img.channel_payload(c))
     assert (resent > 0) == (drop > 0)
+
+
+@pytest.mark.skipif(not os.path.exists(IMAGE), reason="tiny image not generated (cli models --tiny)")
+def test_crc_catches_a_corrupted_transfer():
+    board = Board(dict(trixium_chan_weight_base=0x00C0_0000, trixium_chan_stride=0x0080_0000,
+                       trixium_loader_adds_chan_offset=1, trixium_n_channels=2),
+                  crc=True, corrupt_once=True)
+    udpload.upload(board, board, IMAGE, beats_per_datagram=32, window=16)
+    img = BONSReader(IMAGE); h = img.header
+    meta = bytes(img.data[:h["payload_offset"]])        # The corrupted transfer, resent.
+    assert board.mem[(0, 0x00C0_0000 - wbload.HDR_STAGING_BELOW)][:len(meta)] == meta
+    for c in range(h["n_channels"]):
+        assert board.mem[(c, 0x00C0_0000)] == bytes(img.channel_payload(c))

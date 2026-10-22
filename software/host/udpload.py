@@ -11,7 +11,9 @@ window); the loader is armed through its CSRs (Etherbone: LiteX's RemoteClient),
 datagrams `[seq, payload]` of `beats_per_datagram` 256-bit beats to the board's upload port. The
 port forwards only the next expected datagram, so the host sends a window ahead, reads the
 port's `expected` back, and resends from there whatever was lost; the loader's `done` closes each
-transfer.
+transfer. Builds with the port's `crc` check every transfer as it lands (zlib's CRC-32 of the
+bytes sent against the port's, a mismatch resends the transfer): no read-back, no `imgcheck`
+needed on the way; the datagram size is the port's `max_beats` (32 on builds without it).
 
   litex_server --udp --udp-ip <board-host>
   python3 -m software.host.udpload --csr-csv build/<name>/csr.csv --board-ip <board-host> image.img
@@ -22,6 +24,7 @@ import socket
 import struct
 import sys
 import time
+import zlib
 
 from software.host.wbload import BEAT_BYTES, CHUNK_BEATS, HDR_STAGING_BELOW, constants, wait_done
 from model.bons import BONSReader
@@ -50,49 +53,80 @@ def port_status(regs):
     return st
 
 
-def transfer(bus, link, chan, base, data, beats_per_datagram=32, window=64, verbose=False, stall_s=5.0):
-    """One channel's bytes to `base`, in 128 MB armed transfers; returns the datagrams resent."""
+class CRCError(RuntimeError):
+    pass
+
+
+def transfer(bus, link, chan, base, data, beats_per_datagram=None, window=64, verbose=False,
+             stall_s=5.0, retries=3):
+    """One channel's bytes to `base`, in 128 MB armed transfers, each checked by the port's CRC
+    when the build has it (a mismatch resends it, up to `retries` times); returns the datagrams
+    resent."""
     regs   = bus.regs
+    if beats_per_datagram is None:
+        beats_per_datagram = regs.udpload_max_beats.read() if hasattr(regs, "udpload_max_beats") else 32
     data   = bytes(data) + bytes(-len(data) % BEAT_BYTES)
     beats  = len(data)//BEAT_BYTES
-    dgram  = beats_per_datagram*BEAT_BYTES
     resent = 0
     done   = 0
+    tries  = 0
     while done < beats:
         n = min(beats - done, CHUNK_BEATS)
         chunk = data[done*BEAT_BYTES:(done + n)*BEAT_BYTES]
-        count = (len(chunk) + dgram - 1)//dgram
-        regs.trixium_loader_src_sel.write(0)
-        regs.trixium_loader_chan.write(chan)
-        regs.trixium_loader_base.write(base + done*BEAT_BYTES)
-        regs.trixium_loader_length.write(n)
-        regs.trixium_loader_resync.write(0)
-        regs.udpload_restart.write(0)
-        regs.trixium_loader_start.write(1)
-        sent, last = 0, -1
-        progress = time.time()
-        while True:
-            expected = regs.udpload_expected.read()
-            if expected >= count:
-                break
-            if expected != last:
-                progress = time.time()
-            elif time.time() - progress > stall_s:
-                raise RuntimeError(f"chan {chan}: no datagram accepted for {stall_s:.0f} s at "
-                    f"{expected}/{count}: {port_status(regs)}")
-            if expected == last and sent > expected:   # No progress: the rest was lost.
-                resent += sent - expected
-                sent = expected
-            last = expected
-            stop = min(count, expected + window)
-            while sent < stop:
-                link.send(sent, chunk[sent*dgram:(sent + 1)*dgram])
-                sent += 1
-            time.sleep(0.0005)
-        wait_done(bus, chan, base + done*BEAT_BYTES, n)
+        resent += _send_chunk(bus, link, chan, base + done*BEAT_BYTES, chunk, beats_per_datagram,
+                              window, stall_s)
+        if hasattr(regs, "udpload_crc"):
+            got, want = regs.udpload_crc.read(), zlib.crc32(chunk)
+            if got != want:
+                tries += 1
+                if tries > retries:
+                    raise CRCError(f"chan {chan}: CRC {got:08x}, want {want:08x} after {retries} resends")
+                if verbose:
+                    print(f"    chan {chan}: CRC {got:08x} != {want:08x}, resending", file=sys.stderr)
+                continue
+        tries = 0
         done += n
         if verbose:
             print(f"    chan {chan}: {done}/{beats} beats, {resent} datagrams resent", file=sys.stderr)
+    return resent
+
+
+def _send_chunk(bus, link, chan, base, chunk, beats_per_datagram, window, stall_s):
+    """One armed transfer (<= 128 MB): its datagrams until the port expects no more, then the
+    loader's done; returns the datagrams resent."""
+    regs   = bus.regs
+    dgram  = beats_per_datagram*BEAT_BYTES
+    n      = len(chunk)//BEAT_BYTES
+    resent = 0
+    count  = (len(chunk) + dgram - 1)//dgram
+    regs.trixium_loader_src_sel.write(0)
+    regs.trixium_loader_chan.write(chan)
+    regs.trixium_loader_base.write(base)
+    regs.trixium_loader_length.write(n)
+    regs.trixium_loader_resync.write(0)
+    regs.udpload_restart.write(0)
+    regs.trixium_loader_start.write(1)
+    sent, last = 0, -1
+    progress = time.time()
+    while True:
+        expected = regs.udpload_expected.read()
+        if expected >= count:
+            break
+        if expected != last:
+            progress = time.time()
+        elif time.time() - progress > stall_s:
+            raise RuntimeError(f"chan {chan}: no datagram accepted for {stall_s:.0f} s at "
+                f"{expected}/{count}: {port_status(regs)}")
+        if expected == last and sent > expected:   # No progress: the rest was lost.
+            resent += sent - expected
+            sent = expected
+        last = expected
+        stop = min(count, expected + window)
+        while sent < stop:
+            link.send(sent, chunk[sent*dgram:(sent + 1)*dgram])
+            sent += 1
+        time.sleep(0.0005)
+    wait_done(bus, chan, base, n)
     return resent
 
 

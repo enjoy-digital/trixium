@@ -226,6 +226,23 @@ def cmd_chat(args):
         flags += ["-s", str(args.seed)]
     if args.system:
         flags += ["-y", args.system]
+    if args.board == "ti375":
+        # No PCIe: the weights go over Ethernet before the chat starts, only when the kit does not
+        # hold them already (software/host/ti375.py ensure_model; the firmware boots from the
+        # kit's flash, or `trixium deploy --board ti375` loaded it).
+        from software.host import ti375
+        from software.host.console import run as console_run
+        image = args.image or os.path.join(REPO, "models", "bons", "bonsai2-2b-n4-ti375.img")
+        if args.firmware:
+            sys.exit("--board ti375: the firmware boots from the kit's flash (or trixium deploy --board ti375)")
+        if "trixium>" not in console_run([""], tty, wait=3, baud=ti375.BAUD):
+            sys.exit(f"no TriXium firmware answers on {tty}: power the kit (flash boot) or "
+                     "trixium deploy --board ti375")
+        if not args.no_load:
+            uploaded, dt = ti375.ensure_model(image, force=args.reload)
+            print(f"[ti375] {os.path.basename(image)} {'uploaded' if uploaded else 'already on the kit'}, "
+                  f"ready in {dt:.1f} s", flush=True)
+        args.image = None
     if args.firmware:
         flags += ["-k", args.firmware]
     if args.image:
@@ -351,7 +368,9 @@ def main(argv=None):
     p.add_argument("--remote",         action="store_true",     help="Run the chat on a lab board host over ssh (boards.ini).")
     p.add_argument("--board",          default="xcu1525",       help="Lab board of --remote (a boards.ini section); ti375: the Efinix kit on this machine's serial port.")
     p.add_argument("-k", "--firmware",                          help="Boot this firmware first (trixium.bin).")
-    p.add_argument("-m", "--image",                             help="Upload this weight image first.")
+    p.add_argument("-m", "--image",                             help="Upload this weight image first (--board ti375: the image, over Ethernet unless already there).")
+    p.add_argument("--reload",         action="store_true",     help="--board ti375: upload the weights even when the kit holds them.")
+    p.add_argument("--no-load",        action="store_true",     help="--board ti375: chat with whatever the kit holds.")
     p.set_defaults(fn=cmd_chat)
 
     # Console.

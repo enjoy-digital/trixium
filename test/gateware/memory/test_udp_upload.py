@@ -9,6 +9,8 @@ sequence number passes, whole; gaps, duplicates, partial beats and oversized dat
 dropped and counted; the output is the accepted payloads in order, under back-pressure."""
 
 import random
+import struct
+import zlib
 from types import SimpleNamespace
 
 from migen import *
@@ -65,10 +67,51 @@ def test_only_the_expected_datagram_passes():
         state["expected"] = (yield dut.expected.status)
         state["dropped"]  = (yield dut.dropped.status)
         state["accepted"] = (yield dut.accepted.status)
+        state["crc"]      = (yield dut.crc.status)
 
     run_simulation(dut, [sender(), receiver()])
     assert got == want, f"{len(got)} words out, {len(want)} wanted"
+    # The CRC covers exactly the forwarded payload, as the host computes it.
+    crc = state.pop("crc")
+    assert crc == zlib.crc32(struct.pack(f"<{len(want)}I", *want)), f"crc {crc:08x}"
     assert state == {"expected": 3, "dropped": 5, "accepted": 3}, state
+
+
+def test_crc_restarts_with_the_transfer():
+    port = SimpleNamespace(source=stream.Endpoint(eth_udp_user_description(32)))
+    dut  = UDPUpload(port, max_beats=2, out_dw=128)
+    rng  = random.Random(5)
+    a = [rng.getrandbits(32) for _ in range(16)]
+    b = [rng.getrandbits(32) for _ in range(8)]
+    crcs = []
+
+    def send(seq, words):
+        for k, w in enumerate([seq] + words):
+            yield port.source.data.eq(w)
+            yield port.source.last.eq(k == len(words))
+            yield port.source.valid.eq(1)
+            yield
+        yield port.source.valid.eq(0)
+
+    def gen():
+        yield dut.source.ready.eq(1)
+        yield from send(0, a)
+        for _ in range(60): yield
+        crcs.append((yield dut.crc.status))
+        yield dut.restart.storage.eq(0)          # A new transfer: the CRC starts over.
+        yield dut.restart.re.eq(1)
+        yield
+        yield dut.restart.re.eq(0)
+        yield
+        crcs.append((yield dut.crc.status))
+        yield from send(0, b)
+        for _ in range(60): yield
+        crcs.append((yield dut.crc.status))
+        crcs.append((yield dut.max_beats.status))
+
+    run_simulation(dut, gen())
+    assert crcs == [zlib.crc32(struct.pack("<16I", *a)), 0, zlib.crc32(struct.pack("<8I", *b)), 2], \
+        [hex(c) for c in crcs]
 
 
 def test_never_backpressures_the_udp_rx():

@@ -22,6 +22,11 @@ The port never back-pressures the UDP RX path (it is LiteEth's, shared with Ethe
 there stops the CSR link too): a datagram that does not fit, while the loader drains earlier ones,
 is dropped and resent like a lost one. `last_seq`/`last_words`/`last_flags` describe the last
 datagram received (bring-up: why datagrams are refused).
+
+`crc` is the CRC-32 (IEEE 802.3, zlib's) of every payload byte forwarded to the loader since the
+last `restart`, the words taken little-endian: the host compares it with zlib.crc32 of the bytes
+it sent, so a transfer is checked as it lands, without reading the memory back. `max_beats`
+tells the host the largest datagram the port stages.
 """
 
 from migen import *
@@ -30,6 +35,8 @@ from litex.gen import *
 
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import CSRStorage, CSRStatus, CSR
+
+from liteeth.mac.crc import LiteEthMACCRCEngine
 
 # UDPUpload ----------------------------------------------------------------------------------------
 
@@ -43,6 +50,8 @@ class UDPUpload(LiteXModule):
         self.expected = CSRStatus(32,  description="The next expected sequence number.")
         self.dropped  = CSRStatus(32,  description="Datagrams dropped (sequence, size).")
         self.accepted = CSRStatus(32,  description="Datagrams forwarded to the loader.")
+        self.crc      = CSRStatus(32,  description="CRC-32 (zlib's) of the payload forwarded since the last restart.")
+        self.max_beats = CSRStatus(16, reset=max_beats, description="The largest datagram payload, in 256-bit beats.")
 
         # # #
 
@@ -157,6 +166,20 @@ class UDPUpload(LiteXModule):
             verdicts.source.ready.eq(~busy & verdicts.source.valid & counts.source.valid),
             counts.source.ready.eq(~busy & verdicts.source.valid & counts.source.valid),
         ]
+        # The forwarded words' CRC (IEEE 802.3: LiteEth's engine, the MAC's), restarted with the
+        # transfer.
+        self.crcgen = crcgen = LiteEthMACCRCEngine(data_width=32, width=32, polynom=0x04c11db7)
+        crc_reg = Signal(32, reset=0xffffffff)
+        self.comb += [
+            crcgen.data.eq(fifo.source.data),
+            crcgen.crc_prev.eq(crc_reg),
+            self.crc.status.eq(crc_reg[::-1] ^ 0xffffffff),
+        ]
+        self.sync += If(self.restart.re,
+            crc_reg.eq(0xffffffff),
+        ).Elif(conv.sink.valid & conv.sink.ready,
+            crc_reg.eq(crcgen.crc_next),
+        )
         self.sync += [
             If(~busy & verdicts.source.valid & counts.source.valid,
                 busy.eq(counts.source.n != 0),

@@ -51,6 +51,9 @@ from litex.soc.interconnect.csr import CSRStatus
 from trixium_ypcb import YPCB_HYBRID_UNIT_OPTIONS, YPCB_LITE_UNIT_OPTIONS, YPCB_LITE_ATTN, VEXII_ARGS
 
 UPLOAD_PORT = 2345   # software/host/udpload.py
+# The firmware's place in the kit's configuration flash (IS25WP512M, 64 MB): above the bitstream
+# (~7 MB), as LiteX's flashboot image (length + CRC + the binary: crcfbigen).
+FIRMWARE_FLASH_OFFSET = 0x0200_0000
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -84,7 +87,7 @@ class _CRG(LiteXModule):
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
                  eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 1024), dn_sublanes=0,
-                 ddr_targets=1, no_core=False, **kwargs):
+                 ddr_targets=1, with_spi_flash=False, upload_beats=32, no_core=False, **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
         # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
         idle_channels = 0
@@ -114,7 +117,21 @@ class TriXiumTi375SoC(SoCCore):
         # the upload port in the SoC's sys clock domain (cd="etherbone").
         self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, data_width=32, with_timing_constraints=False)
         udp_port = self.ethcore_etherbone.udp.crossbar.get_port(UPLOAD_PORT, dw=32, cd="etherbone")
-        self.udpload = UDPUpload(udp_port, max_beats=32, out_dw=128)
+        # upload_beats: the largest datagram (45 beats = 1,440 bytes + the sequence word fit a
+        # 1,500-byte MTU's UDP payload; 32 before).
+        self.udpload = UDPUpload(udp_port, max_beats=upload_beats, out_dw=128)
+
+        # The configuration flash: the BIOS boots the firmware from it (flashboot) when no host
+        # answers its serial boot first - power up and the firmware runs (software/host/ti375.py
+        # flash writes bitstream + firmware). The SDR PHY (1:1): the firmware's 226 KB copy in
+        # tens of milliseconds at quad SPI, no DDR I/O to time.
+        if with_spi_flash:
+            from litespi.modules import IS25WP512M
+            from litespi.opcodes import SpiNorFlashOpCodes as Codes
+            self.add_spi_flash(mode="4x", clk_freq=50e6, number=0,
+                               module=IS25WP512M(Codes.READ_1_1_4_4B), with_master=True, rate="1:1")
+            self.add_constant("FLASH_BOOT_ADDRESS",
+                              self.bus.regions["spiflash"].origin + FIRMWARE_FLASH_OFFSET)
 
         # Memory: the hard controller's port, shared --------------------------------------------
         # EfinixDDR's own AXI ID width (the controller's 6 bits): litex-boards' ddr_config pinned 8
@@ -249,6 +266,8 @@ def main():
     parser.add_target_argument("--prefetch",        default=256,   type=int,   help="Reader FIFO beats (0: no prefetch).")
     parser.add_target_argument("--dn-sublanes",     default=1,     type=int,   help="DeltaNet stream sub-lanes per channel (1 at 4 channels: width 4).")
     parser.add_target_argument("--ddr-targets",     default=1,     type=int, choices=[1, 2], help="The DDR controller's AXI targets the channels use (2: twice the port bandwidth).")
+    parser.add_target_argument("--with-spi-flash",  action="store_true",       help="The configuration flash on the bus: the BIOS boots the firmware from it.")
+    parser.add_target_argument("--upload-beats",    default=32,    type=int,   help="UDP upload datagram payload in 256-bit beats (45 fills a 1,500 MTU).")
     parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--attn-t-max",      default=1024,  type=int,   help="Attention stream context positions.")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
@@ -260,7 +279,8 @@ def main():
     soc = TriXiumTi375SoC(sys_clk_freq=args.sys_clk_freq, engine_channels=args.engine_channels,
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
                           dn_sublanes=args.dn_sublanes, attn_geometry=YPCB_LITE_ATTN + (256, args.attn_t_max),
-                          ddr_targets=args.ddr_targets, no_core=args.no_core,
+                          ddr_targets=args.ddr_targets, with_spi_flash=args.with_spi_flash,
+                          upload_beats=args.upload_beats, no_core=args.no_core,
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:

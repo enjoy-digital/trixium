@@ -472,7 +472,7 @@ class Local(Remote):
         Remote.__init__(self, {"target": "local", "dir": REPO}, dry_run)
 
 
-def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firmware=None):
+def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firmware=None, check=False):
     """The kit's sequence: firmware, the bitstream archived and loaded volatile over JTAG, the
     serial boot, the weights over UDP (software/host/udpload.py), hdrload + imgcheck, tokens
     before numbers, bench. ~/.config/trixium/boards.ini [ti375] (or TRIXIUM_TI375_<KEY>): tty
@@ -506,15 +506,13 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
     # shared firmware/), for this build's CSR map.
     firmware = firmware or build_firmware(local, out)
     if reconfigure:
-        say("bitstream: archive + JTAG load (volatile, the flash untouched)")
+        say("bitstream (JTAG, volatile) + serial boot")
         archive = os.path.join(REPO, "build", "archive")
         os.makedirs(archive, exist_ok=True)
         shutil.copy(bit, os.path.join(archive, f"{name}.bit"))
-        ti375.load(bit)
-        time.sleep(8)                   # The BIOS: memtest, then it gives up booting on its own.
-    if reconfigure:
-        say("serial boot")
-        boot = ti375.boot(firmware, tty)
+        # litex_term attached before the load answers the BIOS's serial boot at once (and ahead
+        # of a firmware in the flash).
+        boot = ti375.boot(firmware, tty, bit=bit)
         print("\n".join(l for l in boot.splitlines() if l.startswith(("TriXium", "BONS", "SPTEST", "hybrid: emb"))))
     else:
         # --no-reconfigure: the firmware already running (the BIOS's serial boot needs its prompt:
@@ -525,27 +523,17 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
     if not ti375.ping(ip, iface):
         raise DeployError(f"the board does not answer at {ip}")
     say("weights over UDP")
-    srv = ti375.start_server(ip, iface)
-    try:
-        from litex.tools.litex_client import RemoteClient
-        from software.host.udpload import UDPLink, upload
-        bus = RemoteClient(csr_csv=os.path.join(out, "csr.csv"))
-        bus.open()
-        t0 = time.time()
-        n, resent = upload(bus, UDPLink(ip, iface=iface), image)
-        print(f"{n/1e6:.1f} MB in {time.time() - t0:.1f} s, {resent} datagrams resent")
-        bus.close()
-    finally:
-        srv.kill()
-    out_txt = console_run(["hdrload", "imgcheck"], tty, wait=300, until=" bad", baud=ti375.BAUD)   # the summary line's end: "imgcheck: ... N bad"
-    print("\n".join(l for l in out_txt.splitlines() if l.startswith(("hdrload", "imgcheck"))))
-    if "inference ready" not in out_txt or " 0 bad" not in out_txt:
-        raise DeployError("header or weights wrong on the board - refusing to go on")
-    if not dry_run:
-        # For `trixium smi --board ti375`: the weights and the build whose csr.csv maps the kit.
-        from software.host.ebsmi import state_write
-        state_write("load", board="ti375", image=os.path.realpath(image), bytes=os.path.getsize(image),
-                    build=name, csr_csv=os.path.join(out, "csr.csv"), time=int(time.time()))
+    # The upload (each transfer CRC-checked on builds with the port's CRC), the host's load record
+    # (smi, `trixium chat --board ti375`'s skip), hdrload.
+    csr_csv = os.path.join(out, "csr.csv")
+    _, dt = ti375.ensure_model(image, csr_csv, force=True)
+    print(f"{os.path.getsize(image)/1e6:.1f} MB uploaded, ready in {dt:.1f} s")
+    if check or "udpload_crc" not in open(csr_csv).read():
+        # The deep check: every tensor fetched back and its CRC compared (~7 min on the CPU).
+        out_txt = console_run(["imgcheck"], tty, wait=900, until=" bad", baud=ti375.BAUD)   # "imgcheck: ... N bad"
+        print("\n".join(l for l in out_txt.splitlines() if l.startswith("imgcheck")))
+        if " 0 bad" not in out_txt:
+            raise DeployError("weights wrong on the board - refusing to go on")
     say(f"tokens first - want: {want} ...")
     out_txt = console_run([f"gen 8 {prompt}"], tty, wait=timeout, until="GEN DONE", baud=ti375.BAUD)
     got = next((l[4:].strip() for l in out_txt.splitlines() if l.startswith("GEN:")), "")
@@ -568,6 +556,7 @@ def add_arguments(parser):
     parser.add_argument("--approval",            default="ddr4-overclock",                    help="XCU1525 timing gate approval (software/lab/timing.py; '' for none).")
     parser.add_argument("--serializer-baseline", default="v8",                                   help="XCU1525 timing gate serializer baseline.")
     parser.add_argument("--bench",               type=int,                                       help="bench n (default: per model).")
+    parser.add_argument("--check",               action="store_true",                            help="--board ti375: imgcheck after the upload (the deep check; builds with the upload CRC skip it).")
     parser.add_argument("--dry-run",             action="store_true",                            help="Print every command, run nothing.")
     parser.add_argument("--firmware",            default=None,                                   help="Ti375: ship this firmware binary (built for the build's CSR map) instead of building one.")
 
@@ -576,7 +565,7 @@ def run(args):
     try:
         if args.board == "ti375":
             return deploy_ti375(args.build or args.board, args.model, not args.no_reconfigure,
-                                args.dry_run, args.bench, args.firmware)
+                                args.dry_run, args.bench, args.firmware, args.check)
         return deploy(args.build or args.board, args.board, args.model,
             reconfigure         = not args.no_reconfigure,
             boot                = args.boot,
