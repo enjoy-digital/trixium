@@ -87,7 +87,7 @@ class _CRG(LiteXModule):
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
                  eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 1024), dn_sublanes=0,
-                 ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, no_core=False, **kwargs):
+                 ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, with_softmax=False, no_core=False, **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
         # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
         idle_channels = 0
@@ -227,7 +227,7 @@ class TriXiumTi375SoC(SoCCore):
                         (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3]))))
         units.update(YPCB_HYBRID_UNIT_OPTIONS)
         if profile == "lite":
-            units.update(YPCB_LITE_UNIT_OPTIONS, with_softmax=False)
+            units.update(YPCB_LITE_UNIT_OPTIONS, with_softmax=with_softmax)
         # The attention stream's operand memories in block RAM (Efinix has no distributed RAM: an
         # asynchronous read became 131k flip-flops).
         units["attnstream_options"] = units["attnstream_options"] + (("sync_operand", True),)
@@ -278,6 +278,7 @@ def main():
     parser.add_target_argument("--with-spi-flash",  action="store_true",       help="The configuration flash on the bus: the BIOS boots the firmware from it.")
     parser.add_target_argument("--upload-beats",    default=32,    type=int,   help="UDP upload datagram payload in 256-bit beats (45 fills a 1,500 MTU).")
     parser.add_target_argument("--chan-skew",       default=0,     type=lambda x: int(x, 0), help="Per-channel window offset in bytes (DRAM bank spreading; 4 KB multiple).")
+    parser.add_target_argument("--with-softmax",    action="store_true",       help="Lite profile: keep the attention softmax unit (the CPU's softmax is ~half the attention at long context).")
     parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--attn-t-max",      default=1024,  type=int,   help="Attention stream context positions.")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
@@ -290,7 +291,8 @@ def main():
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
                           dn_sublanes=args.dn_sublanes, attn_geometry=YPCB_LITE_ATTN + (256, args.attn_t_max),
                           ddr_targets=args.ddr_targets, with_spi_flash=args.with_spi_flash,
-                          upload_beats=args.upload_beats, chan_skew=args.chan_skew, no_core=args.no_core,
+                          upload_beats=args.upload_beats, chan_skew=args.chan_skew, with_softmax=args.with_softmax,
+                          no_core=args.no_core,
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:
