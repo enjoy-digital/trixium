@@ -133,6 +133,9 @@ class TriXiumTi375SoC(SoCCore):
                                module=IS25WP512M(Codes.READ_1_1_4_4B), with_master=True, rate="1:1")
             self.add_constant("FLASH_BOOT_ADDRESS",
                               self.bus.regions["spiflash"].origin + FIRMWARE_FLASH_OFFSET)
+            # The BIOS's clock calibration reads one block at faster divisors and keeps the fastest
+            # whose CRC matches: the sporadic DQ3 errors pass it at 50 MHz. Keep the 25 MHz.
+            self.add_constant("SPIFLASH_SKIP_FREQ_INIT")
 
         # Memory: the hard controller's port, shared --------------------------------------------
         # EfinixDDR's own AXI ID width (the controller's 6 bits): litex-boards' ddr_config pinned 8

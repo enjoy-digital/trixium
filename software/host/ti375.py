@@ -60,15 +60,55 @@ def _programmer():
     from litex.build.efinix.programmer import EfinixProgrammer
     return EfinixProgrammer(family="Titanium")
 
+def kit_usb():
+    """(bus, address) of the kit's FT4232H, found by its USB product string: other FTDI devices on
+    the machine (without serial numbers, the kit's has none either) must not be programmed."""
+    import glob
+    for d in glob.glob("/sys/bus/usb/devices/*"):
+        try:
+            if "Ti375" in open(os.path.join(d, "product")).read():
+                return int(open(os.path.join(d, "busnum")).read()), int(open(os.path.join(d, "devnum")).read())
+        except OSError:
+            continue
+    raise RuntimeError("no Ti375 kit on USB")
+
+def _efx(args, prog=None):
+    """Efinity's ftdi_program.py with only the kit visible (software/host/efx_select.py)."""
+    prog = prog or _programmer()
+    bus, address = kit_usb()
+    cmd = [prog.efinity_path + "/bin/python3", os.path.join(REPO, "software", "host", "efx_select.py"),
+           str(bus), str(address), prog.efinity_path + "/pgm/bin/efx_pgm/ftdi_program.py"] + args
+    r = subprocess.run(cmd, env=prog.env, capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    return r
+
+def _openfpgaloader():
+    """openFPGALoader with the Ti375 (>= 1.2: build/tools/ first, then PATH), or None."""
+    import shutil
+    for exe in (os.path.join(REPO, "build", "tools", "openFPGALoader"), shutil.which("openFPGALoader")):
+        if exe and os.path.exists(exe):
+            v = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout + \
+                subprocess.run([exe, "--version"], capture_output=True, text=True).stderr
+            m = __import__("re").search(r"v(\d+)\.(\d+)", v)
+            if m and (int(m.group(1)), int(m.group(2))) >= (1, 2):
+                return exe
+    return None
+
 def load(bit, hz=JTAG_HZ):
-    """The bitstream into the FPGA's configuration memory (volatile), at `hz` (6 MHz retried). A
-    load counts only when the programmer read the device's ID (its exit code alone does not tell)."""
-    prog = _programmer()
-    cmd  = prog._load_bitstream_command(bit)
+    """The bitstream into the FPGA's configuration memory (volatile): openFPGALoader when it knows
+    the Ti375 (~4.5 s, the kit picked by its USB bus/address), else Efinity's programmer at `hz`
+    (6 MHz retried; a load counts only when it read the device's ID: its exit code alone does not
+    tell)."""
+    bus, address = kit_usb()
+    ofl = _openfpgaloader()
+    if ofl:
+        r = subprocess.run([ofl, "-c", "efinix_jtag_ft4232", "--busdev-num", f"{bus}:{address}",
+                            "--freq", str(int(hz)), bit], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        sys.stdout.write(r.stdout + r.stderr)
     for f in ([hz, 6_000_000] if hz != 6_000_000 else [hz]):
-        r = subprocess.run(cmd + ["--jtag_clock_freq", str(int(f))], env=prog.env,
-                           capture_output=True, text=True)
-        sys.stdout.write(r.stdout)
+        r = _efx([bit, "-m", "jtag", "--jtag_clock_freq", str(int(f))])
         if r.returncode == 0 and f"{DEVICE_ID:#010X}"[2:] in r.stdout.upper():
             return
     raise OSError(f"JTAG load of {bit} failed")
@@ -95,8 +135,12 @@ def flash(build, firmware):
         fw_hex = os.path.join(d, "firmware.hex")
         with open(fbi, "rb") as f:
             _hex_bytes(f.read(), fw_hex)
-        prog.flash(0, hexf, device_id=DEVICE_ID)
-        prog.flash(FIRMWARE_FLASH_OFFSET, fw_hex)
+        # Efinity's JTAG bridge image first, then each image at its offset (verified).
+        load(prog._bridge_image_path(None, DEVICE_ID))
+        for addr, f in ((0, hexf), (FIRMWARE_FLASH_OFFSET, fw_hex)):
+            r = _efx([f, "-m", "jtag_bridge", "--address", hex(addr)], prog)
+            if r.returncode != 0 or "verify successful" not in r.stdout:
+                raise OSError(f"flash write at {addr:#x} failed")
 
 # Serial Boot --------------------------------------------------------------------------------------
 
