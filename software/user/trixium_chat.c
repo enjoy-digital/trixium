@@ -20,6 +20,11 @@
  *   trixium_chat -m models/bons/bonsai-1p7b-n8.img \
  *                -k firmware/trixium.bin              # Full bring-up, then chat.
  *   trixium_chat                                      # Attach to an already-configured card.
+ *   trixium_chat -t /dev/ttyUSB2 -z models/2b/tokenizer.bin   # A board on a serial console.
+ *
+ * Built against a gateware build without the LitePCIe driver (the Efinix Ti375 kit), it is a
+ * console-only tool (TRIXIUM_UART_ONLY): -m/-k/-U/-C refuse, the weights come from
+ * `trixium deploy`, -K serial-boots a firmware.
  */
 
 #include <ctype.h>
@@ -37,10 +42,14 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 
+#ifdef TRIXIUM_UART_ONLY
+#define MAIN_RAM_BASE 0x40000000 /* The BIOS serial-boot target (every TriXium SoC). */
+#else
 #include "soc.h"
 #include "mem.h"
 #include "csr.h"
 #include "liblitepcie.h"
+#endif
 #include "trixium_loader.h"
 
 /* Parameters */
@@ -66,6 +75,7 @@ static const char *ui(const char *seq) { return g_color ? seq : ""; }
 #define UI_RESET ui("\033[0m")
 
 static int  g_devnum;
+static const char *g_tty_name = "";
 static char g_model[48] = "Bonsai"; /* From the firmware's `info` (layers x embd). */
 static char g_short[16] = "bonsai";
 static int  g_layers;
@@ -411,6 +421,7 @@ static int tty_open(const char *path)
     struct termios t;
     if (tcgetattr(fd, &t) == 0) {
         cfmakeraw(&t);
+        cfsetspeed(&t, B115200);                  /* A serial console (LiteUART ignores it). */
         t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 1;      /* 100 ms read timeout. */
         tcsetattr(fd, TCSANOW, &t);
     }
@@ -548,6 +559,21 @@ static void chat_state(int devnum, const char *state, long tokens, double tok_s,
         "\"tok_s\": %.3f, \"ttft\": %.3f, \"time\": %ld",
         g_model, state, tokens, tok_s, ttft, (long)time(NULL));
 }
+
+#ifdef TRIXIUM_UART_ONLY
+/* No BAR0 loader on a console-only board. */
+static void uart_only(void)
+{
+    fprintf(stderr, "this trixium_chat is a console-only build (no PCIe): upload the weights with "
+                    "`trixium deploy`, boot a firmware with -K\n");
+    exit(1);
+}
+void     loader_bar_map(int devnum)               { (void)devnum; uart_only(); }
+void     loader_cpu_reset(void)                   { uart_only(); }
+void     loader_clear_staging(void)               { uart_only(); }
+uint64_t loader_upload_image(const char *p, int v) { (void)p; (void)v; uart_only(); return 0; }
+uint64_t loader_upload_firmware(const char *p)    { (void)p; uart_only(); return 0; }
+#endif
 
 /* Weight upload and fast boot, through the shared loader (trixium_loader.c) */
 /*----------------------------------------------------------------------------*/
@@ -894,12 +920,18 @@ static void model_name(const char *info)
 /* The card's SoC identifier ("TriXium on <board> ..."), read over /dev/trixiumN (no root). */
 static void card_name(int devnum, char *out, size_t n)
 {
+#ifdef TRIXIUM_UART_ONLY
+    (void)devnum;
+    snprintf(out, n, "%s", g_tty_name);
+#else
     char dev[64];
     snprintf(dev, sizeof(dev), "/dev/trixium%d", devnum);
-    snprintf(out, n, "%s", dev);
     int fd = open(dev, O_RDWR);
-    if (fd < 0)
+    if (fd < 0) {
+        snprintf(out, n, "%s", g_tty_name); /* No PCIe card: a console-only board. */
         return;
+    }
+    snprintf(out, n, "%s", dev);
     char id[256];
     for (int i = 0; i < 255; i++)
         id[i] = (char)litepcie_readl(fd, CSR_IDENTIFIER_MEM_BASE + 4*i);
@@ -911,6 +943,7 @@ static void card_name(int devnum, char *out, size_t n)
         if (sscanf(on + 4, "%63s", board) == 1)
             snprintf(out, n, "%s · %s", board, dev);
     }
+#endif
 }
 
 /* Visible width of a UTF-8 string (box drawing): colour escapes take no column. */
@@ -1085,6 +1118,7 @@ int main(int argc, char **argv)
 
     g_tty = tty_open(tty);
     if (g_tty < 0) return 1;
+    g_tty_name = tty;
 
     if (fw && fastboot(fw) < 0) return 1;
     if (fw_serial && serialboot(fw_serial) < 0) return 1;

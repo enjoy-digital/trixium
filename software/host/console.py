@@ -109,10 +109,11 @@ def main(argv=None):
     parser.add_argument("-w", "--wait",    type=float,      default=20.0,    help="Seconds to wait for each command's output.")
     parser.add_argument("--quiet-after",   type=float,      default=2.0,     help="Stop early once the SoC has been silent this long (s).")
     parser.add_argument("--until",                                           help="Wait until this literal marker is received.")
+    parser.add_argument("--baud",          type=int,        default=None,    help="A serial UART's rate (the Ti375 kit: 115200).")
     args = parser.parse_args(argv)
 
     try:
-        with Console(args.tty) as console:
+        with Console(args.tty, args.baud) as console:
             console.run(args.cmd, args.wait, args.quiet_after, args.until)
     except ConsoleBusy as e:
         sys.exit(str(e))

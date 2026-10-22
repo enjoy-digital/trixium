@@ -18,6 +18,8 @@
     trixium driver    load|unload                                # trixium.ko + liteuart.ko
     trixium chat      [--tty /dev/ttyLXU0] [-n 256]              # on the machine with the card
     trixium chat      --remote --board fk33                      # on a lab board host, over ssh
+    trixium chat      --board ti375                              # the Efinix kit on this machine's serial port
+    trixium smi       --board ti375 [-w 1]                       # its status, over Etherbone
     trixium console   "stats" "bench 64"                         # raw firmware commands
     trixium demo      --board ypcb --build ypcb                 # the README's chat + smi GIF
 
@@ -201,8 +203,23 @@ def cmd_driver(args):
     driver_main([args.action, "--dir", args.dir])
 
 
+def board_tty(args):
+    """The console tty: --tty, else the Ti375 kit's serial port (boards.ini [ti375]), else the
+    PCIe card's LiteUART."""
+    if args.tty:
+        return args.tty
+    if args.board == "ti375":
+        from software.host.ti375 import config
+        return config()[0]
+    return "/dev/ttyLXU0"
+
+
 def cmd_chat(args):
     flags = ["-n", str(args.n)]
+    tty   = board_tty(args)
+    if args.tokenizer is None:
+        # The Ti375 runs the 2B; the PCIe cards' default is the 1.7B.
+        args.tokenizer = os.path.join(REPO, "models", "2b" if args.board == "ti375" else "1.7b", "tokenizer.bin")
     if args.temp or args.top_p != 1.0 or args.repeat != 1.0:
         flags += ["-S", f"{args.temp},{args.top_p},{args.repeat}"]
     if args.seed:
@@ -222,24 +239,35 @@ def cmd_chat(args):
         tokenizer = os.path.relpath(os.path.abspath(args.tokenizer), REPO)
         if tokenizer.startswith(".."):
             sys.exit(f"--remote: {args.tokenizer} is not under the tree (the deploy copies models/<model>/tokenizer.bin).")
-        remote = (f"cd {shlex.quote(conf['dir'])} && ./user/trixium_chat -t {shlex.quote(args.tty)} "
+        remote = (f"cd {shlex.quote(conf['dir'])} && ./user/trixium_chat -t {shlex.quote(tty)} "
                   f"-z {shlex.quote(tokenizer)} " + " ".join(shlex.quote(f) for f in flags))
         os.execvp("ssh", ["ssh", "-t", conf["target"], remote])
     exe = os.path.join(REPO, "software", "user", "trixium_chat")
     if not os.path.exists(exe):
         sys.exit(f"{exe} not built: make -C software/user BUILD_DIR=../../build/<build>")
-    os.execv(exe, [exe, "-t", args.tty, "-z", args.tokenizer] + flags)
+    os.execv(exe, [exe, "-t", tty, "-z", args.tokenizer] + flags)
 
 
 def cmd_console(args):
     from software.host.console import main as console_main
-    argv = ["-t", args.tty, "-w", str(args.wait), "--quiet-after", str(args.quiet)]
+    argv = ["-t", board_tty(args), "-w", str(args.wait), "--quiet-after", str(args.quiet)]
+    if args.board == "ti375":
+        argv += ["--baud", "115200"]
     for c in args.commands:
         argv += ["-c", c]
     console_main(argv)
 
 
 def cmd_smi(args):
+    if "--board" in args:
+        # A board without PCIe: the same status over Etherbone (software/host/ebsmi.py).
+        i = args.index("--board")
+        board, rest = args[i + 1] if i + 1 < len(args) else "", args[:i] + args[i + 2:]
+        if board != "ti375":
+            sys.exit("smi --board: only ti375 (the PCIe cards: trixium smi without --board)")
+        from software.host.ti375 import main as ti375_main
+        ti375_main(["smi"] + rest)
+        sys.exit(0)
     exe = os.path.join(REPO, "software", "user", "trixium_smi")
     if not os.path.exists(exe):
         sys.exit(f"{exe} not built: make -C software/user BUILD_DIR=../../build/<build>")
@@ -311,10 +339,9 @@ def main(argv=None):
     p.set_defaults(fn=cmd_driver)
 
     # Chat.
-    tokenizer = os.path.join(REPO, "models", "1.7b", "tokenizer.bin")
     p = subparsers.add_parser("chat", help="Chat REPL on the machine with the card.")
-    p.add_argument("--tty",            default="/dev/ttyLXU0",  help="Console tty.")
-    p.add_argument("--tokenizer",      default=tokenizer,       help="tokenizer.bin.")
+    p.add_argument("--tty",            default=None,            help="Console tty (default: /dev/ttyLXU0; --board ti375: the kit's serial port).")
+    p.add_argument("--tokenizer",      default=None,            help="tokenizer.bin (default: the 1.7B's; --board ti375: the 2B's).")
     p.add_argument("-n",               default=256, type=int,   help="Reply cap in tokens (replies end at <|im_end|>).")
     p.add_argument("--temp",           default=0.0, type=float, help="Sampling temperature (0 = greedy).")
     p.add_argument("--top-p",          default=1.0, type=float, help="Sampling top-p.")
@@ -322,7 +349,7 @@ def main(argv=None):
     p.add_argument("--seed",           default=0,   type=int,   help="Sampling PRNG seed.")
     p.add_argument("--system",                                  help="System prompt (a system turn ahead of the conversation).")
     p.add_argument("--remote",         action="store_true",     help="Run the chat on a lab board host over ssh (boards.ini).")
-    p.add_argument("--board",          default="xcu1525",       help="Lab board of --remote (a boards.ini section).")
+    p.add_argument("--board",          default="xcu1525",       help="Lab board of --remote (a boards.ini section); ti375: the Efinix kit on this machine's serial port.")
     p.add_argument("-k", "--firmware",                          help="Boot this firmware first (trixium.bin).")
     p.add_argument("-m", "--image",                             help="Upload this weight image first.")
     p.set_defaults(fn=cmd_chat)
@@ -330,13 +357,14 @@ def main(argv=None):
     # Console.
     p = subparsers.add_parser("console", help="Send firmware console commands and print the replies.")
     p.add_argument("commands", nargs="+",                help="Firmware console commands.")
-    p.add_argument("--tty",    default="/dev/ttyLXU0",   help="Console tty.")
+    p.add_argument("--tty",    default=None,             help="Console tty (default: /dev/ttyLXU0; --board ti375: the kit's serial port).")
+    p.add_argument("--board",  default=None,             help="ti375: the Efinix kit's serial console (115200).")
     p.add_argument("--wait",   default=60.0, type=float, help="Seconds to wait for each command's output.")
     p.add_argument("--quiet",  default=3.0,  type=float, help="Stop early once the console has been silent this long (s).")
     p.set_defaults(fn=cmd_console)
 
     # SMI.
-    subparsers.add_parser("smi", help="Card status and diagnostics (runs trixium_smi; -h for its options).")
+    subparsers.add_parser("smi", help="Card status and diagnostics (runs trixium_smi; -h for its options; --board ti375: over Etherbone).")
     subparsers.add_parser("demo", help="Record the README's chat + smi demo GIF on a lab board (-h for its options).")
 
     args = parser.parse_args(argv)

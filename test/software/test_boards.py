@@ -19,7 +19,7 @@ def test_ypcb_windows():
     between its windows (864 MB at 4 channels, 432 MB at 8), the last one short of the bank skew
     (64 KB / windows per extra window), as trixium_ypcb.py lays them out."""
     from software.cli import board_windows, BOARD_CHANNELS
-    assert BOARD_CHANNELS == {"fk33": 16, "xcu1525": 16, "ypcb": 8}
+    assert BOARD_CHANNELS == {"fk33": 16, "xcu1525": 16, "ypcb": 8, "ti375": 4}
     for channels, stride_mb in [(4, 864), (8, 432)]:
         stride, window, reserve = board_windows("ypcb", channels)
         chan_mod, chan_skew = channels//2, 0x10000//(channels//2)

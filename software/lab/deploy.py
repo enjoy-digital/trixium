@@ -403,7 +403,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
         remote.scp(sorted(glob.glob(os.path.join(out, "driver", "user", "liblitepcie", "*.[ch]"))),
             "gen/driver/user/liblitepcie/")
         # Every host-tool source: the loader module, the tools and their Makefile change together.
-        remote.scp([os.path.join("software", "user", f) for f in ["trixium_loader.c", "trixium_loader.h",
+        remote.scp([os.path.join("software", "user", f) for f in ["trixium_loader.c", "trixium_loader.h", "trixium_state.c",
             "trixium_load.c", "trixium_chat.c", "trixium_smi.c", "Makefile"]], "user/")
         # The tokenizers (the C chat tool wants the .bin, the Python client the .json).
         for m in ["1.7b", "8b", "27b", "2b", "4b"]:
@@ -482,11 +482,7 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
     from software.host.console import run as console_run
     if model not in ("2b",):
         raise DeployError("the Ti375's 1 GB holds the 2B (bonsai2-2b-n4-ti375.img); the 4B does not fit")
-    cfg = configparser.ConfigParser()
-    cfg.read(BOARDS_INI)
-    sec  = cfg["ti375"] if cfg.has_section("ti375") else {}
-    get  = lambda k, d=None: os.environ.get(f"TRIXIUM_TI375_{k.upper()}", sec.get(k, d))
-    tty, ip, iface = get("tty", ti375.TTY), get("ip", ti375.BOARD_IP), get("iface")
+    tty, ip, iface = ti375.config()
     tok, prompt, want, bench_n, timeout = MODELS[model]
     want    = BOARD_GOLDEN.get(("ti375", model), want)
     bench_n = bench_n if bench is None else bench
@@ -545,6 +541,11 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
     print("\n".join(l for l in out_txt.splitlines() if l.startswith(("hdrload", "imgcheck"))))
     if "inference ready" not in out_txt or " 0 bad" not in out_txt:
         raise DeployError("header or weights wrong on the board - refusing to go on")
+    if not dry_run:
+        # For `trixium smi --board ti375`: the weights and the build whose csr.csv maps the kit.
+        from software.host.ebsmi import state_write
+        state_write("load", board="ti375", image=os.path.realpath(image), bytes=os.path.getsize(image),
+                    build=name, csr_csv=os.path.join(out, "csr.csv"), time=int(time.time()))
     say(f"tokens first - want: {want} ...")
     out_txt = console_run([f"gen 8 {prompt}"], tty, wait=timeout, until="GEN DONE", baud=ti375.BAUD)
     got = next((l[4:].strip() for l in out_txt.splitlines() if l.startswith("GEN:")), "")

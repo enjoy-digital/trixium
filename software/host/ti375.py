@@ -13,6 +13,7 @@ the SoC's UART (the console, 115200); its RJ45 gives Etherbone (the CSRs) and th
   python3 -m software.host.ti375 load build/ti375_v7/gateware/efinix_ti375_c529_dev_kit.bit
   python3 -m software.host.ti375 boot build/ti375_v7/trixium.bin
   python3 -m software.host.ti375 server --iface enp5s0      # litex_server on that interface
+  python3 -m software.host.ti375 smi [-w 1]                 # trixium smi over Etherbone
 
 A workstation with several interfaces on the board's subnet must reach it through the wired
 one: `--iface` binds the Etherbone server's and the uploader's sockets to it (SO_BINDTODEVICE,
@@ -25,11 +26,23 @@ import time
 import socket
 import argparse
 import subprocess
+import configparser
 
 TTY     = "/dev/ttyUSB2"   # The FT4232H's third port: the SoC's UART.
 BAUD    = 115200
 BOARD_IP = "<board-host>"
 MAIN_RAM = 0x4000_0000     # Where the BIOS serial-boots the firmware.
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+def config():
+    """(tty, ip, iface) of the kit: ~/.config/trixium/boards.ini [ti375] (doc/boards.ini.example),
+    TRIXIUM_TI375_<KEY> overriding, then the defaults above."""
+    ini = configparser.ConfigParser()
+    ini.read(os.environ.get("TRIXIUM_BOARDS_INI", os.path.expanduser("~/.config/trixium/boards.ini")))
+    sec = ini["ti375"] if ini.has_section("ti375") else {}
+    get = lambda k, d=None: os.environ.get(f"TRIXIUM_TI375_{k.upper()}", sec.get(k, d))
+    return get("tty", TTY), get("ip", BOARD_IP), get("iface")
 
 # JTAG ---------------------------------------------------------------------------------------------
 
@@ -105,6 +118,45 @@ def ping(ip=BOARD_IP, iface=None):
     cmd = ["ping", "-c", "2", "-W", "1"] + (["-I", iface] if iface else []) + [ip]
     return subprocess.run(cmd, capture_output=True).returncode == 0
 
+# Status -------------------------------------------------------------------------------------------
+
+def loaded_csr_csv():
+    """The csr.csv of the build the deploy last put on the kit (its "load" record), else the
+    newest build/ti375_*."""
+    from software.host.ebsmi import state_read
+    load = state_read("load")
+    if load and load.get("board") == "ti375" and os.path.exists(load.get("csr_csv", "")):
+        return load["csr_csv"]
+    import glob
+    builds = sorted(glob.glob(os.path.join(REPO, "build", "ti375_*", "csr.csv")), key=os.path.getmtime)
+    if not builds:
+        raise SystemExit("no build/ti375_*/csr.csv: pass --csr-csv")
+    return builds[-1]
+
+def smi(csr_csv=None, interval=0.25, watch=0.0, as_json=False):
+    """trixium smi over Etherbone (software/host/ebsmi.py), starting a litex_server on the kit's
+    interface when none answers on localhost:1234."""
+    from software.host import ebsmi
+    tty, ip, iface = config()
+    csr_csv = csr_csv or loaded_csr_csv()
+    server  = None
+    try:
+        socket.create_connection(("localhost", 1234), timeout=0.5).close()
+    except OSError:
+        server = start_server(ip, iface)
+    try:
+        # The identifier first: a csr.csv of another build would read wrong addresses.
+        card = ebsmi.Card(csr_csv)
+        ident, want = card.identifier(), str(card.bus.constants.config_identifier)
+        card.close()
+        if ident != want:
+            raise SystemExit(f"the kit runs '{ident}', {csr_csv} is '{want}': pass the loaded build's --csr-csv")
+        ebsmi.run(csr_csv, interval=interval, watch=watch, as_json=as_json,
+                  where=f"Ti375 · {ip}{' via ' + iface if iface else ''}")
+    finally:
+        if server:
+            server.kill()
+
 # Main ---------------------------------------------------------------------------------------------
 
 def main(argv=None):
@@ -113,11 +165,15 @@ def main(argv=None):
     p = sub.add_parser("load");   p.add_argument("bit")
     p = sub.add_parser("boot");   p.add_argument("firmware"); p.add_argument("--tty", default=TTY)
     p = sub.add_parser("server"); p.add_argument("--ip", default=BOARD_IP); p.add_argument("--iface", default=None)
+    p = sub.add_parser("smi");    p.add_argument("--csr-csv", default=None); p.add_argument("-i", default=0.25, type=float, dest="interval")
+    p.add_argument("-w", default=0.0, type=float, dest="watch"); p.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if args.cmd == "load":
         load(args.bit)
     elif args.cmd == "boot":
         print(boot(args.firmware, args.tty))
+    elif args.cmd == "smi":
+        smi(args.csr_csv, args.interval, args.watch, args.json)
     else:
         server(args.ip, args.iface)
 
