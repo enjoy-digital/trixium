@@ -19,7 +19,7 @@ Everything in sys (100 MHz, the hard controller's AXI included), the units at th
 4 channels. One 512-bit port at 100 MHz is 6.4 GB/s, half the LPDDR4x's rate, and the weight
 stream runs at ~92% of it: --ddr-targets 2 also enables the controller's second AXI target and
 splits the channels between the two (channels 0-1 and the CPU on target 0, 2-3 on target 1;
-needs LiteX's EfinixDDR with `targets`). Efinity 2025.1: LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1.
+needs LiteX's EfinixDDR with `targets`, litex#2688). Efinity 2025.1: LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1.
 
   ./trixium_ti375.py --build [--ddr-targets 2]
 """
@@ -117,8 +117,8 @@ class TriXiumTi375SoC(SoCCore):
         self.udpload = UDPUpload(udp_port, max_beats=32, out_dw=128)
 
         # Memory: the hard controller's port, shared --------------------------------------------
-        # EfinixDDR's own AXI ID width (the controller's 6 bits): litex-boards' ddr_config pins 8
-        # until litex-boards#931.
+        # EfinixDDR's own AXI ID width (the controller's 6 bits): litex-boards' ddr_config pinned 8
+        # before litex-boards#931 (merged); the key is dropped for older checkouts.
         ddr_config = {k: v for k, v in platform.ddr_config.items() if k != "id_width"}
         # ddr_targets=2: the controller's second AXI target too (bus1), the channels split between
         # the two (the first half with the CPU on target 0): two 512-bit ports at sys, 12.8 GB/s,
