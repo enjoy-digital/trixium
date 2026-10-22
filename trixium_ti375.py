@@ -15,10 +15,13 @@ bursts buffered before their AW, per-master read buffers). The engine's 256-bit 
 merge two beats per word (AXIWide). No PCIe: the console on the kit's UART, the host link over
 Ethernet (RGMII): Etherbone for the CSRs and UDPUpload for the weights (software/host/udpload.py).
 
-First version: everything in sys (100 MHz, the hard controller's AXI included), the units at the
-lite profile, 4 channels. Efinity 2025.1: LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1.
+Everything in sys (100 MHz, the hard controller's AXI included), the units at the lite profile,
+4 channels. One 512-bit port at 100 MHz is 6.4 GB/s, half the LPDDR4x's rate, and the weight
+stream runs at ~92% of it: --ddr-targets 2 also enables the controller's second AXI target and
+splits the channels between the two (channels 0-1 and the CPU on target 0, 2-3 on target 1;
+needs LiteX's EfinixDDR with `targets`). Efinity 2025.1: LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1.
 
-  ./trixium_ti375.py --build
+  ./trixium_ti375.py --build [--ddr-targets 2]
 """
 
 import os
@@ -81,7 +84,7 @@ class _CRG(LiteXModule):
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
                  eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 1024), dn_sublanes=0,
-                 no_core=False, **kwargs):
+                 ddr_targets=1, no_core=False, **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
         # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
         idle_channels = 0
@@ -117,7 +120,10 @@ class TriXiumTi375SoC(SoCCore):
         # EfinixDDR's own AXI ID width (the controller's 6 bits): litex-boards' ddr_config pins 8
         # until litex-boards#931.
         ddr_config = {k: v for k, v in platform.ddr_config.items() if k != "id_width"}
-        self.ddr = ddr = EfinixDDR(platform=platform, clock_domain="sys", **ddr_config)
+        # ddr_targets=2: the controller's second AXI target too (bus1), the channels split between
+        # the two (the first half with the CPU on target 0): two 512-bit ports at sys, 12.8 GB/s,
+        # instead of one port at half the LPDDR4x's rate.
+        self.ddr = ddr = EfinixDDR(platform=platform, clock_domain="sys", targets=ddr_targets, **ddr_config)
         ctrl_size  = platform.ddr_size
         chan_mod   = engine_channels or 4
         chan_stride = ddr_chan_stride(ctrl_size, chan_mod)
@@ -125,7 +131,9 @@ class TriXiumTi375SoC(SoCCore):
         assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000
         assert HBM_WEIGHT_BASE + chan_mod*chan_stride <= ctrl_size
 
-        masters, memory_ports = [], []
+        masters, memory_ports = [[] for t in range(ddr_targets)], []
+        n_ports = engine_channels + idle_channels
+        target_of = lambda c: c*ddr_targets//n_ports
         for c in range(engine_channels):
             # 3 ID bits (the readers round-robin 4 IDs): with the master index, the port's IDs fit
             # the controller's 6 ID pins.
@@ -133,9 +141,9 @@ class TriXiumTi375SoC(SoCCore):
             wide = AXIInterface(data_width=512, address_width=32, id_width=3)
             self.add_module(f"engwide{c}", AXIWide(axi, wide))
             memory_ports.append(axi)
-            masters.append(wide)
+            masters[target_of(c)].append(wide)
         for c in range(idle_channels):
-            masters.append(AXIInterface(data_width=512, address_width=32, id_width=3))
+            masters[target_of(c)].append(AXIInterface(data_width=512, address_width=32, id_width=3))
         base = self.mem_map["main_ram"]
         self.bus.add_region("main_ram", SoCRegion(origin=base, size=main_ram_size, mode="rwx"))
         if hasattr(self.cpu, "add_memory_buses"):
@@ -152,19 +160,22 @@ class TriXiumTi375SoC(SoCCore):
             for ch in ("b", "r"):
                 self.comb += getattr(far, ch).connect(getattr(mem_bus, ch))
             self.comb += [far.ar.addr.eq(mem_bus.ar.addr - base), far.aw.addr.eq(mem_bus.aw.addr - base)]
-            masters.append(far)
-        idw = slave_id_width(masters)
-        # The controller's AXI IDs are 6 bits (ARID/AWID/RID/BID[5:0]): the masters' index must fit.
-        assert idw <= len(ddr.bus.ar.id), f"{idw} ID bits for the port, the controller has {len(ddr.bus.ar.id)}"
-        shared = AXIInterface(data_width=512, address_width=32, id_width=idw)
-        self.port = AXISharedPort(masters, shared, r_buffer=96)
-        for ch in ("aw", "w", "ar"):
-            self.comb += getattr(shared, ch).connect(getattr(ddr.bus, ch), omit={"id", "addr"})
-            self.comb += [getattr(ddr.bus, ch).id.eq(getattr(shared, ch).id)] if ch != "w" else []
-        self.comb += [ddr.bus.ar.addr.eq(shared.ar.addr), ddr.bus.aw.addr.eq(shared.aw.addr)]
-        for ch in ("b", "r"):
-            self.comb += getattr(ddr.bus, ch).connect(getattr(shared, ch), omit={"id"})
-            self.comb += getattr(shared, ch).id.eq(getattr(ddr.bus, ch).id[:idw])
+            masters[0].append(far)
+        for t, ms in enumerate(masters):
+            bus = ddr.bus1 if t else ddr.bus
+            idw = slave_id_width(ms)
+            # The controller's AXI IDs are 6 bits (ARID/AWID/RID/BID[5:0]): the masters' index must fit.
+            assert idw <= len(bus.ar.id), f"{idw} ID bits for the port, the controller has {len(bus.ar.id)}"
+            shared = AXIInterface(data_width=512, address_width=32, id_width=idw)
+            port = AXISharedPort(ms, shared, r_buffer=96)
+            setattr(self, f"port{t}" if t else "port", port)
+            for ch in ("aw", "w", "ar"):
+                self.comb += getattr(shared, ch).connect(getattr(bus, ch), omit={"id", "addr"})
+                self.comb += [getattr(bus, ch).id.eq(getattr(shared, ch).id)] if ch != "w" else []
+            self.comb += [bus.ar.addr.eq(shared.ar.addr), bus.aw.addr.eq(shared.aw.addr)]
+            for ch in ("b", "r"):
+                self.comb += getattr(bus, ch).connect(getattr(shared, ch), omit={"id"})
+                self.comb += getattr(shared, ch).id.eq(getattr(bus, ch).id[:idw])
         self.comb += ddr.awallstrb.eq(0)
 
         # Bring-up visibility over Etherbone (the CPU has no debug port here): where the CPU is
@@ -223,6 +234,8 @@ class TriXiumTi375SoC(SoCCore):
         self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
         self.add_constant("TRIXIUM_CHAN_SKEW",        0)
         self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
+        # The memory port's bytes per sys clock (smi's peak: the channels outrun the port here).
+        self.add_constant("TRIXIUM_PORT_BYTES",       64*ddr_targets)
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -235,6 +248,7 @@ def main():
     parser.add_target_argument("--profile",         default="lite", choices=["full", "lite"], help="The units' sizing.")
     parser.add_target_argument("--prefetch",        default=256,   type=int,   help="Reader FIFO beats (0: no prefetch).")
     parser.add_target_argument("--dn-sublanes",     default=1,     type=int,   help="DeltaNet stream sub-lanes per channel (1 at 4 channels: width 4).")
+    parser.add_target_argument("--ddr-targets",     default=1,     type=int, choices=[1, 2], help="The DDR controller's AXI targets the channels use (2: twice the port bandwidth).")
     parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--attn-t-max",      default=1024,  type=int,   help="Attention stream context positions.")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
@@ -246,7 +260,7 @@ def main():
     soc = TriXiumTi375SoC(sys_clk_freq=args.sys_clk_freq, engine_channels=args.engine_channels,
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
                           dn_sublanes=args.dn_sublanes, attn_geometry=YPCB_LITE_ATTN + (256, args.attn_t_max),
-                          no_core=args.no_core,
+                          ddr_targets=args.ddr_targets, no_core=args.no_core,
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:

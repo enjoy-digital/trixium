@@ -400,7 +400,7 @@ class TriXiumSimSoC(SoCCore):
                  with_softmax=False,
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
-                 axi1_latency=24, axi1_reorder=0, reader_n_ids=4,
+                 axi1_latency=24, axi1_reorder=0, axi1_targets=1, reader_n_ids=4,
                  unit_options=(), efinix_ram=False, attn_sync_operand=False):
         assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
@@ -511,7 +511,7 @@ class TriXiumSimSoC(SoCCore):
             read_ports = [] if ddr_readers else None   # --ddr-readers: the port in its own clock.
             self.axi1_reorder = axi1_reorder
             chan_mod = self.add_axi1(n_channels, ram, img, memory_ports, stride, axi1_latency,
-                                     read_ports=read_ports)
+                                     read_ports=read_ports, targets=axi1_targets)
         else:
             stride   = ddr3_stride(img)
             read_ports = [] if ddr_readers else None   # --ddr-readers: the readers in the ddr domain.
@@ -648,15 +648,21 @@ class TriXiumSimSoC(SoCCore):
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 
-    def add_axi1(self, n_channels, ram, img, memory_ports, stride, latency, read_ports=None):
+    def add_axi1(self, n_channels, ram, img, memory_ports, stride, latency, read_ports=None, targets=1):
         """The Ti375's memory system: one 512-bit AXI4 memory (the hard DDR controller's port,
         modelled with a fixed latency) behind AXISharedPort, carrying main_ram at 0 and every
         engine channel's window; returns chan_mod (= the channels: all on one memory).
 
         read_ports: a list to receive a read-only 256-bit AXI per channel in the port's own `ddr`
         clock (the readers there, as --ddr-readers on the YPCB): the reads merge and the shared
-        port and the memory run in ddr; the channels' writes and the CPU cross from sys."""
+        port and the memory run in ddr; the channels' writes and the CPU cross from sys.
+
+        targets=2: the controller's two AXI targets (trixium_ti375.py --ddr-targets 2): the first
+        half of the channels with the CPU on one AXISharedPort, the second half on another, the
+        two merged again into the one memory model (the wiring and IDs as on the board; not the
+        board's doubled bandwidth)."""
         split = read_ports is not None
+        assert targets == 1 or not split, "two targets with the port in sys only"
         cd    = "ddr" if split else "sys"
         def to_port(m):                  # A sys-side master onto the port's domain.
             if not split:
@@ -669,6 +675,7 @@ class TriXiumSimSoC(SoCCore):
         size     = 1 << (max(len(content), DDR3_SIM_WEIGHT_BASE + chan_mod*stride) - 1).bit_length()
         self.axi1_size = size
         masters = []
+        target_of = []   # Each master's target (the CPU's is 0).
         # Engine channels: 256-bit ports merged two beats per 512-bit word (reads and writes).
         for c in range(n_channels):
             axi  = AXIInterface(data_width=256, address_width=32, id_width=6)
@@ -688,6 +695,7 @@ class TriXiumSimSoC(SoCCore):
                 self.add_module(f"engwide{c}", AXIWide(axi, wide))
             memory_ports.append(axi)
             masters.append(wide)
+            target_of.append(c*targets//n_channels)
         # main_ram: the CPU's memory buses at 512 bits (and the wishbone path for the other
         # bus masters, as add_sdram), the region's base taken off the address.
         base = self.mem_map["main_ram"]
@@ -713,10 +721,22 @@ class TriXiumSimSoC(SoCCore):
             self.submodules += Wishbone2AXI(wb, a32, base_address=base)
             self.submodules += AXIConverter(a32, a512)
             masters.append(to_port(a512))
+        target_of += [0]*(len(masters) - len(target_of))
+        if targets > 1:
+            # One AXISharedPort per target (as the board), then the targets onto the one memory.
+            ports = []
+            for t in range(targets):
+                ms  = [m for m, tm in zip(masters, target_of) if tm == t]
+                tgt = AXIInterface(data_width=512, address_width=32, id_width=slave_id_width(ms))
+                self.add_module(f"axi1_target{t}", AXISharedPort(ms, tgt, r_buffer=96))
+                ports.append(tgt)
+            masters = ports
         self.axi1_slave = slave = AXIInterface(data_width=512, address_width=32,
                                                id_width=slave_id_width(masters))
-        # r_buffer: a channel reader's 8 bursts of 16 beats are <= 72 words in flight.
-        self.axi1_port  = ClockDomainsRenamer(cd)(AXISharedPort(masters, slave, r_buffer=96))
+        # r_buffer: a channel reader's 8 bursts of 16 beats are <= 72 words in flight (a target's
+        # masters' together for the merge of the targets: no head-of-line block between them).
+        r_buffer = 96*max(target_of.count(t) for t in range(targets))
+        self.axi1_port  = ClockDomainsRenamer(cd)(AXISharedPort(masters, slave, r_buffer=r_buffer))
         # axi1_reorder: bursts on different IDs served out of order (as the hard controller may).
         self.axi1_mem   = ClockDomainsRenamer(cd)(HBMChannelModel(slave, size=size, init=words512(content),
                                           latency=latency, data_width=512, axi3=False,
@@ -995,6 +1015,9 @@ def build_sim(args, board, out_dir):
     if args.axi1_reorder:
         assert args.board == "ti375", "--axi1-reorder: --board ti375"
         soc_kwargs["axi1_reorder"] = args.axi1_reorder
+    if args.axi1_targets > 1:
+        assert args.board == "ti375" and not args.ddr_readers, "--axi1-targets: --board ti375, port in sys"
+        soc_kwargs["axi1_targets"] = args.axi1_targets
     if args.pipe_clk_freq:
         soc_kwargs["pipe_clk_freq"] = args.pipe_clk_freq
     if args.dn_sublanes and "unit_options" in soc_kwargs:
@@ -1065,6 +1088,7 @@ def main():
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--reader-ids",     default=0, type=int, choices=[0, 1, 2, 4, 8],           help="ARIDs each channel reader rotates (0: the board's; the Ti375 uses 1).")
     parser.add_argument("--axi1-reorder",   default=0, type=int, choices=[0, 2, 4, 8],              help="--board ti375: the memory model serves bursts out of order across N ID queues (as the hard controller may).")
+    parser.add_argument("--axi1-targets",   default=1, type=int, choices=[1, 2],                    help="--board ti375: the channels split over the controller's two AXI targets (trixium_ti375.py --ddr-targets).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
     parser.add_argument("--memctrl",        default=0, type=int, choices=[0, 1, 2],                 help="--board ypcb: DDR3 controllers (default: the board's two; 1 = every channel and main_ram on one, the small boards' topology).")
     parser.add_argument("--profile",        default="full", choices=["full", "lite"],               help="--hybrid: the units' sizing (lite: the small boards' profile).")

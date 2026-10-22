@@ -71,6 +71,12 @@ class Card:
         self.regs = self.bus.regs
         self.n_ch = int(self.bus.constants.trixium_n_channels)
         self.platform = str(getattr(self.bus.constants, "config_platform_name", ""))
+        # The memory port's bytes per clock where the channels outrun it (the Ti375's shared
+        # 512-bit port(s)); builds before the constant: one port.
+        port = getattr(self.bus.constants, "trixium_port_bytes", None)
+        if port is None and self.platform.startswith("efinix"):
+            port = 64
+        self.peak_bytes = min(self.n_ch*BEAT_BYTES, int(port)) if port else self.n_ch*BEAT_BYTES
 
     def close(self):
         self.bus.close()
@@ -118,7 +124,8 @@ def status(card, interval=0.25):
     cycles  = d32(s0["cyc_total"], s1["cyc_total"])
     util    = lambda k: d32(s0[k], s1[k])/cycles if cycles else 0.0
     clk     = cycles/dt if dt > 0 else 0.0
-    ch_util = [d32(s0["beats"][c], s1["beats"][c])/cycles if cycles else 0.0 for c in range(card.n_ch)]
+    share   = card.peak_bytes/(card.n_ch*BEAT_BYTES)   # A channel's beats per clock at the port's peak.
+    ch_util = [d32(s0["beats"][c], s1["beats"][c])/cycles/share if cycles else 0.0 for c in range(card.n_ch)]
     gbs     = sum(d32(s0["beats"][c], s1["beats"][c]) for c in range(card.n_ch))*BEAT_BYTES/dt/1e9 if dt > 0 else 0.0
     ar_wait = sum(d32(s0["ar"][c], s1["ar"][c])/cycles if cycles else 0.0 for c in range(card.n_ch))/card.n_ch
     load, chat = state_read("load"), state_read("chat")
@@ -129,7 +136,7 @@ def status(card, interval=0.25):
                 engine_busy=st & 1, seconds=dt, engine=util("cyc_eng"), units=util("cyc_vec"),
                 overlap=util("cyc_both"), ops_s=d32(s0["done"], s1["done"])/dt if dt > 0 else 0.0,
                 prefetch_s=d32(s0["pf_hits"], s1["pf_hits"])/dt if dt > 0 else 0.0,
-                channels=card.n_ch, gbs=gbs, peak_gbs=card.n_ch*BEAT_BYTES*clk/1e9,
+                channels=card.n_ch, gbs=gbs, peak_gbs=card.peak_bytes*clk/1e9,
                 request_wait=ar_wait, channel_util=ch_util, load=load, chat=chat)
 
 # Table ---------------------------------------------------------------------------------------------
