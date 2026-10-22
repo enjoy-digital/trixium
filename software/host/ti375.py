@@ -38,7 +38,8 @@ TTY     = "/dev/ttyUSB2"   # The FT4232H's third port: the SoC's UART.
 BAUD    = 115200
 BOARD_IP = "<board-host>"
 MAIN_RAM = 0x4000_0000     # Where the BIOS serial-boots the firmware.
-JTAG_HZ  = 30_000_000      # The FT4232H's JTAG clock for loads (Efinity's default: 6 MHz).
+JTAG_HZ  = 15_000_000      # JTAG clock for loads: 11.5 s (Efinity's default 6 MHz: ~17 s; at 30 MHz
+                           # the programmer reports success and nothing is configured).
 DEVICE_ID = 0x006A0A79     # The Ti375's JTAG ID (the flash bridge image's name).
 FIRMWARE_FLASH_OFFSET = 0x0200_0000   # trixium_ti375.py's (the BIOS's FLASH_BOOT_ADDRESS).
 
@@ -60,11 +61,15 @@ def _programmer():
     return EfinixProgrammer(family="Titanium")
 
 def load(bit, hz=JTAG_HZ):
-    """The bitstream into the FPGA's configuration memory (volatile), at `hz` (6 MHz retried)."""
+    """The bitstream into the FPGA's configuration memory (volatile), at `hz` (6 MHz retried). A
+    load counts only when the programmer read the device's ID (its exit code alone does not tell)."""
     prog = _programmer()
     cmd  = prog._load_bitstream_command(bit)
     for f in ([hz, 6_000_000] if hz != 6_000_000 else [hz]):
-        if subprocess.call(cmd + ["--jtag_clock_freq", str(int(f))], env=prog.env) == 0:
+        r = subprocess.run(cmd + ["--jtag_clock_freq", str(int(f))], env=prog.env,
+                           capture_output=True, text=True)
+        sys.stdout.write(r.stdout)
+        if r.returncode == 0 and f"{DEVICE_ID:#010X}"[2:] in r.stdout.upper():
             return
     raise OSError(f"JTAG load of {bit} failed")
 

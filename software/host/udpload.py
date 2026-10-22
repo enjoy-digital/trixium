@@ -57,7 +57,7 @@ class CRCError(RuntimeError):
     pass
 
 
-def transfer(bus, link, chan, base, data, beats_per_datagram=None, window=64, verbose=False,
+def transfer(bus, link, chan, base, data, beats_per_datagram=None, window=512, verbose=False,
              stall_s=5.0, retries=3):
     """One channel's bytes to `base`, in 128 MB armed transfers, each checked by the port's CRC
     when the build has it (a mismatch resends it, up to `retries` times); returns the datagrams

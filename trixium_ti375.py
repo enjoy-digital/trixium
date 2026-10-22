@@ -123,12 +123,13 @@ class TriXiumTi375SoC(SoCCore):
 
         # The configuration flash: the BIOS boots the firmware from it (flashboot) when no host
         # answers its serial boot first - power up and the firmware runs (software/host/ti375.py
-        # flash writes bitstream + firmware). The SDR PHY (1:1): the firmware's 226 KB copy in
-        # tens of milliseconds at quad SPI, no DDR I/O to time.
+        # flash writes bitstream + firmware). The SDR PHY (1:1) at 25 MHz: at 50 MHz DQ3 is sampled
+        # late (~0.6% of the words lose a bit, measured on the kit; 33 MHz clean): the firmware's
+        # 226 KB copy still takes ~20 ms.
         if with_spi_flash:
             from litespi.modules import IS25WP512M
             from litespi.opcodes import SpiNorFlashOpCodes as Codes
-            self.add_spi_flash(mode="4x", clk_freq=50e6, number=0,
+            self.add_spi_flash(mode="4x", clk_freq=25e6, number=0,
                                module=IS25WP512M(Codes.READ_1_1_4_4B), with_master=True, rate="1:1")
             self.add_constant("FLASH_BOOT_ADDRESS",
                               self.bus.regions["spiflash"].origin + FIRMWARE_FLASH_OFFSET)
