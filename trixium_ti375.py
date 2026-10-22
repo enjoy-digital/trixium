@@ -87,7 +87,7 @@ class _CRG(LiteXModule):
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
                  eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 1024), dn_sublanes=0,
-                 ddr_targets=1, with_spi_flash=False, upload_beats=32, no_core=False, **kwargs):
+                 ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, no_core=False, **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
         # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
         idle_channels = 0
@@ -148,6 +148,11 @@ class TriXiumTi375SoC(SoCCore):
         ctrl_size  = platform.ddr_size
         chan_mod   = engine_channels or 4
         chan_stride = ddr_chan_stride(ctrl_size, chan_mod)
+        # chan_skew: channel k's window starts k*skew further, so the channels' simultaneous
+        # streams fall in different DRAM banks (the YPCB's: the bank cycle / channels); the last
+        # window loses (chan_mod - 1)*skew.
+        assert chan_skew % 0x1000 == 0 and (chan_mod - 1)*chan_skew < chan_stride//64
+        chan_window = chan_stride - (chan_mod - 1)*chan_skew
         main_ram_size = 0x1000_0000
         assert main_ram_size <= HBM_WEIGHT_BASE - 0x100000
         assert HBM_WEIGHT_BASE + chan_mod*chan_stride <= ctrl_size
@@ -231,7 +236,7 @@ class TriXiumTi375SoC(SoCCore):
         config = TriXiumConfig(scratchpad_xpm=False, efinix_ram=True, **units,
             chan_stride       = chan_stride,
             chan_mod          = chan_mod,
-            chan_skew         = 0,
+            chan_skew         = chan_skew,
             with_trit5        = True,
             with_prefetch     = bool(prefetch),
             reader_fifo_depth = prefetch or 512,
@@ -250,10 +255,10 @@ class TriXiumTi375SoC(SoCCore):
         self.add_constant("TRIXIUM_HDR_ADDR",         0x4000_0000 + HDR_CPU_OFFSET)
         self.add_constant("TRIXIUM_CHAN_WEIGHT_BASE", HBM_WEIGHT_BASE)
         self.add_constant("TRIXIUM_CHAN_STRIDE",      chan_stride)
-        self.add_constant("TRIXIUM_CHAN_WINDOW",      chan_stride)
+        self.add_constant("TRIXIUM_CHAN_WINDOW",      chan_window)
         self.add_constant("TRIXIUM_N_CHANNELS",       engine_channels)
         self.add_constant("TRIXIUM_CHAN_MOD",         chan_mod)
-        self.add_constant("TRIXIUM_CHAN_SKEW",        0)
+        self.add_constant("TRIXIUM_CHAN_SKEW",        chan_skew)
         self.add_constant("TRIXIUM_MEM_CPU_OFFSET",   0)
         # The memory port's bytes per sys clock (smi's peak: the channels outrun the port here).
         self.add_constant("TRIXIUM_PORT_BYTES",       64*ddr_targets)
@@ -272,6 +277,7 @@ def main():
     parser.add_target_argument("--ddr-targets",     default=1,     type=int, choices=[1, 2], help="The DDR controller's AXI targets the channels use (2: twice the port bandwidth).")
     parser.add_target_argument("--with-spi-flash",  action="store_true",       help="The configuration flash on the bus: the BIOS boots the firmware from it.")
     parser.add_target_argument("--upload-beats",    default=32,    type=int,   help="UDP upload datagram payload in 256-bit beats (45 fills a 1,500 MTU).")
+    parser.add_target_argument("--chan-skew",       default=0,     type=lambda x: int(x, 0), help="Per-channel window offset in bytes (DRAM bank spreading; 4 KB multiple).")
     parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--attn-t-max",      default=1024,  type=int,   help="Attention stream context positions.")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
@@ -284,7 +290,7 @@ def main():
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
                           dn_sublanes=args.dn_sublanes, attn_geometry=YPCB_LITE_ATTN + (256, args.attn_t_max),
                           ddr_targets=args.ddr_targets, with_spi_flash=args.with_spi_flash,
-                          upload_beats=args.upload_beats, no_core=args.no_core,
+                          upload_beats=args.upload_beats, chan_skew=args.chan_skew, no_core=args.no_core,
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:
