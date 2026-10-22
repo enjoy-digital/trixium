@@ -28,6 +28,9 @@ through every switch. Here:
   buffer until WLAST; B is routed back by the upper BID bits.
 
 The slave's ID width must hold the masters' IDs and the index: `id_width(masters)`.
+
+Upstream as LiteX's AXIArbiter(..., interleave=True) (litex#2689); this copy stays until a LiteX
+release carries it.
 """
 
 from migen import *
