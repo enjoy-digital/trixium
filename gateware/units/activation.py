@@ -315,7 +315,7 @@ class ActivationScratchpad(LiteXModule):
         self.scan             = scan = Fp32AbsmaxWord()
         self.quantize         = quantize = Fp32ToQ8()
         self.integer_quantize = integer_quantize = IntegerToQ8()
-        self.responses        = responses = ResetInserter()(SyncFIFO(width=258, depth=2))
+        self.responses        = responses = ResetInserter()(SyncFIFO(width=258, depth=4))
         # Block buffer for the ping-pong mode (pp, per-block FP32 with <= 1,024 elements and
         # several blocks): the scan pass copies the block into one half, so the convert pass
         # reads it from there while the next block's scan reads the scratchpad into the other
@@ -441,7 +441,10 @@ class ActivationScratchpad(LiteXModule):
             in_convert.eq((state == CONVERT) | (state == CONVERT_DRAIN)),
             clear.eq(self.cancel | (~in_scan & ~in_convert & ~(s_active & (state != FAILED)))),
             s_issuing.eq(s_active & (s_issued < read_count) & (state != FAILED) & ~self.cancel),
-            cnv_issue.eq((state == CONVERT) & ((reserved < 2) | response_pop) & ~self.cancel),
+            # Credits, not the pop: the pop hangs off the quantizer's ready chain and the write
+            # grant, which made the read address the unit's critical path. Four entries keep
+            # one read per clock (one in flight, the one popped this cycle counted).
+            cnv_issue.eq((state == CONVERT) & (reserved < 4) & ~self.cancel),
             issue_main.eq(Mux(pp & in_convert, cnv_issue,
                               self.sp_rd_req & ~s_issuing & (in_scan | in_convert))),
             buf_rd.adr.eq(Cat(issued[:7], block[0])),
@@ -473,7 +476,7 @@ class ActivationScratchpad(LiteXModule):
             responses.re.eq(response_pop),
             reserved.eq(responses.level + Mux(pp, buf_pend, read_pending)),
             self.sp_rd_req.eq(~self.cancel & ((state == SCAN) |
-                ((state == CONVERT) & ~pp & ((reserved < 2) | response_pop)) | s_issuing |
+                ((state == CONVERT) & ~pp & (reserved < 4)) | s_issuing |
                 (state == META_E_REQ) | (state == META_A_REQ))),
             self.sp_rd_adr.eq(Mux(state == META_E_REQ, (captured["exponents"] >> 5) + (block >> 3),
                 Mux(state == META_A_REQ, (captured["maxima"] >> 5) + (block >> 3),
