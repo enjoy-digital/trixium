@@ -4,10 +4,11 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""gateware/memory/axi_shared.py: AXISharedPort - channel readers and a writer on one AXI port
-(the single-controller boards), against HBMChannelModel: every beat back to its master in order,
-the writes landed, and the reads interleaved (the port stays busy while one master waits),
-where LiteX's AXIArbiter streams one master's bursts at a time."""
+"""LiteX's AXIArbiter in its interleaved mode (litex#2689, how the single-controller boards put
+channel readers, writers and the CPU on one AXI port) and gateware/memory/axi_shared.py's
+AXIIDSquash, against HBMChannelModel: every beat back to its master in order, the writes landed,
+and the reads interleaved (the port stays busy while one master waits), where the default
+AXIArbiter streams one master's bursts at a time."""
 
 import random
 
@@ -18,9 +19,9 @@ from migen import *
 from migen.sim import run_simulation
 
 from litex.soc.interconnect.axi import AXIInterface, AXIArbiter
+from litex.soc.interconnect.axi import axi_interleaved_id_width as slave_id_width
 
 from gateware.memory.axi import AXIReader, AXIWriter
-from gateware.memory.axi_shared import AXISharedPort, slave_id_width
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
 
 MEM_SIZE = 256*1024
@@ -38,7 +39,7 @@ class _DUT(Module):
         self.submodules.writer = AXIWriter(self.waxi, burst_beats=16)
         if arbiter == "shared":
             self.slave = AXIInterface(data_width=256, address_width=33, id_width=slave_id_width(masters))
-            self.submodules.port = AXISharedPort(masters, self.slave)
+            self.submodules.port = AXIArbiter(masters, self.slave, interleave=True)
         else:
             self.slave = AXIInterface(data_width=256, address_width=33, id_width=6)
             self.submodules.port = AXIArbiter(masters, self.slave)
@@ -137,7 +138,7 @@ def test_interleaving_beats_the_lock_step_arbiter():
 
 
 # The Ti375 attachment: 256-bit engine ports merged two beats per 512-bit word (AXIWide), on one
-# 512-bit AXI4 port through AXISharedPort.
+# 512-bit AXI4 port through the interleaved AXIArbiter.
 
 class _WideDUT(Module):
     def __init__(self, n_readers, init, latency):
@@ -154,7 +155,7 @@ class _WideDUT(Module):
             setattr(self.submodules, f"wide{i}", AXIWide(a, w))
             wides.append(w)
         self.slave = AXIInterface(data_width=512, address_width=32, id_width=slave_id_width(wides))
-        self.submodules.port  = AXISharedPort(wides, self.slave, r_buffer=96)
+        self.submodules.port  = AXIArbiter(wides, self.slave, r_buffer=96, interleave=True)
         words = [int.from_bytes(init[i:i + 64], "little") for i in range(0, len(init), 64)]
         self.submodules.model = HBMChannelModel(self.slave, size=MEM_SIZE, init=words, latency=latency,
                                                 data_width=512, axi3=False)
@@ -235,7 +236,7 @@ def test_write_data_of_one_master_waiting_on_another_does_not_deadlock():
     b = AXIInterface(data_width=256, address_width=33, id_width=6)
     slave = AXIInterface(data_width=256, address_width=33, id_width=slave_id_width([a, b]))
     dut = Module()
-    dut.submodules.port  = AXISharedPort([a, b], slave)
+    dut.submodules.port  = AXIArbiter([a, b], slave, interleave=True)
     dut.submodules.model = HBMChannelModel(slave, size=MEM_SIZE, latency=8)
     state = {"b_done": False, "a_done": False}
     BEATS = 8
@@ -337,7 +338,7 @@ def test_writes_with_every_slave_write_order(write_order):
     dut = Module()
     dut.submodules.wa = AXIWriter(a, burst_beats=16)
     dut.submodules.wb = AXIWriter(b, burst_beats=16)
-    dut.submodules.port = AXISharedPort([a, b], slave)
+    dut.submodules.port = AXIArbiter([a, b], slave, interleave=True)
     dut.submodules.model = HBMChannelModel(slave, size=MEM_SIZE, latency=4, write_order=write_order)
     rng = np.random.default_rng(len(write_order))
     beats = 40

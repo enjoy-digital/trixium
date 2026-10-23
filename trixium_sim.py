@@ -59,7 +59,7 @@ from litex.soc.integration.soc_core import SoCCore
 from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.builder import Builder
 from litex.soc.interconnect.csr import CSR, CSRStatus, CSRStorage
-from litex.soc.interconnect.axi import AXIInterface, Wishbone2AXI, AXIConverter
+from litex.soc.interconnect.axi import AXIInterface, Wishbone2AXI, AXIConverter, AXIArbiter, axi_interleaved_id_width
 from litex.soc.interconnect import wishbone
 
 from litedram.modules import MT40A512M8
@@ -73,7 +73,6 @@ from model.layout import HDR_CPU_OFFSET, KIND_TERNARY5
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, EnginePortStats, NativePortStats
 from gateware.memory.hbm_model import HBMChannelModel, words_from_bytes
-from gateware.memory.axi_shared import AXISharedPort, slave_id_width
 from gateware.memory.axi import AXIWide, AXIReadMerge, AXIWriteMerge
 from gateware.memory.ddr import AXICrossing
 from gateware.memory.ckphase_model import ckphase_model_settings, CKPhasePHYModel, NoDMPHYModel
@@ -650,7 +649,7 @@ class TriXiumSimSoC(SoCCore):
 
     def add_axi1(self, n_channels, ram, img, memory_ports, stride, latency, read_ports=None, targets=1):
         """The Ti375's memory system: one 512-bit AXI4 memory (the hard DDR controller's port,
-        modelled with a fixed latency) behind AXISharedPort, carrying main_ram at 0 and every
+        modelled with a fixed latency) behind an interleaved AXIArbiter, carrying main_ram at 0 and every
         engine channel's window; returns chan_mod (= the channels: all on one memory).
 
         read_ports: a list to receive a read-only 256-bit AXI per channel in the port's own `ddr`
@@ -658,7 +657,7 @@ class TriXiumSimSoC(SoCCore):
         port and the memory run in ddr; the channels' writes and the CPU cross from sys.
 
         targets=2: the controller's two AXI targets (trixium_ti375.py --ddr-targets 2): the first
-        half of the channels with the CPU on one AXISharedPort, the second half on another, the
+        half of the channels with the CPU on one interleaved AXIArbiter, the second half on another, the
         two merged again into the one memory model (the wiring and IDs as on the board; not the
         board's doubled bandwidth)."""
         split = read_ports is not None
@@ -723,20 +722,20 @@ class TriXiumSimSoC(SoCCore):
             masters.append(to_port(a512))
         target_of += [0]*(len(masters) - len(target_of))
         if targets > 1:
-            # One AXISharedPort per target (as the board), then the targets onto the one memory.
+            # One interleaved AXIArbiter per target (as the board), then the targets onto the one memory.
             ports = []
             for t in range(targets):
                 ms  = [m for m, tm in zip(masters, target_of) if tm == t]
-                tgt = AXIInterface(data_width=512, address_width=32, id_width=slave_id_width(ms))
-                self.add_module(f"axi1_target{t}", AXISharedPort(ms, tgt, r_buffer=96))
+                tgt = AXIInterface(data_width=512, address_width=32, id_width=axi_interleaved_id_width(ms))
+                self.add_module(f"axi1_target{t}", AXIArbiter(ms, tgt, interleave=True, r_buffer=96))
                 ports.append(tgt)
             masters = ports
         self.axi1_slave = slave = AXIInterface(data_width=512, address_width=32,
-                                               id_width=slave_id_width(masters))
+                                               id_width=axi_interleaved_id_width(masters))
         # r_buffer: a channel reader's 8 bursts of 16 beats are <= 72 words in flight (a target's
         # masters' together for the merge of the targets: no head-of-line block between them).
         r_buffer = 96*max(target_of.count(t) for t in range(targets))
-        self.axi1_port  = ClockDomainsRenamer(cd)(AXISharedPort(masters, slave, r_buffer=r_buffer))
+        self.axi1_port  = ClockDomainsRenamer(cd)(AXIArbiter(masters, slave, interleave=True, r_buffer=r_buffer))
         # axi1_reorder: bursts on different IDs served out of order (as the hard controller may).
         self.axi1_mem   = ClockDomainsRenamer(cd)(HBMChannelModel(slave, size=size, init=words512(content),
                                           latency=latency, data_width=512, axi3=False,
@@ -903,7 +902,7 @@ BOARDS = {
         cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS),
     # The Efinix Ti375 C529 (small boards, milestone M4): one hard DDR controller with ONE AXI4
     # port (512 bits) for every engine channel and the CPU's memory, no LiteDRAM - modelled as
-    # one 512-bit AXI memory behind AXISharedPort. Run with --hybrid (lite profile by default).
+    # one 512-bit AXI memory behind an interleaved AXIArbiter. Run with --hybrid (lite profile by default).
     "ti375": dict(mem="axi1", n_memctrl=1,
         cpu_type="vexiiriscv", icache_kb=None, vexii_extra=YPCB_VEXII_ARGS,
         efinix_ram=True, attn_sync_operand=True, reader_n_ids=1),

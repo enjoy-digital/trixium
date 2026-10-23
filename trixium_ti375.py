@@ -10,8 +10,8 @@
 
 The memory system is the simulator's `--board ti375` preset on the real part: the hard LPDDR4x
 controller's single 512-bit AXI4 port (1 GB) carries the CPU's main_ram and every engine
-channel's window, through AXISharedPort (reads interleaved per request, each master's write
-bursts buffered before their AW, per-master read buffers). The engine's 256-bit channel ports
+channel's window, through LiteX's AXIArbiter in its interleaved mode (reads interleaved per
+request, each master's write bursts buffered before their AW, per-master read buffers). The engine's 256-bit channel ports
 merge two beats per word (AXIWide). No PCIe: the console on the kit's UART, the host link over
 Ethernet (RGMII): Etherbone for the CSRs and UDPUpload for the weights (software/host/udpload.py).
 
@@ -37,13 +37,13 @@ from litex.soc.cores.clock.efinix import TITANIUMPLL
 from litex.soc.integration.soc import SoCRegion
 from litex.soc.integration.soc_core import SoCCore
 from litex.soc.integration.builder import Builder
-from litex.soc.interconnect.axi import AXIInterface
+from litex.soc.interconnect.axi import AXIInterface, AXIArbiter, axi_interleaved_id_width
 from litex.soc.cores.ram.efinix_ddr import EfinixDDR
 
 from model.layout import HBM_WEIGHT_BASE, HDR_CPU_OFFSET, ddr_chan_stride
 from gateware.core.core import TriXiumConfig, TriXiumCore
 from gateware.memory.axi import AXIWide
-from gateware.memory.axi_shared import AXISharedPort, AXIIDSquash, slave_id_width
+from gateware.memory.axi_shared import AXIIDSquash
 from gateware.memory.udp_upload import UDPUpload
 from gateware.common import CPUBusMonitor
 from litex.soc.interconnect.csr import CSRStatus
@@ -189,14 +189,18 @@ class TriXiumTi375SoC(SoCCore):
             masters[0].append(far)
         for t, ms in enumerate(masters):
             bus = ddr.bus1 if t else ddr.bus
-            idw = slave_id_width(ms)
+            idw = axi_interleaved_id_width(ms)
             # The controller's AXI IDs are 6 bits (ARID/AWID/RID/BID[5:0]): the masters' index must fit.
             assert idw <= len(bus.ar.id), f"{idw} ID bits for the port, the controller has {len(bus.ar.id)}"
             shared = AXIInterface(data_width=512, address_width=32, id_width=idw)
-            port = AXISharedPort(ms, shared, r_buffer=96)
+            port = AXIArbiter(ms, shared, interleave=True, r_buffer=96)
             setattr(self, f"port{t}" if t else "port", port)
+            # The masters' AxCACHE/LOCK/PROT/QOS/REGION/USER stay off the controller (0, as before):
+            # its AWCACHE sets when B returns (0: once the command reaches the PHY).
+            ax_extra = {"lock", "prot", "cache", "qos", "region", "user"}
             for ch in ("aw", "w", "ar"):
-                self.comb += getattr(shared, ch).connect(getattr(bus, ch), omit={"id", "addr"})
+                self.comb += getattr(shared, ch).connect(getattr(bus, ch),
+                    omit={"id", "addr"} | (ax_extra if ch != "w" else set()))
                 self.comb += [getattr(bus, ch).id.eq(getattr(shared, ch).id)] if ch != "w" else []
             self.comb += [bus.ar.addr.eq(shared.ar.addr), bus.aw.addr.eq(shared.aw.addr)]
             for ch in ("b", "r"):
