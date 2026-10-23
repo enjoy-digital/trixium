@@ -162,7 +162,7 @@ static void help(void)
     puts("  tokload           - load the tokenizer staged with the image (trixium load --tokenizer)");
     puts("  chat [n]          - chat in text on this console, replies up to n tokens (default 512)");
 #ifdef CSR_SD_BASE
-    puts("  sdinit [mhz]      - SD card init (4-bit, 50 MHz high speed when the card takes it)");
+    puts("  sdinit [mhz]      - SD card init (4-bit, else 1-bit; 50 MHz high speed when the card takes it)");
     puts("  sdload c b s n    - n 512-byte blocks from sector s into channel c's window at b");
     puts("  sdboot            - the image on the SD card: weights, hdrload, tokload");
     puts("  sdsave            - the uploaded model (and tokenizer) to the SD card, booted at power-up");

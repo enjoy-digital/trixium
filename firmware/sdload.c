@@ -89,8 +89,33 @@ static int sd_switch_hs(void)
     return sd_wait(sd_core_data_event_read);
 }
 
+// ACMD6 (bus width) and the PHY's matching setting.
+static int sd_bus_width(uint32_t rca, int width)
+{
+    if (sd_cmd(rca << 16, 55, RSP_SHORT | RSP_CRC) != SD_OK ||
+        sd_cmd(width == 4 ? 2 : 0, 6, RSP_SHORT | RSP_CRC) != SD_OK)
+        return SD_TIMEOUT;
+    sd_phy_settings_write(width == 4 ? PHY_SPEED_4X : PHY_SPEED_1X);
+    return SD_OK;
+}
+
+// One block read of sector 0 (the gateware drops it: sd_upload is clear).
+static int sd_read_check(void)
+{
+    sd_core_block_length_write(512);
+    sd_core_block_count_write(1);
+    int rc = sd_cmd_retry(0, 17, DATA_READ | RSP_SHORT | RSP_CRC);
+    if (rc == SD_OK)
+        rc = sd_wait(sd_core_data_event_read);
+    if (rc != SD_OK)
+        (void)sd_cmd(0, 12, RSP_BUSY | RSP_CRC);              // Back to transfer state.
+    return rc;
+}
+
 int sd_init(int mhz, int tries)
 {
+    int force_1bit = mhz < 0;
+    if (mhz < 0) mhz = -mhz;
     uint32_t r[SD_CMD_RESPONSE_SIZE/4];
     int timeout;
     sd_ok = 0;
@@ -137,19 +162,22 @@ int sd_init(int mhz, int tries)
     }
     // High speed (50 MHz) when asked for and the card takes the switch; 25 MHz otherwise.
     int hs = mhz > 25 && sd_switch_hs() == SD_OK;
-    if (sd_cmd(rca << 16, 55, RSP_SHORT | RSP_CRC) != SD_OK ||
-        sd_cmd(2, 6, RSP_SHORT | RSP_CRC) != SD_OK) {         // ACMD6: 4-bit.
-        puts("sdinit: 4-bit bus refused");
-        return -1;
-    }
-    sd_phy_settings_write(PHY_SPEED_4X);
     if (sd_cmd(512, 16, RSP_SHORT | RSP_CRC) != SD_OK) {      // CMD16: 512-byte blocks.
         puts("sdinit: block length refused");
         return -1;
     }
     sd_clk(hs ? (uint32_t)mhz*1000000u : 25000000u);
+    // 4-bit, checked with one block read (dropped): on the Ti375 kit the card switches but the
+    // 4-bit reader never sees a start bit on all four lines (at any clock), so 1-bit then.
+    int width = 1;
+    if (!force_1bit && sd_bus_width(rca, 4) == SD_OK && sd_read_check() == SD_OK)
+        width = 4;
+    else if (sd_bus_width(rca, 1) != SD_OK || sd_read_check() != SD_OK) {
+        puts("sdinit: no block reads at 1 or 4 bits");
+        return -1;
+    }
     sd_ok = 1;
-    printf("SDINIT ok, 4-bit at %d MHz\n", hs ? mhz : 25);
+    printf("SDINIT ok, %d-bit at %d MHz\n", width, hs ? mhz : 25);
     return 0;
 }
 
