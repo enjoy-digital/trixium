@@ -161,7 +161,7 @@ static void help(void)
     puts("  gen n id id ...   - generate n tokens from prompt ids");
     puts("  tokload           - load the tokenizer staged with the image (trixium load --tokenizer)");
     puts("  chat [n]          - chat in text on this console, replies up to n tokens (default 512)");
-#ifdef CSR_SDCARD_BASE
+#ifdef CSR_SD_BASE
     puts("  sdinit [mhz]      - SD card init (4-bit, 50 MHz high speed when the card takes it)");
     puts("  sdload c b s n    - n 512-byte blocks from sector s into channel c's window at b");
     puts("  sdboot            - the image on the SD card: weights, hdrload, tokload");
@@ -1634,7 +1634,7 @@ static void console_service(void)
         tok_load();
     else if (strcmp(token, "chat") == 0)
         chat_cmd(str);
-#ifdef CSR_SDCARD_BASE
+#ifdef CSR_SD_BASE
     else if (strcmp(token, "sdinit") == 0) {
         char *m = get_token(&str);
         sd_init(*m ? parse_int(m) : 50, 1000);
@@ -1724,7 +1724,7 @@ int main(void)
     puts("ddr: simulation (PHY model) - controller init and DDRTEST skipped");
 #endif
 #endif
-#if defined(CSR_SDCARD_BASE) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
+#if defined(CSR_SD_BASE) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
     // Power-up with nothing staged (no host uploaded a model since the DRAM lost it) and a
     // TriXium image on the SD card: load it, a host-free start. Three quick probes without a card.
     engine_fetch(0, HDR_STAGING, 1, 0xC000);

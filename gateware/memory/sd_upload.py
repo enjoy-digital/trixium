@@ -6,8 +6,8 @@
 
 """SDCardUpload: the weights from an SD card, through the same loader as the UDP upload.
 
-LiteSDCard's PHY and core (the CSRs LiteX's liblitesdcard drives: sdcard_init, the commands,
-block length and count) with the card's read stream (8-bit) widened to the loader's and offered
+LiteSDCard's PHY and core (the firmware's firmware/sdload.c drives the commands, block length
+and count) with the card's read stream (8-bit) widened to the loader's and offered
 as an upload source: with `upload` set, the loader takes it instead of the UDP port's. The
 firmware arms the loader (chan, base, length) as for a UDP transfer, then issues a multi-block
 read (CMD18): the blocks land in the channel's window with no CPU copy and no DMA through the
@@ -19,8 +19,9 @@ the CPU pushes 32-bit words into `wdata` (a FIFO of `wfifo_depth`, its fill in `
 little-endian into the core's write stream; the firmware fetches the DRAM through the engine into
 the scratchpad and pushes from there. Slow (the CPU's CSR writes) but small, and once per model.
 
-One module named `sdcard` in the SoC, so the CSR names are liblitesdcard's (sdcard_phy_*,
-sdcard_core_*). `use_emulator`: LiteSDCard's card model instead of pads (simulation).
+The SoC names it `sd`, not `sdcard`: under that name LiteX's BIOS links liblitesdcard's FatFs disk,
+which needs the block2mem DMA (the link fails without it); the firmware has its own commands.
+`use_emulator`: LiteSDCard's card model instead of pads (simulation).
 """
 
 from migen import *
@@ -54,8 +55,8 @@ class SDCardUpload(LiteXModule):
         self.core = SDCore(self.phy)
         # Bytes in card order, the first in the low bits: the order the UDP port gives the loader.
         # Without `upload` the card's data is dropped before the converter: the init's own data
-        # reads (the switch status, the SCR: liblitesdcard takes them by a DMA this design does
-        # not have) must not leave bytes for the first transfer, whole or in a partial word.
+        # reads (the switch status) must not leave bytes for the first transfer, whole or in a
+        # partial word.
         self.conv = conv = stream.Converter(8, out_dw)
         self.comb += [
             If(self.upload.storage,

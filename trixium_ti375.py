@@ -256,10 +256,11 @@ class TriXiumTi375SoC(SoCCore):
             SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
         if with_sdcard:
             # The weights from the microSD slot (4-bit): the card's read stream into the loader in
-            # place of the UDP port's while `sdcard_upload` is set (the firmware's `sdload`).
-            self.sdcard = SDCardUpload(platform, sys_clk_freq, pads=platform.request("sdcard"))
-            self.comb += If(self.sdcard.upload.storage,
-                self.sdcard.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}),
+            # place of the UDP port's while `sd_upload` is set (the firmware's `sdload`). Named `sd`:
+            # as `sdcard` LiteX's BIOS links liblitesdcard's FatFs disk, which needs a block2mem DMA.
+            self.sd = SDCardUpload(platform, sys_clk_freq, pads=platform.request("sdcard"))
+            self.comb += If(self.sd.upload.storage,
+                self.sd.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}),
             ).Else(
                 self.udpload.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}),
             )

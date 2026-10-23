@@ -560,9 +560,9 @@ class TriXiumSimSoC(SoCCore):
         # its one 512-byte block (words 0..127) for every sector read.
         if with_sdcard:
             from gateware.memory.sd_upload import SDCardUpload
-            self.sdcard = SDCardUpload(platform, self.sys_clk_freq, use_emulator=True)
-            self.comb += If(self.sdcard.upload.storage,
-                self.sdcard.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}))
+            self.sd = SDCardUpload(platform, self.sys_clk_freq, use_emulator=True)
+            self.comb += If(self.sd.upload.storage,
+                self.sd.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}))
 
         # Scratchpad on the SoC bus (CPU access).
         self.bus.add_slave("scratchpad", self.trixium.bus,

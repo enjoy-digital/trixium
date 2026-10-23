@@ -21,43 +21,98 @@
 #include "sdload.h"
 #include "tokenizer.h"
 
-#ifdef CSR_SDCARD_BASE
+#ifdef CSR_SD_BASE
 
 #include <libbase/crc.h>
-#include <liblitesdcard/sdcard.h>
 
 // The card's read stream feeds the weight loader (gateware/memory/sd_upload.py): the firmware
 // arms the loader for a channel window, as the host does for a UDP transfer, and a multi-block
-// read (CMD18) lands there - no CPU copy. Init is liblitesdcard's sequence without its two data
-// reads into CPU memory (the switch status, the SCR: they need the DMA this design does not
-// have, the gateware drops that data): 4-bit assumed, which every SD memory card supports.
+// read (CMD18) lands there - no CPU copy. The SoC's module is `sd`, not `sdcard`: under that
+// name LiteX's BIOS builds its FatFs disk on liblitesdcard, which needs the block2mem DMA this
+// design does not have (the link fails). So the commands are here, after liblitesdcard's: init
+// without its two data reads into CPU memory (the switch status, the SCR; the gateware drops
+// that data): 4-bit assumed, which every SD memory card supports.
+
+#define SD_OK       0
+#define SD_CRCERROR 1
+#define SD_TIMEOUT  2
+#define SD_CMD_RESPONSE_SIZE 16
+#define RSP_NONE  0
+#define RSP_SHORT 1
+#define RSP_LONG  2
+#define RSP_BUSY  3
+#define RSP_CRC   4
+#define DATA_READ  (1 << 5)
+#define DATA_WRITE (2 << 5)
+#define PHY_SPEED_1X 0
+#define PHY_SPEED_4X 1
 
 static int sd_ok;
+
+static int sd_wait(uint32_t (*event)(void))
+{
+    uint32_t e;
+    while (!((e = event()) & 1))
+        busy_wait_us(10);
+    return (e & 4) ? SD_TIMEOUT : (e & 8) ? SD_CRCERROR : SD_OK;
+}
+
+static int sd_cmd(uint32_t arg, int cmd, int rsp)
+{
+    sd_core_cmd_argument_write(arg);
+    sd_core_cmd_command_write((cmd << 8) | rsp);
+    sd_core_cmd_send_write(1);
+    return sd_wait(sd_core_cmd_event_read);
+}
+
+static int sd_cmd_retry(uint32_t arg, int cmd, int rsp)
+{
+    int rc = SD_TIMEOUT;
+    for (int i = 0; i < 16 && rc != SD_OK; i++)
+        rc = sd_cmd(arg, cmd, rsp);
+    return rc;
+}
+
+static void sd_clk(uint32_t hz)
+{
+    uint32_t div = (CONFIG_CLOCK_FREQUENCY + hz - 1)/hz;
+    sd_phy_clocker_divider_write(div < 2 ? 2 : div > 256 ? 256 : div);
+}
+
+// CMD6 (switch to high speed): its 64-byte status reply is dropped by the gateware.
+static int sd_switch_hs(void)
+{
+    sd_core_block_length_write(64);
+    sd_core_block_count_write(1);
+    if (sd_cmd_retry(0x80fffff1, 6, DATA_READ | RSP_SHORT | RSP_CRC) != SD_OK)
+        return SD_TIMEOUT;
+    return sd_wait(sd_core_data_event_read);
+}
 
 int sd_init(int mhz, int tries)
 {
     uint32_t r[SD_CMD_RESPONSE_SIZE/4];
     int timeout;
     sd_ok = 0;
-    sdcard_upload_write(0);
-    sdcard_phy_settings_write(SD_PHY_SPEED_1X);
-    sdcard_set_clk_freq(400000, 0);
+    sd_upload_write(0);
+    sd_phy_settings_write(PHY_SPEED_1X);
+    sd_clk(400000);
     for (timeout = tries; timeout > 0; timeout--) {
         busy_wait(1);
-        sdcard_phy_init_initialize_write(1);       // 80 clocks.
+        sd_phy_init_initialize_write(1);           // 80 clocks.
         busy_wait(1);
-        (void)sdcard_go_idle();
+        (void)sd_cmd(0, 0, RSP_NONE);              // CMD0: idle.
         busy_wait(1);
-        if (sdcard_send_ext_csd() == SD_OK)        // CMD8: a v2.00+ card.
+        if (sd_cmd(0x1aa, 8, RSP_SHORT | RSP_CRC) == SD_OK)   // CMD8: a v2.00+ card.
             break;
     }
     if (!timeout) { if (tries > 3) puts("sdinit: no card answers (CMD8)"); return -1; }
-    sdcard_set_clk_freq(25000000, 0);
+    sd_clk(25000000);
     busy_wait(1);
     for (timeout = 1000; timeout > 0; timeout--) {
-        sdcard_app_cmd(0);
-        if (sdcard_app_send_op_cond(1) == SD_OK) {
-            csr_rd_buf_uint32(CSR_SDCARD_CORE_CMD_RESPONSE_ADDR, r, SD_CMD_RESPONSE_SIZE/4);
+        sd_cmd(0, 55, RSP_SHORT | RSP_CRC);        // ACMD41, high capacity.
+        if (sd_cmd(0x70ff8000, 41, RSP_SHORT) == SD_OK) {
+            csr_rd_buf_uint32(CSR_SD_CORE_CMD_RESPONSE_ADDR, r, SD_CMD_RESPONSE_SIZE/4);
             if (r[0] & 0x80000000)                 // Power-up done.
                 break;
         }
@@ -68,28 +123,31 @@ int sd_init(int mhz, int tries)
         puts("sdinit: a standard-capacity card (byte addresses): use an SDHC/SDXC card");
         return -1;
     }
-    if (sdcard_all_send_cid() != SD_OK || sdcard_set_relative_address() != SD_OK) {
+    if (sd_cmd(0, 2, RSP_LONG | RSP_CRC) != SD_OK ||          // CMD2: CID.
+        sd_cmd(0, 3, RSP_SHORT | RSP_CRC) != SD_OK) {         // CMD3: RCA.
         puts("sdinit: identification failed");
         return -1;
     }
-    uint16_t rca = sdcard_decode_rca();
-    if (sdcard_send_cid(rca) != SD_OK || sdcard_send_csd(rca) != SD_OK ||
-        sdcard_select_card(rca) != SD_OK) {
+    csr_rd_buf_uint32(CSR_SD_CORE_CMD_RESPONSE_ADDR, r, SD_CMD_RESPONSE_SIZE/4);
+    uint32_t rca = (r[0] >> 16) & 0xffff;
+    if (sd_cmd(rca << 16, 9, RSP_LONG | RSP_CRC) != SD_OK ||  // CMD9: CSD.
+        sd_cmd(rca << 16, 7, RSP_BUSY | RSP_CRC) != SD_OK) {  // CMD7: select.
         puts("sdinit: selection failed");
         return -1;
     }
     // High speed (50 MHz) when asked for and the card takes the switch; 25 MHz otherwise.
-    int hs = mhz > 25 && sdcard_switch(SD_SWITCH_SWITCH, SD_GROUP_ACCESSMODE, SD_SPEED_SDR25) == SD_OK;
-    if (sdcard_app_cmd(rca) != SD_OK || sdcard_app_set_bus_width() != SD_OK) {
+    int hs = mhz > 25 && sd_switch_hs() == SD_OK;
+    if (sd_cmd(rca << 16, 55, RSP_SHORT | RSP_CRC) != SD_OK ||
+        sd_cmd(2, 6, RSP_SHORT | RSP_CRC) != SD_OK) {         // ACMD6: 4-bit.
         puts("sdinit: 4-bit bus refused");
         return -1;
     }
-    sdcard_phy_settings_write(SD_PHY_SPEED_4X);
-    if (sdcard_app_set_blocklen(512) != SD_OK) {
+    sd_phy_settings_write(PHY_SPEED_4X);
+    if (sd_cmd(512, 16, RSP_SHORT | RSP_CRC) != SD_OK) {      // CMD16: 512-byte blocks.
         puts("sdinit: block length refused");
         return -1;
     }
-    sdcard_set_clk_freq(hs ? (uint32_t)mhz*1000000u : 25000000u, 0);
+    sd_clk(hs ? (uint32_t)mhz*1000000u : 25000000u);
     sd_ok = 1;
     printf("SDINIT ok, 4-bit at %d MHz\n", hs ? mhz : 25);
     return 0;
@@ -105,13 +163,17 @@ int sd_load(int chan, uint32_t base, uint32_t sector, uint32_t blocks)
     trixium_loader_length_write(blocks*16);       // 512-byte blocks in 32-byte beats.
     trixium_loader_resync_write(0);
     trixium_loader_start_write(1);
-    sdcard_upload_write(1);
-    int rc = sdcard_read_multiple_block(sector, blocks);
-    (void)sdcard_stop_transmission();
+    sd_upload_write(1);
+    sd_core_block_length_write(512);
+    sd_core_block_count_write(blocks);
+    int rc = sd_cmd_retry(sector, 18, DATA_READ | RSP_SHORT | RSP_CRC);   // CMD18.
+    if (rc == SD_OK)
+        rc = sd_wait(sd_core_data_event_read);
+    (void)sd_cmd(0, 12, RSP_BUSY | RSP_CRC);                              // CMD12: stop.
     // The loader drains its last beats into the memory (its writers' responses).
     for (int t = 0; t < 100000 && !(trixium_loader_status_read() & 1); t++)
         busy_wait_us(10);
-    sdcard_upload_write(0);
+    sd_upload_write(0);
     if (rc != SD_OK || !(trixium_loader_status_read() & 1)) {
         printf("sdload: %s (loader status %08lx, %lu beats armed)\n",
                rc == SD_CRCERROR ? "CRC error on the card's data" : rc != SD_OK ? "read timeout" :
@@ -131,8 +193,8 @@ static void sd_push(const volatile uint32_t *w, uint32_t n)
     uint32_t room = 0;
     for (uint32_t i = 0; i < n; i++) {
         while (room == 0)
-            room = SD_WFIFO_DEPTH - sdcard_wlevel_read();
-        sdcard_wdata_write(w[i]);
+            room = SD_WFIFO_DEPTH - sd_wlevel_read();
+        sd_wdata_write(w[i]);
         room--;
     }
 }
@@ -140,13 +202,12 @@ static void sd_push(const volatile uint32_t *w, uint32_t n)
 int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const uint32_t *cpu)
 {
     if (!sd_ok) { puts("sdwrite: sdinit first"); return -1; }
-    sdcard_core_block_length_write(512);
-    sdcard_core_block_count_write(blocks);
-    sdcard_core_cmd_argument_write(sector);
-    sdcard_core_cmd_command_write(((blocks > 1 ? 25 : 24) << 8) | (SDCARD_CTRL_DATA_TRANSFER_WRITE << 5) |
-                                  SDCARD_CTRL_RESPONSE_SHORT | SDCARD_CTRL_RESPONSE_CRC);
-    sdcard_core_cmd_send_write(1);
-    if (sdcard_wait_cmd_done() != SD_OK) { puts("sdwrite: write command refused"); return -1; }
+    sd_core_block_length_write(512);
+    sd_core_block_count_write(blocks);
+    if (sd_cmd(sector, blocks > 1 ? 25 : 24, DATA_WRITE | RSP_SHORT | RSP_CRC) != SD_OK) {
+        puts("sdwrite: write command refused");
+        return -1;
+    }
     uint32_t bytes = blocks*512;
     for (uint32_t off = 0; off < bytes; off += 0x10000) {
         uint32_t chunk = bytes - off > 0x10000 ? 0x10000 : bytes - off;
@@ -157,9 +218,9 @@ int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const ui
             sd_push((const volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000), chunk/4);
         }
     }
-    int rc = sdcard_wait_data_done();
+    int rc = sd_wait(sd_core_data_event_read);
     if (blocks > 1)
-        (void)sdcard_stop_transmission();
+        (void)sd_cmd(0, 12, RSP_BUSY | RSP_CRC);
     if (rc != SD_OK) {
         printf("sdwrite: %s at sector %lu\n", rc == SD_CRCERROR ? "the card refused a block (CRC)" :
                "write timeout", (unsigned long)sector);
