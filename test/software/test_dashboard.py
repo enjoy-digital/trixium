@@ -97,3 +97,28 @@ def test_server_fake():
         stop.set()
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_sampler_reconnects():
+    # An interrupted read leaves the litex_server stream out of step: the sampler reconnects
+    # instead of reporting the same error forever.
+    class Flaky(d.FakeSource):
+        def __init__(self):
+            super().__init__(interval=0.01)
+            self.broken, self.reconnects = True, 0
+
+        def sample(self):
+            if self.broken:
+                raise ValueError("unpack_from requires a buffer of at least 24 bytes")
+            return super().sample()
+
+        def reconnect(self):
+            self.broken, self.reconnects = False, self.reconnects + 1
+
+    src, hub, stop = Flaky(), d.Hub(), threading.Event()
+    th = threading.Thread(target=d.sampler, args=(src, d.Tracker(), hub, stop), daemon=True)
+    th.start()
+    try:
+        assert hub.wait(0, 5.0) and src.reconnects == 1 and hub.error is None
+    finally:
+        stop.set()

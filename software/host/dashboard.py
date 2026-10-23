@@ -62,7 +62,8 @@ def parse_live(words):
 class BoardSource:
     """Samples a board through a litex_server (ebsmi.Card) and the firmware's live block."""
     def __init__(self, csr_csv, host="localhost", port=1234, interval=0.25):
-        self.card     = ebsmi.Card(csr_csv, host, port)
+        self.args     = (csr_csv, host, port)
+        self.card     = ebsmi.Card(*self.args)
         self.interval = interval
         # The start of sram (linker.ld's .live): on the shared bus, unlike main_ram on the Ti375 -
         # never read an address the bus does not decode: each read waits out the bus timeout and
@@ -90,6 +91,15 @@ class BoardSource:
         s = ebsmi.status(self.card, self.interval)
         s["live"] = self.live()
         return s
+
+    def reconnect(self):
+        """A new litex_server connection: after an interrupted read (the board reloaded, the
+        server restarted) the old one is out of step - every later read gets an earlier reply."""
+        try:
+            self.card.close()
+        except Exception:
+            pass
+        self.card = ebsmi.Card(*self.args)
 
     def close(self):
         self.card.close()
@@ -227,9 +237,14 @@ def sampler(source, tracker, hub, stop):
         try:
             hub.publish(tracker.record(source.sample()))
             hub.error = None
-        except Exception as e:            # A dropped Etherbone read: report it, keep going.
+        except Exception as e:            # A dropped Etherbone read: report it, reconnect.
             hub.error = f"{type(e).__name__}: {e}"
             time.sleep(1.0)
+            try:
+                if hasattr(source, "reconnect"):
+                    source.reconnect()
+            except Exception as e:
+                hub.error = f"{type(e).__name__}: {e}"
 
 def make_handler(hub):
     class Handler(BaseHTTPRequestHandler):

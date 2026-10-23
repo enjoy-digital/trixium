@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import time
+import fcntl
 import argparse
 
 STATE_DIR  = "/tmp/trixium"
@@ -100,11 +101,31 @@ class Card:
                  done=r("trixium_engine_csr_done_count"),
                  pf_hits=r("trixium_engine_csr_pf_hits") if self.has("trixium_engine_csr_pf_hits") else 0,
                  beats=[], ar=[])
-        for c in range(self.n_ch):
-            self.regs.trixium_engine_csr_perf_chan.write(c)
-            s["beats"].append(r("trixium_engine_csr_perf_beats"))
-            s["ar"].append(r("trixium_engine_csr_perf_ar"))
+        # perf_chan selects the channel the counters show: two monitors (smi and the dashboard)
+        # interleaving select and read get another channel's counts, and the deltas wrap (the
+        # page showed hundreds of GB/s). One lock on this machine keeps each select-read pair whole.
+        with perf_lock():
+            for c in range(self.n_ch):
+                self.regs.trixium_engine_csr_perf_chan.write(c)
+                s["beats"].append(r("trixium_engine_csr_perf_beats"))
+                s["ar"].append(r("trixium_engine_csr_perf_ar"))
         return s
+
+class perf_lock:
+    """An exclusive flock on STATE_DIR/perf.lock (no lock if the directory is not writable)."""
+    def __enter__(self):
+        self.f = None
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            self.f = open(os.path.join(STATE_DIR, "perf.lock"), "a")
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.f is not None:
+            self.f.close()             # Releases the lock.
 
 # Status --------------------------------------------------------------------------------------------
 

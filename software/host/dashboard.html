@@ -38,7 +38,9 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
 .brand { font-weight: 700; font-size: 20px; letter-spacing: .2px; }
 .brand b { color: var(--teal); }
 .meta { color: var(--dim); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 16px; }
-.pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px;
+/* min-width: "idle" and "generating" take the same room, so the header never re-wraps (the page
+   jumped at every reply). */
+.pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px; min-width: 132px;
   border: 1px solid var(--line); border-radius: 999px; background: var(--panel); font-size: 13px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
 .pill.on .dot { background: var(--teal); box-shadow: 0 0 0 0 var(--teal); animation: pulse 1.4s infinite; }
