@@ -38,6 +38,7 @@
 #include "vec.h"
 #include "progs.h"
 #include "static_memory.h"
+#include "tokenizer.h"
 
 /* Checks */
 /*--------*/
@@ -157,6 +158,8 @@ static void help(void)
     puts("  hdrload           - copy the BONS header+table staged by trixium_load to CPU memory");
     puts("  tokclr/tok/genb   - chunked prompt buffer + generate [stop ids] (host chat tools)");
     puts("  gen n id id ...   - generate n tokens from prompt ids");
+    puts("  tokload           - load the tokenizer staged with the image (trixium load --tokenizer)");
+    puts("  chat [n]          - chat in text on this console, replies up to n tokens (default 512)");
     puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
     puts("  bench [n]         - profiled generation benchmark (default 4 tokens)");
     puts("Hardware vs CPU reference (default: the hardware path where the bitstream has it):");
@@ -992,6 +995,122 @@ static void genb_cmd(char *args)
     }
 }
 
+/* On-board Chat */
+/*---------------*/
+
+// The tokenizer runs here: a plain serial terminal is the whole client. The conversation lives
+// in the prompt buffer and continues from the KV cache, as genb's.
+
+static void chat_emit(int id)
+{
+    const struct ttok *t = tok_get();
+    if (pbuf_n < PBUF_N)
+        pbuf[pbuf_n++] = id;
+    if (!t || id == t->im_end || id == t->im_start)
+        return;                   // Template tokens are structure, not text.
+    uint32_t len;
+    const uint8_t *b = ttok_piece(t, id, &len);
+    for (uint32_t i = 0; i < len; i++)
+        putchar(b[i]);            // UTF-8 bytes: the terminal joins a split character.
+}
+
+// One line from the console, echoed; backspace removes a whole UTF-8 character. -1 on Ctrl-D.
+static int chat_readline(char *buf, int cap)
+{
+    int n = 0;
+    while (1) {
+        int c = getchar();
+        if (c == '\r' || c == '\n') {
+            if (n == 0 && c == '\n')
+                continue;         // The \n of a terminal's \r\n.
+            putchar('\n');
+            buf[n] = 0;
+            return n;
+        }
+        if (c == 0x04)
+            return -1;
+        if (c == 0x7f || c == 0x08) {
+            if (n > 0) {
+                while (--n > 0 && ((uint8_t)buf[n] & 0xC0) == 0x80);
+                fputs("\x08 \x08", stdout);
+            }
+            continue;
+        }
+        if (n < cap - 1) {
+            buf[n++] = (char)c;
+            putchar(c);
+        }
+    }
+}
+
+static void chat_cmd(char *args)
+{
+    const struct ttok *t = tok_get();
+    const struct bons_header *h = model_header();
+    if (!t || t->im_end < 0 || !h || h->magic != BONS_MAGIC) {
+        puts(t ? "chat: no model (hdrload)" : "chat: no tokenizer (tokload)");
+        return;
+    }
+    char *a = get_token(&args);
+    int nmax = *a ? parse_int(a) : 512;
+    if (nmax < 1 || nmax > PBUF_N/2) nmax = 512;
+    char *line = (char *)TRIXIUM_CHAT_LINE_ADDR;
+    int first = 1, prev_closed = 1;
+    pbuf_n = pbuf_kv = 0;
+    puts("TriXium chat, the tokenizer on the board: /reset clears the conversation, /exit or Ctrl-D leaves");
+    while (1) {
+        printf("\nyou> ");
+        int ln = chat_readline(line, TRIXIUM_CHAT_LINE_SIZE);
+        // A trailing backslash continues the message on the next line.
+        while (ln > 0 && line[ln - 1] == '\\') {
+            line[ln - 1] = '\n';
+            printf("   > ");
+            int m = chat_readline(line + ln, TRIXIUM_CHAT_LINE_SIZE - ln);
+            if (m < 0) { ln = -1; break; }
+            ln += m;
+        }
+        if (ln < 0 || strcmp(line, "/exit") == 0)
+            break;
+        if (ln == 0)
+            continue;
+        if (strcmp(line, "/reset") == 0) {
+            pbuf_n = pbuf_kv = 0; first = prev_closed = 1;
+            puts("(conversation cleared)");
+            continue;
+        }
+        int n = ttok_turn(t, line, NULL, first, prev_closed, pbuf + pbuf_n, PBUF_N - pbuf_n);
+        if (pbuf_n + n + nmax > PBUF_N) {    // The context is full: start over with this turn.
+            puts("(context full: conversation restarted)");
+            pbuf_n = pbuf_kv = 0;
+            n = ttok_turn(t, line, NULL, 1, 1, pbuf, PBUF_N);
+        }
+        pbuf_n += n;
+        int before = pbuf_n, stop = t->im_end;
+        printf("bonsai> ");
+        infer_set_stop(&stop, 1);
+        infer_set_recent(pbuf, &pbuf_n);
+        int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
+        uint64_t t0 = perf_now64();
+        int r = infer_generate_from(pbuf, before, resident, nmax, chat_emit);
+        uint64_t dt = perf_now64() - t0;
+        pbuf_kv     = infer_kv_resident();
+        pbuf_serial = infer_gen_serial();
+        infer_set_stop(&stop, 0);
+        int got = pbuf_n - before;
+        prev_closed = got > 0 && pbuf[pbuf_n - 1] == t->im_end;
+        first = 0;
+        uint32_t ms = (uint32_t)(dt/(CONFIG_CLOCK_FREQUENCY/1000));
+        printf("\n[%d tokens in %lu.%01lu s, context %d%s]\n", got, (unsigned long)(ms/1000),
+               (unsigned long)(ms%1000/100), pbuf_n, prev_closed ? "" : ", capped");
+        if (r < 0 || engine_wedged) {
+            puts("(generation error: conversation restarted)");
+            if (engine_wedged) engine_recover();
+            pbuf_n = pbuf_kv = 0; first = prev_closed = 1;
+        }
+    }
+    puts("(chat ended)");
+}
+
 static void gen_cmd(char *args)
 {
     int *const prompt = (int *)TRIXIUM_CONSOLE_PROMPT_ADDR;
@@ -1503,6 +1622,10 @@ static void console_service(void)
                engine_diag ? "on" : "off");
     } else if (strcmp(token, "hdrload") == 0)
         hdrload();
+    else if (strcmp(token, "tokload") == 0)
+        tok_load();
+    else if (strcmp(token, "chat") == 0)
+        chat_cmd(str);
     else if (strlen(token))
         puts("unknown command");
     printf("trixium> ");

@@ -15,6 +15,7 @@ the SoC's UART (the console, 115200); its RJ45 gives Etherbone (the CSRs) and th
   python3 -m software.host.ti375 boot build/ti375_v7/trixium.bin
   python3 -m software.host.ti375 flash build/ti375_v10 firmware/trixium.bin   # power-up boot
   python3 -m software.host.ti375 model models/bons/bonsai2-2b-n4-ti375.img    # upload unless there
+  python3 -m software.host.ti375 model <img> --tokenizer models/2b/tokenizer.bin # + on-board chat
   python3 -m software.host.ti375 server --iface enp5s0      # litex_server on that interface
   python3 -m software.host.ti375 smi [-w 1]                 # trixium smi over Etherbone
   python3 -m software.host.ti375 dashboard [--watts 7.5]    # the live page, http://localhost:8375/
@@ -226,13 +227,14 @@ def image_id(image):
     st = os.stat(image)
     return dict(image=os.path.realpath(image), bytes=st.st_size, mtime=int(st.st_mtime))
 
-def ensure_model(image, csr_csv=None, force=False, verbose=False):
+def ensure_model(image, csr_csv=None, force=False, verbose=False, tokenizer=None):
     """The weights of `image` on the kit: uploaded over UDP (each transfer CRC-checked on the
-    builds with the port's CRC) unless the kit still holds them, then `hdrload`. Returns
-    (uploaded, seconds)."""
+    builds with the port's CRC) unless the kit still holds them, then `hdrload`. With a
+    `tokenizer` (BTOK), staged with the weights and loaded on the board (`tokload`): a plain
+    serial terminal can then chat (the firmware's `chat`). Returns (uploaded, seconds)."""
     from litex.tools.litex_client import RemoteClient
     from software.host.ebsmi import state_read, state_write
-    from software.host.udpload import UDPLink, upload
+    from software.host.udpload import UDPLink, upload, upload_tokenizer
     from software.host.console import run as console_run
     import random
     tty, ip, iface = config()
@@ -250,16 +252,20 @@ def ensure_model(image, csr_csv=None, force=False, verbose=False):
         rec = state_read("load") or {}
         same = (not force and rec.get("board") == "ti375" and rec.get("tag")
                 and bus.regs.ctrl_scratch.read() == rec["tag"]
-                and {k: rec.get(k) for k in ("image", "bytes", "mtime")} == image_id(image))
+                and {k: rec.get(k) for k in ("image", "bytes", "mtime")} == image_id(image)
+                and (tokenizer is None or rec.get("tokenizer") == image_id(tokenizer)))
         if not same:
             bus.regs.ctrl_scratch.write(SCRATCH_RESET)     # Invalid while the weights change.
             n, resent = upload(bus, UDPLink(ip, iface=iface), image, verbose=verbose)
+            if tokenizer:
+                upload_tokenizer(bus, UDPLink(ip, iface=iface), tokenizer, verbose=verbose)
             tag = random.randrange(1, 1 << 32)
             while tag == SCRATCH_RESET:
                 tag = random.randrange(1, 1 << 32)
             bus.regs.ctrl_scratch.write(tag)
             state_write("load", board="ti375", tag=tag, csr_csv=csr_csv, time=int(time.time()),
-                        **image_id(image), build=os.path.basename(os.path.dirname(csr_csv)))
+                        **image_id(image), build=os.path.basename(os.path.dirname(csr_csv)),
+                        tokenizer=image_id(tokenizer) if tokenizer else None)
             uploaded = True
         bus.close()
     finally:
@@ -268,6 +274,10 @@ def ensure_model(image, csr_csv=None, force=False, verbose=False):
     out = console_run(["hdrload"], tty, wait=20, until="inference ready", baud=BAUD)
     if "inference ready" not in out:
         raise RuntimeError("hdrload failed:\n" + out[-800:])
+    if tokenizer:
+        out = console_run(["tokload"], tty, wait=20, until="TOKLOAD", baud=BAUD)
+        if "TOKLOAD" not in out:
+            raise RuntimeError("tokload failed:\n" + out[-800:])
     return uploaded, time.time() - t0
 
 # Status -------------------------------------------------------------------------------------------
@@ -343,6 +353,7 @@ def main(argv=None):
     p = sub.add_parser("flash");  p.add_argument("build"); p.add_argument("firmware")
     p = sub.add_parser("model");  p.add_argument("image"); p.add_argument("--csr-csv", default=None)
     p.add_argument("--force", action="store_true", help="Upload even when the kit holds the image.")
+    p.add_argument("--tokenizer", default=None, help="BTOK to stage and load on the board (its `chat` command).")
     p = sub.add_parser("server"); p.add_argument("--ip", default=BOARD_IP); p.add_argument("--iface", default=None)
     p = sub.add_parser("smi");    p.add_argument("--csr-csv", default=None); p.add_argument("-i", default=0.25, type=float, dest="interval")
     p.add_argument("-w", default=0.0, type=float, dest="watch"); p.add_argument("--json", action="store_true")
@@ -357,7 +368,8 @@ def main(argv=None):
     elif args.cmd == "flash":
         flash(args.build, args.firmware)
     elif args.cmd == "model":
-        uploaded, dt = ensure_model(args.image, args.csr_csv, args.force, verbose=True)
+        uploaded, dt = ensure_model(args.image, args.csr_csv, args.force, verbose=True,
+                                    tokenizer=args.tokenizer)
         print(f"{'uploaded' if uploaded else 'already on the kit'}, ready in {dt:.1f} s")
     elif args.cmd == "smi":
         smi(args.csr_csv, args.interval, args.watch, args.json)

@@ -15,20 +15,20 @@ BUILD_DIR ?= ../../build/xcu1525
 DRV_DIR   := $(BUILD_DIR)/driver
 LIB_DIR   := $(DRV_DIR)/user/liblitepcie
 
-CFLAGS=-O2 -Wall -g -I$(DRV_DIR)/kernel -I$(BUILD_DIR)/software/include -I$(LIB_DIR) -MMD -fPIC
+CFLAGS=-O2 -Wall -g -I$(DRV_DIR)/kernel -I$(BUILD_DIR)/software/include -I$(LIB_DIR) -I../lib -MMD -fPIC
 LDFLAGS=-g
 CC=$(CROSS_COMPILE)gcc
 AR=ar
 
 PROGS=trixium_smi trixium_load trixium_chat
-CHAT_OBJS=liblitepcie.a trixium_loader.o trixium_state.o trixium_chat.o
+CHAT_OBJS=liblitepcie.a trixium_loader.o trixium_state.o trixium_tok.o trixium_chat.o
 
 # A build without the LitePCIe driver (the Efinix Ti375 kit: no PCIe): trixium_chat alone, a
 # console-only tool (the board's status is `trixium smi --board ti375`, over Etherbone).
 ifeq ($(wildcard $(DRV_DIR)),)
 CFLAGS+=-DTRIXIUM_UART_ONLY
 PROGS=trixium_chat
-CHAT_OBJS=trixium_state.o trixium_chat.o
+CHAT_OBJS=trixium_state.o trixium_tok.o trixium_chat.o
 endif
 
 all: $(PROGS)
@@ -52,6 +52,9 @@ clean:
 %.o: %.c
 	$(CC) -c $(CFLAGS) -o $@ $<
 
+trixium_tok.o: ../lib/trixium_tok.c
+	$(CC) -c $(CFLAGS) -o $@ $<
+
 litepcie_%.o: $(LIB_DIR)/litepcie_%.c
 	$(CC) -c $(CFLAGS) -o $@ $<
 
@@ -65,4 +68,4 @@ BUILD_KEY := $(abspath $(BUILD_DIR))|$(CC)|$(CFLAGS)|$(LDFLAGS)
 ifneq ($(strip $(file <$(BUILD_STAMP))),$(strip $(BUILD_KEY)))
 $(file >$(BUILD_STAMP),$(BUILD_KEY))
 endif
-$(PROGS:%=%.o) trixium_loader.o trixium_state.o litepcie_dma.o litepcie_flash.o litepcie_helpers.o: $(BUILD_STAMP)
+$(PROGS:%=%.o) trixium_loader.o trixium_state.o trixium_tok.o litepcie_dma.o litepcie_flash.o litepcie_helpers.o: $(BUILD_STAMP)

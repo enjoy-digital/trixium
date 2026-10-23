@@ -51,6 +51,7 @@
 #include "liblitepcie.h"
 #endif
 #include "trixium_loader.h"
+#include "trixium_tok.h"
 
 /* Parameters */
 /*------------*/
@@ -93,295 +94,48 @@ static double g_prompt_wait = 120.0;
 /* -R: the BIOS is already at its prompt (a host-side DDR training ran after its calibration). */
 static int g_no_cpu_reset;
 
-/* Tokenizer: byte-level BPE over the exported vocab (raw bytes) + merge ranks */
-/*-----------------------------------------------------------------------------*/
+/* Tokenizer: software/lib/trixium_tok.c, the firmware's encoder too */
+/*-------------------------------------------------------------------*/
 
-struct tok_entry { uint32_t len; const uint8_t *bytes; };
-
-struct merge_slot { uint64_t key; uint32_t rank, result; };
-
-static struct tok_entry *g_vocab;
-static uint32_t          g_nvocab;
-static uint8_t          *g_blob;          /* Owns all token bytes. */
-static struct merge_slot *g_mtab;         /* Open-addressed (a,b) -> rank/result. */
-static uint32_t          g_mmask;
-static int32_t           g_byte_id[256];  /* Single-byte token ids. */
-
-static uint64_t mkey(uint32_t a, uint32_t b) { return ((uint64_t)a << 32) | b; }
-
-static uint64_t hash64(uint64_t x)
-{
-    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
-    return x ^ (x >> 33);
-}
-
-static const struct merge_slot *merge_find(uint32_t a, uint32_t b)
-{
-    uint64_t k = mkey(a, b);
-    uint32_t i = (uint32_t)(hash64(k) & g_mmask);
-    while (g_mtab[i].key != UINT64_MAX) {
-        if (g_mtab[i].key == k)
-            return &g_mtab[i];
-        i = (i + 1) & g_mmask;
-    }
-    return NULL;
-}
-
-static uint8_t g_tok_sha[32];
-static int     g_tok_sha_ok;
-
+static struct ttok g_tok;
 /* Chat-template tokens (Qwen3: <|im_start|> 151644, <|im_end|> 151645, <think> 151667,
- * </think> 151668), found by their literal text in the table - added tokens are stored as
- * UTF-8, and the added-token id is the highest one carrying that text. -1 = not this
- * tokenizer, and the tool falls back to raw completion. */
-static int g_im_start = -1, g_im_end = -1, g_think = -1, g_think_end = -1;
-
-static int tok_find(const char *lit)
-{
-    size_t n = strlen(lit);
-    for (uint32_t i = g_nvocab; i-- > 0; )
-        if (g_vocab[i].len == n && memcmp(g_vocab[i].bytes, lit, n) == 0)
-            return (int)i;
-    return -1;
-}
+ * </think> 151668), -1 when absent: the tool falls back to raw completion. */
+static int g_im_start = -1, g_im_end = -1;
 
 static int tok_load(const char *path)
 {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
-    char magic[4];
-    uint32_t ver, nvocab, nmerges;
-    if (fread(magic, 4, 1, f) != 1 || memcmp(magic, "BTOK", 4) ||
-        fread(&ver, 4, 1, f) != 1 || fread(&nvocab, 4, 1, f) != 1 ||
-        fread(&nmerges, 4, 1, f) != 1) {
-        fprintf(stderr, "%s: not a BTOK tokenizer (run trixium tokenizer)\n", path);
-        fclose(f); return -1;
-    }
-
-    if (ver >= 2) {                                  /* v2: the source tokenizer.json's hash. */
-        if (fread(g_tok_sha, 32, 1, f) != 1) { perror("fread"); fclose(f); return -1; }
-        g_tok_sha_ok = 1;
-    }
-    long here = ftell(f);
     fseek(f, 0, SEEK_END);
-    long rest = ftell(f) - here;
-    fseek(f, here, SEEK_SET);
-    g_blob = malloc(rest);
-    if (fread(g_blob, 1, rest, f) != (size_t)rest) { perror("fread"); fclose(f); return -1; }
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *btok = malloc(len > 0 ? len : 1);
+    if (len <= 0 || fread(btok, 1, len, f) != (size_t)len) { perror(path); fclose(f); return -1; }
     fclose(f);
-
-    g_vocab  = calloc(nvocab, sizeof(*g_vocab));
-    g_nvocab = nvocab;
-    memset(g_byte_id, -1, sizeof(g_byte_id));
-    uint8_t *p = g_blob;
-    for (uint32_t i = 0; i < nvocab; i++) {
-        uint32_t len; memcpy(&len, p, 4); p += 4;
-        g_vocab[i].len   = len;
-        g_vocab[i].bytes = p;
-        if (len == 1 && g_byte_id[p[0]] < 0)
-            g_byte_id[p[0]] = (int32_t)i;
-        p += len;
+    size_t need = ttok_arena_size(btok, len);
+    void *arena = need ? malloc(need) : NULL;
+    if (!arena || ttok_init(&g_tok, btok, len, arena) < 0) {
+        fprintf(stderr, "%s: not a BTOK tokenizer (run trixium tokenizer)\n", path);
+        return -1;
     }
-
-    uint32_t cap = 1;
-    while (cap < nmerges*2) cap <<= 1;
-    g_mtab  = malloc(cap*sizeof(*g_mtab));
-    g_mmask = cap - 1;
-    for (uint32_t i = 0; i < cap; i++) g_mtab[i].key = UINT64_MAX;
-    for (uint32_t r = 0; r < nmerges; r++) {
-        uint32_t a, b, ab;
-        memcpy(&a, p, 4); memcpy(&b, p + 4, 4); memcpy(&ab, p + 8, 4); p += 12;
-        uint64_t k = mkey(a, b);
-        uint32_t i = (uint32_t)(hash64(k) & g_mmask);
-        while (g_mtab[i].key != UINT64_MAX) i = (i + 1) & g_mmask;
-        g_mtab[i].key = k; g_mtab[i].rank = r; g_mtab[i].result = ab;
-    }
-    g_im_start  = tok_find("<|im_start|>");
-    g_im_end    = tok_find("<|im_end|>");
-    g_think     = tok_find("<think>");
-    g_think_end = tok_find("</think>");
+    g_im_start = g_tok.im_start;
+    g_im_end   = g_tok.im_end;
     return 0;
 }
 
-/* BPE over one pre-token: start from single bytes, repeatedly merge the best-ranked pair. */
-static int bpe_chunk(const uint8_t *s, size_t n, int *out, int max)
-{
-    static int ids[4096];
-    if (n == 0 || n > sizeof(ids)/sizeof(ids[0])) return 0;
-    size_t cnt = 0;
-    for (size_t i = 0; i < n; i++) {
-        int id = g_byte_id[s[i]];
-        if (id < 0) continue; /* Should not happen: byte-level vocab covers 0..255. */
-        ids[cnt++] = id;
-    }
-    while (cnt > 1) {
-        uint32_t best = UINT32_MAX; size_t at = 0; uint32_t res = 0;
-        for (size_t i = 0; i + 1 < cnt; i++) {
-            const struct merge_slot *m = merge_find(ids[i], ids[i+1]);
-            if (m && m->rank < best) { best = m->rank; at = i; res = m->result; }
-        }
-        if (best == UINT32_MAX) break;
-        ids[at] = (int)res;
-        memmove(&ids[at+1], &ids[at+2], (cnt - at - 2)*sizeof(int));
-        cnt--;
-    }
-    int w = 0;
-    for (size_t i = 0; i < cnt && w < max; i++) out[w++] = ids[i];
-    return w;
-}
-
-/* Pre-tokenizer */
-/*---------------*/
-
-/* Minimal UTF-8 decode: returns the codepoint and sets *len. */
-static uint32_t utf8_cp(const uint8_t *s, size_t n, int *len)
-{
-    if (n == 0) { *len = 0; return 0; }
-    if (s[0] < 0x80)                    { *len = 1; return s[0]; }
-    if ((s[0] & 0xE0) == 0xC0 && n >= 2) { *len = 2; return ((s[0]&0x1F)<<6)|(s[1]&0x3F); }
-    if ((s[0] & 0xF0) == 0xE0 && n >= 3) { *len = 3;
-        return ((s[0]&0x0F)<<12)|((s[1]&0x3F)<<6)|(s[2]&0x3F); }
-    if ((s[0] & 0xF8) == 0xF0 && n >= 4) { *len = 4;
-        return ((uint32_t)(s[0]&0x07)<<18)|((s[1]&0x3F)<<12)|((s[2]&0x3F)<<6)|(s[3]&0x3F); }
-    *len = 1; return s[0];
-}
-
-/* \p{L} approximation: good enough to separate letters (incl. accented, Greek, Cyrillic,
- * CJK) from symbols/emoji, which is what the pre-tokenizer split actually depends on. */
-static int cp_is_letter(uint32_t cp)
-{
-    if (cp < 0x80)    return isalpha((int)cp) != 0;
-    if (cp < 0x2000)  return 1;   /* Latin-1/Extended, Greek, Cyrillic, Hebrew, Arabic... */
-    if (cp < 0x3040)  return 0;   /* Punctuation, arrows, math, misc symbols.             */
-    if (cp < 0xD800)  return 1;   /* Kana, Hangul, CJK.                                   */
-    if (cp < 0x1F000) return 1;   /* CJK compat, presentation forms.                      */
-    return 0;                     /* Emoji and pictographs.                               */
-}
-static int cp_is_digit(uint32_t cp) { return cp >= '0' && cp <= '9'; }
-static int cp_is_space(uint32_t cp)
-{
-    return cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n' || cp == 0x0b || cp == 0x0c;
-}
-
-/* Follows the Qwen/GPT-2 pre-tokenizer alternation, in order:
- *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N}
- *   | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
- * Order matters: a symbol run absorbs one leading space, so " + " is [" +"][" "].
- * `-T` checks this against the reference encoder. */
 static int tok_encode(const char *text, int *out, int max)
 {
-    const uint8_t *s = (const uint8_t *)text;
-    size_t n = strlen(text), i = 0;
-    int w = 0;
-    static const char *contr[] = {"'s","'t","'re","'ve","'m","'ll","'d", NULL};
-
-    while (i < n && w < max) {
-        size_t start = i;
-        int l;
-        uint32_t cp = utf8_cp(s + i, n - i, &l);
-
-        /* 1. contractions */
-        int done = 0;
-        for (int c = 0; contr[c]; c++) {
-            size_t cl = strlen(contr[c]);
-            if (i + cl <= n && strncasecmp((const char *)s + i, contr[c], cl) == 0) {
-                i += cl; done = 1; break;
-            }
-        }
-
-        /* 2. [^\r\n\p{L}\p{N}]? \p{L}+ */
-        if (!done) {
-            size_t k = i; int kl; uint32_t kc = cp;
-            if (!cp_is_letter(kc) && !cp_is_digit(kc) && kc != '\r' && kc != '\n') {
-                k += l;
-                kc = utf8_cp(s + k, n - k, &kl);
-            }
-            if (k < n && cp_is_letter(kc)) {
-                while (k < n) {
-                    uint32_t c2 = utf8_cp(s + k, n - k, &kl);
-                    if (!cp_is_letter(c2)) break;
-                    k += kl;
-                }
-                i = k; done = 1;
-            }
-        }
-        /* 3. \p{N} : one digit at a time */
-        if (!done && cp_is_digit(cp)) { i += l; done = 1; }
-
-        /* 4. ' ?' [^\s\p{L}\p{N}]+ [\r\n]*  (symbol run may absorb ONE leading space) */
-        if (!done) {
-            size_t k = i; int kl; uint32_t kc = cp;
-            if (kc == ' ') { k += l; kc = utf8_cp(s + k, n - k, &kl); }
-            if (k < n && !cp_is_space(kc) && !cp_is_letter(kc) && !cp_is_digit(kc)) {
-                while (k < n) {
-                    uint32_t c2 = utf8_cp(s + k, n - k, &kl);
-                    if (cp_is_space(c2) || cp_is_letter(c2) || cp_is_digit(c2)) break;
-                    k += kl;
-                }
-                while (k < n && (s[k] == '\r' || s[k] == '\n')) k++;
-                i = k; done = 1;
-            }
-        }
-        /* 5/6/7. whitespace: \s*[\r\n]+ , then \s+(?!\S) , then \s+ */
-        if (!done) {
-            size_t k = i;
-            while (k < n && cp_is_space(utf8_cp(s + k, n - k, &l))) k += l;
-            size_t nl_end = k;
-            while (nl_end > i && (s[nl_end-1] == '\r' || s[nl_end-1] == '\n')) nl_end--;
-            if (k > i && nl_end < k) {
-                i = k;                       /* run ends in newline(s) */
-            } else if (k < n && k > i + 1) {
-                i = k - 1;                   /* \s+(?!\S): last space belongs to the word */
-            } else {
-                i = (k > i) ? k : i + 1;
-            }
-        }
-        if (i <= start) i = start + 1;       /* Never stall. */
-        w += bpe_chunk(s + start, i - start, out + w, max - w);
-    }
-    return w;
+    return ttok_encode(&g_tok, (const uint8_t *)text, strlen(text), out, max);
 }
 
-/* Chat template */
-/*---------------*/
-
-/* One user turn in the Qwen3 chat template, as the HF tokenizer would encode it (it splits
- * at the added tokens and BPE-encodes the runs between - same ids as this, piece by piece):
- *   [\n] <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
- * The empty think block is the template's "enable_thinking=False": without it the model
- * spends the whole budget inside <think>. On a continuing conversation the previous reply
- * is closed first (the card keeps it in the buffer; a reply cut by -n has no <|im_end|>). */
+/* One user turn in the Qwen3 chat template (ttok_turn); the text alone in raw mode (-r). On a
+ * continuing conversation the previous reply is closed first (the card keeps it in the buffer;
+ * a reply cut by -n has no <|im_end|>). */
 static int encode_turn(const char *text, int *out, int max, int first, int prev_closed)
 {
-    int n = 0;
-    if (!g_chat || g_im_start < 0)
+    if (!g_chat)
         return tok_encode(text, out, max);
-    if (!first) {
-        if (!prev_closed && n < max) out[n++] = g_im_end;
-        n += tok_encode("\n", out + n, max - n);
-    }
-    if (first && g_system && *g_system) {         /* <|im_start|>system\n...<|im_end|>\n */
-        if (n < max) out[n++] = g_im_start;
-        n += tok_encode("system\n", out + n, max - n);
-        n += tok_encode(g_system, out + n, max - n);
-        if (n < max) out[n++] = g_im_end;
-        n += tok_encode("\n", out + n, max - n);
-    }
-    if (n < max) out[n++] = g_im_start;
-    n += tok_encode("user\n", out + n, max - n);
-    n += tok_encode(text, out + n, max - n);
-    if (n < max) out[n++] = g_im_end;
-    n += tok_encode("\n", out + n, max - n);
-    if (n < max) out[n++] = g_im_start;
-    n += tok_encode("assistant\n", out + n, max - n);
-    if (g_think >= 0 && g_think_end >= 0) {
-        if (n < max) out[n++] = g_think;
-        n += tok_encode("\n\n", out + n, max - n);
-        if (n < max) out[n++] = g_think_end;
-        n += tok_encode("\n\n", out + n, max - n);
-    }
-    return n;
+    return ttok_turn(&g_tok, text, g_system, first, prev_closed, out, max);
 }
 
 /* Console UART */
@@ -796,10 +550,11 @@ static int stream_generate(double timeout, int *ids, int max, double *first_dt, 
         }
         if (acc == g_im_end || acc == g_im_start) {
             /* Template tokens are structure, not text (the firmware stops on <|im_end|>). */
-        } else if (acc >= 0 && (uint32_t)acc < g_nvocab) {
-            const struct tok_entry *t = &g_vocab[acc];
-            for (size_t i = 0; i < t->len; i++) {
-                if (pendn < sizeof(pend)) pend[pendn++] = (unsigned char)t->bytes[i];
+        } else if (acc >= 0 && (uint32_t)acc < g_tok.nvocab) {
+            uint32_t len;
+            const uint8_t *bytes = ttok_piece(&g_tok, (int)acc, &len);
+            for (size_t i = 0; i < len; i++) {
+                if (pendn < sizeof(pend)) pend[pendn++] = (unsigned char)bytes[i];
                 size_t need = utf8_len(pend[0]);
                 if (pendn >= need) {           /* character complete: emit it */
                     wrap_char(pend, need);
@@ -1152,12 +907,12 @@ int main(int argc, char **argv)
     send_line("info");
     tty_expect("trixium>", 10.0, cap, sizeof(cap), 0);
     model_name(cap);
-    if (g_tok_sha_ok) {
+    if (g_tok.sha_ok) {
         /* The image header carries the converter's tokenizer hash; a mismatch means the
          * ids sent and the ids the model was converted with do not agree. */
         char *p = strstr(cap, "tokenizer sha256 ");
         char hex[65];
-        for (int i = 0; i < 32; i++) sprintf(hex + 2*i, "%02x", g_tok_sha[i]);
+        for (int i = 0; i < 32; i++) sprintf(hex + 2*i, "%02x", g_tok.sha[i]);
         if (!p)
             fprintf(stderr, "[warn] firmware did not report the image's tokenizer hash\n");
         else if (strncmp(p + 17, hex, 64) != 0)

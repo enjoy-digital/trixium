@@ -30,6 +30,10 @@ from software.host.wbload import BEAT_BYTES, CHUNK_BEATS, HDR_STAGING_BELOW, con
 from model.bons import BONSReader
 
 UPLOAD_PORT = 2345
+# The on-board tokenizer's staging (firmware/tokenizer.h): channel 0, 16 MB below the weights, a
+# 32-byte record ("TOKS", length) then the BTOK tables; the firmware's `tokload` copies it.
+TOK_STAGING_BELOW = 0x1000000
+TOK_MAGIC         = 0x534b4f54
 
 
 class UDPLink:
@@ -146,6 +150,25 @@ def upload(bus, link, image, verbose=False, **kw):
         resent += transfer(bus, link, ch, base, payload, verbose=verbose, **kw)
         total  += len(payload)
     return total, resent
+
+
+def tokenizer_record(path):
+    """The staged form of a BTOK file: the 32-byte record, the tables, padded to whole beats."""
+    btok = open(path, "rb").read()
+    if btok[:4] != b"BTOK":
+        raise ValueError(f"{path}: not a BTOK tokenizer (trixium tokenizer)")
+    if len(btok) > TOK_STAGING_BELOW - HDR_STAGING_BELOW - 32:
+        raise ValueError(f"{path}: {len(btok)} bytes, more than the staging area")
+    data = struct.pack("<II", TOK_MAGIC, len(btok)) + bytes(24) + btok
+    return data + bytes(-len(data) % BEAT_BYTES)
+
+
+def upload_tokenizer(bus, link, path, verbose=False, **kw):
+    """The tokenizer to its staging area on channel 0, for the firmware's `tokload`."""
+    c = constants(bus)
+    data = tokenizer_record(path)
+    resent = transfer(bus, link, 0, c["weight_base"] - TOK_STAGING_BELOW, data, verbose=verbose, **kw)
+    return len(data), resent
 
 
 def main():
