@@ -39,6 +39,7 @@
 #include "progs.h"
 #include "static_memory.h"
 #include "tokenizer.h"
+#include "sdload.h"
 
 /* Checks */
 /*--------*/
@@ -160,6 +161,11 @@ static void help(void)
     puts("  gen n id id ...   - generate n tokens from prompt ids");
     puts("  tokload           - load the tokenizer staged with the image (trixium load --tokenizer)");
     puts("  chat [n]          - chat in text on this console, replies up to n tokens (default 512)");
+#ifdef CSR_SDCARD_BASE
+    puts("  sdinit [mhz]      - SD card init (4-bit, 50 MHz high speed when the card takes it)");
+    puts("  sdload c b s n    - n 512-byte blocks from sector s into channel c's window at b");
+    puts("  sdboot            - the image on the SD card (trixium sdimage): weights, hdrload, tokload");
+#endif
     puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
     puts("  bench [n]         - profiled generation benchmark (default 4 tokens)");
     puts("Hardware vs CPU reference (default: the hardware path where the bitstream has it):");
@@ -1626,6 +1632,33 @@ static void console_service(void)
         tok_load();
     else if (strcmp(token, "chat") == 0)
         chat_cmd(str);
+#ifdef CSR_SDCARD_BASE
+    else if (strcmp(token, "sdinit") == 0) {
+        char *m = get_token(&str);
+        sd_init(*m ? parse_int(m) : 50, 1000);
+    } else if (strcmp(token, "sdload") == 0) {
+        char *c = get_token(&str), *b = get_token(&str), *sc = get_token(&str), *n = get_token(&str);
+        int ch = (int)strtoul(c, NULL, 0);
+        uint32_t base = strtoul(b, NULL, 0);
+        if (sd_load(ch, base, strtoul(sc, NULL, 0), strtoul(n, NULL, 0)) == 0) {
+            engine_fetch(ch, base, 1, 0xC000);       // What landed: the first beat.
+            printf("SDLOAD ok:");
+            for (int w = 0; w < 8; w++)
+                printf(" %08lx", (unsigned long)((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[w]);
+            printf("\n");
+        }
+    }
+#if TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
+    else if (strcmp(token, "sdboot") == 0) {
+        if (sd_boot() == 0) {
+            hdrload();
+            engine_fetch(0, TOK_STAGING, 1, 0xC000);   // A tokenizer on the card: load it too.
+            if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
+                tok_load();
+        }
+    }
+#endif
+#endif
     else if (strlen(token))
         puts("unknown command");
     printf("trixium> ");
@@ -1675,6 +1708,17 @@ int main(void)
     // stay on the console (`ddrinit`, `ddrtest`).
     puts("ddr: simulation (PHY model) - controller init and DDRTEST skipped");
 #endif
+#endif
+#if defined(CSR_SDCARD_BASE) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
+    // Power-up with nothing staged (no host uploaded a model since the DRAM lost it) and a
+    // TriXium image on the SD card: load it, a host-free start. Three quick probes without a card.
+    engine_fetch(0, HDR_STAGING, 1, 0xC000);
+    if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) != BONS_MAGIC && sd_init(50, 3) == 0 &&
+        sd_boot() == 0) {
+        engine_fetch(0, TOK_STAGING, 1, 0xC000);
+        if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
+            tok_load();   // After the header below: tok_load compares hashes when it can.
+    }
 #endif
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
     model_info();

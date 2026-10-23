@@ -31,7 +31,7 @@ CFLAGS += -I$(PORTABLE_LIB)
 CFLAGS += $(EXTRA_CFLAGS)
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o infer_float.o infer_bfp.o infer_lists.o perf.o \
-          ops.o vec.o seq.o ddr.o hybrid.o resident.o tokenizer.o trixium_sequence.o trixium_tok.o
+          ops.o vec.o seq.o ddr.o hybrid.o resident.o tokenizer.o sdload.o trixium_sequence.o trixium_tok.o
 
 # Build tree stamp ---------------------------------------------------------------------------------
 

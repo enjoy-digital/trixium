@@ -400,7 +400,7 @@ class TriXiumSimSoC(SoCCore):
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
                  axi1_latency=24, axi1_reorder=0, axi1_targets=1, reader_n_ids=4,
-                 unit_options=(), efinix_ram=False, attn_sync_operand=False):
+                 unit_options=(), efinix_ram=False, attn_sync_operand=False, with_sdcard=False):
         assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
@@ -555,6 +555,14 @@ class TriXiumSimSoC(SoCCore):
                                    cd="ddr" if ddr_readers else "sys")
         for name, value in self.trixium.constants.items():
             self.add_constant(name, value)
+
+        # The SD card weight source (trixium_ti375.py --with-sdcard) on LiteSDCard's card model:
+        # its one 512-byte block (words 0..127) for every sector read.
+        if with_sdcard:
+            from gateware.memory.sd_upload import SDCardUpload
+            self.sdcard = SDCardUpload(platform, self.sys_clk_freq, use_emulator=True)
+            self.comb += If(self.sdcard.upload.storage,
+                self.sdcard.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}))
 
         # Scratchpad on the SoC bus (CPU access).
         self.bus.add_slave("scratchpad", self.trixium.bus,
@@ -1019,6 +1027,9 @@ def build_sim(args, board, out_dir):
         soc_kwargs["axi1_targets"] = args.axi1_targets
     if args.pipe_clk_freq:
         soc_kwargs["pipe_clk_freq"] = args.pipe_clk_freq
+    if args.with_sdcard:
+        assert args.board == "ti375", "--with-sdcard: --board ti375"
+        soc_kwargs["with_sdcard"] = True
     if args.dn_sublanes and "unit_options" in soc_kwargs:
         # The DeltaNet stream's sub-lanes per channel, over the board's default.
         soc_kwargs["unit_options"] = tuple((k, v) for k, v in soc_kwargs["unit_options"]
@@ -1087,6 +1098,7 @@ def main():
     parser.add_argument("--sys-clk-freq",   default=125e6, type=float,                             help="--board ypcb: the board's sys clock (the sim keeps the sys/ddr ratio).")
     parser.add_argument("--reader-ids",     default=0, type=int, choices=[0, 1, 2, 4, 8],           help="ARIDs each channel reader rotates (0: the board's; the Ti375 uses 1).")
     parser.add_argument("--axi1-reorder",   default=0, type=int, choices=[0, 2, 4, 8],              help="--board ti375: the memory model serves bursts out of order across N ID queues (as the hard controller may).")
+    parser.add_argument("--with-sdcard",    action="store_true",                                   help="--board ti375: the SD card weight source on LiteSDCard's card model (firmware sdinit/sdload).")
     parser.add_argument("--axi1-targets",   default=1, type=int, choices=[1, 2],                    help="--board ti375: the channels split over the controller's two AXI targets (trixium_ti375.py --ddr-targets).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
     parser.add_argument("--memctrl",        default=0, type=int, choices=[0, 1, 2],                 help="--board ypcb: DDR3 controllers (default: the board's two; 1 = every channel and main_ram on one, the small boards' topology).")

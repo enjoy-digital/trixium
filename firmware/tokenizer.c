@@ -47,8 +47,9 @@ const struct ttok *tok_get(void)
 int tok_load(void)
 {
     tok_ok = 0;
-#if MAIN_RAM_SIZE < 0x8000000
-    puts("tokload: main_ram too small for the tables (128 MB needed)");
+#if MAIN_RAM_SIZE < 0x8000000 || TRIXIUM_CHAN_WEIGHT_BASE < 0x2000000
+    puts("tokload: this memory map has no room for the tables (128 MB of main_ram, a 16 MB "
+         "staging below the weights)");
     return -1;
 #else
     engine_fetch(0, TOK_STAGING, 1, 0xC000);
