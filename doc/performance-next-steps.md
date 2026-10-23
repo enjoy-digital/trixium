@@ -220,6 +220,107 @@ attention, during which the memory idles. The levers, roughly in order of gain p
   speculative decoding pay on a stream-bound engine: the largest lever left, and the largest piece
   of work.
 
+## Long context and two-row speculative decoding: the analysis, parked (2026-10-22)
+
+Both were analysed and deliberately not started; this section is the starting point when they
+are picked up. Figures are the 2B (24 layers: 18 Gated DeltaNet + 6 attention; 8 query heads,
+2 KV heads of 256; `n_embd` 2048) on `ypcb_hyb21_d100` and `ti375_v7`.
+
+### Long context (2048 -> 4096 positions)
+
+**What caps it today.** `max_ctx = 2048` (`model/configs.py`, written into the image header and
+used by the converter's reservation and the firmware's allocation) and the attention stream's
+`t_max` (2048 on the YPCB, `trixium_ypcb.py`; 1024 on the Ti375, `--attn-t-max`, chosen for
+block RAM). The softmax unit already accepts 4096. Nothing in the model limits it: `max_ctx` is
+a memory budget.
+
+**What a position costs.** 2B on hyb21: 20.33 / 19.49 / 15.81 tok/s at 64 / 256 / 1,024 tokens,
+i.e. 4.92 M -> 6.33 M cycles per forward, **~1.47 k cycles per extra position** (the attention's
+scores and weighted-V passes; the DeltaNet layers do not grow). Extrapolated: ~10.9 M cycles per
+forward at position 4,096 (**~9.2 tok/s** at the end of the context, ~12.7 averaged over a
+0 -> 4,096 generation). Ti375: 5.41 tok/s at 1,024 (from 8.86 at 64), about 2x the YPCB's
+per-position cost (one shared port, attention 4 lanes / 1 group).
+
+**The prompt is a cost of its own.** The prompt goes through the decode forward one token at a
+time (`infer.c`, the prefill loop; only the LM head is skipped, `want_logits`), so a 4,000-token
+prompt is ~4,000 forwards: **~4-5 minutes on the YPCB** before the first token. The resident
+prefix (`resident` in the same loop) avoids re-forwarding a prompt prefix already in the KV, which
+is what makes chat usable. A real long-context use case needs batched prefill, which is what the
+two-row pipe below provides (two prompt tokens per weight pass; the DeltaNet recurrence stays
+sequential but its projections batch).
+
+**Memory at 4096** (per channel unless stated; the KV rows are FP32, 2 KB per position and
+layer):
+
+| item | 2048 | 4096 | note |
+| --- | ---: | ---: | --- |
+| attention-stream K/V spans (`at_slots` x 6 layers x K+V) | 12 MB | 24 MB | `hybrid.c`, above the DeltaNet state |
+| converter's KV reservation (`model/convert.py`, `kv_bytes`) | 14 MB | 28 MB | sized for **all 24 layers**: 4x what the 6 attention layers need |
+| CPU's K/V copy in main_ram (`kv_b`) | 50 MB | 100 MB | of 256 MB main_ram; `ctx_cap` halves silently if the heap is short |
+| weights (YPCB image with emb16 / Ti375 image) | 362 / 108 MB | same | |
+
+The YPCB's 704 MB windows hold it easily. The Ti375's 176 MB windows do not as-is: 108 MB weights
++ 28 MB reservation + 9-18 MB DeltaNet state + 24 MB K/V is ~170-178 MB. Sizing the reservation
+by the attention layers only (`n_attn_layers`, firmware and converter together) frees 21 MB there.
+The Ti375's block RAM (85.6% placed with `t_max` 1024) is the harder limit: the attention unit's
+operand memories scale with `t_max`.
+
+**Steps when picked up:**
+1. Measure, console only: the 2B at `bench 2048`, the 4B at `bench 1024` on the current YPCB
+   build; check `ctx_cap` printed at model load is 2048 (not silently halved).
+2. Size the KV reservation by `n_attn_layers` (converter + `hybrid.c`, both places compute it;
+   image format unchanged, `max_ctx` stays in the header). Tiny-model gate.
+3. `max_ctx` and `t_max` 4096: a sim gate at a tiny geometry with a context past 2048 (the
+   tiny models' `max_ctx` raised; the gate's `bench` long enough to cross it), then one YPCB build
+   (BRAM delta of the attention unit at `t_max` 4096 first, out of context).
+4. Only if long context is a real use: 16 attention lanes (area; halves the per-position cost) or
+   8-bit K/V (bandwidth and memory; a numerics change, the golden model must follow), and batched
+   prefill (below).
+
+### Two activation rows per weight beat + speculative decoding
+
+**Why.** The decode forward is bound by the weight stream (393 MB per 2B forward at the
+controllers' rate) plus serial per-token work. Each weight beat is used for one activation
+vector. A second adder tree per channel that applies the same trits to a second int8 activation
+vector would compute two tokens' matrix products for about one stream.
+
+**How it turns into tokens.** Decoding does not know the second token, so a cheap draft proposes
+it and one two-row pass verifies both: accepted, two tokens per pass; rejected, the first is kept
+and the second rolled back. Prefill needs no draft: the prompt tokens are known (two per pass).
+
+**The arithmetic that decides it.** Let S be the stream's share of a forward and a the draft's
+acceptance rate. Verifying two tokens costs S + 2(1 - S) of a forward if only the matrix products
+are two-row, about S + (1 - S) if the units (DeltaNet heads, conv, norms, attention, LM head)
+also process both rows. Tokens per pass = 1 + a.
+- S ~0.6, a 0.7, units one row at a time: 1.7 / 1.4 = **~1.2x**.
+- Same with two-row units: up to **~1.6x** (1.35x at a more cautious verify cost of 1.25).
+- The 2026-10-06 MTP graft on the XCU1525 (section 3 below) lost (0.72x) because its verify paid
+  a full second stream: the dual-row pipe is what removes that cost.
+
+**What is missing:**
+- **A draft.** The Ternary-Bonsai-2 GGUFs carry no MTP/next-token tensors (checked 2026-10-19).
+  Options: the original Qwen3.5-2B's MTP layer grafted on (acceptance on the ternary model
+  unmeasured; on the 27B the upstream head reached 60-64% on the board), a small separate model,
+  or prompt lookup (n-gram matches in the context: no weights, good only on repetitive text).
+- **Rollback.** A second DeltaNet state set (the ECC retry's double buffer, `dn_set_bytes`,
+  exists), a two-row K/V append and its undo, the conv ring's spare slot (exists: re-running a
+  forward is already supported, `hybrid_ckpt_save`), accept/reject in the token loop.
+- **Area.** A second 128-trit adder tree, scale and accumulator per channel (estimate: about half
+  a pipe, measure out of context). The YPCB is at ~85-90% LUTs with both controllers' regions kept
+  free and already refused DeltaNet at 4 sub-lanes (hyb22); the Ti375 is at 75% logic and 86%
+  RAM. Area must come back elsewhere first.
+- Earlier work to reuse from git history: the batched matvec (`nbatch`, 4a7ed63), the MTP head
+  and versioned DeltaNet state (48acf64).
+
+**Steps when picked up** (~2 weeks in total; the first two decide go / no-go without hardware):
+1. Acceptance, offline: the mirror (`model/mirror.py`) generating with each draft candidate
+   (prompt lookup, the grafted Qwen3.5-2B MTP layer) on a set of real prompts; record a per draft.
+2. Area, out of context: the pipe with a second activation row on the K7 and in Efinity.
+3. Go only if a >= 0.6 with a cheap draft and the area fits; then the gateware (two-row pipe,
+   `nbatch`-style descriptors), the firmware (two-row lists, rollback), batched prefill first
+   (no draft, exact, measurable on its own), speculative decode second; each step sim-gated
+   bit-exact against the mirror.
+
 ## Denser ternary codes (5 trits per byte): the YPCB's default since 2026-10-15
 
 Adopted for the YPCB-00338 (eight channels, `--trit5` by default: 32.1 / 7.83 tok/s on the card

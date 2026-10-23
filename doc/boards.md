@@ -622,6 +622,62 @@ the CSRs (Etherbone) and the weights (UDP, `UDPUpload`); no PCIe, no LiteDRAM. E
 100 MHz. The kit plugs into the workstation itself: USB for JTAG and the console, the RJ45 on the
 LAN.
 
+One 512-bit port at 100 MHz carries 6.4 GB/s, half the LPDDR4x's 12.8 GB/s, and v7's weight
+stream runs at ~92% of it (`mvbw 13 0 8`: 0.46 beats per channel per clock of the port's 0.5):
+two thirds of a 2B forward wait on it. `--ddr-targets 2` also enables the controller's second AXI
+target and splits the channels between the two (channels 0-1 and the CPU on target 0, 2-3 on
+target 1), twice the port bandwidth at the same clock. It needs LiteX's `EfinixDDR(targets=2)`
+(litex#2688). The simulator checks the wiring with `--board ti375 --axi1-targets 2` (both
+targets merged onto the one memory model: the gate, not the bandwidth).
+
+**ti375_v8** (`--ddr-targets 2`, otherwise v7; timing met, 102.9 MHz possible; area unchanged):
+the 2B golden, `mvbw 13 0 8` 0.75 beats per channel per clock (9.6 GB/s, from 0.46), **11.94 tok/s
+at 64 tokens, 10.46 at 256** (v7: 8.86 / 8.05). Per forward: FFN projections 2.93 -> 1.94 M
+cycles, LM head 2.20 -> 1.35 M; the DeltaNet heads (1.39 M, the stream at width 4) are now the
+largest part that does not scale with the port.
+
+**ti375_v9** (`--ddr-targets 2 --dn-sublanes 2`: the DeltaNet stream at width 8; timing met, 106.7
+MHz possible; 80% XLRs, 81% RAM blocks, 28% DSPs): the 2B golden, **12.94 tok/s at 64 tokens,
+11.20 at 256, 6.66 at 1,024** (v7: 8.86 / 8.05 / 5.41); the heads 1.39 -> 0.76 M cycles per
+forward. The embedding restore runs on the Hadamard unit (firmware, `embres unit|cpu`: 436 k ->
+245 k cycles per forward): **13.28 / 11.45 / 6.75 tok/s**.
+
+**ti375_v10** (v9 + `--with-spi-flash --upload-beats 45`: the flash boot and the fast upload
+below; same speed). **ti375_v11** (v10 + `--chan-skew 0x2000`; timing met, 106.5 MHz possible):
+each channel's window starts 8 KB further than the one before, so the four channels' streams,
+which advance in step, stop opening rows in the same LPDDR4x banks: `mvbw 13 0 8` 0.75 -> 0.78
+beats per channel per clock, **13.63 / 11.70 / 6.84 tok/s** (the 2B golden). The sweep, each a
+build on the kit: 0 -> 13.28, 4 KB 13.63, 8 KB 13.63, 12 KB 13.61, 16 KB 13.22 (0.72 beats/clk):
+any skew under 16 KB breaks the aliasing; 8 KB, the middle of the plateau.
+
+**ti375_v15** (v11 + `--with-softmax`: the attention softmax unit, which the lite profile left out;
+timing met, 107.1 MHz possible; 89.7% XLRs, 82% RAM blocks, 33% DSPs): the 2B golden, **14.08 /
+13.20 / 9.31 tok/s** at 64 / 256 / 1,024 tokens. At 1,024 tokens the CPU's softmax was 3.9 M of
+the attention's 8.0 M cycles per forward; with the unit the attention is 4.1 M (the values pass,
+3.2 M, is now most of it).
+
+**ti375_v17 / v18** (timing margin at 100 MHz, then the attention stream at 8 lanes / 2 groups).
+v17 registers the units' cancel (the reset drain's fan-out to 263 unit loads was 2,653 of the top
+3,000 endpoints) and puts a stage on the upload source: same speed, the drain group gone, but a new
+worst path (+0.496 ns) in the activation unit (its state through the quantizer's ready chain and the
+response pop into the scratchpad read address). v18 issues those reads on credits (a 4-entry
+response FIFO, `gateware/units/activation.py`) and runs the attention stream at 8 lanes / 2 groups
+(`--attn-lanes 8 --attn-groups 2`): with 4 lanes the firmware served one kv head per command (n_rep
+4), two commands per layer; 8 lanes serve both in one. The values pass at 1,024 tokens 3.25 M ->
+1.66 M cycles; 2B **14.33 / 13.97 / 10.93 tok/s** at 64 / 256 / 1,024 tokens (v15: 14.08 / 13.20 /
+9.31), golden. 94.4% XLRs, 87.5% RAM blocks, 34.6% DSPs. Timing: 237 of the top endpoints under
++1.5 ns (v17: 2,470), 12 under +1.0 ns, worst +0.498 ns (one group: scratchpad read data into the
+activation unit's absmax tree; next round with the Hadamard maximum and the softmax operands). The
+build to deploy (in the kit's flash):
+
+```
+PYTHONPATH=<litex master>:$PWD LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1 \
+  systemd-run --user -p MemoryMax=40G ... python3 trixium_ti375.py --build --ddr-targets 2 \
+  --dn-sublanes 2 --with-spi-flash --upload-beats 45 --chan-skew 0x2000 --with-softmax \
+  --attn-lanes 8 --attn-groups 2 --output-dir build/ti375_v18
+trixium deploy --board ti375 --model 2b ti375_v18
+```
+
 ### Build
 
 ```
@@ -631,31 +687,94 @@ PYTHONPATH=<litex at 2e8b2bb or later>:$PWD LITEX_ENV_EFINITY=/opt/efinix/efinit
 
 Defaults: the lite profile, the DeltaNet stream at width 4 (one sub-lane per channel), reader
 FIFOs and prefetch at 256 beats, the attention stream at 4 lanes / 1 group with a context of 1,024,
-one ARID per channel reader. ~2 h; 189k LUT4, 2,300 of 2,688 RAM blocks, timing met (+0.68 ns).
+one ARID per channel reader. ~50 min (v9: synthesis 14, placement 13, routing and bitstream 26); 189k LUT4, 2,300 of 2,688 RAM blocks, timing met (+0.68 ns).
 Needs LiteX with litex#2684 (Etherbone at 32 bits with the Titanium PHY's `eth0_*` clock domains)
-and litex#2685 (the hard controller's 6-bit AXI IDs); litex-boards#931 drops the platform's
-`id_width = 8` (the target ignores that key until then).
+and litex#2685 (the hard controller's 6-bit AXI IDs); `--ddr-targets 2` also litex#2688 (the
+controller's second AXI target). litex-boards#931 (merged) dropped the platform's `id_width = 8`;
+the target ignores that key, for older litex-boards checkouts.
 
 ### Deploy
 
 ```
-TRIXIUM_TI375_IFACE=enp5s0 trixium deploy --board ti375 --model 2b ti375_v7
+trixium deploy --board ti375 --model 2b ti375_v18 [--check]     # ~1 min
 ```
 
-Loads the bitstream over JTAG (volatile: the SPI flash is never written), serial-boots the
-firmware, uploads `models/bons/bonsai2-2b-n4-ti375.img` over UDP (452 MB in ~9 s), `hdrload`,
-`imgcheck` (every tensor against its table CRC; 0 bad or stop), the tokens, then `bench`.
-`iface` is the NIC that reaches the board when another interface also routes its subnet (the
-sockets are bound to it; no root). The image has no int16 embedding table (it would take the
-whole 1 GB): the firmware restores each embedding row exactly on the CPU, one LSB away from the
-converter's float32 table at most, which flips the 2B's third token - the board's reference is
-its image's own (the mirror's): `11751 13 561 6511 314 17163 369 23327`.
+The firmware built for the build, then `litex_term` attached and the bitstream loaded over JTAG
+(volatile, at 15 MHz: 11.5 s; at 30 MHz the programmer reports success and configures nothing),
+so the BIOS's serial boot is answered at once (also ahead of a firmware in the flash); the weights
+over UDP (`models/bons/bonsai2-2b-n4-ti375.img`, 452 MB in 4.8 s, ~95 MB/s: 45-beat datagrams
+and a 512-datagram window), each transfer checked against the port's CRC-32 as it lands (a
+mismatch resends it); `hdrload`; the tokens; `bench`. `--check` adds `imgcheck` (every tensor
+fetched back against its table CRC, ~7 min on the CPU; always run on builds without the port's
+CRC). `iface` (`boards.ini [ti375]`) is the NIC that reaches the board when another interface
+also routes its subnet. The image has no int16 embedding table (it would take the whole 1 GB):
+each row is restored exactly from the rotated table, one LSB away from the converter's float32
+table at most, which flips the 2B's third token - the board's reference is its image's own (the
+mirror's): `11751 13 561 6511 314 17163 369 23327`.
 
-| context | tok/s | cycles/token |
-| --- | ---: | ---: |
-| 64 | 8.86 | 11.28 M |
-| 256 | 8.05 | 12.42 M |
-| 1,024 | 5.41 | 18.49 M |
+`--no-reconfigure` keeps the running bitstream and firmware (weights, tokens, bench). The deploy
+records the image, the build and a tag in `/tmp/trixium` (`smi`, the chat's skip below).
+
+**Power-up boot** (`--with-spi-flash` builds; needs a LiteX master with litex#2690 merged, the crt0
+alignment fix, without which the BIOS traps before its banner):
+
+```
+python3 -m software.host.ti375 flash build/ti375_v18 build/archive/ti375_v18_trixium.bin
+```
+
+writes the bitstream (offset 0) and the firmware (LiteX's flashboot image at 32 MB) through
+Efinity's JTAG bridge (~75 s, verified). The bridge driver sleeps after each page program instead
+of polling the flash's busy bit, for the datasheet's typical time (0.2 ms), and only after a failed
+verify rewrites everything with the maximum: `software/host/efx_select.py` makes it wait the
+maximum (0.8 ms) from the start (first passes failed 3 times in 4 before, none since). At power-up the FPGA configures itself and the BIOS boots
+the firmware from the flash (after its serial boot: a host answering that one still boots its
+own): the firmware is ready 0.7-1.1 s after the configuration, with no model (the kit's flash holds
+`ti375_v18`). Then
+`trixium chat --board ti375` uploads the weights and answers: **10.2 s from the command to the
+answer** (`ti375_v10`, measured), 0.6 s to the prompt once the weights are there. The flash is
+read at 25 MHz with the BIOS's clock calibration off (`SPIFLASH_SKIP_FREQ_INIT`): at 50 MHz DQ3
+is sampled late, and the calibration's one-block CRC test does not see the sporadic errors.
+
+The kit is picked by its USB product string: another FT4232H without a serial number on the same
+machine makes Efinity's programmer refuse. Loads use openFPGALoader >= 1.2 (it knows the Ti375;
+`build/tools/openFPGALoader` or PATH) with `--busdev-num` (4.6 s), else Efinity's programmer at
+15 MHz (11.5 s); flash writes run Efinity's tool through `software/host/efx_select.py`, which
+shows it only the kit.
+
+### Chat, console, status
+
+```
+make -C software/user BUILD_DIR=../../build/ti375_v18       # trixium_chat, console-only
+trixium chat    --board ti375 [--reload | --no-load]        # loads the 2B first when needed
+trixium console --board ti375 "bench 64"
+trixium smi     --board ti375 [-w 1]
+trixium dashboard --board ti375 [--watts 7.5]               # the live page, http://localhost:8375/
+python3 -m software.host.ti375 model <img>                  # the model alone (update over Ethernet)
+```
+
+`trixium chat --board ti375` checks that the firmware answers, uploads the weights only when
+the kit does not hold them (`ctrl_scratch` carries a random tag written after an upload and
+recorded with the image's identity; it resets with the SoC: power-up, a bitstream load), runs
+`hdrload`, then the chat: ~0.6 s when the weights are there, ~6 s when they are uploaded. A build
+without the LitePCIe driver gives a console-only `trixium_chat` (`TRIXIUM_UART_ONLY`). `smi
+--board ti375` reads the status over Etherbone (`software/host/ebsmi.py`), starting a
+`litex_server` on the kit's interface when none is running, and checks the bitstream's identifier
+against the csr.csv it uses; it runs next to a chat or a bench (the port peak from
+`TRIXIUM_PORT_BYTES`).
+
+`trixium dashboard --board ti375` serves a page to keep next to the chat
+(`software/host/dashboard.py`, standard library only; `--fake` for synthetic data without a board):
+decode tok/s (the chat's record, else forwards per second), DDR GB/s against the port peak and per
+channel, the engine and unit utilization, where a token's cycles go (embedding, DeltaNet,
+attention, FFN, LM head: the firmware's per-stage rdcycle totals, which it publishes once per
+forward in `struct hyb_live` at the start of sram, linker.ld's `.live`, read over Etherbone: the
+kit's main_ram is the CPU's own memory port, which Etherbone does not reach) and the power typed
+from a meter, with tokens per joule. Watching costs nothing: bench 256 gives 13.98 tok/s with the
+page open (the first try read main_ram: every read of an undecoded address waits out the bus
+timeout and held the CSR bus, 9.65 tok/s). The kit has no power monitor of its own:
+it takes 12 V on its barrel jack (PJ1; its USB-C is the FTDI only), so a USB-C PD trigger cable
+(12 V, 5.5 mm, center positive) from a power bank with a 12 V PD profile and an inline USB-C meter
+gives both the supply and the reading.
 
 ### Rules
 

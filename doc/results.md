@@ -17,7 +17,7 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
 | YPCB-00338 (hybrid build, 2x DDR3-1066, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 9.23 | 10.8 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock |
 | YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 20.33 | 4.92 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock; 19.49 tok/s at 256 tokens, 15.81 at 1,024 |
-| Efinix Ti375 C529 (LPDDR4x x32, one AXI port, 4 channels, lite units) | Ternary-Bonsai-2 2B | 8.86 | 11.28 M | everything at 100 MHz; 8.05 tok/s at 256 tokens, 5.41 at 1,024 |
+| Efinix Ti375 C529 (LPDDR4x x32, both AXI targets, 4 channels, lite units) | Ternary-Bonsai-2 2B | 14.33 | 6.98 M | everything at 100 MHz (`ti375_v18`); 13.97 tok/s at 256 tokens, 10.93 at 1,024 |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate
@@ -26,15 +26,28 @@ approved overclock), and the builds close timing to the project's empirical gate
 (reset-less datapath, fused residual tail). Where the remaining time goes:
 [`performance-next-steps.md`](performance-next-steps.md).
 
-The Ti375 kit is the first small board: one LPDDR4x x32 behind the hard controller's single
-512-bit AXI port at 100 MHz (6.4 GB/s at the port), shared by the CPU and four engine channels,
-the lighter unit set (no softmax unit, RoPE on the CPU, the DeltaNet stream at width 4), the
-weights uploaded over UDP. A forward is 10.4 M cycles (`hybprof`): the DeltaNet layers 3.9 M (their
-in-projections 1.6 M, the recurrence heads 1.4 M, the convolution and activation 0.9 M), the FFNs
-2.9 M, the LM head 2.1 M, the attention layers 1.0 M, and 0.43 M for the embedding row the CPU
-restores (the image has no int16 table: it would fill the 1 GB); the engine is busy 81% of the
-time, its weight streams at ~0.46 beats per channel per clock on a large matvec - the shared
-port, not the pipes, is this board's limit. The board's
+The Ti375 kit is the first small board: one LPDDR4x x32 behind the hard DDR controller, shared by
+the CPU and four engine channels, the lighter unit set (no softmax unit, RoPE on the CPU), the
+weights uploaded over UDP, everything at 100 MHz. The first bitstream (v7, 8.86 tok/s) used one of
+the controller's two 512-bit AXI targets: 6.4 GB/s, half the LPDDR4x's rate, and its weight
+streams ran at ~0.46 beats per channel per clock, 92% of that port - two thirds of a forward
+waited on it. Five steps since, each measured on the kit:
+
+| step | 2B tok/s at 64 / 256 / 1,024 | what moved |
+| --- | --- | --- |
+| v7: one AXI target, DeltaNet stream width 4 | 8.86 / 8.05 / 5.41 | |
+| v8: both AXI targets (`--ddr-targets 2`, litex#2688) | 11.94 / 10.46 / - | streams 0.46 -> 0.75 beats per channel per clock (9.6 GB/s); FFN projections 2.93 -> 1.94 M cycles, LM head 2.20 -> 1.35 M |
+| v9: + DeltaNet stream width 8 (`--dn-sublanes 2`) | 12.94 / 11.20 / 6.66 | the recurrence heads 1.39 -> 0.76 M |
+| v9 + the embedding restore on the Hadamard unit (firmware) | 13.28 / 11.45 / 6.75 | the embedding row 436 k -> 245 k cycles |
+| v11: + the channel windows skewed by 8 KB (`--chan-skew 0x2000`) | 13.63 / 11.70 / 6.84 | the channels stop hitting the same DRAM banks: streams 0.75 -> 0.78 beats per channel per clock |
+| v15: + the attention softmax unit (`--with-softmax`) | 14.08 / 13.20 / 9.31 | the CPU's softmax (3.9 M cycles per forward at 1,024 tokens) moves to the unit: attention 8.0 -> 4.1 M |
+| v18: + the attention stream at 8 lanes / 2 groups (`--attn-lanes 8 --attn-groups 2`) | 14.33 / 13.97 / 10.93 | both kv heads in one command per layer: the values pass at 1,024 tokens 3.25 -> 1.66 M cycles |
+
+A v9 forward at 64 tokens is 7.3 M cycles (`hybprof`): the DeltaNet layers 2.6 M, the FFNs 1.9 M,
+the LM head 1.35 M, the attention layers 1.1 M, the embedding row 0.25 M. The image has no int16
+embedding table (it would fill the 1 GB), so each token's row is restored from the rotated
+ternary table: split exactly into int8 chunks, rotated on the Hadamard unit, recombined and
+rounded on the CPU (`embres unit|cpu`). The board's
 reference tokens are its image's own (that restore is exact, one LSB away from the converter's
 table), checked against the mirror and deterministic run to run ([`boards.md`](boards.md#efinix-ti375-c529)).
 
