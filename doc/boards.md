@@ -667,15 +667,23 @@ response FIFO, `gateware/units/activation.py`) and runs the attention stream at 
 1.66 M cycles; 2B **14.33 / 13.97 / 10.93 tok/s** at 64 / 256 / 1,024 tokens (v15: 14.08 / 13.20 /
 9.31), golden. 94.4% XLRs, 87.5% RAM blocks, 34.6% DSPs. Timing: 237 of the top endpoints under
 +1.5 ns (v17: 2,470), 12 under +1.0 ns, worst +0.498 ns (one group: scratchpad read data into the
-activation unit's absmax tree; next round with the Hadamard maximum and the softmax operands). The
-build to deploy (in the kit's flash):
+activation unit's absmax tree; next round with the Hadamard maximum and the softmax operands).
+v19 registers the scratchpad's read data in the activation unit (before its scan, block buffer and
+response FIFO, the FIFO at 5 entries for the extra beat in flight) and in the softmax unit's pass 1
+(both worst groups were wires: one RAM output drives 58 loads across the die, 8.2 ns of route) and
+builds the attention stream for 2,048 positions (`--attn-t-max 2048`, now the default: past t_max
+the firmware ran attention on the CPU, ~4.6 s per token, so v18's 1,024-token bench lost its last
+forwards and a chat past 1,024 tokens crawled; one counter bit): worst slack +0.783 ns (108.5 MHz
+achievable), 95.2% XLRs, 87.9% RAM blocks; 2B **14.32 / 13.96 / 11.97 tok/s** at 64 / 256 / 1,024
+tokens and 10.44 at 1,800, golden; the first build on LiteX's `AXIArbiter(interleave=True)`. The
+build to deploy:
 
 ```
 PYTHONPATH=<litex master>:$PWD LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1 \
   systemd-run --user -p MemoryMax=40G ... python3 trixium_ti375.py --build --ddr-targets 2 \
   --dn-sublanes 2 --with-spi-flash --upload-beats 45 --chan-skew 0x2000 --with-softmax \
-  --attn-lanes 8 --attn-groups 2 --output-dir build/ti375_v18
-trixium deploy --board ti375 --model 2b ti375_v18
+  --attn-lanes 8 --attn-groups 2 --with-sdcard --output-dir build/ti375_v20
+trixium deploy --board ti375 --model 2b ti375_v20
 ```
 
 ### Build
@@ -750,6 +758,7 @@ trixium console --board ti375 "bench 64"
 trixium smi     --board ti375 [-w 1]
 trixium dashboard --board ti375 [--watts 7.5]               # the live page, http://localhost:8375/
 python3 -m software.host.ti375 model <img>                  # the model alone (update over Ethernet)
+python3 -m software.host.ti375 model <img> --tokenizer models/2b/tokenizer.bin  # + on-board chat
 ```
 
 `trixium chat --board ti375` checks that the firmware answers, uploads the weights only when
@@ -775,6 +784,51 @@ timeout and held the CSR bus, 9.65 tok/s). The kit has no power monitor of its o
 it takes 12 V on its barrel jack (PJ1; its USB-C is the FTDI only), so a USB-C PD trigger cable
 (12 V, 5.5 mm, center positive) from a power bank with a 12 V PD profile and an inline USB-C meter
 gives both the supply and the reading.
+
+**The tokenizer on the board.** `model --tokenizer` stages the BTOK tables with the weights
+(channel 0, 16 MB below the weight base, 5.8 MB for the 2B: a fraction of a second at the upload's
+~95 MB/s) and runs the
+firmware's `tokload`, which copies them to the top 16 MB of main_ram and indexes them (14.9 MB in
+all) and compares their hash with the image's. The firmware's `chat [n]` then talks text on the
+console: any serial terminal (`picocom -b 115200 /dev/ttyUSB2`, then `chat`) is the whole client,
+the conversation continuing from the KV cache turn by turn (`/reset`, `/exit`). The encoder is
+`software/lib/trixium_tok.c`, the same as `trixium_chat`'s (`test/software/test_tokenizer.py`: the
+reference encoder's ids on 614 paragraphs, the docs plus multilingual and edge cases); encoding a
+turn is estimated at ~1-3k CPU cycles per token (not measured yet), small beside its prefill. The
+weights still come over Ethernet at each power-up: a host-free kit needs them from the SD card.
+
+**Weights from the microSD card** (`--with-sdcard`, `gateware/memory/sd_upload.py`, `ti375_v20`).
+LiteSDCard's PHY and core on the slot, the card's read stream widened into the same loader as the UDP upload: the firmware arms the loader for a channel window and a
+multi-block read (CMD18) lands there, no CPU copy (the CPU's bus reaches main_ram only, not the
+windows). `software/host/sdimage.py` writes the card image (a table at 1 MB, then the BONS
+header+table, each channel's payload and the tokenizer, each where a UDP upload puts it; 438 MB
+for the 2B with its tokenizer), `dd` to the whole card (SDHC/SDXC). The firmware's `sdinit`,
+`sdload <chan> <base> <sector> <blocks>` and `sdboot` (everything, then `hdrload` and `tokload`);
+`sdsave` writes the card itself from what a UDP upload staged (`ti375 model <img> --tokenizer <btok>
+--persist`: no card reader, no dd; the CPU pushes the DRAM, fetched through the engine, into a
+write FIFO, a block released to the card only once whole: the PHY's writer clocks out whatever its
+input holds inside a block, so a slow push mid-block corrupted it; the old table invalidated first
+and the new one written last, so a cut save leaves no image to boot);
+at power-up, when a card answers, it boots from it (`SDBOOT in 1 s (s to skip ...)`: the host's
+serial boot sends `s`, as it uploads next; `ti375 boot --sd` lets it run): power, a serial
+terminal, `chat`. Not "only when nothing is staged": a bitstream reload keeps the DRAM's header
+but not all its weights (after one, 3 of 470 tensors failed their table CRC, and `imgcheck`
+takes 100 s, the card 74 s), so whatever the DRAM holds at boot is not trusted. The SoC's module is `sd`, not
+`sdcard` (under that name LiteX's BIOS links liblitesdcard's FatFs disk, which needs its block2mem DMA: the link fails), and the firmware has
+its own commands after liblitesdcard's, the init without its two data reads into CPU memory (the
+gateware drops that data, so no stray bytes reach the first transfer), 50 MHz when the card takes
+the high-speed switch, 4-bit when one block reads back at 4 bits, else 1-bit. On the kit the card
+switches to 4-bit but the reader never sees the start bit on all four lines, at any clock down to
+390 kHz: DAT2 is never low (`software/lab/ti375_sd.py`, a 2-minute SoC with LiteX's own BIOS
+driver, per-pad sticky flags and LiteScope: the BIOS's 4-bit write fails its CRC status too, and
+DAT2 reads low while the FPGA drives it), so it is open between the A8 ball and the card (R323,
+the slot's pin 1, or the card; pins and 10k pull-ups match the schematic, and Efinix's demo runs
+this kit at 4 bits), so the kit runs 1-bit: **SDSAVE 436 MB in 75 s, SDBOOT 436 MB in
+74 s (6 MB/s)**, then `hdrload`, `tokload` and the golden; 4-bit would be ~18 s. Simulated on
+LiteSDCard's card model (`trixium_sim.py --board ti375 --with-sdcard`, 4-bit): init, a 2-block
+load into channel 0, a block written and read back (`sdwtest`), the gate bit-exact. v20 = v19 +
+`--with-sdcard`: 105.3 MHz achievable, 96.05% XLRs, 88.1% RAM blocks; 2B 14.34 / 13.98 / 11.99
+tok/s, golden.
 
 ### Rules
 

@@ -224,15 +224,15 @@ such, with assumed board powers:
 | FK33 | VU33P | 2x HBM2, 8 GB | 1.7B | 106.3 (measured) | 27 W FPGA (Vivado) | 0.07 (est.) |
 | XCU1525 | VU9P | 4x DDR4 | 27B | 4.03 (measured) | 20 W FPGA (Vivado) | 1.4 (est.) |
 | YPCB-00338, small-board setup | K7-480T, 155k LUTs used | 1x DDR3-933 x64, 2 channels | Bonsai-2 2B | 10.3 (measured) | | |
-| Efinix Ti375 C529 | Titanium Ti375, everything at 100 MHz | LPDDR4x x32, 1 GB, both AXI targets | Bonsai-2 2B | 14.33 (measured) | 3-5 W | ~0.06-0.10 |
+| Efinix Ti375 C529 | Titanium Ti375, everything at 100 MHz | LPDDR4x x32, 1 GB, both AXI targets | Bonsai-2 2B | 14.32 (measured) | 3-5 W | ~0.06-0.10 |
 | Acorn CLE-215+ | Artix-7 200T | 1x DDR3, 1 GB | 1.7B | ~2.5-4 (projected) | 3-5 W | ~0.2-0.6 |
 | Titanium SiP | Ti60 / Ti125 | 32-64 MiB HyperRAM in the package | tiny (15M+) | ~10-30 (projected) | 0.3-1 W | ~0.003-0.03 |
 
 The small-board setup is the YPCB-00338 built the way a small board would be: one DDR3 controller
 for the CPU and two engine channels, the lighter unit set (`--engine-memctrl 1 --profile lite`),
 the same firmware and a two-channel image. It was the rehearsal for the Ti375, which now runs the
-2B on its kit (`trixium deploy --board ti375`: the weights over UDP, 14.33 tok/s at 64 tokens,
-13.97 at 256, 10.93 at 1,024, from 8.86 / 8.05 / 5.41 for the first bitstream: the hard memory
+2B on its kit (`trixium deploy --board ti375`: the weights over UDP, 14.32 tok/s at 64 tokens,
+13.96 at 256, 11.97 at 1,024, from 8.86 / 8.05 / 5.41 for the first bitstream: the hard memory
 controller's second AXI target, the DeltaNet stream at width 8, the embedding restore on the
 Hadamard unit, the channel windows skewed across the DRAM banks, the softmax unit and the attention stream at
 8 lanes; [doc/boards.md](doc/boards.md#efinix-ti375-c529)). `trixium chat`, `console` and

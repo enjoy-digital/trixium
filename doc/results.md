@@ -17,7 +17,7 @@ the [known issues](boards.md#known-issues)). How the numbers evolved: [`timeline
 | YPCB-00338 | Ternary-Bonsai 1.7B | 35.2 | 3.55 M | sys 125 MHz |
 | YPCB-00338 (hybrid build, 2x DDR3-1066, 4 channels, ECC + forward retry) | Ternary-Bonsai-2 4B | 9.23 | 10.8 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock |
 | YPCB-00338 (hybrid build) | Ternary-Bonsai-2 2B | 20.33 | 4.92 M | sys 100 MHz, pipes 143 MHz, readers in the DDR clock; 19.49 tok/s at 256 tokens, 15.81 at 1,024 |
-| Efinix Ti375 C529 (LPDDR4x x32, both AXI targets, 4 channels, lite units) | Ternary-Bonsai-2 2B | 14.33 | 6.98 M | everything at 100 MHz (`ti375_v18`); 13.97 tok/s at 256 tokens, 10.93 at 1,024 |
+| Efinix Ti375 C529 (LPDDR4x x32, both AXI targets, 4 channels, lite units) | Ternary-Bonsai-2 2B | 14.32 | 6.98 M | everything at 100 MHz (`ti375_v19`); 13.96 tok/s at 256 tokens, 11.97 at 1,024, 10.44 at 1,800 |
 
 The fine print: the XCU1525 runs its DDR4 at 1500 MT/s, past the PHY's qualified rate (an
 approved overclock), and the builds close timing to the project's empirical gate
@@ -42,6 +42,8 @@ waited on it. Five steps since, each measured on the kit:
 | v11: + the channel windows skewed by 8 KB (`--chan-skew 0x2000`) | 13.63 / 11.70 / 6.84 | the channels stop hitting the same DRAM banks: streams 0.75 -> 0.78 beats per channel per clock |
 | v15: + the attention softmax unit (`--with-softmax`) | 14.08 / 13.20 / 9.31 | the CPU's softmax (3.9 M cycles per forward at 1,024 tokens) moves to the unit: attention 8.0 -> 4.1 M |
 | v18: + the attention stream at 8 lanes / 2 groups (`--attn-lanes 8 --attn-groups 2`) | 14.33 / 13.97 / 10.93 | both kv heads in one command per layer: the values pass at 1,024 tokens 3.25 -> 1.66 M cycles |
+| v19: + the attention stream to 2,048 positions (`--attn-t-max 2048`), registered read data in the activation and softmax units | 14.32 / 13.96 / 11.97 | past 1,024 positions v18 ran attention on the CPU (~4.6 s per token; the 1,024 bench's last forwards); 1,800 tokens at 10.44 tok/s; worst slack +0.78 ns (108.5 MHz achievable) |
+| v20: + the microSD card (`--with-sdcard`) | 14.34 / 13.98 / 11.99 | the weights and tokenizer from the card at power-up (1-bit on the kit: 436 MB in 74 s); 105.3 MHz achievable, 96.05% XLRs |
 
 A v9 forward at 64 tokens is 7.3 M cycles (`hybprof`): the DeltaNet layers 2.6 M, the FFNs 1.9 M,
 the LM head 1.35 M, the attention layers 1.1 M, the embedding row 0.25 M. The image has no int16
