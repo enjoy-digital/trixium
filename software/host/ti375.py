@@ -147,7 +147,7 @@ def flash(build, firmware):
 
 # Serial Boot --------------------------------------------------------------------------------------
 
-def boot(firmware, tty=TTY, timeout=240, bit=None):
+def boot(firmware, tty=TTY, timeout=240, bit=None, sd=False):
     """The firmware through the BIOS's serial boot (litex_term in a pty, as it wants a terminal).
     With `bit`: litex_term is attached first, then the bitstream loaded, so it answers the BIOS's
     serial boot as soon as the BIOS starts (no wait, and a firmware in the flash cannot boot
@@ -166,8 +166,16 @@ def boot(firmware, tty=TTY, timeout=240, bit=None):
             c.send("\r")
             time.sleep(0.5)
             c.send("serialboot\r")
-        i = c.expect([r"TRIXIUM-READY", pexpect.TIMEOUT, pexpect.EOF], timeout=timeout)
+        # A card in the slot: the firmware offers a second to skip its SD boot (the caller
+        # uploads a model next); `sd` lets it boot from the card.
+        i = c.expect([r"TRIXIUM-READY", r"SDBOOT in 1 s", pexpect.TIMEOUT, pexpect.EOF], timeout=timeout)
         log.append(c.before or "")
+        if i == 1:
+            if not sd:
+                c.send("s")
+            log.append("SDBOOT in 1 s")
+            i = c.expect([r"TRIXIUM-READY", pexpect.TIMEOUT, pexpect.EOF], timeout=timeout)
+            log.append(c.before or "")
         if i != 0:
             raise RuntimeError("the firmware did not come up:\n" + "".join(log)[-2000:])
         c.expect([r"trixium> ", pexpect.TIMEOUT], timeout=120)
@@ -351,6 +359,7 @@ def main(argv=None):
     p = sub.add_parser("load");   p.add_argument("bit")
     p = sub.add_parser("boot");   p.add_argument("firmware"); p.add_argument("--tty", default=TTY)
     p.add_argument("--bit", default=None, help="Load this bitstream first (litex_term already attached).")
+    p.add_argument("--sd", action="store_true", help="Let the firmware boot the model from the SD card (default: skip it).")
     p = sub.add_parser("flash");  p.add_argument("build"); p.add_argument("firmware")
     p = sub.add_parser("model");  p.add_argument("image"); p.add_argument("--csr-csv", default=None)
     p.add_argument("--force", action="store_true", help="Upload even when the kit holds the image.")
@@ -366,7 +375,7 @@ def main(argv=None):
     if args.cmd == "load":
         load(args.bit)
     elif args.cmd == "boot":
-        print(boot(args.firmware, args.tty, bit=args.bit))
+        print(boot(args.firmware, args.tty, bit=args.bit, sd=args.sd))
     elif args.cmd == "flash":
         flash(args.build, args.firmware)
     elif args.cmd == "model":

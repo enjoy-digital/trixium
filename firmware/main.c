@@ -1724,15 +1724,25 @@ int main(void)
     puts("ddr: simulation (PHY model) - controller init and DDRTEST skipped");
 #endif
 #endif
-#if defined(CSR_SD_BASE) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
-    // Power-up with nothing staged (no host uploaded a model since the DRAM lost it) and a
-    // TriXium image on the SD card: load it, a host-free start. Three quick probes without a card.
-    engine_fetch(0, HDR_STAGING, 1, 0xC000);
-    if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) != BONS_MAGIC && sd_init(50, 3) == 0 &&
-        sd_boot() == 0) {
-        engine_fetch(0, TOK_STAGING, 1, 0xC000);
-        if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
-            tok_load();   // After the header below: tok_load compares hashes when it can.
+#if defined(CSR_SD_BASE) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000 && !defined(TRIXIUM_SIM)
+    // A card answers: its image is the model, a host-free start. Whatever the DRAM still holds
+    // is from before this boot: a bitstream reload (and a short power cut) keeps the header
+    // but not all the weights (after a reload: 3 of 470 tensors off their table CRC, and
+    // `imgcheck` takes 100 s, the card 74). `s` within a second keeps the staged model (the
+    // host's serial boot answers it: it uploads right after). Three quick probes without a card.
+    // Not in the simulation (a second is 100M cycles there): `sdinit`/`sdboot` on its console.
+    if (sd_init(50, 3) == 0) {
+        puts("SDBOOT in 1 s (s to skip: keep the staged model)");
+        int skip = 0;
+        uint64_t t_wait = perf_now64();
+        while (!skip && perf_now64() - t_wait < CONFIG_CLOCK_FREQUENCY)
+            if (readchar_nonblock())
+                skip = getchar() == 's';
+        if (!skip && sd_boot() == 0 && hdrload_staged(1) >= 0) {
+            engine_fetch(0, TOK_STAGING, 1, 0xC000);
+            if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
+                tok_load();
+        }
     }
 #endif
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
