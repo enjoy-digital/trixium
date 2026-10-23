@@ -289,16 +289,17 @@ class SoftmaxScratchpad(LiteXModule):
         # Pass 1: the maximum, one beat per clock --------------------------------------------------
         issue1 = Signal()
         self.comb += issue1.eq((state == S["P1"]) & (beat < nbeats) & ~self.cancel)
-        p1_valid = Signal()
-        self.comb += p1_valid.eq(rd_pending & (rd_kind == 1))
-        p1_mask = Signal(8, reset_less=True)
-        self.sync += p1_mask.eq(beat_mask(beat))
+        # The read data through one register first: the scratchpad's outputs fan out across the
+        # die and the wire into the key compares was a Ti375 near-critical group.
+        p1_valid, p1_dat = Signal(), Signal(256, reset_less=True)
+        self.sync += [p1_valid.eq(rd_pending & (rd_kind == 1) & ~clear), p1_dat.eq(self.sp_rd_dat)]
+        p1_mask = _delay(self, beat_mask(beat), 2, "p1_mask")
         # Tree of keys: lane -> 4 -> 2 -> 1 -> the running maximum.
         mx_run = Signal(32, reset_less=True)
         mx_key = _key(self, mx_run)
         ks, xs = [], []
         for j in range(8):
-            x = self.sp_rd_dat[32*j:32*j + 32]
+            x = p1_dat[32*j:32*j + 32]
             k = _key(self, x)
             kk = Signal(32, name=f"k{j}")
             self.comb += kk.eq(Mux(p1_mask[j] & ~_nan(x), k, 0))
@@ -317,7 +318,8 @@ class SoftmaxScratchpad(LiteXModule):
         p1_inflight = Signal(3)
         self.sync += If(clear, p1_inflight.eq(0)).Else(p1_inflight.eq(p1_inflight + p1_valid - t_valid))
         p1_final = Signal()                        # P1_END: every beat of the row is in mx_run
-        self.comb += p1_final.eq((state == S["P1_END"]) & (p1_inflight == 0) & ~t_valid & ~p1_valid)
+        self.comb += p1_final.eq((state == S["P1_END"]) & (p1_inflight == 0) & ~t_valid & ~p1_valid &
+                                  ~(rd_pending & (rd_kind == 1)))
         self.sync += If((state == S["VALIDATE"]) | p1_final, mx_run.eq(F32_M1E30)
                      ).Elif(t_valid & (k1[0] > mx_key), mx_run.eq(x1[0]))
         self.comb += [mx_w.adr.eq(row), mx_w.dat_w.eq(mx_run), mx_w.we.eq(p1_final)]

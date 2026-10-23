@@ -315,7 +315,7 @@ class ActivationScratchpad(LiteXModule):
         self.scan             = scan = Fp32AbsmaxWord()
         self.quantize         = quantize = Fp32ToQ8()
         self.integer_quantize = integer_quantize = IntegerToQ8()
-        self.responses        = responses = ResetInserter()(SyncFIFO(width=258, depth=4))
+        self.responses        = responses = ResetInserter()(SyncFIFO(width=258, depth=5))
         # Block buffer for the ping-pong mode (pp, per-block FP32 with <= 1,024 elements and
         # several blocks): the scan pass copies the block into one half, so the convert pass
         # reads it from there while the next block's scan reads the scratchpad into the other
@@ -415,6 +415,13 @@ class ActivationScratchpad(LiteXModule):
         s_first, s_last = Signal(reset_less=True), Signal(reset_less=True) # (s_pend)
         buf_pend, cnv_issue, issue_main = Signal(), Signal(), Signal()
         buf_wadr = Signal(8, reset_less=True)                             # (write strobe)
+        # The scratchpad's read data through one register before the scan, the block buffer
+        # and the response FIFO: the RAM outputs fan out to every unit across the die, and
+        # the wire to this unit alone was the Ti375's worst path (8.2 ns, no logic).
+        rd_dat = Signal(256, reset_less=True)
+        rd_pend, rd_s_pend = Signal(), Signal()
+        rd_first, rd_last = Signal(reset_less=True), Signal(reset_less=True)  # (rd_*pend)
+        rd_wadr = Signal(8, reset_less=True)
         self.comb += metadata_length.eq(0)
         for bit in range(32):
             self.comb += If(metadata_a[bit], metadata_length.eq(bit + 1))
@@ -443,24 +450,26 @@ class ActivationScratchpad(LiteXModule):
             s_issuing.eq(s_active & (s_issued < read_count) & (state != FAILED) & ~self.cancel),
             # Credits, not the pop: the pop hangs off the quantizer's ready chain and the write
             # grant, which made the read address the unit's critical path. Four entries keep
-            # one read per clock (one in flight, the one popped this cycle counted).
+            # one read per clock (one in flight, the one popped this cycle counted); five without
+            # pp (two in flight: the read and its data register).
             cnv_issue.eq((state == CONVERT) & (reserved < 4) & ~self.cancel),
             issue_main.eq(Mux(pp & in_convert, cnv_issue,
                               self.sp_rd_req & ~s_issuing & (in_scan | in_convert))),
             buf_rd.adr.eq(Cat(issued[:7], block[0])),
-            buf_wr.adr.eq(buf_wadr), buf_wr.dat_w.eq(self.sp_rd_dat),
-            buf_wr.we.eq(pp & ((read_pending & in_scan) | s_pend) & ~self.cancel),
+            buf_wr.adr.eq(rd_wadr), buf_wr.dat_w.eq(rd_dat),
+            buf_wr.we.eq(pp & ((rd_pend & in_scan) | rd_s_pend) & ~self.cancel),
             scan.cancel.eq(clear), quantize.cancel.eq(clear), integer_quantize.cancel.eq(clear),
             responses.reset.eq(clear),
             read_count.eq(captured["elements"] >> 3),
-            scan.sink.valid.eq(((read_pending & in_scan) | s_pend) & ~self.cancel),
-            scan.sink.data.eq(self.sp_rd_dat),
-            scan.sink.first.eq(Mux(s_pend, s_first, read_first)),
-            scan.sink.last.eq(Mux(s_pend, s_last, read_last)),
+            scan.sink.valid.eq(((rd_pend & in_scan) | rd_s_pend) & ~self.cancel),
+            scan.sink.data.eq(rd_dat),
+            scan.sink.first.eq(rd_first),
+            scan.sink.last.eq(rd_last),
             scan.source.ready.eq(1),
             maximum.eq(Mux(scan.source.absmax > self.absmax, scan.source.absmax, self.absmax)),
-            responses.we.eq(Mux(pp, buf_pend, read_pending) & in_convert & ~self.cancel),
-            responses.din.eq(Cat(Mux(pp, buf_rd.dat_r, self.sp_rd_dat), read_first, read_last)),
+            responses.we.eq(Mux(pp, buf_pend, rd_pend) & in_convert & ~self.cancel),
+            responses.din.eq(Mux(pp, Cat(buf_rd.dat_r, read_first, read_last),
+                                  Cat(rd_dat, rd_first, rd_last))),
             quantize.sink.valid.eq(responses.readable & in_convert & ~rotation & ~self.cancel),
             quantize.sink.data.eq(responses.dout[:256]),
             quantize.sink.first.eq(responses.dout[256]),
@@ -474,9 +483,9 @@ class ActivationScratchpad(LiteXModule):
             response_pop.eq(Mux(rotation, integer_quantize.sink.valid & integer_quantize.sink.ready,
                                quantize.sink.valid & quantize.sink.ready)),
             responses.re.eq(response_pop),
-            reserved.eq(responses.level + Mux(pp, buf_pend, read_pending)),
+            reserved.eq(responses.level + Mux(pp, buf_pend, read_pending + rd_pend)),
             self.sp_rd_req.eq(~self.cancel & ((state == SCAN) |
-                ((state == CONVERT) & ~pp & (reserved < 4)) | s_issuing |
+                ((state == CONVERT) & ~pp & (reserved < 5)) | s_issuing |
                 (state == META_E_REQ) | (state == META_A_REQ))),
             self.sp_rd_adr.eq(Mux(state == META_E_REQ, (captured["exponents"] >> 5) + (block >> 3),
                 Mux(state == META_A_REQ, (captured["maxima"] >> 5) + (block >> 3),
@@ -510,6 +519,11 @@ class ActivationScratchpad(LiteXModule):
         ]
         self.sync += If(clear, raw_bad_r.eq(0)).Else(
             raw_bad_r.eq(rotation & in_convert & responses.readable & raw_bad))
+        self.sync += If(clear, rd_pend.eq(0), rd_s_pend.eq(0)).Else(
+            rd_pend.eq(read_pending), rd_s_pend.eq(s_pend))
+        self.sync += [rd_dat.eq(self.sp_rd_dat), rd_wadr.eq(buf_wadr),
+                      rd_first.eq(Mux(s_pend, s_first, read_first)),
+                      rd_last.eq(Mux(s_pend, s_last, read_last))]
         self.sync += If(clear, read_pending.eq(0), buf_pend.eq(0), s_pend.eq(0)).Else(
             read_pending.eq(self.sp_rd_req & ~s_issuing & (in_scan | in_convert)),
             buf_pend.eq(cnv_issue & pp),
