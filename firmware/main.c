@@ -164,7 +164,9 @@ static void help(void)
 #ifdef CSR_SDCARD_BASE
     puts("  sdinit [mhz]      - SD card init (4-bit, 50 MHz high speed when the card takes it)");
     puts("  sdload c b s n    - n 512-byte blocks from sector s into channel c's window at b");
-    puts("  sdboot            - the image on the SD card (trixium sdimage): weights, hdrload, tokload");
+    puts("  sdboot            - the image on the SD card: weights, hdrload, tokload");
+    puts("  sdsave            - the uploaded model (and tokenizer) to the SD card, booted at power-up");
+    puts("  sdwtest s         - write a pattern block at sector s and read it back");
 #endif
     puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
     puts("  bench [n]         - profiled generation benchmark (default 4 tokens)");
@@ -1647,8 +1649,21 @@ static void console_service(void)
                 printf(" %08lx", (unsigned long)((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[w]);
             printf("\n");
         }
+    } else if (strcmp(token, "sdwtest") == 0) {   // sdwtest <sector>: write, read back, compare.
+        uint32_t sec = strtoul(get_token(&str), NULL, 0), w[128];
+        for (int i = 0; i < 128; i++) w[i] = 0xA5000000u ^ (sec << 8) ^ (uint32_t)i;
+        if (sd_write(sec, 1, 0, 0, w) == 0 &&
+            sd_load(0, TRIXIUM_CHAN_WEIGHT_BASE - 0x200000, sec, 1) == 0) {
+            engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE - 0x200000, 16, 0xC000);
+            int bad = 0;
+            for (int i = 0; i < 128; i++)
+                bad += ((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[i] != w[i];
+            printf("SDWTEST %s (%d of 128 words differ)\n", bad ? "FAIL" : "ok", bad);
+        }
     }
 #if TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
+    else if (strcmp(token, "sdsave") == 0)
+        sd_save();
     else if (strcmp(token, "sdboot") == 0) {
         if (sd_boot() == 0) {
             hdrload();

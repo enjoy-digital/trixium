@@ -16,6 +16,7 @@ the SoC's UART (the console, 115200); its RJ45 gives Etherbone (the CSRs) and th
   python3 -m software.host.ti375 flash build/ti375_v10 firmware/trixium.bin   # power-up boot
   python3 -m software.host.ti375 model models/bons/bonsai2-2b-n4-ti375.img    # upload unless there
   python3 -m software.host.ti375 model <img> --tokenizer models/2b/tokenizer.bin # + on-board chat
+  python3 -m software.host.ti375 model <img> --tokenizer <btok> --persist     # + to the SD card
   python3 -m software.host.ti375 server --iface enp5s0      # litex_server on that interface
   python3 -m software.host.ti375 smi [-w 1]                 # trixium smi over Etherbone
   python3 -m software.host.ti375 dashboard [--watts 7.5]    # the live page, http://localhost:8375/
@@ -354,6 +355,7 @@ def main(argv=None):
     p = sub.add_parser("model");  p.add_argument("image"); p.add_argument("--csr-csv", default=None)
     p.add_argument("--force", action="store_true", help="Upload even when the kit holds the image.")
     p.add_argument("--tokenizer", default=None, help="BTOK to stage and load on the board (its `chat` command).")
+    p.add_argument("--persist", action="store_true", help="Then save it to the SD card (sdsave): the kit boots it at power-up.")
     p = sub.add_parser("server"); p.add_argument("--ip", default=BOARD_IP); p.add_argument("--iface", default=None)
     p = sub.add_parser("smi");    p.add_argument("--csr-csv", default=None); p.add_argument("-i", default=0.25, type=float, dest="interval")
     p.add_argument("-w", default=0.0, type=float, dest="watch"); p.add_argument("--json", action="store_true")
@@ -371,6 +373,15 @@ def main(argv=None):
         uploaded, dt = ensure_model(args.image, args.csr_csv, args.force, verbose=True,
                                     tokenizer=args.tokenizer)
         print(f"{'uploaded' if uploaded else 'already on the kit'}, ready in {dt:.1f} s")
+        if args.persist:
+            # The firmware copies what the upload staged to the card (a bitstream built with
+            # --with-sdcard): minutes, once per model.
+            from software.host.console import run as console_run
+            tty = config()[0]
+            out = console_run(["sdsave"], tty, wait=1800, quiet_after=1800, until="trixium>", baud=BAUD)
+            print("\n".join(l for l in out.splitlines() if "chan" in l or "SD" in l or "sd" in l))
+            if "SDSAVE" not in out:
+                raise SystemExit("sdsave failed")
     elif args.cmd == "smi":
         smi(args.csr_csv, args.interval, args.watch, args.json)
     elif args.cmd == "dashboard":

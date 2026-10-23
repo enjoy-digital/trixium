@@ -27,5 +27,9 @@
 int sd_init(int mhz, int tries);
 int sd_load(int chan, uint32_t base, uint32_t sector, uint32_t blocks);
 int sd_boot(void);
+// n blocks to the card from a DRAM window (chan, base), or from CPU memory when cpu != NULL.
+int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const uint32_t *cpu);
+// The staged model (and tokenizer) to the card, in sd_boot's layout.
+int sd_save(void);
 
 #endif

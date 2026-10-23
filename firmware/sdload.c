@@ -15,9 +15,11 @@
 #include <generated/soc.h>
 #include <system.h>
 
+#include "bons.h"
 #include "engine.h"
 #include "perf.h"
 #include "sdload.h"
+#include "tokenizer.h"
 
 #ifdef CSR_SDCARD_BASE
 
@@ -120,7 +122,104 @@ int sd_load(int chan, uint32_t base, uint32_t sector, uint32_t blocks)
     return 0;
 }
 
+// Writes: blocks from a DRAM window (through the engine into the scratchpad) or from CPU memory
+// (cpu != NULL), pushed word by word into the card's write FIFO (sd_upload.py's wdata).
+#define SD_WFIFO_DEPTH 1024
+
+static void sd_push(const volatile uint32_t *w, uint32_t n)
+{
+    uint32_t room = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        while (room == 0)
+            room = SD_WFIFO_DEPTH - sdcard_wlevel_read();
+        sdcard_wdata_write(w[i]);
+        room--;
+    }
+}
+
+int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const uint32_t *cpu)
+{
+    if (!sd_ok) { puts("sdwrite: sdinit first"); return -1; }
+    sdcard_core_block_length_write(512);
+    sdcard_core_block_count_write(blocks);
+    sdcard_core_cmd_argument_write(sector);
+    sdcard_core_cmd_command_write(((blocks > 1 ? 25 : 24) << 8) | (SDCARD_CTRL_DATA_TRANSFER_WRITE << 5) |
+                                  SDCARD_CTRL_RESPONSE_SHORT | SDCARD_CTRL_RESPONSE_CRC);
+    sdcard_core_cmd_send_write(1);
+    if (sdcard_wait_cmd_done() != SD_OK) { puts("sdwrite: write command refused"); return -1; }
+    uint32_t bytes = blocks*512;
+    for (uint32_t off = 0; off < bytes; off += 0x10000) {
+        uint32_t chunk = bytes - off > 0x10000 ? 0x10000 : bytes - off;
+        if (cpu) {
+            sd_push(cpu + off/4, chunk/4);
+        } else {
+            engine_fetch(chan, base + off, chunk/32, 0xC000);
+            sd_push((const volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000), chunk/4);
+        }
+    }
+    int rc = sdcard_wait_data_done();
+    if (blocks > 1)
+        (void)sdcard_stop_transmission();
+    if (rc != SD_OK) {
+        printf("sdwrite: %s at sector %lu\n", rc == SD_CRCERROR ? "the card refused a block (CRC)" :
+               "write timeout", (unsigned long)sector);
+        return -1;
+    }
+    return 0;
+}
+
 #if TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000   // The staging areas below the weights.
+int sd_save(void)
+{
+    if (!sd_ok && sd_init(50, 1000) < 0)
+        return -1;
+    // What a UDP upload staged: the BONS header+table, each channel's payload, the tokenizer.
+    _Static_assert(sizeof(struct bons_header) <= 512, "the header in 16 beats");
+    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE - 0x100000, 16, 0xC000);
+    struct bons_header h;
+    for (uint32_t i = 0; i < sizeof(h)/4; i++)
+        ((uint32_t *)&h)[i] = ((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[i];
+    if (h.magic != BONS_MAGIC) { puts("sdsave: no staged model (upload one first)"); return -1; }
+    uint32_t t[128];
+    memset(t, 0, sizeof(t));
+    uint32_t n = 0, sector = SD_IMAGE_SECTOR + 1;
+#define SD_ENTRY(c, b, bytes) do { uint32_t *x = &t[4 + 4*n++]; x[0] = (c); x[1] = (b); \
+        x[2] = ((bytes) + 511)/512; x[3] = sector; sector += x[2]; } while (0)
+    SD_ENTRY(0, TRIXIUM_CHAN_WEIGHT_BASE - 0x100000, h.payload_offset);
+    for (uint32_t c = 0; c < h.n_channels; c++)
+        SD_ENTRY(c, TRIXIUM_CHAN_WEIGHT_BASE
+#ifndef TRIXIUM_LOADER_ADDS_CHAN_OFFSET
+                    + c*TRIXIUM_CHAN_STRIDE
+#endif
+                 , (uint32_t)(h.payload_beats*32));
+    engine_fetch(0, TOK_STAGING, 1, 0xC000);
+    volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000);
+    if (rec[0] == TOK_STAGING_MAGIC && rec[1] <= TOK_STAGING_MAX)
+        SD_ENTRY(0, TOK_STAGING, 32 + rec[1]);
+    t[0] = SD_IMAGE_MAGIC; t[1] = 1; t[2] = n;
+    t[3] = crc32((unsigned char *)&t[4], n*16);
+    // The old table first invalidated, the table last: a save cut short leaves no image to boot.
+    uint32_t zero[128];
+    memset(zero, 0, sizeof(zero));
+    if (sd_write(SD_IMAGE_SECTOR, 1, 0, 0, zero) < 0)
+        return -1;
+    uint64_t t0 = perf_now64(), bytes = 0;
+    for (uint32_t e = 0; e < n; e++) {
+        const uint32_t *x = &t[4 + 4*e];
+        printf("  chan %lu: %lu KB to sector %lu\n", (unsigned long)x[0], (unsigned long)(x[2]/2),
+               (unsigned long)x[3]);
+        if (sd_write(x[3], x[2], (int)x[0], x[1], NULL) < 0)
+            return -1;
+        bytes += (uint64_t)x[2]*512;
+    }
+    if (sd_write(SD_IMAGE_SECTOR, 1, 0, 0, t) < 0)
+        return -1;
+    uint32_t ms = (uint32_t)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000));
+    printf("SDSAVE %lu MB in %lu s (%lu KB/s)\n", (unsigned long)(bytes >> 20),
+           (unsigned long)(ms/1000), (unsigned long)(ms ? bytes/ms : 0));
+    return 0;
+}
+
 int sd_boot(void)
 {
     if (!sd_ok && sd_init(50, 1000) < 0)
