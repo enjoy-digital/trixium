@@ -75,6 +75,15 @@ SECTIONS
 		PROVIDE_HIDDEN (__fini_array_end = .);
 	} > main_ram
 
+	/* A host monitor's fixed block at the start of sram (firmware/hybrid.c struct hyb_live, read
+	 * over Etherbone by software/host/dashboard.py: main_ram is the CPU's own memory port on some
+	 * boards, sram is on the shared bus everywhere). Not loaded, not zeroed: the firmware sets it. */
+	.live (NOLOAD) :
+	{
+		KEEP(*(.live))
+		. = ALIGN(128);
+	} > sram
+
 	.data :
 	{
 		. = ALIGN(8);

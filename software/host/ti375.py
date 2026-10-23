@@ -17,6 +17,7 @@ the SoC's UART (the console, 115200); its RJ45 gives Etherbone (the CSRs) and th
   python3 -m software.host.ti375 model models/bons/bonsai2-2b-n4-ti375.img    # upload unless there
   python3 -m software.host.ti375 server --iface enp5s0      # litex_server on that interface
   python3 -m software.host.ti375 smi [-w 1]                 # trixium smi over Etherbone
+  python3 -m software.host.ti375 dashboard [--watts 7.5]    # the live page, http://localhost:8375/
 
 A build with `--with-spi-flash` boots the firmware from the flash at power-up (LiteX's
 flashboot, after the BIOS's serial boot: a host answering that one still boots its own).
@@ -308,6 +309,29 @@ def smi(csr_csv=None, interval=0.25, watch=0.0, as_json=False):
         if server:
             server.kill()
 
+def dashboard(csr_csv=None, port=8375, bind="127.0.0.1", watts=None, interval=0.25):
+    """The live page (software/host/dashboard.py) for the kit, starting a litex_server on its
+    interface when none answers on localhost:1234; it runs next to `trixium chat`."""
+    from software.host import ebsmi
+    from software.host.dashboard import BoardSource, serve
+    tty, ip, iface = config()
+    csr_csv = csr_csv or loaded_csr_csv()
+    server  = None
+    try:
+        socket.create_connection(("localhost", 1234), timeout=0.5).close()
+    except OSError:
+        server = start_server(ip, iface)
+    try:
+        card = ebsmi.Card(csr_csv)
+        ident, want = card.identifier(), str(card.bus.constants.config_identifier)
+        card.close()
+        if ident != want:
+            raise SystemExit(f"the kit runs '{ident}', {csr_csv} is '{want}': pass the loaded build's --csr-csv")
+        serve(BoardSource(csr_csv, interval=interval), port, bind, watts)
+    finally:
+        if server:
+            server.kill()
+
 # Main ---------------------------------------------------------------------------------------------
 
 def main(argv=None):
@@ -322,6 +346,9 @@ def main(argv=None):
     p = sub.add_parser("server"); p.add_argument("--ip", default=BOARD_IP); p.add_argument("--iface", default=None)
     p = sub.add_parser("smi");    p.add_argument("--csr-csv", default=None); p.add_argument("-i", default=0.25, type=float, dest="interval")
     p.add_argument("-w", default=0.0, type=float, dest="watch"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("dashboard"); p.add_argument("--csr-csv", default=None)
+    p.add_argument("--port", default=8375, type=int); p.add_argument("--bind", default="127.0.0.1")
+    p.add_argument("--watts", default=None, type=float); p.add_argument("-i", default=0.25, type=float, dest="interval")
     args = parser.parse_args(argv)
     if args.cmd == "load":
         load(args.bit)
@@ -334,6 +361,8 @@ def main(argv=None):
         print(f"{'uploaded' if uploaded else 'already on the kit'}, ready in {dt:.1f} s")
     elif args.cmd == "smi":
         smi(args.csr_csv, args.interval, args.watch, args.json)
+    elif args.cmd == "dashboard":
+        dashboard(args.csr_csv, args.port, args.bind, args.watts, args.interval)
     else:
         server(args.ip, args.iface)
 

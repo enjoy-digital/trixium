@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TriXium Live</title>
+<style>
+:root {
+  --bg: #f4f6f5; --panel: #ffffff; --line: #dfe5e3; --ink: #14201d; --dim: #5f7871; --faint: #9aaba6;
+  --teal: #12a08c; --teal-soft: rgba(18,160,140,.14); --coral: #d9604a; --amber: #c48a12;
+  --s-embed: #8a7bd6; --s-deltanet: #12a08c; --s-attention: #3d8fd1; --s-ffn: #d9604a;
+  --s-lmhead: #c48a12; --s-other: #9aaba6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b1210; --panel: #111b18; --line: #1e2c28; --ink: #e6efec; --dim: #8fa8a1; --faint: #4f6660;
+    --teal: #35c2ae; --teal-soft: rgba(53,194,174,.14); --coral: #f07a62; --amber: #e6b04a;
+    --s-embed: #a597ee; --s-deltanet: #35c2ae; --s-attention: #5aaaf0; --s-ffn: #f07a62;
+    --s-lmhead: #e6b04a; --s-other: #5d756e;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0b1210; --panel: #111b18; --line: #1e2c28; --ink: #e6efec; --dim: #8fa8a1; --faint: #4f6660;
+  --teal: #35c2ae; --teal-soft: rgba(53,194,174,.14); --coral: #f07a62; --amber: #e6b04a;
+  --s-embed: #a597ee; --s-deltanet: #35c2ae; --s-attention: #5aaaf0; --s-ffn: #f07a62;
+  --s-lmhead: #e6b04a; --s-other: #5d756e;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 20px 16px 28px;
+}
+.wrap { max-width: 1280px; margin: 0 auto; display: grid; gap: 14px; }
+.mono { font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+.brand { font-weight: 700; font-size: 20px; letter-spacing: .2px; }
+.brand b { color: var(--teal); }
+.meta { color: var(--dim); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.pill { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--panel); font-size: 13px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
+.pill.on .dot { background: var(--teal); box-shadow: 0 0 0 0 var(--teal); animation: pulse 1.4s infinite; }
+.pill.err .dot { background: var(--coral); }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 var(--teal-soft); } 70% { box-shadow: 0 0 0 9px rgba(0,0,0,0); } 100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+.panel h2 { margin: 0 0 10px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+.kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 14px; }
+.kpi .v { font-size: 34px; font-weight: 650; line-height: 1.1; }
+.kpi .v small { font-size: 14px; font-weight: 500; color: var(--dim); margin-left: 4px; }
+.kpi .sub { color: var(--dim); font-size: 12.5px; margin-top: 4px; min-height: 18px; }
+.kpi.hero .v { color: var(--teal); font-size: 44px; }
+.row { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+.stack { display: flex; height: 30px; border-radius: 7px; overflow: hidden; background: var(--line); }
+.stack div { height: 100%; transition: flex-grow .6s ease; min-width: 0; }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+td { padding: 5px 4px; border-top: 1px solid var(--line); }
+td.n { text-align: right; }
+td .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; vertical-align: -1px; }
+.note { color: var(--faint); font-size: 12px; margin-top: 8px; }
+canvas { display: block; width: 100%; }
+#trits { height: 230px; border-radius: 8px; }
+.chans { display: grid; gap: 8px; }
+.chan { display: grid; grid-template-columns: 34px minmax(0, 1fr) 46px; align-items: center; gap: 10px; font-size: 13px; }
+.bar { height: 14px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--teal); transition: width .3s ease; }
+.util { display: grid; gap: 8px; margin-top: 14px; }
+.spark { height: 120px; }
+.legend { display: flex; gap: 14px; color: var(--dim); font-size: 12px; margin-top: 6px; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: 3px; background: currentColor; }
+.watts { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.watts input { width: 70px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+.err { color: var(--coral); }
+@media (max-width: 1000px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } .row { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 560px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } .kpi .v { font-size: 26px; } .kpi.hero .v { font-size: 34px; } .pill { margin-left: 0; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">Tri<b>X</b>ium <span style="font-weight:500;color:var(--dim)">live</span></div>
+    <div class="meta">
+      <span id="ident">connecting…</span>
+      <span id="model"></span>
+      <span id="clock" class="mono"></span>
+    </div>
+    <div class="pill" id="state"><span class="dot"></span><span id="statetext">waiting for data</span></div>
+  </header>
+
+  <section class="kpis">
+    <div class="panel kpi hero"><h2>Decode</h2><div class="v mono"><span id="toks">–</span><small>tok/s</small></div><div class="sub" id="toksub"></div></div>
+    <div class="panel kpi"><h2>Forwards</h2><div class="v mono"><span id="fwds">–</span><small>/s</small></div><div class="sub" id="fwdsub"></div></div>
+    <div class="panel kpi"><h2>DDR read</h2><div class="v mono"><span id="gbs">–</span><small>GB/s</small></div><div class="sub" id="gbsub"></div></div>
+    <div class="panel kpi"><h2>Engine busy</h2><div class="v mono"><span id="eng">–</span><small>%</small></div><div class="sub" id="engsub"></div></div>
+    <div class="panel kpi"><h2>Power</h2><div class="v mono"><span id="watt">–</span><small>W</small></div>
+      <div class="watts sub"><input id="wattin" type="number" step="0.1" min="0" placeholder="meter W" aria-label="Board power in watts"><span>from the meter</span></div></div>
+    <div class="panel kpi"><h2>Efficiency</h2><div class="v mono"><span id="tpj">–</span><small>tok/J</small></div><div class="sub" id="tpjsub"></div></div>
+  </section>
+
+  <section class="row">
+    <div class="panel">
+      <h2>Where a token's cycles go</h2>
+      <div class="stack" id="stack"></div>
+      <table class="mono" id="split"></table>
+      <div class="note" id="splitnote">The firmware's per-stage cycle counters, averaged over the last second of forwards.</div>
+    </div>
+    <div class="panel">
+      <h2>Ternary engine</h2>
+      <canvas id="trits"></canvas>
+      <div class="note">Each cell is a weight in {−1, 0, +1}; the grid streams at the measured DDR rate and lights with the engine's busy share.</div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="panel">
+      <h2>Memory channels · LPDDR4x</h2>
+      <div class="chans mono" id="chans"></div>
+      <div class="util mono">
+        <div class="chan"><span>Eng</span><div class="bar"><i id="b-eng"></i></div><span id="t-eng" style="text-align:right"></span></div>
+        <div class="chan"><span>Units</span><div class="bar"><i id="b-units" style="background:var(--s-attention)"></i></div><span id="t-units" style="text-align:right"></span></div>
+      </div>
+      <div class="note" id="memnote"></div>
+    </div>
+    <div class="panel">
+      <h2>Last two minutes</h2>
+      <canvas id="spark" class="spark"></canvas>
+      <div class="legend"><span style="color:var(--teal)">tok/s (forwards)</span><span style="color:var(--s-attention)">DDR GB/s</span></div>
+    </div>
+  </section>
+  <div class="note err" id="error"></div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const fmt = (x, d = 1) => (x == null || !isFinite(x)) ? "–" : x.toFixed(d);
+  const HIST = 480;                      // 2 min at 4 samples/s
+  const hist = [];
+  let last = null, wattsTyped = null;
+
+  try { const w = localStorage.getItem("trixium.watts"); if (w) { wattsTyped = parseFloat(w); $("wattin").value = w; } } catch (e) {}
+  $("wattin").addEventListener("input", e => {
+    const v = parseFloat(e.target.value);
+    wattsTyped = isFinite(v) && v > 0 ? v : null;
+    try { wattsTyped ? localStorage.setItem("trixium.watts", String(wattsTyped)) : localStorage.removeItem("trixium.watts"); } catch (err) {}
+    if (last) render(last);
+  });
+
+  function render(r) {
+    last = r;
+    $("error").textContent = r.error || "";
+    if (!r.identifier) return;
+    $("ident").textContent = r.identifier;
+    $("model").textContent = r.model ? "model " + r.model : "";
+    $("clock").textContent = r.clock_mhz ? `sys ${fmt(r.clock_mhz)} MHz` : "";
+    const chat = r.chat || {};
+    const busy = r.engine > 0.02 || r.units > 0.02;
+    const pill = $("state");
+    pill.className = "pill" + (r.error ? " err" : busy ? " on" : "");
+    $("statetext").textContent = r.error ? "link error" : busy ? (chat.state === "generating" ? "generating" : "thinking") : "idle";
+
+    // Decode rate: the chat tool's own figure while it generates, else forwards/s.
+    const tok = !busy ? 0 : chat.state === "generating" && chat.tok_s > 0 ? chat.tok_s : (r.fwd_s || 0);
+    $("toks").textContent = fmt(tok);
+    $("toksub").textContent = chat.tokens ? `${chat.tokens} tokens · first token ${fmt(chat.ttft, 2)} s` : (r.live ? "" : "firmware without live counters");
+    $("fwds").textContent = r.live ? fmt(busy ? r.fwd_s : 0) : "–";
+    $("fwdsub").textContent = r.forwards != null ? `${r.forwards.toLocaleString()} since load` : "";
+    $("gbs").textContent = fmt(r.gbs, 2);
+    $("gbsub").textContent = r.peak_gbs ? `${fmt(100*r.gbs/r.peak_gbs, 0)}% of ${fmt(r.peak_gbs, 1)} GB/s port peak` : "";
+    $("eng").textContent = fmt(100*r.engine, 0);
+    $("engsub").textContent = `units ${fmt(100*r.units, 0)}% · ${Math.round(r.ops_s).toLocaleString()} ops/s`;
+    const w = wattsTyped || r.watts;
+    $("watt").textContent = w ? fmt(w) : "–";
+    $("tpj").textContent = w && tok > 0 ? fmt(tok / w, 2) : "–";
+    $("tpjsub").textContent = w ? `${fmt(w / Math.max(tok, 1e-9) * 1000, 0)} mJ per token` : "type the meter's watts";
+
+    // Cycle split per token.
+    const split = r.split, groups = r.groups || [];
+    if (split && r.split_cycles > 0) {
+      const total = r.split_cycles, mhz = r.clock_mhz || 100;
+      const stack = $("stack");
+      if (stack.children.length !== groups.length) {
+        stack.innerHTML = groups.map(([g]) => `<div data-g="${g}" style="background:var(--s-${g})"></div>`).join("");
+      }
+      for (const el of stack.children) el.style.flexGrow = String(split[el.dataset.g] / total);
+      $("split").innerHTML = groups.map(([g, label]) => {
+        const c = split[g];
+        return `<tr><td><span class="sw" style="background:var(--s-${g})"></span>${label}</td>` +
+               `<td class="n">${fmt(c / mhz / 1000, 1)} ms</td><td class="n">${fmt(100 * c / total, 0)}%</td></tr>`;
+      }).join("") + `<tr><td><b>Per token</b></td><td class="n"><b>${fmt(total / mhz / 1000, 1)} ms</b></td><td class="n">${fmt(mhz * 1e6 / total, 1)} tok/s</td></tr>`;
+      if (r.weight_beats) {
+        const floor = r.weight_beats / total;
+        $("splitnote").textContent = `Weights stream at ${fmt(100 * floor, 0)}% of one 32-byte beat per channel per clock over the whole forward. Averaged over the last second of forwards.`;
+      }
+    } else if (!r.live) {
+      $("splitnote").textContent = "This firmware does not publish the per-stage counters (struct hyb_live): hardware counters only.";
+    }
+
+    // Channels.
+    const chans = $("chans");
+    const cu = r.channel_util || [];
+    if (chans.children.length !== cu.length) {
+      chans.innerHTML = cu.map((_, c) => `<div class="chan"><span>ch${c}</span><div class="bar"><i></i></div><span style="text-align:right"></span></div>`).join("");
+    }
+    cu.forEach((u, c) => {
+      const row = chans.children[c];
+      row.children[1].firstChild.style.width = `${Math.min(100, 100 * u)}%`;
+      row.children[2].textContent = `${fmt(100 * u, 0)}%`;
+    });
+    $("b-eng").style.width = `${100 * r.engine}%`; $("t-eng").textContent = `${fmt(100 * r.engine, 0)}%`;
+    $("b-units").style.width = `${100 * r.units}%`; $("t-units").textContent = `${fmt(100 * r.units, 0)}%`;
+    $("memnote").textContent = `${r.channels} engine channels · share of each channel's port bandwidth · request wait ${fmt(100 * r.request_wait, 0)}%`;
+
+    hist.push({ tok: busy ? (r.fwd_s || 0) : 0, gbs: r.gbs || 0 });
+    if (hist.length > HIST) hist.shift();
+    drawSpark(r.peak_gbs || 1);
+  }
+
+  // Trend lines.
+  function sizeCanvas(cv) {
+    const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+    if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+    const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); return [ctx, w, h];
+  }
+  function drawSpark(peak) {
+    const [ctx, w, h] = sizeCanvas($("spark"));
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = css("--line"); ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) { ctx.beginPath(); ctx.moveTo(0, h * i / 4 + .5); ctx.lineTo(w, h * i / 4 + .5); ctx.stroke(); }
+    const tmax = Math.max(16, ...hist.map(p => p.tok));
+    const line = (key, max, color) => {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+      hist.forEach((p, i) => { const x = w - (hist.length - 1 - i) * w / (HIST - 1), y = h - 4 - (h - 8) * p[key] / max; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.stroke();
+    };
+    line("gbs", peak, css("--s-attention"));
+    line("tok", tmax, css("--teal"));
+    ctx.fillStyle = css("--dim"); ctx.font = "11px ui-monospace, monospace";
+    ctx.fillText(`${tmax.toFixed(0)} tok/s · ${peak.toFixed(1)} GB/s`, 6, 13);
+  }
+
+  // Ternary weight grid: rows scroll at the DDR rate, cells light with the engine's busy share.
+  const tcv = $("trits");
+  let cells = [], cols = 0, rows = 0, offset = 0, prev = performance.now();
+  function rollRow() { const r = new Int8Array(cols); for (let i = 0; i < cols; i++) { const x = Math.random(); r[i] = x < .31 ? -1 : x < .69 ? 0 : 1; } return r; }
+  function frame(t) {
+    const [ctx, w, h] = sizeCanvas(tcv);
+    const size = 11, gap = 3, pitch = size + gap;
+    const c = Math.floor(w / pitch), rr = Math.ceil(h / pitch) + 1;
+    if (c !== cols || rr !== rows) { cols = c; rows = rr; cells = Array.from({ length: rows }, rollRow); }
+    const dt = Math.min(0.1, (t - prev) / 1000); prev = t;
+    const r = last || {};
+    const gbs = r.gbs || 0, eng = r.engine || 0;
+    offset += dt * gbs * 9;                      // rows per second, scaled to the DDR rate
+    while (offset >= 1) { offset -= 1; cells.pop(); cells.unshift(rollRow()); }
+    ctx.clearRect(0, 0, w, h);
+    const pos = css("--teal"), neg = css("--coral"), zero = css("--line");
+    const x0 = (w - cols * pitch + gap) / 2;
+    for (let y = 0; y < rows; y++) {
+      const yy = (y - 1 + offset) * pitch;
+      for (let x = 0; x < cols; x++) {
+        const v = cells[y][x];
+        ctx.globalAlpha = v === 0 ? 1 : 0.18 + 0.82 * eng * (0.6 + 0.4 * Math.random());
+        ctx.fillStyle = v > 0 ? pos : v < 0 ? neg : zero;
+        ctx.fillRect(x0 + x * pitch, yy, size, size);
+      }
+    }
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  async function connect() {
+    try {
+      const past = await (await fetch("/api/history")).json();
+      hist.push(...past.slice(-HIST));
+    } catch (e) {}
+    const es = new EventSource("/events");
+    es.onmessage = e => { try { render(JSON.parse(e.data)); } catch (err) { $("error").textContent = String(err); } };
+    es.onerror = () => { $("state").className = "pill err"; $("statetext").textContent = "dashboard server unreachable"; };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

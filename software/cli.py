@@ -20,6 +20,7 @@
     trixium chat      --remote --board fk33                      # on a lab board host, over ssh
     trixium chat      --board ti375                              # the Efinix kit on this machine's serial port
     trixium smi       --board ti375 [-w 1]                       # its status, over Etherbone
+    trixium dashboard --board ti375 [--watts 7.5]                # its live page (http://localhost:8375/)
     trixium console   "stats" "bench 64"                         # raw firmware commands
     trixium demo      --board ypcb --build ypcb                 # the README's chat + smi GIF
 
@@ -297,6 +298,18 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["smi"]:
         cmd_smi(argv[1:])
+    if argv[:1] == ["dashboard"]:
+        # The live page: --board ti375 (litex_server started, build checked), else
+        # software/host/dashboard.py's own options (--csr-csv, --fake).
+        rest = argv[1:]
+        if "--board" in rest:
+            i = rest.index("--board")
+            if rest[i + 1:i + 2] != ["ti375"]:
+                sys.exit("dashboard --board: only ti375")
+            from software.host.ti375 import main as ti375_main
+            return ti375_main(["dashboard"] + rest[:i] + rest[i + 2:])
+        from software.host.dashboard import main as dashboard_main
+        return dashboard_main(rest)
     if argv[:1] == ["demo"]:
         # demo passes everything through to software/lab/demo.py (its own options).
         from software.lab.demo import main as demo_main
@@ -384,6 +397,7 @@ def main(argv=None):
 
     # SMI.
     subparsers.add_parser("smi", help="Card status and diagnostics (runs trixium_smi; -h for its options; --board ti375: over Etherbone).")
+    subparsers.add_parser("dashboard", help="Live page of a board's counters (--board ti375, or --csr-csv / --fake; -h for its options).")
     subparsers.add_parser("demo", help="Record the README's chat + smi demo GIF on a lab board (-h for its options).")
 
     args = parser.parse_args(argv)

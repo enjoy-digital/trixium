@@ -188,6 +188,42 @@ struct hyb_prof {
 #define HP ((struct hyb_prof *)TRIXIUM_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
 static uint32_t hyb_forwards_profiled;
+// Live counters for a host monitor (software/host/dashboard.py reads them over Etherbone while
+// the board runs): cumulative since hybrid_init, not cleared by `stats`, published at the end of
+// each forward's layers (the LM head of a forward lands in the next publication). The block is
+// the first thing in sram (linker.ld's .live): the shared bus reaches sram on every board, while
+// main_ram is the CPU's own memory port on some (the Ti375). seq is odd while the block changes;
+// a reader retries when it differs across its read. The CPU's L1 is write-back: each
+// publication cleans the block's lines.
+#define HYB_LIVE_MAGIC   0x4556494cu     // "LIVE"
+#define HYB_LIVE_VERSION 1
+#define HYB_LIVE_STAGES  10
+struct hyb_live {
+    uint32_t magic, version, seq, forwards;
+    uint64_t now;                        // perf_now64() at the publication
+    uint64_t cyc[HYB_LIVE_STAGES];       // embed anorm dn attn resid fprep fproj fact fdown logits
+    uint64_t weight_beats;               // weight beats one forward streams (HP->fwd_weight_beats)
+};
+static uint64_t hyb_live_base[HYB_LIVE_STAGES];   // the totals before the last hybrid_stats_reset
+static struct hyb_live hyb_live __attribute__((section(".live"), used));
+#define HL ((volatile struct hyb_live *)&hyb_live)
+_Static_assert(sizeof(struct hyb_live) <= 128, "linker.ld's .live is 128 bytes");
+
+static void hyb_live_publish(void)
+{
+    const uint64_t c[HYB_LIVE_STAGES] = {hyb_cyc_embed, hyb_cyc_anorm, hyb_cyc_dn, hyb_cyc_attn,
+        hyb_cyc_resid, hyb_cyc_fprep, hyb_cyc_fproj, hyb_cyc_fact, hyb_cyc_fdown, hyb_cyc_logits};
+    HL->seq++;
+    for (int i = 0; i < HYB_LIVE_STAGES; i++)
+        HL->cyc[i] = hyb_live_base[i] + c[i];
+    HL->forwards++;
+    HL->weight_beats = HP->fwd_weight_beats;
+    HL->now = perf_now64();
+    HL->seq++;
+#ifdef HAS_CLEAN_CPU_DCACHE_RANGE
+    clean_cpu_dcache_range((void *)HL, sizeof(struct hyb_live));
+#endif
+}
 
 /* Activation Tables */
 /*-------------------*/
@@ -641,6 +677,10 @@ static void rope_apply_partial(float *vh)   // one head: the first rope_n dims, 
 int hybrid_init(void)
 {
     H = model_header();
+    memset((void *)HL, 0, sizeof(struct hyb_live));      // .live is not .bss
+    memset(hyb_live_base, 0, sizeof hyb_live_base);
+    HL->version = HYB_LIVE_VERSION;
+    HL->magic   = HYB_LIVE_MAGIC;
     out_norm = NULL;
     n_ch = H->n_channels; n_layer = H->n_layer; n_embd = H->n_embd; n_head = H->n_head;
     n_kv_head = H->n_kv_head; head_dim = H->head_dim; ffn_dim = H->ffn_dim;
@@ -1033,6 +1073,12 @@ void hybrid_reset(void)
 
 void hybrid_stats_reset(void)
 {
+    if (HL->magic == HYB_LIVE_MAGIC) {
+        const uint64_t c[HYB_LIVE_STAGES] = {hyb_cyc_embed, hyb_cyc_anorm, hyb_cyc_dn, hyb_cyc_attn,
+            hyb_cyc_resid, hyb_cyc_fprep, hyb_cyc_fproj, hyb_cyc_fact, hyb_cyc_fdown, hyb_cyc_logits};
+        for (int i = 0; i < HYB_LIVE_STAGES; i++)
+            hyb_live_base[i] += c[i];
+    }
     dn_cyc_inproj = dn_cyc_act = dn_cyc_conv = dn_cyc_prep = 0;
     dn_cyc_heads = dn_cyc_gate = dn_cyc_outproj = 0;
     hyb_cyc_embed = hyb_cyc_anorm = hyb_cyc_dn = hyb_cyc_attn = 0;
@@ -2696,6 +2742,7 @@ int hybrid_forward(int token, int want_logits)
     if (dn_set_bytes)
         dn_par ^= 1;                      // every layer's state is now in the other set
     hyb_forwards_profiled++;
+    hyb_live_publish();
     if (!want_logits) return -1;
     t0 = perf_now64();
     if (!out_norm)                        // model_entry_kind scans the table: once
