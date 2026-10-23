@@ -177,13 +177,19 @@ class Loader(LiteXModule):
         sync_hunt = Signal()
         sync_seen = Signal()
 
-        # Upload source seen by the transfer FSM: DMA (via the width converter) or CSR pokes.
-        src = stream.Endpoint([("data", 256)])
+        # Upload source seen by the transfer FSM: DMA (via the width converter) or CSR pokes,
+        # through a registered stage both ways: the FSM's ready depends on the beat (the resync
+        # marker), and from the poke FIFO's RAM through it back into the converter's load enable
+        # was one of the longest paths on the Ti375.
+        src_mux = stream.Endpoint([("data", 256)])
         self.comb += If(self.src_sel.storage,
-            poke_fifo.source.connect(src),
+            poke_fifo.source.connect(src_mux),
         ).Else(
-            conv.source.connect(src),
+            conv.source.connect(src_mux),
         )
+        self.src_buf = src_buf = stream.Buffer([("data", 256)], pipe_valid=True, pipe_ready=True)
+        src = src_buf.source
+        self.comb += src_mux.connect(src_buf.sink)
 
         # FSM: upload (CMD/SYNC/DATA/DRAIN), engine STORE (EST_*), multi-channel store (MST_*).
         self.fsm = fsm = FSM(reset_state="IDLE")

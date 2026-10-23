@@ -297,6 +297,12 @@ class TriXiumCore(LiteXModule):
         self.engine_csr = EngineCSR(self.engine, seq=seq)
 
         # Scratchpad unit dispatch: a unit's command is accepted only while it may own the port.
+        # The units' cancel is registered: the soft reset's busy ORs every port shim's drain state,
+        # and that net, fanned out to every unit and on through the scratchpad's write grant, was
+        # the worst path of the design. One cycle late at both ends: a unit may work one more
+        # cycle before a reset, and no command is dispatched while the cancel is still up.
+        units_cancel = Signal()
+        self.sync += units_cancel.eq(self.engine_csr.rst_trigger | self.engine_csr.rst_busy)
         for name, unit in extensions:
             available = Signal()
             other_idle = ~reduce(or_, base_busy, C(0, 1))
@@ -309,13 +315,13 @@ class TriXiumCore(LiteXModule):
                 # OVERLAP (sequencer.py w0[9]): the per-cycle arbitration shares the ports.
                 available.eq((~self.engine.sp_busy | seq.overlap) & other_idle &
                              ~self.scratchpad.sbw_pending & ~self.engine_csr.rst_busy &
-                             ~self.engine_csr.rst_trigger),
+                             ~self.engine_csr.rst_trigger & ~units_cancel),
                 command.connect(unit.cmd, omit={"valid", "ready"}),
                 unit.cmd.valid.eq(command.valid & available),
                 command.ready.eq(unit.cmd.ready & available),
                 getattr(seq, name + "_done").eq(unit.done),
                 getattr(seq, name + "_failed").eq(unit.error),
-                unit.cancel.eq(self.engine_csr.rst_trigger | self.engine_csr.rst_busy),
+                unit.cancel.eq(units_cancel),
             ]
         self.comb += [
             self.engrst.trigger.eq(self.engine_csr.rst_trigger),

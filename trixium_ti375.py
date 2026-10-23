@@ -281,7 +281,8 @@ def main():
     parser.add_target_argument("--with-softmax",    action="store_true",       help="Lite profile: keep the attention softmax unit (the CPU's softmax is ~half the attention at long context).")
     parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--attn-t-max",      default=1024,  type=int,   help="Attention stream context positions.")
-    parser.add_target_argument("--attn-groups",     default=YPCB_LITE_ATTN[1], type=int, help="Attention stream groups (the values/scores passes' parallelism).")
+    parser.add_target_argument("--attn-lanes",      default=YPCB_LITE_ATTN[0], type=int, help="Attention stream lanes (query heads served at once).")
+    parser.add_target_argument("--attn-groups",     default=YPCB_LITE_ATTN[1], type=int, help="Attention stream groups (kv heads served at once, at most lanes / the model's query heads per kv head: 8 lanes / 2 groups serve the 2B's heads in one pass).")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
     # LiteX applies the CPU arguments inside parse_args (with the variant's own: mul/div, which the
     # FPU needs); never touch the shared VexiiRiscv checkout.
@@ -290,7 +291,7 @@ def main():
     os.environ.setdefault("LITEX_ENV_EFINITY", "/opt/efinix/efinity/2025.1")
     soc = TriXiumTi375SoC(sys_clk_freq=args.sys_clk_freq, engine_channels=args.engine_channels,
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
-                          dn_sublanes=args.dn_sublanes, attn_geometry=(YPCB_LITE_ATTN[0], args.attn_groups, 256, args.attn_t_max),
+                          dn_sublanes=args.dn_sublanes, attn_geometry=(args.attn_lanes, args.attn_groups, 256, args.attn_t_max),
                           ddr_targets=args.ddr_targets, with_spi_flash=args.with_spi_flash,
                           upload_beats=args.upload_beats, chan_skew=args.chan_skew, with_softmax=args.with_softmax,
                           no_core=args.no_core,
