@@ -19,6 +19,7 @@
 #include "engine.h"
 #include "perf.h"
 #include "sdload.h"
+#include "static_memory.h"
 #include "tokenizer.h"
 
 #ifdef CSR_SD_BASE
@@ -267,36 +268,55 @@ int sd_load(int chan, uint32_t base, uint32_t sector, uint32_t blocks)
 // (cpu != NULL), pushed word by word into the card's write FIFO (sd_upload.py's wdata).
 #define SD_WFIFO_DEPTH 1024
 
-static void sd_push(const volatile uint32_t *w, uint32_t n)
-{
-    uint32_t room = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        while (room == 0)
-            room = SD_WFIFO_DEPTH - sd_wlevel_read();
-        sd_wdata_write(w[i]);
-        room--;
-    }
-}
 
-// CRC-32 (zlib's) a byte at a time from a 1 KB table: ~5 cycles a byte while sdsave pushes.
-static uint32_t crc_tab[256];
+// CRC-32 (zlib's), slicing-by-4: one 32-bit word per 4 lookups (4 KB of tables in the main_ram
+// static window) while sdsave pushes; a byte-at-a-time table loop made the save 108 s, not 39.
+static uint32_t (*const crc_tab)[256] = (uint32_t (*)[256])TRIXIUM_CRC_TABLES_ADDR;
+static int crc_ready;
 static uint32_t crc_update(uint32_t crc, const volatile uint32_t *w, uint32_t words)
 {
-    if (!crc_tab[1])
+    if (!crc_ready) {
         for (uint32_t i = 0; i < 256; i++) {
             uint32_t c = i;
             for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xedb88320u : c >> 1;
-            crc_tab[i] = c;
+            crc_tab[0][i] = c;
         }
+        for (uint32_t i = 0; i < 256; i++)
+            for (int t = 1; t < 4; t++)
+                crc_tab[t][i] = (crc_tab[t - 1][i] >> 8) ^ crc_tab[0][crc_tab[t - 1][i] & 0xff];
+        crc_ready = 1;
+    }
     for (uint32_t i = 0; i < words; i++) {
-        uint32_t v = w[i];                       // The bytes in the order the write FIFO sends them.
-        for (int b = 0; b < 4; b++, v >>= 8)
-            crc = crc_tab[(crc ^ v) & 0xff] ^ (crc >> 8);
+        uint32_t v = crc ^ w[i];                 // Little-endian: the bytes the write FIFO sends.
+        crc = crc_tab[3][v & 0xff] ^ crc_tab[2][(v >> 8) & 0xff] ^
+              crc_tab[1][(v >> 16) & 0xff] ^ crc_tab[0][v >> 24];
     }
     return crc;
 }
 
 static uint32_t *write_crc;                      // sd_write: the running CRC of what it pushes.
+
+// Words into the card's write FIFO (CSR writes), each read once: the running CRC (sdsave) on the
+// same value (re-reading the uncached scratchpad for the CRC cost 45 s of the 2B's save).
+static void sd_push(const volatile uint32_t *w, uint32_t n)
+{
+    uint32_t room = 0, crc = write_crc ? *write_crc : 0;
+    crc_update(0, w, 0);                         // The tables, once.
+    for (uint32_t i = 0; i < n; i++) {
+        while (room == 0)
+            room = SD_WFIFO_DEPTH - sd_wlevel_read();
+        uint32_t x = w[i];
+        sd_wdata_write(x);
+        room--;
+        if (write_crc) {
+            uint32_t v = crc ^ x;
+            crc = crc_tab[3][v & 0xff] ^ crc_tab[2][(v >> 8) & 0xff] ^
+                  crc_tab[1][(v >> 16) & 0xff] ^ crc_tab[0][v >> 24];
+        }
+    }
+    if (write_crc)
+        *write_crc = crc;
+}
 
 int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const uint32_t *cpu)
 {
@@ -316,8 +336,6 @@ int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const ui
         else
             engine_fetch(chan, base + off, chunk/32, 0xC000);
         sd_push(src, chunk/4);
-        if (write_crc)
-            *write_crc = crc_update(*write_crc, src, chunk/4);
     }
     int rc = sd_wait(sd_core_data_event_read);
     if (blocks > 1)

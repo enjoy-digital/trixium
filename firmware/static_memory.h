@@ -33,5 +33,6 @@
 #define TRIXIUM_CHAT_LINE_SIZE      8192
 #define TRIXIUM_NET_CONNS_ADDR      (TRIXIUM_HDR_ADDR + 0xd0000) // struct conn[NET_CONNS] (net.c), < 72 KB
 #define TRIXIUM_WEB_REQS_ADDR       (TRIXIUM_HDR_ADDR + 0xe2000) // struct req[NET_CONNS] (web.c), < 20 KB
+#define TRIXIUM_CRC_TABLES_ADDR     (TRIXIUM_HDR_ADDR + 0xe8000) // uint32[4][256] slicing-by-4 CRC (sdload.c), 4 KB
 
 #endif
