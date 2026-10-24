@@ -69,7 +69,12 @@ class _ResultPacker(LiteXModule):
     as soon as it is full. Byte-exact: the memory sees the same lanes with the same data,
     only in fewer, wider writes.
     """
-    def __init__(self):
+    def __init__(self, room=False):
+        # room: expose `room` (the packer can take an input this cycle, independent of its
+        # valid), for the multi-row fork that feeds several packers from one entry. The fork
+        # only presents the entry when every packer has room, so the held beat is displaced
+        # on `pending` (an entry waits at the fork) instead of on the input valid: otherwise
+        # two packers each waiting to displace for the merge's grant would wait forever.
         layout = [("row", 16), ("data", 256), ("wide", 1), ("head", 1), ("slot", 24)]
         self.sink   = stream.Endpoint(layout)
         self.source = stream.Endpoint(layout + [("lanes", 8)])
@@ -92,6 +97,8 @@ class _ResultPacker(LiteXModule):
 
         # Merge / emit / accept decisions.
 
+        if room:
+            self.pending = Signal()
         in_v     = Signal()
         lane     = Signal(3)
         merge    = Signal() # Same beat as the held one: add a lane.
@@ -103,7 +110,7 @@ class _ResultPacker(LiteXModule):
             in_v.eq(self.sink.valid),
             lane.eq(self.sink.slot[0:3]),
             merge.eq(self.enable & p_v & (p_slot[3:] == self.sink.slot[3:])),
-            displace.eq(in_v & p_v & ~merge),
+            displace.eq((self.pending if room else in_v) & p_v & ~merge),
             full.eq(p_lanes == 0xFF),
             is_last.eq((self.sink.row == self.rows_last) & (~self.qn | self.sink.head)),
             # Emit: as a plain relay whenever something is held; packing, when the beat is
@@ -122,6 +129,9 @@ class _ResultPacker(LiteXModule):
             accept.eq(in_v & (~p_v | merge | self.source.ready)),
             self.sink.ready.eq(accept),
         ]
+        if room:
+            self.room = Signal()
+            self.comb += self.room.eq(~p_v | merge | self.source.ready)
 
         # Held entry update.
         load = Signal()
@@ -161,7 +171,14 @@ class MatVecEngine(LiteXModule):
     def __init__(self, scratchpad, hbm_axis, xbuf_groups=96, vecunit=None, seq=None,
                  chan_stride=0, chan_mod=0, chan_skew=0, dnstream=False, attnstream=False,
                  trit5=False, prefetch=False, reader_fifo_depth=512, reader_max_bursts=8, reader_n_ids=4,
-                 axpy=True, pipe_cd=None, readers_cd=None, read_axis=None):
+                 axpy=True, pipe_cd=None, readers_cd=None, read_axis=None, nrows=1):
+        # nrows: activation rows per weight beat (doc/plan-multirow.md): ChannelPipe(nrows) in
+        # every channel and the command's `nr` (rows used - 1, < nrows) / `xstride` fields.
+        # Ternary/trit5 matvec only. Row r's x8 is read from xsrc + r*xstride beats and its
+        # results land at dst + 4*r*qstride bytes (channel-major as row 0's). nrows=1 (the
+        # default) is the single-row engine, netlist unchanged (no nr/xstride fields).
+        assert 1 <= nrows <= 4, "nr is 2 bits"
+        self.nrows = nrows
         # readers_cd/read_axis: the channels' readers in the memory's clock domain on these
         # read-only AXI ports (gateware/core/reader_island.py; requires pipe_cd: the weight
         # beats go from that domain into the pipe island's FIFO). hbm_axis then only counts the
@@ -259,7 +276,13 @@ class MatVecEngine(LiteXModule):
                              # wbase + r*dstride beats from xsrc + r*sstride beats.
             ("dstride", 24), # STORE: memory beats between consecutive packets.
             ("sstride", 8),  # STORE: scratchpad beats between consecutive source slots.
-        ])
+        ] + ([
+            ("nr",      2),  # Multi-row matvec (nrows builds): activation rows - 1. Row r's x8
+                             # at xsrc + r*xstride beats, its results at dst + 4*r*qstride.
+                             # Kind 0 (ternary/trit5) only; with Q8, AXPY, qn, ilv or rem, or
+                             # nr >= nrows: sticky error and the op runs single-row.
+            ("xstride", 12), # Multi-row: scratchpad beats from row r's x8 to row r+1's.
+        ] if nrows > 1 else []))
         # sp_busy: busy + 1 cycle. The registered write stage's last beat lands the cycle after
         # busy drops; sideband arbitration (scratchpad.units_idle) must wait for it.
         self.sp_busy = Signal()
@@ -335,7 +358,7 @@ class MatVecEngine(LiteXModule):
                 reader = ReaderIsland(readers_cd, read_axis[i], n_ids=reader_n_ids, fifo_depth=reader_fifo_depth,
                                       max_bursts=reader_max_bursts)
                 pipe = PipeIsland(pipe_cd, in_cd=readers_cd, trit5=trit5, xbuf_groups=xbuf_groups,
-                                  chan_id=i, n_channels=n, axpy=axpy)
+                                  chan_id=i, n_channels=n, axpy=axpy, nrows=nrows)
                 setattr(self, f"reader{i}", reader)
                 setattr(self, f"pipe{i}",   pipe)
                 self.comb += reader.wsource.connect(pipe.sink)
@@ -384,9 +407,10 @@ class MatVecEngine(LiteXModule):
             if pipe_cd:
                 # The island holds the unpacker too (its output rate is the island's input).
                 pipe = PipeIsland(pipe_cd, trit5=trit5, xbuf_groups=xbuf_groups, chan_id=i,
-                                  n_channels=n, axpy=axpy)
+                                  n_channels=n, axpy=axpy, nrows=nrows)
             else:
-                pipe = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n, axpy=axpy)
+                pipe = ChannelPipe(xbuf_groups=xbuf_groups, chan_id=i, n_channels=n, axpy=axpy,
+                                   nrows=nrows)
             setattr(self, f"reader{i}", reader)
             setattr(self, f"pipe{i}",   pipe)
             # trit5: the compute beats go through the unpacker (a pass-through unless the op's
@@ -462,7 +486,7 @@ class MatVecEngine(LiteXModule):
         for name in (("kind", "rows", "cols", "wbase", "wlen", "sbeats", "cbeats", "pk",
                      "bias", "rshift", "xsrc", "dst", "chan", "rem", "ilv", "supw",
                      "rep", "dstride", "sstride",
-                     "qn", "qstride", "rshift2", "xred")):
+                     "qn", "qstride", "rshift2", "xred") + (("nr", "xstride") if nrows > 1 else ())):
             cmd_r[name] = Signal.like(getattr(self.cmd, name), reset_less=(name != "kind"))
         self.sync += If(self.cmd.valid & self.cmd.ready,
             *[cmd_r[k].eq(getattr(self.cmd, k)) for k in cmd_r])
@@ -511,23 +535,53 @@ class MatVecEngine(LiteXModule):
         # Overflow is included so any future rate mismatch fails loud (sticky error bit)
         # instead of dropping results and hanging the op.
         pipe_errors = [p.error | p.overflow for p in self.pipes]
-        self.comb += self.error.eq(reduce_or(pipe_errors)
-                                  | ((at_mode & at.error) if attnstream else 0))
+        # Multi-row: nr_eff is the op's rows - 1 as executed. An unsupported combination (Q8,
+        # AXPY, dual-Q, interleaved, striped rem, or more rows than the build has) runs
+        # single-row and raises the sticky error (held until the next command). Registered from
+        # cmd_r: valid from the cycle after START (FILL), long before RUN.
+        nr_eff = C(0, 1)
+        nr_err = C(0, 1)
+        if nrows > 1:
+            nr_eff  = Signal(2)
+            nr_err  = Signal()
+            nr_bad  = Signal()
+            nr_next = Signal(2) # From cmd_r (START): the registered products below use it.
+            self.comb += [
+                nr_bad.eq((cmd_r["nr"] != 0) & (
+                    (cmd_r["kind"] == 1) | (cmd_r["kind"] == 4) | (cmd_r["nr"] > nrows - 1)
+                    | ((cmd_r["kind"] == 0) & (cmd_r["qn"] | cmd_r["ilv"] | (cmd_r["rem"] != 0))))),
+                nr_next.eq(Mux(nr_bad, 0, cmd_r["nr"])),
+            ]
+            self.sync += [
+                nr_eff.eq(nr_next),
+                nr_err.eq(nr_bad),
+            ]
+        engine_error = (reduce_or(pipe_errors)
+                        | ((at_mode & at.error) if attnstream else 0))
+        if nrows > 1:
+            engine_error = engine_error | nr_err
+        self.comb += self.error.eq(engine_error)
 
         # x-fill -----------------------------------------------------------------------------------
-        fill_beat  = Signal(10)
-        fill_total = Signal(10)
+        fill_w     = 10 if nrows == 1 else 12 # Multi-row: up to 4 x 511 beats.
+        fill_beat  = Signal(fill_w)
+        fill_total = Signal(fill_w)
         fill_half  = Signal(10) # Beats per head (dual-Q reads 2x: A then B, contiguous).
-        self.comb += [
-            fill_half.eq(Mux(axpy_mode,
-                (cmd_r["rows"]*self.n_channels + cmd_r["rem"] + 31) >> 5,
-                cmd_r["cols"] >> 5)),
-            fill_total.eq(Mux(cmd_r["qn"], fill_half << 1, fill_half)),
-        ]
+        self.comb += fill_half.eq(Mux(axpy_mode,
+            (cmd_r["rows"]*self.n_channels + cmd_r["rem"] + 31) >> 5,
+            cmd_r["cols"] >> 5))
+        if nrows == 1:
+            self.comb += fill_total.eq(Mux(cmd_r["qn"], fill_half << 1, fill_half))
+        else:
+            # Multi-row: (nr+1) x vectors of cols/32 beats each, a registered product loaded
+            # during START (cmd_r is valid there; the first compare is in FILL).
+            fill_rows = Signal(fill_w, reset_less=True)
+            self.sync += fill_rows.eq(fill_half*(nr_next + 1))
+            self.comb += fill_total.eq(Mux(cmd_r["qn"], fill_half << 1, fill_rows))
 
         # Registered fill pipeline: address at T, data+write at T+1.
         fill_active_d = Signal()
-        fill_beat_d   = Signal(10, reset_less=True)
+        fill_beat_d   = Signal(fill_w, reset_less=True)
         st_cnt        = Signal(13) # STORE beat counter (address holds until accepted).
         # Multi-packet STORE state: packet index, running memory address, running source
         # beat offset (all reset on accept; advanced between packets).
@@ -567,6 +621,24 @@ class MatVecEngine(LiteXModule):
         fill_headb = Signal()
         fill_g     = Signal(10)
         fill_pos   = Signal(10)
+        # Multi-row fill: row r's beats come from xsrc + r*xstride and land in quarter 4r + q of
+        # the x words (pipe xw_sub). fill_vb is the beat within the row (the x-buffer position),
+        # fill_row the row; the scratchpad address stays a counter, re-based at each row's end
+        # from fill_vnext (the next row's base, advanced by xstride a row ahead).
+        fill_lin = fill_beat_d # x-buffer beat of a plain (single-vector) fill.
+        if nrows > 1:
+            fill_vb     = Signal(10)
+            fill_row    = Signal(2)
+            fill_vwrap  = Signal()
+            fill_vnext  = Signal(len(scratchpad.fill.adr), reset_less=True)
+            fill_vb_d   = Signal(10, reset_less=True)
+            fill_row_d  = Signal(2,  reset_less=True)
+            self.comb += fill_vwrap.eq((nr_eff != 0) & (fill_vb == fill_half - 1))
+            self.sync += [
+                fill_vb_d.eq(fill_vb),
+                fill_row_d.eq(fill_row),
+            ] # The counters advance with fill_beat (below, once the FSM exists).
+            fill_lin = fill_vb_d
         self.comb += [
             fill_headb.eq(cmd_r["qn"] & (fill_beat_d >= fill_half)),
             fill_g.eq(Mux(fill_headb, fill_beat_d - fill_half, fill_beat_d)),
@@ -577,7 +649,7 @@ class MatVecEngine(LiteXModule):
                 Mux(cmd_r["kind"] == 0,
                     Cat(fill_g[0:2], fill_headb, fill_g[2:9]),
                     Cat(fill_headb, fill_g[:9])),
-                fill_beat_d)),
+                fill_lin)),
         ]
         # Fill broadcast, registered for timing: one relay register next to the scratchpad,
         # then per-pipe copies (dont_touch) the placer can pull next to each x-buffer;
@@ -591,6 +663,9 @@ class MatVecEngine(LiteXModule):
             fill_pos1.eq(fill_pos),
             fill_dat1.eq(scratchpad.fill.dat_r),
         ]
+        if nrows > 1:
+            fill_row1 = Signal(2, reset_less=True)
+            self.sync += fill_row1.eq(fill_row_d)
         for i, pipe in enumerate(self.pipes):
             fa2 = Signal(name=f"fill_act2_{i}")
             fp2 = Signal(10, name=f"fill_pos2_{i}", reset_less=True)
@@ -602,9 +677,15 @@ class MatVecEngine(LiteXModule):
                 fp2.eq(fill_pos1),
                 fd2.eq(fill_dat1),
             ]
+            xw_sub = fp2[:2]
+            if nrows > 1:
+                fr2 = Signal(2, name=f"fill_row2_{i}", reset_less=True)
+                fr2.attr.add(("dont_touch", "true"))
+                self.sync += fr2.eq(fill_row1)
+                xw_sub = Cat(fp2[:2], fr2) # Quarter 4r + q.
             self.comb += [
                 pipe.xw_group.eq(fp2[2:]),
-                pipe.xw_sub.eq(fp2[:2]),
+                pipe.xw_sub.eq(xw_sub),
                 pipe.xw_data.eq(fd2),
                 pipe.xw_we.eq(fa2),
             ]
@@ -638,15 +719,24 @@ class MatVecEngine(LiteXModule):
         pack_en = Signal()
         self.comb += pack_en.eq(~fetch_mode & ~store_mode & ~axpy_mode & ~ilv_mode)
         gsrc  = []
+        gsrc_arow = [] # Multi-row: the activation row of each channel's beat.
         packs = []
+        # Multi-row (nrows > 1): a pipe entry carries row r's result in data lane r. Behind the
+        # input buffer a fork feeds one _ResultPacker per row (each row's results still
+        # coalesce into full beats), then a registered per-channel R:1 round-robin presents
+        # the channel's beats to the gather as one source: the top-level gather is unchanged.
+        # Row r's slot = dst + r*qstride + chan*rows + row, from op-static row bases (START).
+        if nrows > 1:
+            rbase = [Signal(24, name=f"rbase{r}", reset_less=True) for r in range(1, nrows)]
+            self.sync += [b.eq(dstw + cmd_r["qstride"]*r) for r, b in enumerate(rbase, 1)]
         for i, pipe in enumerate(self.pipes):
             # Registered input stage: the slot arithmetic below is computed from the pipe
             # FIFO's asynchronous read and lands in flops here, so the packer's merge
             # compare starts from registers.
             ib = stream.Buffer([("row", 16), ("data", 256), ("wide", 1), ("head", 1),
-                                ("slot", 24)])
+                                ("slot", 24)] + [(f"slot{r}", 24) for r in range(1, nrows)])
             setattr(self, f"gin{i}", ib)
-            pk = _ResultPacker()
+            pk = _ResultPacker(**({"room": True} if nrows > 1 else {}))
             setattr(self, f"pack{i}", pk)
             rows_last_i = Signal(16, reset_less=True)
             self.sync += rows_last_i.eq(cmd_r["rows"] - 1 + (i < cmd_r["rem"]))
@@ -662,13 +752,65 @@ class MatVecEngine(LiteXModule):
                       Mux(xred_mode, pipe.source.row,
                           pipe.source.row + Mux(axpy_mode, i*cmd_r["cols"],
                                                                 i*cmd_r["rows"])))),
-                ib.source.connect(pk.sink),
                 pk.enable.eq(pack_en),
                 pk.rows_last.eq(rows_last_i),
                 pk.qn.eq(cmd_r["qn"]),
             ]
-            gsrc.append(pk.source)
-            packs.append(pk)
+            if nrows == 1:
+                self.comb += ib.source.connect(pk.sink)
+                gsrc.append(pk.source)
+                packs.append(pk)
+                continue
+            # Multi-row fork: one entry goes to every active row's packer at once (when all of
+            # them have room), row r's packer seeing lane r replicated (no data mux in it).
+            # Row 0 also carries every other mode (wide AXPY beats pass whole).
+            rpacks = [pk]
+            for r in range(1, nrows):
+                pk_r = _ResultPacker(room=True)
+                setattr(self, f"pack{i}_{r}", pk_r)
+                self.comb += [
+                    getattr(ib.sink, f"slot{r}").eq(rbase[r - 1] + pipe.source.row + i*cmd_r["rows"]),
+                    pk_r.enable.eq(pack_en),
+                    pk_r.rows_last.eq(rows_last_i),
+                    pk_r.qn.eq(cmd_r["qn"]),
+                ]
+                rpacks.append(pk_r)
+            active   = [C(1, 1)] + [nr_eff >= r for r in range(1, nrows)]
+            all_room = Signal(name=f"fork_room{i}")
+            self.comb += [
+                all_room.eq(reduce(and_, [p.room | ~a for p, a in zip(rpacks, active)])),
+                ib.source.ready.eq(all_room),
+            ]
+            for r, (p, a) in enumerate(zip(rpacks, active)):
+                lane = Replicate(ib.source.data[32*r:32*r + 32], 8)
+                if r == 0 and axpy:
+                    lane = Mux(ib.source.wide, ib.source.data, lane)
+                self.comb += [
+                    p.pending.eq(ib.source.valid & a),
+                    p.sink.valid.eq(ib.source.valid & a & all_room),
+                    p.sink.row.eq(ib.source.row),
+                    p.sink.data.eq(lane),
+                    p.sink.wide.eq(ib.source.wide),
+                    p.sink.head.eq(ib.source.head),
+                    p.sink.slot.eq(ib.source.slot if r == 0 else getattr(ib.source, f"slot{r}")),
+                ]
+            # Registered R:1 merge (the channel's beats to the gather).
+            mrr = RoundRobin(nrows, SP_CE)
+            setattr(self, f"rmrg_rr{i}", mrr)
+            mb = stream.Buffer(pk.source.description.payload_layout + [("arow", 2)])
+            setattr(self, f"rmrg{i}", mb)
+            self.comb += [
+                mrr.request.eq(Cat(*[p.source.valid for p in rpacks])),
+                mrr.ce.eq(1),
+                mb.sink.valid.eq(Array([p.source.valid for p in rpacks])[mrr.grant]),
+                mb.sink.arow.eq(mrr.grant),
+                *[getattr(mb.sink, f).eq(Array([getattr(p.source, f) for p in rpacks])[mrr.grant])
+                  for f in ("row", "data", "wide", "head", "slot", "lanes")],
+                *[p.source.ready.eq(mb.sink.ready & (mrr.grant == r)) for r, p in enumerate(rpacks)],
+            ]
+            gsrc.append(mb.source)
+            gsrc_arow.append(mb.source.arow)
+            packs.extend(rpacks)
         grant_valid = Array([g.valid for g in gsrc])[rr.grant]
         grant_row   = Array([g.row   for g in gsrc])[rr.grant]
         grant_data  = Array([g.data  for g in gsrc])[rr.grant]
@@ -772,11 +914,15 @@ class MatVecEngine(LiteXModule):
         # (INT32_MIN, 0xFFFFFF), which no valid lane loses to. `done` waits for this
         # pipeline to empty (am_busy), so no reader can see a stale argmax.
         am_v_r = Signal()
+        am_tap = is_matvec & ~ilv_mode & grant_valid & ~grant_wide
+        if nrows > 1:
+            # Multi-row: row 0's results only (the hybrid path's argmax is the restore unit's).
+            am_tap = am_tap & (Array(gsrc_arow)[rr.grant] == 0)
         am_l_r = Signal(8,   reset_less=True)
         am_d_r = Signal(256, reset_less=True)
         am_b_r = Signal(24,  reset_less=True)
         self.sync += [
-            am_v_r.eq(is_matvec & ~ilv_mode & grant_valid & ~grant_wide),
+            am_v_r.eq(am_tap),
             am_l_r.eq(grant_lanes),
             am_d_r.eq(grant_data),
             am_b_r.eq(gidx),
@@ -1317,6 +1463,11 @@ class MatVecEngine(LiteXModule):
             ax_total.eq(Mux(cmd_r["xred"], cmd_r["cols"],
                             cmd_r["cols"]*self.n_channels)),
         ]
+        mv_total_rows = mv_total
+        if nrows > 1:
+            # Multi-row: (nr+1) rows of results, a registered product (RUN is far from START).
+            mv_total_rows = Signal(26, reset_less=True)
+            self.sync += mv_total_rows.eq(mv_total*(nr_next + 1))
         self.comb += run_state.eq(fsm.ongoing("RUN"))
         fsm.act("RUN",
             self.busy.eq(1),
@@ -1325,7 +1476,7 @@ class MatVecEngine(LiteXModule):
                    # Dual-Q ops retire two heads' results per stream.
                    result_cnt == Mux(cmd_r["qn"],
                        Mux(axpy_mode, ax_total << 1, mv_total << 1),
-                       Mux(axpy_mode, ax_total, mv_total)))))
+                       Mux(axpy_mode, ax_total, mv_total_rows)))))
                & ~gw_pending  # Queued writes must be in RAM before done.
                & ~am_busy & ~absmax_busy,
                 self.done.eq(1),
@@ -1346,11 +1497,26 @@ class MatVecEngine(LiteXModule):
             ).Elif(st_next,
                 eng_fill_adr.eq(xsrc_w + st_src_off + cmd_r["sstride"]),
             ).Elif(fsm.ongoing("FILL") & rd_free,
-                eng_fill_adr.eq(eng_fill_adr + 1),
+                eng_fill_adr.eq(Mux(fill_vwrap, fill_vnext, eng_fill_adr + 1) if nrows > 1 else
+                                eng_fill_adr + 1),
             ).Elif(st_issue,
                 eng_fill_adr.eq(eng_fill_adr + 1),
             ),
             If(start_pulse | st_next, st_iss.eq(0)).Elif(st_issue, st_iss.eq(st_iss + 1)),
+            # Multi-row fill counters (see fill_vb above).
+            *([If(start_pulse,
+                   fill_vb.eq(0),
+                   fill_row.eq(0),
+                   fill_vnext.eq(xsrc_w + cmd_r["xstride"]),
+               ).Elif(fsm.ongoing("FILL") & rd_free,
+                   If(fill_vwrap,
+                       fill_vb.eq(0),
+                       fill_row.eq(fill_row + 1),
+                       fill_vnext.eq(fill_vnext + cmd_r["xstride"]),
+                   ).Else(
+                       fill_vb.eq(fill_vb + 1),
+                   ),
+               )] if nrows > 1 else []),
             If(start_pulse,
                 st_cnt.eq(0),
                 st_rep.eq(0),

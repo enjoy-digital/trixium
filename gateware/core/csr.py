@@ -111,6 +111,13 @@ class EngineCSR(LiteXModule):
         self.snap_eng      = CSRStatus(64, description="Snapshot: engine-busy cycles.")
         self.snap_vec      = CSRStatus(64, description="Snapshot: vector/DeltaNet-client busy cycles.")
         self.snap_both     = CSRStatus(64, description="Snapshot: both clients busy.")
+        # Multi-row matvec (engines built with nrows > 1 only: the others keep their CSRs).
+        multirow = hasattr(engine.cmd, "nr")
+        if multirow:
+            self.nr      = CSRStorage(2,  description="Multi-row matvec: activation rows - 1 "
+                                          "(x8 at xsrc + r*xstride beats, results at dst + 4*r*qstride).")
+            self.xstride = CSRStorage(12, description="Multi-row matvec: scratchpad beats between "
+                                          "the rows' x8 vectors.")
 
         # # #
 
@@ -180,6 +187,8 @@ class EngineCSR(LiteXModule):
                 engine.cmd.rep.eq(0 if seq is None else seq.eng_rep),
                 engine.cmd.dstride.eq(0 if seq is None else seq.eng_dstride),
                 engine.cmd.sstride.eq(0 if seq is None else seq.eng_sstride),
+                *([engine.cmd.nr.eq(getattr(seq, "eng_nr", 0)),
+                   engine.cmd.xstride.eq(getattr(seq, "eng_xstride", 0))] if multirow else []),
             ).Else(
                 engine.cmd.valid.eq(pending | manual_request),
                 engine.cmd.kind.eq(self.kind.storage),
@@ -205,6 +214,8 @@ class EngineCSR(LiteXModule):
                 engine.cmd.rep.eq(self.rep.storage),
                 engine.cmd.dstride.eq(self.dstride.storage),
                 engine.cmd.sstride.eq(self.sstride.storage),
+                *([engine.cmd.nr.eq(self.nr.storage),
+                   engine.cmd.xstride.eq(self.xstride.storage)] if multirow else []),
             ),
             self.cyc_total.status.eq(engine.cyc_total[:32]),
             self.cyc_eng.status.eq(engine.cyc_eng[:32]),

@@ -46,12 +46,15 @@ Descriptor: 64 bytes = 2 scratchpad beats, 16 little-endian words.
                    reduce_acc absmax result).
   engine: w1 = kind | ilv<<8 | supw<<9 | rshift_rpre<<10 (rshift taken from
           rpre(prev vec res6) instead of w7) | qn<<11 (dual-Q GQA)
-          | xred<<12 (AXPY: sum the per-channel partials in hardware);
+          | xred<<12 (AXPY: sum the per-channel partials in hardware)
+          | nr<<13 (2 bits, multi-row matvec, matvec_rows builds: activation rows - 1;
+          row r's x8 at xsrc + r*xstride beats, its results at dst + 4*r*qstride);
           w2 = rows | rem<<16;  w3 = cols;  w4 = wbase;  w5 = wlen;
           w6 = sbeats | pk<<4 | cbeats<<8 | qstride<<16 (head-B result offset, words);
           w7 = bias | rshift<<16 | rshift2<<22 (head-B AXPY pre-shift);
           w8 = xsrc;  w9 = dst;  w10 = chan;
-          w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE).
+          w11 = rep, w12 = dstride, w13 = sstride (multi-packet STORE);
+          w14 = xstride (12 bits, multi-row matvec: beats between the rows' x8).
   vec:    w1 = pc;  w2..w9 = args 0..7.
   had:    Optional unit 3, always serialized; w0 exactly 3, w1 src, w2 signs,
           w3 dst, w4 block count, w5 stats, w6 inverse (bit 0) | half blocks (bit 1, ABI 1.1),
@@ -116,7 +119,10 @@ class Sequencer(LiteXModule):
     """Descriptor-list executor (see the module doc for the descriptor format)."""
     def __init__(self, *, with_hadamard=False, with_activation_quantize=False,
                  with_projection_restore=False, with_silu=False, with_norm=False,
-                 with_conv=False, with_softmax=False, norm_rope=True, scratchpad_size=256*1024):
+                 with_conv=False, with_softmax=False, norm_rope=True, scratchpad_size=256*1024,
+                 matvec_rows=1):
+        # matvec_rows: the engine's nrows (MatVecEngine): > 1 decodes the multi-row matvec
+        # fields (nr, xstride) into eng_nr/eng_xstride; 1 leaves them out (netlist unchanged).
         extended = (with_hadamard or with_activation_quantize or with_projection_restore or
                     with_silu or with_norm or with_conv or with_softmax)
         if extended and (scratchpad_size < 32 or scratchpad_size > 256*1024
@@ -249,6 +255,9 @@ class Sequencer(LiteXModule):
         self.eng_rep     = Signal(5)  # Multi-packet STORE (words 11-13).
         self.eng_dstride = Signal(24)
         self.eng_sstride = Signal(8)
+        if matvec_rows > 1:
+            self.eng_nr      = Signal(2)  # Multi-row matvec (w1[14:13]).
+            self.eng_xstride = Signal(12) # Multi-row matvec (w14[11:0]).
         self.eng_done    = Signal()   # From the engine (pulse).
         self.absmax      = Signal(32) # From the engine tracker.
 
@@ -672,6 +681,11 @@ class Sequencer(LiteXModule):
             self.eng_sstride.eq(w(1, 13)[0:8]),
             self.vec_pc.eq(w(0, 1)[0:16]),
         ]
+        if matvec_rows > 1:
+            self.comb += [
+                self.eng_nr.eq(w(0, 1)[13:15]),
+                self.eng_xstride.eq(w(1, 14)[0:12]),
+            ]
 
         # Status.
         self.comb += [

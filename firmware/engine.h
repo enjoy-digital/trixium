@@ -63,6 +63,10 @@ struct engine_op {
     uint8_t  rep;         // STORE: packets per op (0/1 = one).
     uint32_t dstride;     // STORE: HBM beats between packets.
     uint8_t  sstride;     // STORE: scratchpad beats between source slots.
+    uint8_t  nr;          // Multi-row matvec (engines built with nrows > 1: the CSR nr exists):
+                          // activation rows - 1; row r's x8 at xsrc + r*xstride beats, its
+                          // results at dst + 4*r*qstride. 0: single-row (descriptor unchanged).
+    uint16_t xstride;     // Multi-row matvec: scratchpad beats between the rows' x8 vectors.
 };
 
 /* Functions */

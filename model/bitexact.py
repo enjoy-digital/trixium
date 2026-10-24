@@ -118,6 +118,12 @@ def matvec_ternary(scales_f16, codes, x8, B, R):
     assert np.all(np.abs(res) < 2**(RESULT_BITS - 1)), "int32 result overflow"
     return res.astype(np.int32)
 
+def matvec_ternary_rows(scales_f16, codes, x8_rows, B, R):
+    """Multi-row engine matvec (doc/plan-multirow.md): one weight pass against nr+1 x8 vectors
+    (x8_rows: (nr+1, K) int8). Each row is exactly the single-row matvec (B and R are the
+    tensor's; the per-row accumulators share nothing): returns int32 (nr+1, M)."""
+    return np.stack([matvec_ternary(scales_f16, codes, x8, B, R) for x8 in x8_rows])
+
 def matvec_q8(scales_f16, q8w, x8, B, R):
     """Q8 row-dot mode (K-cache scores, Q8 tensors): per-group-of-32 fp16 scales.
     scales (M, K//32), q8w (M, K) int8, x8 (K,) int8 -> int32 (M,)."""

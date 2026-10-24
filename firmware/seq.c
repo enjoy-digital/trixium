@@ -70,7 +70,7 @@ void seq_desc_engine_at(volatile uint32_t *d, const struct engine_op *op)
     d[0]  = 1;
     d[1]  = op->kind | ((uint32_t)op->ilv << 8) | ((uint32_t)op->supw << 9)
                      | ((uint32_t)op->rshift_rpre << 10) | ((uint32_t)op->qn << 11)
-                     | ((uint32_t)op->xred << 12);
+                     | ((uint32_t)op->xred << 12) | ((uint32_t)(op->nr & 3) << 13);
     d[2]  = op->rows | ((uint32_t)op->rem << 16);
     d[3]  = op->cols;
     d[4]  = op->wbase;
@@ -84,8 +84,9 @@ void seq_desc_engine_at(volatile uint32_t *d, const struct engine_op *op)
     d[11] = op->rep;
     d[12] = op->dstride;
     d[13] = op->sstride;
-    d[14] = 0;                 // Every word written: a descriptor's image is deterministic
-    d[15] = 0;                 // (resident.c's list image cache compares them).
+    d[14] = op->xstride & 0xfffu; // Multi-row matvec (0 otherwise). Every word written: a
+    d[15] = 0;                    // descriptor's image is deterministic (resident.c's list
+                                  // image cache compares them).
 }
 
 void seq_desc_stop(uint32_t idx)

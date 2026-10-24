@@ -54,7 +54,7 @@ def _desc_engine(**f):
             | (f.get("kacc", 0) << 8) | (f.get("nowait", 0) << 9))
     w[1] = (f.get("kind", 0) | (f.get("ilv", 0) << 8) | (f.get("supw", 0) << 9)
             | (f.get("rshift_rpre", 0) << 10) | (f.get("qn", 0) << 11)
-            | (f.get("xred", 0) << 12))
+            | (f.get("xred", 0) << 12) | (f.get("nr", 0) << 13))
     w[2] = f.get("rows", 0) | (f.get("rem", 0) << 16)
     w[3] = f.get("cols", 0)
     w[4] = f.get("wbase", 0)
@@ -64,6 +64,7 @@ def _desc_engine(**f):
     w[8] = f.get("xsrc", 0)
     w[9] = f.get("dst", 0)
     w[10] = f.get("chan", 0)
+    w[14] = f.get("xstride", 0) # Multi-row matvec (nr above): beats between the rows' x8.
     return b"".join(x.to_bytes(4, "little") for x in w)
 
 def _desc_vec(pc, args, srcs=None, seed_abs=0, kadds=None, barrier=0, kadd_add=0,

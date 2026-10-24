@@ -42,12 +42,14 @@ class EngineDUT(Module):
 
     hbm: None leaves the AXI ports open (compiled backend: C++ slaves); otherwise one dict of
     HBMChannelModel arguments per channel (Migen backend). sp_init: scratchpad bytes (Migen
-    backend; the compiled one loads an image).
+    backend; the compiled one loads an image). nrows: the engine's activation rows per weight
+    beat (multi-row matvec, doc/plan-multirow.md; the cmd_nr/cmd_xstride fields when > 1).
     """
     def __init__(self, n_channels, xbuf_groups=32, chan_stride=0, chan_mod=0, chan_skew=0,
                  loader=False, loader_width=128, vecunit=False, seq=False, seed7=True,
                  front=False, overlap=False, sp_size=64*1024, hbm=None, sp_init=None, trit5=False,
-                 prefetch=False, reader_fifo_depth=512, axpy=True, pipe_cd=None, readers_cd=None):
+                 prefetch=False, reader_fifo_depth=512, axpy=True, pipe_cd=None, readers_cd=None,
+                 nrows=1):
         self.axis = axis = [AXIInterface(data_width=256, address_width=33, id_width=6)
                             for _ in range(n_channels)]
         if pipe_cd:
@@ -69,12 +71,12 @@ class EngineDUT(Module):
             self.submodules.vu = VectorUnit()
         if seq:
             from gateware.core.sequencer import Sequencer
-            self.submodules.seq = Sequencer()
+            self.submodules.seq = Sequencer(**({"matvec_rows": nrows} if nrows > 1 else {}))
         self.submodules.engine = MatVecEngine(self.scratchpad, axis, xbuf_groups=xbuf_groups,
             chan_stride=chan_stride, chan_mod=chan_mod, chan_skew=chan_skew,
             vecunit=self.vu if vecunit else None, seq=self.seq if seq else None, trit5=trit5,
             prefetch=prefetch, reader_fifo_depth=reader_fifo_depth, axpy=axpy, pipe_cd=pipe_cd,
-            readers_cd=readers_cd, read_axis=self.raxis)
+            readers_cd=readers_cd, read_axis=self.raxis, nrows=nrows)
         if front:
             from gateware.core.csr import EngineCSR
             self.submodules.front = EngineCSR(self.engine, seq=self.seq if seq else None)

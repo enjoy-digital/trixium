@@ -140,6 +140,10 @@ uint32_t engine_submit(const struct engine_op *op)
     ENG_WR(dstride);
     ENG_WR(sstride);
 #endif
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+    ENG_WR(nr);      // Multi-row matvec (nrows > 1 builds).
+    ENG_WR(xstride);
+#endif
 #ifdef CSR_TRIXIUM_ENGINE_CSR_XRED_ADDR
     // Written on every op, not only when set: the CSR is sticky, so an op that left xred=1
     // would silently reshape the next AXPY's result layout.
