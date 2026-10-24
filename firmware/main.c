@@ -162,7 +162,7 @@ static void help(void)
     puts("  tokload           - load the tokenizer staged with the image (trixium load --tokenizer)");
     puts("  chat [n]          - chat in text on this console, replies up to n tokens (default 512)");
 #ifdef CSR_SD_BASE
-    puts("  sdinit [mhz]      - SD card init (4-bit, else 1-bit; 50 MHz high speed when the card takes it)");
+    puts("  sdinit [mhz]      - SD card / eMMC init (the widest bus that reads; 50 MHz high speed when taken)");
     puts("  sdload c b s n    - n 512-byte blocks from sector s into channel c's window at b");
     puts("  sdboot            - the image on the SD card: weights, hdrload, tokload");
     puts("  sdsave            - the uploaded model (and tokenizer) to the SD card, booted at power-up");
@@ -177,6 +177,7 @@ static void help(void)
     puts("  embres unit|cpu   - embedding rows without the int16 table: transform on unit 3 or the CPU");
     puts("  lmchunk rows      - LM head list chunk cap in rows (0 = automatic)");
     puts("  attnchunk n       - cap the heads per attention list");
+    puts("  kvring on|off     - past the KV window: 4 sink positions + a ring of the latest (on), or stop");
     puts("Diagnostics:");
     puts("  stats [reset]     - per-op cycle profile");
     puts("  fprof on|off|print, tprof arm [n]|dump, engdiag on|off");
@@ -317,6 +318,7 @@ static int *const pbuf = (int *)(TRIXIUM_HDR_ADDR + 0xA0000); // [PBUF_N]
 static int pbuf_n;
 static int      pbuf_kv;      // pbuf[0..pbuf_kv) are in the KV cache (from the last genb)...
 static uint32_t pbuf_serial;  // ...as long as no other generation ran since.
+static int      pbuf_base;    // pbuf[0] is this position (chat dropped older, resident tokens).
 
 static void emit_token(int tok)
 {
@@ -941,6 +943,7 @@ static void tokclr_cmd(void)
 {
     pbuf_n = 0;
     pbuf_kv = 0;
+    pbuf_base = 0;
     printf("TOKCLR %d\n", pbuf_n);
 }
 
@@ -991,8 +994,10 @@ static void genb_cmd(char *args)
     // Continue from the KV cache when the buffer's head is still what the last genb left
     // there (gen/bench in between reset it); otherwise the whole buffer is re-forwarded.
     int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
+    infer_set_base(pbuf_base);
     int r = infer_generate_from(pbuf, pbuf_n, resident, n, emit_token);
-    pbuf_kv     = infer_kv_resident();
+    pbuf_kv     = infer_kv_resident();     // Relative to pbuf: before the base goes back to 0.
+    infer_set_base(0);
     pbuf_serial = infer_gen_serial();
     infer_set_stop(stop, 0);
     gen_emit_to_pbuf = 0;
@@ -1064,7 +1069,7 @@ static void chat_cmd(char *args)
     if (nmax < 1 || nmax > PBUF_N/2) nmax = 512;
     char *line = (char *)TRIXIUM_CHAT_LINE_ADDR;
     int first = 1, prev_closed = 1;
-    pbuf_n = pbuf_kv = 0;
+    pbuf_n = pbuf_kv = pbuf_base = 0;
     puts("TriXium chat, the tokenizer on the board: /reset clears the conversation, /exit or Ctrl-D leaves");
     while (1) {
         printf("\nyou> ");
@@ -1082,14 +1087,23 @@ static void chat_cmd(char *args)
         if (ln == 0)
             continue;
         if (strcmp(line, "/reset") == 0) {
-            pbuf_n = pbuf_kv = 0; first = prev_closed = 1;
+            pbuf_n = pbuf_kv = pbuf_base = 0; first = prev_closed = 1;
             puts("(conversation cleared)");
             continue;
+        }
+        // Past half the buffer with the KV ring (a hybrid model): drop the oldest tokens, already
+        // in the KV ring and the DeltaNet state, and go on from the same position.
+        int resident_now = pbuf_serial == infer_gen_serial() ? pbuf_kv : 0;
+        if (pbuf_n > PBUF_N/2 && infer_context_unbounded() && resident_now > PBUF_N/4 &&
+            resident_now <= pbuf_n) {
+            int drop = resident_now - PBUF_N/4;
+            memmove(pbuf, pbuf + drop, (size_t)(pbuf_n - drop)*sizeof(pbuf[0]));
+            pbuf_n -= drop; pbuf_kv -= drop; pbuf_base += drop;
         }
         int n = ttok_turn(t, line, NULL, first, prev_closed, pbuf + pbuf_n, PBUF_N - pbuf_n);
         if (pbuf_n + n + nmax > PBUF_N) {    // The context is full: start over with this turn.
             puts("(context full: conversation restarted)");
-            pbuf_n = pbuf_kv = 0;
+            pbuf_n = pbuf_kv = pbuf_base = 0;
             n = ttok_turn(t, line, NULL, 1, 1, pbuf, PBUF_N);
         }
         pbuf_n += n;
@@ -1099,9 +1113,11 @@ static void chat_cmd(char *args)
         infer_set_recent(pbuf, &pbuf_n);
         int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
         uint64_t t0 = perf_now64();
+        infer_set_base(pbuf_base);
         int r = infer_generate_from(pbuf, before, resident, nmax, chat_emit);
+        pbuf_kv     = infer_kv_resident();  // Relative to pbuf: before the base goes back to 0.
+        infer_set_base(0);
         uint64_t dt = perf_now64() - t0;
-        pbuf_kv     = infer_kv_resident();
         pbuf_serial = infer_gen_serial();
         infer_set_stop(&stop, 0);
         int got = pbuf_n - before;
@@ -1109,13 +1125,14 @@ static void chat_cmd(char *args)
         first = 0;
         uint32_t ms = (uint32_t)(dt/(CONFIG_CLOCK_FREQUENCY/1000));
         printf("\n[%d tokens in %lu.%01lu s, context %d%s]\n", got, (unsigned long)(ms/1000),
-               (unsigned long)(ms%1000/100), pbuf_n, prev_closed ? "" : ", capped");
+               (unsigned long)(ms%1000/100), pbuf_base + pbuf_n, prev_closed ? "" : ", capped");
         if (r < 0 || engine_wedged) {
             puts("(generation error: conversation restarted)");
             if (engine_wedged) engine_recover();
-            pbuf_n = pbuf_kv = 0; first = prev_closed = 1;
+            pbuf_n = pbuf_kv = pbuf_base = 0; first = prev_closed = 1;
         }
     }
+    pbuf_base = 0;
     puts("(chat ended)");
 }
 
@@ -1552,6 +1569,11 @@ static void console_service(void)
         if (strncmp(str, "on", 2) == 0)  hybrid_softmax_div = 1;
         if (strncmp(str, "off", 3) == 0) hybrid_softmax_div = 0;
         printf("SOFTMAXDIV %s\n", hybrid_softmax_div ? "on (a divide per position)" : "off (one reciprocal per head)");
+    } else if (strcmp(token, "kvring") == 0) { // kvring on|off: past the KV window the attention keeps 4 sink positions + a ring of the latest (on) or the generation stops (off)
+        extern int hybrid_kv_ring;
+        if (strncmp(str, "on", 2) == 0)  hybrid_kv_ring = 1;
+        if (strncmp(str, "off", 3) == 0) hybrid_kv_ring = 0;
+        printf("KVRING %s\n", hybrid_kv_ring ? "on (4 sinks + a ring past the KV window)" : "off (the generation stops at the KV window)");
     } else if (strcmp(token, "softmaxunit") == 0) { // softmaxunit on|off: the attention softmax on unit 14 (on, the default where the unit exists) or on the CPU
         extern int hybrid_softmax_unit;
         if (strncmp(str, "on", 2) == 0)  hybrid_softmax_unit = 1;

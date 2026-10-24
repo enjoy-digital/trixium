@@ -87,6 +87,9 @@ void *halloc_hi(uint32_t n)
 const struct bons_header *H;
 int n_ch, head_dim, n_head, n_kv_head, n_embd, ffn_dim, n_layer;
 static int max_ctx;
+// buf[0] of infer_generate_from is position buf_base: a chat that dropped its oldest tokens
+// (already in the KV ring and the DeltaNet state) passes the rest from there (infer_set_base).
+static int buf_base;
 static int cpu_kv_ctx; // CPU-side KV cache depth (capped at CPU_KV_CTX, halved to fit the heap).
 
 static float **attn_norm, **ffn_norm, **q_norm, **k_norm; // Per layer.
@@ -1859,7 +1862,7 @@ void infer_kv_fill(uint32_t pattern)
 
 int infer_kv_resident(void)
 {
-    return n_pos;
+    return n_pos - buf_base;     // Relative to the caller's buffer (infer_set_base).
 }
 
 uint32_t infer_gen_serial(void)
@@ -1959,6 +1962,13 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
 // from position 0: the rows and the kv_ekmax ratchet evolve in the same order either way.
 // The chat clients keep the conversation on the card (tokclr/tok/genb), so without this
 // every turn would re-run the whole history and the first-token latency would grow with it.
+void infer_set_base(int base) { buf_base = base; }
+
+int infer_context_unbounded(void)
+{
+    return hybrid_present() && hybrid_context_unbounded();
+}
+
 int infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok))
 {
     memset(&last_prefill, 0, sizeof(last_prefill));
@@ -1974,12 +1984,17 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
             printf(" [bad token id %d at %d, vocab %lu]", buf[i], i, (unsigned long)H->vocab);
             return -1;
         }
-    if (n > max_ctx) { // KV rows live at [0, max_ctx); the generation loop stops there too.
-        printf(" [%d tokens exceed the KV budget of %d - tokclr]", n, max_ctx);
+    int unbounded = infer_context_unbounded();
+    if (buf_base + n > max_ctx && !unbounded) { // KV rows live at [0, max_ctx); the loop stops there too.
+        printf(" [%d tokens exceed the KV budget of %d - tokclr]", buf_base + n, max_ctx);
         return -1;
     }
-    if (resident <= 0 || resident > n || resident != n_pos)
+    if (resident <= 0 || resident > n || buf_base + resident != n_pos)
         resident = 0;
+    if (resident == 0 && buf_base != 0) {  // The positions before buf are gone: start over.
+        printf(" [the conversation's start is gone: restart it]");
+        return -1;
+    }
     gen_serial++;
     uint64_t reset_start = perf_now64();
     if (resident == 0) {
@@ -2010,7 +2025,7 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
     last_prefill.valid = 1;
     int count = 0;
     for (int i = 0; i < max_new; i++) {
-        if (n_pos >= max_ctx)
+        if (n_pos >= max_ctx && !unbounded)
             break;
         if (engine_wedged) { printf(" [engine wedged]"); return -1; } // the token is garbage
         emit(tok);

@@ -28,6 +28,8 @@ int  infer_kv_resident(void);       // Tokens in the KV cache after a generation
 void infer_kv_fill(uint32_t pattern); // Diagnostic (`kvfill`): every channel's KV region <- pattern.
 uint32_t infer_gen_serial(void);    // Bumped by every generation.
 int  infer_context_capacity(void); // Actual allocation, not the image's requested max_ctx.
+int  infer_context_unbounded(void); // A hybrid with the KV ring: generation goes past the capacity.
+void infer_set_base(int base);     // infer_generate_from's buf[0] is this position (default 0).
 struct infer_prefill_profile {
     uint64_t reset_cycles, prefill_cycles;
     uint32_t tokens, forwards;

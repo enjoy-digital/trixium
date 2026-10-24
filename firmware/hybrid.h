@@ -19,6 +19,7 @@ int  hybrid_init(void);                          // After the header checks; 0 o
 void hybrid_reset(void);                         // New generation: states and position to zero.
 int  hybrid_pos(void);                           // Positions processed since the reset.
 int  hybrid_context_capacity(void);              // Actual KV allocation after heap-fit reduction.
+int  hybrid_context_unbounded(void);             // Past the capacity the KV ring goes on.
 int  hybrid_forward(int token, int want_logits); // Next token (argmax) or -1.
 int  hybrid_ckpt_save(void);                     // 1: the next forward can be re-run ...
 void hybrid_ckpt_restore(void);                  // ... from here (ECC retry).

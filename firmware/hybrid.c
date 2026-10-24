@@ -127,6 +127,26 @@ static int dn_hw_written;              // the span was cleared once since the bo
 // 144 MiB in engine DDR at every generation's first token.
 static uint64_t dn_state_zero;
 int hybrid_softmax_div;                  // Console `softmaxdiv on`: the per-position divide (A/B).
+// Past the KV window (ctx_cap positions) the attention layers keep the first KV_SINKS positions
+// and a ring of the most recent ones: the conversation goes on without a restart or a re-prefill
+// (the DeltaNet layers' recurrent state carries the whole history anyway). K rows are stored
+// rotated at their absolute position, so the scores stay exact relative attention over the
+// slots kept. Console `kvring off`: the old hard stop at ctx_cap.
+int hybrid_kv_ring = 1;
+#define KV_SINKS 4
+
+static int kv_ring_on(void)
+{
+    return hybrid_kv_ring && ctx_cap > 2*KV_SINKS;
+}
+
+// The KV slot of position p (p < ctx_cap: p itself).
+static uint32_t kv_slot(int p)
+{
+    if (p < ctx_cap)
+        return (uint32_t)p;
+    return (uint32_t)(KV_SINKS + (p - KV_SINKS) % (ctx_cap - KV_SINKS));
+}
 int hybrid_softmax_unit = 1;             // Console `softmaxunit off`: the CPU softmax instead of unit 14.
 int hybrid_dn_list = 1;                  // Console `dnlist off`: the DeltaNet heads op through the CSRs
 int hybrid_dn_zbeside = 0;               // Console `dnzbeside on`: z beside the conv's SiLU, not in the projection list (A/B pending on the card)
@@ -1176,6 +1196,7 @@ void hybrid_stats_print(void)
 
 int hybrid_pos(void) { return pos; }
 int hybrid_context_capacity(void) { return ctx_cap; }
+int hybrid_context_unbounded(void) { return kv_ring_on(); }
 
 /* DeltaNet Layer */
 /*----------------*/
@@ -1889,9 +1910,10 @@ static void softmax_rows(float *buf, uint32_t rows, uint32_t stride, int T)
     }
 }
 
-static int attn_stream(int a, int T, float scale, int gated, const float *q, uint32_t qstride,
-                       uint32_t qsp, uint32_t ksp, uint32_t vsp)
+static int attn_stream(int a, int T, uint32_t slot, float scale, int gated, const float *q,
+                       uint32_t qstride, uint32_t qsp, uint32_t ksp, uint32_t vsp)
 {
+    // T slots attended (all of them once the ring wrapped), this token's K/V stored at `slot`.
     // qsp/ksp/vsp != 0: q (in [q | gate] at qstride), this token's K and V rows are already in
     // the scratchpad there (the q/k/v list with RoPE on unit 12): no FETCH from main RAM.
     uint32_t QB = qsp ? qsp : AT_Q, KB = ksp ? ksp : AT_KST, VB = vsp ? vsp : AT_VST;
@@ -1899,7 +1921,7 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
     uint32_t Tp = ((uint32_t)T + 7u) & ~7u, rb = at_rowbeats, rowbytes = rb*32u;
     uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes;
     uint32_t vspan = kspan + at_slots*rowbytes;
-    uint32_t p = (uint32_t)T - 1u, nch = (uint32_t)n_ch;
+    uint32_t p = slot, nch = (uint32_t)n_ch;
     int fits = (qsp ? QB + nq*qstride*4u <= AT_REC : nq*qstride*4u <= AT_KST - AT_Q) &&
                (ksp ? KB + (uint32_t)kv_dim*4u <= AT_REC && VB + (uint32_t)kv_dim*4u <= AT_REC
                     : (uint32_t)kv_dim*4u <= AT_VST - AT_KST) &&
@@ -2032,12 +2054,14 @@ static int attn_stream(int a, int T, float scale, int gated, const float *q, uin
 /* Attention Layer */
 /*-----------------*/
 
-// Rows [0, T) of slot a in kc/vc for the CPU loop: rows [kc_rows[a], T - 1) come back from
-// the stream's copy in engine DDR (position t on channel t % n_ch), row T - 1 from kb/vb.
-// -1 when a row cannot be brought back (the loop must not run on stale rows).
-static int attn_kv_main(int a, int T, float *K, float *V)
+// Rows [0, T) of attention slot a in kc/vc for the CPU loop, this token's at row `slot` from
+// kb/vb, the others back from the stream's copy in engine DDR (row t on channel t % n_ch) from
+// kc_rows[a] on. Before the ring wraps slot = T - 1 and rows [kc_rows[a], T - 1) are missing;
+// once wrapped any row may have been rewritten by the stream (kc_rows[a] = 0 then): all T come
+// back. -1 when a row cannot be brought back (the loop must not run on stale rows).
+static int attn_kv_main(int a, int T, uint32_t slot, float *K, float *V)
 {
-    uint32_t have = kc_rows ? kc_rows[a] : 0, last = (uint32_t)T - 1u;
+    uint32_t have = kc_rows ? kc_rows[a] : 0, last = slot == (uint32_t)T - 1u ? slot : (uint32_t)T;
     if (kc_rows && have < last) {
 #ifdef TRIXIUM_HAS_ATTNSTREAM
         uint32_t rb = at_rowbeats, rowbytes = rb*32u, nch = (uint32_t)n_ch;
@@ -2069,8 +2093,8 @@ static int attn_kv_main(int a, int T, float *K, float *V)
     }
     if (kc_rows && have < last)
         return -1;
-    memcpy(K + (uint64_t)last*kv_dim, kb, (size_t)kv_dim*4);
-    memcpy(V + (uint64_t)last*kv_dim, vb, (size_t)kv_dim*4);
+    memcpy(K + (uint64_t)slot*kv_dim, kb, (size_t)kv_dim*4);
+    memcpy(V + (uint64_t)slot*kv_dim, vb, (size_t)kv_dim*4);
     if (kc_rows) kc_rows[a] = (uint16_t)T;
     return 0;
 }
@@ -2186,12 +2210,13 @@ static int attention_layer(int l, const float *h, float *out)
         }
     }
     t1 = perf_now64(); HP->at_rope += t1 - t0; t0 = t1;
-    int T = pos + 1;
+    int T = pos < ctx_cap ? pos + 1 : ctx_cap;      // Slots attended (the ring: all of them).
+    uint32_t slot = kv_slot(pos);
     int stream_on = 0;
 #ifdef TRIXIUM_HAS_ATTNSTREAM
     stream_on = HP->attnstream_active && kc_rows;
 #endif
-    if (!stream_on && attn_kv_main(a, T, K, V)) {
+    if (!stream_on && attn_kv_main(a, T, slot, K, V)) {
         puts("hybrid: attention K/V rows could not be restored");
         engine_wedged = 1;
         return 0;
@@ -2201,8 +2226,10 @@ static int attention_layer(int l, const float *h, float *out)
     int streamed = 0;                  // 1: attnb holds the outputs, 2: gated too
 #ifdef TRIXIUM_HAS_ATTNSTREAM
     if (HP->attnstream_active) {
-        int rc = attn_stream(a, T, scale, gated, qheads, (uint32_t)qstride, r_q, r_k, r_v);
+        int rc = attn_stream(a, T, slot, scale, gated, qheads, (uint32_t)qstride, r_q, r_k, r_v);
         streamed = rc < 0 ? 0 : 1 + rc;
+        // Wrapped, the stream rewrote a row kc may hold: a CPU loop later restores them all.
+        if (streamed && pos >= ctx_cap && kc_rows) kc_rows[a] = 0;
     }
 #endif
     if (!streamed && rope_hw) {
@@ -2217,7 +2244,7 @@ static int attention_layer(int l, const float *h, float *out)
             return 0;
         }
     }
-    if (!streamed && stream_on && attn_kv_main(a, T, K, V)) {   // the CPU loop after all
+    if (!streamed && stream_on && attn_kv_main(a, T, slot, K, V)) {   // the CPU loop after all
         puts("hybrid: attention K/V rows could not be restored");
         engine_wedged = 1;
         return 0;
@@ -2629,7 +2656,10 @@ void hybrid_ckpt_restore(void)
 
 int hybrid_forward(int token, int want_logits)
 {
-    if (pos >= ctx_cap) { printf("hybrid: context cap %d reached\n", ctx_cap); return -1; }
+    if (pos >= ctx_cap && !kv_ring_on()) {
+        printf("hybrid: context cap %d reached\n", ctx_cap);
+        return -1;
+    }
     uint64_t t0 = perf_now64();
     perf_enter(OP_EMBED);
     if (infer_embed_f(token, xb) < 0) return -1;
