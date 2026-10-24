@@ -239,6 +239,13 @@ Hadamard unit, the channel windows skewed across the DRAM banks, the softmax uni
 `smi` work on the kit too (`--board ti375`: the console over its UART, the status over Ethernet), and
 `trixium dashboard --board ti375` shows it working live in a browser.
 
+It also runs with no host at all. The bitstream and firmware boot from the kit's SPI flash, the
+model (436 MB) and its tokenizer load from the kit's eMMC in 9.6 s, and 12.5 s after power-up
+`chat` on the serial console answers, the prompt tokenized on the board (`ti375 model <img>
+--persist` writes the eMMC once, from a UDP upload). Conversations go past the 2,048-token
+attention window: the DeltaNet layers' state carries the whole history, and the attention layers
+keep the first turn and a ring of the latest positions.
+
 The last line is the one we find most exciting: logic and memory in one package, a small model
 and its state inside, a few hundred milliwatts. Not a chat assistant, but a block of
 intelligence you can drop next to a sensor.

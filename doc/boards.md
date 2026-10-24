@@ -838,13 +838,19 @@ v21 = v19 + `--with-emmc` (in place of the slot): 110.0 MHz achievable, 95.16% X
 13.96 / 11.98 tok/s, golden. `software/lab/ti375_sd.py --emmc` brings the eMMC up on its own
 (LiteX's BIOS, whose eMMC support came from this work: litex#2695, litex-boards#933).
 
-**Past the 2,048-token window** (`kvring`, on by default): the attention layers keep the first 4
-positions and a ring of the latest ones (slot `4 + (p - 4) mod 2044` past 2,048), while the
+**Past the 2,048-token window** (`kvring`, on by default): the attention layers keep the
+conversation's first turn (its system prompt and first message, up to 512 positions; 4 for
+`gen`/`bench`) and a ring of the latest positions (slot `P + (p - P) mod (2048 - P)` past 2,048), while the
 DeltaNet layers' recurrent state carries everything; K rows are stored rotated at their absolute
 position, so the scores stay exact relative attention over the slots kept. The stream and the
 CPU loop walk the slots in the same order (bit-identical in the simulation, 100 tokens over a
-64-slot window), and the console `chat` drops its oldest tokens (already in the ring and the
-state) instead of restarting: no re-prefill.
+64-slot window, with 4 sinks and with a 10-token first turn pinned), and the console `chat` and
+the host's `trixium_chat` (`tok`/`genb`) drop their oldest tokens (already in the ring and the
+state) instead of restarting: no re-prefill. A 5-turn story test (4 chapters of 1,000 tokens, then
+"what was the keeper's name and what did she find?"): to 4,188 positions on the Ti375 (console)
+and 4,089 on the YPCB (`trixium_chat`), no restart, 7.4 / 8.8 tok/s with the window full; with
+only 4 sinks the answer was a near miss ("Elara", "a glowing crystal"), with the first turn
+pinned it is right on both ("Elena", "a mysterious machine").
 
 ### Rules
 
