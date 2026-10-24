@@ -46,6 +46,7 @@
 #define DATA_WRITE (2 << 5)
 #define PHY_SPEED_1X 0
 #define PHY_SPEED_4X 1
+#define PHY_SPEED_8X 2
 
 static int sd_ok;
 
@@ -79,6 +80,7 @@ static void sd_clk(uint32_t hz)
     sd_phy_clocker_divider_write(div < 2 ? 2 : div > 256 ? 256 : div);
 }
 
+#ifndef TRIXIUM_SD_EMMC
 // CMD6 (switch to high speed): its 64-byte status reply is dropped by the gateware.
 static int sd_switch_hs(void)
 {
@@ -88,14 +90,22 @@ static int sd_switch_hs(void)
         return SD_TIMEOUT;
     return sd_wait(sd_core_data_event_read);
 }
+#endif
 
-// ACMD6 (bus width) and the PHY's matching setting.
+// The bus width (SD: ACMD6; eMMC: CMD6 SWITCH into EXT_CSD BUS_WIDTH) and the PHY's setting.
 static int sd_bus_width(uint32_t rca, int width)
 {
+#ifdef TRIXIUM_SD_EMMC
+    (void)rca;
+    uint32_t bw = width == 8 ? 2 : width == 4 ? 1 : 0;
+    if (sd_cmd((3u << 24) | (183u << 16) | (bw << 8), 6, RSP_BUSY | RSP_CRC) != SD_OK)
+        return SD_TIMEOUT;
+#else
     if (sd_cmd(rca << 16, 55, RSP_SHORT | RSP_CRC) != SD_OK ||
         sd_cmd(width == 4 ? 2 : 0, 6, RSP_SHORT | RSP_CRC) != SD_OK)
         return SD_TIMEOUT;
-    sd_phy_settings_write(width == 4 ? PHY_SPEED_4X : PHY_SPEED_1X);
+#endif
+    sd_phy_settings_write(width == 8 ? PHY_SPEED_8X : width == 4 ? PHY_SPEED_4X : PHY_SPEED_1X);
     return SD_OK;
 }
 
@@ -122,6 +132,42 @@ int sd_init(int mhz, int tries)
     sd_upload_write(0);
     sd_phy_settings_write(PHY_SPEED_1X);
     sd_clk(400000);
+#ifdef TRIXIUM_SD_EMMC
+    // eMMC (CMD1 instead of CMD8/ACMD41, the RCA assigned by the host, EXT_CSD switches).
+    uint32_t rca = 1;
+    int answered = 0;
+    sd_phy_init_initialize_write(1);               // 80 clocks.
+    busy_wait(1);
+    (void)sd_cmd(0, 0, RSP_NONE);                  // CMD0: idle.
+    for (timeout = 1000; timeout > 0; timeout--) {
+        if (sd_cmd(0x40ff8080, 1, RSP_SHORT) == SD_OK) {   // CMD1: sector mode, 1.8/3.3 V.
+            answered = 1;
+            csr_rd_buf_uint32(CSR_SD_CORE_CMD_RESPONSE_ADDR, r, SD_CMD_RESPONSE_SIZE/4);
+            if (r[0] & 0x80000000)                 // Power-up done.
+                break;
+        } else if (!answered && 1000 - timeout >= tries - 1) {
+            if (tries > 3) puts("sdinit: no eMMC answers (CMD1)");
+            return -1;
+        }
+        busy_wait(1);
+    }
+    if (!timeout) { puts("sdinit: the eMMC stays busy (CMD1)"); return -1; }
+    if (((r[0] >> 29) & 3) != 2) {
+        puts("sdinit: a byte-addressed eMMC (2 GB or less): not supported");
+        return -1;
+    }
+    if (sd_cmd(0, 2, RSP_LONG | RSP_CRC) != SD_OK ||              // CMD2: CID.
+        sd_cmd(rca << 16, 3, RSP_SHORT | RSP_CRC) != SD_OK ||     // CMD3: set RCA.
+        sd_cmd(rca << 16, 9, RSP_LONG | RSP_CRC) != SD_OK ||      // CMD9: CSD.
+        sd_cmd(rca << 16, 7, RSP_BUSY | RSP_CRC) != SD_OK) {      // CMD7: select.
+        puts("sdinit: eMMC identification failed");
+        return -1;
+    }
+    sd_clk(25000000);
+    // High speed timing (EXT_CSD HS_TIMING): up to 52 MHz.
+    int hs = mhz > 25 && sd_cmd((3u << 24) | (185u << 16) | (1u << 8), 6, RSP_BUSY | RSP_CRC) == SD_OK;
+    const int widest = 8;
+#else
     for (timeout = tries; timeout > 0; timeout--) {
         busy_wait(1);
         sd_phy_init_initialize_write(1);           // 80 clocks.
@@ -162,19 +208,22 @@ int sd_init(int mhz, int tries)
     }
     // High speed (50 MHz) when asked for and the card takes the switch; 25 MHz otherwise.
     int hs = mhz > 25 && sd_switch_hs() == SD_OK;
+    const int widest = 4;
+#endif
     if (sd_cmd(512, 16, RSP_SHORT | RSP_CRC) != SD_OK) {      // CMD16: 512-byte blocks.
         puts("sdinit: block length refused");
         return -1;
     }
     sd_clk(hs ? (uint32_t)mhz*1000000u : 25000000u);
-    // 4-bit, checked with one block read (dropped): on the Ti375 kit the card switches but the
-    // 4-bit reader never sees a start bit on all four lines (at any clock), so 1-bit then.
-    int width = 1;
-    if (!force_1bit && sd_bus_width(rca, 4) == SD_OK && sd_read_check() == SD_OK)
-        width = 4;
-    else if (sd_bus_width(rca, 1) != SD_OK || sd_read_check() != SD_OK) {
-        puts("sdinit: no block reads at 1 or 4 bits");
-        return -1;
+    // The widest bus that reads one block back (dropped): the Ti375 kit's microSD slot switches
+    // to 4-bit but DAT2 never reaches the FPGA (software/lab/ti375_sd.py), so 1-bit there.
+    int width = force_1bit ? 1 : widest;
+    while (sd_bus_width(rca, width) != SD_OK || sd_read_check() != SD_OK) {
+        if (width == 1) {
+            puts("sdinit: no block reads at any bus width");
+            return -1;
+        }
+        width = width == 8 ? 4 : 1;
     }
     sd_ok = 1;
     printf("SDINIT ok, %d-bit at %d MHz\n", width, hs ? mhz : 25);

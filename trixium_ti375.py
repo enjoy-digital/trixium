@@ -88,7 +88,7 @@ class _CRG(LiteXModule):
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
                  eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 2048), dn_sublanes=0,
-                 ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, with_softmax=False, no_core=False, with_sdcard=False,
+                 ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, with_softmax=False, no_core=False, with_sdcard=False, with_emmc=False,
                  **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
         # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
@@ -254,11 +254,15 @@ class TriXiumTi375SoC(SoCCore):
             self.add_constant(name, value)
         self.bus.add_slave("scratchpad", self.trixium.bus,
             SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
-        if with_sdcard:
-            # The weights from the microSD slot (4-bit): the card's read stream into the loader in
-            # place of the UDP port's while `sd_upload` is set (the firmware's `sdload`). Named `sd`:
-            # as `sdcard` LiteX's BIOS links liblitesdcard's FatFs disk, which needs a block2mem DMA.
-            self.sd = SDCardUpload(platform, sys_clk_freq, pads=platform.request("sdcard"))
+        if with_sdcard or with_emmc:
+            # The weights from the microSD slot (4-bit) or the kit's eMMC (8-bit): the device's read
+            # stream into the loader in place of the UDP port's while `sd_upload` is set (the
+            # firmware's `sdload`). Named `sd`: as `sdcard` LiteX's BIOS links liblitesdcard's FatFs
+            # disk, which needs a block2mem DMA.
+            assert not (with_sdcard and with_emmc)
+            self.sd = SDCardUpload(platform, sys_clk_freq, pads=platform.request("emmc" if with_emmc else "sdcard"))
+            if with_emmc:
+                self.add_constant("TRIXIUM_SD_EMMC")   # The firmware's init: MMC (CMD1), 8-bit.
             self.comb += If(self.sd.upload.storage,
                 self.sd.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}),
             ).Else(
@@ -298,6 +302,7 @@ def main():
     parser.add_target_argument("--with-softmax",    action="store_true",       help="Lite profile: keep the attention softmax unit (the CPU's softmax is ~half the attention at long context).")
     parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--with-sdcard",     action="store_true",       help="The microSD slot as a weight source (the firmware's sdinit/sdload).")
+    parser.add_target_argument("--with-emmc",       action="store_true",       help="The kit's eMMC (8-bit) as the weight source instead of the microSD slot.")
     parser.add_target_argument("--attn-t-max",      default=2048,  type=int,   help="Attention stream context positions (the 2B image's 2,048: past t_max the firmware runs attention on the CPU, ~4.6 s per token).")
     parser.add_target_argument("--attn-lanes",      default=YPCB_LITE_ATTN[0], type=int, help="Attention stream lanes (query heads served at once).")
     parser.add_target_argument("--attn-groups",     default=YPCB_LITE_ATTN[1], type=int, help="Attention stream groups (kv heads served at once, at most lanes / the model's query heads per kv head: 8 lanes / 2 groups serve the 2B's heads in one pass).")
@@ -312,7 +317,7 @@ def main():
                           dn_sublanes=args.dn_sublanes, attn_geometry=(args.attn_lanes, args.attn_groups, 256, args.attn_t_max),
                           ddr_targets=args.ddr_targets, with_spi_flash=args.with_spi_flash,
                           upload_beats=args.upload_beats, chan_skew=args.chan_skew, with_softmax=args.with_softmax,
-                          no_core=args.no_core, with_sdcard=args.with_sdcard,
+                          no_core=args.no_core, with_sdcard=args.with_sdcard, with_emmc=args.with_emmc,
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:
