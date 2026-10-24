@@ -78,12 +78,22 @@ class ChannelPipe(LiteXModule):
     """One memory channel's compute pipeline: weight beats in, one int32 result per row out.
 
     axpy: the weighted-V accumulate (kind 2: per-lane shifters, 4 x 32 int32 accumulators, the
-    wide drain) - the Qwen3 path's attention; a hybrid build never issues it and leaves it out."""
+    wide drain) - the Qwen3 path's attention; a hybrid build never issues it and leaves it out.
+
+    nrows: activation rows per weight beat (doc/plan-multirow.md). Each code beat is applied to
+    `nrows` x vectors at once: the x-buffer is 1024*nrows bits wide (row r's word in bits
+    [1024r, 1024r+1024), written as quarter 4r + sub through xw_sub), and the ternary lanes,
+    adder tree, product, shift and accumulator are replicated per row; the beat parser, scale
+    path and codes are shared. A result entry then carries row r's int32 in data lane r (instead
+    of one int32 replicated in all 8 lanes). Q8 and AXPY stay single-row (row 0's x word).
+    nrows=1 is the single-row pipe, netlist unchanged."""
     def __init__(self, xbuf_groups=96, out_fifo_depth=24, chan_id=0, n_channels=1, axpy=True,
-                 xw_cd="sys"):
+                 xw_cd="sys", nrows=1):
+        assert 1 <= nrows <= 8 # One int32 per row in the 256-bit result entry.
         # xw_cd: the x-buffer write port's clock domain (PipeIsland: the engine's, the rest of
         # the pipe in its own).
-        self.axpy = axpy
+        self.axpy  = axpy
+        self.nrows = nrows
         # Op parameters (quasi-static while busy; registered by the engine every cycle, reset-less:
         # an op only reads them from `start` on).
         self.kind        = Signal(2,  reset_less=True)
@@ -98,14 +108,15 @@ class ChannelPipe(LiteXModule):
 
         # Weight beats in, results out.
         self.sink = stream.Endpoint([("data", 256)])
-        # Matvec results present one int32 in data[:32] (wide=0); AXPY drain entries carry
-        # 8 accumulators = one full scratchpad beat (wide=1, row = first lane index).
+        # Matvec results present one int32 in data[:32] (wide=0; nrows > 1: row r's in lane r);
+        # AXPY drain entries carry 8 accumulators = one full scratchpad beat (wide=1, row = first
+        # lane index).
         # head (gather adds the qstride offset when set) is always 0.
         self.source = stream.Endpoint([("row", 16), ("data", 256), ("wide", 1), ("head", 1)])
 
         # x-buffer broadcast write port (from the engine's fill FSM).
         self.xw_group = Signal(max=max(xbuf_groups, 2))
-        self.xw_sub   = Signal(2)
+        self.xw_sub   = Signal(max=4*nrows) # Quarter of the x word (+ 4*row when nrows > 1).
         self.xw_data  = Signal(256)
         self.xw_we    = Signal()
 
@@ -118,15 +129,15 @@ class ChannelPipe(LiteXModule):
         out_fifo_rdy_ax = Signal() # Drain flow control (driven at the FIFO hookup below).
         out_fifo_room   = Signal() # Beat-intake flow control (driven at the FIFO hookup below).
 
-        # x-buffer: 1024-bit words, one per ternary group (4 q8 groups) ----------------------------
-        xbuf   = Memory(1024, xbuf_groups)
+        # x-buffer: 1024-bit words, one per ternary group (4 q8 groups), x nrows ------------------
+        xbuf   = Memory(1024*nrows, xbuf_groups)
         self.specials += xbuf
         xbuf_w = xbuf.get_port(write_capable=True, we_granularity=256, clock_domain=xw_cd)
         xbuf_r = xbuf.get_port()
         self.specials += xbuf_w, xbuf_r
         self.comb += [
             xbuf_w.adr.eq(self.xw_group),
-            xbuf_w.dat_w.eq(Replicate(self.xw_data, 4)),
+            xbuf_w.dat_w.eq(Replicate(self.xw_data, 4*nrows)),
             xbuf_w.we.eq(Mux(self.xw_we, 1 << self.xw_sub, 0)),
         ]
 
@@ -231,7 +242,7 @@ class ChannelPipe(LiteXModule):
 
         # T1: lane select + scale fp16 mux; register lanes -----------------------------------------
         # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error).
-        xword = xbuf_r.dat_r # 1024-bit, valid at T1.
+        xword = xbuf_r.dat_r if nrows == 1 else xbuf_r.dat_r[:1024] # Row 0, 1024-bit, valid at T1.
 
         tern_lanes = []
         code3_seen = Signal()
@@ -260,6 +271,36 @@ class ChannelPipe(LiteXModule):
         ).Elif(code3_seen,
             self.error.eq(1),
         )
+
+        # Extra activation rows (nrows > 1): the same lanes on row r's x word. Each row has its
+        # own codes_r copy and T1 enables, so every copy keeps the single-row fan-out (128 lanes).
+        # Code 3 is a property of the beat: flagged by row 0's lanes only.
+        tern_lanes_x = []
+        for r in range(1, nrows):
+            codes_x = Signal(256, name=f"codes_r{r}", reset_less=True)
+            codes_x.attr.add(("dont_touch", "true"))
+            self.sync += If(t0_fire, codes_x.eq(self.sink.data))
+            v1_x    = [v1_rep(f"t{k}_r{r}") for k in range(8)]
+            xword_x = xbuf_r.dat_r[1024*r:1024*(r+1)]
+            lanes_x = []
+            for j in range(128):
+                x_j  = Signal((8, True))
+                c_j  = Signal(2)
+                lane = Signal((9, True))
+                self.comb += [
+                    x_j.eq(xword_x[8*j:8*j+8]),
+                    c_j.eq(codes_x[2*j:2*j+2]),
+                    Case(c_j, {
+                        0 : lane.eq(-x_j),
+                        1 : lane.eq(0),
+                        2 : lane.eq(x_j),
+                        3 : lane.eq(0),
+                    }),
+                ]
+                lr = Signal((9, True), reset_less=True)
+                self.sync += If(v1_x[j // 16], lr.eq(lane))
+                lanes_x.append(lr)
+            tern_lanes_x.append(lanes_x)
 
         # Q8 lanes: w8 * x8 over the selected 256-bit x slice.
         xslice = Signal(256)
@@ -455,6 +496,12 @@ class ChannelPipe(LiteXModule):
         q8_sum   = _delay(self, q8_sum,   n_tree - q8_regs - 1, reset_less=True)
         gs = Signal((22, True))
         self.comb += gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum))
+        # Extra rows: ternary only, aligned with row 0's tree output.
+        gs_x = []
+        for lanes_x in tern_lanes_x:
+            sum_x, regs_x = _adder_tree(self, lanes_x)
+            assert regs_x == tern_regs
+            gs_x.append(_delay(self, sum_x, n_tree - tern_regs, reset_less=True))
 
         # Align tags and scale with the tree output. Lanes are registered on v1 (valid T2),
         # the tree adds n_tree stages -> gs valid at T{2+n_tree}. v1 is high at T1, so tags
@@ -509,6 +556,8 @@ class ChannelPipe(LiteXModule):
             row3.eq(row2),
             rlast3.eq(row_last2),
         ]
+        prod_x = [Signal((34, True), reset_less=True) for _ in gs_x]
+        self.sync += [p.eq(g*m11) for p, g in zip(prod_x, gs_x)]
 
         # T+2: shift to accumulator scale (contribution = prod << (e16+B), via <<12 then >>) -------
         contrib = Signal((46, True), reset_less=True)
@@ -521,6 +570,8 @@ class ChannelPipe(LiteXModule):
             row4.eq(row3),
             rlast4.eq(rlast3),
         ]
+        contrib_x = [Signal((46, True), reset_less=True) for _ in prod_x]
+        self.sync += [c.eq((p << 12) >> shamt) for c, p in zip(contrib_x, prod_x)]
 
         # T+3: 48-bit accumulate; emit on row_last -------------------------------------------------
         acc     = Signal((48, True), reset_less=True) # Cleared by `start`.
@@ -528,8 +579,24 @@ class ChannelPipe(LiteXModule):
         result  = Signal((48, True))
         self.comb += result.eq(acc_new >> self.rshift)
         self.comb += acc_new.eq(acc + contrib)
+        # Extra rows: own accumulators, same clear/emit timing as row 0.
+        results = [result]
+        for contrib_r in contrib_x:
+            acc_r     = Signal((48, True), reset_less=True)
+            acc_new_r = Signal((48, True))
+            result_r  = Signal((48, True))
+            self.comb += [
+                result_r.eq(acc_new_r >> self.rshift),
+                acc_new_r.eq(acc_r + contrib_r),
+            ]
+            self.sync += If(self.start,
+                acc_r.eq(0),
+            ).Elif(v4,
+                acc_r.eq(Mux(rlast4, 0, acc_new_r)),
+            )
+            results.append(result_r)
 
-        out_fifo = stream.SyncFIFO([("row", 16), ("data", 32), ("head", 1)], out_fifo_depth)
+        out_fifo = stream.SyncFIFO([("row", 16), ("data", 32*nrows), ("head", 1)], out_fifo_depth)
         # AXPY wide-drain FIFO: 8 accumulators per entry (one full beat). Matvec and AXPY
         # entries never interleave (drain runs only in AXPY mode, row-last pushes only in
         # matvec kinds), so the source muxes by kind.
@@ -556,7 +623,7 @@ class ChannelPipe(LiteXModule):
         matvec_sink = [
             out_fifo.sink.valid.eq(v4 & rlast4),
             out_fifo.sink.row.eq(row4),
-            out_fifo.sink.data.eq(result[:32]),
+            out_fifo.sink.data.eq(result[:32] if nrows == 1 else Cat(*[r[:32] for r in results])),
         ]
         matvec_source = [
             self.source.valid.eq(out_fifo.source.valid),
@@ -564,7 +631,9 @@ class ChannelPipe(LiteXModule):
             # The 32-bit result in every lane: the engine's result packer keeps a
             # per-lane register and enables only the lane this result belongs to, so
             # replicating here (pure fanout) lets the packer carry no data mux.
-            self.source.data.eq(Replicate(out_fifo.source.data, 8)),
+            # nrows > 1: row r's result in lane r (the engine splits them per row).
+            self.source.data.eq(Replicate(out_fifo.source.data, 8) if nrows == 1 else
+                                out_fifo.source.data),
             self.source.head.eq(out_fifo.source.head),
             out_fifo.source.ready.eq(self.source.ready),
         ]
