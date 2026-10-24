@@ -1970,8 +1970,8 @@ boot_demo_done:
         net_platform_init();
         web_init(mac, (uint32_t)TRIXIUM_WEB_IP);
         uint32_t ip = TRIXIUM_WEB_IP;
-        printf("WEB http://%d.%d.%d.%d/\n", (int)(ip >> 24), (int)((ip >> 16) & 0xff),
-               (int)((ip >> 8) & 0xff), (int)(ip & 0xff));
+        printf("WEB DHCP, else http://%d.%d.%d.%d/ in 4 s; http://trixium.local/\n", (int)(ip >> 24),
+               (int)((ip >> 16) & 0xff), (int)((ip >> 8) & 0xff), (int)(ip & 0xff));
     }
 #endif
     puts("TRIXIUM-READY");

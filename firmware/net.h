@@ -21,7 +21,12 @@
 void     net_tx(const uint8_t *frame, int len);
 uint64_t net_now_us(void);
 
-void net_init(const uint8_t mac[6], uint32_t ip);     // ip: <board-host> = 0xc0a80133
+// The address from DHCP, else (no answer within 4 s) `ip`, the static fallback (0xc0a80133 =
+// <board-host>); mDNS answers trixium.local.
+void net_init(const uint8_t mac[6], uint32_t ip);
+uint32_t net_ip(void);                                // 0 until DHCP or the fallback gave one.
+int  net_ip_dhcp(void);                               // The address is a DHCP lease.
+int  net_ip_changed(void);                            // Since the last call (then cleared).
 void net_rx(const uint8_t *frame, int len);           // One received Ethernet frame.
 void net_poll(void);                                  // Retransmissions, queued data.
 

@@ -88,11 +88,219 @@ static uint16_t csum_fold(uint32_t sum)
     return (uint16_t)~sum;
 }
 
+static void eth_ip_header_ttl(uint8_t *f, const uint8_t *dst_mac, uint32_t src_ip, uint32_t dst_ip,
+                              uint8_t proto, int ip_len, uint8_t ttl);
+
+/* UDP: DHCP client, mDNS responder */
+/*----------------------------------*/
+
+// The address comes from a DHCP server when the LAN has one (DISCOVER, OFFER, REQUEST, ACK,
+// renewal at half the lease); without an answer within DHCP_WAIT_US the static address given to
+// net_init is used (a cable straight to a PC) and DHCP keeps trying in the background. mDNS
+// answers "<hostname>.local" (A records), so the page is http://trixium.local/ on any LAN.
+
+enum { DHCP_DISCOVER = 1, DHCP_REQUEST, DHCP_BOUND, DHCP_STATIC };
+#define DHCP_WAIT_US   4000000u
+#define DHCP_RETRY_US  1000000u
+#define DHCP_BG_US     30000000u    // Background DISCOVERs on the static address.
+
+static int      dhcp_state;
+static uint32_t dhcp_xid, dhcp_server, dhcp_offer, static_ip;
+static uint64_t dhcp_start, dhcp_sent, dhcp_renew_at, dhcp_expire_at;
+static int      ip_changed;
+static const char hostname[] = "trixium";
+static const uint8_t bcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+static const uint8_t mdns_mac[6]  = {0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb};
+#define MDNS_IP 0xe00000fbu         // 224.0.0.251
+
+static void udp_out(const uint8_t *dst_mac, uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
+                    const uint8_t *d, int n, uint8_t ttl)
+{
+    static uint8_t f[ETH_HDR + IP_HDR + 8 + 600];
+    if (n > 600)
+        return;
+    eth_ip_header_ttl(f, dst_mac, src, dst, 17, IP_HDR + 8 + n, ttl);
+    uint8_t *u = f + ETH_HDR + IP_HDR;
+    wr16(u, sport); wr16(u + 2, dport); wr16(u + 4, (uint16_t)(8 + n)); wr16(u + 6, 0);
+    memcpy(u + 8, d, n);
+    uint8_t pseudo[12];
+    wr32(pseudo, src); wr32(pseudo + 4, dst); pseudo[8] = 0; pseudo[9] = 17; wr16(pseudo + 10, (uint16_t)(8 + n));
+    uint16_t c = csum_fold(csum_add(csum_add(0, pseudo, 12), u, 8 + n));
+    wr16(u + 6, c ? c : 0xffff);
+    int len = ETH_HDR + IP_HDR + 8 + n;
+    if (len < 60) { memset(f + len, 0, 60 - len); len = 60; }
+    net_tx(f, len);
+}
+
+static void dhcp_send(int type)         // 1 DISCOVER, 3 REQUEST
+{
+    uint8_t m[300];
+    memset(m, 0, sizeof(m));
+    m[0] = 1; m[1] = 1; m[2] = 6;
+    wr32(m + 4, dhcp_xid);
+    int renew = dhcp_state == DHCP_BOUND;
+    if (!renew) wr16(m + 10, 0x8000);   // Broadcast replies: no address to receive them at yet.
+    if (renew) wr32(m + 12, my_ip);     // ciaddr
+    memcpy(m + 28, my_mac, 6);
+    wr32(m + 236, 0x63825363u);
+    int o = 240;
+    m[o++] = 53; m[o++] = 1; m[o++] = (uint8_t)type;
+    if (type == 3 && !renew) {
+        m[o++] = 50; m[o++] = 4; wr32(m + o, dhcp_offer); o += 4;
+        m[o++] = 54; m[o++] = 4; wr32(m + o, dhcp_server); o += 4;
+    }
+    m[o++] = 12; m[o++] = sizeof(hostname) - 1; memcpy(m + o, hostname, sizeof(hostname) - 1); o += sizeof(hostname) - 1;
+    m[o++] = 55; m[o++] = 3; m[o++] = 1; m[o++] = 3; m[o++] = 51;
+    m[o++] = 255;
+    udp_out(bcast_mac, renew ? my_ip : 0, 0xffffffffu, 68, 67, m, sizeof(m), 64);
+    dhcp_sent = net_now_us();
+}
+
+static void dhcp_begin(void)
+{
+    dhcp_xid = 0x54580000u ^ ((uint32_t)my_mac[4] << 8 | my_mac[5]) ^ (uint32_t)net_now_us();
+    if (dhcp_state != DHCP_STATIC)
+        dhcp_state = DHCP_DISCOVER;
+    dhcp_send(1);
+}
+
+static void dhcp_in(const uint8_t *m, int n)
+{
+    if (n < 240 || m[0] != 2 || rd32(m + 4) != dhcp_xid || rd32(m + 236) != 0x63825363u)
+        return;
+    for (int i = 0; i < 6; i++)                 // Our chaddr (the firmware's libc has no memcmp).
+        if (m[28 + i] != my_mac[i])
+            return;
+    int type = 0;
+    uint32_t server = 0, lease = 3600;
+    for (int o = 240; o < n && m[o] != 255; ) {
+        if (m[o] == 0) { o++; continue; }
+        if (o + 2 > n || o + 2 + m[o + 1] > n) break;
+        const uint8_t *v = m + o + 2;
+        if (m[o] == 53 && m[o + 1] >= 1) type = v[0];
+        if (m[o] == 54 && m[o + 1] >= 4) server = rd32(v);
+        if (m[o] == 51 && m[o + 1] >= 4) lease = rd32(v);
+        o += 2 + m[o + 1];
+    }
+    uint64_t now = net_now_us();
+    if (type == 2 && (dhcp_state == DHCP_DISCOVER || dhcp_state == DHCP_STATIC)) {   // OFFER
+        dhcp_offer = rd32(m + 16);
+        dhcp_server = server;
+        dhcp_state = DHCP_REQUEST;
+        dhcp_send(3);
+    } else if (type == 5 && (dhcp_state == DHCP_REQUEST || dhcp_state == DHCP_BOUND)) {   // ACK
+        uint32_t ip = rd32(m + 16);
+        if (ip != my_ip) ip_changed = 1;
+        my_ip = ip;
+        dhcp_state = DHCP_BOUND;
+        if (lease < 60) lease = 60;
+        dhcp_renew_at  = now + (uint64_t)lease*500000u;
+        dhcp_expire_at = now + (uint64_t)lease*1000000u;
+    } else if (type == 6) {                                                           // NAK
+        dhcp_state = DHCP_DISCOVER;
+        dhcp_begin();
+    }
+}
+
+static void dhcp_poll(void)
+{
+    uint64_t now = net_now_us();
+    switch (dhcp_state) {
+    case DHCP_DISCOVER:
+    case DHCP_REQUEST:
+        if (now - dhcp_start > DHCP_WAIT_US && my_ip == 0) {      // No server: the static address.
+            my_ip = static_ip;
+            ip_changed = 1;
+            dhcp_state = DHCP_STATIC;
+            dhcp_sent = now;
+        } else if (now - dhcp_sent > DHCP_RETRY_US) {
+            if (dhcp_state == DHCP_DISCOVER) dhcp_begin(); else dhcp_send(3);
+        }
+        break;
+    case DHCP_STATIC:
+        if (now - dhcp_sent > DHCP_BG_US)
+            dhcp_begin();
+        break;
+    case DHCP_BOUND:
+        if (now > dhcp_expire_at) {
+            dhcp_state = DHCP_DISCOVER;
+            dhcp_start = now;
+            dhcp_begin();
+        } else if (now > dhcp_renew_at && now - dhcp_sent > 10*DHCP_RETRY_US) {
+            dhcp_send(3);
+        }
+        break;
+    }
+}
+
+// "<label><label>" of a DNS name at m + o against hostname.local; returns the offset after it or -1.
+static int mdns_name_is_ours(const uint8_t *m, int n, int o)
+{
+    const char *want[2] = {hostname, "local"};
+    for (int k = 0; k < 2; k++) {
+        int len = (int)strlen(want[k]);
+        if (o >= n || m[o] != len || o + 1 + len > n)
+            return -1;
+        for (int i = 0; i < len; i++) {
+            char c = (char)m[o + 1 + i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != want[k][i])
+                return -1;
+        }
+        o += 1 + len;
+    }
+    return (o < n && m[o] == 0) ? o + 1 : -1;
+}
+
+static void mdns_in(const uint8_t *f, const uint8_t *ip, const uint8_t *m, int n, uint16_t sport)
+{
+    if (n < 12 || my_ip == 0 || (m[2] & 0x80) || rd16(m + 4) == 0)   // Responses and empty queries.
+        return;
+    int q = mdns_name_is_ours(m, n, 12);
+    if (q < 0 || q + 4 > n)
+        return;
+    uint16_t qtype = rd16(m + q);
+    if (qtype != 1 && qtype != 255)                                  // A or ANY.
+        return;
+    int legacy = sport != 5353;                                      // A plain resolver's query.
+    uint8_t r[128];
+    int o = 0;
+    wr16(r, legacy ? rd16(m) : 0); wr16(r + 2, 0x8400);
+    wr16(r + 4, legacy ? 1 : 0); wr16(r + 6, 1); wr16(r + 8, 0); wr16(r + 10, 0);
+    o = 12;
+    int name_len = q - 12;
+    if (legacy) {                                                    // The question echoed.
+        memcpy(r + o, m + 12, name_len + 4); o += name_len + 4;
+    }
+    memcpy(r + o, m + 12, name_len); o += name_len;
+    wr16(r + o, 1); wr16(r + o + 2, legacy ? 0x0001 : 0x8001);        // A, IN (+ cache flush).
+    wr32(r + o + 4, 120); wr16(r + o + 8, 4); wr32(r + o + 10, my_ip);
+    o += 14;
+    if (legacy)
+        udp_out(f + 6, my_ip, rd32(ip + 12), 5353, sport, r, o, 64);
+    else
+        udp_out(mdns_mac, my_ip, MDNS_IP, 5353, 5353, r, o, 255);
+}
+
 void net_init(const uint8_t mac[6], uint32_t ip)
 {
     memcpy(my_mac, mac, 6);
-    my_ip = ip;
+    static_ip = ip;
+    my_ip = 0;
     memset(conns, 0, NET_CONNS*sizeof(struct conn));
+    dhcp_state = DHCP_DISCOVER;
+    dhcp_start = net_now_us();
+    dhcp_begin();
+}
+
+uint32_t net_ip(void) { return my_ip; }
+int net_ip_dhcp(void) { return dhcp_state == DHCP_BOUND; }
+
+int net_ip_changed(void)
+{
+    int c = ip_changed;
+    ip_changed = 0;
+    return c;
 }
 
 void net_listen(uint16_t port, void (*on_data)(int, const uint8_t *, int), void (*on_closed)(int))
@@ -107,6 +315,12 @@ void net_listen(uint16_t port, void (*on_data)(int, const uint8_t *, int), void 
 
 static void eth_ip_header(uint8_t *f, const uint8_t *dst_mac, uint32_t dst_ip, uint8_t proto, int ip_len)
 {
+    eth_ip_header_ttl(f, dst_mac, my_ip, dst_ip, proto, ip_len, 64);
+}
+
+static void eth_ip_header_ttl(uint8_t *f, const uint8_t *dst_mac, uint32_t src_ip, uint32_t dst_ip,
+                              uint8_t proto, int ip_len, uint8_t ttl)
+{
     memcpy(f, dst_mac, 6);
     memcpy(f + 6, my_mac, 6);
     wr16(f + 12, 0x0800);
@@ -115,9 +329,9 @@ static void eth_ip_header(uint8_t *f, const uint8_t *dst_mac, uint32_t dst_ip, u
     wr16(ip + 2, (uint16_t)ip_len);
     wr16(ip + 4, ip_id++);
     wr16(ip + 6, 0x4000);        // Don't fragment.
-    ip[8] = 64; ip[9] = proto;
+    ip[8] = ttl; ip[9] = proto;
     wr16(ip + 10, 0);
-    wr32(ip + 12, my_ip);
+    wr32(ip + 12, src_ip);
     wr32(ip + 16, dst_ip);
     wr16(ip + 10, csum_fold(csum_add(0, ip, IP_HDR)));
 }
@@ -302,7 +516,7 @@ void net_rx(const uint8_t *f, int len)
     uint16_t type = rd16(f + 12);
     if (type == 0x0806 && len >= ETH_HDR + 28) {        // ARP
         const uint8_t *a = f + ETH_HDR;
-        if (rd16(a + 6) != 1 || rd32(a + 24) != my_ip)
+        if (rd16(a + 6) != 1 || my_ip == 0 || rd32(a + 24) != my_ip)
             return;
         uint8_t r[60] = {0};
         memcpy(r, a + 8, 6); memcpy(r + 6, my_mac, 6); wr16(r + 12, 0x0806);
@@ -319,12 +533,26 @@ void net_rx(const uint8_t *f, int len)
     int ihl = (ip[0] & 0xf)*4, ip_len = rd16(ip + 2);
     if ((ip[0] >> 4) != 4 || ihl < IP_HDR || ip_len < ihl || ETH_HDR + ip_len > len)
         return;
-    if (rd32(ip + 16) != my_ip || (rd16(ip + 6) & 0x3fff))   // Not ours, or a fragment.
-        return;
+    uint32_t dst = rd32(ip + 16);
+    int unicast = my_ip && dst == my_ip;
+    if ((!unicast && dst != 0xffffffffu && dst != MDNS_IP) || (rd16(ip + 6) & 0x3fff))
+        return;                                         // Not ours, or a fragment.
     if (csum_fold(csum_add(0, ip, ihl)) != 0)
         return;
     const uint8_t *pl = ip + ihl;
     int pl_len = ip_len - ihl;
+    if (ip[9] == 17 && pl_len >= 8) {                   // UDP: DHCP replies, mDNS queries
+        uint16_t sport = rd16(pl), dport = rd16(pl + 2), ulen = rd16(pl + 4);
+        if (ulen < 8 || ulen > pl_len)
+            return;
+        if (dport == 68 && sport == 67)
+            dhcp_in(pl + 8, ulen - 8);
+        else if (dport == 5353)
+            mdns_in(f, ip, pl + 8, ulen - 8, sport);
+        return;
+    }
+    if (!unicast)
+        return;
     if (ip[9] == 1 && pl_len >= 8 && pl[0] == 8) {      // ICMP echo request
         static uint8_t r[ETH_HDR + IP_HDR + 1500];
         if (pl_len > 1500 - IP_HDR)
@@ -350,6 +578,7 @@ void net_rx(const uint8_t *f, int len)
 
 void net_poll(void)
 {
+    dhcp_poll();
     uint64_t now = net_now_us();
     for (int c = 0; c < NET_CONNS; c++) {
         struct conn *k = &conns[c];

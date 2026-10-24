@@ -17,6 +17,7 @@
 // that streams for a minute keeps the stack polled (ACKs, retransmissions) without another
 // generation starting inside it: a second /chat waits for the first.
 
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -189,6 +190,12 @@ void web_init(const uint8_t mac[6], uint32_t ip)
 void web_service(void)
 {
     net_platform_poll();
+    if (net_ip_changed()) {               // A DHCP lease, or the static fallback.
+        uint32_t ip = net_ip();
+        printf("\nWEB http://%d.%d.%d.%d/ (%s), http://trixium.local/\n", (int)(ip >> 24),
+               (int)((ip >> 16) & 0xff), (int)((ip >> 8) & 0xff), (int)(ip & 0xff),
+               net_ip_dhcp() ? "DHCP" : "static: no DHCP server");
+    }
     for (int c = 0; c < NET_CONNS; c++)
         if (reqs[c].done && net_alive(c)) {
             handle(c);

@@ -41,8 +41,15 @@ def lib(tmp_path_factory):
     L = ctypes.CDLL(str(so))
     L.stub_last_line.restype = ctypes.c_char_p
     L.stub_set_now.argtypes = [ctypes.c_uint64]
+    L.net_ip.restype = ctypes.c_uint32
     L.web_init(ctypes.create_string_buffer(BOARD_MAC, 6), BOARD_IP)
+    # No DHCP server here: past the wait the static address (the DISCOVERs dropped).
+    L.stub_set_now(T0)
+    L.net_poll()
+    frames(L)
+    assert L.net_ip() == BOARD_IP and not L.net_ip_dhcp()
     L.page = page
+    L.so = str(so)
     return L
 
 
@@ -94,6 +101,7 @@ def parse_tcp(f):
     return dict(seq=seq, ack=ack, flags=flags, data=t[(off >> 4)*4:], win=win, dport=dport, opts=t[20:(off >> 4)*4])
 
 FIN, SYN, RST, PSH, ACK = 1, 2, 4, 8, 16
+T0 = 5_000_000                                  # Past the 4 s DHCP wait: the clock never goes back.
 
 
 class Client:
@@ -112,12 +120,16 @@ class Client:
         send(self.L, tcp_segment(self.port, self.seq, self.ack, ACK | PSH, data))
         self.seq += len(data)
 
-    def collect(self, rounds=200):
-        """Run the server, acknowledge each segment in order; returns (payload, fin)."""
+    def collect(self, rounds=200, first=None):
+        """Run the server, acknowledge each segment in order (from `first`, segments already
+        taken off the wire, if given); returns (payload, fin)."""
         payload, fin = b"", False
-        for _ in range(rounds):
-            self.L.web_service()
-            segs = [parse_tcp(f) for f in frames(self.L)]
+        for i in range(rounds):
+            if i == 0 and first is not None:
+                segs = first
+            else:
+                self.L.web_service()
+                segs = [parse_tcp(f) for f in frames(self.L)]
             for s in segs:
                 assert s["dport"] == self.port
                 if s["seq"] == self.ack and s["data"]:
@@ -200,15 +212,123 @@ def test_retransmission(lib):
     first = [s for s in (parse_tcp(f) for f in frames(lib)) if s["data"]]
     assert first and first[0]["seq"] == c.ack
     # Nothing acknowledged: past the RTO the stack sends from the first unacknowledged byte again.
-    lib.stub_set_now(400000)
+    lib.stub_set_now(T0 + 400000)
     lib.net_poll()
-    again = [s for s in (parse_tcp(f) for f in frames(lib)) if s["data"]]
-    assert again and again[0]["seq"] == c.ack and again[0]["data"].startswith(first[0]["data"])
-    lib.stub_set_now(0)
-    payload, fin = c.collect()
+    again = [parse_tcp(f) for f in frames(lib)]
+    data = [s for s in again if s["data"]]
+    assert data and data[0]["seq"] == c.ack and data[0]["data"].startswith(first[0]["data"])
+    payload, fin = c.collect(first=again)
     assert payload.split(b"\r\n\r\n", 1)[1] == lib.page and fin
 
 def test_unknown_segment_gets_reset(lib):
     send(lib, tcp_segment(40999, 5, 77, ACK, b"x"))
     (r,) = [parse_tcp(f) for f in frames(lib)]
     assert r["flags"] & RST and r["seq"] == 77
+
+
+# DHCP and mDNS ------------------------------------------------------------------------------------
+
+def udp_frame(sport, dport, payload, src_ip, dst_ip, dst_mac=None, src_mac=HOST_MAC):
+    u = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload
+    h = struct.pack("!BBHHHBBHII", 0x45, 0, 20 + len(u), 1, 0, 64, 17, 0, src_ip, dst_ip)
+    h = h[:10] + struct.pack("!H", csum(h)) + h[12:]
+    return (dst_mac or BOARD_MAC) + src_mac + b"\x08\x00" + h + u
+
+def parse_udp(f):
+    ip = f[14:]
+    ihl = (ip[0] & 0xf)*4
+    total = struct.unpack("!H", ip[2:4])[0]
+    assert ip[9] == 17 and csum(ip[:ihl]) == 0
+    u = ip[ihl:total]
+    src, dst = struct.unpack("!II", ip[12:20])
+    pseudo = struct.pack("!IIBBH", src, dst, 0, 17, len(u))
+    assert csum(pseudo + u) in (0, 0xffff) or struct.unpack("!H", u[6:8])[0] == 0, "UDP checksum"
+    sport, dport = struct.unpack("!HH", u[:4])
+    return dict(eth_dst=f[:6], src=src, dst=dst, ttl=ip[8], sport=sport, dport=dport, data=u[8:])
+
+def dhcp_options(m):
+    opts, o = {}, 240
+    while o < len(m) and m[o] != 255:
+        if m[o] == 0:
+            o += 1; continue
+        opts[m[o]] = m[o + 2:o + 2 + m[o + 1]]
+        o += 2 + m[o + 1]
+    return opts
+
+def dhcp_reply(req, mtype, yiaddr, server, lease):
+    m = bytearray(300)
+    m[0] = 2; m[1] = 1; m[2] = 6
+    m[4:8] = req[4:8]
+    m[16:20] = struct.pack("!I", yiaddr)
+    m[28:34] = req[28:34]
+    m[236:240] = struct.pack("!I", 0x63825363)
+    o = 240
+    for code, val in ((53, bytes([mtype])), (54, struct.pack("!I", server)), (51, struct.pack("!I", lease)), (1, b"\xff\xff\xff\x00")):
+        m[o] = code; m[o + 1] = len(val); m[o + 2:o + 2 + len(val)] = val; o += 2 + len(val)
+    m[o] = 255
+    return udp_frame(67, 68, bytes(m), server, 0xffffffff, dst_mac=b"\xff"*6)
+
+@pytest.fixture
+def fresh(lib, tmp_path):
+    """A second instance of the stack (its own globals): a boot on a LAN with a DHCP server."""
+    import shutil
+    so = tmp_path / "libnet2.so"
+    shutil.copy(lib.so, so)
+    L = ctypes.CDLL(str(so))
+    L.net_ip.restype = ctypes.c_uint32
+    L.stub_set_now.argtypes = [ctypes.c_uint64]
+    L.stub_set_now(1000)
+    L.web_init(ctypes.create_string_buffer(BOARD_MAC, 6), BOARD_IP)
+    return L
+
+def test_dhcp_lease_and_renewal(fresh):
+    L = fresh
+    (d,) = [parse_udp(f) for f in frames(L)]
+    assert d["eth_dst"] == b"\xff"*6 and d["src"] == 0 and d["dst"] == 0xffffffff and (d["sport"], d["dport"]) == (68, 67)
+    disc = d["data"]
+    assert disc[0] == 1 and disc[28:34] == BOARD_MAC and dhcp_options(disc)[53] == b"\x01"
+    assert dhcp_options(disc)[12] == b"trixium" and L.net_ip() == 0
+    SERVER, LEASED = 0x0A000001, 0x0A00002A                       # 10.0.0.1, 10.0.0.42
+    send(L, dhcp_reply(disc, 2, LEASED, SERVER, 120))               # OFFER
+    (r,) = [parse_udp(f) for f in frames(L)]
+    o = dhcp_options(r["data"])
+    assert o[53] == b"\x03" and o[50] == struct.pack("!I", LEASED) and o[54] == struct.pack("!I", SERVER)
+    send(L, dhcp_reply(r["data"], 5, LEASED, SERVER, 120))          # ACK
+    assert L.net_ip() == LEASED and L.net_ip_dhcp() and L.net_ip_changed()
+    # Past the 4 s wait nothing falls back; past half the lease (60 s) the renewal goes out.
+    L.stub_set_now(10_000_000); L.net_poll()
+    assert L.net_ip() == LEASED and frames(L) == []
+    L.stub_set_now(61_000_000); L.net_poll()
+    (n,) = [parse_udp(f) for f in frames(L)]
+    assert dhcp_options(n["data"])[53] == b"\x03" and n["data"][12:16] == struct.pack("!I", LEASED) and n["src"] == LEASED
+
+def test_dhcp_nak_restarts(fresh):
+    L = fresh
+    (d,) = [parse_udp(f) for f in frames(L)]
+    send(L, dhcp_reply(d["data"], 2, 0x0A00002A, 0x0A000001, 120))
+    (r,) = [parse_udp(f) for f in frames(L)]
+    send(L, dhcp_reply(r["data"], 6, 0, 0x0A000001, 0))             # NAK: DISCOVER again
+    (again,) = [parse_udp(f) for f in frames(L)]
+    assert dhcp_options(again["data"])[53] == b"\x01" and L.net_ip() == 0
+
+def mdns_query(name, qtype=1, sport=5353, qid=0):
+    q = struct.pack("!HHHHHH", qid, 0, 1, 0, 0, 0)
+    for label in name.split("."):
+        q += bytes([len(label)]) + label.encode()
+    return q + b"\0" + struct.pack("!HH", qtype, 1)
+
+def test_mdns_answers_its_name(lib):
+    send(lib, udp_frame(5353, 5353, mdns_query("TriXium.local"), HOST_IP, 0xe00000fb, dst_mac=bytes.fromhex("01005e0000fb")))
+    (r,) = [parse_udp(f) for f in frames(lib)]
+    assert r["dst"] == 0xe00000fb and r["eth_dst"] == bytes.fromhex("01005e0000fb") and r["ttl"] == 255
+    m = r["data"]
+    assert struct.unpack("!HHHH", m[2:10]) == (0x8400, 0, 1, 0)
+    assert m[-4:] == struct.pack("!I", BOARD_IP)
+    # Another name, or a response: nothing.
+    send(lib, udp_frame(5353, 5353, mdns_query("other.local"), HOST_IP, 0xe00000fb, dst_mac=bytes.fromhex("01005e0000fb")))
+    assert frames(lib) == []
+    # A plain resolver's query (not from 5353): a unicast answer with its id and question.
+    send(lib, udp_frame(40000, 5353, mdns_query("trixium.local", qid=0x1234), HOST_IP, 0xe00000fb, dst_mac=bytes.fromhex("01005e0000fb")))
+    (u,) = [parse_udp(f) for f in frames(lib)]
+    assert u["dst"] == HOST_IP and u["dport"] == 40000 and u["data"][:2] == b"\x12\x34"
+    assert struct.unpack("!H", u["data"][4:6])[0] == 1 and u["data"][-4:] == struct.pack("!I", BOARD_IP)
