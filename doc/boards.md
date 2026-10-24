@@ -682,8 +682,8 @@ build to deploy:
 PYTHONPATH=<litex master>:$PWD LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1 \
   systemd-run --user -p MemoryMax=40G ... python3 trixium_ti375.py --build --ddr-targets 2 \
   --dn-sublanes 2 --with-spi-flash --upload-beats 45 --chan-skew 0x2000 --with-softmax \
-  --attn-lanes 8 --attn-groups 2 --with-sdcard --output-dir build/ti375_v20
-trixium deploy --board ti375 --model 2b ti375_v20
+  --attn-lanes 8 --attn-groups 2 --with-emmc --output-dir build/ti375_v21
+trixium deploy --board ti375 --model 2b ti375_v21
 ```
 
 ### Build
@@ -829,6 +829,22 @@ LiteSDCard's card model (`trixium_sim.py --board ti375 --with-sdcard`, 4-bit): i
 load into channel 0, a block written and read back (`sdwtest`), the gate bit-exact. v20 = v19 +
 `--with-sdcard`: 105.3 MHz achievable, 96.05% XLRs, 88.1% RAM blocks; 2B 14.34 / 13.98 / 11.99
 tok/s, golden.
+
+**Weights from the kit's eMMC** (`--with-emmc`, `ti375_v21`): the same core and loader on the kit's
+8 GB eMMC (8-bit, 1.8 V; it came blank), the firmware's init the MMC one (CMD1, the host-assigned
+RCA, EXT_CSD BUS_WIDTH and HS_TIMING), then the same `sdsave`/`sdboot`/power-up path: **SDBOOT
+436 MB in 9.6 s (46 MB/s)** against the slot's 74 s, SDSAVE in 39 s (the CPU pushing the words).
+v21 = v19 + `--with-emmc` (in place of the slot): 110.0 MHz achievable, 95.16% XLRs; 2B 14.32 /
+13.96 / 11.98 tok/s, golden. `software/lab/ti375_sd.py --emmc` brings the eMMC up on its own
+(LiteX's BIOS, whose eMMC support came from this work: litex#2695, litex-boards#933).
+
+**Past the 2,048-token window** (`kvring`, on by default): the attention layers keep the first 4
+positions and a ring of the latest ones (slot `4 + (p - 4) mod 2044` past 2,048), while the
+DeltaNet layers' recurrent state carries everything; K rows are stored rotated at their absolute
+position, so the scores stay exact relative attention over the slots kept. The stream and the
+CPU loop walk the slots in the same order (bit-identical in the simulation, 100 tokens over a
+64-slot window), and the console `chat` drops its oldest tokens (already in the ring and the
+state) instead of restarting: no re-prefill.
 
 ### Rules
 

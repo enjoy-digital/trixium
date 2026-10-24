@@ -44,6 +44,7 @@ waited on it. Five steps since, each measured on the kit:
 | v18: + the attention stream at 8 lanes / 2 groups (`--attn-lanes 8 --attn-groups 2`) | 14.33 / 13.97 / 10.93 | both kv heads in one command per layer: the values pass at 1,024 tokens 3.25 -> 1.66 M cycles |
 | v19: + the attention stream to 2,048 positions (`--attn-t-max 2048`), registered read data in the activation and softmax units | 14.32 / 13.96 / 11.97 | past 1,024 positions v18 ran attention on the CPU (~4.6 s per token; the 1,024 bench's last forwards); 1,800 tokens at 10.44 tok/s; worst slack +0.78 ns (108.5 MHz achievable) |
 | v20: + the microSD card (`--with-sdcard`) | 14.34 / 13.98 / 11.99 | the weights and tokenizer from the card at power-up (1-bit on the kit: 436 MB in 74 s); 105.3 MHz achievable, 96.05% XLRs |
+| v21: the kit's eMMC in place of the slot (`--with-emmc`) | 14.32 / 13.96 / 11.98 | the model and tokenizer from the eMMC at power-up: 436 MB in 9.6 s (46 MB/s, 8-bit at 50 MHz); 110.0 MHz achievable, 95.16% XLRs |
 
 A v9 forward at 64 tokens is 7.3 M cycles (`hybprof`): the DeltaNet layers 2.6 M, the FFNs 1.9 M,
 the LM head 1.35 M, the attention layers 1.1 M, the embedding row 0.25 M. The image has no int16
