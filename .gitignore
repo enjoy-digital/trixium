@@ -27,6 +27,7 @@ firmware/*.elf
 firmware/*.elf.map
 firmware/trixium.bin
 firmware/progs.h
+firmware/web_page.h
 firmware/.build_dir_stamp
 firmware/.build.lock
 

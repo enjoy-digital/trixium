@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TriXium chat</title>
+<style>
+:root { --bg: #f6f5f1; --fg: #1d1d1b; --dim: #6b6a65; --card: #ffffff; --line: #e2e0d8; --acc: #0f7b6c; --me: #e8f3f1; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161615; --fg: #ecebe6; --dim: #9a9890; --card: #1f1f1d; --line: #33322f; --acc: #4cc2ae; --me: #1d2e2b; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+header b { font-size: 18px; }
+header span { color: var(--dim); font-size: 14px; }
+header button { margin-left: auto; }
+main { max-width: 820px; margin: 0 auto; padding: 16px; padding-bottom: 120px; }
+.msg { margin: 12px 0; padding: 10px 14px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; }
+.me { background: var(--me); margin-left: 15%; }
+code { font-family: ui-monospace, monospace; font-size: 0.92em; }
+.stats { color: var(--dim); font-size: 13px; margin: -6px 2px 0; }
+form { position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg); border-top: 1px solid var(--line); padding: 12px 16px; }
+form div { max-width: 820px; margin: 0 auto; display: flex; gap: 8px; }
+textarea { flex: 1; resize: none; height: 52px; padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); font: inherit; }
+button { border: 1px solid var(--acc); background: var(--acc); color: #fff; border-radius: 8px; padding: 0 16px; font: inherit; cursor: pointer; }
+button.ghost { background: transparent; color: var(--acc); padding: 4px 12px; }
+button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <b>TriXium chat</b>
+  <span>Bonsai 2 on the FPGA: tokenizer, model and this page all on the board</span>
+  <button class="ghost" id="reset" type="button">New conversation</button>
+</header>
+<main id="log"></main>
+<form id="f">
+  <div>
+    <textarea id="q" placeholder="Message (Enter sends, Shift+Enter for a new line)" autofocus></textarea>
+    <button id="send">Send</button>
+  </div>
+</form>
+<script>
+const log = document.getElementById('log'), q = document.getElementById('q'), send = document.getElementById('send');
+// The model writes light Markdown: **bold**, `code`, # headings (escaped first, then marked up).
+function md(t) {
+  t = t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  return t.replace(/^#{1,4} +(.*)$/gm, '<b>$1</b>');
+}
+function add(cls, text) {
+  const d = document.createElement('div');
+  d.className = cls; d.textContent = text; log.appendChild(d);
+  window.scrollTo(0, document.body.scrollHeight);
+  return d;
+}
+async function ask() {
+  const text = q.value.trim();
+  if (!text || send.disabled) return;
+  q.value = ''; send.disabled = true;
+  add('msg me', text);
+  const out = add('msg', '');
+  try {
+    const r = await fetch('/chat', { method: 'POST', body: text });
+    if (!r.ok) { out.textContent = await r.text(); return; }
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let all = '';
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      all += dec.decode(value, { stream: true });
+      const k = all.indexOf('\x1e');
+      out.innerHTML = md((k < 0 ? all : all.slice(0, k)).trim());
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+    const k = all.indexOf('\x1e');
+    if (k >= 0) {
+      const s = JSON.parse(all.slice(k + 1));
+      const rate = s.ms ? (s.tokens / (s.ms / 1000)).toFixed(1) : '?';
+      add('stats', `${s.tokens} tokens in ${(s.ms / 1000).toFixed(1)} s (${rate} tok/s) · context ${s.context}` +
+          (s.capped ? ' · capped' : '') + (s.restarted ? ' · new conversation (context full)' : '') +
+          (s.error ? ' · generation error' : ''));
+    }
+  } catch (e) {
+    out.textContent = 'connection error: ' + e;
+  } finally {
+    send.disabled = false; q.focus();
+  }
+}
+document.getElementById('f').addEventListener('submit', e => { e.preventDefault(); ask(); });
+q.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); } });
+document.getElementById('reset').addEventListener('click', async () => {
+  await fetch('/reset', { method: 'POST' });
+  log.textContent = '';
+  q.focus();
+});
+</script>
+</body>
+</html>

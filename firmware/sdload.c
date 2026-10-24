@@ -122,6 +122,8 @@ static int sd_read_check(void)
     return rc;
 }
 
+int sd_init_done(void) { return sd_ok; }
+
 int sd_init(int mhz, int tries)
 {
     int force_1bit = mhz < 0;
@@ -276,6 +278,26 @@ static void sd_push(const volatile uint32_t *w, uint32_t n)
     }
 }
 
+// CRC-32 (zlib's) a byte at a time from a 1 KB table: ~5 cycles a byte while sdsave pushes.
+static uint32_t crc_tab[256];
+static uint32_t crc_update(uint32_t crc, const volatile uint32_t *w, uint32_t words)
+{
+    if (!crc_tab[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xedb88320u : c >> 1;
+            crc_tab[i] = c;
+        }
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t v = w[i];                       // The bytes in the order the write FIFO sends them.
+        for (int b = 0; b < 4; b++, v >>= 8)
+            crc = crc_tab[(crc ^ v) & 0xff] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+static uint32_t *write_crc;                      // sd_write: the running CRC of what it pushes.
+
 int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const uint32_t *cpu)
 {
     if (!sd_ok) { puts("sdwrite: sdinit first"); return -1; }
@@ -288,12 +310,14 @@ int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const ui
     uint32_t bytes = blocks*512;
     for (uint32_t off = 0; off < bytes; off += 0x10000) {
         uint32_t chunk = bytes - off > 0x10000 ? 0x10000 : bytes - off;
-        if (cpu) {
-            sd_push(cpu + off/4, chunk/4);
-        } else {
+        const volatile uint32_t *src = (const volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000);
+        if (cpu)
+            src = cpu + off/4;
+        else
             engine_fetch(chan, base + off, chunk/32, 0xC000);
-            sd_push((const volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000), chunk/4);
-        }
+        sd_push(src, chunk/4);
+        if (write_crc)
+            *write_crc = crc_update(*write_crc, src, chunk/4);
     }
     int rc = sd_wait(sd_core_data_event_read);
     if (blocks > 1)
@@ -307,8 +331,40 @@ int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const ui
 }
 
 #if TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000   // The staging areas below the weights.
-int sd_save(void)
+
+// One 512-byte sector through the loader into `t` (the table's landing place on channel 0).
+static int sd_read_sector(uint32_t sector, uint32_t t[128])
 {
+    uint32_t scratch = TRIXIUM_CHAN_WEIGHT_BASE - SD_TABLE_STAGING_BELOW;
+    if (sd_load(0, scratch, sector, 1) < 0)
+        return -1;
+    engine_fetch(0, scratch, 16, 0xC000);
+    for (int i = 0; i < 128; i++)
+        t[i] = ((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[i];
+    return 0;
+}
+
+static uint32_t slot_sector(int slot) { return SD_IMAGE_SECTOR + (uint32_t)slot*SD_SLOT_SECTORS; }
+
+// A slot's table: 0 and *v1 = 0/1 when valid (version 2: label and per-entry CRCs; 1: neither).
+static int table_ok(const uint32_t *t, int *v1)
+{
+    if (t[0] != SD_IMAGE_MAGIC || t[2] == 0)
+        return -1;
+    if (t[1] == 1 && t[2] <= SD_IMAGE_MAX_ENTRIES && crc32((unsigned char *)&t[4], t[2]*16) == t[3]) {
+        *v1 = 1;
+        return 0;
+    }
+    if (t[1] == 2 && t[2] <= SD_V2_MAX_ENTRIES && crc32((unsigned char *)&t[12], t[2]*20) == t[3]) {
+        *v1 = 0;
+        return 0;
+    }
+    return -1;
+}
+
+int sd_save(int slot, const char *label)
+{
+    if (slot < 0 || slot >= SD_MAX_SLOTS) { printf("sdsave: slot 0..%d\n", SD_MAX_SLOTS - 1); return -1; }
     if (!sd_ok && sd_init(50, 1000) < 0)
         return -1;
     // What a UDP upload staged: the BONS header+table, each channel's payload, the tokenizer.
@@ -320,8 +376,8 @@ int sd_save(void)
     if (h.magic != BONS_MAGIC) { puts("sdsave: no staged model (upload one first)"); return -1; }
     uint32_t t[128];
     memset(t, 0, sizeof(t));
-    uint32_t n = 0, sector = SD_IMAGE_SECTOR + 1;
-#define SD_ENTRY(c, b, bytes) do { uint32_t *x = &t[4 + 4*n++]; x[0] = (c); x[1] = (b); \
+    uint32_t n = 0, sector = slot_sector(slot) + 1;
+#define SD_ENTRY(c, b, bytes) do { uint32_t *x = &t[12 + 5*n++]; x[0] = (c); x[1] = (b); \
         x[2] = ((bytes) + 511)/512; x[3] = sector; sector += x[2]; } while (0)
     SD_ENTRY(0, TRIXIUM_CHAN_WEIGHT_BASE - 0x100000, h.payload_offset);
     for (uint32_t c = 0; c < h.n_channels; c++)
@@ -334,61 +390,125 @@ int sd_save(void)
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000);
     if (rec[0] == TOK_STAGING_MAGIC && rec[1] <= TOK_STAGING_MAX)
         SD_ENTRY(0, TOK_STAGING, 32 + rec[1]);
-    t[0] = SD_IMAGE_MAGIC; t[1] = 1; t[2] = n;
-    t[3] = crc32((unsigned char *)&t[4], n*16);
+    if (sector - slot_sector(slot) > SD_SLOT_SECTORS) { puts("sdsave: the model is larger than a slot"); return -1; }
+    t[0] = SD_IMAGE_MAGIC; t[1] = 2; t[2] = n;
+    for (int i = 0; i < 31 && label && label[i]; i++)
+        ((char *)&t[4])[i] = label[i];
     // The old table first invalidated, the table last: a save cut short leaves no image to boot.
     uint32_t zero[128];
     memset(zero, 0, sizeof(zero));
-    if (sd_write(SD_IMAGE_SECTOR, 1, 0, 0, zero) < 0)
+    if (sd_write(slot_sector(slot), 1, 0, 0, zero) < 0)
         return -1;
     uint64_t t0 = perf_now64(), bytes = 0;
     for (uint32_t e = 0; e < n; e++) {
-        const uint32_t *x = &t[4 + 4*e];
+        uint32_t *x = &t[12 + 5*e], crc = 0xffffffffu;
         printf("  chan %lu: %lu KB to sector %lu\n", (unsigned long)x[0], (unsigned long)(x[2]/2),
                (unsigned long)x[3]);
-        if (sd_write(x[3], x[2], (int)x[0], x[1], NULL) < 0)
+        write_crc = &crc;
+        int rc = sd_write(x[3], x[2], (int)x[0], x[1], NULL);
+        write_crc = NULL;
+        if (rc < 0)
             return -1;
+        x[4] = ~crc;
         bytes += (uint64_t)x[2]*512;
     }
-    if (sd_write(SD_IMAGE_SECTOR, 1, 0, 0, t) < 0)
+    t[3] = crc32((unsigned char *)&t[12], n*20);
+    if (sd_write(slot_sector(slot), 1, 0, 0, t) < 0)
         return -1;
     uint32_t ms = (uint32_t)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000));
-    printf("SDSAVE %lu MB in %lu s (%lu KB/s)\n", (unsigned long)(bytes >> 20),
-           (unsigned long)(ms/1000), (unsigned long)(ms ? bytes/ms : 0));
+    printf("SDSAVE slot %d \"%s\": %lu MB in %lu s (%lu KB/s)\n", slot, (char *)&t[4],
+           (unsigned long)(bytes >> 20), (unsigned long)(ms/1000), (unsigned long)(ms ? bytes/ms : 0));
     return 0;
 }
 
-int sd_boot(void)
+int sd_boot(int slot)
 {
+    if (slot < 0 || slot >= SD_MAX_SLOTS) { printf("sdboot: slot 0..%d\n", SD_MAX_SLOTS - 1); return -1; }
     if (!sd_ok && sd_init(50, 1000) < 0)
         return -1;
-    // The image's table, through the loader to a scratch place on channel 0, then the scratchpad.
-    uint32_t scratch = TRIXIUM_CHAN_WEIGHT_BASE - SD_TABLE_STAGING_BELOW;
-    if (sd_load(0, scratch, SD_IMAGE_SECTOR, 1) < 0)
-        return -1;
-    engine_fetch(0, scratch, 16, 0xC000);
     uint32_t t[128];
-    for (int i = 0; i < 128; i++)
-        t[i] = ((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[i];
-    if (t[0] != SD_IMAGE_MAGIC || t[1] != 1 || t[2] == 0 || t[2] > SD_IMAGE_MAX_ENTRIES ||
-        crc32((unsigned char *)&t[4], t[2]*16) != t[3]) {
-        printf("sdboot: no TriXium image at sector %u (magic %08lx)\n", SD_IMAGE_SECTOR,
-               (unsigned long)t[0]);
+    int v1;
+    if (sd_read_sector(slot_sector(slot), t) < 0)
+        return -1;
+    if (table_ok(t, &v1) < 0) {
+        printf("sdboot: no TriXium image in slot %d (sector %lu, magic %08lx)\n", slot,
+               (unsigned long)slot_sector(slot), (unsigned long)t[0]);
         return -1;
     }
     uint64_t t0 = perf_now64(), bytes = 0;
+    int checked = 0;
     for (uint32_t e = 0; e < t[2]; e++) {
-        const uint32_t *x = &t[4 + 4*e];         // chan, base, blocks, sector
+        const uint32_t *x = v1 ? &t[4 + 4*e] : &t[12 + 5*e];   // chan, base, blocks, sector[, crc]
         printf("  chan %lu: %lu KB from sector %lu\n", (unsigned long)x[0],
                (unsigned long)(x[2]/2), (unsigned long)x[3]);
+#ifdef CSR_SD_CRC_ADDR
+        sd_crc_reset_write(1);
+#endif
         if (sd_load((int)x[0], x[1], x[3], x[2]) < 0)
             return -1;
+#ifdef CSR_SD_CRC_ADDR
+        // The data went to the DRAM without the CPU: the read stream's CRC against the table's.
+        if (!v1) {
+            uint32_t got = sd_crc_read();
+            if (got != x[4]) {
+                printf("sdboot: entry %lu CRC %08lx, the table says %08lx: the device's data is damaged\n",
+                       (unsigned long)e, (unsigned long)got, (unsigned long)x[4]);
+                return -1;
+            }
+            checked++;
+        }
+#endif
         bytes += (uint64_t)x[2]*512;
     }
     uint32_t ms = (uint32_t)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000));
-    printf("SDBOOT %lu MB in %lu.%01lu s (%lu MB/s)\n", (unsigned long)(bytes >> 20),
-           (unsigned long)(ms/1000), (unsigned long)(ms%1000/100),
-           (unsigned long)(ms ? (bytes >> 10)/ms : 0));
+    printf("SDBOOT slot %d \"%s\": %lu MB in %lu.%01lu s (%lu MB/s)%s\n", slot, v1 ? "" : (char *)&t[4],
+           (unsigned long)(bytes >> 20), (unsigned long)(ms/1000), (unsigned long)(ms%1000/100),
+           (unsigned long)(ms ? (bytes >> 10)/ms : 0), checked ? ", CRC ok" : "");
+    return 0;
+}
+
+void sd_list(void)
+{
+    if (!sd_ok && sd_init(50, 1000) < 0)
+        return;
+    int def = sd_default_slot();
+    for (int slot = 0; slot < SD_MAX_SLOTS; slot++) {
+        uint32_t t[128];
+        int v1;
+        if (sd_read_sector(slot_sector(slot), t) < 0)
+            break;                                       // Past the device's end.
+        if (table_ok(t, &v1) < 0)
+            continue;
+        uint64_t bytes = 0;
+        for (uint32_t e = 0; e < t[2]; e++)
+            bytes += (uint64_t)(v1 ? t[4 + 4*e + 2] : t[12 + 5*e + 2])*512;
+        printf("SDSLOT %d%s \"%s\" %lu MB, %lu entries%s\n", slot, slot == def ? " (boot)" : "",
+               v1 ? "" : (char *)&t[4], (unsigned long)(bytes >> 20), (unsigned long)t[2],
+               v1 ? ", version 1 (no CRCs)" : "");
+    }
+}
+
+// The slot booted at power-up: the boot sector's, 0 without one.
+int sd_default_slot(void)
+{
+    uint32_t t[128];
+    if (sd_read_sector(SD_BOOT_SECTOR, t) < 0 || t[0] != SD_BOOT_MAGIC || t[2] != ~t[1] ||
+        t[1] >= SD_MAX_SLOTS)
+        return 0;
+    return (int)t[1];
+}
+
+int sd_set_default(int slot)
+{
+    if (slot < 0 || slot >= SD_MAX_SLOTS) { printf("sddefault: slot 0..%d\n", SD_MAX_SLOTS - 1); return -1; }
+    if (!sd_ok && sd_init(50, 1000) < 0)
+        return -1;
+    uint32_t t[128];
+    memset(t, 0, sizeof(t));
+    t[0] = SD_BOOT_MAGIC; t[1] = (uint32_t)slot; t[2] = ~(uint32_t)slot;
+    if (sd_write(SD_BOOT_SECTOR, 1, 0, 0, t) < 0)
+        return -1;
+    printf("SDDEFAULT slot %d\n", slot);
     return 0;
 }
 

@@ -88,7 +88,7 @@ class _CRG(LiteXModule):
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
                  eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 2048), dn_sublanes=0,
-                 ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, with_softmax=False, no_core=False, with_sdcard=False, with_emmc=False,
+                 ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, with_softmax=False, no_core=False, with_sdcard=False, with_emmc=False, with_web=False, web_ip="<board-host>",
                  **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
         # Ethernet): a ~10-minute build to bring the board and the memory attachment up alone.
@@ -117,7 +117,17 @@ class TriXiumTi375SoC(SoCCore):
             self.ethphy.crg.cd_eth_rx.clk, self.ethphy.crg.cd_eth_tx.clk)
         # The UDP/IP core at 32 bits in sys (an 8-bit one at 100 MHz is slower than the 1 Gb/s line);
         # the upload port in the SoC's sys clock domain (cd="etherbone").
-        self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, data_width=32, with_timing_constraints=False)
+        # with_web: the CPU's own MAC beside the hardware stack (LiteEth's hybrid crossbar: the
+        # hardware MAC's unicasts stay in hardware, broadcasts reach both, the rest the CPU), for
+        # the firmware's web page (firmware/net.c, web.c) at web_ip.
+        web_mac = 0x10e2d5000001
+        self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, data_width=32, with_timing_constraints=False,
+            with_ethmac=with_web, ethmac_address=web_mac, ethmac_local_ip=web_ip)
+        if with_web:
+            ip = [int(b) for b in web_ip.split(".")]
+            self.add_constant("TRIXIUM_WEB_IP",     ip[0] << 24 | ip[1] << 16 | ip[2] << 8 | ip[3])
+            self.add_constant("TRIXIUM_WEB_MAC_HI", web_mac >> 32)
+            self.add_constant("TRIXIUM_WEB_MAC_LO", web_mac & 0xffffffff)
         udp_port = self.ethcore_etherbone.udp.crossbar.get_port(UPLOAD_PORT, dw=32, cd="etherbone")
         # upload_beats: the largest datagram (45 beats = 1,440 bytes + the sequence word fit a
         # 1,500-byte MTU's UDP payload; 32 before).
@@ -303,6 +313,8 @@ def main():
     parser.add_target_argument("--no-core",         action="store_true",       help="Without the TriXium core (board bring-up).")
     parser.add_target_argument("--with-sdcard",     action="store_true",       help="The microSD slot as a weight source (the firmware's sdinit/sdload).")
     parser.add_target_argument("--with-emmc",       action="store_true",       help="The kit's eMMC (8-bit) as the weight source instead of the microSD slot.")
+    parser.add_target_argument("--with-web",        action="store_true",       help="The CPU's own Ethernet MAC: the firmware serves the chat page (http://<web-ip>/).")
+    parser.add_target_argument("--web-ip",          default="<board-host>",    help="The web page's IP address (the CPU's MAC; --eth-ip stays the hardware stack's).")
     parser.add_target_argument("--attn-t-max",      default=2048,  type=int,   help="Attention stream context positions (the 2B image's 2,048: past t_max the firmware runs attention on the CPU, ~4.6 s per token).")
     parser.add_target_argument("--attn-lanes",      default=YPCB_LITE_ATTN[0], type=int, help="Attention stream lanes (query heads served at once).")
     parser.add_target_argument("--attn-groups",     default=YPCB_LITE_ATTN[1], type=int, help="Attention stream groups (kv heads served at once, at most lanes / the model's query heads per kv head: 8 lanes / 2 groups serve the 2B's heads in one pass).")
@@ -317,7 +329,7 @@ def main():
                           dn_sublanes=args.dn_sublanes, attn_geometry=(args.attn_lanes, args.attn_groups, 256, args.attn_t_max),
                           ddr_targets=args.ddr_targets, with_spi_flash=args.with_spi_flash,
                           upload_beats=args.upload_beats, chan_skew=args.chan_skew, with_softmax=args.with_softmax,
-                          no_core=args.no_core, with_sdcard=args.with_sdcard, with_emmc=args.with_emmc,
+                          no_core=args.no_core, with_sdcard=args.with_sdcard, with_emmc=args.with_emmc, with_web=args.with_web, web_ip=args.web_ip,
                           **parser.soc_argdict)
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:

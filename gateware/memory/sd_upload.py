@@ -33,6 +33,25 @@ from litex.soc.interconnect.csr import CSRStatus, CSRStorage
 
 # SD Card Upload -----------------------------------------------------------------------------------
 
+class CRC32Byte(LiteXModule):
+    """CRC-32 (IEEE, reflected: zlib's and libbase's crc32) of a byte stream, one byte a cycle.
+    `value` is the CRC of the bytes since `reset` (final XOR applied)."""
+    def __init__(self):
+        self.reset = Signal()
+        self.ce    = Signal()
+        self.data  = Signal(8)
+        self.value = Signal(32)
+
+        # # #
+
+        reg = Signal(32, reset=0xffffffff)
+        nxt = reg ^ self.data
+        for _ in range(8):
+            nxt = Mux(nxt[0], (nxt >> 1) ^ 0xedb88320, nxt >> 1)
+        self.sync += If(self.reset, reg.eq(0xffffffff)).Elif(self.ce, reg.eq(nxt))
+        self.comb += self.value.eq(~reg)
+
+
 class SDCardUpload(LiteXModule):
     def __init__(self, platform, sys_clk_freq, pads=None, out_dw=128, use_emulator=False,
                  wfifo_depth=1024):
@@ -57,6 +76,17 @@ class SDCardUpload(LiteXModule):
         # Without `upload` the card's data is dropped before the converter: the init's own data
         # reads (the switch status) must not leave bytes for the first transfer, whole or in a
         # partial word.
+        # The CRC-32 of what the loader takes (each entry's, checked against the card's table:
+        # the data goes to the DRAM without the CPU seeing it).
+        self.crc_reset = CSRStorage(1, description="Write 1: restart the read CRC.")
+        self.crc       = CSRStatus(32, description="CRC-32 of the bytes sent to the loader since crc_reset.")
+        self.crc32 = crc32 = CRC32Byte()
+        self.comb += [
+            crc32.reset.eq(self.crc_reset.re),
+            crc32.ce.eq(self.upload.storage & self.core.source.valid & self.core.source.ready),
+            crc32.data.eq(self.core.source.data),
+            self.crc.status.eq(crc32.value),
+        ]
         self.conv = conv = stream.Converter(8, out_dw)
         self.comb += [
             If(self.upload.storage,

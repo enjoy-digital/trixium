@@ -31,7 +31,8 @@ CFLAGS += -I$(PORTABLE_LIB)
 CFLAGS += $(EXTRA_CFLAGS)
 
 OBJECTS = crt0.o main.o engine.o model.o infer.o infer_float.o infer_bfp.o infer_lists.o perf.o \
-          ops.o vec.o seq.o ddr.o hybrid.o resident.o tokenizer.o sdload.o trixium_sequence.o trixium_tok.o
+          ops.o vec.o seq.o ddr.o hybrid.o resident.o tokenizer.o sdload.o trixium_sequence.o trixium_tok.o \
+          net.o net_ethmac.o web.o
 
 # Build tree stamp ---------------------------------------------------------------------------------
 
@@ -75,6 +76,12 @@ progs.h: FORCE
 	cd .. && $(PYTHON) -m model.asm firmware/progs.h --vregs $(VREGS) --fused $(FUSED)
 FORCE:
 infer.o infer_bfp.o infer_lists.o main.o vec.o resident.o: progs.h
+
+# web_page.h: the page web.c serves (web_page.html as one C string).
+web_page.h: web_page.html
+	$(PYTHON) -c "import sys; d = open(sys.argv[1], 'rb').read(); print('static const char web_page[] = {' + ','.join(str(b) for b in d) + ',0};')" $< > $@
+web.o: web_page.h
+net.o web.o: CFLAGS += -DTRIXIUM_FIRMWARE   # Their buffers in the main_ram static window.
 
 %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@

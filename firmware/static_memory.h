@@ -31,5 +31,7 @@
 #define TRIXIUM_EMB16_ROW_ADDR      (TRIXIUM_HDR_ADDR + 0xca000) // int16[n_embd] embedding row by DMA (infer_bfp.c), 16 KB
 #define TRIXIUM_CHAT_LINE_ADDR      (TRIXIUM_HDR_ADDR + 0xce000) // the on-board chat's input line (main.c chat), 8 KB
 #define TRIXIUM_CHAT_LINE_SIZE      8192
+#define TRIXIUM_NET_CONNS_ADDR      (TRIXIUM_HDR_ADDR + 0xd0000) // struct conn[NET_CONNS] (net.c), < 72 KB
+#define TRIXIUM_WEB_REQS_ADDR       (TRIXIUM_HDR_ADDR + 0xe2000) // struct req[NET_CONNS] (web.c), < 20 KB
 
 #endif

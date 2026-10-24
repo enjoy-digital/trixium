@@ -39,6 +39,8 @@
 #include "progs.h"
 #include "static_memory.h"
 #include "tokenizer.h"
+#include "chat.h"
+#include "web.h"
 #include "sdload.h"
 
 /* Checks */
@@ -164,8 +166,9 @@ static void help(void)
 #ifdef CSR_SD_BASE
     puts("  sdinit [mhz]      - SD card / eMMC init (the widest bus that reads; 50 MHz high speed when taken)");
     puts("  sdload c b s n    - n 512-byte blocks from sector s into channel c's window at b");
-    puts("  sdboot            - the image on the SD card: weights, hdrload, tokload");
-    puts("  sdsave            - the uploaded model (and tokenizer) to the SD card, booted at power-up");
+    puts("  sdboot [slot]     - a model on the SD card / eMMC: weights (CRC-checked), hdrload, tokload");
+    puts("  sdsave [slot] [label] - the uploaded model (and tokenizer) to a slot");
+    puts("  sdls              - the slots on the card; sddefault slot - the one booted at power-up");
     puts("  sdwtest s         - write a pattern block at sector s and read it back");
 #endif
     puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
@@ -1035,6 +1038,8 @@ static void genb_cmd(char *args)
 // The tokenizer runs here: a plain serial terminal is the whole client. The conversation lives
 // in the prompt buffer and continues from the KV cache, as genb's.
 
+static void (*chat_out)(const uint8_t *b, uint32_t n);   // chat_turn's reply bytes.
+
 static void chat_emit(int id)
 {
     const struct ttok *t = tok_get();
@@ -1044,8 +1049,74 @@ static void chat_emit(int id)
         return;                   // Template tokens are structure, not text.
     uint32_t len;
     const uint8_t *b = ttok_piece(t, id, &len);
-    for (uint32_t i = 0; i < len; i++)
-        putchar(b[i]);            // UTF-8 bytes: the terminal joins a split character.
+    chat_out(b, len);             // UTF-8 bytes: the reader joins a split character.
+}
+
+static void chat_putbytes(const uint8_t *b, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; i++)
+        putchar(b[i]);
+}
+
+// The conversation (pbuf) the console `chat` and the web page share.
+static int chat_first = 1, chat_prev_closed = 1;
+
+int chat_ready(void)
+{
+    const struct ttok *t = tok_get();
+    const struct bons_header *h = model_header();
+    return t && t->im_end >= 0 && h && h->magic == BONS_MAGIC;
+}
+
+void chat_reset(void)
+{
+    pbuf_n = pbuf_kv = pbuf_base = 0;
+    chat_first = chat_prev_closed = 1;
+}
+
+// One turn: `line` in, the reply's bytes to `out` as they come (nmax tokens at most).
+int chat_turn(const char *line, int nmax, void (*out)(const uint8_t *b, uint32_t n),
+              struct chat_result *res)
+{
+    const struct ttok *t = tok_get();
+    memset(res, 0, sizeof(*res));
+    // Past half the buffer with the KV ring: room for a long turn and its reply.
+    if (pbuf_n > PBUF_N/2)
+        pbuf_make_room(PBUF_N/2);
+    int n = ttok_turn(t, line, NULL, chat_first, chat_prev_closed, pbuf + pbuf_n, PBUF_N - pbuf_n);
+    if (pbuf_n + n + nmax > PBUF_N) {        // The context is full: start over with this turn.
+        res->restarted = 1;
+        pbuf_n = pbuf_kv = pbuf_base = 0;
+        n = ttok_turn(t, line, NULL, 1, 1, pbuf, PBUF_N);
+    }
+    pbuf_n += n;
+    int before = pbuf_n, stop = t->im_end;
+    infer_set_stop(&stop, 1);
+    infer_set_recent(pbuf, &pbuf_n);
+    int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
+    if (resident == 0)
+        infer_set_pin(before);              // A fresh conversation: its first turn stays attended.
+    uint64_t t0 = perf_now64();
+    chat_out = out;
+    infer_set_base(pbuf_base);
+    int r = infer_generate_from(pbuf, before, resident, nmax, chat_emit);
+    pbuf_kv     = infer_kv_resident();      // Relative to pbuf: before the base goes back to 0.
+    infer_set_base(0);
+    uint64_t dt = perf_now64() - t0;
+    pbuf_serial = infer_gen_serial();
+    infer_set_stop(&stop, 0);
+    res->tokens  = pbuf_n - before;
+    res->ms      = (uint32_t)(dt/(CONFIG_CLOCK_FREQUENCY/1000));
+    chat_prev_closed = res->tokens > 0 && pbuf[pbuf_n - 1] == t->im_end;
+    res->capped  = !chat_prev_closed;
+    chat_first = 0;
+    res->context = pbuf_base + pbuf_n;
+    if (r < 0 || engine_wedged) {
+        res->error = 1;
+        if (engine_wedged) engine_recover();
+        chat_reset();
+    }
+    return res->error ? -1 : 0;
 }
 
 // One line from the console, echoed; backspace removes a whole UTF-8 character. -1 on Ctrl-D.
@@ -1079,18 +1150,15 @@ static int chat_readline(char *buf, int cap)
 
 static void chat_cmd(char *args)
 {
-    const struct ttok *t = tok_get();
-    const struct bons_header *h = model_header();
-    if (!t || t->im_end < 0 || !h || h->magic != BONS_MAGIC) {
-        puts(t ? "chat: no model (hdrload)" : "chat: no tokenizer (tokload)");
+    if (!chat_ready()) {
+        puts(tok_get() ? "chat: no model (hdrload)" : "chat: no tokenizer (tokload)");
         return;
     }
     char *a = get_token(&args);
     int nmax = *a ? parse_int(a) : 512;
     if (nmax < 1 || nmax > PBUF_N/2) nmax = 512;
     char *line = (char *)TRIXIUM_CHAT_LINE_ADDR;
-    int first = 1, prev_closed = 1;
-    pbuf_n = pbuf_kv = pbuf_base = 0;
+    chat_reset();
     puts("TriXium chat, the tokenizer on the board: /reset clears the conversation, /exit or Ctrl-D leaves");
     while (1) {
         printf("\nyou> ");
@@ -1108,48 +1176,20 @@ static void chat_cmd(char *args)
         if (ln == 0)
             continue;
         if (strcmp(line, "/reset") == 0) {
-            pbuf_n = pbuf_kv = pbuf_base = 0; first = prev_closed = 1;
+            chat_reset();
             puts("(conversation cleared)");
             continue;
         }
-        // Past half the buffer with the KV ring: room for a long turn and its reply.
-        if (pbuf_n > PBUF_N/2)
-            pbuf_make_room(PBUF_N/2);
-        int n = ttok_turn(t, line, NULL, first, prev_closed, pbuf + pbuf_n, PBUF_N - pbuf_n);
-        if (pbuf_n + n + nmax > PBUF_N) {    // The context is full: start over with this turn.
-            puts("(context full: conversation restarted)");
-            pbuf_n = pbuf_kv = pbuf_base = 0;
-            n = ttok_turn(t, line, NULL, 1, 1, pbuf, PBUF_N);
-        }
-        pbuf_n += n;
-        int before = pbuf_n, stop = t->im_end;
+        struct chat_result res;
         printf("bonsai> ");
-        infer_set_stop(&stop, 1);
-        infer_set_recent(pbuf, &pbuf_n);
-        int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
-        if (resident == 0)
-            infer_set_pin(before);          // A fresh conversation: its first turn stays attended.
-        uint64_t t0 = perf_now64();
-        infer_set_base(pbuf_base);
-        int r = infer_generate_from(pbuf, before, resident, nmax, chat_emit);
-        pbuf_kv     = infer_kv_resident();  // Relative to pbuf: before the base goes back to 0.
-        infer_set_base(0);
-        uint64_t dt = perf_now64() - t0;
-        pbuf_serial = infer_gen_serial();
-        infer_set_stop(&stop, 0);
-        int got = pbuf_n - before;
-        prev_closed = got > 0 && pbuf[pbuf_n - 1] == t->im_end;
-        first = 0;
-        uint32_t ms = (uint32_t)(dt/(CONFIG_CLOCK_FREQUENCY/1000));
-        printf("\n[%d tokens in %lu.%01lu s, context %d%s]\n", got, (unsigned long)(ms/1000),
-               (unsigned long)(ms%1000/100), pbuf_base + pbuf_n, prev_closed ? "" : ", capped");
-        if (r < 0 || engine_wedged) {
+        chat_turn(line, nmax, chat_putbytes, &res);
+        if (res.restarted)
+            printf("\n(context full: conversation restarted)");
+        printf("\n[%d tokens in %lu.%01lu s, context %d%s]\n", res.tokens, (unsigned long)(res.ms/1000),
+               (unsigned long)(res.ms%1000/100), res.context, res.capped ? ", capped" : "");
+        if (res.error)
             puts("(generation error: conversation restarted)");
-            if (engine_wedged) engine_recover();
-            pbuf_n = pbuf_kv = pbuf_base = 0; first = prev_closed = 1;
-        }
     }
-    pbuf_base = 0;
     puts("(chat ended)");
 }
 
@@ -1701,10 +1741,20 @@ static void console_service(void)
         }
     }
 #if TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
-    else if (strcmp(token, "sdsave") == 0)
-        sd_save();
-    else if (strcmp(token, "sdboot") == 0) {
-        if (sd_boot() == 0) {
+    else if (strcmp(token, "sdsave") == 0) {      // sdsave [slot] [label]
+        char *a = get_token(&str), *label = get_token(&str);
+        sd_save(*a ? (int)strtoul(a, NULL, 0) : 0, label);
+    } else if (strcmp(token, "sdls") == 0)
+        sd_list();
+    else if (strcmp(token, "sddefault") == 0) {   // sddefault slot: the one the power-up boots
+        char *a = get_token(&str);
+        sd_set_default(*a ? (int)strtoul(a, NULL, 0) : 0);
+    } else if (strcmp(token, "sdboot") == 0) {     // sdboot [slot] (default: the boot slot)
+        char *a = get_token(&str);
+        int slot = *a ? (int)strtoul(a, NULL, 0) : -1;
+        if (slot < 0)
+            slot = (sd_init_done() || sd_init(50, 1000) == 0) ? sd_default_slot() : 0;
+        if (sd_boot(slot) == 0) {
             hdrload();
             engine_fetch(0, TOK_STAGING, 1, 0xC000);   // A tokenizer on the card: load it too.
             if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
@@ -1777,7 +1827,7 @@ int main(void)
         while (!skip && perf_now64() - t_wait < CONFIG_CLOCK_FREQUENCY)
             if (readchar_nonblock())
                 skip = getchar() == 's';
-        if (!skip && sd_boot() == 0 && hdrload_staged(1) >= 0) {
+        if (!skip && sd_boot(sd_default_slot()) == 0 && hdrload_staged(1) >= 0) {
             engine_fetch(0, TOK_STAGING, 1, 0xC000);
             if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
                 tok_load();
@@ -1912,11 +1962,26 @@ int main(void)
 boot_demo_done:
     hwops_init(); // Leave the shell on the fast path, not on the debug fallbacks.
     SIM_MARK("ready");
+#ifdef TRIXIUM_WEB_IP
+    // The chat page on the CPU's own MAC (net.c, web.c), served between console commands.
+    {
+        uint8_t mac[6] = {TRIXIUM_WEB_MAC_HI >> 8, TRIXIUM_WEB_MAC_HI & 0xff, TRIXIUM_WEB_MAC_LO >> 24,
+                          (TRIXIUM_WEB_MAC_LO >> 16) & 0xff, (TRIXIUM_WEB_MAC_LO >> 8) & 0xff, TRIXIUM_WEB_MAC_LO & 0xff};
+        net_platform_init();
+        web_init(mac, (uint32_t)TRIXIUM_WEB_IP);
+        uint32_t ip = TRIXIUM_WEB_IP;
+        printf("WEB http://%d.%d.%d.%d/\n", (int)(ip >> 24), (int)((ip >> 16) & 0xff),
+               (int)((ip >> 8) & 0xff), (int)(ip & 0xff));
+    }
+#endif
     puts("TRIXIUM-READY");
     printf("trixium> ");
 
     while (1) {
         console_service();
+#ifdef TRIXIUM_WEB_IP
+        web_service();
+#endif
     }
     return 0;
 }
