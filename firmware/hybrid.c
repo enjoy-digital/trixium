@@ -134,10 +134,16 @@ int hybrid_softmax_div;                  // Console `softmaxdiv on`: the per-pos
 // slots kept. Console `kvring off`: the old hard stop at ctx_cap.
 int hybrid_kv_ring = 1;
 #define KV_SINKS 4
+// Positions kept for good past the window: at least the KV_SINKS, a chat's whole first turn (its
+// system prompt and first message, hybrid_set_pin before the generation's reset) up to a
+// quarter of the window: what the conversation is about stays attended to.
+static int kv_pin = KV_SINKS, kv_pin_next = KV_SINKS;
+
+void hybrid_set_pin(int n) { kv_pin_next = n; }
 
 static int kv_ring_on(void)
 {
-    return hybrid_kv_ring && ctx_cap > 2*KV_SINKS;
+    return hybrid_kv_ring && ctx_cap > 2*kv_pin;
 }
 
 // The KV slot of position p (p < ctx_cap: p itself).
@@ -145,7 +151,7 @@ static uint32_t kv_slot(int p)
 {
     if (p < ctx_cap)
         return (uint32_t)p;
-    return (uint32_t)(KV_SINKS + (p - KV_SINKS) % (ctx_cap - KV_SINKS));
+    return (uint32_t)(kv_pin + (p - kv_pin) % (ctx_cap - kv_pin));
 }
 int hybrid_softmax_unit = 1;             // Console `softmaxunit off`: the CPU softmax instead of unit 14.
 int hybrid_dn_list = 1;                  // Console `dnlist off`: the DeltaNet heads op through the CSRs
@@ -1035,6 +1041,9 @@ static int dn_conv_zero(void)
 void hybrid_reset(void)
 {
     pos = 0;
+    kv_pin = kv_pin_next < KV_SINKS ? KV_SINKS : kv_pin_next > ctx_cap/4 ? ctx_cap/4 : kv_pin_next;
+    if (kv_pin < KV_SINKS) kv_pin = KV_SINKS;
+    kv_pin_next = KV_SINKS;            // One generation's: gen/bench take the default.
 #ifdef TRIXIUM_HAS_ATTNSTREAM
     HP->attnstream_active = HP->attnstream_enabled && at_geom_ok && resident_active();
 #endif

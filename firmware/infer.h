@@ -30,6 +30,7 @@ uint32_t infer_gen_serial(void);    // Bumped by every generation.
 int  infer_context_capacity(void); // Actual allocation, not the image's requested max_ctx.
 int  infer_context_unbounded(void); // A hybrid with the KV ring: generation goes past the capacity.
 void infer_set_base(int base);     // infer_generate_from's buf[0] is this position (default 0).
+void infer_set_pin(int n);         // A fresh generation keeps its first n positions past the window.
 struct infer_prefill_profile {
     uint64_t reset_cycles, prefill_cycles;
     uint32_t tokens, forwards;

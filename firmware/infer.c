@@ -1963,6 +1963,7 @@ int infer_generate(const int *prompt, int n_prompt, int max_new, void (*emit)(in
 // The chat clients keep the conversation on the card (tokclr/tok/genb), so without this
 // every turn would re-run the whole history and the first-token latency would grow with it.
 void infer_set_base(int base) { buf_base = base; }
+void infer_set_pin(int n) { if (hybrid_present()) hybrid_set_pin(n); }
 
 int infer_context_unbounded(void)
 {

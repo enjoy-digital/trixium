@@ -364,7 +364,7 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
 
     # Copy.
     remote.ssh(f"mkdir -p {shlex.quote(conf['dir'])} && cd {shlex.quote(conf['dir'])} && mkdir -p prog "
-        "gen/software/include/generated gen/driver/kernel gen/driver/user/liblitepcie user "
+        "gen/software/include/generated gen/driver/kernel gen/driver/user/liblitepcie user lib "
         "software/host software/lab models/1.7b models/8b models/27b", cd=False, check=True)
     # The remote tree keeps the repository's layout, so `python3 -m software.host.X` (and the
     # card-side clients software.lab.mirror / software.lab.fp32_check) import the same way there.
@@ -405,6 +405,8 @@ def deploy(build, board, model, reconfigure=True, boot=False, dry_run=False, app
         # Every host-tool source: the loader module, the tools and their Makefile change together.
         remote.scp([os.path.join("software", "user", f) for f in ["trixium_loader.c", "trixium_loader.h", "trixium_state.c",
             "trixium_load.c", "trixium_chat.c", "trixium_smi.c", "Makefile"]], "user/")
+        # trixium_chat's tokenizer is the firmware's (software/lib, ../lib from user/).
+        remote.scp([os.path.join("software", "lib", f) for f in ["trixium_tok.c", "trixium_tok.h"]], "lib/")
         # The tokenizers (the C chat tool wants the .bin, the Python client the .json).
         for m in ["1.7b", "8b", "27b", "2b", "4b"]:
             if os.path.exists(os.path.join(REPO, "models", m, "tokenizer.bin")):

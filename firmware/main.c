@@ -320,6 +320,22 @@ static int      pbuf_kv;      // pbuf[0..pbuf_kv) are in the KV cache (from the 
 static uint32_t pbuf_serial;  // ...as long as no other generation ran since.
 static int      pbuf_base;    // pbuf[0] is this position (chat dropped older, resident tokens).
 
+// Room for `need` more tokens in pbuf. With the KV ring (a hybrid model) the oldest tokens, already
+// in the ring and the DeltaNet state, go (pbuf keeps a quarter of its size of the latest) and the
+// conversation goes on from the same position; 0 when there is room.
+static int pbuf_make_room(int need)
+{
+    int resident = pbuf_serial == infer_gen_serial() ? pbuf_kv : 0;
+    if (pbuf_n + need <= PBUF_N)
+        return 0;
+    if (!infer_context_unbounded() || resident <= PBUF_N/4 || resident > pbuf_n)
+        return -1;
+    int drop = resident - PBUF_N/4;
+    memmove(pbuf, pbuf + drop, (size_t)(pbuf_n - drop)*sizeof(pbuf[0]));
+    pbuf_n -= drop; pbuf_kv -= drop; pbuf_base += drop;
+    return pbuf_n + need <= PBUF_N ? 0 : -1;
+}
+
 static void emit_token(int tok)
 {
     printf(" %d", tok);
@@ -962,6 +978,8 @@ static void tok_cmd(char *args)
             printf("TOK ERR bad id %d (vocab %lu)\n", id, (unsigned long)vocab);
             return;
         }
+        if (pbuf_n == PBUF_N)
+            pbuf_make_room(1);
         if (pbuf_n < PBUF_N)
             pbuf[pbuf_n++] = id;
     }
@@ -987,6 +1005,7 @@ static void genb_cmd(char *args)
         puts("usage: tok <ids...> ; genb <n> [stop ids...]");
         return;
     }
+    pbuf_make_room(n);                    // The reply's tokens join pbuf too.
     printf("GEN:");
     gen_emit_to_pbuf = 1;
     infer_set_stop(stop, nstop);
@@ -994,6 +1013,8 @@ static void genb_cmd(char *args)
     // Continue from the KV cache when the buffer's head is still what the last genb left
     // there (gen/bench in between reset it); otherwise the whole buffer is re-forwarded.
     int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
+    if (resident == 0)
+        infer_set_pin(pbuf_n);            // A fresh conversation: its first turn stays attended.
     infer_set_base(pbuf_base);
     int r = infer_generate_from(pbuf, pbuf_n, resident, n, emit_token);
     pbuf_kv     = infer_kv_resident();     // Relative to pbuf: before the base goes back to 0.
@@ -1091,15 +1112,9 @@ static void chat_cmd(char *args)
             puts("(conversation cleared)");
             continue;
         }
-        // Past half the buffer with the KV ring (a hybrid model): drop the oldest tokens, already
-        // in the KV ring and the DeltaNet state, and go on from the same position.
-        int resident_now = pbuf_serial == infer_gen_serial() ? pbuf_kv : 0;
-        if (pbuf_n > PBUF_N/2 && infer_context_unbounded() && resident_now > PBUF_N/4 &&
-            resident_now <= pbuf_n) {
-            int drop = resident_now - PBUF_N/4;
-            memmove(pbuf, pbuf + drop, (size_t)(pbuf_n - drop)*sizeof(pbuf[0]));
-            pbuf_n -= drop; pbuf_kv -= drop; pbuf_base += drop;
-        }
+        // Past half the buffer with the KV ring: room for a long turn and its reply.
+        if (pbuf_n > PBUF_N/2)
+            pbuf_make_room(PBUF_N/2);
         int n = ttok_turn(t, line, NULL, first, prev_closed, pbuf + pbuf_n, PBUF_N - pbuf_n);
         if (pbuf_n + n + nmax > PBUF_N) {    // The context is full: start over with this turn.
             puts("(context full: conversation restarted)");
@@ -1112,6 +1127,8 @@ static void chat_cmd(char *args)
         infer_set_stop(&stop, 1);
         infer_set_recent(pbuf, &pbuf_n);
         int resident = (pbuf_serial == infer_gen_serial()) ? pbuf_kv : 0;
+        if (resident == 0)
+            infer_set_pin(before);          // A fresh conversation: its first turn stays attended.
         uint64_t t0 = perf_now64();
         infer_set_base(pbuf_base);
         int r = infer_generate_from(pbuf, before, resident, nmax, chat_emit);

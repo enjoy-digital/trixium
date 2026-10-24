@@ -745,7 +745,7 @@ static void header(int devnum, int ntok, const char *sampling)
     putchar('\n');
     box_rule(W, "╭", "TriXium chat", "╮");
     box_line(W, "%s%s%s  ·  %s", UI_BOLD, g_model, UI_RESET, card);
-    box_line(W, "%s%d layers · 2048-token context · %s · replies up to %d tokens%s", UI_DIM,
+    box_line(W, "%s%d layers · 2048-token window · %s · replies up to %d tokens%s", UI_DIM,
              g_layers, sampling ? "sampled" : "greedy", ntok, UI_RESET);
     box_line(W, "%sthe model runs on the card, this host only tokenizes%s%s", UI_DIM,
              g_chat ? " · thinking off" : " · raw completion", UI_RESET);
@@ -761,7 +761,7 @@ static void reply_stats(int ng, double dt, double first, double rate, int ctx, i
     if (fill > cells) fill = cells;
     for (int i = 0; i < cells; i++) strcat(bar, i < fill ? "█" : "░");
     (void)dt;
-    /* Fits the 72-column box: the header already gives the 2048-token context. */
+    /* Fits the 72-column box; past the 2048-token window the card keeps the first turn and a ring. */
     printf("\n%s  %d tokens%s · first %.2f s · %s%.1f tok/s%s%s · context %d %s%s%s\n\n",
            UI_DIM, ng, cut ? ", capped" : "", first, UI_TEAL, rate, UI_RESET, UI_DIM, ctx,
            UI_TEAL, bar, UI_RESET);
@@ -792,7 +792,8 @@ static void usage(FILE *f)
            "\n"
            "generation:\n"
            "-n tokens      Reply cap (default = 256; a reply ends at <|im_end|> anyway, the cap\n"
-           "               is for runaways; the card holds 2048 tokens of conversation).\n"
+           "               is for runaways; past its 2048-token window the card keeps the first turn\n"
+           "               and a ring of the latest positions).\n"
            "-r             Raw completion: no chat template, the text continues as typed.\n"
            "-S T,P,R       Sampling: temperature (0 = greedy), top-p, repetition penalty,\n"
            "               e.g. -S 0.7,0.9,1.1 (1.1 alone already breaks greedy list loops).\n"
