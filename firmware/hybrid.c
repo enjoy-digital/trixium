@@ -210,6 +210,9 @@ struct hyb_prof {
     uint64_t fd_prep, fd_mv;         // inside hyb_cyc_fdown: the down prepare, the down matvec
     uint8_t keep_out;                // the mixer/FFN outputs stay in RS_F for the residual add
     uint8_t xres_on;                 // the resident residual stream runs this forward (out_resid_*)
+    uint8_t xres_row;                // the batched prefill's row whose residual slot XRES_SP names
+    uint8_t prefill2;                // console `prefill2 on|off`: two prompt tokens per weight pass
+    uint8_t pair_geom;               // the model fits the batched FFN lists: 0 unknown, 1 yes, 2 no
 };
 #define HP ((struct hyb_prof *)TRIXIUM_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -404,7 +407,9 @@ static void rmsnorm_fv(float *dst, const float *src, const float *w, int n)
     for (; i < n; i++) dst[i] = src[i]*r*w[i];
 }
 
-#define XRES_SP   0x36600u        // the resident residual stream (above the persistent map)
+#define XRES_SP0  0x36600u        // the resident residual stream (above the persistent map)
+#define XRES_SP1  (XRES_SP0 + 0x2800u) // the batched prefill's second row's (n_embd <= 2560)
+#define XRES_SP   (HP->xres_row ? XRES_SP1 : XRES_SP0)
 // hb's main-RAM copy for the CPU paths. Untraced, the residual list leaves hb in RS_F and stores
 // nothing (a STORE descriptor, 8 KB flushed and 8 KB invalidated at every list, 49 times a
 // token); the resident consumers take it from RS_F (rl_rsf_is). A CPU reader of hb (a declined
@@ -947,6 +952,9 @@ int hybrid_init(void)
     SIM_MARK("hybrid: reset");
     HP->dnres_enabled = 0;
     HP->xres_enabled = 0;
+    HP->xres_row = 0;
+    HP->prefill2 = 1;
+    HP->pair_geom = 0;
     if (H->hadamard_block && resident_available()) {
         if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
@@ -1464,7 +1472,7 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         (trixium_seq_conv_abi_read() >> 16) != 1)
         return -1;
 #ifdef DN_STATE_HW
-    if (dn_hw && (SLOT0 + 2u*DN_HEAD_BYTES > XRES_SP || nv > 64))
+    if (dn_hw && (SLOT0 + 2u*DN_HEAD_BYTES > XRES_SP0 || nv > 64))
         return -1;                     // the two head-state slots must fit below x
 #endif
     struct bns_seq_descriptor d;
@@ -1824,7 +1832,7 @@ fatal:
 static int xres_ok(void)
 {
     return HP->xres_enabled && resident_active() && n_embd % 8 == 0 && n_embd <= 8192 &&
-           XRES_SP + 4u*(uint32_t)n_embd <= 0x3C000u &&
+           XRES_SP0 + 4u*(uint32_t)n_embd <= 0x3C000u &&
            (trixium_seq_norm_abi_read() >> 16) == 1 && (trixium_seq_conv_abi_read() >> 16) == 1;
 }
 
@@ -2795,4 +2803,262 @@ int hybrid_forward(int token, int want_logits)
     int r = head_argmax(t0);
     perf_exit(OP_LMHEAD);
     return r;
+}
+
+/* Batched Prefill */
+/*-----------------*/
+
+// Two prompt tokens (positions p, p+1) forwarded layer-major with the multi-row matvec
+// (doc/plan-multirow.md, an engine built with nrows >= 2: CSR_TRIXIUM_ENGINE_CSR_NR_ADDR). Per
+// layer, each token in turn runs the attention norm, its mixer (DeltaNet or attention: the state
+// carried from token to token stays strictly sequential) and the residual add with the FFN norm,
+// exactly as hybrid_forward does, on its own residual slot (XRES_SP0 / XRES_SP1); then one FFN
+// pass streams the gate, up and down weights once for both: each token's FFN input normed again
+// from its slot and prepared with its own exponent, the matvecs with two activation rows
+// (rl_matvec2), every row restored with its own exponent beat, SiLU-multiply per row, the down
+// projection added into each slot. Each row's arithmetic is the single-token arithmetic, so the
+// activations, the K/V rows and the DeltaNet state are bit-identical to two hybrid_forward calls.
+// No logits (prefill: the caller forwards the last prompt token alone).
+//
+// Per row: pos, the DeltaNet set parity (row 0 reads set p and writes p^1, row 1 reads p^1
+// and writes p), the residual slot, the trace position (infer_dbg_row) and the list image
+// cache's salt (row 1's lists name the second slot; row 0's are the single-token images).
+#if defined(DNRES_BUILT) && defined(CSR_TRIXIUM_ENGINE_CSR_NR_ADDR)
+
+#define P2_FIX1 (RS_Q8B_ADDR + 0x800u)   // row 1's SiLU fixup bitmap (row 0's at RS_Q8B)
+
+static int pair_geom(void)
+{
+    if (HP->pair_geom)
+        return HP->pair_geom == 1;
+    HP->pair_geom = 2;
+    uint32_t n = (uint32_t)n_embd, F = (uint32_t)ffn_dim;
+    // Scratchpad: gate rows in RS_F, up rows then the activations in RS_Y, both rows' Q8 in the
+    // persistent region, the second residual slot below the sign bits.
+    if (n % 32 || F % 32 || F < n || F > 16384u || 4u*4u*F > RS_F_ADDR - RS_Y_ADDR ||
+        2u*4u*F > 0x32000u - RS_F_ADDR || 2u*F > RS_E8_ADDR - RS_XW_ADDR || F/32u > 0xFFFu ||
+        XRES_SP0 + 4u*n > XRES_SP1 || XRES_SP1 + 4u*n > 0x3C000u)
+        return 0;
+    for (int l = 0; l < n_layer; l++) {
+        const struct bons_entry *e[3] = {model_entry(ROLE_FFN_GATE, l), model_entry(ROLE_FFN_UP, l),
+                                         model_entry(ROLE_FFN_DOWN, l)};
+        for (int k = 0; k < 3; k++) {
+            uint32_t rows = k == 2 ? n : F, cols = k == 2 ? F : n;
+            if (!e[k] || (e[k]->flags & FLAG_KSEG) || e[k]->rows != rows || e[k]->cols != cols ||
+                (e[k]->kind != KIND_TERNARY && e[k]->kind != KIND_TERNARY5) ||
+                rows % 8 || rows % (uint32_t)n_ch)
+                return 0;
+        }
+        if (!norm_ffn[l] || !norm_attn[l])
+            return 0;
+    }
+    HP->pair_geom = 1;
+    return 1;
+}
+
+static int pair_ok(void)
+{
+    return HP->prefill2 && xres_ok() && resident_silu_active() && H->hadamard_block && pair_geom();
+}
+
+static void pair_row(int r, int p0, int par0)
+{
+    pos = p0 + r;
+    dn_par = dn_set_bytes ? par0 ^ r : par0;
+    HP->xres_row = (uint8_t)r;
+    resident_listcache_salt(r ? 0x9A1B0000u | (uint32_t)r : 0u);
+    infer_dbg_row(r);
+}
+
+// The current row's layer l up to the FFN (hybrid_forward's loop body on the resident residual
+// stream, the attention norm never fused into the previous FFN's list).
+static int pair_seg(int l)
+{
+    int traced = infer_dbg_armed();
+    HP->keep_out = !traced;
+    uint64_t t0 = perf_now64();
+    perf_enter(OP_RMSNORM);
+    int rc = xres_list(NULL, norm_attn[l], l == 0, 0);
+    hyb_cyc_anorm += perf_now64() - t0;
+    perf_exit(OP_RMSNORM);
+    if (rc) return -1;
+    infer_dbg_f32("attn_norm", l, hb, n_embd);
+    t0 = perf_now64();
+    int resid_done = 0;
+    if (dn_slot[l] >= 0) {
+        rc = deltanet_layer_resident(l, hb, tmp_h);
+        if (rc == -2) return -1;
+        if (rc == 1) { resid_done = 1; rc = 0; }
+        if (rc)
+            deltanet_layer(l, hb, tmp_h);
+        hyb_cyc_dn += perf_now64() - t0;
+    } else {
+        perf_enter(OP_ATTN);
+        rc = attention_layer(l, hb, tmp_h);
+        hyb_cyc_attn += perf_now64() - t0;
+        perf_exit(OP_ATTN);
+        if (rc == -2) return -1;
+        resid_done = rc == 1;
+    }
+    infer_dbg_f32(dn_slot[l] >= 0 ? "dn_out" : "attn_out", l, tmp_h, n_embd);
+    t0 = perf_now64();
+    perf_enter(OP_RESID_ADD);
+    rc = !resid_done && xres_list(tmp_h, norm_ffn[l], 0, traced);
+    hyb_cyc_resid += perf_now64() - t0;
+    perf_exit(OP_RESID_ADD);
+    if (rc) return -1;
+    infer_dbg_f32("attn_res", l, xb, n_embd);
+    infer_dbg_f32("ffn_norm", l, hb, n_embd);
+    return 0;
+}
+
+// Both rows' FFN of layer l, added into their residual slots: two lists (gate/up/SiLU, then
+// down/residual), the unit 11 fixups patched between them. The trace reads its taps from the
+// scratchpad, so the lists are the same traced or not.
+static int ffn_pair(int l, int p0, int par0)
+{
+    const struct bons_entry *gate = model_entry(ROLE_FFN_GATE, l), *up = model_entry(ROLE_FFN_UP, l);
+    const struct bons_entry *down = model_entry(ROLE_FFN_DOWN, l);
+    const uint32_t n = (uint32_t)n_embd, F = (uint32_t)ffn_dim, fq = 4u*F, nq = 4u*n;
+    const uint32_t ACT = RS_Y_ADDR + 2u*fq;               // the activations, above the up rows
+    const uint32_t slot[2] = {XRES_SP0, XRES_SP1}, e8[2] = {RS_E8_ADDR, RS_E8B_ADDR};
+    const uint32_t fix[2] = {RS_Q8B_ADDR, P2_FIX1};
+    const uint32_t gdst[2] = {RS_F_ADDR, RS_F_ADDR + fq}, udst[2] = {RS_Y_ADDR, RS_Y_ADDR + fq};
+    const uint32_t adst[2] = {ACT, ACT + fq}, ddst[2] = {RS_F_ADDR, RS_F_ADDR + nq};
+    struct bns_seq_descriptor d;
+#define SPF(a) ((const float *)(SCRATCHPAD_BASE + (a)))
+    resident_listcache_salt(0);
+    uint64_t t0 = perf_now64();
+    perf_enter(OP_FFN_PROJ);
+    // A: both rows' FFN norm (from the slots: the segments left only the second row's in RS_F)
+    // and prepare, gate and up for two rows (gate restored into RS_F, up in place), SiLU-multiply.
+    rl_begin_keyed(0x0F000000u | (uint32_t)l << 8, (uint32_t)(uintptr_t)gate, (uint32_t)(uintptr_t)up);
+    rl_fetch_raw(norm_ffn[l], nq, RS_Y_ADDR);             // the norm weight (cleaned at load)
+    for (int r = 0; r < 2; r++) {
+        bns_seq_desc_norm(&d, 0, slot[r], RS_F_ADDR, RS_Y_ADDR, n, 1, f32_bits(rms_eps));
+        rl_desc(&d);
+        rl_prepare_sp(RS_F_ADDR, n, 1, RS_XW_ADDR + (uint32_t)r*n, e8[r]);
+    }
+    rl_matvec2(gate, RS_XW_ADDR, n, e8, RS_Y_ADDR, gdst);
+    rl_matvec2(up,   RS_XW_ADDR, n, e8, RS_Y_ADDR, udst);
+    for (int r = 0; r < 2; r++) {
+        bns_seq_desc_silu(&d, gdst[r], udst[r], adst[r], fix[r], F);
+        rl_desc(&d);
+    }
+    // A runs while the CPU builds B (the other descriptor bank); the fixups are patched between
+    // the two lists, B then posted (the next layer's first list waits for it) unless traced.
+    int rc = rl_start("ffn2 activation");
+    if (rc) {
+        perf_exit(OP_FFN_PROJ);
+        return -1;
+    }
+    int traced = 0;
+    for (int r = 0; r < 2; r++) {
+        pair_row(r, p0, par0);
+        traced |= infer_dbg_armed() != 0;
+    }
+    resident_listcache_salt(0);
+    // B: both rows' activations prepared, down for two rows (restored into RS_F), each added
+    // into its slot.
+    rl_begin_keyed(0x0F000001u | (uint32_t)l << 8, (uint32_t)(uintptr_t)down, 0);
+    for (int r = 0; r < 2; r++)
+        rl_prepare_sp(adst[r], F, 1, RS_XW_ADDR + (uint32_t)r*F, e8[r]);
+    rl_matvec2(down, RS_XW_ADDR, F, e8, RS_Y_ADDR, ddst);
+    for (int r = 0; r < 2; r++) {
+        bns_seq_desc_add(&d, slot[r], ddst[r], slot[r], n);
+        rl_desc(&d);
+    }
+    rc = rl_wait();
+    if (!rc) {
+        int fixups = 1;
+#ifdef CSR_TRIXIUM_SEQ_SILU_FIXUPS_ADDR
+        fixups = trixium_seq_silu_fixups_read() != 0;
+#endif
+        for (int r = 0; r < 2 && fixups; r++)
+            resident_silu_patch(gdst[r], udst[r], adst[r], fix[r], F, 0, 0, 0);
+    }
+    hyb_cyc_fproj += perf_now64() - t0;
+    perf_exit(OP_FFN_PROJ);
+    if (rc) return -1;
+    for (int r = 0; r < 2; r++) {          // the trace's taps (nothing when not armed)
+        pair_row(r, p0, par0);
+        infer_dbg_f32("ffn_gate", l, SPF(gdst[r]), F);
+        infer_dbg_f32("ffn_up", l, SPF(udst[r]), F);
+        infer_dbg_f32("ffn_act", l, SPF(adst[r]), F);
+    }
+    resident_listcache_salt(0);
+    t0 = perf_now64();
+    perf_enter(OP_FFN_DOWN);
+    rc = rl_start("ffn2 down");
+    if (!rc && traced)
+        rc = rl_wait();
+    hyb_cyc_fdown += perf_now64() - t0;
+    perf_exit(OP_FFN_DOWN);
+    if (rc) return -1;
+    hb_stale = 0;                           // the next layer's segments norm again
+    for (int r = 0; r < 2; r++) {
+        pair_row(r, p0, par0);
+        infer_dbg_f32("ffn_down", l, SPF(ddst[r]), n);
+        infer_dbg_f32("ffn_res", l, SPF(slot[r]), n);
+    }
+#undef SPF
+    return 0;
+}
+#endif
+
+int hybrid_forward2_ok(void)
+{
+#if defined(DNRES_BUILT) && defined(CSR_TRIXIUM_ENGINE_CSR_NR_ADDR)
+    return H && pair_ok() && (pos + 2 <= ctx_cap || kv_ring_on());
+#else
+    return 0;
+#endif
+}
+
+void hybrid_prefill2_enable(int on) { HP->prefill2 = on ? 1 : 0; }
+int  hybrid_prefill2_enabled(void) { return HP->prefill2; }
+
+int hybrid_forward2(const int *tokens)
+{
+#if defined(DNRES_BUILT) && defined(CSR_TRIXIUM_ENGINE_CSR_NR_ADDR)
+    if (!hybrid_forward2_ok())
+        return -2;                          // nothing ran: the caller forwards one at a time
+    int p0 = pos, par0 = dn_par, rc = 0;
+    HP->xres_on = 1;
+    for (int l = 0; l < n_layer && !rc; l++) {
+        for (int r = 0; r < 2 && !rc; r++) {
+            pair_row(r, p0, par0);
+            if (l == 0) {
+                // The embedding uses the engine and xb: the previous row's lists done first.
+                resident_join();
+                uint64_t t0 = perf_now64();
+                perf_enter(OP_EMBED);
+                rc = infer_embed_f(tokens[r], xb) < 0;
+                hyb_cyc_embed += perf_now64() - t0;
+                perf_exit(OP_EMBED);
+                if (rc) break;
+                infer_dbg_f32("emb", -1, xb, n_embd);
+            }
+            rc = pair_seg(l);
+        }
+        if (!rc)
+            rc = ffn_pair(l, p0, par0);
+    }
+    resident_join();
+    HP->xres_row = 0;
+    HP->keep_out = 0;
+    resident_listcache_salt(0);
+    pos = p0 + 2;
+    dn_par = par0;                          // flipped once per token
+    hyb_forwards_profiled += 2;
+    hyb_live_publish();
+    if (rc) {
+        printf("hybrid: batched prefill failed at position %d\n", p0);
+        return -1;
+    }
+    return 0;
+#else
+    (void)tokens;
+    return -2;
+#endif
 }

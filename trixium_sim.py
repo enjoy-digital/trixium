@@ -400,7 +400,8 @@ class TriXiumSimSoC(SoCCore):
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
                  axi1_latency=24, axi1_reorder=0, axi1_targets=1, reader_n_ids=4,
-                 unit_options=(), efinix_ram=False, attn_sync_operand=False, with_sdcard=False):
+                 unit_options=(), efinix_ram=False, attn_sync_operand=False, with_sdcard=False,
+                 matvec_rows=1):
         assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
@@ -536,6 +537,7 @@ class TriXiumSimSoC(SoCCore):
             readers_cd               = "ddr" if ddr_readers else "",
             with_attnstream          = attn_geometry is not None,
             with_prefetch            = bool(prefetch),
+            matvec_rows              = matvec_rows, # Multi-row matvec (doc/plan-multirow.md).
             with_vec_fused           = vec_fused,
             reader_fifo_depth        = prefetch or 512,
             reader_max_bursts        = reader_bursts,
@@ -1015,6 +1017,8 @@ def build_sim(args, board, out_dir):
         soc_kwargs["ddr_readers"] = True
     if args.prefetch:
         soc_kwargs["prefetch"] = args.prefetch
+    if args.matvec_rows > 1:
+        soc_kwargs["matvec_rows"] = args.matvec_rows
     if args.reader_bursts:
         soc_kwargs["reader_bursts"] = args.reader_bursts
     if args.reader_ids:
@@ -1101,7 +1105,8 @@ def main():
     parser.add_argument("--with-sdcard",    action="store_true",                                   help="--board ti375: the SD card weight source on LiteSDCard's card model (firmware sdinit/sdload).")
     parser.add_argument("--axi1-targets",   default=1, type=int, choices=[1, 2],                    help="--board ti375: the channels split over the controller's two AXI targets (trixium_ti375.py --ddr-targets).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
-    parser.add_argument("--memctrl",        default=0, type=int, choices=[0, 1, 2],                 help="--board ypcb: DDR3 controllers (default: the board's two; 1 = every channel and main_ram on one, the small boards' topology).")
+    parser.add_argument("--matvec-rows",    default=1, type=int, choices=[1, 2, 3, 4],              help="Activation rows per weight beat (multi-row matvec, doc/plan-multirow.md; firmware: batched prefill).")
+    parser.add_argument("--memctrl",       default=0, type=int, choices=[0, 1, 2],                 help="--board ypcb: DDR3 controllers (default: the board's two; 1 = every channel and main_ram on one, the small boards' topology).")
     parser.add_argument("--profile",        default="full", choices=["full", "lite"],               help="--hybrid: the units' sizing (lite: the small boards' profile).")
     parser.add_argument("--port-clk-ratio", default=2.0, type=float,                               help="--board ti375 --ddr-readers: the memory port's clock over sys (2: the AXI at 200 MHz).")
     parser.add_argument("--ddr-readers",    action="store_true",                                   help="--board ypcb: the channel readers in the controllers' ddr domain (reader islands), with --pipe-clk-freq.")

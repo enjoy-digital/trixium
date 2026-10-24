@@ -496,6 +496,16 @@ int infer_dbg_armed(void)
     return dbg_armed;
 }
 
+// A batched prefill pass (forward_pair) traces each of its rows as its own forward: row r at
+// the pass's first position + r, armed when the count before the pass covered it.
+static int pair_pos0, pair_dbg0;
+
+void infer_dbg_row(int r)
+{
+    n_pos     = pair_pos0 + r;
+    dbg_armed = pair_dbg0 > r ? pair_dbg0 - r : 0;
+}
+
 static void dbg_typed(const char *tag, int layer, const void *values, uint32_t n,
                       const char *dtype)
 {
@@ -1931,6 +1941,31 @@ static int forward_checked(int token, int want_logits)
     }
 }
 
+// Two prompt tokens in one batched prefill pass (hybrid_forward2: the multi-row matvec), no
+// logits. -2: not run (the caller forwards them one at a time). Not re-runnable: the pass's
+// second token overwrites the DeltaNet state set the checkpoint names, so an uncorrectable ECC
+// read during it is only counted (infer_ecc_unrecovered); `eccforce` keeps the prefill single.
+static int forward_pair(const int *tokens)
+{
+    if (!hybrid_present() || infer_ecc_force || !hybrid_forward2_ok())
+        return -2;
+    pair_pos0 = n_pos;
+    pair_dbg0 = dbg_armed;
+    uint32_t d0 = ecc_uncorrectable();
+    int rc = hybrid_forward2(tokens);
+    if (rc == -2) {
+        n_pos = pair_pos0;
+        dbg_armed = pair_dbg0;
+        return -2;
+    }
+    infer_forwards += 2;
+    if (ecc_uncorrectable() != d0)
+        infer_ecc_unrecovered++;
+    dbg_armed = pair_dbg0 > 2 ? pair_dbg0 - 2 : 0;
+    n_pos = hybrid_pos();
+    return rc;
+}
+
 // One forward of a fixed token from the current state and back, as a retry re-runs one: the
 // read eye scan's traffic (ddr.c ddr_eye_scan). -1 when the model cannot be re-run from here
 // (no hybrid checkpoint) or the engine wedged.
@@ -2016,8 +2051,14 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
     int tok = -1;
     uint32_t prefill_f0 = infer_forwards;
     uint64_t prefill_start = perf_now64();
-    for (int i = resident; i < n; i++) {
-        tok = forward_checked(buf[i], i == n - 1);
+    for (int i = resident; i < n; ) {
+        // Two tokens per weight pass while neither is the last (whose logits are wanted).
+        if (i + 2 < n && forward_pair(buf + i) != -2) {
+            i += 2;
+        } else {
+            tok = forward_checked(buf[i], i == n - 1);
+            i++;
+        }
         if (engine_wedged) { printf(" [engine wedged during the prompt]"); return -1; }
     }
     last_prefill.prefill_cycles = perf_now64() - prefill_start;

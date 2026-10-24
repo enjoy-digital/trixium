@@ -169,6 +169,22 @@ uint32_t rl_count(void);
 void resident_rsf_set(const void *src);   // RS_F now holds src (FP32), after a list
 int  rl_rsf_is(const void *src);          // the list being built still has src in RS_F
 int  rl_wait_desc(uint32_t k);
+// Multi-row matvec (doc/plan-multirow.md, the batched prefill): the persistent Q8 region and
+// the exponent beats of two activation rows (row 1's beat in the gap below hybrid.c's residual
+// stream at 0x36600).
+#define RS_XW_ADDR  0x32000u
+#define RS_E8_ADDR  0x36400u
+#define RS_E8B_ADDR 0x365C0u
+// The prepare of the FP32 vector at scratchpad src_sp (RS_F clobbered: the Hadamard's output)
+// into Q8 slot xw and exponent beat e8.
+void rl_prepare_sp(uint32_t src_sp, uint32_t width, int rotate, uint32_t xw, uint32_t e8);
+// e (one K-segment, ternary) for two rows in one weight pass (engine nr = 1): row r's Q8 at
+// xw0 + r*xstride, its int32 results at ystage + 4*r*e->rows, restored with e8[r] into dst[r].
+// Needs CSR_TRIXIUM_ENGINE_CSR_NR_ADDR (marks the list bad otherwise).
+void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, const uint32_t e8[2],
+                uint32_t ystage, const uint32_t dst[2]);
+// A fourth word in the names of the lists built from now on (the list image cache; 0 = none).
+void resident_listcache_salt(uint32_t salt);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).
 uint32_t resident_silu_patch(uint32_t g_sp, uint32_t m_sp, uint32_t dst_sp, uint32_t fixmap_sp,
                              uint32_t n, uint32_t seg, uint32_t perm_a, uint32_t perm_b);

@@ -74,6 +74,8 @@ class TriXiumConfig:
                                            # pipes' shifters, accumulators and drain; off in hybrid builds.
     with_vec_fused: bool           = False # Vector unit: fused clamp/round instructions (asm.fuse).
     attnstream_options: tuple      = ()    # (name, value) overrides of the unit's arguments.
+    matvec_rows: int               = 1     # Activation rows per weight beat (doc/plan-multirow.md): the
+                                           # engine's nrows and the sequencer's matvec_rows (1..4).
 
     def __post_init__(self):
         if (self.with_hadamard or self.with_activation_quantize or self.with_projection_restore
@@ -94,6 +96,8 @@ class TriXiumConfig:
             raise ValueError("scratchpad must contain a whole number of 32-byte beats")
         if self.loader_data_width not in (32, 64, 128, 256):
             raise ValueError("upload stream width must divide 256 bits")
+        if not 1 <= self.matvec_rows <= 4:
+            raise ValueError("matvec_rows must be 1..4")
         if self.readers_cd and not self.pipe_clk:
             raise ValueError("readers in the memory's domain need the pipe clock island (pipe_clk)")
 
@@ -170,7 +174,8 @@ class TriXiumCore(LiteXModule):
             with_conv                = config.with_conv,
             with_softmax             = config.with_softmax,
             norm_rope                = config.norm_rope,
-            scratchpad_size          = config.scratchpad_size))
+            scratchpad_size          = config.scratchpad_size,
+            matvec_rows              = config.matvec_rows))
         for name in ("TRIXIUM_HAS_SEQ", "TRIXIUM_SEQ_OVERLAP"):
             self.add_constant(name)
         if config.with_vecunit:
@@ -272,7 +277,10 @@ class TriXiumCore(LiteXModule):
             pipe_cd    = "peng" if config.pipe_clk else None,
             readers_cd = "reng" if config.readers_cd else None,
             read_axis  = self.engrst.read_masters if config.readers_cd else None,
+            nrows      = config.matvec_rows,
             **placement))
+        if config.matvec_rows > 1:
+            self.add_constant("TRIXIUM_MATVEC_ROWS", config.matvec_rows)
         if config.with_trit5:
             self.add_constant("TRIXIUM_HAS_TRIT5")
         if config.with_axpy:

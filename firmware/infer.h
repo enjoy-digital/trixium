@@ -62,6 +62,7 @@ extern int seq_use;
 void infer_dbg(int n);    // Checksum the resident intermediates of the next n forwards (dbg).
 void infer_dbg_f32(const char *tag, int layer, const float *values, uint32_t n);
 int  infer_dbg_armed(void);   // Typed traces on: callers that skip a main-RAM copy must not.
+void infer_dbg_row(int r);    // Batched prefill: the trace's position and armed count for row r.
 void infer_attn_chunk(int cap); // Debug: cap the heads per attention list (attnchunk N).
 extern uint32_t infer_forwards;  // Forwards run since boot.
 extern uint32_t infer_ecc_retries, infer_ecc_unrecovered; // DDR ECC: forwards re-run / still bad.

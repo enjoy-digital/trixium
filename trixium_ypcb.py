@@ -217,6 +217,7 @@ class TriXiumYPCBSoC(SoCCore):
         ddr_readers    = False,
         engine_memctrl = 2,
         profile        = "full",
+        matvec_rows    = 1,
         **kwargs):
         # engine_memctrl: the DDR3 controllers built (2: the board's; 1: every channel and main_ram
         # on controller 0, the single-DRAM topology of the small boards, proven here first).
@@ -387,7 +388,9 @@ class TriXiumYPCBSoC(SoCCore):
             pipe_clk          = "pipeclk" if pipe_clk_freq else "",   # TRIXIUM_PIPE_CLK_FREQ below ("pclk" is the PCIe PHY's)
             readers_cd        = "ddr" if ddr_readers else "",
             # Fused vector instructions (the clamp/round after an ALU op in one instruction).
-            with_vec_fused    = vec_fused)
+            with_vec_fused    = vec_fused,
+            # Multi-row matvec (doc/plan-multirow.md): activation rows per weight beat.
+            matvec_rows       = matvec_rows)
         self.trixium = TriXiumCore(memory_ports, config, read_ports=read_ports if ddr_readers else None)
         if pipe_clk_freq:
             self.add_constant("TRIXIUM_PIPE_CLK_FREQ", int(pipe_clk_freq))
@@ -485,6 +488,7 @@ def main():
     parser.add_target_argument("--ddr-readers",      action="store_true",                                    help="The channel readers in the controllers' ddr clock domain (reader islands: the weight stream past the sys-clock port cap), with --pipe-clk-freq.")
     parser.add_target_argument("--engine-memctrl",   default=2,        type=int, choices=[1, 2],          help="DDR3 controllers built (1: every channel and main_ram on controller 0, the small boards' topology).")
     parser.add_target_argument("--profile",          default="full",   choices=["full", "lite"],            help="--hybrid: the units' sizing (lite: the small boards' profile).")
+    parser.add_target_argument("--matvec-rows",      default=1,        type=int, choices=[1, 2, 3, 4],    help="Activation rows per weight beat (multi-row matvec, doc/plan-multirow.md: batched prefill).")
     parser.add_target_argument("--reader-bursts",     default=8,        type=int,                            help="16-beat bursts a channel reader keeps outstanding (8: the core's default).")
     parser.add_target_argument("--ddr-quiet-regions", nargs="?", const="ctrl1", default=False, choices=["ctrl1", "both"],                                   help="The matvec engine's streaming datapath kept out of controller 1's I/O clock regions (Pblock): a clean read eye under the streams.")
     parser.add_target_argument("--driver",             action="store_true",                                   help="Generate PCIe driver (always with --build).")
@@ -526,6 +530,7 @@ def main():
         ddr_readers        = args.ddr_readers,
         engine_memctrl     = args.engine_memctrl,
         profile            = args.profile,
+        matvec_rows        = args.matvec_rows,
         **({"attn_geometry": tuple(int(x) for x in args.attn_geometry.split(","))} if args.attn_geometry else {}),
         **parser.soc_argdict)
     add_zbb_constant(soc, args)

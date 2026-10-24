@@ -256,14 +256,19 @@ static void bench_cmd(char *args)
     char *tok = get_token(&args);
     int n = (*tok) ? parse_int(tok) : 4;
     if (n <= 0) { puts("BENCH ERR: token count must be positive"); return; }
-    static const int prompt[3] = {1, 2, 3};
+    // Optional prompt length P (default 3: ids 1, 2, 3): ids 1..P (the prefill measurement).
+    int prompt[64];
+    tok = get_token(&args);
+    int np = (*tok) ? parse_int(tok) : 3;
+    if (np < 1 || np > 64) { puts("BENCH ERR: prompt length 1..64"); return; }
+    for (int i = 0; i < np; i++) prompt[i] = 1 + i;
     perf_reset();
     uint32_t f0 = infer_forwards;
     uint64_t t0 = perf_now64();
     memset(&bench_samples, 0, sizeof(bench_samples));
     bench_samples.start = t0;
     printf("GEN:");
-    int count = infer_generate(prompt, 3, n, bench_emit_token);
+    int count = infer_generate(prompt, np, n, bench_emit_token);
     uint64_t dt = perf_now64() - t0;
     uint32_t fwd = infer_forwards - f0;
     puts("");
@@ -1640,6 +1645,14 @@ static void console_service(void)
                (unsigned long)(trixium_seq_softmax_abi_read() >> 16), (unsigned long)(trixium_seq_softmax_abi_read() & 0xFFFF));
 #else
         printf("SOFTMAXUNIT %s (no unit 14 in this bitstream: the CPU softmax)\n", hybrid_softmax_unit ? "on" : "off");
+#endif
+    } else if (strcmp(token, "prefill2") == 0) { // prefill2 on|off: two prompt tokens per weight pass (the multi-row matvec)
+        if (strncmp(str, "on", 2) == 0)  hybrid_prefill2_enable(1);
+        if (strncmp(str, "off", 3) == 0) hybrid_prefill2_enable(0);
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+        printf("PREFILL2 %s\n", hybrid_prefill2_enabled() ? "on (two prompt tokens per weight pass)" : "off (one token per forward)");
+#else
+        printf("PREFILL2 off (no multi-row matvec in this bitstream)\n");
 #endif
     } else if (strcmp(token, "fuseout") == 0) { // fuseout on|off: a mixer's or the FFN's output projection, the residual add and the next norm as one list (on) or as separate lists (off)
         extern int hybrid_fuse_out;

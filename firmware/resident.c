@@ -274,10 +274,11 @@ struct rl_state {
     struct rl_image *images;        // RLC_SLOTS images in the heap (0: none yet)
     struct rl_image *img;           // the list being built: its slot (0: not cached)
     uint32_t replay;                // ... is a replay: desc_* write nothing
-    uint32_t key[3];
+    uint32_t key[4];
     uint32_t cmode;                 // 0 off, 1 on, 2 verify (build anyway, compare)
     uint32_t nslots;                // images allocated (RLC_SLOTS, or fewer in a small heap)
     uint32_t chits, crecords, cevict, cmism, cfall;
+    uint32_t salt;                  // the names' fourth word (resident_listcache_salt)
 };
 #define RLS ((struct rl_state *)TRIXIUM_RL_STATE_ADDR)
 _Static_assert(sizeof(struct rl_state) <= 1024, "rl_state window is 1 KB");
@@ -301,9 +302,9 @@ _Static_assert(sizeof(struct rl_state) <= 1024, "rl_state window is 1 KB");
 #define RLC_SLOTS 1024                    // 4-way sets by key hash (~165 names on the 2B);
                                           // a small heap (the simulation) gets 256 or 64
 struct rl_image {
-    uint32_t key[3];                      // all zero: empty
+    uint32_t key[4];                      // key[0] zero: empty; key[3] the salt
     uint32_t count;                       // descriptors, the stop included
-    uint32_t pad[12];                     // the words on their own cache lines
+    uint32_t pad[11];                     // the words on their own cache lines
     uint32_t words[RLC_DESCS*16];         // the staged descriptors, clean in memory
 };
 _Static_assert(sizeof(struct rl_image) % 64 == 0, "list images are cache-line multiples");
@@ -336,12 +337,13 @@ static void cache_begin(uint32_t a, uint32_t b, uint32_t c)
         L->images = (struct rl_image *)(((uintptr_t)p + 63) & ~(uintptr_t)63);
         memset(L->images, 0, sizeof(struct rl_image)*L->nslots);
     }
-    L->key[0] = a; L->key[1] = b; L->key[2] = c;
+    uint32_t d = L->salt;
+    L->key[0] = a; L->key[1] = b; L->key[2] = c; L->key[3] = d;
     // The key's 4-way set: its image, or the way to fill (an empty one, else round-robin;
     // 2-way sets still evicted 3 names per forward on the 2B).
     struct rl_image *set = &L->images[rlc_hash(L->key) & ~3u], *img = 0;
     for (int w = 0; w < 4; w++)
-        if (set[w].key[0] == a && set[w].key[1] == b && set[w].key[2] == c)
+        if (set[w].key[0] == a && set[w].key[1] == b && set[w].key[2] == c && set[w].key[3] == d)
             img = &set[w];
     for (int w = 0; w < 4 && !img; w++)
         if (!set[w].key[0])
@@ -351,7 +353,7 @@ static void cache_begin(uint32_t a, uint32_t b, uint32_t c)
         set[0].pad[0] = (set[0].pad[0] + 1u) & 3u;
     }
     L->img = img;
-    if (L->cmode == 1 && img->key[0] == a && img->key[1] == b && img->key[2] == c) {
+    if (L->cmode == 1 && img->key[0] == a && img->key[1] == b && img->key[2] == c && img->key[3] == d) {
         L->replay = 1;
         L->chits++;
     }
@@ -580,7 +582,8 @@ static int run_list_start(uint32_t count, const char *what)
     } else {
         clean_cpu_dcache_range((void *)src, count*64);
         if (img && count <= RLC_DESCS) {
-            if (img->key[0] == L->key[0] && img->key[1] == L->key[1] && img->key[2] == L->key[2]) {
+            if (img->key[0] == L->key[0] && img->key[1] == L->key[1] && img->key[2] == L->key[2] &&
+                img->key[3] == L->key[3]) {
                 // Verify: the same name built again must give the same list.
                 uint32_t bad = img->count != count;
                 for (uint32_t i = 0; !bad && i < count*16; i++)
@@ -597,6 +600,7 @@ static int run_list_start(uint32_t count, const char *what)
             for (uint32_t i = 0; i < count*16; i++) img->words[i] = src[i];
             img->count = count;
             img->key[0] = L->key[0]; img->key[1] = L->key[1]; img->key[2] = L->key[2];
+            img->key[3] = L->key[3];
             clean_cpu_dcache_range(img->words, count*64);
             L->crecords++;
         }
@@ -1269,6 +1273,80 @@ static void rl_prepare_to(const float *src, uint32_t width, int rotate, uint32_t
     }
 }
 
+/* Multi-row Matvec (batched prefill) */
+/*------------------------------------*/
+
+// The rotated (or plain) prepare of the FP32 vector at scratchpad src_sp into the Q8 slot xw
+// and the exponent beat e8 (doc/plan-multirow.md 2.5): rl_prepare_to's descriptors with the
+// quantize reading src_sp instead of RS_F. The Hadamard writes RS_F (width*4 bytes), so a second
+// source above that span survives a first row's prepare.
+void rl_prepare_sp(uint32_t src_sp, uint32_t width, int rotate, uint32_t xw, uint32_t e8)
+{
+    struct resident_state *R = resident_state();
+    const struct bons_header *H = model_header();
+    uint32_t B = (uint32_t)H->hadamard_block;
+    struct bns_seq_descriptor d;
+    if (!rl_room(3) || width > RS_WIDTH_MAX || width % 32 || src_sp % 32 || xw % 32 || e8 % 32) {
+        RLS->bad = 1;
+        return;
+    }
+    if (rotate) {
+        int wi = width_index(H, width);
+        if (wi < 0 || width/B > 32) { RLS->bad = 1; return; }
+        uint32_t blocks = width/B;
+        bns_seq_desc_quantize(&d, src_sp, RS_Q8B, RS_EXP, B, blocks);          desc_words(RLS->n++, &d);
+        bns_seq_desc_hadamard(&d, RS_Q8B, R->sign_base[wi], RS_F, RS_MAX, blocks, had_flags(R)); desc_words(RLS->n++, &d);
+        bns_seq_desc_requantize(&d, RS_F, xw, RS_EXP, RS_MAX, e8, blocks | req_flags(R)); desc_words(RLS->n++, &d);
+    } else {
+        bns_seq_desc_quantize(&d, src_sp, xw, e8, width, 1);                    desc_words(RLS->n++, &d);
+    }
+    rl_rsf_lost();
+}
+
+// One weight pass of e for two activation rows (the engine's nr = 1, TRIXIUM_MATVEC_ROWS >= 2):
+// row r's Q8 at xw0 + r*xstride bytes, its int32 results at ystage + r*4*rows (channel-major as a
+// single-row op's), each restored with its own exponent beat e8[r] into dst[r]. e: one K-segment,
+// ternary (Q8 stays single-row in the engine), rows multiples of 8 and of the channels.
+void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, const uint32_t e8[2],
+                uint32_t ystage, const uint32_t dst[2])
+{
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+    struct resident_state *R = resident_state();
+    if (!rl_room(3) || !e || (e->flags & FLAG_KSEG) ||
+        (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5) ||
+        e->rows % 8 || e->rows % (uint32_t)R->n_ch || e->rows > 0xFFFFu || xstride % 32 ||
+        xstride/32 > 0xFFFu || xw0 % 32 || ystage % 32 ||
+        ystage + 2u*4u*e->rows > RS_F || xw0 + xstride + e->cols > RS_E8) {
+        RLS->bad = 1;
+        return;
+    }
+    struct engine_op op;
+    matvec_seg_op(&op, e, 0, e->rows/(uint32_t)R->n_ch, 0, ystage);
+    op.xsrc    = xw0;
+    op.nr      = 1;
+    op.xstride = (uint16_t)(xstride/32);
+    op.qstride = (uint16_t)e->rows;              // row r's results at dst + 4*r*qstride
+    desc_engine(RLS->n++, &op);
+    for (int r = 0; r < 2; r++) {
+        struct bns_seq_descriptor d;
+        if (bns_seq_desc_restore(&d, ystage + 4u*e->rows*(uint32_t)r, dst[r], e8[r], e->rows,
+                                 (int32_t)e->rshift - (int32_t)e->bias)) {
+            RLS->bad = 1;
+            return;
+        }
+        desc_words(RLS->n++, &d);
+    }
+    rl_rsf_lost();
+#else
+    (void)e; (void)xw0; (void)xstride; (void)e8; (void)ystage; (void)dst;
+    RLS->bad = 1;
+#endif
+}
+
+// The list image cache's fourth key word for the lists built from here on (0: none): the
+// batched prefill's second row builds the same lists as the first on another residual slot.
+void resident_listcache_salt(uint32_t salt) { RLS->salt = salt; }
+
 int rl_run(const char *what)
 {
     if (rl_start(what))
@@ -1815,6 +1893,16 @@ void resident_listprof_names(void) {}
 void resident_listcache_mode(int mode) { (void)mode; }
 void resident_listcache_print(void) {}
 void resident_listcache_reset(void) {}
+void resident_listcache_salt(uint32_t salt) { (void)salt; }
+void rl_prepare_sp(uint32_t src_sp, uint32_t width, int rotate, uint32_t xw, uint32_t e8)
+{
+    (void)src_sp; (void)width; (void)rotate; (void)xw; (void)e8;
+}
+void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, const uint32_t e8[2],
+                uint32_t ystage, const uint32_t dst[2])
+{
+    (void)e; (void)xw0; (void)xstride; (void)e8; (void)ystage; (void)dst;
+}
 void resident_reenable(void) {}
 int  rl_begin_keyed(uint32_t a, uint32_t b, uint32_t c) { (void)a; (void)b; (void)c; return 0; }
 int  rl_replaying(void) { return 0; }
