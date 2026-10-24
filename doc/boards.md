@@ -682,8 +682,8 @@ build to deploy:
 PYTHONPATH=<litex master>:$PWD LITEX_ENV_EFINITY=/opt/efinix/efinity/2025.1 \
   systemd-run --user -p MemoryMax=40G ... python3 trixium_ti375.py --build --ddr-targets 2 \
   --dn-sublanes 2 --with-spi-flash --upload-beats 45 --chan-skew 0x2000 --with-softmax \
-  --attn-lanes 8 --attn-groups 2 --with-emmc --output-dir build/ti375_v21
-trixium deploy --board ti375 --model 2b ti375_v21
+  --attn-lanes 8 --attn-groups 2 --with-emmc --with-web --output-dir build/ti375_v23
+trixium deploy --board ti375 --model 2b ti375_v23
 ```
 
 ### Build
@@ -837,6 +837,30 @@ RCA, EXT_CSD BUS_WIDTH and HS_TIMING), then the same `sdsave`/`sdboot`/power-up 
 v21 = v19 + `--with-emmc` (in place of the slot): 110.0 MHz achievable, 95.16% XLRs; 2B 14.32 /
 13.96 / 11.98 tok/s, golden. `software/lab/ti375_sd.py --emmc` brings the eMMC up on its own
 (LiteX's BIOS, whose eMMC support came from this work: litex#2695, litex-boards#933).
+
+**Several models on the card** (card layout version 2): up to 7 slots 1 GB apart (the eMMC's
+7.28 GB), slot k's table at sector 2048 + k x 2^21 with a 32-byte label (the image's name) and
+each entry's CRC-32, its data right after; sector 2047 names the slot the power-up boots.
+`sdls` lists the slots, `sdsave [slot] [label]` (`ti375 model <img> --persist --slot k`) writes
+one (64 s for the 2B: the CRC folded into the CPU's push, slicing-by-4), `sddefault k` picks the
+power-up slot, `sdboot [slot]` loads one. The read stream's CRC-32 is computed in the gateware on
+the bytes sent to the loader (`SDCardUpload.crc32`: the data never passes through the CPU) and
+compared per entry with the table's (`ti375_v23`, in the kit's flash: the 2B's 6 entries checked
+in the same 9.6 s; a block overwritten in slot 1 stopped its boot with "entry 1 CRC b91ed0d0, the
+table says 25faaa54"; v23: 109.9 MHz achievable, 96.69% XLRs, golden, 14.33 / 13.97 / 11.98 tok/s). Version-1 tables (the first `sdsave`,
+`software/host/sdimage.py`) still boot, without CRCs.
+
+**The chat in a browser** (`--with-web`, `ti375_v22`): LiteX's shared CPU MAC beside the hardware
+stack (`add_etherbone(with_ethmac=True)`: the hardware MAC's unicasts stay in hardware, broadcasts
+reach both), and a small stack in the firmware, `firmware/net.c` (ARP, ICMP echo, TCP for 4
+connections with go-back-N retransmission) and `web.c` (HTTP: the page, `POST /chat` streaming
+the reply, `POST /reset`). Open `http://<web-ip>/` (the `--web-ip` address): the page, the tokenizer and the
+model all run on the board. Requests are buffered by the receive path and run from the main loop,
+so a reply streaming for a minute keeps the stack polled and a second request waits instead of
+nesting a generation; the console `chat` and the page share one conversation (`chat_turn`). On
+the kit: ping 0.12 ms, the page in 3 ms, the first words of a reply after 1.5 s, 12.3 tok/s in
+Chrome. `test/software/test_net.py` runs `net.c` and `web.c` on the host against crafted frames.
+v22 = v21 + `--with-web`: 109.5 MHz achievable, 96.26% XLRs, golden, 14.32 / 13.97 / 11.98 tok/s.
 
 **Past the 2,048-token window** (`kvring`, on by default): the attention layers keep the
 conversation's first turn (its system prompt and first message, up to 512 positions; 4 for
