@@ -854,11 +854,13 @@ table says 25faaa54"; v23: 109.9 MHz achievable, 96.69% XLRs, golden, 14.33 / 13
 stack (`add_etherbone(with_ethmac=True)`: the hardware MAC's unicasts stay in hardware, broadcasts
 reach both), and a small stack in the firmware, `firmware/net.c` (ARP, ICMP echo, TCP for 4
 connections with go-back-N retransmission) and `web.c` (HTTP: the page, `POST /chat` streaming
-the reply, `POST /reset`). Open `http://<web-ip>/` (the `--web-ip` address): the page, the tokenizer and the
+the reply, `POST /reset`). Open `http://trixium.local/` (mDNS) or the address the console prints: the firmware takes a DHCP lease
+(DISCOVER/OFFER/REQUEST/ACK, renewed at half the lease) and falls back to `--web-ip` when no server answers within 4 s (a
+cable straight to a PC), and answers mDNS queries for `trixium.local`: the page, the tokenizer and the
 model all run on the board. Requests are buffered by the receive path and run from the main loop,
 so a reply streaming for a minute keeps the stack polled and a second request waits instead of
 nesting a generation; the console `chat` and the page share one conversation (`chat_turn`). On
-the kit: ping 0.12 ms, the page in 3 ms, the first words of a reply after 1.5 s, 12.3 tok/s in
+the kit: a DHCP lease from the LAN's router, `trixium.local` resolved by the PC's resolver, ping 0.12 ms, the page in 3 ms, the first words of a reply after 1.5 s, 12.3 tok/s in
 Chrome. `test/software/test_net.py` runs `net.c` and `web.c` on the host against crafted frames.
 v22 = v21 + `--with-web`: 109.5 MHz achievable, 96.26% XLRs, golden, 14.32 / 13.97 / 11.98 tok/s.
 

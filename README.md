@@ -243,7 +243,7 @@ It also runs with no host at all. The bitstream and firmware boot from the kit's
 model (436 MB) and its tokenizer load from the kit's eMMC in 9.6 s, and 12.5 s after power-up
 `chat` on the serial console answers, the prompt tokenized on the board (`ti375 model <img>
 --persist` writes the eMMC once, from a UDP upload; it holds several models). Or plug in an
-Ethernet cable and open `http://<web-ip>/` (`--web-ip`): the board serves the chat page itself. Conversations go past the 2,048-token
+Ethernet cable and open `http://trixium.local/`: the board takes an address by DHCP, answers its mDNS name and serves the chat page itself. Conversations go past the 2,048-token
 attention window: the DeltaNet layers' state carries the whole history, and the attention layers
 keep the first turn and a ring of the latest positions.
 
