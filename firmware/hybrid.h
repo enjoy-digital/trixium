@@ -27,8 +27,8 @@ int  hybrid_forward(int token, int want_logits); // Next token (argmax) or -1.
 // (no hardware, `prefill2 off`, the model does not fit the lists, the context cap).
 int  hybrid_forward2(const int *tokens);
 int  hybrid_forward2_ok(void);                   // hybrid_forward2 would run now
-void hybrid_prefill2_enable(int on);             // Console `prefill2 on|off` (default on).
-int  hybrid_prefill2_enabled(void);
+void hybrid_prefill2_enable(int on);             // Console `prefill2 on|off|ffn` (1, 0, 2: the FFN only; default on).
+int  hybrid_prefill2_enabled(void);               // 1 on, 2 the FFN only, 0 off.
 int  hybrid_ckpt_save(void);                     // 1: the next forward can be re-run ...
 void hybrid_ckpt_restore(void);                  // ... from here (ECC retry).
 

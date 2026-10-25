@@ -61,6 +61,22 @@
 #define DN_STATE_HW 1
 #endif
 
+#if defined(DNRES_BUILT) && defined(CSR_TRIXIUM_ENGINE_CSR_NR_ADDR)
+#define P2_BUILT 1
+// The batched prefill's in-projections (doc/plan-multirow.md): the mixer of row 0 (P2_LEAD)
+// also projects row 1 in the same weight pass - row 1's attention norm from its residual slot,
+// its rotated prepare into Q8 slot 1 - and parks row 1's restored outputs in main RAM; the
+// mixer of row 1 (P2_FOLLOW, only when the lead list ran: p2_parked) fetches them back where
+// its own projections would have restored them. The outputs are the restores of the same int32
+// sums with the same exponents, so the follower's list sees the single-token values.
+#define P2_LEAD   1
+#define P2_FOLLOW 2
+static int p2_mode;                    // what pair_seg asks of the mixer it calls (0: nothing)
+static int p2_parked;                  // the lead list ran: row 1's outputs are in p2_park
+static float *p2_park;
+static uint32_t p2_park_bytes;
+#endif
+
 /* Variables */
 /*-----------*/
 
@@ -213,6 +229,7 @@ struct hyb_prof {
     uint8_t xres_row;                // the batched prefill's row whose residual slot XRES_SP names
     uint8_t prefill2;                // console `prefill2 on|off`: two prompt tokens per weight pass
     uint8_t pair_geom;               // the model fits the batched FFN lists: 0 unknown, 1 yes, 2 no
+    uint8_t pair_inproj;             // `prefill2 on` (1) also batches the mixers' in-projections; `prefill2 ffn` (0)
 };
 #define HP ((struct hyb_prof *)TRIXIUM_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -873,6 +890,19 @@ int hybrid_init(void)
     delta = infer_halloc((hv + 16)*4, 0);
     qfull = infer_halloc((2*q_dim + 16)*4, 0);
     attnb = infer_halloc((q_dim + 16)*4, 0);
+#ifdef P2_BUILT
+    {
+        // The batched prefill's park: row 1's DeltaNet qkv + z or attention q + k + v. Only the
+        // engine writes and reads it (raw transfers): no dirty line of the CPU's may remain.
+        uint32_t dn_b = 4u*(uint32_t)(2*nq + 2*nvh), at_b = 4u*(uint32_t)(2*q_dim + 2*kv_dim);
+        p2_park_bytes = (dn_b > at_b ? dn_b : at_b) + 64u;
+        p2_park = infer_halloc(p2_park_bytes, 0);
+        if (p2_park)
+            flush_cpu_dcache_range(p2_park, p2_park_bytes);
+        else
+            p2_park_bytes = 0;
+    }
+#endif
     gateb = infer_halloc(ffn_dim*4, 0); upb = infer_halloc(ffn_dim*4, 0);
     actb = infer_halloc(ffn_dim*4, 0);   // Resident FFN activation (gateb keeps the gate trace).
     scores = infer_halloc(ctx_cap*4, 0);
@@ -955,6 +985,7 @@ int hybrid_init(void)
     HP->xres_row = 0;
     HP->prefill2 = 1;
     HP->pair_geom = 0;
+    HP->pair_inproj = 1;
     if (H->hadamard_block && resident_available()) {
         if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
@@ -1407,6 +1438,58 @@ static uint32_t f32_bits(float x)
     return v.u;
 }
 
+#ifdef P2_BUILT
+
+// The lead's list fits: ternary single-K-segment entries, row 1's norm weight and every entry's
+// two staged rows above RS_F (below the persistent Q8), the park big enough.
+static int p2_lead_fits(const struct bons_entry *const *e, int ne)
+{
+    uint32_t n = (uint32_t)n_embd, stage = 0, park = 0;
+    if (!p2_park || n % 32 || RS_F_ADDR + 8u*n > RS_XW_ADDR || RS_XW_ADDR + 2u*n > RS_E8_ADDR)
+        return 0;
+    for (int k = 0; k < ne; k++) {
+        if (!e[k] || (e[k]->flags & FLAG_KSEG) || e[k]->cols != n ||
+            (e[k]->kind != KIND_TERNARY && e[k]->kind != KIND_TERNARY5) ||
+            e[k]->rows % 8 || e[k]->rows % (uint32_t)n_ch || e[k]->rows > 0xFFFFu)
+            return 0;
+        stage += 8u*e[k]->rows;
+        park  += 4u*e[k]->rows;
+    }
+    return RS_F_ADDR + stage <= RS_XW_ADDR && park <= p2_park_bytes;
+}
+
+// After row 0's rotated prepare into slot 0 (RS_XW, RS_E8): row 1's attention norm (the
+// residual list's descriptor on XRES_SP1) and prepare into slot 1, then each entry for both rows
+// staged from RS_F up, row 0 restored to dst0[k], row 1 in place and stored to the park.
+static void p2_lead_emit(int l, const struct bons_entry *const *e, const uint32_t *dst0, int ne)
+{
+    struct bns_seq_descriptor d;
+    uint32_t n = (uint32_t)n_embd, w1 = RS_F_ADDR + ((4u*n + 31u) & ~31u), off = 0, S = RS_F_ADDR;
+    const uint32_t e8[2] = {RS_E8_ADDR, RS_E8B_ADDR};
+    rl_fetch_raw(norm_attn[l], 4u*n, w1);              // a norm weight: cleaned at load
+    if (!rl_replaying())
+        bns_seq_desc_norm(&d, 0, XRES_SP1, RS_F_ADDR, w1, n, 1, f32_bits(rms_eps));
+    rl_desc(&d);
+    rl_prepare_sp(RS_F_ADDR, n, 1, RS_XW_ADDR + n, RS_E8B_ADDR);
+    for (int k = 0; k < ne; k++) {
+        uint32_t rows = e[k]->rows, dst[2] = {dst0[k], S + 4u*rows};
+        rl_matvec2(e[k], RS_XW_ADDR, n, e8, S, dst);
+        rl_store_raw((uint8_t *)p2_park + off, 4u*rows, dst[1]);
+        off += 4u*rows;
+        S += 8u*rows;
+    }
+}
+
+// Row 1: the parked outputs back where its projections would have restored them.
+static void p2_follow_emit(const struct bons_entry *const *e, const uint32_t *dst0, int ne)
+{
+    for (uint32_t k = 0, off = 0; k < (uint32_t)ne; k++) {
+        rl_fetch_raw((uint8_t *)p2_park + off, 4u*e[k]->rows, dst0[k]);
+        off += 4u*e[k]->rows;
+    }
+}
+#endif
+
 // The resident DeltaNet layer: the whole layer in scratchpad lists (units 1/3/4/5/8 for the
 // projections, 13 conv, 11 SiLU, 12 norms, engine op 5 for the heads), the CPU doing
 // only the per-head scalars and the rare SiLU fixups. Bit-exact with deltanet_layer (the
@@ -1493,6 +1576,16 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     // buffers end below it) and writes Z; the SiLU touches DNR_QKV and FIX; z is used by the
     // gated norm in the core list.
     int zbeside = early && hybrid_dn_zbeside;
+    // The batched prefill: qkv and z of both rows in row 0's list (lead), fetched back in row 1's.
+    int lead = 0, follow = 0;
+#ifdef P2_BUILT
+    const struct bons_entry *p2e[2] = {e_qkv, e_z};
+    const uint32_t p2d[2] = {DNR_QKV, Z};
+    if (early && !zbeside) {
+        lead   = p2_mode == P2_LEAD && p2_lead_fits(p2e, 2);
+        follow = p2_mode == P2_FOLLOW;
+    }
+#endif
     float scale = 1.0f/sqrtf((float)hk);
     int rep = nv/nk;
     uint64_t t0 = perf_now64(), act_dt = 0, conv_dt = 0;
@@ -1532,17 +1625,28 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
     } while (0)
     perf_enter(OP_DN_PROJ);           // the token trace's phases (tprof): nested brackets
     rl_begin_keyed(0x04000000u | (uint32_t)l << 8 | (uint32_t)early | (uint32_t)z_stays << 1 |
-                   (uint32_t)rl_rsf_is(h) << 2 | (uint32_t)zbeside << 3,
+                   (uint32_t)rl_rsf_is(h) << 2 | (uint32_t)zbeside << 3 | (uint32_t)lead << 4 |
+                   (uint32_t)follow << 5,
                    (uint32_t)(uintptr_t)h | pf_key(), 0);
     if (early) {
         rl_prepare_for(h, (uint32_t)n_embd, 0, model_entry(ROLE_SSM_BETA, l)); // beta/alpha are not folded
         rl_matvec(model_entry(ROLE_SSM_BETA, l), BA, BA);
         rl_matvec(model_entry(ROLE_SSM_ALPHA, l), AL, AL);
         uint32_t k_ba = rl_count();
-        rl_prepare_for(h, (uint32_t)n_embd, 1, e_qkv);
-        rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
-        if (!zbeside)
-            rl_matvec(e_z, Z, Z);
+#ifdef P2_BUILT
+        if (follow) {
+            p2_follow_emit(p2e, p2d, 2);
+        } else if (lead) {
+            rl_prepare_for(h, (uint32_t)n_embd, 1, e_qkv);
+            p2_lead_emit(l, p2e, p2d, 2);
+        } else
+#endif
+        {
+            rl_prepare_for(h, (uint32_t)n_embd, 1, e_qkv);
+            rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
+            if (!zbeside)
+                rl_matvec(e_z, Z, Z);
+        }
         if (rl_start("deltanet projections"))
             return -1;
         if (rl_wait_desc(k_ba) == 0) {
@@ -1566,6 +1670,10 @@ static int deltanet_layer_resident(int l, const float *h, float *out)
         conv_dt = perf_now64() - tc;
         if (rl_wait())
             return -1;                 // nothing of the layer's state has moved yet
+#ifdef P2_BUILT
+        if (lead)
+            p2_parked = 1;
+#endif
     } else {
         rl_prepare_for(h, (uint32_t)n_embd, 1, e_qkv);
         rl_matvec(e_qkv, DNR_QKV, DNR_QKV);
@@ -2160,15 +2268,36 @@ static int attention_layer(int l, const float *h, float *out)
         bns_seq_desc_norm_strided(&dq, 0, QS, QS, NQ, (uint32_t)head_dim, (uint32_t)n_head, eps,
                                   gated ? 2*hb8 : hb8, gated ? 2*hb8 : hb8);
         if (want_rope && bns_seq_desc_norm_rope(&dq, (uint32_t)rope_n, RT)) want_rope = 0;
+        // The batched prefill: q, k and v of both rows in row 0's list (lead), fetched back in
+        // row 1's (the norms, the RoPE and everything after stay per row).
+        int lead = 0, follow = 0;
+#ifdef P2_BUILT
+        const struct bons_entry *p2e[3] = {model_entry(ROLE_ATTN_Q, l), model_entry(ROLE_ATTN_K, l),
+                                           model_entry(ROLE_ATTN_V, l)};
+        const uint32_t p2d[3] = {QS, KS, VS};
+        lead   = p2_mode == P2_LEAD && p2_lead_fits(p2e, 3);
+        follow = p2_mode == P2_FOLLOW;
+#endif
         int qkv_replay = rl_begin_keyed(0x08000000u | (uint32_t)l << 8 | (uint32_t)gated |
-                                        (uint32_t)want_rope << 1 | (uint32_t)rl_rsf_is(h) << 2,
+                                        (uint32_t)want_rope << 1 | (uint32_t)rl_rsf_is(h) << 2 |
+                                        (uint32_t)lead << 3 | (uint32_t)follow << 4,
                                         (uint32_t)(uintptr_t)h | pf_key(), 0);
         rl_fetch_raw(norm_q[l], 4*(uint32_t)head_dim, NQ);
         rl_fetch_raw(norm_k[l], 4*(uint32_t)head_dim, NK);
-        rl_prepare_for(h, (uint32_t)n_embd, 1, model_entry(ROLE_ATTN_Q, l));
-        rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
-        rl_matvec(model_entry(ROLE_ATTN_K, l), KS, KS);
-        rl_matvec(model_entry(ROLE_ATTN_V, l), VS, VS);
+#ifdef P2_BUILT
+        if (follow) {
+            p2_follow_emit(p2e, p2d, 3);
+        } else if (lead) {
+            rl_prepare_for(h, (uint32_t)n_embd, 1, p2e[0]);
+            p2_lead_emit(l, p2e, p2d, 3);
+        } else
+#endif
+        {
+            rl_prepare_for(h, (uint32_t)n_embd, 1, model_entry(ROLE_ATTN_Q, l));
+            rl_matvec(model_entry(ROLE_ATTN_Q, l), QS, QS);
+            rl_matvec(model_entry(ROLE_ATTN_K, l), KS, KS);
+            rl_matvec(model_entry(ROLE_ATTN_V, l), VS, VS);
+        }
         rl_desc(&dq);
         if (!qkv_replay) {
             bns_seq_desc_norm(&d, 0, KS, KS, NK, (uint32_t)head_dim, (uint32_t)n_kv_head, eps);
@@ -2182,6 +2311,10 @@ static int attention_layer(int l, const float *h, float *out)
             rl_store(vb, 4*(uint32_t)kv_dim, VS);
         }
         normed = rl_run(want_rope ? "attention q/k/v+rope" : "attention q/k/v") == 0;
+#ifdef P2_BUILT
+        if (normed && lead)
+            p2_parked = 1;
+#endif
         rope_hw = normed && want_rope;
         if (rope_hw) { r_q = QS; r_k = KS; r_v = VS; r_qbytes = 4*qrows; }
     }
@@ -2878,11 +3011,18 @@ static int pair_seg(int l)
     HP->keep_out = !traced;
     uint64_t t0 = perf_now64();
     perf_enter(OP_RMSNORM);
-    int rc = xres_list(NULL, norm_attn[l], l == 0, 0);
+    int rc = xres_list(NULL, norm_attn[l], 0, 0);     // both slots loaded (hybrid_forward2)
     hyb_cyc_anorm += perf_now64() - t0;
     perf_exit(OP_RMSNORM);
     if (rc) return -1;
     infer_dbg_f32("attn_norm", l, hb, n_embd);
+    // Row 0's mixer projects row 1 too (lead), row 1's fetches its outputs back (follow).
+    if (HP->xres_row == 0) {
+        p2_parked = 0;
+        p2_mode = HP->pair_inproj ? P2_LEAD : 0;
+    } else {
+        p2_mode = p2_parked ? P2_FOLLOW : 0;
+    }
     t0 = perf_now64();
     int resid_done = 0;
     if (dn_slot[l] >= 0) {
@@ -2900,6 +3040,7 @@ static int pair_seg(int l)
         if (rc == -2) return -1;
         resid_done = rc == 1;
     }
+    p2_mode = 0;
     infer_dbg_f32(dn_slot[l] >= 0 ? "dn_out" : "attn_out", l, tmp_h, n_embd);
     t0 = perf_now64();
     perf_enter(OP_RESID_ADD);
@@ -3015,8 +3156,12 @@ int hybrid_forward2_ok(void)
 #endif
 }
 
-void hybrid_prefill2_enable(int on) { HP->prefill2 = on ? 1 : 0; }
-int  hybrid_prefill2_enabled(void) { return HP->prefill2; }
+void hybrid_prefill2_enable(int on)
+{
+    HP->prefill2 = on ? 1 : 0;
+    HP->pair_inproj = on == 1;           // 2: the FFN only
+}
+int  hybrid_prefill2_enabled(void) { return HP->prefill2 ? (HP->pair_inproj ? 1 : 2) : 0; }
 
 int hybrid_forward2(const int *tokens)
 {
@@ -3025,26 +3170,35 @@ int hybrid_forward2(const int *tokens)
         return -2;                          // nothing ran: the caller forwards one at a time
     int p0 = pos, par0 = dn_par, rc = 0;
     HP->xres_on = 1;
+    // Both embeddings into their residual slots first: row 0's first mixer reads row 1's slot
+    // (the batched in-projections).
+    for (int r = 0; r < 2 && !rc; r++) {
+        pair_row(r, p0, par0);
+        // The embedding uses the engine and xb: the previous row's lists done first.
+        resident_join();
+        uint64_t t0 = perf_now64();
+        perf_enter(OP_EMBED);
+        rc = infer_embed_f(tokens[r], xb) < 0;
+        if (!rc) {
+            rl_begin();
+            rl_fetch(xb, 4u*(uint32_t)n_embd, XRES_SP);
+            rc = rl_run("residual load") != 0;
+        }
+        hyb_cyc_embed += perf_now64() - t0;
+        perf_exit(OP_EMBED);
+        if (!rc)
+            infer_dbg_f32("emb", -1, xb, n_embd);
+    }
     for (int l = 0; l < n_layer && !rc; l++) {
         for (int r = 0; r < 2 && !rc; r++) {
             pair_row(r, p0, par0);
-            if (l == 0) {
-                // The embedding uses the engine and xb: the previous row's lists done first.
-                resident_join();
-                uint64_t t0 = perf_now64();
-                perf_enter(OP_EMBED);
-                rc = infer_embed_f(tokens[r], xb) < 0;
-                hyb_cyc_embed += perf_now64() - t0;
-                perf_exit(OP_EMBED);
-                if (rc) break;
-                infer_dbg_f32("emb", -1, xb, n_embd);
-            }
             rc = pair_seg(l);
         }
         if (!rc)
             rc = ffn_pair(l, p0, par0);
     }
     resident_join();
+    p2_mode = p2_parked = 0;
     HP->xres_row = 0;
     HP->keep_out = 0;
     resident_listcache_salt(0);

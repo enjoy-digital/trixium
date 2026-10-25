@@ -1646,11 +1646,14 @@ static void console_service(void)
 #else
         printf("SOFTMAXUNIT %s (no unit 14 in this bitstream: the CPU softmax)\n", hybrid_softmax_unit ? "on" : "off");
 #endif
-    } else if (strcmp(token, "prefill2") == 0) { // prefill2 on|off: two prompt tokens per weight pass (the multi-row matvec)
+    } else if (strcmp(token, "prefill2") == 0) { // prefill2 on|ffn|off: two prompt tokens per weight pass (the multi-row matvec)
         if (strncmp(str, "on", 2) == 0)  hybrid_prefill2_enable(1);
         if (strncmp(str, "off", 3) == 0) hybrid_prefill2_enable(0);
+        if (strncmp(str, "ffn", 3) == 0) hybrid_prefill2_enable(2);   // the FFN only (A/B)
 #ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
-        printf("PREFILL2 %s\n", hybrid_prefill2_enabled() ? "on (two prompt tokens per weight pass)" : "off (one token per forward)");
+        printf("PREFILL2 %s\n", hybrid_prefill2_enabled() == 1 ? "on (two prompt tokens per weight pass: FFN, DeltaNet qkv/z, attention q/k/v)" :
+                                hybrid_prefill2_enabled() == 2 ? "ffn (two prompt tokens per weight pass: the FFN only)" :
+                                "off (one token per forward)");
 #else
         printf("PREFILL2 off (no multi-row matvec in this bitstream)\n");
 #endif

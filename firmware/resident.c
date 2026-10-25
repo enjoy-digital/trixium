@@ -1290,6 +1290,11 @@ void rl_prepare_sp(uint32_t src_sp, uint32_t width, int rotate, uint32_t xw, uin
         RLS->bad = 1;
         return;
     }
+    if (RLS->replay) {                    // the image holds the descriptors: nothing to encode
+        RLS->n += rotate ? 3u : 1u;
+        rl_rsf_lost();
+        return;
+    }
     if (rotate) {
         int wi = width_index(H, width);
         if (wi < 0 || width/B > 32) { RLS->bad = 1; return; }
@@ -1305,7 +1310,8 @@ void rl_prepare_sp(uint32_t src_sp, uint32_t width, int rotate, uint32_t xw, uin
 
 // One weight pass of e for two activation rows (the engine's nr = 1, TRIXIUM_MATVEC_ROWS >= 2):
 // row r's Q8 at xw0 + r*xstride bytes, its int32 results at ystage + r*4*rows (channel-major as a
-// single-row op's), each restored with its own exponent beat e8[r] into dst[r]. e: one K-segment,
+// single-row op's; the staging may reach into RS_F, up to the persistent Q8), each restored with
+// its own exponent beat e8[r] into dst[r] (in place allowed). e: one K-segment,
 // ternary (Q8 stays single-row in the engine), rows multiples of 8 and of the channels.
 void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, const uint32_t e8[2],
                 uint32_t ystage, const uint32_t dst[2])
@@ -1316,8 +1322,13 @@ void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, cons
         (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5) ||
         e->rows % 8 || e->rows % (uint32_t)R->n_ch || e->rows > 0xFFFFu || xstride % 32 ||
         xstride/32 > 0xFFFu || xw0 % 32 || ystage % 32 ||
-        ystage + 2u*4u*e->rows > RS_F || xw0 + xstride + e->cols > RS_E8) {
+        ystage + 2u*4u*e->rows > RS_SP_END || xw0 + xstride + e->cols > RS_E8) {
         RLS->bad = 1;
+        return;
+    }
+    if (RLS->replay) {                    // the engine op and the two restores are in the image
+        RLS->n += 3;
+        rl_rsf_lost();
         return;
     }
     struct engine_op op;
