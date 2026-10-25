@@ -161,6 +161,9 @@ static void help(void)
     puts("  hdrload           - copy the BONS header+table staged by trixium_load to CPU memory");
     puts("  tokclr/tok/genb   - chunked prompt buffer + generate [stop ids] (host chat tools)");
     puts("  gen n id id ...   - generate n tokens from prompt ids");
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+    puts("  gen2 n ids | ids  - two conversations decoded together (multi-row matvec); gen2 dual|seq, lmhead on|off, trace a|b");
+#endif
     puts("  tokload           - load the tokenizer staged with the image (trixium load --tokenizer)");
     puts("  chat [n]          - chat in text on this console, replies up to n tokens (default 512)");
 #ifdef CSR_SD_BASE
@@ -1221,6 +1224,70 @@ static void gen_cmd(char *args)
         engine_recover();
 }
 
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+// `gen2 n idsA... | idsB...`: two fresh conversations decoded together, one weight pass per step
+// for both (infer_generate_dual); prints each stream, then the cycles. `gen2 seq` runs the same
+// steps as two single forwards (the A/B, same tokens), `gen2 dual` back; `gen2 trace a|b`: the
+// conversation `dbg N` traces.
+static int gen2_dual = 1, gen2_trace;
+static void gen2_cmd(char *args)
+{
+    int pa[64], pb[64], oa[256], ob[256];
+    int *const prompt[2] = {pa, pb}, *const out[2] = {oa, ob};
+    int np[2] = {0, 0}, s = 0;
+    char *tok = get_token(&args);
+    if (strcmp(tok, "dual") == 0 || strcmp(tok, "seq") == 0) {
+        gen2_dual = tok[0] == 'd';
+        printf("GEN2 %s\n", gen2_dual ? "dual (one weight pass per step for both)" : "seq (two single forwards per step)");
+        return;
+    }
+    if (strcmp(tok, "lmhead") == 0) {
+        tok = get_token(&args);
+        if (strncmp(tok, "on", 2) == 0)  hybrid_lmhead2_enable(1);
+        if (strncmp(tok, "off", 3) == 0) hybrid_lmhead2_enable(0);
+        printf("GEN2 lmhead %s\n", hybrid_lmhead2_enabled() ? "on (both LM heads in one weight pass)" : "off (one LM head per conversation)");
+        return;
+    }
+    if (strcmp(tok, "trace") == 0) {
+        tok = get_token(&args);
+        gen2_trace = tok[0] == 'b';
+        printf("GEN2 trace %c\n", gen2_trace ? 'b' : 'a');
+        return;
+    }
+    int n = parse_int(tok);
+    while (1) {
+        tok = get_token(&args);
+        if (*tok == 0)
+            break;
+        if (tok[0] == '|') {
+            if (++s > 1) break;
+            continue;
+        }
+        if (np[s] < 64)
+            prompt[s][np[s]++] = parse_int(tok);
+    }
+    if (n <= 0 || n > 256 || s != 1 || !np[0] || !np[1]) {
+        puts("usage: gen2 n id id ... | id id ...  (n <= 256, prompts <= 64 ids)");
+        return;
+    }
+    int count[2], steps;
+    uint64_t cyc[2];
+    printf("GEN2:");
+    int r = infer_generate_dual((const int *const *)prompt, np, n, gen2_dual, gen2_trace, out, count, cyc, &steps);
+    for (int k = 0; k < 2; k++) {
+        printf("\nGEN2 %c:", 'A' + k);
+        for (int i = 0; i < count[k]; i++)
+            printf(" %d", out[k][i]);
+    }
+    printf("\nGEN2 %s: prefill %lu cycles, %d steps with both %lu cycles (%lu per step)\n",
+           gen2_dual ? "dual" : "seq", (unsigned long)cyc[0], steps, (unsigned long)cyc[1],
+           (unsigned long)(steps ? cyc[1]/(uint64_t)steps : 0));
+    puts(r < 0 ? "GEN2 ERR" : "GEN2 DONE");
+    if (engine_wedged)
+        engine_recover();
+}
+#endif
+
 /* Self-tests */
 /*------------*/
 
@@ -1470,6 +1537,10 @@ static void console_service(void)
         selftest();
     else if (strcmp(token, "gen") == 0)
         gen_cmd(str);
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+    else if (strcmp(token, "gen2") == 0)
+        gen2_cmd(str);
+#endif
     else if (strcmp(token, "tok") == 0)
         tok_cmd(str);
     else if (strcmp(token, "tokclr") == 0)

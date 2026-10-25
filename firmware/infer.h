@@ -24,6 +24,12 @@ int  infer_eye_forward(void);                   // One forward from the state an
 // Same, continuing a conversation: buf[0..resident) are in the KV cache from the previous
 // call (check infer_gen_serial() has not moved), the rest is new. resident 0 = fresh.
 int  infer_generate_from(const int *buf, int n, int resident, int max_new, void (*emit)(int tok));
+// Two fresh conversations decoded together (a hybrid model on an engine with the multi-row
+// matvec, console `gen2`): out[s][0..count[s]) the greedy tokens of prompt s, bit-identical to
+// infer_generate on each alone; dual 0: two single forwards per step instead (the A/B). dbg_seq:
+// the sequence `dbg N` traces. cycles: prefills, steps with both; steps: their count. 0 / -1.
+int  infer_generate_dual(const int *const prompt[2], const int n[2], int max_new, int dual, int dbg_seq,
+                         int *const out[2], int count[2], uint64_t cycles[2], int *steps);
 int  infer_kv_resident(void);       // Tokens in the KV cache after a generation (= n_pos).
 void infer_kv_fill(uint32_t pattern); // Diagnostic (`kvfill`): every channel's KV region <- pattern.
 uint32_t infer_gen_serial(void);    // Bumped by every generation.

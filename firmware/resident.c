@@ -1316,31 +1316,45 @@ void rl_prepare_sp(uint32_t src_sp, uint32_t width, int rotate, uint32_t xw, uin
 void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, const uint32_t e8[2],
                 uint32_t ystage, const uint32_t dst[2])
 {
+    rl_matvec2_rows(e, 0, e ? e->rows : 0, xw0, xstride, e8, ystage, dst, 3u);
+}
+
+// rl_matvec2 over the rows [row0, row0 + rows) of every channel's block (the LM head's chunks:
+// channel-major as rl_matvec_rows), restoring only the rows in `restore` (bit r: row r; the
+// others stay int32 at ystage + 4*r*rows for a later rl_restore_rows).
+void rl_matvec2_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t xw0,
+                     uint32_t xstride, const uint32_t e8[2], uint32_t ystage, const uint32_t dst[2],
+                     uint32_t restore)
+{
 #ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
     struct resident_state *R = resident_state();
-    if (!rl_room(3) || !e || (e->flags & FLAG_KSEG) ||
-        (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5) ||
-        e->rows % 8 || e->rows % (uint32_t)R->n_ch || e->rows > 0xFFFFu || xstride % 32 ||
+    uint32_t nres = (restore & 1u) + (restore >> 1 & 1u);
+    if (!rl_room(1 + nres) || !e || (e->flags & FLAG_KSEG) ||
+        (e->kind != KIND_TERNARY && e->kind != KIND_TERNARY5) || !rows ||
+        rows % 8 || rows % (uint32_t)R->n_ch || row0 % (uint32_t)R->n_ch || row0 + rows > e->rows ||
+        rows > 0xFFFFu || xstride % 32 ||
         xstride/32 > 0xFFFu || xw0 % 32 || ystage % 32 ||
-        ystage + 2u*4u*e->rows > RS_SP_END || xw0 + xstride + e->cols > RS_E8) {
+        ystage + 2u*4u*rows > RS_SP_END || xw0 + xstride + e->cols > RS_E8) {
         RLS->bad = 1;
         return;
     }
-    if (RLS->replay) {                    // the engine op and the two restores are in the image
-        RLS->n += 3;
+    if (RLS->replay) {                    // the engine op and the restores are in the image
+        RLS->n += 1 + nres;
         rl_rsf_lost();
         return;
     }
     struct engine_op op;
-    matvec_seg_op(&op, e, 0, e->rows/(uint32_t)R->n_ch, 0, ystage);
+    matvec_seg_op(&op, e, row0, rows/(uint32_t)R->n_ch, 0, ystage);
     op.xsrc    = xw0;
     op.nr      = 1;
     op.xstride = (uint16_t)(xstride/32);
-    op.qstride = (uint16_t)e->rows;              // row r's results at dst + 4*r*qstride
+    op.qstride = (uint16_t)rows;                 // row r's results at dst + 4*r*qstride
     desc_engine(RLS->n++, &op);
     for (int r = 0; r < 2; r++) {
+        if (!(restore >> r & 1u))
+            continue;
         struct bns_seq_descriptor d;
-        if (bns_seq_desc_restore(&d, ystage + 4u*e->rows*(uint32_t)r, dst[r], e8[r], e->rows,
+        if (bns_seq_desc_restore(&d, ystage + 4u*rows*(uint32_t)r, dst[r], e8[r], rows,
                                  (int32_t)e->rshift - (int32_t)e->bias)) {
             RLS->bad = 1;
             return;
@@ -1349,9 +1363,28 @@ void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, cons
     }
     rl_rsf_lost();
 #else
-    (void)e; (void)xw0; (void)xstride; (void)e8; (void)ystage; (void)dst;
+    (void)e; (void)row0; (void)rows; (void)xw0; (void)xstride; (void)e8; (void)ystage; (void)dst;
+    (void)restore;
     RLS->bad = 1;
 #endif
+}
+
+// The restore of `rows` int32 results of e at src into FP32 at dst with the exponent beat e8.
+void rl_restore_rows(const struct bons_entry *e, uint32_t src, uint32_t dst, uint32_t e8, uint32_t rows)
+{
+    struct bns_seq_descriptor d;
+    if (!rl_room(1) || !e) { RLS->bad = 1; return; }
+    if (RLS->replay) {
+        RLS->n++;
+        rl_rsf_lost();
+        return;
+    }
+    if (bns_seq_desc_restore(&d, src, dst, e8, rows, (int32_t)e->rshift - (int32_t)e->bias)) {
+        RLS->bad = 1;
+        return;
+    }
+    desc_words(RLS->n++, &d);
+    rl_rsf_lost();
 }
 
 // The list image cache's fourth key word for the lists built from here on (0: none): the
@@ -1913,6 +1946,17 @@ void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, cons
                 uint32_t ystage, const uint32_t dst[2])
 {
     (void)e; (void)xw0; (void)xstride; (void)e8; (void)ystage; (void)dst;
+}
+void rl_matvec2_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t xw0,
+                     uint32_t xstride, const uint32_t e8[2], uint32_t ystage, const uint32_t dst[2],
+                     uint32_t restore)
+{
+    (void)e; (void)row0; (void)rows; (void)xw0; (void)xstride; (void)e8; (void)ystage; (void)dst;
+    (void)restore;
+}
+void rl_restore_rows(const struct bons_entry *e, uint32_t src, uint32_t dst, uint32_t e8, uint32_t rows)
+{
+    (void)e; (void)src; (void)dst; (void)e8; (void)rows;
 }
 void resident_reenable(void) {}
 int  rl_begin_keyed(uint32_t a, uint32_t b, uint32_t c) { (void)a; (void)b; (void)c; return 0; }

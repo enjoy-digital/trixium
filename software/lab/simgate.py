@@ -131,6 +131,7 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
             # middle of an op (stall reporter, soft reset, self-test).
             print(f"pre: {cmd}", flush=True)
             done, ok = {"gen":      (r"GEN (DONE|ERR)",                "GEN DONE"),
+                        "gen2":     (r"GEN2 (DONE|ERR|trace .|dual|seq)|usage: gen2", None),
                         # bench answers the prompt before its tokens too; BENCH_PHASE is its
                         # last line (without this marker the driver moved on to `dbg` while
                         # the bench ran, timed out 60 s later and killed the simulator: a
@@ -163,6 +164,20 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
                 want = mirror_tokens(image, pids, n_new)
                 print(f"pre-gen tokens: {got} mirror: {want}", flush=True)
                 pre_ok &= got == want
+            # `gen2 N idsA... | idsB...` (two conversations decoded together): each stream must be
+            # the mirror's tokens for its own prompt.
+            if words[0] == "gen2" and len(words) > 2 and words[1].isdigit():
+                n_new = int(words[1])
+                rest = " ".join(words[2:]).split("|")
+                ok2 = "GEN2 DONE" in answer and len(rest) == 2
+                for k, part in enumerate(rest[:2]):
+                    pids = [int(w) for w in part.split()]
+                    got = re.search(rf"GEN2 {'AB'[k]}:([ \t\d-]*)", answer)
+                    got = [int(t) for t in got.group(1).split()] if got else []
+                    want = mirror_tokens(image, pids, n_new)
+                    print(f"gen2 stream {'AB'[k]}: {got} mirror: {want}", flush=True)
+                    ok2 &= got == want
+                pre_ok &= ok2
             print(f"pre: {cmd}: ok", flush=True)
         child.sendline(f"dbg {dbg}")
         child.expect(r"DBG armed for \d+ forwards", timeout=60)

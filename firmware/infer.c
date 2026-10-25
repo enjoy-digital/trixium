@@ -499,9 +499,21 @@ int infer_dbg_armed(void)
 // A batched prefill pass (forward_pair) traces each of its rows as its own forward: row r at
 // the pass's first position + r, armed when the count before the pass covered it.
 static int pair_pos0, pair_dbg0;
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+// Two conversations (infer_generate_dual): sequence s's own trace count; a dual step traces row
+// r (= sequence r) at that sequence's position.
+static int dual_on, dual_dbg[2];
+#endif
 
 void infer_dbg_row(int r)
 {
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+    if (dual_on) {
+        n_pos     = hybrid_pos();
+        dbg_armed = dual_dbg[r];
+        return;
+    }
+#endif
     n_pos     = pair_pos0 + r;
     dbg_armed = pair_dbg0 > r ? pair_dbg0 - r : 0;
 }
@@ -2082,3 +2094,148 @@ int infer_generate_from(const int *buf, int n, int resident, int max_new, void (
     }
     return count;
 }
+
+#ifdef CSR_TRIXIUM_ENGINE_CSR_NR_ADDR
+/* Two Conversations */
+/*-------------------*/
+
+// The sequence s's turn on the single-token paths (its prefill; its decode once the other has
+// stopped, or every step with dual off): its state in the globals, its position, its traces.
+static void dual_enter(int s)
+{
+    hybrid_seq_select(s);
+    n_pos = hybrid_pos();
+    dbg_armed = dual_dbg[s];
+}
+static void dual_leave(int s)
+{
+    dual_dbg[s] = dbg_armed;
+}
+
+// One dual step: the next token of each sequence (hybrid_forward_dual). -2: not run. Not
+// re-runnable (as the batched prefill): an uncorrectable ECC read during it is only counted.
+static int forward_dual(const int tok[2], int out[2])
+{
+    int p[2];
+    for (int s = 0; s < 2; s++) {
+        hybrid_seq_select(s);
+        p[s] = hybrid_pos();
+    }
+    dual_on = 1;
+    uint32_t d0 = ecc_uncorrectable();
+    int rc = hybrid_forward_dual(tok, out);
+    dual_on = 0;
+    if (rc == -2)
+        return -2;
+    infer_forwards += 2;
+    if (ecc_uncorrectable() != d0)
+        infer_ecc_unrecovered++;
+    for (int s = 0; s < 2; s++)
+        if (dual_dbg[s]) {
+            uint32_t token_bits = (uint32_t)out[s];
+            n_pos = p[s];
+            dbg_armed = 1;
+            dbg_typed("argmax", -1, &token_bits, 1, "u32");
+            dual_dbg[s]--;
+        }
+    dbg_armed = 0;
+    return rc;
+}
+
+// Two fresh conversations, greedy: each prompt prefilled on its own sequence, then every step
+// forwards the last token of both in one dual pass (dual = 0: two single forwards per step, the
+// A/B). Once one stops (max_new, a stop token, the context cap) the other goes on alone. The
+// `dbg N` count traces sequence dbg_seq's forwards. out[s][0..count[s]): the tokens; cycles[0]
+// the prefills, cycles[1] the steps with both sequences, steps[0] their count.
+int infer_generate_dual(const int *const prompt[2], const int n[2], int max_new, int dual, int dbg_seq,
+                        int *const out[2], int count[2], uint64_t cycles[2], int *steps)
+{
+    count[0] = count[1] = 0;
+    cycles[0] = cycles[1] = 0;
+    *steps = 0;
+    if (!H || H->magic != BONS_MAGIC || n_layer == 0 || !hybrid_present()) {
+        printf(" [no hybrid model]");
+        return -1;
+    }
+    for (int s = 0; s < 2; s++) {
+        if (n[s] < 1) {
+            printf(" [empty prompt]");
+            return -1;
+        }
+        for (int i = 0; i < n[s]; i++)
+            if (prompt[s][i] < 0 || (uint32_t)prompt[s][i] >= H->vocab) {
+                printf(" [bad token id %d, vocab %lu]", prompt[s][i], (unsigned long)H->vocab);
+                return -1;
+            }
+    }
+    int unbounded = infer_context_unbounded();
+    if (!unbounded && (n[0] > max_ctx || n[1] > max_ctx)) {
+        printf(" [prompt exceeds the KV budget of %d]", max_ctx);
+        return -1;
+    }
+    if (hybrid_dual_setup()) {
+        printf(" [dual decode unavailable]");
+        return -1;
+    }
+    gen_serial++;                          // a chat continuation cannot follow this
+    buf_base = 0;
+    dual_dbg[dbg_seq & 1] = dbg_armed;
+    dual_dbg[(dbg_seq & 1) ^ 1] = 0;
+    int rc = 0, cur[2], active[2] = {1, 1};
+    uint64_t t0 = perf_now64();
+    for (int s = 0; s < 2 && !rc; s++) {
+        dual_enter(s);
+        n_pos = 0;
+        hybrid_reset();
+        for (int i = 0; i + 1 < n[s] && !engine_wedged; ) {
+            if (i + 2 < n[s] && forward_pair(prompt[s] + i) != -2) {
+                i += 2;
+            } else {
+                (void)forward_checked(prompt[s][i], 0);
+                i++;
+            }
+        }
+        if (engine_wedged) { printf(" [engine wedged during the prompt]"); rc = -1; }
+        cur[s] = prompt[s][n[s] - 1];
+        dual_leave(s);
+    }
+    cycles[0] = perf_now64() - t0;
+    while (!rc && (active[0] || active[1])) {
+        int next[2] = {-1, -1};
+        uint64_t ts = perf_now64();
+        int both = active[0] && active[1];
+        if (both && dual && forward_dual(cur, next) == 0) {
+            // done
+        } else {
+            if (both && dual) {            // declined (the context cap): one at a time
+                dual = 0;
+                printf(" [dual step declined: single forwards]");
+            }
+            for (int s = 0; s < 2; s++)
+                if (active[s]) {
+                    dual_enter(s);
+                    next[s] = forward_checked(cur[s], 1);
+                    dual_leave(s);
+                }
+        }
+        if (both) {
+            cycles[1] += perf_now64() - ts;
+            (*steps)++;
+        }
+        if (engine_wedged) { printf(" [engine wedged]"); rc = -1; break; }
+        for (int s = 0; s < 2; s++) {
+            if (!active[s])
+                continue;
+            if (!unbounded && hybrid_seq_pos(s) >= max_ctx) { active[s] = 0; continue; }
+            out[s][count[s]++] = next[s];
+            cur[s] = next[s];
+            if (count[s] >= max_new || gen_is_stop(next[s]))
+                active[s] = 0;
+        }
+    }
+    hybrid_seq_select(0);
+    n_pos = hybrid_pos();
+    dbg_armed = 0;
+    return rc;
+}
+#endif

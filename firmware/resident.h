@@ -183,6 +183,13 @@ void rl_prepare_sp(uint32_t src_sp, uint32_t width, int rotate, uint32_t xw, uin
 // Needs CSR_TRIXIUM_ENGINE_CSR_NR_ADDR (marks the list bad otherwise).
 void rl_matvec2(const struct bons_entry *e, uint32_t xw0, uint32_t xstride, const uint32_t e8[2],
                 uint32_t ystage, const uint32_t dst[2]);
+// The same over the rows [row0, row0 + rows) of each channel's block, restoring only the rows
+// in the mask `restore` (bit r); a row left int32 at ystage + 4*r*rows is restored later with
+// rl_restore_rows (the two conversations' LM head: one argmax tracker per list).
+void rl_matvec2_rows(const struct bons_entry *e, uint32_t row0, uint32_t rows, uint32_t xw0,
+                     uint32_t xstride, const uint32_t e8[2], uint32_t ystage, const uint32_t dst[2],
+                     uint32_t restore);
+void rl_restore_rows(const struct bons_entry *e, uint32_t src, uint32_t dst, uint32_t e8, uint32_t rows);
 // A fourth word in the names of the lists built from now on (the list image cache; 0 = none).
 void resident_listcache_salt(uint32_t salt);
 // Unit 11 fixups for such lists (m_sp 0: m = 1.0; perm_a > 1: the unit's permuted output).

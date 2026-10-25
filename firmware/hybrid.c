@@ -169,6 +169,34 @@ static uint32_t kv_slot(int p)
         return (uint32_t)p;
     return (uint32_t)(kv_pin + (p - kv_pin) % (ctx_cap - kv_pin));
 }
+
+#ifdef P2_BUILT
+// Two conversations decoded together (hybrid_forward_dual): everything one sequence carries
+// from token to token, swapped in and out of the globals the forward reads (seq_swap), so the
+// single-token code runs unchanged on either. Sequence 0 is the one every other path uses; the
+// second set (engine-DDR DeltaNet state and attention K/V spans, the conv window, main RAM's K/V
+// copy) is allocated by hybrid_dual_setup on the first `gen2`.
+struct hyb_seq {
+    int pos, dn_par, kv_pin, kv_pin_next, dn_hw_written;
+    uint64_t dn_state_zero;
+    uint32_t dn_hbm_base, at_hbm_base;
+    float *dn_state, *dn_conv, *kc, *vc;
+    uint8_t *dn_conv_pos;
+    uint16_t *kc_rows;
+};
+static struct hyb_seq hseq[2];
+static int hseq_cur;                   // the sequence whose state the globals hold
+static int hseq_ready;                 // the second set: 0 not tried, 1 allocated, -1 refused
+static int p2_dual;                    // pair_row swaps sequences (the dual decode), not positions
+static void seq_swap(int s);
+// The list image cache's salt of row r of the current sequence: the lists of sequence 1 name its
+// own engine-DDR state (the DeltaNet core list's wbase), the second row the second residual slot.
+static uint32_t seq_salt(int r)
+{
+    uint32_t k = (uint32_t)hseq_cur << 1 | (uint32_t)r;
+    return k ? 0x9A1B0000u | k : 0u;
+}
+#endif
 int hybrid_softmax_unit = 1;             // Console `softmaxunit off`: the CPU softmax instead of unit 14.
 int hybrid_dn_list = 1;                  // Console `dnlist off`: the DeltaNet heads op through the CSRs
 int hybrid_dn_zbeside = 0;               // Console `dnzbeside on`: z beside the conv's SiLU, not in the projection list (A/B pending on the card)
@@ -230,6 +258,7 @@ struct hyb_prof {
     uint8_t prefill2;                // console `prefill2 on|off`: two prompt tokens per weight pass
     uint8_t pair_geom;               // the model fits the batched FFN lists: 0 unknown, 1 yes, 2 no
     uint8_t pair_inproj;             // `prefill2 on` (1) also batches the mixers' in-projections; `prefill2 ffn` (0)
+    uint8_t lmhead2;                 // `gen2 lmhead on|off`: the two conversations' LM heads in one weight pass
 };
 #define HP ((struct hyb_prof *)TRIXIUM_HYBPROF_ADDR)
 _Static_assert(sizeof(struct hyb_prof) <= 256, "hyb_prof window is 256 bytes");
@@ -725,6 +754,11 @@ static void rope_apply_partial(float *vh)   // one head: the first rope_n dims, 
 int hybrid_init(void)
 {
     H = model_header();
+#ifdef P2_BUILT
+    hseq_cur = 0;                      // a new heap: the second sequence's set is gone
+    hseq_ready = 0;
+    p2_dual = 0;
+#endif
     memset((void *)HL, 0, sizeof(struct hyb_live));      // .live is not .bss
     memset(hyb_live_base, 0, sizeof hyb_live_base);
     HL->version = HYB_LIVE_VERSION;
@@ -986,6 +1020,7 @@ int hybrid_init(void)
     HP->prefill2 = 1;
     HP->pair_geom = 0;
     HP->pair_inproj = 1;
+    HP->lmhead2 = 1;
     if (H->hadamard_block && resident_available()) {
         if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
@@ -2996,10 +3031,14 @@ static int pair_ok(void)
 
 static void pair_row(int r, int p0, int par0)
 {
-    pos = p0 + r;
-    dn_par = dn_set_bytes ? par0 ^ r : par0;
+    if (p2_dual) {                          // two sequences: row r is sequence r, at its own state
+        seq_swap(r);
+    } else {
+        pos = p0 + r;
+        dn_par = dn_set_bytes ? par0 ^ r : par0;
+    }
     HP->xres_row = (uint8_t)r;
-    resident_listcache_salt(r ? 0x9A1B0000u | (uint32_t)r : 0u);
+    resident_listcache_salt(seq_salt(r));
     infer_dbg_row(r);
 }
 
@@ -3201,7 +3240,7 @@ int hybrid_forward2(const int *tokens)
     p2_mode = p2_parked = 0;
     HP->xres_row = 0;
     HP->keep_out = 0;
-    resident_listcache_salt(0);
+    resident_listcache_salt(seq_salt(0));
     pos = p0 + 2;
     dn_par = par0;                          // flipped once per token
     hyb_forwards_profiled += 2;
@@ -3213,6 +3252,346 @@ int hybrid_forward2(const int *tokens)
     return 0;
 #else
     (void)tokens;
+    return -2;
+#endif
+}
+
+/* Two Conversations */
+/*-------------------*/
+
+// Two independent sequences decoded together on the multi-row engine (doc/plan-multirow.md,
+// "small batches"): one layer-major pass per step produces the next token of each. Per layer,
+// each sequence in turn runs its attention norm, its mixer and the residual add with the FFN
+// norm on its own state (seq_swap: position, DeltaNet state set and parity, conv window, K/V
+// spans and ring) and its own residual slot (XRES_SP0 / XRES_SP1); the weight streams the
+// batched prefill shares (DeltaNet qkv/z, attention q/k/v, FFN gate/up/down) run once for both
+// rows with rl_matvec2, each row restored with its own exponent. Then each sequence's output
+// norm and LM head. Each row's arithmetic is the single-token arithmetic, so both token streams
+// and every checkpoint are bit-identical to decoding each sequence alone.
+#ifdef P2_BUILT
+static void seq_save(struct hyb_seq *q)
+{
+    q->pos = pos; q->dn_par = dn_par; q->kv_pin = kv_pin; q->kv_pin_next = kv_pin_next;
+    q->dn_hw_written = dn_hw_written; q->dn_state_zero = dn_state_zero;
+    q->dn_hbm_base = dn_hbm_base;
+#ifdef TRIXIUM_HAS_ATTNSTREAM
+    q->at_hbm_base = at_hbm_base;
+#endif
+    q->dn_state = dn_state; q->dn_conv = dn_conv; q->kc = kc; q->vc = vc;
+    q->dn_conv_pos = dn_conv_pos; q->kc_rows = kc_rows;
+}
+
+static void seq_load(const struct hyb_seq *q)
+{
+    pos = q->pos; dn_par = q->dn_par; kv_pin = q->kv_pin; kv_pin_next = q->kv_pin_next;
+    dn_hw_written = q->dn_hw_written; dn_state_zero = q->dn_state_zero;
+    dn_hbm_base = q->dn_hbm_base;
+#ifdef TRIXIUM_HAS_ATTNSTREAM
+    at_hbm_base = q->at_hbm_base;
+#endif
+    dn_state = q->dn_state; dn_conv = q->dn_conv; kc = q->kc; vc = q->vc;
+    dn_conv_pos = q->dn_conv_pos; kc_rows = q->kc_rows;
+}
+
+static void seq_swap(int s)
+{
+    if (s == hseq_cur || (s && hseq_ready <= 0))
+        return;
+    seq_save(&hseq[hseq_cur]);
+    seq_load(&hseq[s]);
+    hseq_cur = s;
+    resident_listcache_salt(seq_salt(0));   // a single-token forward of this sequence
+}
+#endif
+
+int hybrid_dual_setup(void)
+{
+#ifdef P2_BUILT
+    if (hseq_ready)
+        return hseq_ready > 0 ? 0 : -1;
+    if (!H || !pair_ok()) {
+        printf("hybrid: dual decode needs the resident lists and the batched FFN geometry\n");
+        return -1;                          // not latched: `prefill2 on` may come later
+    }
+    hseq_ready = -1;
+    seq_swap(0);
+    seq_save(&hseq[0]);
+    struct hyb_seq *b = &hseq[1];
+    *b = hseq[0];
+    // Engine DDR: a second DeltaNet state span (both sets) and a second pair of K/V spans per
+    // attention layer, above everything the first sequence uses, inside the channel window.
+    uint64_t end = 0, dn_span = 0, at_span = 0, limit = 0;
+#ifdef DN_STATE_HW
+    if (dn_hw) {
+        dn_span = ((uint64_t)n_dn*nv + n_ch - 1u)/n_ch*DN_HEAD_BYTES*(dn_set_bytes ? 2u : 1u);
+        end = (uint64_t)dn_hbm_base + dn_span;
+    }
+#endif
+#ifdef TRIXIUM_HAS_ATTNSTREAM
+    if (at_geom_ok) {
+        at_span = (uint64_t)n_attn*2u*at_slots*at_rowbeats*32u;
+        if ((uint64_t)at_hbm_base + at_span > end)
+            end = (uint64_t)at_hbm_base + at_span;
+    }
+#endif
+    if (end) {
+        uint64_t base = (end + 0xFFFu) & ~0xFFFull;
+#if defined(TRIXIUM_HAS_ATTNSTREAM) || defined(DN_STATE_HW)
+        limit = chan_limit();
+#endif
+        if (dn_span) {
+            b->dn_hbm_base = (uint32_t)base;
+            base = (base + dn_span + 0xFFFu) & ~0xFFFull;
+        }
+        if (at_span) {
+            b->at_hbm_base = (uint32_t)base;
+            base += at_span;
+        }
+        if (base > limit) {
+            printf("hybrid: dual decode: the second state set reaches %08lx, past the channel "
+                   "window's end %08lx\n", (unsigned long)base, (unsigned long)limit);
+            return -1;
+        }
+    }
+    // main RAM: the conv window, the CPU path's K/V copy (and the state matrices without the
+    // stream), at the first sequence's context capacity.
+    uint64_t matrix_b = (uint64_t)n_dn*nv*hv*hk*4;
+    uint64_t conv_b = (uint64_t)n_dn*dn_conv_w*(2*nq + nvh)*4;
+    uint64_t kv_b = (uint64_t)n_attn*ctx_cap*kv_dim*4*2;
+    uint64_t need = (dn_hw ? 0 : matrix_b) + conv_b + kv_b + 4096u, room = infer_heap_room(1);
+    if (need > room) {
+        printf("hybrid: dual decode: the second sequence needs %lu KB of main RAM, %lu KB free\n",
+               (unsigned long)(need >> 10), (unsigned long)(room >> 10));
+        return -1;
+    }
+    b->dn_state = (n_dn && !dn_hw) ? infer_halloc(matrix_b, 1) : NULL;
+    b->dn_conv = n_dn ? infer_halloc(conv_b, 1) : NULL;
+    b->dn_conv_pos = n_dn ? infer_halloc(n_dn, 0) : NULL;
+    b->kc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
+    b->vc = n_attn ? infer_halloc(kv_b/2, 1) : NULL;
+    b->kc_rows = n_attn ? infer_halloc(((uint64_t)n_attn*2 + 31) & ~31ull, 0) : NULL;
+    if ((n_dn && (!b->dn_conv || !b->dn_conv_pos || (!dn_hw && !b->dn_state))) ||
+        (n_attn && (!b->kc || !b->vc || !b->kc_rows))) {
+        printf("hybrid: dual decode: no heap for the second sequence\n");
+        return -1;
+    }
+    b->pos = 0;
+    b->dn_par = 0;
+    b->dn_state_zero = 0;
+    b->kv_pin = b->kv_pin_next = KV_SINKS;
+#ifdef TRIXIUM_SIM
+    // Simulation: the second span was never written (the memory model's zeros, no ECC); the
+    // board clears it once at the sequence's first reset (never-written DDR has no valid ECC).
+    b->dn_hw_written = 1;
+#else
+    b->dn_hw_written = 0;
+#endif
+    if (b->dn_conv_pos) memset(b->dn_conv_pos, 0, (size_t)n_dn);
+    if (b->kc_rows) memset(b->kc_rows, 0, (size_t)n_attn*2);
+    hseq_ready = 1;
+    printf("hybrid: dual decode: second sequence: engine DDR DeltaNet %lu KB at %08lx, K/V %lu KB "
+           "at %08lx (window end %08lx); main RAM %lu KB (ctx %d)\n",
+           (unsigned long)(dn_span >> 10), (unsigned long)b->dn_hbm_base,
+           (unsigned long)(at_span >> 10), (unsigned long)b->at_hbm_base, (unsigned long)limit,
+           (unsigned long)(need >> 10), ctx_cap);
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+void hybrid_lmhead2_enable(int on) { HP->lmhead2 = on ? 1 : 0; }
+int  hybrid_lmhead2_enabled(void) { return HP->lmhead2; }
+
+void hybrid_seq_select(int s)
+{
+#ifdef P2_BUILT
+    seq_swap(s);
+#else
+    (void)s;
+#endif
+}
+
+int hybrid_seq_pos(int s)
+{
+#ifdef P2_BUILT
+    if (s != hseq_cur && hseq_ready > 0)
+        return hseq[s].pos;
+#endif
+    (void)s;
+    return pos;
+}
+
+#if defined(P2_BUILT) && defined(CSR_TRIXIUM_SEQ_RESTORE_ARGMAX_IDX_ADDR)
+// Both sequences' LM heads in one weight pass per chunk: the first chunk's list norms each
+// residual slot with the output norm and prepares it into its Q8 slot; each chunk streams the
+// head once for both rows (rl_matvec2_rows, int32 staged from RS_Y up), its list restores row 0
+// (in place) and the restore unit's tracker gives row 0's argmax; a second list restores row 1
+// for its tracker. Same tie-breaks as lm_head_argmax (chunk order is model row order within a
+// chunk, the smaller row across chunks). A chunk the tracker cannot answer for (a NaN, padding
+// past the vocabulary) leaves best[r] = -1: the caller runs that row's single LM head.
+static int lm_head_argmax2(const struct bons_entry *head, int best[2])
+{
+    if (!(H->hadamard_block && resident_active() && head && out_norm &&
+          (head->kind == KIND_TERNARY || head->kind == KIND_TERNARY5) && !(head->flags & FLAG_KSEG)))
+        return -1;
+    uint32_t nch = (uint32_t)n_ch, unit = 8u*nch, per = head->rows/nch, vocab = (uint32_t)H->vocab;
+    uint32_t n = (uint32_t)n_embd, chunk = lm_chunk_rows(), cap = (0x32000u - RS_Y_ADDR)/8u/unit*unit;
+    if (chunk > cap)
+        chunk = cap;
+    if (head->rows % unit || !chunk || n % 32 || 4u*n > RS_F_ADDR - RS_Y_ADDR)
+        return -1;
+    const uint32_t slot[2] = {XRES_SP0, XRES_SP1}, e8[2] = {RS_E8_ADDR, RS_E8B_ADDR};
+    int have[2] = {0, 0}, bad[2] = {0, 0};
+    float bv[2] = {0.0f, 0.0f};
+    uint32_t brow[2] = {0, 0};
+    struct bns_seq_descriptor d;
+    for (uint32_t r0 = 0; r0 < head->rows; r0 += chunk) {
+        uint32_t rows = head->rows - r0 < chunk ? head->rows - r0 : chunk, rpc = rows/nch;
+        const uint32_t ys[2] = {RS_Y_ADDR, RS_Y_ADDR + 4u*rows};
+        for (int r = 0; r < 2; r++) {
+            rl_begin();
+            if (!r0 && !r) {
+                rl_fetch_raw(out_norm, 4u*n, RS_Y_ADDR);   // fetched by the engine: clean
+                for (int k = 0; k < 2; k++) {
+                    bns_seq_desc_norm(&d, 0, slot[k], RS_F_ADDR, RS_Y_ADDR, n, 1, f32_bits(rms_eps));
+                    rl_desc(&d);
+                    rl_prepare_sp(RS_F_ADDR, n, 1, RS_XW_ADDR + (uint32_t)k*n, e8[k]);
+                }
+            }
+            if (!r)
+                rl_matvec2_rows(head, r0, rows, RS_XW_ADDR, n, e8, RS_Y_ADDR, ys, 1u);
+            else
+                rl_restore_rows(head, ys[1], ys[1], e8[1], rows);
+            if (rl_run("lm head2"))
+                return -1;
+            uint32_t idx = trixium_seq_restore_argmax_idx_read();
+            union { uint32_t u; float f; } v;
+            v.u = trixium_seq_restore_argmax_val_read();
+            uint32_t row = idx < rows ? (idx/rpc)*per + r0/nch + idx % rpc : 0xFFFFFFFFu;
+            if (bad[r])
+                continue;
+            if (row >= vocab || v.f != v.f) {
+                bad[r] = 1;
+                continue;
+            }
+            if (!have[r] || v.f > bv[r] || (v.f == bv[r] && row < brow[r])) {
+                bv[r] = v.f;
+                brow[r] = row;
+                have[r] = 1;
+            }
+        }
+    }
+    for (int r = 0; r < 2; r++)
+        best[r] = bad[r] ? -1 : have[r] ? (int)brow[r] : 0;
+    return 0;
+}
+#endif
+
+int hybrid_forward_dual(const int *tokens, int *out)
+{
+#ifdef P2_BUILT
+    if (hseq_ready <= 0 || !pair_ok())
+        return -2;
+    for (int s = 0; s < 2; s++) {
+        seq_swap(s);
+        if (pos >= ctx_cap && !kv_ring_on()) {
+            seq_swap(0);
+            return -2;
+        }
+    }
+    int rc = 0;
+    out[0] = out[1] = -1;
+    resident_join();
+    if (!out_norm)                          // model_entry_kind scans the table: once
+        out_norm = fetch_f32(model_entry_kind(ROLE_OUT_NORM, 0, KIND_F32));
+    p2_dual = 1;
+    HP->xres_on = 1;
+    // Both embeddings into their residual slots first (row 0's mixers read row 1's slot).
+    for (int r = 0; r < 2 && !rc; r++) {
+        pair_row(r, 0, 0);
+        resident_join();
+        uint64_t t0 = perf_now64();
+        perf_enter(OP_EMBED);
+        rc = infer_embed_f(tokens[r], xb) < 0;
+        if (!rc) {
+            rl_begin();
+            rl_fetch(xb, 4u*(uint32_t)n_embd, XRES_SP);
+            rc = rl_run("residual load") != 0;
+        }
+        hyb_cyc_embed += perf_now64() - t0;
+        perf_exit(OP_EMBED);
+        if (!rc)
+            infer_dbg_f32("emb", -1, xb, n_embd);
+    }
+    for (int l = 0; l < n_layer && !rc; l++) {
+        for (int r = 0; r < 2 && !rc; r++) {
+            pair_row(r, 0, 0);
+            rc = pair_seg(l);
+        }
+        if (!rc)
+            rc = ffn_pair(l, 0, 0);
+    }
+    hyb_forwards_profiled += 2;
+    hyb_live_publish();
+    // Both LM heads in one weight pass (untraced: the trace's logits and out_norm taps are the
+    // single head's), else, or for a row it could not answer, each sequence's output norm (from
+    // its slot) and LM head.
+    int traced2 = 0;
+    for (int r = 0; r < 2; r++) {
+        pair_row(r, 0, 0);
+        traced2 |= infer_dbg_armed() != 0;
+    }
+#ifdef CSR_TRIXIUM_SEQ_RESTORE_ARGMAX_IDX_ADDR
+    if (!rc && !traced2 && HP->hwargmax && HP->lmhead2) {
+        const struct bons_entry *head = model_entry(ROLE_LM_HEAD, 0);
+        if (!head) head = model_entry(ROLE_TOK_EMB, 0);
+        uint64_t t0 = perf_now64();
+        perf_enter(OP_LMHEAD);
+        resident_listcache_salt(0);
+        int best[2];
+        if (resident_join() == 0 && lm_head_argmax2(head, best) == 0) {
+            out[0] = best[0];
+            out[1] = best[1];
+        }
+        hyb_cyc_logits += perf_now64() - t0;
+        perf_exit(OP_LMHEAD);
+    }
+#endif
+    for (int r = 0; r < 2 && !rc; r++) {
+        if (out[r] >= 0)
+            continue;
+        pair_row(r, 0, 0);
+        int traced = infer_dbg_armed() != 0;
+        HP->keep_out = 0;
+        uint64_t t0 = perf_now64();
+        perf_enter(OP_LMHEAD);
+        rc = xres_list(NULL, out_norm, 0, traced) != 0;
+        if (!rc) {
+            infer_dbg_f32("out_norm", -1, hb, n_embd);
+            out[r] = head_argmax(t0);
+        }
+        perf_exit(OP_LMHEAD);
+    }
+    resident_join();
+    p2_dual = 0;
+    p2_mode = p2_parked = 0;
+    HP->xres_row = 0;
+    HP->keep_out = 0;
+    for (int s = 1; s >= 0; s--) {          // every layer's state is now in the other set
+        seq_swap(s);
+        pos++;
+        if (dn_set_bytes)
+            dn_par ^= 1;
+    }
+    resident_listcache_salt(seq_salt(0));
+    if (rc) {
+        puts("hybrid: dual decode failed - these tokens are invalid");
+        return -1;
+    }
+    return 0;
+#else
+    (void)tokens; (void)out;
     return -2;
 #endif
 }

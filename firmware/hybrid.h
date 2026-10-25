@@ -29,6 +29,16 @@ int  hybrid_forward2(const int *tokens);
 int  hybrid_forward2_ok(void);                   // hybrid_forward2 would run now
 void hybrid_prefill2_enable(int on);             // Console `prefill2 on|off|ffn` (1, 0, 2: the FFN only; default on).
 int  hybrid_prefill2_enabled(void);               // 1 on, 2 the FFN only, 0 off.
+// Two conversations decoded together (the same engines): sequence 1's state set allocated on
+// the first call (0 ok, -1 not built or does not fit), the sequence the other calls act on
+// (0 everywhere else), one step of both: out[s] = the next token of sequence s after tokens[s],
+// bit-identical to hybrid_forward(tokens[s], 1) on each. 0 done, -1 failed, -2 not run.
+int  hybrid_dual_setup(void);
+void hybrid_seq_select(int s);
+int  hybrid_seq_pos(int s);                      // Sequence s's position.
+void hybrid_lmhead2_enable(int on);              // Console `gen2 lmhead on|off`: both LM heads in one pass (default on).
+int  hybrid_lmhead2_enabled(void);
+int  hybrid_forward_dual(const int *tokens, int *out);
 int  hybrid_ckpt_save(void);                     // 1: the next forward can be re-run ...
 void hybrid_ckpt_restore(void);                  // ... from here (ECC retry).
 
