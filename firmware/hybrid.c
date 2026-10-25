@@ -1020,7 +1020,8 @@ int hybrid_init(void)
     HP->prefill2 = 1;
     HP->pair_geom = 0;
     HP->pair_inproj = 1;
-    HP->lmhead2 = 1;
+    HP->lmhead2 = 0;                  // Off: on the card's 2B (24,576-row chunks) the two-row head
+                                      // gave wrong tokens (the tiny image's 128-row chunks pass): to fix.
     if (H->hadamard_block && resident_available()) {
         if (resident_init() == 0) {
             puts("hybrid: resident projections (scratchpad quantize/rotate/restore lists) on");
