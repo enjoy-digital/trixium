@@ -46,9 +46,16 @@ def _delay(module, sig, cycles, reset_less=False):
         cur = nxt
     return cur
 
-def _adder_tree(module, lanes, reg_every=2):
-    """Pairwise adder tree; registers every `reg_every` levels. Returns (out, n_reg_stages)."""
-    level  = list(lanes)
+def _adder_tree(module, lanes, reg_every=2, cins=None):
+    """Pairwise adder tree; registers every `reg_every` levels. Returns (out, n_reg_stages).
+
+    cins: optional 1-bit signals (valid with the lanes) added into the sum, one per adder as its
+    carry-in (a + b + c is one carry chain): the first level's adders take the first ones, the
+    next level's the following ones (delayed through the tree's register stages), and so on. At
+    most one per adder (len(lanes) - 1 in all)."""
+    level   = list(lanes)
+    pending = list(cins) if cins is not None else []
+    assert len(pending) <= max(len(level) - 1, 0)
     n_lvl  = 0
     n_regs = 0
     while len(level) > 1:
@@ -56,7 +63,16 @@ def _adder_tree(module, lanes, reg_every=2):
         for i in range(0, len(level), 2):
             if i + 1 < len(level):
                 s = Signal((len(level[i]) + 1, True))
-                module.comb += s.eq(level[i] + level[i+1])
+                if pending:
+                    # Signed 2-bit copy of the carry: a 1-bit unsigned operand would make the
+                    # emitted Verilog sum unsigned.
+                    c = Signal((2, True))
+                    module.comb += [
+                        c.eq(pending.pop(0)),
+                        s.eq(level[i] + level[i+1] + c),
+                    ]
+                else:
+                    module.comb += s.eq(level[i] + level[i+1])
             else:
                 s = level[i]
             nxt.append(s)
@@ -68,9 +84,61 @@ def _adder_tree(module, lanes, reg_every=2):
                 module.sync += r.eq(s)
                 regs.append(r)
             nxt = regs
+            pend_r = []
+            for c in pending:
+                r = Signal(reset_less=True)
+                module.sync += r.eq(c)
+                pend_r.append(r)
+            pending = pend_r
             n_regs += 1
         level = nxt
+    assert not pending
     return level[0], n_regs
+
+def _ternary_lanes(module, xword, codes, enables):
+    """128 registered ternary lanes of x (8-bit signed, from `xword`) by the 2-bit codes.
+
+    The group sum is that of code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0, computed without a
+    negation per lane: -x = ~x + 1, so lane j > 0 selects {~x, 0, x} (8-bit signed: ~x of x in
+    [-128, 127] is in [-128, 127]) and returns its code-00 bit as a carry-in for the adder tree.
+    Lane 0 keeps the negation (9-bit): 128 corrections but 127 adders. `enables`: one register
+    enable per 16 lanes. Returns (lanes, cins), both registered (valid one cycle later)."""
+    lanes = []
+    cins  = []
+    for j in range(128):
+        x_j  = Signal((8, True))
+        c_j  = Signal(2)
+        neg_lane = (j == 0)
+        lane = Signal((9 if neg_lane else 8, True))
+        module.comb += [
+            x_j.eq(xword[8*j:8*j+8]),
+            c_j.eq(codes[2*j:2*j+2]),
+        ]
+        if neg_lane:
+            module.comb += Case(c_j, {
+                0 : lane.eq(-x_j),
+                1 : lane.eq(0),
+                2 : lane.eq(x_j),
+                3 : lane.eq(0),
+            })
+        else:
+            nx_j = Signal((8, True))
+            module.comb += [
+                nx_j.eq(~x_j),
+                Case(c_j, {
+                    0 : lane.eq(nx_j),
+                    1 : lane.eq(0),
+                    2 : lane.eq(x_j),
+                    3 : lane.eq(0),
+                }),
+            ]
+            k_r = Signal(reset_less=True)
+            module.sync += If(enables[j // 16], k_r.eq(c_j == 0))
+            cins.append(k_r)
+        r = Signal.like(lane, reset_less=True)
+        module.sync += If(enables[j // 16], r.eq(lane))
+        lanes.append(r)
+    return lanes, cins
 
 # Channel Pipe -------------------------------------------------------------------------------------
 
@@ -241,30 +309,14 @@ class ChannelPipe(LiteXModule):
         row_last1 = _delay(self, row_last, 1, reset_less=True) # A tag: qualified by v4.
 
         # T1: lane select + scale fp16 mux; register lanes -----------------------------------------
-        # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error).
+        # Ternary lanes: code 00 -> -x, 01 -> 0, 10 -> +x, 11 -> 0 (+ sticky error), as
+        # {~x, 0, x} lanes plus code-00 carry-ins into the adder tree (exact, no per-lane negation).
         xword = xbuf_r.dat_r if nrows == 1 else xbuf_r.dat_r[:1024] # Row 0, 1024-bit, valid at T1.
 
-        tern_lanes = []
+        # Cheap lanes ({~x, 0, x} + code-00 carry-ins into the tree, see _ternary_lanes).
+        tern_lanes, tern_cins = _ternary_lanes(self, xword, codes_r, v1_tern)
         code3_seen = Signal()
-        code3_any  = []
-        for j in range(128):
-            x_j  = Signal((8, True))
-            c_j  = Signal(2)
-            lane = Signal((9, True))
-            self.comb += [
-                x_j.eq(xword[8*j:8*j+8]),
-                c_j.eq(codes_r[2*j:2*j+2]),
-                Case(c_j, {
-                    0 : lane.eq(-x_j),
-                    1 : lane.eq(0),
-                    2 : lane.eq(x_j),
-                    3 : lane.eq(0),
-                }),
-            ]
-            code3_any.append(c_j == 3)
-            r = Signal((9, True), reset_less=True)
-            self.sync += If(v1_tern[j // 16], r.eq(lane))
-            tern_lanes.append(r)
+        code3_any  = [codes_r[2*j:2*j+2] == 3 for j in range(128)]
         self.comb += code3_seen.eq(v1 & (self.kind == KIND_OP_TERNARY) & reduce(or_, code3_any))
         self.sync += If(self.start,
             self.error.eq(0),
@@ -282,24 +334,7 @@ class ChannelPipe(LiteXModule):
             self.sync += If(t0_fire, codes_x.eq(self.sink.data))
             v1_x    = [v1_rep(f"t{k}_r{r}") for k in range(8)]
             xword_x = xbuf_r.dat_r[1024*r:1024*(r+1)]
-            lanes_x = []
-            for j in range(128):
-                x_j  = Signal((8, True))
-                c_j  = Signal(2)
-                lane = Signal((9, True))
-                self.comb += [
-                    x_j.eq(xword_x[8*j:8*j+8]),
-                    c_j.eq(codes_x[2*j:2*j+2]),
-                    Case(c_j, {
-                        0 : lane.eq(-x_j),
-                        1 : lane.eq(0),
-                        2 : lane.eq(x_j),
-                        3 : lane.eq(0),
-                    }),
-                ]
-                lr = Signal((9, True), reset_less=True)
-                self.sync += If(v1_x[j // 16], lr.eq(lane))
-                lanes_x.append(lr)
+            lanes_x = _ternary_lanes(self, xword_x, codes_x, v1_x)
             tern_lanes_x.append(lanes_x)
 
         # Q8 lanes: w8 * x8 over the selected 256-bit x slice.
@@ -487,7 +522,7 @@ class ChannelPipe(LiteXModule):
         # (end of the AXPY datapath)
 
         # T2..: adder trees (both built; result muxed by kind) -------------------------------------
-        tern_sum, tern_regs = _adder_tree(self, tern_lanes) # 7 levels -> 16b, n regs.
+        tern_sum, tern_regs = _adder_tree(self, tern_lanes, cins=tern_cins) # 7 levels -> 16b, n regs.
         q8_sum,   q8_regs   = _adder_tree(self, q8_lanes)   # 5 levels -> 21b, n regs.
         # Q8 lanes are valid one cycle after the ternary lanes (the DSP operand stage).
         n_tree = max(tern_regs, q8_regs + 1)
@@ -498,8 +533,8 @@ class ChannelPipe(LiteXModule):
         self.comb += gs.eq(Mux(self.kind == KIND_OP_Q8, q8_sum, tern_sum))
         # Extra rows: ternary only, aligned with row 0's tree output.
         gs_x = []
-        for lanes_x in tern_lanes_x:
-            sum_x, regs_x = _adder_tree(self, lanes_x)
+        for lanes_x, cins_x in tern_lanes_x:
+            sum_x, regs_x = _adder_tree(self, lanes_x, cins=cins_x)
             assert regs_x == tern_regs
             gs_x.append(_delay(self, sum_x, n_tree - tern_regs, reset_less=True))
 
