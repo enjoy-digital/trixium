@@ -149,7 +149,7 @@ class AttentionStream(LiteXModule):
         ngroups = Signal(max=t_max//8 + 1, reset_less=True)
 
         # Record, then the per-lane operands: registered read requests -----------------------------
-        ld_st = Signal(3)       # 0 idle, 1 record, 2 decode, 3 operands, 4 last, 5 ready
+        ld_st = Signal(3)       # 0 idle, 1 record, 6 check, 2 decode, 3 operands, 4 last, 5 ready
         # The request/response payloads are reset-less: qualified by rq_v / rsp_v.
         rq_v, rq_adr, rq_lane, rq_word, rq_last = (Signal(), Signal(adr_bits, reset_less=True),
             Signal(max=L, reset_less=True), Signal(pw, reset_less=True), Signal(reset_less=True))
@@ -167,7 +167,11 @@ class AttentionStream(LiteXModule):
             self.sp_rd_adr.eq(rq_adr),
             ld_words.eq(Mux(mode, tbeats, hb)),
         ]
-        rec_w = [dat[32*i:32*(i + 1)] for i in range(8)]
+        # The record word registered before its check and decode: the scratchpad's BRAM output
+        # through the geometry check (products) to every decoded register's enable was the sys
+        # clock's worst path once the multi-row engine sat beside it (ypcb_mr2: -0.573 ns).
+        rec_q = Signal(256, reset_less=True)
+        rec_w = [rec_q[32*i:32*(i + 1)] for i in range(8)]
         geometry_bad = Signal()
         self.comb += geometry_bad.eq(
             (rec_w[0][8:16] == 0) | (rec_w[0][8:16] > L) | (rec_w[0][16:24] == 0) |
@@ -196,6 +200,9 @@ class AttentionStream(LiteXModule):
                 If(taken, rq_v.eq(0)),
                 Case(ld_st, {
                     1: If(rsp_rec,
+                        rec_q.eq(dat), ld_st.eq(6),
+                    ),
+                    6: [
                         If(geometry_bad,
                             self.error.eq(1), ld_st.eq(0),
                         ).Else(
@@ -208,7 +215,7 @@ class AttentionStream(LiteXModule):
                             scale.eq(rec_w[7]),
                             ld_st.eq(2),
                         )
-                    ),
+                    ],
                     2: [
                         rowbeats.eq(nkv*hb),
                         tbeats.eq((T + 7) >> 3),
