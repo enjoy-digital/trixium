@@ -508,6 +508,15 @@ def main():
         vivado_max_threads                   = 4,
     )
     args = parser.parse_args()
+    # The multi-row engine fills the quiet regions' Pblock (~86% of the LUTs): the timing-driven
+    # directives leave it unroutable (ypcb_mr2b: global congestion 6); the default synthesis and the
+    # spread-logic placement route it (ypcb_mr2c: WNS -0.104, one PCIe endpoint, the engine's clocks
+    # closed). Directives given on the command line win.
+    if args.matvec_rows > 1:
+        if "--vivado-synth-directive" not in sys.argv:
+            args.vivado_synth_directive = "default"
+        if "--vivado-place-directive" not in sys.argv:
+            args.vivado_place_directive = "AltSpreadLogic_high"
 
     soc = TriXiumYPCBSoC(
         sys_clk_freq       = args.sys_clk_freq,
