@@ -163,3 +163,33 @@ def test_sim_ypcb_hybrid_gate(image, memctrl, profile):
     r = subprocess.run(common + ["--gate", "--gate-pre", "listcache verify;gen 4 1 2 3;stats"],
                        capture_output=True, text=True, timeout=60*60)
     assert r.returncode == 0 and "GATE PASS" in r.stdout, r.stdout[-3000:] + r.stderr[-1500:]
+
+
+# Two conversations decoded together (`gen2`, --matvec-rows 2) with the two-row LM head on an LM
+# head of real-model chunk sizes: the tiny image's 512-row vocabulary is one 512-row chunk (and
+# `lmchunk 128` only shrinks it), where the 2B's head runs 22,016-row chunks and a ragged tail.
+# The image here has a 24,000-row vocabulary: an automatic chunk of 22,016 rows (5,504 per
+# channel, the 2B's: row 1's int32 staged up to 0x2F800) and a ragged 1,984-row tail, then
+# `lmchunk 2048`: twelve chunks with a ragged 1,472-row tail. Each stream must be the mirror's
+# tokens for its own prompt (the gate's gen2 check), the per-row heads (`lmhead off`) too.
+GEN2_VOCAB = 24000
+
+@pytest.mark.slow
+def test_sim_ypcb_gen2_lmhead_chunks():
+    from model import tinygen
+    image = f"models/tiny/bonsai-tiny-hybrid-1k-v{GEN2_VOCAB}-t5-n4.img"
+    if not os.path.exists(image):
+        tinygen.generate("models/tiny", 4, cfg=tinygen.BONSAI_TINY_HYBRID_1K, trit5=True,
+                         vocab=GEN2_VOCAB)
+    out_dir = os.path.join("build", f"sim_ypcb_mr2_v{GEN2_VOCAB}")
+    common = [sys.executable, "trixium_sim.py", "--board", "ypcb", "--hybrid", "--image", image,
+              "--sys-clk-freq", "100e6", "--prefetch", "512", "--pipe-clk-freq", "125e6",
+              "--memctrl", "2", "--matvec-rows", "2", "--out-dir", out_dir]
+    if not os.path.exists(os.path.join(out_dir, "gateware", "obj_dir", "Vsim")):
+        subprocess.run(common + ["--build"], check=True)
+    pre = ("listcache verify;gen2 lmhead on;gen2 4 1 2 3 | 5 6;lmchunk 2048;gen2 4 5 6 | 1 2 3;"
+           "gen2 lmhead off;gen2 3 1 2 3 | 5 6;lmchunk 0;stats")
+    r = subprocess.run(common + ["--gate", "--gate-pre", pre],
+                       capture_output=True, text=True, timeout=3*60*60)
+    assert r.returncode == 0 and "GATE PASS" in r.stdout, r.stdout[-3000:] + r.stderr[-1500:]
+    assert r.stdout.count("pre: gen2 ") >= 3 and "gen2 stream B" in r.stdout, r.stdout[-3000:]

@@ -14,6 +14,7 @@ Usage: python -m model.tinygen --out models/tiny --channels 2 [--seed 1234]
 
 import os
 import argparse
+import dataclasses
 
 import numpy as np
 
@@ -132,12 +133,17 @@ def make_tiny_hybrid_tensors(cfg, seed=1234):
 # Generate -----------------------------------------------------------------------------------------
 
 def generate(out_dir, n_channels=2, seed=1234, cfg=BONSAI_TINY, kseg_max=None, trit5=False,
-             emb16=True):
+             emb16=True, vocab=None):
     """kseg_max: split matvecs wider than this into K-segments (the 27B's FFN down projection
     path, exercised on the tiny model with e.g. 256); the image is named `-kseg`. emb16=False
-    leaves out the int16 embedding table (a 1 GB board's image), named `-noemb16`."""
+    leaves out the int16 embedding table (a 1 GB board's image), named `-noemb16`. vocab: the
+    config's vocabulary replaced (an LM head of several thousand-row chunks, as the real
+    models'), named `-v<vocab>`."""
     os.makedirs(out_dir, exist_ok=True)
     suffix = ""
+    if vocab is not None:
+        cfg = dataclasses.replace(cfg, vocab=vocab, hadamard_signs=None)
+        suffix += f"-v{vocab}"
     if cfg.layer_types:
         tensors = make_tiny_hybrid_tensors(cfg, seed)
     else:
@@ -185,6 +191,7 @@ def main():
     parser.add_argument("--kseg-max",  default=None, type=int, help="Split matvecs wider than this (K-segments).")
     parser.add_argument("--slice",     default=None, choices=list(SLICE_OF), help="A shape-true slice (real widths, few layers).")
     parser.add_argument("--trit5",     action="store_true",    help="Streamed ternary weights 5 trits per byte (KIND_TERNARY5).")
+    parser.add_argument("--vocab",     default=None, type=int, help="Override the vocabulary (e.g. 24000: a multi-chunk LM head).")
     args = parser.parse_args()
 
     if args.slice:
@@ -193,7 +200,7 @@ def main():
     else:
         cfg = BONSAI_TINY_HYBRID_1K if args.hybrid_1k else BONSAI_TINY_HYBRID if args.hybrid else BONSAI_TINY
         img, man, manifest = generate(args.out, args.channels, args.seed, cfg=cfg,
-                                      kseg_max=args.kseg_max, trit5=args.trit5)
+                                      kseg_max=args.kseg_max, trit5=args.trit5, vocab=args.vocab)
     print(f"image    : {img} ({os.path.getsize(img)/1e6:.2f} MB)")
     print(f"manifest : {man}")
     print(f"payload  : {manifest['payload_beats']} beats/channel "
