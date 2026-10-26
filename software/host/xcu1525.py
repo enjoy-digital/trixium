@@ -21,10 +21,12 @@ standalone.md): every command takes --dry-run, which prints what it would do.
 
 The flash (MT25QU01G, 128 MB): the bitstream at 0, the firmware as LiteX's flashboot image at
 FIRMWARE_FLASH_OFFSET (trixium_xcu1525.py's). openFPGALoader writes it through a spiOverJtag
-helper bitstream for the card's package (xcvu9p-fsgd2104), which its release does not ship:
-build it with openFPGALoader/spiOverJtag/build.py (Vivado) and install it next to the others
-(/usr/local/share/openFPGALoader/). `flash` reads the whole flash back first (--no-backup skips
-it), since the card's factory image is overwritten.
+helper bitstream for the card's package (xcvu9p-fsgd2104), which its release does not ship: the
+one built with openFPGALoader/spiOverJtag/build.py (the part added, two fixes in the UltraScale
+branch of xilinx_spiOverJtag.v: the primary flash nets declared, one driver of the SPI clock)
+sits in build/tools/spiOverJtag_xcvu9p-fsgd2104.bit and is passed with --bridge; installed in
+/usr/local/share/openFPGALoader/ it would be found by name. `flash` reads the whole flash back
+first (--no-backup skips it), since the card's factory image is overwritten.
 
 The SSD (firmware/storage.h: slots of TRIXIUM_STORAGE_SLOT_SECTORS, version-3 tables) is written
 from here: each entry streamed over UDP into the SoC's `satastore` (gateware/memory/sata_upload.py)
@@ -48,6 +50,7 @@ BOARD_IP = "<board-host>"          # --eth-ip of the build (Etherbone, the uploa
 OFL_BOARD = "vcu1525"             # openFPGALoader's name for the card (ft4232, xcvu9p-fsgd2104).
 FLASH_SIZE = 128 << 20
 HELPER   = "spiOverJtag_xcvu9p-fsgd2104.bit.gz"
+HELPER_LOCAL = os.path.join("build", "tools", "spiOverJtag_xcvu9p-fsgd2104.bit")   # built here (see above)
 FIRMWARE_FLASH_OFFSET = 0x0500_0000   # trixium_xcu1525.py's (the BIOS's FLASH_BOOT_ADDRESS).
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -89,6 +92,12 @@ def helper_present(exe):
     return share, os.path.exists(os.path.join(share, HELPER))
 
 
+def bridge_args():
+    """--bridge with the locally built helper when openFPGALoader's share has none."""
+    local = os.path.join(REPO, HELPER_LOCAL)
+    return ["--bridge", local] if os.path.exists(local) else []
+
+
 def load(bit, dry_run=False):
     """The bitstream into the FPGA (volatile), as `trixium deploy` does on the lab card."""
     run([openfpgaloader(), "-b", OFL_BOARD, bit], dry_run)
@@ -104,9 +113,10 @@ def flash(build, firmware, backup=True, dry_run=False):
     if not os.path.exists(bit) and not dry_run:
         raise SystemExit(f"{bit} missing (the build's bitstream)")
     share, ok = helper_present(exe)
-    if not ok:
-        print(f"no {HELPER} in {share}: build it with openFPGALoader/spiOverJtag/build.py (Vivado) and "
-              f"copy it there (or use Vivado's hardware manager: program_hw_cfgmem)", file=sys.stderr)
+    bridge = [] if ok else bridge_args()
+    if not ok and not bridge:
+        print(f"no {HELPER} in {share} and no {HELPER_LOCAL}: build it with openFPGALoader/spiOverJtag/build.py "
+              f"(Vivado), or use Vivado's hardware manager (program_hw_cfgmem)", file=sys.stderr)
         if not dry_run:
             raise SystemExit(1)
     with tempfile.TemporaryDirectory() as d:
@@ -116,9 +126,9 @@ def flash(build, firmware, backup=True, dry_run=False):
         if backup:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             dump = os.path.join(build, f"flash-backup-{stamp}.bin")
-            run([exe, "-b", OFL_BOARD, "--dump-flash", "--file-size", str(FLASH_SIZE), dump], dry_run)
-        run([exe, "-b", OFL_BOARD, "-f", bit], dry_run)
-        run([exe, "-b", OFL_BOARD, "-f", "--offset", hex(FIRMWARE_FLASH_OFFSET), "--file-type", "raw", fbi], dry_run)
+            run([exe, "-b", OFL_BOARD] + bridge + ["--dump-flash", "--file-size", str(FLASH_SIZE), dump], dry_run)
+        run([exe, "-b", OFL_BOARD] + bridge + ["-f", bit], dry_run)
+        run([exe, "-b", OFL_BOARD] + bridge + ["-f", "--offset", hex(FIRMWARE_FLASH_OFFSET), "--file-type", "raw", fbi], dry_run)
     print("flashed: power-cycle the card (the FPGA runs the helper image until then)")
 
 # Console ------------------------------------------------------------------------------------------
