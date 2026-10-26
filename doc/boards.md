@@ -622,6 +622,8 @@ the CSRs (Etherbone) and the weights (UDP, `UDPUpload`); no PCIe, no LiteDRAM. E
 100 MHz. The kit plugs into the workstation itself: USB for JTAG and the console, the RJ45 on the
 LAN.
 
+![Ti375 C529 standalone: flash boot, the model from the eMMC, LiteEth with the firmware's TCP/IP and HTTP chat server, four engine channels and the CPU on the hard LPDDR4x controller's two 512-bit AXI targets](images/board-ti375.png)
+
 One 512-bit port at 100 MHz carries 6.4 GB/s, half the LPDDR4x's 12.8 GB/s, and v7's weight
 stream runs at ~92% of it (`mvbw 13 0 8`: 0.46 beats per channel per clock of the port's 0.5):
 two thirds of a 2B forward wait on it. `--ddr-targets 2` also enables the controller's second AXI
@@ -863,6 +865,28 @@ nesting a generation; the console `chat` and the page share one conversation (`c
 the kit: a DHCP lease from the LAN's router, `trixium.local` resolved by the PC's resolver, ping 0.12 ms, the page in 3 ms, the first words of a reply after 1.5 s, 12.3 tok/s in
 Chrome. `test/software/test_net.py` runs `net.c` and `web.c` on the host against crafted frames.
 v22 = v21 + `--with-web`: 109.5 MHz achievable, 96.26% XLRs, golden, 14.32 / 13.97 / 11.98 tok/s.
+
+**Power-up to the chat page, measured** (`python3 -m software.lab.ti375_boot`, `ti375_v23` in the
+flash, 2026-10-26; t=0 is the kit's FT4232H enumerating on the workstation's USB, a few hundred ms
+after the switch, since the kit powers it):
+
+| t (s) | event |
+|------:|-------|
+| 4.9 | first console byte: the FPGA has configured itself from the QSPI flash, the BIOS runs |
+| 5.3-5.6 | the BIOS's serial boot attempt times out (0.24 s); the firmware copied from the flash (264 KB, 0.1 s) |
+| 5.7 | Liftoff: the firmware starts; the eMMC answers at 5.8 |
+| 5.9-6.9 | `SDBOOT in 1 s (s to skip)`: the key wait |
+| 6.9-16.4 | the 2B from the eMMC: 436 MB in 9.6 s, CRC ok |
+| 16.5-17.4 | header, tokenizer (14.9 MB), model header parsed |
+| 17.4-18.2 | scratchpad self-test, the two-token GEN-HW demo, the profiling prints |
+| 18.2 | `TRIXIUM-READY`, the web server up; the DHCP lease 0.1 s later |
+| 19.4 | the first `GET /` answered (ping answers at 19.3; both polled every ~0.5 s) |
+
+So about 20 s from the switch to the page (the "12.5 s" quoted earlier counted from Liftoff).
+Without a code change there are ~2.3 s of slack: the 1 s skip-key wait, the serial-boot timeout, the
+BIOS's 2 MiB memtest (0.3 s) and the boot demo + profiling prints (0.8 s); the FPGA configuration
+(4.9 s) is Efinity's configuration clock and width; the eMMC's 46 MB/s is close to its 8-bit
+high-speed cap.
 
 **Past the 2,048-token window** (`kvring`, on by default): the attention layers keep the
 conversation's first turn (its system prompt and first message, up to 512 positions; 4 for

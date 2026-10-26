@@ -240,12 +240,15 @@ Hadamard unit, the channel windows skewed across the DRAM banks, the softmax uni
 `trixium dashboard --board ti375` shows it working live in a browser.
 
 It also runs with no host at all. The bitstream and firmware boot from the kit's SPI flash, the
-model (436 MB) and its tokenizer load from the kit's eMMC in 9.6 s, and 12.5 s after power-up
-`chat` on the serial console answers, the prompt tokenized on the board (`ti375 model <img>
+model (436 MB) and its tokenizer load from the kit's eMMC in 9.6 s, and 18 s after power-up
+(4.9 s of FPGA configuration, the model, the tokenizer and the self-tests; measured with
+`software/lab/ti375_boot.py`) `chat` on the serial console answers, the prompt tokenized on the board (`ti375 model <img>
 --persist` writes the eMMC once, from a UDP upload; it holds several models). Or plug in an
 Ethernet cable and open `http://trixium.local/`: the board takes an address by DHCP, answers its mDNS name and serves the chat page itself. Conversations go past the 2,048-token
 attention window: the DeltaNet layers' state carries the whole history, and the attention layers
 keep the first turn and a ring of the latest positions.
+
+[![TriXium on the Efinix Ti375 C529, standalone: bitstream and firmware from the flash, the model and its tokenizer from the eMMC, LiteEth with the firmware's TCP/IP and HTTP chat server, the core streaming ternary weights from 1 GB of LPDDR4x through the hard controller's two AXI targets](doc/images/board-ti375.png)](doc/images/board-ti375.png)
 
 The last line is the one we find most exciting: logic and memory in one package, a small model
 and its state inside, a few hundred milliwatts. Not a chat assistant, but a block of

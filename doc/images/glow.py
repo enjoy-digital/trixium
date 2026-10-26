@@ -76,6 +76,9 @@ def main():
     for path in files:
         with open(path, encoding="utf-8") as f:
             svg = f.read()
+        if "<!-- glow:skip -->" in svg:   # The classic light-style diagrams (board-ti375.svg).
+            print(f"{os.path.basename(path)}: skipped")
+            continue
         new = glow(svg, level)
         if new != svg:
             with open(path, "w", encoding="utf-8") as f:

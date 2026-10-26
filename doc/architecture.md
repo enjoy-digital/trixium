@@ -44,14 +44,19 @@ with three standard interfaces: `memory_ports` (one 256-bit AXI master per engin
 the sys domain), `bus` (a 32-bit wishbone slave onto the scratchpad, the CPU's window) and
 `upload` (a stream sink fed by the host's PCIe DMA). The XCU1525 maps its 16 channels onto four LiteDRAM DDR4
 controllers (in their own clock domain, crossed at the AXI level); the FK33 onto 16 HBM2
-pseudo-channels; the YPCB maps eight channels onto two LiteDRAM DDR3 controllers;
-the Verilator simulation uses memory models with the same contract.
+pseudo-channels; the YPCB maps eight channels onto two LiteDRAM DDR3 controllers; the Ti375
+(`trixium_ti375.py`) maps four channels and the CPU onto the hard LPDDR4x controller's two
+512-bit AXI targets, with no PCIe: the weights come from the kit's eMMC or over UDP, and the
+firmware serves the chat page itself; the Verilator simulation uses memory models with the same
+contract.
 
 ![FK33: LitePCIe Gen3 x4 and 16 direct HBM2 engine ports](images/board-fk33.svg)
 
 ![XCU1525: LitePCIe Gen3 x4 and four LiteDRAM DDR4 controllers, 4 x 4 = 16 engine ports](images/board-xcu1525.svg)
 
 ![YPCB-00338: LitePCIe Gen2 x8 and two LiteDRAM DDR3 controllers, 2 x 4 = 8 engine ports](images/board-ypcb.svg)
+
+![Ti375 C529, standalone: flash and eMMC boot, LiteEth and the firmware's HTTP chat server, 4 engine channels on the hard LPDDR4x controller](images/board-ti375.png)
 
 **Weights.** The converter (`model/convert.py`) turns a GGUF into a BONS image: every
 matrix is split row-wise across the channels so each channel streams its own slice in
