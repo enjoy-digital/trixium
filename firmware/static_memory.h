@@ -23,6 +23,7 @@
 #define TRIXIUM_RESIDENT_STATE_ADDR (TRIXIUM_HDR_ADDR + 0xc0900) // struct resident_state (resident.h)
 #define TRIXIUM_HYBPROF_ADDR        (TRIXIUM_HDR_ADDR + 0xc0a00) // struct hyb_prof (hybrid.c), 256 B
 #define TRIXIUM_EPS_MEMO_ADDR       (TRIXIUM_HDR_ADDR + 0xc0b00) // int32[128] seq_eps_int memo (infer_lists.c), 512 B
+#define TRIXIUM_GEN2_BUF_ADDR       (TRIXIUM_HDR_ADDR + 0xc0e00) // int32[2][64] prompts + int32[2][256] streams (main.c gen2), 2.5 KB
 #define TRIXIUM_LISTPROF_ADDR       (TRIXIUM_HDR_ADDR + 0xc2000) // struct list_prof[16] (resident.c), 8.25 KB
 #define TRIXIUM_RL_STATE_ADDR       (TRIXIUM_HDR_ADDR + 0xc6000) // struct rl_state (resident.c), < 1 KB
 #define TRIXIUM_ECC_SAVED_ADDR      (TRIXIUM_HDR_ADDR + 0xc6400) // int8[1024] KV exponents for a re-run (infer.c), 1 KB

@@ -1232,8 +1232,10 @@ static void gen_cmd(char *args)
 static int gen2_dual = 1, gen2_trace;
 static void gen2_cmd(char *args)
 {
-    int pa[64], pb[64], oa[256], ob[256];
-    int *const prompt[2] = {pa, pb}, *const out[2] = {oa, ob};
+    // In the main_ram static window: 2.5 KB on the 4 KiB SRAM stack overflowed into .bss on the
+    // single-forward path (`gen2 seq`, a sequence alone), corrupting later runs.
+    int *const buf = (int *)TRIXIUM_GEN2_BUF_ADDR;
+    int *const prompt[2] = {buf, buf + 64}, *const out[2] = {buf + 128, buf + 384};
     int np[2] = {0, 0}, s = 0;
     char *tok = get_token(&args);
     if (strcmp(tok, "dual") == 0 || strcmp(tok, "seq") == 0) {
@@ -1346,6 +1348,26 @@ static void selftest(void)
 
 /* Console Service */
 /*-----------------*/
+
+// Stack tripwire: the stack sits at the top of the SRAM above .bss with a 4 KiB floor
+// (linker.ld) and an overflow corrupts .bss silently (a later run wrong, or a hang). The bytes
+// just above .bss are painted at boot and checked after every console poll.
+extern char _ebss[];
+#define STACK_GUARD 256
+static void stack_guard_paint(void)
+{
+    memset(_ebss, 0x5a, STACK_GUARD);
+}
+static void stack_guard_check(void)
+{
+    for (int i = 0; i < STACK_GUARD; i++)
+        if (_ebss[i] != 0x5a) {
+            printf("\nSTACK OVERFLOW: the SRAM stack reached .bss; results from here are suspect, "
+                   "reboot\n");
+            stack_guard_paint();
+            return;
+        }
+}
 
 static void console_service(void)
 {
@@ -1878,6 +1900,7 @@ int main(void)
     while (1)
         console_service();
 #endif
+    stack_guard_paint();
     perf_init();
     infer_static_init();
     vec_init();
@@ -2066,6 +2089,7 @@ boot_demo_done:
 
     while (1) {
         console_service();
+        stack_guard_check();
 #ifdef TRIXIUM_WEB_IP
         web_service();
 #endif

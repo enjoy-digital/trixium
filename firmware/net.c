@@ -336,16 +336,17 @@ static void eth_ip_header_ttl(uint8_t *f, const uint8_t *dst_mac, uint32_t src_i
     wr16(ip + 10, csum_fold(csum_add(0, ip, IP_HDR)));
 }
 
-static void tcp_out(struct conn *k, uint32_t seq, uint8_t flags, const uint8_t *data, int n)
+static void tcp_send(const uint8_t *mac, uint32_t ip, uint16_t port, uint32_t rcv_nxt,
+                     uint32_t seq, uint8_t flags, const uint8_t *data, int n)
 {
     uint8_t *tcp = txf + ETH_HDR + IP_HDR;
     int opt = (flags & TCP_SYN) ? 4 : 0;       // MSS option on the SYN-ACK.
     int tcp_len = TCP_HDR + opt + n;
-    eth_ip_header(txf, k->peer_mac, k->peer_ip, 6, IP_HDR + tcp_len);
+    eth_ip_header(txf, mac, ip, 6, IP_HDR + tcp_len);
     wr16(tcp, listen_port);
-    wr16(tcp + 2, k->peer_port);
+    wr16(tcp + 2, port);
     wr32(tcp + 4, seq);
-    wr32(tcp + 8, (flags & TCP_ACK) ? k->rcv_nxt : 0);
+    wr32(tcp + 8, (flags & TCP_ACK) ? rcv_nxt : 0);
     tcp[12] = (uint8_t)(((TCP_HDR + opt)/4) << 4);
     tcp[13] = flags;
     wr16(tcp + 14, RX_WINDOW);
@@ -354,7 +355,7 @@ static void tcp_out(struct conn *k, uint32_t seq, uint8_t flags, const uint8_t *
     if (opt) { tcp[20] = 2; tcp[21] = 4; wr16(tcp + 22, NET_MSS); }
     if (n) memcpy(tcp + TCP_HDR + opt, data, n);
     uint8_t pseudo[12];
-    wr32(pseudo, my_ip); wr32(pseudo + 4, k->peer_ip);
+    wr32(pseudo, my_ip); wr32(pseudo + 4, ip);
     pseudo[8] = 0; pseudo[9] = 6; wr16(pseudo + 10, (uint16_t)tcp_len);
     wr16(tcp + 16, csum_fold(csum_add(csum_add(0, pseudo, 12), tcp, tcp_len)));
     int len = ETH_HDR + IP_HDR + tcp_len;
@@ -362,13 +363,16 @@ static void tcp_out(struct conn *k, uint32_t seq, uint8_t flags, const uint8_t *
     net_tx(txf, len);
 }
 
-// A RST for a segment that belongs to no connection.
+static void tcp_out(const struct conn *k, uint32_t seq, uint8_t flags, const uint8_t *data, int n)
+{
+    tcp_send(k->peer_mac, k->peer_ip, k->peer_port, k->rcv_nxt, seq, flags, data, n);
+}
+
+// A RST for a segment that belongs to no connection (no struct conn on the stack: its 16 KB
+// queue is four times the SRAM stack).
 static void tcp_reset(const uint8_t *src_mac, uint32_t ip, uint16_t port, uint32_t seq, uint32_t ack, int with_ack)
 {
-    struct conn k = {0};
-    memcpy(k.peer_mac, src_mac, 6);
-    k.peer_ip = ip; k.peer_port = port; k.rcv_nxt = ack;
-    tcp_out(&k, seq, TCP_RST | (with_ack ? TCP_ACK : 0), NULL, 0);
+    tcp_send(src_mac, ip, port, ack, seq, TCP_RST | (with_ack ? TCP_ACK : 0), NULL, 0);
 }
 
 /* TCP */
