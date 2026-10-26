@@ -42,6 +42,7 @@
 #include "chat.h"
 #include "web.h"
 #include "sdload.h"
+#include "storage.h"
 
 /* Checks */
 /*--------*/
@@ -169,10 +170,16 @@ static void help(void)
 #ifdef CSR_SD_BASE
     puts("  sdinit [mhz]      - SD card / eMMC init (the widest bus that reads; 50 MHz high speed when taken)");
     puts("  sdload c b s n    - n 512-byte blocks from sector s into channel c's window at b");
-    puts("  sdboot [slot]     - a model on the SD card / eMMC: weights (CRC-checked), hdrload, tokload");
-    puts("  sdsave [slot] [label] - the uploaded model (and tokenizer) to a slot");
-    puts("  sdls              - the slots on the card; sddefault slot - the one booted at power-up");
     puts("  sdwtest s         - write a pattern block at sector s and read it back");
+#endif
+#ifdef CSR_SATAUP_BASE
+    puts("  satainit          - SATA SSD init (PHY, link, IDENTIFY)");
+    puts("  sataload c b s n  - n 512-byte sectors from sector s into channel c's window at b");
+#endif
+#if defined(CSR_SD_BASE) || defined(CSR_SATAUP_BASE)
+    puts("  stboot [slot]     - a model on the device: weights (CRC-checked), hdrload, tokload (sdboot too)");
+    puts("  stsave [slot] [label] - the uploaded model (and tokenizer) to a slot (SD/eMMC; sdsave too)");
+    puts("  stls              - the slots; stdefault slot - the one booted at power-up (sdls/sddefault too)");
 #endif
     puts("  sample T P R [S]  - temperature/top-p/repeat-penalty x1000 (0 1000 1000 = greedy), seed");
     puts("  bench [n]         - profiled generation benchmark (default 4 tokens)");
@@ -1588,6 +1595,14 @@ static void console_service(void)
     else if (strcmp(token, "ddrinit") == 0) {
         char *arg = get_token(&str);
         if (arg && *arg) ddr_init(parse_int(arg)); else ddr_init_all();
+#if defined(SDRAM_WRITE_TRAINING) && !defined(SDRAM_CSR_STRIDE)
+    } else if (strcmp(token, "ddrtrain") == 0) {     // ddrtrain k: liblitedram's write training again
+        char *arg = get_token(&str);
+        ddr_train(arg && *arg ? parse_int(arg) : 1);
+    } else if (strcmp(token, "ddrcheck") == 0) {     // ddrcheck k: error bits per module
+        char *arg = get_token(&str);
+        ddr_check(arg && *arg ? parse_int(arg) : 0);
+#endif
     } else if (strcmp(token, "ddrtest") == 0) {
         char *arg = get_token(&str);
         ddr_test((arg && *arg) ? parse_int(arg) : -1);
@@ -1825,7 +1840,8 @@ static void console_service(void)
 #ifdef CSR_SD_BASE
     else if (strcmp(token, "sdinit") == 0) {
         char *m = get_token(&str);
-        sd_init(*m ? parse_int(m) : 50, 1000);
+        if (sd_init(*m ? parse_int(m) : 50, 1000) == 0)
+            storage_select(&sd_storage_ops);
     } else if (strcmp(token, "sdload") == 0) {
         char *c = get_token(&str), *b = get_token(&str), *sc = get_token(&str), *n = get_token(&str);
         int ch = (int)strtoul(c, NULL, 0);
@@ -1849,28 +1865,46 @@ static void console_service(void)
             printf("SDWTEST %s (%d of 128 words differ)\n", bad ? "FAIL" : "ok", bad);
         }
     }
-#if TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
-    else if (strcmp(token, "sdsave") == 0) {      // sdsave [slot] [label]
+#endif
+#ifdef CSR_SATAUP_BASE
+    else if (strcmp(token, "satainit") == 0) {
+        if (sata_storage_ops.init(1, 1000) == 0)
+            storage_select(&sata_storage_ops);
+    } else if (strcmp(token, "sataload") == 0) {  // sataload c b s n: the first beat printed.
+        char *c = get_token(&str), *b = get_token(&str), *sc = get_token(&str), *n = get_token(&str);
+        int ch = (int)strtoul(c, NULL, 0);
+        uint32_t base = strtoul(b, NULL, 0);
+        if (sata_storage_ops.read_to_loader(strtoull(sc, NULL, 0), strtoul(n, NULL, 0), ch, base) == 0) {
+            engine_fetch(ch, base, 1, 0xC000);
+            printf("SATALOAD ok:");
+            for (int w = 0; w < 8; w++)
+                printf(" %08lx", (unsigned long)((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[w]);
+            printf("\n");
+        }
+    }
+#endif
+#if (defined(CSR_SD_BASE) || defined(CSR_SATAUP_BASE)) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
+    // The slots of the selected device (the one that answered at boot, or sdinit/satainit's).
+    else if (strcmp(token, "stsave") == 0 || strcmp(token, "sdsave") == 0) {   // [slot] [label]
         char *a = get_token(&str), *label = get_token(&str);
-        sd_save(*a ? (int)strtoul(a, NULL, 0) : 0, label);
-    } else if (strcmp(token, "sdls") == 0)
-        sd_list();
-    else if (strcmp(token, "sddefault") == 0) {   // sddefault slot: the one the power-up boots
+        storage_save(*a ? (int)strtoul(a, NULL, 0) : 0, label);
+    } else if (strcmp(token, "stls") == 0 || strcmp(token, "sdls") == 0)
+        storage_list();
+    else if (strcmp(token, "stdefault") == 0 || strcmp(token, "sddefault") == 0) {   // the power-up slot
         char *a = get_token(&str);
-        sd_set_default(*a ? (int)strtoul(a, NULL, 0) : 0);
-    } else if (strcmp(token, "sdboot") == 0) {     // sdboot [slot] (default: the boot slot)
+        storage_set_default(*a ? (int)strtoul(a, NULL, 0) : 0);
+    } else if (strcmp(token, "stboot") == 0 || strcmp(token, "sdboot") == 0) {   // [slot] (default: the boot slot)
         char *a = get_token(&str);
         int slot = *a ? (int)strtoul(a, NULL, 0) : -1;
         if (slot < 0)
-            slot = (sd_init_done() || sd_init(50, 1000) == 0) ? sd_default_slot() : 0;
-        if (sd_boot(slot) == 0) {
+            slot = storage_ready() ? storage_default_slot() : 0;
+        if (storage_boot(slot) == 0) {
             hdrload();
-            engine_fetch(0, TOK_STAGING, 1, 0xC000);   // A tokenizer on the card: load it too.
+            engine_fetch(0, TOK_STAGING, 1, 0xC000);   // A tokenizer on the device: load it too.
             if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
                 tok_load();
         }
     }
-#endif
 #endif
     else if (strlen(token))
         puts("unknown command");
@@ -1923,26 +1957,32 @@ int main(void)
     puts("ddr: simulation (PHY model) - controller init and DDRTEST skipped");
 #endif
 #endif
-#if defined(CSR_SD_BASE) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000 && !defined(TRIXIUM_SIM)
-    // A card answers: its image is the model, a host-free start. Whatever the DRAM still holds
-    // is from before this boot: a bitstream reload (and a short power cut) keeps the header
-    // but not all the weights (after a reload: 3 of 470 tensors off their table CRC, and
-    // `imgcheck` takes 100 s, the card 74). `s` within a second keeps the staged model (the
-    // host's serial boot answers it: it uploads right after). Three quick probes without a card.
-    // Not in the simulation (a second is 100M cycles there): `sdinit`/`sdboot` on its console.
-    if (sd_init(50, 3) == 0) {
-        puts("SDBOOT in 1 s (s to skip: keep the staged model)");
+#if (defined(CSR_SD_BASE) || defined(CSR_SATAUP_BASE)) && TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000
+    // A device answers (the SATA SSD first, then the SD card / eMMC): its image is the model, a
+    // host-free start. Whatever the DRAM still holds is from before this boot: a bitstream
+    // reload (and a short power cut) keeps the header but not all the weights (after a reload:
+    // 3 of 470 tensors off their table CRC, and `imgcheck` takes 100 s, the card 74). `s` within
+    // a second keeps the staged model (the host's serial boot answers it: it uploads right
+    // after). Three quick probes without a device. The simulated SD card is not probed (a second
+    // is 100M cycles there: `sdinit`/`sdboot` on its console); the simulated SSD boots at once.
+#if defined(TRIXIUM_SIM) && !defined(CSR_SATAUP_BASE)
+#else
+    if (storage_probe(1, 3) == 0) {
         int skip = 0;
+#ifndef TRIXIUM_SIM
+        printf("%sBOOT in 1 s (s to skip: keep the staged model)\n", storage->tag);
         uint64_t t_wait = perf_now64();
         while (!skip && perf_now64() - t_wait < CONFIG_CLOCK_FREQUENCY)
             if (readchar_nonblock())
                 skip = getchar() == 's';
-        if (!skip && sd_boot(sd_default_slot()) == 0 && hdrload_staged(1) >= 0) {
+#endif
+        if (!skip && storage_boot(storage_default_slot()) == 0 && hdrload_staged(1) >= 0) {
             engine_fetch(0, TOK_STAGING, 1, 0xC000);
             if (*(volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000) == TOK_STAGING_MAGIC)
                 tok_load();
         }
     }
+#endif
 #endif
     hdrload_staged(1);   // A different image than main_ram's header says: take the staged one.
     model_info();

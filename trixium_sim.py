@@ -401,7 +401,7 @@ class TriXiumSimSoC(SoCCore):
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
                  axi1_latency=24, axi1_reorder=0, axi1_targets=1, reader_n_ids=4,
                  unit_options=(), efinix_ram=False, attn_sync_operand=False, with_sdcard=False,
-                 matvec_rows=1):
+                 matvec_rows=1, with_sata=False, sata_tokenizer=None):
         assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
         ddr_split = mem in ("ddr4", "ddr3")
@@ -505,13 +505,13 @@ class TriXiumSimSoC(SoCCore):
                 memory_ports.append(axi)
         elif mem == "ddr4":
             chan_mod = self.add_ddr4(n_channels, n_memctrl, ram, img, memory_ports, dmap,
-                                     contents)
+                                     contents, weights=not with_sata)
         elif mem == "axi1":
             stride   = ddr3_stride(img)
             read_ports = [] if ddr_readers else None   # --ddr-readers: the port in its own clock.
             self.axi1_reorder = axi1_reorder
             chan_mod = self.add_axi1(n_channels, ram, img, memory_ports, stride, axi1_latency,
-                                     read_ports=read_ports, targets=axi1_targets)
+                                     read_ports=read_ports, targets=axi1_targets, weights=not with_sata)
         else:
             stride   = ddr3_stride(img)
             read_ports = [] if ddr_readers else None   # --ddr-readers: the readers in the ddr domain.
@@ -565,6 +565,30 @@ class TriXiumSimSoC(SoCCore):
             self.sd = SDCardUpload(platform, self.sys_clk_freq, use_emulator=True)
             self.comb += If(self.sd.upload.storage,
                 self.sd.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}))
+
+        # The SATA SSD weight source (trixium_xcu1525.py --standalone) on a port model holding the
+        # image in the firmware's device layout (software/host/sdimage.py: a version-3 slot at
+        # sector 2048, the tokenizer too when given), the channel windows left empty: the firmware's
+        # storage_probe() boots the model from the "SSD" at start (storage.c, sataload.c) and the
+        # gate runs on those weights. Needs the staging areas below the weights (--weight-base >=
+        # 32 MB: the firmware's slot code is compiled out under it).
+        if with_sata:
+            from gateware.memory.sata_upload import SATAUpload, LiteSATAPortModel
+            from software.host import sdimage
+            weight_base = dmap.weight_base if ddr_split else DDR3_SIM_WEIGHT_BASE
+            assert weight_base >= 0x2000000, "--with-sata: --weight-base 0x2000000 or more (the staging areas)"
+            c = dict(weight_base=weight_base, stride=0 if mem == "hbm" else (dmap.chan_stride if ddr_split else stride),
+                     adds_offset=True, n_channels=n_channels, slot_sectors=sdimage.SLOT_SECTORS)
+            table_sector, table, ents = sdimage.slot_layout(sdimage.entries(image, sata_tokenizer, c),
+                                                            version=3, slot=0, label="sim")
+            data = bytearray(table)
+            for chan, base, blocks, sector, crc, d in ents:
+                assert len(data) == (sector - table_sector)*512
+                data += d + bytes(-len(d) % 512)
+            self.sata_model = LiteSATAPortModel(sectors=bytes(data), base_sector=table_sector)
+            self.sataup = SATAUpload(self.sata_model, out_dw=128)
+            self.comb += If(self.sataup.upload.storage,
+                self.sataup.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}))
 
         # Scratchpad on the SoC bus (CPU access).
         self.bus.add_slave("scratchpad", self.trixium.bus,
@@ -626,9 +650,9 @@ class TriXiumSimSoC(SoCCore):
         # targets never define it.
         self.add_constant("TRIXIUM_SIM")
 
-    def add_ddr4(self, n_channels, n_memctrl, ram, img, memory_ports, dmap, contents=True):
+    def add_ddr4(self, n_channels, n_memctrl, ram, img, memory_ports, dmap, contents=True, weights=True):
         """The XCU1525's memory system on LiteDRAM's PHY model at the map `dmap`; returns
-        chan_mod."""
+        chan_mod. weights=False: the channel windows start empty (the SSD model fills them)."""
         assert n_channels % n_memctrl == 0, "channels shard evenly over the controllers"
         chan_mod = n_channels//n_memctrl
         assert chan_mod & (chan_mod - 1) == 0
@@ -636,7 +660,7 @@ class TriXiumSimSoC(SoCCore):
         # Controllers.
         self.sdrams, split_phys, split_modules = [], [], []
         for k in range(n_memctrl):
-            content     = ddr4_content(k, ram, img, chan_mod, dmap) if contents else b""
+            content     = ddr4_content(k, ram, img if weights else None, chan_mod, dmap) if contents else b""
             phy, module = ddr4_phy(content, dmap)
             split_phys.append(phy)
             split_modules.append(module)
@@ -657,7 +681,8 @@ class TriXiumSimSoC(SoCCore):
         set_main_ram_executable(self, MAIN_RAM_BASE)
         return chan_mod
 
-    def add_axi1(self, n_channels, ram, img, memory_ports, stride, latency, read_ports=None, targets=1):
+    def add_axi1(self, n_channels, ram, img, memory_ports, stride, latency, read_ports=None, targets=1,
+                 weights=True):
         """The Ti375's memory system: one 512-bit AXI4 memory (the hard DDR controller's port,
         modelled with a fixed latency) behind an interleaved AXIArbiter, carrying main_ram at 0 and every
         engine channel's window; returns chan_mod (= the channels: all on one memory).
@@ -680,7 +705,7 @@ class TriXiumSimSoC(SoCCore):
             self.submodules += AXICrossing(m, far, "sys", "ddr")
             return far
         chan_mod = n_channels
-        content  = ddr3_content(0, ram, img, chan_mod, stride, 1 << 62, skew=0)
+        content  = ddr3_content(0, ram, img if weights else None, chan_mod, stride, 1 << 62, skew=0)
         size     = 1 << (max(len(content), DDR3_SIM_WEIGHT_BASE + chan_mod*stride) - 1).bit_length()
         self.axi1_size = size
         masters = []
@@ -1034,6 +1059,14 @@ def build_sim(args, board, out_dir):
     if args.with_sdcard:
         assert args.board == "ti375", "--with-sdcard: --board ti375"
         soc_kwargs["with_sdcard"] = True
+    if args.weight_base is not None:
+        global DDR3_SIM_WEIGHT_BASE
+        assert args.board in ("ti375", "ypcb"), "--weight-base: --board ti375/ypcb"
+        DDR3_SIM_WEIGHT_BASE = args.weight_base
+    if args.with_sata:
+        assert args.board == "ti375", "--with-sata: --board ti375"
+        soc_kwargs["with_sata"] = True
+        soc_kwargs["sata_tokenizer"] = args.sata_tokenizer
     if args.dn_sublanes and "unit_options" in soc_kwargs:
         # The DeltaNet stream's sub-lanes per channel, over the board's default.
         soc_kwargs["unit_options"] = tuple((k, v) for k, v in soc_kwargs["unit_options"]
@@ -1103,6 +1136,9 @@ def main():
     parser.add_argument("--reader-ids",     default=0, type=int, choices=[0, 1, 2, 4, 8],           help="ARIDs each channel reader rotates (0: the board's; the Ti375 uses 1).")
     parser.add_argument("--axi1-reorder",   default=0, type=int, choices=[0, 2, 4, 8],              help="--board ti375: the memory model serves bursts out of order across N ID queues (as the hard controller may).")
     parser.add_argument("--with-sdcard",    action="store_true",                                   help="--board ti375: the SD card weight source on LiteSDCard's card model (firmware sdinit/sdload).")
+    parser.add_argument("--with-sata",      action="store_true",                                   help="--board ti375: the SATA SSD weight source (the XCU1525 standalone's) on a port model holding the image; the firmware boots it (needs --weight-base 0x2000000).")
+    parser.add_argument("--sata-tokenizer", default=None,                                          help="--with-sata: a BTOK tokenizer on the SSD too.")
+    parser.add_argument("--weight-base",    default=None, type=lambda x: int(x, 0),               help="--board ti375/ypcb: the channel windows' base (default 12 MB; 32 MB for --with-sata).")
     parser.add_argument("--axi1-targets",   default=1, type=int, choices=[1, 2],                    help="--board ti375: the channels split over the controller's two AXI targets (trixium_ti375.py --ddr-targets).")
     parser.add_argument("--prefetch",       default=0, type=int, metavar="BEATS",                 help="Engine weight prefetch (op 7) with BEATS-deep reader FIFOs per channel (0: none).")
     parser.add_argument("--matvec-rows",    default=1, type=int, choices=[1, 2, 3, 4],              help="Activation rows per weight beat (multi-row matvec, doc/plan-multirow.md; firmware: batched prefill).")

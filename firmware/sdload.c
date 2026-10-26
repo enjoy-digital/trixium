@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  *
- * TriXium weights from an SD card
+ * TriXium weights from an SD card / eMMC
  *
  * This file is part of TriXium.
  *
@@ -15,16 +15,12 @@
 #include <generated/soc.h>
 #include <system.h>
 
-#include "bons.h"
 #include "engine.h"
-#include "perf.h"
 #include "sdload.h"
 #include "static_memory.h"
-#include "tokenizer.h"
+#include "storage.h"
 
 #ifdef CSR_SD_BASE
-
-#include <libbase/crc.h>
 
 // The card's read stream feeds the weight loader (gateware/memory/sd_upload.py): the firmware
 // arms the loader for a channel window, as the host does for a UDP transfer, and a multi-block
@@ -32,7 +28,8 @@
 // name LiteX's BIOS builds its FatFs disk on liblitesdcard, which needs the block2mem DMA this
 // design does not have (the link fails). So the commands are here, after liblitesdcard's: init
 // without its two data reads into CPU memory (the switch status, the SCR; the gateware drops
-// that data): 4-bit assumed, which every SD memory card supports.
+// that data): 4-bit assumed, which every SD memory card supports. The slots and tables are
+// storage.c's (the same on a SATA SSD); this file is the device.
 
 #define SD_OK       0
 #define SD_CRCERROR 1
@@ -236,13 +233,8 @@ int sd_init(int mhz, int tries)
 int sd_load(int chan, uint32_t base, uint32_t sector, uint32_t blocks)
 {
     if (!sd_ok) { puts("sdload: sdinit first"); return -1; }
-    if (blocks == 0 || blocks > (1u << 24)/16) { puts("sdload: 1..1M blocks"); return -1; }
-    trixium_loader_src_sel_write(0);
-    trixium_loader_chan_write(chan);
-    trixium_loader_base_write(base);
-    trixium_loader_length_write(blocks*16);       // 512-byte blocks in 32-byte beats.
-    trixium_loader_resync_write(0);
-    trixium_loader_start_write(1);
+    if (storage_arm_loader(chan, base, blocks) < 0)
+        return -1;
     sd_upload_write(1);
     sd_core_block_length_write(512);
     sd_core_block_count_write(blocks);
@@ -250,11 +242,9 @@ int sd_load(int chan, uint32_t base, uint32_t sector, uint32_t blocks)
     if (rc == SD_OK)
         rc = sd_wait(sd_core_data_event_read);
     (void)sd_cmd(0, 12, RSP_BUSY | RSP_CRC);                              // CMD12: stop.
-    // The loader drains its last beats into the memory (its writers' responses).
-    for (int t = 0; t < 100000 && !(trixium_loader_status_read() & 1); t++)
-        busy_wait_us(10);
+    int drained = storage_wait_loader() == 0;
     sd_upload_write(0);
-    if (rc != SD_OK || !(trixium_loader_status_read() & 1)) {
+    if (rc != SD_OK || !drained) {
         printf("sdload: %s (loader status %08lx, %lu beats armed)\n",
                rc == SD_CRCERROR ? "CRC error on the card's data" : rc != SD_OK ? "read timeout" :
                "the loader did not finish", (unsigned long)trixium_loader_status_read(),
@@ -348,188 +338,43 @@ int sd_write(uint32_t sector, uint32_t blocks, int chan, uint32_t base, const ui
     return 0;
 }
 
-#if TRIXIUM_CHAN_WEIGHT_BASE >= 0x2000000   // The staging areas below the weights.
+// The device, for storage.c's slots and tables.
+static int sd_ops_init(int fast, int tries) { return sd_init(fast ? 50 : 25, tries); }
 
-// One 512-byte sector through the loader into `t` (the table's landing place on channel 0).
-static int sd_read_sector(uint32_t sector, uint32_t t[128])
+static int sd_ops_read_to_loader(uint64_t sector, uint32_t blocks, int chan, uint32_t base)
 {
-    uint32_t scratch = TRIXIUM_CHAN_WEIGHT_BASE - SD_TABLE_STAGING_BELOW;
-    if (sd_load(0, scratch, sector, 1) < 0)
-        return -1;
-    engine_fetch(0, scratch, 16, 0xC000);
-    for (int i = 0; i < 128; i++)
-        t[i] = ((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[i];
-    return 0;
+    if (sector >> 32) { puts("sdload: sector beyond 32 bits"); return -1; }
+    return sd_load(chan, base, (uint32_t)sector, blocks);
 }
 
-static uint32_t slot_sector(int slot) { return SD_IMAGE_SECTOR + (uint32_t)slot*SD_SLOT_SECTORS; }
-
-// A slot's table: 0 and *v1 = 0/1 when valid (version 2: label and per-entry CRCs; 1: neither).
-static int table_ok(const uint32_t *t, int *v1)
+static int sd_ops_write(uint64_t sector, uint32_t blocks, int chan, uint32_t base,
+                        const uint32_t *cpu, uint32_t *crc)
 {
-    if (t[0] != SD_IMAGE_MAGIC || t[2] == 0)
-        return -1;
-    if (t[1] == 1 && t[2] <= SD_IMAGE_MAX_ENTRIES && crc32((unsigned char *)&t[4], t[2]*16) == t[3]) {
-        *v1 = 1;
-        return 0;
-    }
-    if (t[1] == 2 && t[2] <= SD_V2_MAX_ENTRIES && crc32((unsigned char *)&t[12], t[2]*20) == t[3]) {
-        *v1 = 0;
-        return 0;
-    }
-    return -1;
+    if (sector >> 32) { puts("sdwrite: sector beyond 32 bits"); return -1; }
+    write_crc = crc;
+    int rc = sd_write((uint32_t)sector, blocks, chan, base, cpu);
+    write_crc = NULL;
+    return rc;
 }
 
-int sd_save(int slot, const char *label)
-{
-    if (slot < 0 || slot >= SD_MAX_SLOTS) { printf("sdsave: slot 0..%d\n", SD_MAX_SLOTS - 1); return -1; }
-    if (!sd_ok && sd_init(50, 1000) < 0)
-        return -1;
-    // What a UDP upload staged: the BONS header+table, each channel's payload, the tokenizer.
-    _Static_assert(sizeof(struct bons_header) <= 512, "the header in 16 beats");
-    engine_fetch(0, TRIXIUM_CHAN_WEIGHT_BASE - 0x100000, 16, 0xC000);
-    struct bons_header h;
-    for (uint32_t i = 0; i < sizeof(h)/4; i++)
-        ((uint32_t *)&h)[i] = ((volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000))[i];
-    if (h.magic != BONS_MAGIC) { puts("sdsave: no staged model (upload one first)"); return -1; }
-    uint32_t t[128];
-    memset(t, 0, sizeof(t));
-    uint32_t n = 0, sector = slot_sector(slot) + 1;
-#define SD_ENTRY(c, b, bytes) do { uint32_t *x = &t[12 + 5*n++]; x[0] = (c); x[1] = (b); \
-        x[2] = ((bytes) + 511)/512; x[3] = sector; sector += x[2]; } while (0)
-    SD_ENTRY(0, TRIXIUM_CHAN_WEIGHT_BASE - 0x100000, h.payload_offset);
-    for (uint32_t c = 0; c < h.n_channels; c++)
-        SD_ENTRY(c, TRIXIUM_CHAN_WEIGHT_BASE
-#ifndef TRIXIUM_LOADER_ADDS_CHAN_OFFSET
-                    + c*TRIXIUM_CHAN_STRIDE
-#endif
-                 , (uint32_t)(h.payload_beats*32));
-    engine_fetch(0, TOK_STAGING, 1, 0xC000);
-    volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + 0xC000);
-    if (rec[0] == TOK_STAGING_MAGIC && rec[1] <= TOK_STAGING_MAX)
-        SD_ENTRY(0, TOK_STAGING, 32 + rec[1]);
-    if (sector - slot_sector(slot) > SD_SLOT_SECTORS) { puts("sdsave: the model is larger than a slot"); return -1; }
-    t[0] = SD_IMAGE_MAGIC; t[1] = 2; t[2] = n;
-    for (int i = 0; i < 31 && label && label[i]; i++)
-        ((char *)&t[4])[i] = label[i];
-    // The old table first invalidated, the table last: a save cut short leaves no image to boot.
-    uint32_t zero[128];
-    memset(zero, 0, sizeof(zero));
-    if (sd_write(slot_sector(slot), 1, 0, 0, zero) < 0)
-        return -1;
-    uint64_t t0 = perf_now64(), bytes = 0;
-    for (uint32_t e = 0; e < n; e++) {
-        uint32_t *x = &t[12 + 5*e], crc = 0xffffffffu;
-        printf("  chan %lu: %lu KB to sector %lu\n", (unsigned long)x[0], (unsigned long)(x[2]/2),
-               (unsigned long)x[3]);
-        write_crc = &crc;
-        int rc = sd_write(x[3], x[2], (int)x[0], x[1], NULL);
-        write_crc = NULL;
-        if (rc < 0)
-            return -1;
-        x[4] = ~crc;
-        bytes += (uint64_t)x[2]*512;
-    }
-    t[3] = crc32((unsigned char *)&t[12], n*20);
-    if (sd_write(slot_sector(slot), 1, 0, 0, t) < 0)
-        return -1;
-    uint32_t ms = (uint32_t)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000));
-    printf("SDSAVE slot %d \"%s\": %lu MB in %lu s (%lu KB/s)\n", slot, (char *)&t[4],
-           (unsigned long)(bytes >> 20), (unsigned long)(ms/1000), (unsigned long)(ms ? bytes/ms : 0));
-    return 0;
-}
-
-int sd_boot(int slot)
-{
-    if (slot < 0 || slot >= SD_MAX_SLOTS) { printf("sdboot: slot 0..%d\n", SD_MAX_SLOTS - 1); return -1; }
-    if (!sd_ok && sd_init(50, 1000) < 0)
-        return -1;
-    uint32_t t[128];
-    int v1;
-    if (sd_read_sector(slot_sector(slot), t) < 0)
-        return -1;
-    if (table_ok(t, &v1) < 0) {
-        printf("sdboot: no TriXium image in slot %d (sector %lu, magic %08lx)\n", slot,
-               (unsigned long)slot_sector(slot), (unsigned long)t[0]);
-        return -1;
-    }
-    uint64_t t0 = perf_now64(), bytes = 0;
-    int checked = 0;
-    for (uint32_t e = 0; e < t[2]; e++) {
-        const uint32_t *x = v1 ? &t[4 + 4*e] : &t[12 + 5*e];   // chan, base, blocks, sector[, crc]
-        printf("  chan %lu: %lu KB from sector %lu\n", (unsigned long)x[0],
-               (unsigned long)(x[2]/2), (unsigned long)x[3]);
 #ifdef CSR_SD_CRC_ADDR
-        sd_crc_reset_write(1);
+static void     sd_ops_crc_reset(void) { sd_crc_reset_write(1); }
+static uint32_t sd_ops_crc_read(void)  { return sd_crc_read(); }
 #endif
-        if (sd_load((int)x[0], x[1], x[3], x[2]) < 0)
-            return -1;
+
+const struct storage_ops sd_storage_ops = {
+    .name           = "SD card / eMMC",
+    .tag            = "SD",
+    .cmd            = "sd",
+    .init           = sd_ops_init,
+    .ready          = sd_init_done,
+    .read_to_loader = sd_ops_read_to_loader,
+    .write          = sd_ops_write,
+    .bulk_write     = 1,
 #ifdef CSR_SD_CRC_ADDR
-        // The data went to the DRAM without the CPU: the read stream's CRC against the table's.
-        if (!v1) {
-            uint32_t got = sd_crc_read();
-            if (got != x[4]) {
-                printf("sdboot: entry %lu CRC %08lx, the table says %08lx: the device's data is damaged\n",
-                       (unsigned long)e, (unsigned long)got, (unsigned long)x[4]);
-                return -1;
-            }
-            checked++;
-        }
+    .crc_reset      = sd_ops_crc_reset,
+    .crc_read       = sd_ops_crc_read,
 #endif
-        bytes += (uint64_t)x[2]*512;
-    }
-    uint32_t ms = (uint32_t)((perf_now64() - t0)/(CONFIG_CLOCK_FREQUENCY/1000));
-    printf("SDBOOT slot %d \"%s\": %lu MB in %lu.%01lu s (%lu MB/s)%s\n", slot, v1 ? "" : (char *)&t[4],
-           (unsigned long)(bytes >> 20), (unsigned long)(ms/1000), (unsigned long)(ms%1000/100),
-           (unsigned long)(ms ? (bytes >> 10)/ms : 0), checked ? ", CRC ok" : "");
-    return 0;
-}
+};
 
-void sd_list(void)
-{
-    if (!sd_ok && sd_init(50, 1000) < 0)
-        return;
-    int def = sd_default_slot();
-    for (int slot = 0; slot < SD_MAX_SLOTS; slot++) {
-        uint32_t t[128];
-        int v1;
-        if (sd_read_sector(slot_sector(slot), t) < 0)
-            break;                                       // Past the device's end.
-        if (table_ok(t, &v1) < 0)
-            continue;
-        uint64_t bytes = 0;
-        for (uint32_t e = 0; e < t[2]; e++)
-            bytes += (uint64_t)(v1 ? t[4 + 4*e + 2] : t[12 + 5*e + 2])*512;
-        printf("SDSLOT %d%s \"%s\" %lu MB, %lu entries%s\n", slot, slot == def ? " (boot)" : "",
-               v1 ? "" : (char *)&t[4], (unsigned long)(bytes >> 20), (unsigned long)t[2],
-               v1 ? ", version 1 (no CRCs)" : "");
-    }
-}
-
-// The slot booted at power-up: the boot sector's, 0 without one.
-int sd_default_slot(void)
-{
-    uint32_t t[128];
-    if (sd_read_sector(SD_BOOT_SECTOR, t) < 0 || t[0] != SD_BOOT_MAGIC || t[2] != ~t[1] ||
-        t[1] >= SD_MAX_SLOTS)
-        return 0;
-    return (int)t[1];
-}
-
-int sd_set_default(int slot)
-{
-    if (slot < 0 || slot >= SD_MAX_SLOTS) { printf("sddefault: slot 0..%d\n", SD_MAX_SLOTS - 1); return -1; }
-    if (!sd_ok && sd_init(50, 1000) < 0)
-        return -1;
-    uint32_t t[128];
-    memset(t, 0, sizeof(t));
-    t[0] = SD_BOOT_MAGIC; t[1] = (uint32_t)slot; t[2] = ~(uint32_t)slot;
-    if (sd_write(SD_BOOT_SECTOR, 1, 0, 0, t) < 0)
-        return -1;
-    printf("SDDEFAULT slot %d\n", slot);
-    return 0;
-}
-
-#endif
-
-#endif
+#endif // CSR_SD_BASE

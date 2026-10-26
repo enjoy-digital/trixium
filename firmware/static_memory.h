@@ -35,5 +35,9 @@
 #define TRIXIUM_NET_CONNS_ADDR      (TRIXIUM_HDR_ADDR + 0xd0000) // struct conn[NET_CONNS] (net.c), < 72 KB
 #define TRIXIUM_WEB_REQS_ADDR       (TRIXIUM_HDR_ADDR + 0xe2000) // struct req[NET_CONNS] (web.c), < 20 KB
 #define TRIXIUM_CRC_TABLES_ADDR     (TRIXIUM_HDR_ADDR + 0xe8000) // uint32[4][256] slicing-by-4 CRC (sdload.c), 4 KB
+#define TRIXIUM_STORAGE_TABLE_ADDR  (TRIXIUM_HDR_ADDR + 0xe9000) // uint32[512] a slot table, 4 sectors (storage.c), 2 KB
+#define TRIXIUM_STORAGE_ZERO_ADDR   (TRIXIUM_HDR_ADDR + 0xe9800) // uint32[512] zero sectors for a save (storage.c), 2 KB
+#define TRIXIUM_STORAGE_BOOT_ADDR   (TRIXIUM_HDR_ADDR + 0xea000) // uint32[128] the boot sector (storage.c), 512 B
+#define TRIXIUM_NET_TXF_ADDR        (TRIXIUM_HDR_ADDR + 0xea800) // the TCP/IP stack's transmit frame (net.c), < 2 KB
 
 #endif

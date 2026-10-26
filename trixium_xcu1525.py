@@ -20,6 +20,13 @@ From the repository root:
   ./trixium_xcu1525.py --build --sys-clk-freq 137.5e6 --output-dir build/xcu1525_137
   ./trixium_xcu1525.py --load                          # openFPGALoader (JTAG)
   trixium deploy --board xcu1525 --model 27b           # the lab board: software/lab/deploy.py
+  ./trixium_xcu1525.py --standalone --build            # no host: build/xcu1525_standalone/
+
+--standalone (doc/plan-xcu1525-standalone.md): no PCIe; Ethernet on QSFP1 through a QSFP-to-SFP+
+adapter and a 1G copper SFP (LiteEth: Etherbone, the UDP weight upload, the CPU's MAC for the
+firmware's chat page), a SATA SSD on QSFP0 through an adapter and an SFP-to-SATA module (the
+models, CRC-checked slots), the firmware in the configuration flash, the console on the card's
+serial pins, the DDR4 trained by the card itself (liblitedram's write training).
 
 Vivado 2024.1 (--vivado-settings). A VU9P route needs ~15 GB of disk and ~25 GB of RAM.
 """
@@ -53,6 +60,13 @@ from gateware.memory.ddr import add_ddr_domain_controllers, engine_ddr_port, reg
 from gateware.common import add_cluster_constraints, add_zbb_constant
 from gateware.common import set_main_ram_executable, CPUBusMonitor
 from gateware.common import VIVADO_PATH, set_vivado_env, write_verdict
+from gateware.memory.udp_upload import UDPUpload
+from litex.soc.interconnect.csr import CSRStorage
+
+UPLOAD_PORT = 2345   # software/host/udpload.py
+# The standalone build's firmware in the card's configuration flash (MT25QU01G, 128 MB): above
+# the compressed bitstream, as LiteX's flashboot image (length + CRC + the binary: crcfbigen).
+FIRMWARE_FLASH_OFFSET = 0x0500_0000
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -66,7 +80,7 @@ class _CRG(LiteXModule):
     leveling. A second MMCM on the same reference makes sys; the memory ports cross at the AXI
     level (memory/ddr.py), the controllers' CSRs behind a wishbone crossing.
     """
-    def __init__(self, platform, sys_clk_freq, ddr_clk_freq, clk_channel=0):
+    def __init__(self, platform, sys_clk_freq, ddr_clk_freq, clk_channel=0, with_gt_refclks=False):
         assert ddr_clk_freq != sys_clk_freq
         self.rst       = Signal()
         self.cd_sys    = ClockDomain()
@@ -96,6 +110,18 @@ class _CRG(LiteXModule):
         syspll.register_clkin(pll.clkin, 300e6)
         syspll.create_clkout(self.cd_sys, sys_clk_freq, with_reset=False)
         platform.add_false_path_constraints(self.cd_sys.clk, self.cd_ddr.clk)
+
+        # GT reference clocks (the standalone build): 200 MHz for the 1000BASE-X CPLL and 150 MHz
+        # for the SATA PHY (the only rate its GTY CRG takes), from a PLL of their own on the same
+        # 300 MHz input, so the sys and DDR MMCMs keep their settings.
+        if with_gt_refclks:
+            self.cd_eth         = ClockDomain()
+            self.cd_sata_refclk = ClockDomain()
+            self.gtpll = gtpll = USPPLL(speedgrade=-2)
+            self.comb += gtpll.reset.eq(self.rst)
+            gtpll.register_clkin(pll.clkin, 300e6)
+            gtpll.create_clkout(self.cd_eth,         200e6, margin=0)
+            gtpll.create_clkout(self.cd_sata_refclk, 150e6, margin=0)
 
         # DDR clock buffers.
         self.specials += [
@@ -227,6 +253,10 @@ class TriXiumXCU1525SoC(SoCCore):
         chan_skew      = 0x8000,
         attn_geometry  = (24, 4, 256, 1024),
         cpu_slr        = 1,
+        standalone     = False,
+        eth_ip         = "<board-host>",
+        web_ip         = "<board-host>",
+        upload_beats   = 45,
         **kwargs):
         ddram_channels = 4
         assert engine_channels % ddram_channels == 0, \
@@ -236,14 +266,23 @@ class TriXiumXCU1525SoC(SoCCore):
         platform = sqrl_xcu1525.Platform()
 
         # CRG --------------------------------------------------------------------------------------
-        self.crg = _CRG(platform, sys_clk_freq, ddr_clk_freq=ddr_clk_freq)
+        self.crg = _CRG(platform, sys_clk_freq, ddr_clk_freq=ddr_clk_freq, with_gt_refclks=standalone)
 
         # SoCCore ----------------------------------------------------------------------------------
-        if kwargs.get("uart_name", "serial") == "serial":
-            kwargs["uart_name"] = "crossover" # Console over PCIe/JTAGBone.
-        kwargs["with_jtagbone"] = True
+        # 16 KB of SRAM (LiteX's default 8 KB): the firmware's .data/.bss (7 KB: the network stack,
+        # the tokenizer, the tables) must leave the 4 KB stack (firmware/linker.ld).
+        kwargs["integrated_sram_size"] = max(kwargs.get("integrated_sram_size") or 0, 0x4000)
+        if standalone:
+            # No host: the console on the card's own serial pins (its FT4232H). JTAGBone reads
+            # zeros on this board; Etherbone over the QSFP Ethernet takes its role.
+            kwargs["uart_name"]     = "serial"
+            kwargs["with_jtagbone"] = False
+        else:
+            if kwargs.get("uart_name", "serial") == "serial":
+                kwargs["uart_name"] = "crossover" # Console over PCIe/JTAGBone.
+            kwargs["with_jtagbone"] = True
         SoCCore.__init__(self, platform, sys_clk_freq,
-            ident = "TriXium on XCU1525", **kwargs)
+            ident = "TriXium on XCU1525" + (" standalone" if standalone else ""), **kwargs)
         self.add_constant("TRIXIUM_VARIANT", ord("b"))
 
         # DDR4 x4 ----------------------------------------------------------------------------------
@@ -251,7 +290,7 @@ class TriXiumXCU1525SoC(SoCCore):
         # controllers 1-3 have crossbar ports only.
         self.sdrams = []
         self.add_ddr_controllers(platform, ddram_channels, ddr_clk_freq, main_ram_size,
-            kwargs.get("l2_size", 8192))
+            kwargs.get("l2_size", 8192), standalone=standalone)
         set_main_ram_executable(self)
         # Workaround for a Vivado DRC on the PHY's clocking (upstream target).
         platform.add_platform_command("set_property SEVERITY {{Warning}} [get_drc_checks PDCN-2736]")
@@ -267,10 +306,11 @@ class TriXiumXCU1525SoC(SoCCore):
             memory_ports.append(axi)
 
         # PCIe -------------------------------------------------------------------------------------
-        self.pcie_phy = USPPCIEPHY(platform, platform.request("pcie_x4"),
-            data_width = 128,
-            bar0_size  = 0x40000) # Covers DDR_CSR_WINDOW (CSR region + 0x20000): host DDR trainer.
-        self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
+        if not standalone:
+            self.pcie_phy = USPPCIEPHY(platform, platform.request("pcie_x4"),
+                data_width = 128,
+                bar0_size  = 0x40000) # Covers DDR_CSR_WINDOW (CSR region + 0x20000): host DDR trainer.
+            self.add_pcie(phy=self.pcie_phy, ndmas=1, address_width=32)
 
         # CPU Bus Monitor (read over PCIe by software/host/cpumon.py) ------------------------------
         self.cpumon = CPUBusMonitor(self.cpu)
@@ -327,9 +367,12 @@ class TriXiumXCU1525SoC(SoCCore):
         self.bus.add_slave("scratchpad", self.trixium.bus,
             SoCRegion(origin=0xa000_0000, size=self.trixium.scratchpad.size, cached=False))
 
-        # PCIe DMA0 (host -> FPGA) -> TriXium upload stream.
-        self.comb += self.pcie_dma0.source.connect(self.trixium.upload,
-            keep={"valid", "ready", "data"})
+        if standalone:
+            self.add_standalone(platform, sys_clk_freq, eth_ip, web_ip, upload_beats)
+        else:
+            # PCIe DMA0 (host -> FPGA) -> TriXium upload stream.
+            self.comb += self.pcie_dma0.source.connect(self.trixium.upload,
+                keep={"valid", "ready", "data"})
 
         # Board memory map, for the firmware.
         self.add_constant("TRIXIUM_LOADER_ADDS_CHAN_OFFSET", 1)
@@ -343,7 +386,7 @@ class TriXiumXCU1525SoC(SoCCore):
         self.add_constant("TRIXIUM_N_MEMCTRL",        ddram_channels)
         self.add_constant("TRIXIUM_DDR_CSR_STRIDE",   DDR_CSR_STRIDE)
 
-    def add_ddr_controllers(self, platform, n, ddr_clk_freq, main_ram_size, l2_size):
+    def add_ddr_controllers(self, platform, n, ddr_clk_freq, main_ram_size, l2_size, standalone=False):
         """n USPDDRPHY + MT40A512M8 controllers in the `ddr` domain (memory/ddr.py)."""
         phys, modules = [], []
         for i in range(n):
@@ -355,12 +398,114 @@ class TriXiumXCU1525SoC(SoCCore):
             # liblitedram's write DQ-DQS training (per-module centering of the DQ output delay
             # against the DQS), which the US+ PHY does not declare by default: without it,
             # controller 0's byte lane 7 comes out of write leveling at the edge of its write eye.
-            phy.settings.write_dq_dqs_training = True
+            # The standalone build's write training (below) scans every write bitslip and delay
+            # itself and replaces it.
+            if not standalone:
+                phy.settings.write_dq_dqs_training = True
             register_delay_controls(phy)
             phys.append(phy)
             modules.append(MT40A512M8(ddr_clk_freq, "1:4"))
         add_ddr_domain_controllers(self, phys, modules, ddr_clk_freq, main_ram_size, l2_size,
             DDR_CSR_WINDOW, phy_renames={"sys": "ddr", "sys4x": "ddr4x"})
+        if standalone:
+            # The DDR4 trained by the card: liblitedram's round-trip write training (the port of
+            # software/host/rdlevel.py; the BIOS for controller 0, firmware/ddr.c for 1-3), the
+            # BIOS levelling again until a 64 MB memtest passes, and a boot counter the firmware
+            # bumps when controller 0 fails its deep test before resetting the SoC (reset-less:
+            # it survives the reset that re-runs the BIOS; cleared by the configuration).
+            self.add_constant("SDRAM_WRITE_TRAINING")
+            self.add_constant("SDRAM_LEVELING_RETRIES", 3)
+            self.add_constant("SDRAM_MEMTEST_SIZE",     64 << 20)
+            self.bootcnt = LiteXModule()
+            self.bootcnt.value = CSRStorage(8, reset_less=True,
+                description="Boots since the configuration that ended in a controller-0 retrain (the firmware counts, the BIOS runs again).")
+
+    def add_standalone(self, platform, sys_clk_freq, eth_ip, web_ip, upload_beats):
+        """No host: Ethernet on QSFP1 (a QSFP-to-SFP+ adapter and a 1G copper SFP), the SATA SSD on
+        QSFP0 (the adapter and an SFP-to-SATA module), the firmware in the configuration flash."""
+        from liteeth.phy.usp_gty_1000basex import USP_GTY_1000BASEX
+        from litesata.phy import LiteSATAPHY
+        from litespi.modules import MT25QU01G
+        from litespi.opcodes import SpiNorFlashOpCodes as Codes
+        from litespi.phy.generic import LiteSPIXilinxUSPHY
+        from litex.build.generic_platform import Subsignal, Pins
+        from gateware.memory.sata_upload import SATAUpload, SATAStore
+
+        # Ethernet: Etherbone (the CSRs) and the weight upload port on the hardware UDP/IP stack,
+        # the CPU's own MAC beside it (LiteEth's hybrid crossbar: the hardware MAC's unicasts stay
+        # in hardware, broadcasts reach both, the rest the CPU) for the firmware's TCP/IP, DHCP,
+        # mDNS and chat page (firmware/net.c, web.c), as on the Ti375. The 1000BASE-X PCS does
+        # SGMII autonegotiation too (the copper SFP); the reference clock comes from the fabric.
+        self.ethphy = USP_GTY_1000BASEX(self.crg.cd_eth.clk,
+            data_pads          = platform.request("qsfp1_sfp0"),
+            sys_clk_freq       = sys_clk_freq,
+            refclk_from_fabric = True)
+        web_mac = 0x10e2d5000002
+        self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, data_width=32,
+            with_ethmac=True, ethmac_address=web_mac, ethmac_local_ip=web_ip)
+        ip = [int(b) for b in web_ip.split(".")]
+        self.add_constant("TRIXIUM_WEB_IP",     ip[0] << 24 | ip[1] << 16 | ip[2] << 8 | ip[3])
+        self.add_constant("TRIXIUM_WEB_MAC_HI", web_mac >> 32)
+        self.add_constant("TRIXIUM_WEB_MAC_LO", web_mac & 0xffffffff)
+        udp_port = self.ethcore_etherbone.udp.crossbar.get_port(UPLOAD_PORT, dw=32, cd="etherbone")
+        self.udpload = UDPUpload(udp_port, max_beats=upload_beats, out_dw=128)
+
+        # SATA: LiteSATA on QSFP0's first lane (the pins upstream's --with-sata uses), gen2 on a
+        # 16-bit datapath. The stock DMAs and IDENTIFY serve the BIOS and the firmware's small
+        # sectors (the tables, the boot sector), the BIST the bring-up; two crossbar ports carry
+        # the bulk: the SSD into the weight loader (sataup, firmware/sataload.c) and the UDP
+        # upload stream onto the SSD (satastore, software/host/xcu1525.py model --persist).
+        platform.add_extension([("qsfp0_sata", 0,
+            Subsignal("tx_p", Pins("N9")), Subsignal("tx_n", Pins("N8")),
+            Subsignal("rx_p", Pins("N4")), Subsignal("rx_n", Pins("N3")))])
+        self.sata_phy = LiteSATAPHY(platform.device,
+            refclk     = ClockSignal("sata_refclk"),
+            pads       = platform.request("qsfp0_sata"),
+            gen        = "gen2",
+            clk_freq   = sys_clk_freq,
+            data_width = 16)
+        self.add_sata(phy=self.sata_phy, mode="read+write", with_identify=True, with_bist=True)
+        self.sataup    = SATAUpload(self.sata_crossbar.get_port(dw=32), out_dw=128)
+        self.satastore = SATAStore(self.sata_crossbar.get_port(dw=32), in_dw=128)
+        self.comb += If(self.sataup.upload.storage,
+            self.sataup.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}),
+        ).Elif(self.satastore.enable.storage,
+            self.udpload.source.connect(self.satastore.sink, keep={"valid", "ready", "data"}),
+        ).Else(
+            self.udpload.source.connect(self.trixium.upload, keep={"valid", "ready", "data"}),
+        )
+        # 16 GB slots (firmware/storage.h: the 27B's 8.5 GB image; 7 slots on a 128 GB SSD).
+        self.add_constant("TRIXIUM_STORAGE_SLOT_SECTORS", 1 << 25)
+        self.add_constant("TRIXIUM_STORAGE_MAX_SLOTS",    7)
+
+        # The cages' modules: out of reset 10 ms after the SoC, never in low-power mode. (The
+        # platform maps qsfp1_refclk_rst and qsfp1_fs to one pin: neither is requested, the GT
+        # reference clocks come from the fabric.)
+        reset_cycles = int(sys_clk_freq*10e-3)
+        reset_count  = Signal(max=reset_cycles + 1, reset=reset_cycles)
+        self.sync += If(reset_count != 0, reset_count.eq(reset_count - 1))
+        for q in (0, 1):
+            self.comb += [
+                platform.request(f"qsfp{q}_resetl").eq(reset_count == 0),
+                platform.request(f"qsfp{q}_lpmode").eq(0),
+            ]
+
+        # The configuration flash: the BIOS boots the firmware from it (flashboot) once its serial
+        # boot finds no host. MT25QU01G (128 MB) through STARTUPE3, quad reads at ~15 MHz (the
+        # firmware's 300 KB in ~20 ms), the image above the compressed bitstream
+        # (FIRMWARE_FLASH_OFFSET; software/host/xcu1525.py flash writes both).
+        class MT25QU01G_Q(MT25QU01G):
+            supported_opcodes = MT25QU01G.supported_opcodes + [Codes.READ_1_1_4_4B]
+        module  = MT25QU01G_Q(Codes.READ_1_1_4_4B, program_cmd=Codes.PP_1_1_1_4B)
+        divisor = -(-int(sys_clk_freq)//20_000_000)
+        divisor += divisor % 2
+        self.add_spi_flash(mode="4x", module=module,
+            phy=LiteSPIXilinxUSPHY(module, default_divisor=divisor), with_master=True)
+        self.add_constant("FLASH_BOOT_ADDRESS",
+                          self.bus.regions["spiflash"].origin + FIRMWARE_FLASH_OFFSET)
+        for prop in ("CONFIG_VOLTAGE 1.8", "BITSTREAM.CONFIG.SPI_BUSWIDTH 4",
+                     "BITSTREAM.CONFIG.SPI_32BIT_ADDR YES", "BITSTREAM.CONFIG.CONFIGRATE 51.0"):
+            platform.add_platform_command(f"set_property {prop} [current_design]")
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -387,6 +532,10 @@ def main():
     parser.add_target_argument("--driver",          action="store_true",                                     help="Generate PCIe driver (always with --build).")
     parser.add_target_argument("--vivado-settings", default=os.environ.get("LITEX_ENV_VIVADO", VIVADO_PATH), help="Vivado install sourced by the build (settings64.sh).")
     parser.add_target_argument("--timing-approval", default="ddr4-overclock",                             help="Timing gate approval (software/lab/timing.py APPROVALS); DDR4-1500 overclocks the ISERDES.")
+    parser.add_target_argument("--standalone",      action="store_true",                                     help="No host: Ethernet on QSFP1, a SATA SSD on QSFP0, the firmware in the flash, the console on the serial pins.")
+    parser.add_target_argument("--eth-ip",          default="<board-host>",                                  help="--standalone: Etherbone / upload IP address.")
+    parser.add_target_argument("--web-ip",          default="<board-host>",                                  help="--standalone: the chat page's address when no DHCP server answers.")
+    parser.add_target_argument("--upload-beats",    default=45, type=int,                                    help="--standalone: 256-bit beats per upload datagram.")
     # The shipping recipe (overridable from the command line).
     parser.set_defaults(
         cpu_type                             = "vexiiriscv",
@@ -407,12 +556,16 @@ def main():
         ddr_clk_freq    = args.ddr_clk_freq,
         engine_channels = args.engine_channels,
         cpu_slr         = args.cpu_slr,
+        standalone      = args.standalone,
+        eth_ip          = args.eth_ip,
+        web_ip          = args.web_ip,
+        upload_beats    = args.upload_beats,
         **parser.soc_argdict)
     add_zbb_constant(soc, args)
 
     builder_argd = parser.builder_argdict
     if builder_argd.get("output_dir") is None:
-        builder_argd["output_dir"] = os.path.join("build", "xcu1525")
+        builder_argd["output_dir"] = os.path.join("build", "xcu1525_standalone" if args.standalone else "xcu1525")
     if builder_argd.get("csr_csv") is None:
         builder_argd["csr_csv"] = os.path.join(builder_argd["output_dir"], "csr.csv")
     builder = Builder(soc, **builder_argd)
@@ -428,7 +581,8 @@ def main():
             if builder.compile_gateware:
                 write_verdict(verdict, 1)
             raise
-        generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"), name="trixium")
+        if not args.standalone:
+            generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"), name="trixium")
 
         # A successful Vivado run is not a qualified bitstream: the timing gate decides. The strict
         # release verdict is printed for information; DDR4-1500 runs the USPDDRPHY's ISERDES past

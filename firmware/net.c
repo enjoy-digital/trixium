@@ -65,7 +65,11 @@ static struct conn conns[NET_CONNS];
 #endif
 static uint32_t iss_seed = 0x54525800u;
 static uint16_t ip_id;
+#ifdef TRIXIUM_FIRMWARE
+static uint8_t *const txf = (uint8_t *)TRIXIUM_NET_TXF_ADDR;   // Not .bss either (1.5 KB).
+#else
 static uint8_t  txf[ETH_HDR + IP_HDR + TCP_HDR + 4 + NET_MSS];
+#endif
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }

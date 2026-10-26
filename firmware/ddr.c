@@ -112,6 +112,45 @@ int ddr_init_all(void)
     return ok;
 }
 
+#if defined(SDRAM_WRITE_TRAINING) && !defined(SDRAM_CSR_STRIDE)
+// liblitedram's round-trip write training again on controller k (k > 0: the one the firmware
+// runs from is the BIOS's), what the host's `rdlevel.py train --ctrl k` did over PCIe: the
+// controller under software control for its duration (no refresh), so never with anything in
+// its windows worth keeping. Returns 1 when every module converged.
+int ddr_train(int k)
+{
+    if (k <= 0 || k >= TRIXIUM_N_MEMCTRL) {
+        printf("ddr: controller %d is not retrainable here (1..%d; 0 holds main_ram: a reboot)\n",
+               k, TRIXIUM_N_MEMCTRL - 1);
+        return 0;
+    }
+    ddr_csr_base = ddr_csr_base0 + (unsigned long)k*TRIXIUM_DDR_CSR_STRIDE;
+    printf("ddr: controller %d write training\n", k);
+    sdram_software_control_on();
+    int mask = sdram_write_training();
+    sdram_software_control_off();
+    ddr_csr_base = ddr_csr_base0;
+    printf("ddr: controller %d training %s\n", k, mask ? "FAILED" : "OK");
+    return mask == 0;
+}
+
+// The injector's error bits per module (the host's `rdlevel.py check`).
+void ddr_check(int k)
+{
+    if (k < 0 || k >= TRIXIUM_N_MEMCTRL) return;
+    int errors[SDRAM_PHY_MODULES];
+    ddr_csr_base = ddr_csr_base0 + (unsigned long)k*TRIXIUM_DDR_CSR_STRIDE;
+    sdram_software_control_on();
+    sdram_write_training_check(errors);
+    sdram_software_control_off();
+    ddr_csr_base = ddr_csr_base0;
+    printf("ddr: controller %d error bits per module:", k);
+    for (int m = 0; m < SDRAM_PHY_MODULES; m++)
+        printf(" m%d:%d", m, errors[m]);
+    printf("\n");
+}
+#endif
+
 int ddr_boot_init(void)
 {
 #ifdef SDRAM_CSR_STRIDE
@@ -125,7 +164,47 @@ int ddr_boot_init(void)
     return 1;
 #endif
 #else
-    return ddr_init_all();
+    int ok = ddr_init_all();
+#if defined(SDRAM_WRITE_TRAINING) && !defined(TRIXIUM_SIM)
+    // The standalone board's boot (what software/host/board.py boot_xcu1525 ran from the host):
+    // every controller's windows under the deep test, the failing controllers trained again, up
+    // to three rounds. Controller 0 cannot be retrained from here (the firmware runs from it: no
+    // refresh for the training's duration, and its test row is the reset vector): the boot
+    // counter is bumped and the SoC reset, so the BIOS levels it again and boots the firmware
+    // again; after three such boots the console is left to the user.
+    ddr_test(-1);
+    uint32_t bad = 0;
+    for (int round = 0; round < 3; round++) {
+        bad = ddr_test_deep(512, -1);
+        if (bad == 0)
+            break;
+        for (int k = 1; k < TRIXIUM_N_MEMCTRL; k++)
+            if (bad & (1u << k))
+                ddr_train(k);
+        if (bad & 1)
+            break;
+    }
+    if (bad & 1) {
+#ifdef CSR_BOOTCNT_VALUE_ADDR
+        uint32_t n = bootcnt_value_read();
+        if (n < 3) {
+            printf("DDR: controller 0 fails the deep test - rebooting to retrain it (boot %lu of 3)\n",
+                   (unsigned long)n + 1);
+            bootcnt_value_write(n + 1);
+            busy_wait(100);                     // The message out of the UART first.
+            ctrl_reset_write(1);
+            while (1);
+        }
+        puts("DDR: controller 0 still fails after three boots - trained by hand (ddrtrain, rdlevel.py)");
+#else
+        puts("DDR: controller 0 fails the deep test - a reboot retrains it");
+#endif
+        return 0;
+    }
+    return ok && bad == 0;
+#else
+    return ok;
+#endif
 #endif
 }
 

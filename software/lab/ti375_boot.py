@@ -6,7 +6,9 @@
 # Copyright (c) 2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
-"""The Ti375 kit's power-on -> chat-ready timeline, measured from the workstation its USB is on.
+"""A board's power-on -> chat-ready timeline, measured from the workstation its USB is on: the
+Ti375 kit (default), or the standalone XCU1525 (--board xcu1525: its FT4232H, the console on its
+second port).
 
     python3 -m software.lab.ti375_boot [--name trixium.local | --ip A.B.C.D] [--log boot.log]
 
@@ -70,20 +72,23 @@ class Measure:
 
     # The kit on USB ----------------------------------------------------------------------------
 
-    @staticmethod
-    def find_kit():
+    usb_product = "Ti375"     # The FT4232H's USB product string (the kit's names it).
+    uart_if     = 2           # Its interface carrying the console (the kit: the third port).
+
+    @classmethod
+    def find_kit(cls):
         for d in glob.glob("/sys/bus/usb/devices/*"):
             try:
-                if "Ti375" in open(os.path.join(d, "product")).read():
+                if cls.usb_product in open(os.path.join(d, "product")).read():
                     return d
             except OSError:
                 pass
         return None
 
-    @staticmethod
-    def kit_tty(d):
+    @classmethod
+    def kit_tty(cls, d):
         base = os.path.basename(d)
-        for pat in (base + ":1.2/ttyUSB*", base + ":1.2/tty/ttyUSB*"):   # The third port: the UART.
+        for pat in (f"{base}:1.{cls.uart_if}/ttyUSB*", f"{base}:1.{cls.uart_if}/tty/ttyUSB*"):
             for t in glob.glob(os.path.join(d, pat)):
                 return "/dev/" + os.path.basename(t)
         return None
@@ -153,7 +158,7 @@ class Measure:
     def run(self):
         if os.path.exists(TRIG):
             os.remove(TRIG)
-        self.out(f"waiting for the kit on USB (product 'Ti375')... or the {TRIG} trigger file")
+        self.out(f"waiting for the board on USB (product '{self.usb_product}')... or the {TRIG} trigger file")
         t_start = time.time()
         d = None
         while True:
@@ -305,6 +310,9 @@ def main():
     parser.add_argument("--ip",   default=None, help="The board's address, if the name does not resolve.")
     parser.add_argument("--log",  default="ti375_boot.log", help="Timestamped console + probe log.")
     parser.add_argument("--wait", type=int, default=1800, help="Seconds to wait for each step (USB, off, on).")
+    parser.add_argument("--board", default="ti375", choices=["ti375", "xcu1525"], help="ti375: the kit (USB product 'Ti375', console on port 3); xcu1525: the standalone card.")
+    parser.add_argument("--usb-product", default=None, help="The FT4232H's USB product string to look for (overrides --board's).")
+    parser.add_argument("--uart-if", type=int, default=None, help="The FT4232H interface of the console (0-3; overrides --board's).")
     args = parser.parse_args()
     ip = args.ip
     if ip is None:
@@ -312,6 +320,10 @@ def main():
             ip = socket.getaddrinfo(args.name, 80, socket.AF_INET)[0][4][0]
         except OSError:
             sys.exit(f"{args.name} does not resolve: pass --ip (the board must have run once for its DHCP lease)")
+    boards = {"ti375": ("Ti375", 2), "xcu1525": ("Quad RS232-HS", 1)}   # the XCU1525's: to confirm on the bench
+    Measure.usb_product, Measure.uart_if = boards[args.board]
+    if args.usb_product: Measure.usb_product = args.usb_product
+    if args.uart_if is not None: Measure.uart_if = args.uart_if
     return Measure(ip, args.name, args.log, args.wait).run()
 
 if __name__ == "__main__":

@@ -62,10 +62,11 @@ class CRCError(RuntimeError):
 
 
 def transfer(bus, link, chan, base, data, beats_per_datagram=None, window=512, verbose=False,
-             stall_s=5.0, retries=3):
+             stall_s=5.0, retries=3, arm=None, wait=None):
     """One channel's bytes to `base`, in 128 MB armed transfers, each checked by the port's CRC
     when the build has it (a mismatch resends it, up to `retries` times); returns the datagrams
-    resent."""
+    resent. `arm(base, beats)` / `wait(base, beats)` replace the loader's arming and done wait
+    for another sink of the port's stream (the SATA store of the standalone XCU1525)."""
     regs   = bus.regs
     if beats_per_datagram is None:
         beats_per_datagram = regs.udpload_max_beats.read() if hasattr(regs, "udpload_max_beats") else 32
@@ -78,7 +79,7 @@ def transfer(bus, link, chan, base, data, beats_per_datagram=None, window=512, v
         n = min(beats - done, CHUNK_BEATS)
         chunk = data[done*BEAT_BYTES:(done + n)*BEAT_BYTES]
         resent += _send_chunk(bus, link, chan, base + done*BEAT_BYTES, chunk, beats_per_datagram,
-                              window, stall_s)
+                              window, stall_s, arm, wait)
         if hasattr(regs, "udpload_crc"):
             got, want = regs.udpload_crc.read(), zlib.crc32(chunk)
             if got != want:
@@ -95,21 +96,25 @@ def transfer(bus, link, chan, base, data, beats_per_datagram=None, window=512, v
     return resent
 
 
-def _send_chunk(bus, link, chan, base, chunk, beats_per_datagram, window, stall_s):
+def _send_chunk(bus, link, chan, base, chunk, beats_per_datagram, window, stall_s, arm=None, wait=None):
     """One armed transfer (<= 128 MB): its datagrams until the port expects no more, then the
-    loader's done; returns the datagrams resent."""
+    sink's done (the loader's, or `wait`); returns the datagrams resent."""
     regs   = bus.regs
     dgram  = beats_per_datagram*BEAT_BYTES
     n      = len(chunk)//BEAT_BYTES
     resent = 0
     count  = (len(chunk) + dgram - 1)//dgram
-    regs.trixium_loader_src_sel.write(0)
-    regs.trixium_loader_chan.write(chan)
-    regs.trixium_loader_base.write(base)
-    regs.trixium_loader_length.write(n)
-    regs.trixium_loader_resync.write(0)
+    if arm is None:
+        regs.trixium_loader_src_sel.write(0)
+        regs.trixium_loader_chan.write(chan)
+        regs.trixium_loader_base.write(base)
+        regs.trixium_loader_length.write(n)
+        regs.trixium_loader_resync.write(0)
     regs.udpload_restart.write(0)
-    regs.trixium_loader_start.write(1)
+    if arm is None:
+        regs.trixium_loader_start.write(1)
+    else:
+        arm(base, n)
     sent, last = 0, -1
     progress = time.time()
     while True:
@@ -130,7 +135,10 @@ def _send_chunk(bus, link, chan, base, chunk, beats_per_datagram, window, stall_
             link.send(sent, chunk[sent*dgram:(sent + 1)*dgram])
             sent += 1
         time.sleep(0.0005)
-    wait_done(bus, chan, base, n)
+    if wait is None:
+        wait_done(bus, chan, base, n)
+    else:
+        wait(base, n)
     return resent
 
 

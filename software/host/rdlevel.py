@@ -123,6 +123,24 @@ class Bar0:
         for j in range(4):
             self.wr(off + 4*j, (v >> (32*(3 - j))) & 0xffffffff)
 
+class RemoteBus:
+    """The same accessors over a litex_server (Etherbone on the standalone build's QSFP Ethernet,
+    or JTAGBone): `base` is the controller's absolute CSR address (CSR_BASE + its page)."""
+    def __init__(self, base, csr_csv=None):
+        from litex.tools.litex_client import RemoteClient
+        self.bus = RemoteClient(csr_csv=csr_csv) if csr_csv else RemoteClient()
+        self.bus.open()
+        self.base = base
+
+    def rd(self, off):
+        return self.bus.read(self.base + off)
+
+    def wr(self, off, v):
+        self.bus.write(self.base + off, v & 0xffffffff)
+
+    rd128 = Bar0.rd128
+    wr128 = Bar0.wr128
+
 # Controller ---------------------------------------------------------------------------------------
 
 class Ctrl:
@@ -470,15 +488,30 @@ def csr_shift(path):
 
 CSR_H = "gen/software/include/generated/csr.h"
 
-def open_controller(index=0, csr_h=CSR_H):
-    """BAR0 and the DFI controls of controller `index` (CSR stride 0x1000)."""
-    bar = Bar0(index*0x1000 + csr_shift(csr_h))
+def csr_base(csr_h):
+    """CSR_BASE from the generated mem.h beside csr.h (the absolute address a litex_server needs)."""
+    try:
+        with open(os.path.join(os.path.dirname(csr_h), "mem.h"), encoding="utf-8") as f:
+            m = re.search(r"#define CSR_BASE (0x[0-9a-fA-F]+)L?", f.read())
+            return int(m.group(1), 16) if m else 0xf0000000
+    except OSError:
+        return 0xf0000000
+
+
+def open_controller(index=0, csr_h=CSR_H, bus="pci", csr_csv=None):
+    """The DFI controls of controller `index` (CSR stride 0x1000): over BAR0 (`bus` "pci", the
+    card in a host) or a litex_server on localhost:1234 ("remote": Etherbone over the standalone
+    build's Ethernet, or JTAGBone), the fallback trainer when the card's own training fails."""
+    if bus == "pci":
+        bar = Bar0(index*0x1000 + csr_shift(csr_h))
+    else:
+        bar = RemoteBus(csr_base(csr_h) + index*0x1000 + csr_shift(csr_h), csr_csv)
     return bar, Ctrl(bar)
 
 
-def train_controller(index=0, step=8, modules=None, csr_h=CSR_H):
+def train_controller(index=0, step=8, modules=None, csr_h=CSR_H, bus="pci"):
     """Write DQ-DQS centring + read leveling of `modules` (default: all) of one controller."""
-    _, ctrl = open_controller(index, csr_h)
+    _, ctrl = open_controller(index, csr_h, bus)
     ctrl.software_control_on()
     try:
         train(ctrl, modules or list(range(MODULES)), step)
@@ -499,20 +532,21 @@ def check_controller(index=0, csr_h=CSR_H):
 # Run ----------------------------------------------------------------------------------------------
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="liblitedram's read-leveling scan, driven from the host over BAR0.")
+    parser = argparse.ArgumentParser(description="liblitedram's read-leveling scan, driven from the host over BAR0 (or a litex_server).")
     parser.add_argument("cmd",        choices=["scan", "set", "phases", "raw", "train", "check"],  help="Command.")
     parser.add_argument("module",     type=int, nargs="?", default=7,                              help="Module (byte lane).")
     parser.add_argument("bitslip",    type=int, nargs="?",                                         help="Read bitslip (set).")
     parser.add_argument("delay",      type=int, nargs="?",                                         help="Read delay (set).")
     parser.add_argument("--ctrl",     type=int, default=0,                                         help="Controller index (CSR stride 0x1000).")
     parser.add_argument("--csr-h",    default=CSR_H,                                               help="Build's csr.h (locates the controllers' CSR pages).")
+    parser.add_argument("--bus",      default="pci", choices=["pci", "remote"],                     help="pci: BAR0 (the card in a host); remote: a litex_server on localhost:1234 (Etherbone/JTAGBone, the standalone card).")
     parser.add_argument("--bitslips", type=int, nargs="*", default=None,                           help="Bitslips to scan (train: modules to train).")
     parser.add_argument("--step",     type=int, default=8,                                         help="Delay step of the scan.")
     parser.add_argument("--show",     action="store_true",                                         help="Print want/got at delay 0 per bitslip.")
     parser.add_argument("--errors",   action="store_true",                                         help="Print the error-bit count (3 seeds, capped at 9; '.' = none) instead of 1/0.")
     a = parser.parse_args(argv)
     try:
-        bar, ctrl = open_controller(a.ctrl, a.csr_h)
+        bar, ctrl = open_controller(a.ctrl, a.csr_h, a.bus)
     except OSError as e:
         sys.exit(str(e))
     if a.cmd == "phases":

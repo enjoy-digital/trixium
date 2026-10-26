@@ -87,6 +87,7 @@ MODELS = {
 # Boards: the LiteX platform name of each board's bitstream (build/<name>/gateware/<platform>.bit).
 PLATFORMS = {
     "xcu1525" : "sqrl_xcu1525",
+    "xcu1525-standalone" : "sqrl_xcu1525",   # trixium_xcu1525.py --standalone: no host (software/host/xcu1525.py)
     "fk33"    : "sqrl_fk33",
     "ypcb"    : "ypcb_00338_1p1",
     "ti375"   : "efinix_ti375_c529_dev_kit",
@@ -547,6 +548,73 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
     print("\n".join(l for l in out_txt.splitlines() if l.startswith("BENCH")))
     return 0
 
+# XCU1525 standalone ---------------------------------------------------------------------------------
+
+def deploy_xcu1525_standalone(build, model, reconfigure=True, dry_run=False, bench=None, firmware=None,
+                              persist=False):
+    """The standalone card (trixium_xcu1525.py --standalone, doc/plan-xcu1525-standalone.md) from the
+    workstation its JTAG, console and network reach (software/host/xcu1525.py; ~/.config/trixium/
+    boards.ini [xcu1525]: tty, ip, iface): firmware, the bitstream archived and loaded volatile
+    over JTAG, the firmware booted from the console's serial boot, the weights over UDP into the
+    DRAM (or, with `persist`, into an SSD slot the firmware then boots), tokens before numbers,
+    bench. The card trains its own DDR4 (liblitedram's write training): the boot waits for it.
+    Not yet run on hardware: --dry-run lists the steps."""
+    from software.host import xcu1525
+    from software.host.console import run as console_run
+    tty, ip, iface = xcu1525.config()
+    tok, prompt, want, bench_n, timeout = MODELS[model]
+    bench_n = bench_n if bench is None else bench
+    local   = Local(dry_run)
+    out     = os.path.join(REPO, "build", build)
+    name    = os.path.basename(out)
+    bit     = os.path.join(out, "gateware", f"{PLATFORMS['xcu1525-standalone']}.bit")
+    report  = os.path.join(out, "gateware", f"{PLATFORMS['xcu1525-standalone']}_timing.rpt")
+    stem    = f"bonsai2-{model}" if model in ("2b", "4b") else f"bonsai-{model}"
+    image   = os.path.join(REPO, "models", "bons", f"{stem}-n16.img" if model == "1p7b" else f"{stem}-n16-xcu1525.img")
+    tokenizer = os.path.join(REPO, "models", tok, "tokenizer.bin")
+    print(f"deploy {os.path.relpath(out, REPO)} -> xcu1525 standalone (tty {tty}, {ip}{' via ' + iface if iface else ''}), "
+          f"model {model} ({os.path.relpath(image, REPO)}{', to the SSD' if persist else ''})")
+    if dry_run:
+        for step in ["timing gate", "firmware", "archive + JTAG load (volatile)", "boot: BIOS + the card's DDR4 training, "
+                     "serial boot of the firmware, TRIXIUM-READY", "litex_server", "model --persist (SSD slot 0) + stboot" if persist
+                     else "udpload + hdrload", f"gen {prompt} (want {want})", f"bench {bench_n}"]:
+            print(f"# {step}")
+        return 0
+    if reconfigure:
+        say("timing gate")
+        timing = [sys.executable, "-m", "software.lab.timing"]
+        print("release gate:")
+        local.local(timing + ["--strict", "--serializer-baseline", "v8", report], check=False)
+        if local.local(timing + ["--experiment", "--serializer-baseline", "v8", "--approval", "ddr4-overclock", report], check=False):
+            raise DeployError(f"refusing {os.path.relpath(out, REPO)}")
+    say("firmware")
+    firmware = firmware or build_firmware(local, out)
+    if reconfigure:
+        say("bitstream (JTAG, volatile) + serial boot")
+        archive = os.path.join(REPO, "build", "archive")
+        os.makedirs(archive, exist_ok=True)
+        shutil.copy(bit, os.path.join(archive, f"{name}.bit"))
+        # The bitstream over JTAG; the BIOS trains controller 0 (its retries up to three times), then
+        # its serial boot: the firmware through litex_term (ti375.boot's pty dance), which then
+        # trains controllers 1-3 and probes the SSD. Up to 15 minutes before TRIXIUM-READY.
+        from software.host import ti375
+        xcu1525.load(bit)
+        ti375.boot(firmware, tty, timeout=900)
+    say("weights" + (" -> SSD slot 0" if persist else " over UDP"))
+    csr_csv = os.path.join(out, "csr.csv")
+    xcu1525.model(image, csr_csv, tokenizer if os.path.exists(tokenizer) else None,
+                  persist_slot=0 if persist else None, default=persist, verbose=True)
+    say(f"tokens first - want: {want} ...")
+    out_txt = console_run([f"gen 8 {prompt}"], tty, wait=timeout, until="GEN DONE", baud=xcu1525.BAUD)
+    got = next((l[4:].strip() for l in out_txt.splitlines() if l.startswith("GEN:")), "")
+    print(f"got:  {got}")
+    if got != want:
+        raise DeployError("TOKENS differ - refusing to benchmark")
+    say(f"measure (bench {bench_n})")
+    out_txt = console_run([f"bench {bench_n}"], tty, wait=3600, until="BENCH_PHASE", baud=xcu1525.BAUD)
+    print("\n".join(l for l in out_txt.splitlines() if l.startswith("BENCH")))
+    return 0
+
 # Run ----------------------------------------------------------------------------------------------
 
 def add_arguments(parser):
@@ -561,6 +629,7 @@ def add_arguments(parser):
     parser.add_argument("--check",               action="store_true",                            help="--board ti375: imgcheck after the upload (the deep check; builds with the upload CRC skip it).")
     parser.add_argument("--dry-run",             action="store_true",                            help="Print every command, run nothing.")
     parser.add_argument("--firmware",            default=None,                                   help="Ti375: ship this firmware binary (built for the build's CSR map) instead of building one.")
+    parser.add_argument("--persist",             action="store_true",                            help="--board xcu1525-standalone: the model into SSD slot 0 (the power-up boot) instead of the DRAM.")
 
 
 def run(args):
@@ -568,6 +637,9 @@ def run(args):
         if args.board == "ti375":
             return deploy_ti375(args.build or args.board, args.model, not args.no_reconfigure,
                                 args.dry_run, args.bench, args.firmware, args.check)
+        if args.board == "xcu1525-standalone":
+            return deploy_xcu1525_standalone(args.build or "xcu1525_standalone", args.model, not args.no_reconfigure,
+                                             args.dry_run, args.bench, args.firmware, args.persist)
         return deploy(args.build or args.board, args.board, args.model,
             reconfigure         = not args.no_reconfigure,
             boot                = args.boot,
