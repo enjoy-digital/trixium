@@ -25,6 +25,7 @@ STROKE, TEXT, ARROW, THICK = "#7f7f7f", "#1a1a1a", "#595959", "#8c8c8c"
 MEM, HARD, GROUP, FPGA, BOARD = "#c9c9c9", "#dcdcdc", "#f3f3f3", "#e4e4e4", "#f8f8f8"
 KEY = "#cdcdcd"   # The blocks that make the kit standalone: eMMC path and web server.
 out = []
+boxes = []        # Every box drawn: (title, x1, y1, x2, y2), for --boxes (the video's highlights).
 
 def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -34,6 +35,8 @@ def box(x1, y1, x2, y2, fill="#ffffff", c=14, lines=(), shadow=True, dash=False)
     extra = ' stroke-dasharray="7,4"' if dash else ""
     filt = ' filter="url(#shadow)"' if shadow else ""
     out.append(f'  <polygon points="{pts}" fill="{fill}" stroke="{STROKE}" stroke-width="1.5"{extra}{filt}/>')
+    title = (lines[0][0] if isinstance(lines[0], tuple) else lines[0]) if lines else ""
+    boxes.append((title, x1, y1, x2, y2))
     if lines:
         text_lines((x1 + x2)/2, (y1 + y2)/2, lines)
 
@@ -92,6 +95,7 @@ def line(x1, y1, x2, y2, col=STROKE, w=1):
 
 def begin(W, H, name, desc):
     out.clear()
+    boxes.clear()
     out.append(f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-labelledby="{name}-title {name}-description">')
     out.append(f'  <title id="{name}-title">TriXium on the Efinix Ti375 C529: a standalone local LLM</title>')
     out.append(f'  <desc id="{name}-description">{esc(desc)}</desc>')
@@ -299,9 +303,14 @@ def main():
     parser.add_argument("--variant", default="all", choices=["full", "simple", "all"])
     parser.add_argument("--logos",   default=here, help="Directory with enjoy-digital-logo.png and litex-logo.png.")
     parser.add_argument("--out",     default=here, help="Output directory.")
+    parser.add_argument("--boxes",   default=None, help="Also write the full variant's box geometry as JSON (the video's highlights).")
     args = parser.parse_args()
     if args.variant in ("full", "all"):
         draw_full(args.logos);   finish(os.path.join(args.out, "board-ti375.svg"))
+        if args.boxes:
+            import json
+            json.dump([dict(title=t, x1=x1, y1=y1, x2=x2, y2=y2) for t, x1, y1, x2, y2 in boxes],
+                      open(args.boxes, "w"), indent=1)
     if args.variant in ("simple", "all"):
         draw_simple(args.logos); finish(os.path.join(args.out, "board-ti375-simple.svg"))
 

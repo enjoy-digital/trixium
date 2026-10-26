@@ -5,3 +5,8 @@ music.wav
 node_modules/
 package.json
 package-lock.json
+boot/frames/
+boot/stills/
+boot/assets/
+boot/*.wav
+!boot/boot.mp4

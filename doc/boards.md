@@ -334,6 +334,68 @@ pblock (the core kept out of a region next to the DDR I/O, the PHYs staying by t
 registered `cmd_ready` in LiteDRAM's crossbar, DDR4-1400 (175 MHz, +0.38 ns of period, ~5 % of
 the 27B's rate).
 
+### Standalone: Ethernet and a SATA SSD on the QSFP cages, no host
+
+`trixium_xcu1525.py --standalone` (build/xcu1525_standalone/) is the Ti375's story on the card:
+no PCIe, no PC. Prepared and simulated, **not yet run on hardware** (the plan and its bench
+checklist: [plan-xcu1525-standalone.md](plan-xcu1525-standalone.md)).
+
+| cage | adapter + module | GTY lane | what runs on it |
+|------|------------------|----------|-----------------|
+| QSFP0 | QSFP-to-SFP+ adapter, SFP-to-SATA module, a SATA SSD | quad 231 lane 0 (tx N9/N8, rx N4/N3) | LiteSATA gen2, 16-bit: the models, in CRC-checked slots |
+| QSFP1 | QSFP-to-SFP+ adapter, a 1G copper SFP | quad 230 lane 0 (tx U9/U8, rx U4/U3) | LiteEth 1000BASE-X (the PCS does SGMII): Etherbone, the UDP weight port, the CPU's MAC for the firmware's DHCP, mDNS and chat page |
+
+- **Clocks**: the GT reference clocks come from a PLL on the 300 MHz input (200 MHz for the
+  1000BASE-X CPLL, 150 MHz for the SATA PHY, the only rate its GTY CRG takes); the sys and DDR
+  MMCMs are the host build's, untouched. The cages' modules leave reset 10 ms after the SoC,
+  never in low-power mode; the platform's `qsfp1_refclk_rst` and `qsfp1_fs` share a pin and are
+  not requested.
+- **Console**: the card's serial pins (BF18/BB20, its FT4232H), `uart_name="serial"`: with the
+  crossover UART and no host the BIOS blocks on its first banner. No JTAGBone (it reads zeros on
+  this board); Etherbone over the QSFP Ethernet carries `smi` and the fallback trainer.
+- **Flash**: the firmware in the configuration flash (MT25QU01G, 128 MB) through STARTUPE3
+  (LiteSPI, quad reads at sys/8) as LiteX's flashboot image at 0x0500_0000, above the compressed
+  bitstream; the BIOS tries its serial boot first. `software/host/xcu1525.py flash` writes both
+  through openFPGALoader, after reading the whole flash back (the card's factory image is
+  overwritten); it needs a `spiOverJtag` helper for the card's package (xcvu9p-fsgd2104, built
+  with openFPGALoader's `spiOverJtag/build.py`), or Vivado's `program_hw_cfgmem`.
+- **DDR4 trained by the card**: `SDRAM_WRITE_TRAINING` makes liblitedram run the round-trip
+  write training (the port of `software/host/rdlevel.py train`: write bitslip/DQS/DQ map, write
+  centring, read centring, the fallbacks, 3 attempts per lane) in place of the write latency
+  calibration, the DQ-DQS training and the final read leveling, after the write leveling and the
+  MPR read leveling; `SDRAM_LEVELING_RETRIES 3` levels again until a 64 MB memtest passes
+  (`SDRAM_MEMTEST_SIZE`). The BIOS does controller 0, `firmware/ddr.c` controllers 1-3 then the
+  deep test, retraining a failing controller up to three rounds; a controller-0 failure bumps the
+  reset-less `bootcnt` CSR and resets the SoC (the BIOS levels it again), three times at most.
+  `ddrtrain k` / `ddrcheck k` on the console; `rdlevel.py --bus remote` trains from the
+  workstation over a litex_server when the card's own training fails. The C port is checked
+  against the Python on a model of the DFI injector (`test/ddr/test_wtrain.py`: identical
+  choices on synthetic eyes). On the stock USPDDRPHY the DQS reset CSR has no consumer, so the
+  "DQS" values are relative to where write leveling left the strobe, in both.
+- **The SSD** (`firmware/storage.c`, `sataload.c`; `gateware/memory/sata_upload.py`): slots of
+  `TRIXIUM_STORAGE_SLOT_SECTORS` (16 GB here, the Ti375's eMMC keeps 1 GB) with version-3 tables
+  (4 sectors, 6-word entries with 48-bit sectors and CRCs, up to 83 entries: the 27B's 16
+  channels need two entries each, a loader transfer being 512 MB at most). `SATAUpload` streams
+  sectors into the weight loader (READ DMA EXT by chunks of 256 sectors, a CRC-32 of the stream
+  against the table's); the firmware boots the default slot at power-up (`stboot`, `stls`,
+  `stdefault`; the `sd*` names still work on the Ti375). The SSD is written from the host:
+  `xcu1525.py model <img> --tokenizer <btok> --persist --slot k [--default]` streams every entry
+  over the UDP upload port into `SATAStore` at its sectors (the stream's CRC checked, resent on
+  a mismatch), then the table and the boot sector. The table and boot sectors can also be written
+  by the firmware through LiteSATA's mem2sector DMA (`stdefault`).
+- **Simulation**: `./trixium_sim.py --board ti375 --hybrid --profile lite --with-sata --weight-base 0x2000000 --build
+  --gate` puts the image on a SATA port model (`LiteSATAPortModel`, the slot built by
+  `software/host/sdimage.py --version 3`), leaves the channel windows empty, and the firmware
+  boots the model from the "SSD" before the gate; `test/gateware/memory/test_sata_upload.py`
+  exercises both stream modules against the model.
+- **Expected boot** (the 27B): the FPGA from the flash ~2 s, the BIOS with controller 0's
+  training ~6-9 s, the firmware's controllers 1-3 and deep test ~15-25 s, the 8.5 GB image from
+  the SSD at gen2 ~35 s, the page about 70-90 s after the switch; `software/lab/ti375_boot.py
+  --board xcu1525` measures it. Deploy: `trixium deploy --board xcu1525-standalone --model 27b
+  [--persist]` (`--dry-run` lists the steps).
+- **Area**: the host build is 522k LUTs with LitePCIe; the standalone build drops it and adds
+  LiteEth, LiteSATA, LiteSPI and the two stream modules, in SLR2 next to the GTY quads.
+
 ## FK33
 
 ![FK33: LitePCIe Gen3 x4, 16 direct HBM2 engine ports and a separate CPU memory port](images/board-fk33.svg)
