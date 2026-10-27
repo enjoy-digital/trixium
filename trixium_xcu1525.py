@@ -442,7 +442,26 @@ class TriXiumXCU1525SoC(SoCCore):
             refclk_from_fabric = True)
         web_mac = 0x10e2d5000002
         self.add_etherbone(phy=self.ethphy, ip_address=eth_ip, data_width=32,
-            with_ethmac=True, ethmac_address=web_mac, ethmac_local_ip=web_ip)
+            with_ethmac=True, ethmac_address=web_mac, ethmac_local_ip=web_ip,
+            with_timing_constraints=False)
+        # The PHY's clocks are constrained at the GTY's outputs: eth_tx/eth_rx (125 MHz) and the
+        # transceiver's user clocks eth_tx_half/eth_rx_half (62.5 MHz) are BUFG_GT divisions of
+        # txoutclk and rxoutclk, so Vivado derives each family from its one definition. LiteX's
+        # own constraints (a create_clock on the eth_rx and eth_tx nets alone) gave the first
+        # build an exact 8.000 ns there beside the 15.998 ns the half clocks inherit from the
+        # PLL chain (300.03 MHz x 2/3): the gearbox between them was timed against a 2 ps
+        # requirement (-1.75 ns on its 10 endpoints, every other path closed).
+        phy = self.ethphy
+        platform.add_period_constraint(phy.txoutclk, 1e9/phy.tx_clk_freq, name="eth_tx_clk")
+        platform.add_period_constraint(phy.rxoutclk, 1e9/phy.rx_clk_freq, name="eth_rx_clk")
+        # sys, the transmit family and the recovered-clock family are asynchronous to each other;
+        # a family's full and half clocks are related (the gearbox) and stay timed.
+        sys_clk = self.crg.cd_sys.clk
+        tx, rx, tx_half, rx_half = (phy.cd_eth_tx.clk, phy.cd_eth_rx.clk,
+                                    phy.cd_eth_tx_half.clk, phy.cd_eth_rx_half.clk)
+        for a, b in [(sys_clk, tx), (sys_clk, rx), (sys_clk, tx_half), (sys_clk, rx_half),
+                     (tx, rx), (tx, rx_half), (tx_half, rx), (tx_half, rx_half)]:
+            platform.add_false_path_constraint(a, b)
         ip = [int(b) for b in web_ip.split(".")]
         self.add_constant("TRIXIUM_WEB_IP",     ip[0] << 24 | ip[1] << 16 | ip[2] << 8 | ip[3])
         self.add_constant("TRIXIUM_WEB_MAC_HI", web_mac >> 32)
