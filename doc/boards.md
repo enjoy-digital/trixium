@@ -357,8 +357,11 @@ checklist: [plan-xcu1525-standalone.md](plan-xcu1525-standalone.md)).
   (LiteSPI, quad reads at sys/8) as LiteX's flashboot image at 0x0500_0000, above the compressed
   bitstream; the BIOS tries its serial boot first. `software/host/xcu1525.py flash` writes both
   through openFPGALoader, after reading the whole flash back (the card's factory image is
-  overwritten); it needs a `spiOverJtag` helper for the card's package (xcvu9p-fsgd2104, built
-  with openFPGALoader's `spiOverJtag/build.py`), or Vivado's `program_hw_cfgmem`.
+  overwritten) through a `spiOverJtag` helper for the card's package (xcvu9p-fsgd2104): built
+  with openFPGALoader's `spiOverJtag/build.py` (the part added; the UltraScale branch of
+  `xilinx_spiOverJtag.v` needed its primary-flash nets declared and one driver of the SPI
+  clock), kept in `build/tools/` and passed with `--bridge`; Vivado's `program_hw_cfgmem` is the
+  fallback.
 - **DDR4 trained by the card**: `SDRAM_WRITE_TRAINING` makes liblitedram run the round-trip
   write training (the port of `software/host/rdlevel.py train`: write bitslip/DQS/DQ map, write
   centring, read centring, the fallbacks, 3 attempts per lane) in place of the write latency
@@ -393,8 +396,23 @@ checklist: [plan-xcu1525-standalone.md](plan-xcu1525-standalone.md)).
   the SSD at gen2 ~35 s, the page about 70-90 s after the switch; `software/lab/ti375_boot.py
   --board xcu1525` measures it. Deploy: `trixium deploy --board xcu1525-standalone --model 27b
   [--persist]` (`--dry-run` lists the steps).
-- **Area**: the host build is 522k LUTs with LitePCIe; the standalone build drops it and adds
-  LiteEth, LiteSATA, LiteSPI and the two stream modules, in SLR2 next to the GTY quads.
+- **First build** (2026-10-26, 5 h 15 min: synthesis 51 min, placement 75, routing 136; 21 GB):
+  528.5k LUTs (44.7 %; the host build with LitePCIe: 521.9k), 436k FFs, 1,038 BRAM tiles, 17
+  URAM, 1,347 DSPs; SLR1 holds 250k LUTs (63 %, its CLBs 96 % occupied), SLR0 117k, SLR2 161k
+  (the two GTY lanes, X1Y44 and X1Y48, are in SLR2). sys +0.060 ns, ddr +0.020, the SATA and Ethernet
+  clocks +1.6, hold +0.010; the pulse-width family is DDR4-1500's usual OSERDES minimum period
+  (940 endpoints at -0.269 ns, inside the per-build approval). The one failure was a constraint:
+  LiteX's `create_clock` on the PHY's eth_rx/eth_tx nets (an exact 8.000 ns) beside the half
+  clocks Vivado derives from the PLL chain (15.998 ns) timed the GTY PHY's gearbox against a
+  2 ps requirement, -1.746 ns on its 10 endpoints. The target now constrains txoutclk/rxoutclk
+  and lets the four BUFG_GT clocks derive from them (`add_etherbone(with_timing_constraints=False)`)
+  (the regenerated XDC differs in those lines only). The routed checkpoint re-timed under them
+  closes setup (+6.4 ns on the gearbox) but shows the router's hold fixing done under the old
+  relation (-0.080 ns on the same 10 endpoints); a post-route `phys_opt_design -hold_fix` on the
+  checkpoint (`gateware/ethclk_fix.tcl`) put them at +0.073 ns, and the bitstream, checkpoint
+  and timing report in build/ are that result: WNS +0.020 ns, WHS +0.010, the per-build
+  approval gate passes. The compressed bitstream is 62.7 MB (0x03BC_7EE3), 20 MB below the
+  firmware's 0x0500_0000.
 
 ## FK33
 
