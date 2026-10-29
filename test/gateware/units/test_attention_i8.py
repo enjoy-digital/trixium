@@ -236,15 +236,18 @@ def _desc_softmax(src, n, rows, stride):
 def _desc_stop():
     return [0]*16
 
-@pytest.mark.parametrize("T,hd", [(2, 64), (3, 64), (9, 64), (2, 256), (3, 256)])
-def test_scores_softmax_values_list(T, hd):
+@pytest.mark.parametrize("T,hd,kit", [(2, 64, 0), (3, 64, 0), (9, 64, 0), (2, 256, 0), (3, 256, 0),
+                                      (2, 256, 1)])
+def test_scores_softmax_values_list(T, hd, kit):
+    """kit: the Ti375 firmware's addresses (256 KB scratchpad, the list at SP_DESC 0x3D000, the
+    scores at RS_F 0x1C800)."""
     from gateware.core.core import TriXiumConfig
     from common.cluster import SoC, install_list, pack
     from common.cluster import run as run_cluster
     import test_softmax as tsm
     n, nq, n_rep, nkv = 2, 8, 4, 2
     hb, rb = hd//32, nkv*hd//32 + 1
-    config = TriXiumConfig(with_vecunit=False, with_softmax=True, scratchpad_size=64*1024,
+    config = TriXiumConfig(with_vecunit=False, with_softmax=True, scratchpad_size=(256 if kit else 64)*1024,
         with_attnstream=True, attnstream_options=(("lanes", 8), ("groups", 2), ("hb_max", hd//8),
                                                   ("t_max", 64), ("int8", True)))
     dut = SoC(config, n=n, backend="verilator")
@@ -259,6 +262,9 @@ def test_scores_softmax_values_list(T, hd):
     o = values_reference(p, V8, ev)
     Tp = (T + 7)//8*8
     QSRC, SP, ODST, REC, KB, VB = 0x1000, 0x4000, 0x5000, 0x3800, 0x4000, 0x8000
+    LIST = 0
+    if kit:
+        QSRC, SP, ODST, REC, LIST = 0xC800, 0x1C800, 0x12C00, 0x12800, 0x3D000
     qop = 32*(hb + 1)
     words = {}
     def put(addr, u32):
@@ -287,7 +293,7 @@ def test_scores_softmax_values_list(T, hd):
             for b in range(rb):
                 yield dut.models[c].mem[KB//32 + slot*rb + b].eq(pack(list(krows[t][8*b:8*b + 8])))
                 yield dut.models[c].mem[VB//32 + slot*rb + b].eq(pack(list(vrows[t][8*b:8*b + 8])))
-        yield from install_list(dut, lst)
+        yield from install_list(dut, lst, base=LIST)
         for _ in range(200000):
             if not (yield dut.seq.busy):
                 break

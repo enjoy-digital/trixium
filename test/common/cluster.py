@@ -138,13 +138,14 @@ def submit(dut, **fields):
     raise AssertionError('shared-cluster CSR command timed out')
 
 
-def install_list(dut, descriptors):
-    """Write a descriptor list at scratchpad 0 and start the sequencer on it."""
+def install_list(dut, descriptors, base=0):
+    """Write a descriptor list at scratchpad byte address `base` (default 0) and start the
+    sequencer on it."""
     for index, words in enumerate(descriptors):
         assert len(words) == 16
-        yield dut.scratchpad.mem[index*2].eq(pack(words[:8]))
-        yield dut.scratchpad.mem[index*2 + 1].eq(pack(words[8:]))
-    yield from write(dut.seq.base, 0)
+        yield dut.scratchpad.mem[base//32 + index*2].eq(pack(words[:8]))
+        yield dut.scratchpad.mem[base//32 + index*2 + 1].eq(pack(words[8:]))
+    yield from write(dut.seq.base, base)
     yield from write(dut.seq.count, len(descriptors))
     yield from write(dut.seq.start, 1)
 
