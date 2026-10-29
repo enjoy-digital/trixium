@@ -452,8 +452,10 @@ class TriXiumXCU1525SoC(SoCCore):
         # PLL chain (300.03 MHz x 2/3): the gearbox between them was timed against a 2 ps
         # requirement (-1.75 ns on its 10 endpoints, every other path closed).
         phy = self.ethphy
-        platform.add_period_constraint(phy.txoutclk, 1e9/phy.tx_clk_freq, name="eth_tx_clk")
-        platform.add_period_constraint(phy.rxoutclk, 1e9/phy.rx_clk_freq, name="eth_rx_clk")
+        # No keep: a dont_touch on the transceiver's output nets stops Vivado from inserting the
+        # BUFG_GT_SYNCs the BUFG_GTs need (their resets then cannot be routed).
+        platform.add_period_constraint(phy.txoutclk, 1e9/phy.tx_clk_freq, keep=False, name="eth_tx_clk")
+        platform.add_period_constraint(phy.rxoutclk, 1e9/phy.rx_clk_freq, keep=False, name="eth_rx_clk")
         # sys, the transmit family and the recovered-clock family are asynchronous to each other;
         # a family's full and half clocks are related (the gearbox) and stay timed.
         sys_clk = self.crg.cd_sys.clk
