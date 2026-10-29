@@ -139,9 +139,11 @@ class SoftmaxExp(LiteXModule):
             self.comb += If(mag[bit], lz.eq(7 - bit))
         fnman = Signal(8)
         self.comb += fnman.eq(Array([(mag << k)[:8] for k in range(8)] + [C(0, 8)])[lz])  # the leading one at bit 7
+        # The exponent sliced to 8 bits: the difference is 9 bits wide (Migen's width rules), which
+        # pushes nneg out of fn (the Verilog of LiteX <= 2026-10-24 sized it to 8 bits and hid it).
         fn = Signal(32)
         self.comb += If(mag == 0, fn.eq(0)).Else(
-            fn.eq(Cat(C(0, 16), fnman[:7], (127 + 7) - lz, nneg)))
+            fn.eq(Cat(C(0, 16), fnman[:7], ((127 + 7) - lz)[:8], nneg)))
         nval = Signal((9, True))
         self.comb += nval.eq(Mux(nneg, -mag, mag))
         s3_fn, s3_scale, s3_d = Signal(32), Signal(32), Signal(32)

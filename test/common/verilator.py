@@ -6,7 +6,7 @@
 
 """Compiled (Verilator) simulation of Migen/LiteX modules, with a Migen fallback.
 
-A Simulator converts a module to Verilog (Migen's converter, the one the SoC build uses) and
+A Simulator converts a module to Verilog (LiteX's converter, the one the SoC build uses) and
 builds it with Verilator into build/verilator/<top>-<hash>/: the hash covers the Verilog, the
 generated bindings, every C++ source and the flags, so an unchanged DUT is never rebuilt, and
 a file lock makes concurrent builds (pytest-xdist, run_guarded -j) wait for one another.
@@ -50,7 +50,7 @@ import subprocess
 from pathlib import Path
 
 from migen import *
-from migen.fhdl import verilog
+from migen.fhdl.tools import list_clock_domains
 from migen.fhdl.structure import _Assign, _Slice
 from migen.fhdl.specials import _MemoryLocation
 from migen.sim import passive
@@ -269,7 +269,17 @@ class Simulator:
 
     def _build(self, dut):
         unnamed = self.ios.pop(None, [])
-        conv  = verilog.convert(dut, ios=set(self.ios.values()) | set(unnamed), name=self.top)
+        # LiteX's converter (the SoC's: its expression widths are the simulator's, Migen's are
+        # Verilog's), with the clock domains the DUT uses but does not declare made ports.
+        from litex.gen.fhdl import verilog
+        f = dut.get_fragment()
+        cd_ios = set()
+        for cd_name in sorted(list_clock_domains(f)):
+            if cd_name not in f.clock_domains:
+                cd = ClockDomain(cd_name)
+                f.clock_domains.append(cd)
+                cd_ios |= {cd.clk, cd.rst}
+        conv  = verilog.convert(f, ios=set(self.ios.values()) | set(unnamed) | cd_ios, name=self.top)
         ns    = conv.ns
         vsrc  = conv.main_source
         self.ios.update({ns.get_name(s): s for s in unnamed})

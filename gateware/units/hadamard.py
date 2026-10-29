@@ -468,10 +468,11 @@ class HadamardScratchpad(LiteXModule):
                 # Sign beats arrive in order: shift each in from the top, so after nsb beats
                 # beat 0 sits at the bottom; each accepted data word then consumes L bits.
                 # A half block's nsb/2 beats shift in at the middle instead.
+                # (No half path without half_ok: its slice would be empty, from 256 down to 128.)
                 If(sign_pend,
                     If(half,
                         sign_shift.eq(Cat(sign_shift[256:block_size//2], self.sp_rd_dat,
-                                          sign_shift[block_size//2:])),
+                                          sign_shift[block_size//2:])) if half_ok else [],
                     ).Else(
                         sign_shift.eq(Cat(sign_shift[256:], self.sp_rd_dat) if nsb > 1 else
                                       self.sp_rd_dat)),
