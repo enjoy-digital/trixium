@@ -1118,6 +1118,7 @@ def main():
     parser.add_argument("--image",          default=None,                                          help="BONS image to bake in (default: the board's, DEFAULT_IMAGES).")
     parser.add_argument("--out-dir",        default=None,                                          help="Build directory (default: build/sim_<board>, build/sim_<board>_bt_<image> with --board-timing).")
     parser.add_argument("--board-timing",   action="store_true",                                   help="--board xcu1525: the board's clocks, DDR4 timings/map, CPU and stream geometry (shape-true slices, doc/simulation.md).")
+    parser.add_argument("--with-softmax",   action="store_true",                                   help="--hybrid --profile lite: with the softmax unit anyway (trixium_ti375.py --with-softmax, the kit's build).")
     parser.add_argument("--attn-int8",      action="store_true",                                   help="The attention stream on int8 K/V rows (trixium_ti375.py --attn-int8).")
     parser.add_argument("--attn-geometry",  default=None,                                          help="Attention stream lanes,groups,head_dim,t_max (default: the board's; e.g. 4,1,128,256: one command per kv-head slice).")
     parser.add_argument("--build",          action="store_true",                                   help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
@@ -1188,6 +1189,8 @@ def main():
             parser.error("--hybrid is the YPCB's and the Ti375's (the XCU1525 has every unit already).")
         board.update(LITE_UNITS if args.profile == "lite" else HYBRID_UNITS,
                      vexii_extra=board["vexii_extra"] + " --with-rvf")
+        if args.with_softmax:
+            board.update(with_softmax=True)
     if args.memctrl:
         assert args.board == "ypcb", "--memctrl: --board ypcb"
         board["n_memctrl"] = args.memctrl
