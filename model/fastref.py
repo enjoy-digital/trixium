@@ -241,8 +241,9 @@ class HybridRef:
         return self.proj(layout.ROLE_ATTN_OUT, l, o.reshape(T, -1).astype(f32))
 
     # Sequences -------------------------------------------------------------------------------------
-    def hidden(self, tokens):
-        """Final normed hidden states [T, n_embd] of a sequence (teacher forced from position 0)."""
+    def hidden(self, tokens, taps=None):
+        """Final normed hidden states [T, n_embd] of a sequence (teacher forced from position 0).
+        taps: a dict {layer: None} filled with the residual stream after those layers (unnormed)."""
         X = self.embed(tokens)
         for l in range(self.n_layer):
             Hn = self.rmsnorm(X, self.norm_attn[l])
@@ -252,6 +253,8 @@ class HybridRef:
             g = self.matmul(self._entry(layout.ROLE_FFN_GATE, l), R)
             u = self.matmul(self._entry(layout.ROLE_FFN_UP, l), R)
             X = X + self.proj(layout.ROLE_FFN_DOWN, l, (self.silu(g)*u).astype(f32))
+            if taps is not None and l in taps:
+                taps[l] = X.copy()
         return self.rmsnorm(X, self.out_norm)
 
     def logits(self, Hs):

@@ -592,7 +592,7 @@ def _sumsq64(v):
 
 
 def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=None, fast_cfg=None,
-                      trace=None, silu_mode=None):
+                      trace=None, silu_mode=None, attn_int8=False):
     """exact=True: fp32 weights and no activation quantization (the golden's arithmetic),
     which tests the mirror's structure against the golden independently of the int8 noise.
     fast=True: the DeltaNet recurrence in the fast path's arithmetic (doc/units.md (DeltaNet recurrence arithmetic)) -
@@ -603,7 +603,10 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
     as in the CPU path. fast_stats (a dict) collects the state exponents seen. fast_cfg
     picks the precisions: qk_bits (8 = one int8 plane, 16 = two), wq_extra (extra fraction
     bits on the rank-1 weight, applied as a shift after the product), state_bits (the
-    ratchet's limit), decay_q (the decay's fixed point, None = fp32)."""
+    ratchet's limit), decay_q (the decay's fixed point, None = fp32).
+    attn_int8=True: the attention in gateware/units/attention_i8.py's integer arithmetic (int8
+    q/K/V rows with power-of-two exponents, exact integer sums; the softmax unchanged), what a
+    bitstream with TRIXIUM_ATTN_INT8 computes."""
     silu_mode = silu_mode or ("mathematical" if exact else "rv32f")
     if silu_mode not in ("mathematical", "rv32f"):
         raise ValueError("unknown SiLU numerical profile: " + silu_mode)
@@ -963,17 +966,30 @@ def hybrid27_generate(img, prompt, n_new, exact=False, fast=False, fast_stats=No
         kc[l].append(k); vc[l].append(v)
         T = len(kc[l])
         out = np.zeros((n_head, hd), dtype=f32)
+        if attn_int8:
+            from gateware.units.attention_i8 import quantize_rows, scores_reference, values_reference
+            K8, ek = quantize_rows(np.stack(kc[l]))          # [T, nkv, hd], [T, nkv]
+            V8, ev = quantize_rows(np.stack(vc[l]))
+            q8, eq = quantize_rows(q)
+            sc_all = scores_reference(q8, eq, K8, ek, scale_at)
         for hh in range(n_head):
             kvh = hh//n_rep
-            sc = np.array([f32(_fsum32(q[hh]*kc[l][t][kvh])*scale_at) for t in range(T)], dtype=f32)
+            if attn_int8:
+                sc = sc_all[hh]
+            else:
+                sc = np.array([f32(_fsum32(q[hh]*kc[l][t][kvh])*scale_at) for t in range(T)], dtype=f32)
             mx = sc.max()
             ex = softmax_exp((sc - mx).astype(f32))
             s = _fsum32(ex)
             inv = f32(f32(1)/s)      # one divide per head, then multiplies (as ggml scales by 1/sum)
             o = np.zeros(hd, dtype=f32)
-            for t in range(T):
-                p = f32(ex[t]*inv)
-                o = (o + p*vc[l][t][kvh]).astype(f32)
+            if attn_int8:
+                pr = (ex*inv).astype(f32)
+                o = values_reference(pr[None], V8[:, kvh:kvh + 1], ev[:, kvh:kvh + 1])[0]
+            else:
+                for t in range(T):
+                    p = f32(ex[t]*inv)
+                    o = (o + p*vc[l][t][kvh]).astype(f32)
             if gated:
                 o = (o*sigmoid(gate[hh])).astype(f32)
             out[hh] = o

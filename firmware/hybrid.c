@@ -110,6 +110,13 @@ static int    rope_pos_cached;
 static int      dn_hw;
 #ifdef TRIXIUM_HAS_ATTNSTREAM
 static uint32_t at_hbm_base, at_slots, at_rowbeats;
+// int8 attention: the q heads' int8 operands ([hd/32 beats][exponent beat] per head) and this
+// token's K/V rows ([exponents][K int8][V int8], the K row from AT_I8_KV, the V row from
+// AT_I8_KV + 32 + kv_dim).
+#define AT_I8_QQ  (RS_Y_ADDR + 0x8000u)
+#define AT_I8_QQ_BYTES 0x4000u
+#define AT_I8_KV  (RS_Y_ADDR + 0xD800u)
+#define AT_I8_KV_BYTES 0x800u
 static int at_geom_ok;
 
 // The end (local address, a page below) of a channel's weight window, the smallest of a
@@ -586,7 +593,11 @@ static void rl_prepare_for(const float *src, uint32_t width, int rotate, const s
 // the bit goes into an aligned pointer of the list's name.
 static inline uint32_t pf_key(void) { return (uint32_t)(engine_pf_use && hybrid_pf_use); }
 
-static uint32_t f32_bits(float x);
+static uint32_t f32_bits(float x)
+{
+    union { float f; uint32_t u; } v = { .f = x };
+    return v.u;
+}
 
 /* Output Projection + Residual */
 /*------------------------------*/
@@ -846,7 +857,13 @@ int hybrid_init(void)
 #endif
         base = (base + 0xFFFu) & ~0xFFFull;
         uint64_t limit = chan_limit();
+#ifdef TRIXIUM_ATTN_INT8
+        // int8 rows (gateware/units/attention_i8.py): K = the exponent beat then the heads'
+        // int8, V = the heads' int8 and one unused beat.
+        at_rowbeats = (uint32_t)(n_kv_head*head_dim)/32u + 1u;
+#else
         at_rowbeats = (uint32_t)(n_kv_head*head_dim)/8u;
+#endif
         at_slots = ((uint32_t)H->max_ctx + (uint32_t)n_ch - 1u)/(uint32_t)n_ch;
         uint64_t end = base + (uint64_t)n_attn*2u*at_slots*at_rowbeats*32u;
         at_hbm_base = (uint32_t)base;
@@ -864,6 +881,11 @@ int hybrid_init(void)
         at_geom_ok = n_attn && at_sg >= 1 && at_sg*(n_head/n_kv_head) <= TRIXIUM_ATTN_LANES &&
                      at_sg <= TRIXIUM_ATTN_GROUPS && head_dim >= 8 && head_dim <= TRIXIUM_ATTN_HD_MAX && !(head_dim & (head_dim - 1)) &&
                      n_head % n_kv_head == 0 && at_rowbeats <= 255 && end <= limit;
+#ifdef TRIXIUM_ATTN_INT8
+        at_geom_ok = at_geom_ok && n_kv_head <= 4 && head_dim >= 32 && head_dim % 32 == 0 &&
+                     (uint32_t)n_head*((uint32_t)head_dim/32u + 1u)*32u <= AT_I8_QQ_BYTES &&
+                     32u + 2u*(uint32_t)kv_dim*1u + 32u <= AT_I8_KV_BYTES;
+#endif
         if (at_geom_ok && at_sg < n_kv_head)
             printf("hybrid: attention stream in %d kv-head slices of %d (one command each)\n",
                    n_kv_head/at_sg, at_sg);
@@ -1468,11 +1490,6 @@ static void deltanet_layer(int l, const float *h, float *out)
 /*-------------------------*/
 
 #ifdef DNRES_BUILT
-static uint32_t f32_bits(float x)
-{
-    union { float f; uint32_t u; } v = { .f = x };
-    return v.u;
-}
 
 #ifdef P2_BUILT
 
@@ -2079,6 +2096,14 @@ static int attn_stream(int a, int T, uint32_t slot, float scale, int gated, cons
     // the scratchpad there (the q/k/v list with RoPE on unit 12): no FETCH from main RAM.
     uint32_t QB = qsp ? qsp : AT_Q, KB = ksp ? ksp : AT_KST, VB = vsp ? vsp : AT_VST;
     uint32_t hd = (uint32_t)head_dim, nq = (uint32_t)n_head, nkv = (uint32_t)n_kv_head;
+#ifdef TRIXIUM_ATTN_INT8
+    // One quantize of the four blocks K0 K1 V0 V1 needs V right after K (the q/k/v list
+    // leaves them so; the fetched rows are placed so).
+    if (!vsp) VB = AT_KST + (uint32_t)kv_dim*4u;
+    if (VB != KB + (uint32_t)kv_dim*4u)
+        return -1;
+    uint32_t qop = ((uint32_t)head_dim/32u + 1u)*32u;    // one q head's int8 operand
+#endif
     uint32_t Tp = ((uint32_t)T + 7u) & ~7u, rb = at_rowbeats, rowbytes = rb*32u;
     uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes;
     uint32_t vspan = kspan + at_slots*rowbytes;
@@ -2101,12 +2126,22 @@ static int attn_stream(int a, int T, uint32_t slot, float scale, int gated, cons
     rl_begin();
     if (!ksp) {
         rl_fetch(kb, (uint32_t)kv_dim*4u, AT_KST);
-        rl_fetch(vb, (uint32_t)kv_dim*4u, AT_VST);
+        rl_fetch(vb, (uint32_t)kv_dim*4u, VB);
     }
+    uint32_t ksrc = KB, vsrc = VB;
+#ifdef TRIXIUM_ATTN_INT8
+    {
+        struct bns_seq_descriptor d;
+        if (bns_seq_desc_quantize(&d, KB, AT_I8_KV + 32u, AT_I8_KV, hd, 2u*nkv))
+            return -1;
+        rl_desc(&d);
+        ksrc = AT_I8_KV; vsrc = AT_I8_KV + 32u + (uint32_t)kv_dim;
+    }
+#endif
     memset(&o, 0, sizeof o);
     o.kind = ENGINE_KIND_STORE; o.chan = (uint8_t)(p % nch); o.wlen = rb;
-    o.wbase = kspan + p/nch*rowbytes; o.xsrc = KB; rl_engine(&o);
-    o.wbase = vspan + p/nch*rowbytes; o.xsrc = VB; rl_engine(&o);
+    o.wbase = kspan + p/nch*rowbytes; o.xsrc = ksrc; rl_engine(&o);
+    o.wbase = vspan + p/nch*rowbytes; o.xsrc = vsrc; rl_engine(&o);
     volatile uint32_t *rec = (volatile uint32_t *)(SCRATCHPAD_BASE + AT_REC);
     // One scores and one values record per kv-head slice (at_sg heads, ns query heads): the
     // scores records at AT_REC, the values records after them.
@@ -2117,11 +2152,23 @@ static int attn_stream(int a, int T, uint32_t slot, float scale, int gated, cons
             uint32_t w0 = (sl*(uint32_t)at_sg) << 1 | ns << 8 | (nq/nkv) << 16 | nkv << 24;
             rs[0] = w0 | 0;  rs[1] = (uint32_t)T; rs[2] = hd; rs[3] = QB + sl*ns*qstride*4u;
             rs[4] = qstride*4u; rs[5] = AT_SP + sl*ns*Tp*4u; rs[6] = Tp*4u; rs[7] = f32_bits(scale);
+#ifdef TRIXIUM_ATTN_INT8
+            rs[3] = AT_I8_QQ + sl*ns*qop; rs[4] = qop;
+#endif
             rv[0] = w0 | 1;  rv[1] = (uint32_t)T; rv[2] = hd; rv[3] = AT_SP + sl*ns*Tp*4u;
             rv[4] = Tp*4u;   rv[5] = AT_O + sl*ns*hd*4u; rv[6] = hd*4u; rv[7] = 0;
         }
         if (!qsp)
             rl_fetch(q, nq*qstride*4u, AT_Q);
+#ifdef TRIXIUM_ATTN_INT8
+        for (uint32_t hh = 0; hh < nq; hh++) {           // each head: [int8][exponent beat]
+            struct bns_seq_descriptor d;
+            uint32_t dq = AT_I8_QQ + hh*qop;
+            if (bns_seq_desc_quantize(&d, QB + hh*qstride*4u, dq, dq + qop - 32u, hd, 1))
+                return -1;
+            rl_desc(&d);
+        }
+#endif
         memset(&o, 0, sizeof o);
         o.kind = ENGINE_KIND_ATTN; o.rows = (uint16_t)((uint32_t)T/nch); o.rem = (uint8_t)((uint32_t)T % nch);
         o.wbase = kspan; o.wlen = (uint32_t)o.rows*rb; o.cbeats = (uint8_t)rb;
@@ -2220,6 +2267,24 @@ static int attn_stream(int a, int T, uint32_t slot, float scale, int gated, cons
 // kc_rows[a] on. Before the ring wraps slot = T - 1 and rows [kc_rows[a], T - 1) are missing;
 // once wrapped any row may have been rewritten by the stream (kc_rows[a] = 0 then): all T come
 // back. -1 when a row cannot be brought back (the loop must not run on stale rows).
+#ifdef TRIXIUM_ATTN_INT8
+// The CPU path's FP32 copy of an int8 K/V row pair (k: [exponents][heads' int8], v: [heads'
+// int8][unused]): x = q8 * 2^e, exact.
+static uint8_t at_i8_stage[2*8*(4*512/32 + 1)*32] __attribute__((aligned(64)));
+static void attn_i8_dequant(const uint8_t *k, const uint8_t *v, float *K, float *V)
+{
+    const int32_t *ex = (const int32_t *)k;
+    for (int j = 0; j < n_kv_head; j++) {
+        const int8_t *kq = (const int8_t *)(k + 32) + j*head_dim, *vq = (const int8_t *)v + j*head_dim;
+        float ks = ldexpf(1.0f, ex[j]), vs = ldexpf(1.0f, ex[n_kv_head + j]);
+        for (int i = 0; i < head_dim; i++) {
+            K[j*head_dim + i] = (float)kq[i]*ks;
+            V[j*head_dim + i] = (float)vq[i]*vs;
+        }
+    }
+}
+#endif
+
 static int attn_kv_main(int a, int T, uint32_t slot, float *K, float *V)
 {
     uint32_t have = kc_rows ? kc_rows[a] : 0, last = slot == (uint32_t)T - 1u ? slot : (uint32_t)T;
@@ -2228,6 +2293,9 @@ static int attn_kv_main(int a, int T, uint32_t slot, float *K, float *V)
         uint32_t rb = at_rowbeats, rowbytes = rb*32u, nch = (uint32_t)n_ch;
         uint32_t kspan = at_hbm_base + (uint32_t)(2*a)*at_slots*rowbytes, vspan = kspan + at_slots*rowbytes;
         uint32_t bytes = (uint32_t)kv_dim*4u, per = 8;          // 8 rows of K and V per list: 64 KB of RS_F
+#ifdef TRIXIUM_ATTN_INT8
+        bytes = rowbytes;                  // int8 rows, dequantized below (the CPU loop's FP32
+#endif                                     // copy: close to, not bit-exact with, the stream)
         if (!at_geom_ok || bytes != rowbytes || 2u*per*bytes > 0x32000u - RS_F_ADDR)
             return -1;
         for (uint32_t t0 = have; t0 < last; t0 += per) {
@@ -2239,11 +2307,21 @@ static int attn_kv_main(int a, int T, uint32_t slot, float *K, float *V)
                 o.kind = ENGINE_KIND_FETCH; o.chan = (uint8_t)(t % nch); o.wlen = rb;
                 o.wbase = kspan + t/nch*rowbytes; o.dst = spk; rl_engine(&o);
                 o.wbase = vspan + t/nch*rowbytes; o.dst = spv; rl_engine(&o);
+#ifdef TRIXIUM_ATTN_INT8
+                rl_store(at_i8_stage + 2u*i*bytes, bytes, spk);
+                rl_store(at_i8_stage + (2u*i + 1u)*bytes, bytes, spv);
+#else
                 rl_store(K + (uint64_t)t*kv_dim, bytes, spk);
                 rl_store(V + (uint64_t)t*kv_dim, bytes, spv);
+#endif
             }
             if (rl_run("attention kv restore"))
                 return -1;
+#ifdef TRIXIUM_ATTN_INT8
+            for (uint32_t i = 0; i < n; i++)
+                attn_i8_dequant(at_i8_stage + 2u*i*bytes, at_i8_stage + (2u*i + 1u)*bytes,
+                                K + (uint64_t)(t0 + i)*kv_dim, V + (uint64_t)(t0 + i)*kv_dim);
+#endif
         }
         printf("hybrid: attention slot %d: K/V rows %lu..%lu restored from engine DDR\n", a,
                (unsigned long)have, (unsigned long)(last - 1u));

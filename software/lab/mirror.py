@@ -82,7 +82,7 @@ def prompt_ids(a):
 
 # Mirror (workstation) -----------------------------------------------------------------------------
 
-def mirror(image, ids, out, hybrid_silu="rv32f"):
+def mirror(image, ids, out, hybrid_silu="rv32f", attn_int8=False):
     """Run the Python mirror on `ids` and write its checkpoints to `out`."""
     import numpy as np
     from model.bons import BONSReader
@@ -111,7 +111,7 @@ def mirror(image, ids, out, hybrid_silu="rv32f"):
               file=sys.stderr)
         def typed_trace(pos, layer, tag, dtype, values):
             lines.append(format_typed_trace(pos, layer, tag, dtype, values))
-        tokens = hybrid27_generate(img, ids, 1, trace=typed_trace, silu_mode=mode)
+        tokens = hybrid27_generate(img, ids, 1, trace=typed_trace, silu_mode=mode, attn_int8=attn_int8)
     else:
         tokens = hybrid_generate(img, ids, 1, modes=modes, trace=trace)
         # The card's `gen 1 <ids>` runs the prompt's forwards only: drop the generated token's.
@@ -122,7 +122,7 @@ def mirror(image, ids, out, hybrid_silu="rv32f"):
     print(f"{out}: {len(lines)} checksums, mirror token {tokens}")
 
 
-def mirror_tokens(image, ids, n_new, hybrid_silu="rv32f"):
+def mirror_tokens(image, ids, n_new, hybrid_silu="rv32f", attn_int8=False):
     """The mirror's `n_new` greedy tokens after the prompt `ids` (no trace): what the card's or the
     simulation's `gen n_new ids...` must print."""
     from model.bons import BONSReader
@@ -131,7 +131,7 @@ def mirror_tokens(image, ids, n_new, hybrid_silu="rv32f"):
     h = img.header
     is_hybrid = h["version"] >= 3 and ("deltanet" in h["layer_types"] or h["hadamard_block"])
     if is_hybrid:
-        return [int(t) for t in hybrid27_generate(img, ids, n_new, silu_mode=hybrid_silu)]
+        return [int(t) for t in hybrid27_generate(img, ids, n_new, silu_mode=hybrid_silu, attn_int8=attn_int8)]
     modes = {"silu_mul": "hw", "rmsnorm": "hw", "kv_hbm": "hw"}
     return [int(t) for t in hybrid_generate(img, ids, n_new, modes=modes)]
 

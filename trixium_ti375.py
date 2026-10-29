@@ -87,7 +87,7 @@ class _CRG(LiteXModule):
 
 class TriXiumTi375SoC(SoCCore):
     def __init__(self, sys_clk_freq=100e6, engine_channels=4, profile="lite", prefetch=512,
-                 eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 2048), dn_sublanes=0,
+                 eth_ip="<board-host>", attn_geometry=YPCB_LITE_ATTN + (256, 2048), attn_int8=False, dn_sublanes=0,
                  ddr_targets=1, with_spi_flash=False, upload_beats=32, chan_skew=0, with_softmax=False, no_core=False, with_sdcard=False, with_emmc=False, with_web=False, web_ip="<board-host>",
                  **kwargs):
         # no_core: the SoC without the TriXium core (the clocks, the CPU on the shared memory port,
@@ -247,6 +247,8 @@ class TriXiumTi375SoC(SoCCore):
         # The attention stream's operand memories in block RAM (Efinix has no distributed RAM: an
         # asynchronous read became 131k flip-flops).
         units["attnstream_options"] = units["attnstream_options"] + (("sync_operand", True),)
+        if attn_int8:   # The integer passes on int8 K/V rows (8 products per lane per clock).
+            units["attnstream_options"] = units["attnstream_options"] + (("int8", True),)
         if dn_sublanes:   # lanes (= channels) x sub-lanes: the DeltaNet stream's width.
             units["dnstream_options"] = (("sublanes", dn_sublanes),)
         config = TriXiumConfig(scratchpad_xpm=False, efinix_ram=True, **units,
@@ -316,6 +318,7 @@ def main():
     parser.add_target_argument("--with-web",        action="store_true",       help="The CPU's own Ethernet MAC: the firmware serves the chat page (http://<web-ip>/).")
     parser.add_target_argument("--web-ip",          default="<board-host>",    help="The web page's IP address (the CPU's MAC; --eth-ip stays the hardware stack's).")
     parser.add_target_argument("--attn-t-max",      default=2048,  type=int,   help="Attention stream context positions (the 2B image's 2,048: past t_max the firmware runs attention on the CPU, ~4.6 s per token).")
+    parser.add_target_argument("--attn-int8",       action="store_true", help="Attention stream on int8 K/V rows (gateware/units/attention_i8.py: 8 exact products per lane per clock instead of one FP32 multiply-add).")
     parser.add_target_argument("--attn-lanes",      default=YPCB_LITE_ATTN[0], type=int, help="Attention stream lanes (query heads served at once).")
     parser.add_target_argument("--attn-groups",     default=YPCB_LITE_ATTN[1], type=int, help="Attention stream groups (kv heads served at once, at most lanes / the model's query heads per kv head: 8 lanes / 2 groups serve the 2B's heads in one pass).")
     parser.add_target_argument("--eth-ip",          default="<board-host>",    help="Etherbone / upload IP address.")
@@ -326,7 +329,7 @@ def main():
     os.environ.setdefault("LITEX_ENV_EFINITY", "/opt/efinix/efinity/2025.1")
     soc = TriXiumTi375SoC(sys_clk_freq=args.sys_clk_freq, engine_channels=args.engine_channels,
                           profile=args.profile, prefetch=args.prefetch, eth_ip=args.eth_ip,
-                          dn_sublanes=args.dn_sublanes, attn_geometry=(args.attn_lanes, args.attn_groups, 256, args.attn_t_max),
+                          dn_sublanes=args.dn_sublanes, attn_geometry=(args.attn_lanes, args.attn_groups, 256, args.attn_t_max), attn_int8=args.attn_int8,
                           ddr_targets=args.ddr_targets, with_spi_flash=args.with_spi_flash,
                           upload_beats=args.upload_beats, chan_skew=args.chan_skew, with_softmax=args.with_softmax,
                           no_core=args.no_core, with_sdcard=args.with_sdcard, with_emmc=args.with_emmc, with_web=args.with_web, web_ip=args.web_ip,

@@ -100,6 +100,10 @@ PLATFORMS = {
 # (model/mirror.py) gives this sequence; the card ran it bit-exact.
 BOARD_GOLDEN = {
     ("ti375", "2b"): "11751 13 561 6511 314 17163 369 23327",
+    # The int8 attention (TRIXIUM_ATTN_INT8, gateware/units/attention_i8.py) on the same image:
+    # model/mirror.py hybrid27_generate(attn_int8=True). It lands back on the float reference's
+    # sequence.
+    ("ti375", "2b", "attn_int8"): "11751 13 198 760 6511 314 9338 369",
 }
 
 # Board Hosts --------------------------------------------------------------------------------------
@@ -496,6 +500,8 @@ def deploy_ti375(build, model, reconfigure=True, dry_run=False, bench=None, firm
     soc_h   = os.path.join(out, "software", "include", "generated", "soc.h")
     image   = os.path.join(REPO, "models", "bons",
                            f"bonsai2-{model}-n{soc_constant(soc_h, 'TRIXIUM_N_CHANNELS', '4')}-ti375.img")
+    if os.path.exists(soc_h) and "TRIXIUM_ATTN_INT8" in open(soc_h).read():
+        want = BOARD_GOLDEN.get(("ti375", model, "attn_int8"), want)
     print(f"deploy {os.path.relpath(out, REPO)} -> ti375 (tty {tty}, {ip}{' via ' + iface if iface else ''}), "
           f"model {model} ({os.path.relpath(image, REPO)})")
     if dry_run:

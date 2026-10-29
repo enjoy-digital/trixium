@@ -400,7 +400,7 @@ class TriXiumSimSoC(SoCCore):
                  with_dnstream=False, attn_geometry=None, board_timing=False, contents=True,
                  ddr_settings=None, ckphase_model=False, prefetch=0, vec_fused=False, ddr_readers=False,
                  axi1_latency=24, axi1_reorder=0, axi1_targets=1, reader_n_ids=4,
-                 unit_options=(), efinix_ram=False, attn_sync_operand=False, with_sdcard=False,
+                 unit_options=(), efinix_ram=False, attn_sync_operand=False, attn_int8=False, with_sdcard=False,
                  matvec_rows=1, with_sata=False, sata_tokenizer=None):
         assert mem in ("hbm", "ddr4", "ddr3", "axi1")
         assert not board_timing or mem == "ddr4", "board timing is the XCU1525's (DDR4)"
@@ -548,6 +548,7 @@ class TriXiumSimSoC(SoCCore):
             attnstream_options       = tuple(zip(("lanes", "groups", "hb_max", "t_max"),
                 (attn_geometry[0], attn_geometry[1], attn_geometry[2]//8, attn_geometry[3])))
                 + ((("sync_operand", True),) if attn_sync_operand else ())
+                + ((("int8", True),) if attn_int8 else ())
                 if attn_geometry else (),
             # The Efinix memory forms (trixium_ti375.py): what the board runs, in the gate too.
             efinix_ram               = efinix_ram,
@@ -1117,6 +1118,7 @@ def main():
     parser.add_argument("--image",          default=None,                                          help="BONS image to bake in (default: the board's, DEFAULT_IMAGES).")
     parser.add_argument("--out-dir",        default=None,                                          help="Build directory (default: build/sim_<board>, build/sim_<board>_bt_<image> with --board-timing).")
     parser.add_argument("--board-timing",   action="store_true",                                   help="--board xcu1525: the board's clocks, DDR4 timings/map, CPU and stream geometry (shape-true slices, doc/simulation.md).")
+    parser.add_argument("--attn-int8",      action="store_true",                                   help="The attention stream on int8 K/V rows (trixium_ti375.py --attn-int8).")
     parser.add_argument("--attn-geometry",  default=None,                                          help="Attention stream lanes,groups,head_dim,t_max (default: the board's; e.g. 4,1,128,256: one command per kv-head slice).")
     parser.add_argument("--build",          action="store_true",                                   help="Build the simulation (headers + libraries, firmware, Verilog, Verilator).")
     parser.add_argument("--run",            action="store_true",                                   help="Run the built simulation (console on stdin/stdout).")
@@ -1193,6 +1195,8 @@ def main():
         gateware_dir = os.path.join(out_dir, "gateware")
     if args.attn_geometry is not None:
         board.update(attn_geometry=tuple(int(v) for v in args.attn_geometry.split(",")))
+    if args.attn_int8:
+        board.update(attn_int8=True)
     if args.cpu_type is not None:
         board.update(cpu_type=args.cpu_type, icache_kb=0, vexii_extra="")
     if args.bench_toggle is None:

@@ -37,6 +37,7 @@ from gateware.core.reader_island import ReaderIsland
 from gateware.core.trit5 import Trit5Unpacker
 from gateware.units.deltanet_stream import DeltaNetStream
 from gateware.units.attention_stream import AttentionStream
+from gateware.units.attention_i8 import AttentionStreamI8
 
 # Helpers ------------------------------------------------------------------------------------------
 
@@ -319,8 +320,15 @@ class MatVecEngine(LiteXModule):
         self.with_attnstream = attnstream
         if attnstream:
             opts = dict(attnstream) if isinstance(attnstream, (dict, tuple)) else {}
-            self.attnstream = at = AttentionStream(
-                adr_bits=len(scratchpad.fill.adr), **opts)
+            if opts.pop("int8", False):
+                # The integer passes (int8 K/V rows): same ports, record and op.
+                opts.pop("sync_operand", None)
+                opts["hd_max"] = 8*opts.pop("hb_max", 32)
+                self.attnstream = at = AttentionStreamI8(
+                    adr_bits=len(scratchpad.fill.adr), **opts)
+            else:
+                self.attnstream = at = AttentionStream(
+                    adr_bits=len(scratchpad.fill.adr), **opts)
 
         # # #
 

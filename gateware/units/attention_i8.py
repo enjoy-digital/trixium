@@ -193,6 +193,7 @@ class AttentionStreamI8(LiteXModule):
         pw = max((hb_max + 1 - 1).bit_length(), tb)   # Per-lane operand memory address width.
         Lm = mul_factory.latency
         self.lanes, self.groups, self.hd_max, self.t_max = L, groups, hd_max, t_max
+        self.hb_max, self.int8 = hd_max//8, True    # (hb_max: the FP32 unit's beats per head)
 
         # Control.
         self.start = Signal()

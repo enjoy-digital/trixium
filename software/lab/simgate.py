@@ -113,12 +113,18 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
     `wedge`, a soft reset in the middle of an op: it must leave nothing behind that changes the
     next generation)."""
     os.makedirs(out_dir, exist_ok=True)
+    # An int8-attention build computes the attention in that arithmetic: so must the mirror.
+    soc_h = os.path.join(gateware_dir, "..", "software", "include", "generated", "soc.h")
+    attn_int8 = os.path.exists(soc_h) and "TRIXIUM_ATTN_INT8" in open(soc_h).read()
+    mirror_kw = dict(attn_int8=True) if attn_int8 else {}
+    if attn_int8:
+        print("mirror: int8 attention (the bitstream's TRIXIUM_ATTN_INT8)", flush=True)
     mirror_trace = os.path.join(out_dir, "mirror.txt")
     sim_trace    = os.path.join(out_dir, "trace.txt")
     ids          = [str(i) for i in ids]
 
     # Mirror.
-    mirror(image, [int(i) for i in ids], mirror_trace)
+    mirror(image, [int(i) for i in ids], mirror_trace, **mirror_kw)
 
     # Simulation.
     pre_ok = True
@@ -161,7 +167,7 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
                 # between the GEN: prompt and them).
                 got = re.search(r"(-?\d+(?:[ \t]+-?\d+)*)\s*GEN DONE", answer)
                 got = [int(t) for t in got.group(1).split()] if got else []
-                want = mirror_tokens(image, pids, n_new)
+                want = mirror_tokens(image, pids, n_new, **mirror_kw)
                 print(f"pre-gen tokens: {got} mirror: {want}", flush=True)
                 pre_ok &= got == want
             # `gen2 N idsA... | idsB...` (two conversations decoded together): each stream must be
@@ -174,7 +180,7 @@ def gate(gateware_dir, image, out_dir, ids=(1, 2, 3), dbg=3, expect_silu=False, 
                     pids = [int(w) for w in part.split()]
                     got = re.search(rf"GEN2 {'AB'[k]}:([ \t\d-]*)", answer)
                     got = [int(t) for t in got.group(1).split()] if got else []
-                    want = mirror_tokens(image, pids, n_new)
+                    want = mirror_tokens(image, pids, n_new, **mirror_kw)
                     print(f"gen2 stream {'AB'[k]}: {got} mirror: {want}", flush=True)
                     ok2 &= got == want
                 pre_ok &= ok2
