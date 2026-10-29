@@ -137,7 +137,7 @@ def mirror_tokens(image, ids, n_new, hybrid_silu="rv32f", attn_int8=False):
 
 
 def cmd_mirror(a):
-    mirror(a.image, prompt_ids(a), a.out, a.hybrid_silu)
+    mirror(a.image, prompt_ids(a), a.out, a.hybrid_silu, attn_int8=a.attn_int8)
 
 # Card (board host) --------------------------------------------------------------------------------
 
@@ -246,6 +246,7 @@ def main():
         if name == "mirror":
             p.add_argument("image",                                                             help="BONS image.")
             p.add_argument("--hybrid-silu", choices=("rv32f", "mathematical"), default="rv32f", help="Hybrid SiLU profile (rv32f: the firmware's RV32F libm).")
+            p.add_argument("--attn-int8",   action="store_true",                                    help="The int8 attention's arithmetic (a TRIXIUM_ATTN_INT8 bitstream).")
         else:
             p.add_argument("--tty",  default="/dev/ttyLXU0",                                          help="LiteUART tty.")
             p.add_argument("--pre",  action="append", default=[],                                     help="Console command to send first (repeatable).")

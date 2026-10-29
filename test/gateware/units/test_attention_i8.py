@@ -221,3 +221,188 @@ def test_throughput(tmp_path):
     check(got, expect, care)
     assert cycles[0] < 256*32*1.15 + 600, cycles            # scores: 32 clocks per position
     assert cycles[1] < 256*32*1.15 + 8*256 + 600, cycles    # values + the serial drain
+
+
+# The firmware's list through the shared cluster ------------------------------------------------
+# Scores (engine op 6), the softmax (unit 14) in place, values (op 6): the int8 rows in the
+# channel models, position t on channel t % n, as hybrid.c's attention list runs them.
+
+def _desc_engine(kind, rows=0, rem=0, wbase=0, wlen=0, cbeats=0, xsrc=0):
+    return [1, kind, rows | rem << 16, 0, wbase, wlen, cbeats << 8, 0, xsrc] + [0]*7
+
+def _desc_softmax(src, n, rows, stride):
+    return [14, src, n | rows << 16, stride] + [0]*12
+
+def _desc_stop():
+    return [0]*16
+
+@pytest.mark.parametrize("T,hd", [(2, 64), (3, 64), (9, 64), (2, 256), (3, 256)])
+def test_scores_softmax_values_list(T, hd):
+    from gateware.core.core import TriXiumConfig
+    from common.cluster import SoC, install_list, pack
+    from common.cluster import run as run_cluster
+    import test_softmax as tsm
+    n, nq, n_rep, nkv = 2, 8, 4, 2
+    hb, rb = hd//32, nkv*hd//32 + 1
+    config = TriXiumConfig(with_vecunit=False, with_softmax=True, scratchpad_size=64*1024,
+        with_attnstream=True, attnstream_options=(("lanes", 8), ("groups", 2), ("hb_max", hd//8),
+                                                  ("t_max", 64), ("int8", True)))
+    dut = SoC(config, n=n, backend="verilator")
+    rng = np.random.default_rng(T)
+    K = (rng.normal(0, 2, (T, nkv, hd))).astype(f32)
+    V = (rng.normal(0, 1, (T, nkv, hd))*np.exp2(rng.integers(-2, 3, (T, nkv, 1)))).astype(f32)
+    q = rng.normal(0, 1, (nq, hd)).astype(f32)
+    K8, ek = quantize_rows(K); V8, ev = quantize_rows(V); q8, eq = quantize_rows(q)
+    scale = f32(1/np.sqrt(hd))
+    s = scores_reference(q8, eq, K8, ek, scale)
+    p = np.stack([tsm.softmax_row(s[l]) for l in range(nq)])
+    o = values_reference(p, V8, ev)
+    Tp = (T + 7)//8*8
+    QSRC, SP, ODST, REC, KB, VB = 0x1000, 0x4000, 0x5000, 0x3800, 0x4000, 0x8000
+    qop = 32*(hb + 1)
+    words = {}
+    def put(addr, u32):
+        u32 = np.asarray(u32, np.uint32)
+        for i in range(0, len(u32), 8):
+            words[addr//32 + i//8] = pack(list(u32[i:i + 8]) + [0]*(8 - len(u32[i:i + 8])))
+    for l in range(nq):
+        put(QSRC + l*qop, q8[l].view(np.uint32))
+        put(QSRC + l*qop + 32*hb, [int(eq[l]) & 0xFFFFFFFF])
+    for l in range(nq):                                  # junk in the score rows
+        put(SP + l*Tp*4, rng.integers(0, 1 << 32, Tp, dtype=np.uint64).astype(np.uint32))
+    w0 = nq << 8 | n_rep << 16 | nkv << 24
+    put(REC, [w0, T, hd, QSRC, qop, SP, Tp*4, int(scale.view(np.uint32))])
+    put(REC + 32, [w0 | 1, T, hd, SP, Tp*4, ODST, hd*4, 0])
+    krows, vrows = k_rows(K8, ek, ev), v_rows(V8)
+    lst = [_desc_engine(6, T//n, T % n, KB, (T//n)*rb, rb, REC),
+           _desc_softmax(SP, T, nq, Tp//8),
+           _desc_engine(6, T//n, T % n, VB, (T//n)*rb, rb, REC + 32),
+           _desc_stop()]
+
+    def gen():
+        for a, v in words.items():
+            yield dut.scratchpad.mem[a].eq(v)
+        for t in range(T):
+            c, slot = t % n, t//n
+            for b in range(rb):
+                yield dut.models[c].mem[KB//32 + slot*rb + b].eq(pack(list(krows[t][8*b:8*b + 8])))
+                yield dut.models[c].mem[VB//32 + slot*rb + b].eq(pack(list(vrows[t][8*b:8*b + 8])))
+        yield from install_list(dut, lst)
+        for _ in range(200000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("list did not complete")
+        bad = []
+        for l in range(nq):
+            got = []
+            for w in range(Tp//8):
+                v = yield dut.scratchpad.mem[(SP + l*Tp*4)//32 + w]
+                got += [(v >> (32*i)) & 0xFFFFFFFF for i in range(8)]
+            want = p[l].view(np.uint32)
+            if got[:T] != list(want):
+                bad.append(("p", l, [hex(x) for x in got[:T]], [hex(int(x)) for x in want]))
+            got = []
+            for w in range(hd//8):
+                v = yield dut.scratchpad.mem[(ODST + l*hd*4)//32 + w]
+                got += [(v >> (32*i)) & 0xFFFFFFFF for i in range(8)]
+            if got != list(o[l].view(np.uint32)):
+                bad.append(("o", l))
+        assert not bad, bad[:6]
+
+    run_cluster(dut, [gen()])
+
+
+@pytest.mark.parametrize("T", [2, 3])
+def test_firmware_list_full_units(T):
+    """hybrid.c's whole int8 attention list on the kit's unit set: this token's FP32 K/V and q
+    quantized (unit 4) into the row layout and the lane operands, the rows stored to their
+    channel, then scores / softmax (unit 14) / values."""
+    from gateware.core.core import TriXiumConfig
+    from common.cluster import SoC, install_list, pack
+    from common.cluster import run as run_cluster
+    from model.activation import scratchpad_quantize_descriptor
+    import test_softmax as tsm
+    n, nq, n_rep, nkv, hd = 2, 8, 4, 2, 64
+    hb, rb, kv_dim = hd//32, nkv*hd//32 + 1, nkv*hd
+    config = TriXiumConfig(with_vecunit=False, scratchpad_size=64*1024, with_hadamard=True,
+        with_activation_quantize=True, with_projection_restore=True, with_silu=True, with_norm=True,
+        with_conv=True, with_softmax=True, norm_rope=False, hadamard_lanes=8, silu_ways=1,
+        with_attnstream=True, attnstream_options=(("lanes", 8), ("groups", 2), ("hb_max", hd//8),
+                                                  ("t_max", 64), ("int8", True)))
+    dut = SoC(config, n=n, backend="verilator")
+    rng = np.random.default_rng(100 + T)
+    K = rng.normal(0, 2, (T, nkv, hd)).astype(f32)
+    V = (rng.normal(0, 1, (T, nkv, hd))*np.exp2(rng.integers(-2, 3, (T, nkv, 1)))).astype(f32)
+    qg = rng.normal(0, 1, (nq, 2*hd)).astype(f32)          # [q | gate] per head
+    q = qg[:, :hd]
+    K8, ek = quantize_rows(K); V8, ev = quantize_rows(V); q8, eq = quantize_rows(q)
+    scale = f32(1/np.sqrt(hd))
+    s = scores_reference(q8, eq, K8, ek, scale)
+    p = np.stack([tsm.softmax_row(s[l]) for l in range(nq)])
+    o = values_reference(p, V8, ev)
+    Tp = (T + 7)//8*8
+    QB, KVF, QQ, KVQ, SP, ODST, REC = 0x1000, 0x2000, 0x2800, 0x3000, 0x4000, 0x5000, 0x3800
+    KB, VB = 0x4000, 0x8000
+    qop = 32*(hb + 1)
+    words = {}
+    def put(addr, u32):
+        u32 = np.asarray(u32, np.uint32)
+        for i in range(0, len(u32), 8):
+            words[addr//32 + i//8] = pack(list(u32[i:i + 8]) + [0]*(8 - len(u32[i:i + 8])))
+    put(QB, qg.reshape(-1).view(np.uint32))
+    put(KVF, np.concatenate([K[T - 1].reshape(-1), V[T - 1].reshape(-1)]).view(np.uint32))
+    for l in range(nq):
+        put(SP + l*Tp*4, rng.integers(0, 1 << 32, Tp, dtype=np.uint64).astype(np.uint32))
+    w0 = nq << 8 | n_rep << 16 | nkv << 24
+    put(REC, [w0, T, hd, QQ, qop, SP, Tp*4, int(scale.view(np.uint32))])
+    put(REC + 32, [w0 | 1, T, hd, SP, Tp*4, ODST, hd*4, 0])
+    krows, vrows = k_rows(K8, ek, ev), v_rows(V8)
+    t1 = T - 1
+    qd = lambda **f: list(np.frombuffer(scratchpad_quantize_descriptor(**f), np.uint32)) \
+        if isinstance(scratchpad_quantize_descriptor(**f), (bytes, bytearray)) else list(scratchpad_quantize_descriptor(**f))
+    lst = [qd(src=KVF, dst=KVQ + 32, exponents=KVQ, elements=hd, blocks=2*nkv),
+           [1, 3, 0, 0, KB + (t1//n)*rb*32, rb, 0, 0, KVQ, 0, t1 % n] + [0]*5,
+           [1, 3, 0, 0, VB + (t1//n)*rb*32, rb, 0, 0, KVQ + 32 + kv_dim, 0, t1 % n] + [0]*5]
+    lst += [qd(src=QB + l*2*hd*4, dst=QQ + l*qop, exponents=QQ + l*qop + 32*hb, elements=hd, blocks=1)
+            for l in range(nq)]
+    lst += [_desc_engine(6, T//n, T % n, KB, (T//n)*rb, rb, REC),
+            _desc_softmax(SP, T, nq, Tp//8),
+            _desc_engine(6, T//n, T % n, VB, (T//n)*rb, rb, REC + 32),
+            _desc_stop()]
+    lst = [[int(x) for x in d] + [0]*(16 - len(d)) for d in lst]
+
+    def gen():
+        for a, v in words.items():
+            yield dut.scratchpad.mem[a].eq(v)
+        for t in range(T - 1):                           # the earlier rows, already stored
+            c, slot = t % n, t//n
+            for b in range(rb):
+                yield dut.models[c].mem[KB//32 + slot*rb + b].eq(pack(list(krows[t][8*b:8*b + 8])))
+                yield dut.models[c].mem[VB//32 + slot*rb + b].eq(pack(list(vrows[t][8*b:8*b + 8])))
+        yield from install_list(dut, lst)
+        for _ in range(400000):
+            if not (yield dut.seq.busy):
+                break
+            yield
+        else:
+            raise AssertionError("list did not complete")
+        assert not (yield dut.seq.activation_quantize_error.status)
+        bad = []
+        for l in range(nq):
+            got = []
+            for w in range(Tp//8):
+                v = yield dut.scratchpad.mem[(SP + l*Tp*4)//32 + w]
+                got += [(v >> (32*i)) & 0xFFFFFFFF for i in range(8)]
+            if got[:T] != list(p[l].view(np.uint32)):
+                bad.append(("p", l, [hex(x) for x in got[:T]], [hex(int(x)) for x in p[l].view(np.uint32)]))
+            got = []
+            for w in range(hd//8):
+                v = yield dut.scratchpad.mem[(ODST + l*hd*4)//32 + w]
+                got += [(v >> (32*i)) & 0xFFFFFFFF for i in range(8)]
+            if got != list(o[l].view(np.uint32)):
+                bad.append(("o", l))
+        assert not bad, bad[:6]
+
+    run_cluster(dut, [gen()])

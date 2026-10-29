@@ -136,6 +136,9 @@ static uint64_t chan_limit(void)
 }
 static int at_sg;                      // kv heads per op-6 command (n_kv_head: one command)
 static float *at_buf;
+#ifdef TRIXIUM_ATTN_INT8
+static uint8_t *at_i8_stage;   // 8 int8 K/V row pairs in main RAM (the CPU path's restore)
+#endif
 #endif
 
 static uint32_t dn_hbm_base;
@@ -965,6 +968,10 @@ int hybrid_init(void)
 #ifdef TRIXIUM_HAS_ATTNSTREAM
     // Scores, then p, for every head: [n_head][ctx_cap rounded to 8].
     at_buf = at_geom_ok ? infer_halloc((uint64_t)n_head*((ctx_cap + 7) & ~7)*4, 1) : NULL;
+#ifdef TRIXIUM_ATTN_INT8
+    at_i8_stage = at_geom_ok ? infer_halloc(2u*8u*at_rowbeats*32u, 1) : NULL;
+    if (!at_i8_stage) at_geom_ok = 0;
+#endif
     if (!at_buf) at_geom_ok = 0;
 #endif
     logits = infer_halloc((uint64_t)H->vocab*4 + 64*n_ch*4, 1);
@@ -2270,7 +2277,6 @@ static int attn_stream(int a, int T, uint32_t slot, float scale, int gated, cons
 #ifdef TRIXIUM_ATTN_INT8
 // The CPU path's FP32 copy of an int8 K/V row pair (k: [exponents][heads' int8], v: [heads'
 // int8][unused]): x = q8 * 2^e, exact.
-static uint8_t at_i8_stage[2*8*(4*512/32 + 1)*32] __attribute__((aligned(64)));
 static void attn_i8_dequant(const uint8_t *k, const uint8_t *v, float *K, float *V)
 {
     const int32_t *ex = (const int32_t *)k;
